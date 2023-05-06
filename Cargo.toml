@@ -1,0 +1,20 @@
+[package]
+name = "xng"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+actix-web = "4.3.1"
+clap = { version = "4.2.7", features = ["cargo"] }
+exitcode = "1.1.2"
+lazy_static = "1.4.0"
+log = "0.4.17"
+rand = "0.8.5"
+regex = "1.8.1"
+reqwest = "0.11.17"
+serde = { version = "1.0.162", features = ["derive"] }
+serde_json = "1.0.96"
+stderrlog = "0.5.4"
+tokio = { version = "1.28.0", features = ["process", "macros", "time", "rt-multi-thread"] }
