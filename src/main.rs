@@ -2,26 +2,20 @@ use clap::command;
 use std::process::exit;
 use tokio::runtime::Runtime;
 
+mod common;
 mod modules;
 mod server;
 
 fn main() {
     let manager = modules::ModuleManager::init();
 
-    let mut cmd = command!()
-        .propagate_version(true)
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .subcommand(server::get_server_arguments());
-
-    if let Err(e) = manager.register_arguments(&mut cmd) {
-        eprintln!(
-            "Unexpected error during registering argumented: {}",
-            e.to_string()
-        );
-        eprintln!("Please report this bug to the developer for further analysis.");
-        exit(exitcode::CONFIG);
-    }
+    let cmd = manager.register_arguments(
+        command!()
+            .propagate_version(true)
+            .subcommand_required(true)
+            .arg_required_else_help(true)
+            .subcommand(server::get_server_arguments()),
+    );
 
     let args = cmd.get_matches();
     let rt = match Runtime::new() {

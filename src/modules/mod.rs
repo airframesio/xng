@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use clap::{ArgMatches, Command};
 
 pub trait XngModule {
-    fn register_arguments(&self, cmd: &mut Command) -> Result<(), String>;
+    fn get_arguments(&self) -> Command;
 }
 
 pub struct ModuleManager {
@@ -17,12 +17,13 @@ impl ModuleManager {
         }
     }
 
-    pub fn register_arguments(&self, cmd: &mut Command) -> Result<(), String> {
-        for (_, module) in self.modules.iter() {
-            module.register_arguments(cmd)?
-        }
-
-        Ok(())
+    pub fn register_arguments(&self, cmd: Command) -> Command {
+        cmd.subcommands(
+            self.modules
+                .values()
+                .map(|m| m.get_arguments())
+                .collect::<Vec<Command>>(),
+        )
     }
 
     // TODO: register API endpoints
