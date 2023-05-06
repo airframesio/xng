@@ -1,8 +1,10 @@
+use clap::{ArgMatches, Command};
 use std::collections::HashMap;
 
-use clap::{ArgMatches, Command};
+mod hfdl;
 
 pub trait XngModule {
+    fn id(&self) -> &'static str;
     fn get_arguments(&self) -> Command;
 }
 
@@ -13,7 +15,12 @@ pub struct ModuleManager {
 impl ModuleManager {
     pub fn init() -> ModuleManager {
         ModuleManager {
-            modules: HashMap::new(),
+            modules: HashMap::from_iter(
+                [hfdl::HfdlModule::new()]
+                    .map(|m| (m.id(), m))
+                    .into_iter()
+                    .collect::<Vec<(&'static str, Box<dyn XngModule>)>>(),
+            ),
         }
     }
 
