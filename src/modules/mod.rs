@@ -1,4 +1,4 @@
-use clap::{ArgMatches, Command};
+use clap::{ArgMatches, Command, arg};
 use log::*;
 use reqwest::Url;
 use std::collections::HashMap;
@@ -33,7 +33,15 @@ impl ModuleManager {
         cmd.subcommands(
             self.modules
                 .values()
-                .map(|m| common::arguments::register_common_arguments(m.get_arguments()))
+                .map(|m| 
+                    common::arguments::register_common_arguments(m.get_arguments())
+                        .args(&[
+                            arg!(--"feed-airframes" "Feed JSON frames to airframes.io"),
+                            arg!(--"station-name" <NAME> "Sets up a station name for feeding to airframes.io"),
+                            arg!(--"session-intermission" <SECONDS> "Time to wait between sessions"),
+                            arg!(--"disable-print-frame" "Disable printing JSON frames to STDOUT"), 
+                        ])
+                )
                 .collect::<Vec<Command>>(),
         )
     }
