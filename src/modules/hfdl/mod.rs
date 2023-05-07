@@ -1,4 +1,4 @@
-use clap::{arg, Command};
+use clap::{arg, Arg, ArgAction, Command};
 
 use super::XngModule;
 
@@ -11,10 +11,6 @@ pub struct HfdlModule {
 }
 
 impl XngModule for HfdlModule {
-    fn id(&self) -> &'static str {
-        self.name
-    }
-
     fn get_arguments(&self) -> Command {
         Command::new("hfdl")
             .args(&[
@@ -25,5 +21,10 @@ impl XngModule for HfdlModule {
                 arg!(--"use-airframes-gs-map" "Use airframes.io's live HFDL ground station frequency map"),
                 arg!(--bandwidth <HERTZ> "Initial bandwidth to use for splitting HFDL spectrum into bands of coverage"),
             ])
+            .arg(Arg::new("hfdl-args").action(ArgAction::Append))
+    }
+
+    fn id(&self) -> &'static str {
+        self.name
     }
 }

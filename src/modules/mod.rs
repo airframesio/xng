@@ -1,5 +1,10 @@
 use clap::{ArgMatches, Command};
+use log::*;
+use reqwest::Url;
 use std::collections::HashMap;
+use std::process::exit;
+
+use crate::common;
 
 mod hfdl;
 
@@ -28,7 +33,7 @@ impl ModuleManager {
         cmd.subcommands(
             self.modules
                 .values()
-                .map(|m| m.get_arguments())
+                .map(|m| common::arguments::register_common_arguments(m.get_arguments()))
                 .collect::<Vec<Command>>(),
         )
     }
@@ -36,6 +41,22 @@ impl ModuleManager {
     // TODO: register API endpoints
 
     pub async fn start(&self, cmd: &str, args: &ArgMatches) {
-        todo!()
+        stderrlog::new()
+            .module(module_path!())
+            .quiet(args.get_flag("quiet"))
+            .verbosity(if args.get_flag("debug") { 3 } else if args.get_flag("verbose") { 2 } else { 1 })
+            .timestamp(if args.get_flag("debug") || args.get_flag("verbose") { stderrlog::Timestamp::Second } else { stderrlog::Timestamp::Off })
+            .init()
+            .unwrap();
+
+        if let Some(swarm_url) = args.get_one::<Url>("swarm") {
+            // TODO: don't start or init server
+        } else {
+            // TODO: init actix-web server
+        }
+        
+        let Some(module) = self.modules.get(cmd) else {
+            exit(exitcode::CONFIG);   
+        };
     }
 }
