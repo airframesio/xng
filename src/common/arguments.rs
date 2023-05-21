@@ -11,5 +11,6 @@ pub fn register_common_arguments(cmd: Command) -> Command {
         arg!(--"listen-host" <HOST> "Host for API server to listen on"),
         arg!(--"listen-port" <PORT> "Port for API server to listen on"),
         arg!(--swarm <URL> "xng server instance to connect to (local API server will be disabled)"),
+        arg!(--elastic <URL> "Export processed common JSON frames to ElasticSearch"),
     ])
 }

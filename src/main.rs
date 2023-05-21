@@ -29,8 +29,21 @@ fn main() {
 
     rt.block_on(async {
         match args.subcommand() {
-            Some((server::SERVER_COMMAND, matches)) => server::start(matches).await,
-            Some((subcmd, matches)) => manager.start(subcmd, matches).await,
+            Some((subcmd, matches)) => {
+                stderrlog::new()
+                    .module(module_path!())
+                    .quiet(matches.get_flag("quiet"))
+                    .verbosity(if matches.get_flag("debug") { 3 } else if matches.get_flag("verbose") { 2 } else { 1 })
+                    .timestamp(if matches.get_flag("debug") || matches.get_flag("verbose") { stderrlog::Timestamp::Second } else { stderrlog::Timestamp::Off })
+                    .init()
+                    .unwrap();
+
+                if subcmd == server::SERVER_COMMAND {
+                    server::start(matches).await;
+                } else {
+                    manager.start(subcmd, matches).await;
+                }  
+            },
             _ => unreachable!("Encountered None when subcommand_required is true; see clap-rs for documentation changes or bug report link"),
         }
     })

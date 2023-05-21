@@ -46,25 +46,11 @@ impl ModuleManager {
         )
     }
 
-    // TODO: register API endpoints
-
     pub async fn start(&self, cmd: &str, args: &ArgMatches) {
-        stderrlog::new()
-            .module(module_path!())
-            .quiet(args.get_flag("quiet"))
-            .verbosity(if args.get_flag("debug") { 3 } else if args.get_flag("verbose") { 2 } else { 1 })
-            .timestamp(if args.get_flag("debug") || args.get_flag("verbose") { stderrlog::Timestamp::Second } else { stderrlog::Timestamp::Off })
-            .init()
-            .unwrap();
-
-        if let Some(swarm_url) = args.get_one::<Url>("swarm") {
-            // TODO: don't start or init server
-        } else {
-            // TODO: init actix-web server
-        }
-        
         let Some(module) = self.modules.get(cmd) else {
+            error!("Invalid module '{}', please choose a valid module.", cmd);
             exit(exitcode::CONFIG);   
         };
+
     }
 }
