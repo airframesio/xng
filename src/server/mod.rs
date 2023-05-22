@@ -9,6 +9,7 @@ use tokio::select;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::mpsc;
 use tokio::time::{self, Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 use crate::common;
 use crate::common::frame::CommonFrame;
@@ -45,6 +46,9 @@ pub async fn start(args: &ArgMatches) {
 
     // TODO: Init actix-web server
 
+    let cancel_token = CancellationToken::new();
+    let ingest_cancel_token = cancel_token.clone();
+    
     let (tx, mut rx) = mpsc::channel::<CommonFrame>(DEFAULT_CHANNEL_BUFFER);
     
     let ingest_thread = tokio::spawn(async move {
@@ -57,60 +61,64 @@ pub async fn start(args: &ArgMatches) {
         };
 
         loop {
-            let (client, client_addr) = match listener.accept().await {
-                Ok(x) => x,
-                Err(e) => {
-                    error!("Failed to accept client: {}", e);
-                    break;
-                }
-            };
+            select! {
+                Ok((client, client_addr)) = listener.accept() => {
+                    info!("New client from {} accepted.", client_addr.ip());
 
-            info!("New client from {} accepted.", client_addr.ip());
-
-            let tx = tx.clone();
+                    let tx = tx.clone();
             
-            tokio::spawn(async move {
-                let mut reader = BufReader::new(client);
+                    tokio::spawn(async move {
+                        let mut reader = BufReader::new(client);
 
-                loop {
-                    let mut msg = String::new();
+                        loop {
+                            let mut msg = String::new();
 
-                    let Ok(result) = time::timeout(Duration::from_secs(inactive_timeout_secs), reader.read_line(&mut msg)).await else {
-                        info!("Client from {} idled for longer than {} seconds. ", client_addr.ip(), inactive_timeout_secs);
-                        break;
-                    };
+                            let Ok(result) = time::timeout(
+                                Duration::from_secs(inactive_timeout_secs), 
+                                reader.read_line(&mut msg)
+                            ).await else {
+                                info!("Client from {} idled for longer than {} seconds. ", client_addr.ip(), inactive_timeout_secs);
+                                break;
+                            };
                     
-                    let Ok(size) = result else {
-                        debug!("Failed to unwrap result from read_line");
-                        break;  
-                    };
+                            let Ok(size) = result else {
+                                debug!("Failed to unwrap result from read_line");
+                                break;  
+                            };
 
-                    if size == 0 {
-                        debug!("Received 0 bytes, client socket is probably dead.");
-                        break;
-                    }
+                            if size == 0 {
+                                debug!("Received 0 bytes, client socket is probably dead.");
+                                break;
+                            }
 
-                    let frame = match serde_json::from_str::<CommonFrame>(&msg) {
-                        Ok(frame) => frame,
-                        Err(e) => {
-                            error!("Malformed common frame: {}", e.to_string());
-                            continue
+                            let frame = match serde_json::from_str::<CommonFrame>(&msg) {
+                                Ok(frame) => frame,
+                                Err(e) => {
+                                    error!("Malformed common frame: {}", e.to_string());
+                                    continue
+                                }
+                            };
+
+                            if let Err(e) = frame.validate() {
+                                error!("Common Frame failed validation: {}", e.to_string());
+                                continue;    
+                            }
+                    
+                            if let Err(e) = tx.send(frame).await {
+                                error!("Failed to send common frame to parse thread: {}", e.to_string());
+                            }
                         }
-                    };
-
-                    if let Err(e) = frame.validate() {
-                        error!("Common Frame failed validation: {}", e.to_string());
-                        continue;    
-                    }
-                    
-                    if let Err(e) = tx.send(frame).await {
-                        error!("Failed to send common frame to parse thread: {}", e.to_string());
-                    }
+                    });    
                 }
-            });
+                _ = ingest_cancel_token.cancelled() => {
+                    info!("Ingest thread got cancel request");
+                    break;
+                }    
+            }
+            
         }
 
-        info!("Ingest thread exiting...");
+        info!("Ingest thread exited");
     });
 
     let mut since_batch_start: Option<Instant> = None;
@@ -127,19 +135,26 @@ pub async fn start(args: &ArgMatches) {
                     if since_batch_start.is_none() { inactive_timeout_secs * 1000 } else { DEFAULT_BATCH_WAIT_MS }
                 ), rx.recv()
             ) => {
-                // TODO: parse frame
+                // TODO: parse CFF
+                // TODO: if elastic_url exists, add parsed to metadata, add to batch
+                // TODO: update SQLite tables
             }
             _ = interrupt_signal.recv() => {
+                info!("Got interrupt, sending cancel request to ingest thread");
                 // TODO
+                
                 break;
             }
         }
 
-        // TODO: only if we are sending to ES
+        if elastic_url.is_none() {
+            continue;    
+        }
         
         if let Some(batch_start) = since_batch_start {
             if batch_start.elapsed() >= Duration::from_millis(DEFAULT_BATCH_WAIT_MS) && !batch.is_empty() {
                 // TODO: send batch to ElasticSearch
+                debug!("");
                 
                 batch.clear();
                 since_batch_start = None;
@@ -147,6 +162,11 @@ pub async fn start(args: &ArgMatches) {
         }
     }
 
-    info!("Got interrupt signal, exiting...");
-    ingest_thread.abort();
+    cancel_token.cancel();
+
+    #[allow(unused_must_use)] {
+        ingest_thread.await;
+    }
+
+    info!("Server exited");
 }

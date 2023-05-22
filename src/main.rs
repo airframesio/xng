@@ -3,6 +3,7 @@ use std::process::exit;
 use tokio::runtime::Runtime;
 
 mod common;
+mod http;
 mod modules;
 mod server;
 

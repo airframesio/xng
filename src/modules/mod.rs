@@ -1,16 +1,28 @@
 use clap::{ArgMatches, Command, arg};
 use log::*;
 use reqwest::Url;
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::select;
+use tokio::sync::mpsc;
+use tokio::time::sleep;
 use std::collections::HashMap;
+use std::io;
 use std::process::exit;
+use std::time::Duration;
 
 use crate::common;
 
 mod hfdl;
 
+const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
+
+const DEFAULT_LISTEN_HOST: &'static str = "127.0.0.1";
+const DEFAULT_LIST_PORT: u16 = 7871;
+
 pub trait XngModule {
     fn id(&self) -> &'static str;
     fn get_arguments(&self) -> Command;
+    fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error>;
 }
 
 pub struct ModuleManager {
@@ -36,6 +48,8 @@ impl ModuleManager {
                 .map(|m| 
                     common::arguments::register_common_arguments(m.get_arguments())
                         .args(&[
+                            arg!(--"disable-api-control" "Disable controlling of session from API server"),
+                            arg!(--swarm <URL> "xng server instance to connect to (local API server will be disabled)"),
                             arg!(--"feed-airframes" "Feed JSON frames to airframes.io"),
                             arg!(--"station-name" <NAME> "Sets up a station name for feeding to airframes.io"),
                             arg!(--"session-intermission" <SECONDS> "Time to wait between sessions"),
@@ -46,11 +60,64 @@ impl ModuleManager {
         )
     }
 
-    pub async fn start(&self, cmd: &str, args: &ArgMatches) {
-        let Some(module) = self.modules.get(cmd) else {
+    pub async fn start(&mut self, cmd: &str, args: &ArgMatches) {
+        let Some(module) = self.modules.get_mut(cmd) else {
             error!("Invalid module '{}', please choose a valid module.", cmd);
             exit(exitcode::CONFIG);   
         };
 
+        let api_token: Option<&String> = args.get_one("api-token");
+        let disable_cross_site = args.get_flag("disable-cross-site");
+        let listen_host = args.get_one("listen-host").unwrap_or(&DEFAULT_LISTEN_HOST);
+        let listen_port = args.get_one("listen-port").unwrap_or(&"default").parse::<u16>().unwrap_or(DEFAULT_LIST_PORT);
+        let disable_api_control = args.get_flag("disable-api-control");
+        
+        let feed_airframes = args.get_flag("feed-airframes");
+        let disable_print_frame = args.get_flag("disable-print-frame");
+        
+        let swarm_url: Option<&Url> = args.get_one("swarm");
+        let elastic_url: Option<&Url> = args.get_one("elastic");
+        
+        let station_name: Option<&String> = args.get_one("station-name");
+        let session_intermission_secs = args.get_one("session-intermission")
+            .unwrap_or(&"default").parse::<u64>()
+            .unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS);
+
+        let (end_session_signaler, mut end_session_signal) = mpsc::unbounded_channel::<()>();
+        let Ok(mut interrupt_signal) = signal(SignalKind::interrupt()) else {
+            error!("Failed to register interrupt signal");
+            return;
+        };
+
+        if let Err(e) = module.parse_arguments(args) {
+            error!("Failed to parse arguments: {}", e.to_string());
+            return;    
+        }
+        
+        // TODO: start actix web
+
+        let mut should_run = true;
+
+        while should_run {
+            loop {
+                select! {
+                    _ = end_session_signal.recv() => {
+                        debug!("Got request to end current session");
+                        break;
+                    }
+                    _ = interrupt_signal.recv() => {
+                        error!("Got interrupt, exiting session cleanly...");
+                        // TODO
+                        should_run = false;
+                        break;
+                    }
+                }
+            }
+
+            if session_intermission_secs > 0 {
+                debug!("Session ended, waiting for {} seconds before continuing", session_intermission_secs);
+                sleep(Duration::from_secs(session_intermission_secs)).await;
+            }
+        }
     }
 }

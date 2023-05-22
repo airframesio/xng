@@ -84,7 +84,7 @@ impl GroundStation {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SystemTable {
     version: u8,
     stations: Vec<GroundStation>,

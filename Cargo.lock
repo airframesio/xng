@@ -2172,6 +2172,7 @@ dependencies = [
  "serde_valid",
  "stderrlog",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
