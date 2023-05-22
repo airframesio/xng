@@ -2,6 +2,7 @@ use clap::{arg, ArgMatches, Command};
 use log::*;
 use reqwest::Url;
 use serde_json::Value;
+use serde_valid::Validate;
 use tokio::net::TcpListener;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::select;
@@ -97,6 +98,11 @@ pub async fn start(args: &ArgMatches) {
                         }
                     };
 
+                    if let Err(e) = frame.validate() {
+                        error!("Common Frame failed validation: {}", e.to_string());
+                        continue;    
+                    }
+                    
                     if let Err(e) = tx.send(frame).await {
                         error!("Failed to send common frame to parse thread: {}", e.to_string());
                     }

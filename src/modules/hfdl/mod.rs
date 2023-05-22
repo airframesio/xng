@@ -2,6 +2,7 @@ use clap::{arg, Arg, ArgAction, Command};
 
 use super::XngModule;
 
+mod frame;
 mod module;
 
 const HFDL_COMMAND: &'static str = "hfdl";
