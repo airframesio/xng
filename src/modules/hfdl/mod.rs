@@ -37,17 +37,25 @@ impl XngModule for HfdlModule {
     }
 
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error> {
-        let bin_path = PathBuf::from(args.get_one("bin").unwrap_or(&DEFAULT_BIN_PATH));
+        let bin_path = PathBuf::from(
+            args.get_one::<String>("bin")
+                .unwrap_or(&DEFAULT_BIN_PATH.to_string()),
+        );
         if !bin_path.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("Not a file: {}", bin_path.to_string_lossy()),
+                format!(
+                    "Provided dumphfdl path is not a file: {}",
+                    bin_path.to_string_lossy()
+                ),
             ));
         }
         self.bin = bin_path;
 
-        let systable_path = *args.get_one("systable").unwrap_or(&DEFAULT_SYSTABLE_PATH);
-        self.systable = SystemTable::load(&PathBuf::from(systable_path))?;
+        self.systable = SystemTable::load(&PathBuf::from(
+            args.get_one::<String>("systable")
+                .unwrap_or(&DEFAULT_SYSTABLE_PATH.to_string()),
+        ))?;
 
         let stale_timeout_secs = args
             .get_one("stale-timeout")

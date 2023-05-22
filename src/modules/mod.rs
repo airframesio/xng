@@ -1,3 +1,4 @@
+use actix_web::{HttpServer, App};
 use clap::{ArgMatches, Command, arg};
 use log::*;
 use reqwest::Url;
@@ -5,6 +6,7 @@ use tokio::signal::unix::{SignalKind, signal};
 use tokio::select;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 use std::io;
 use std::process::exit;
@@ -68,7 +70,7 @@ impl ModuleManager {
 
         let api_token: Option<&String> = args.get_one("api-token");
         let disable_cross_site = args.get_flag("disable-cross-site");
-        let listen_host = args.get_one("listen-host").unwrap_or(&DEFAULT_LISTEN_HOST);
+        let listen_host = *args.get_one("listen-host").unwrap_or(&DEFAULT_LISTEN_HOST);
         let listen_port = args.get_one("listen-port").unwrap_or(&"default").parse::<u16>().unwrap_or(DEFAULT_LIST_PORT);
         let disable_api_control = args.get_flag("disable-api-control");
         
@@ -93,9 +95,27 @@ impl ModuleManager {
             error!("Failed to parse arguments: {}", e.to_string());
             return;    
         }
-        
-        // TODO: start actix web
 
+        let cancel_token = CancellationToken::new();
+        let http_cancel_token = cancel_token.clone();
+        
+        let http_thread = tokio::spawn(async move {
+            let server = HttpServer::new(move || {
+                App::new()
+            })
+            .bind((listen_host, listen_port))
+            .unwrap()
+            .run();
+
+            select! {
+                _ = server => {},
+                _ = http_cancel_token.cancelled() => {
+                    info!("HTTP thread got cancel request");
+                    return;
+                }
+            }
+        });
+        
         let mut should_run = true;
 
         while should_run {
@@ -119,5 +139,14 @@ impl ModuleManager {
                 sleep(Duration::from_secs(session_intermission_secs)).await;
             }
         }
+
+        info!("Sending cancel request to spawned threads");
+        cancel_token.cancel();
+
+        #[allow(unused_must_use)] {
+            http_thread.await;
+        }
+
+        info!("Exiting...");
     }
 }

@@ -3,12 +3,11 @@ use std::process::exit;
 use tokio::runtime::Runtime;
 
 mod common;
-mod http;
 mod modules;
 mod server;
 
 fn main() {
-    let manager = modules::ModuleManager::init();
+    let mut manager = modules::ModuleManager::init();
 
     let cmd = manager.register_arguments(
         command!()
