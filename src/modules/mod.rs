@@ -1,4 +1,4 @@
-use actix_web::{HttpServer, App};
+use actix_web::{HttpServer, App, web, Resource};
 use clap::{ArgMatches, Command, arg};
 use log::*;
 use reqwest::Url;
@@ -23,6 +23,9 @@ const DEFAULT_LIST_PORT: u16 = 7871;
 
 pub trait XngModule {
     fn id(&self) -> &'static str;
+
+    fn default_session_timeout_secs(&self) -> u64;
+    
     fn get_arguments(&self) -> Command;
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error>;
 }
@@ -54,6 +57,7 @@ impl ModuleManager {
                             arg!(--swarm <URL> "xng server instance to connect to (local API server will be disabled)"),
                             arg!(--"feed-airframes" "Feed JSON frames to airframes.io"),
                             arg!(--"station-name" <NAME> "Sets up a station name for feeding to airframes.io"),
+                            arg!(--"session-timeout" <SECONDS> "Elapsed time since last frame before a session is considered stale and requires switching"),
                             arg!(--"session-intermission" <SECONDS> "Time to wait between sessions"),
                             arg!(--"disable-print-frame" "Disable printing JSON frames to STDOUT"), 
                         ])
@@ -84,7 +88,13 @@ impl ModuleManager {
         let session_intermission_secs = args.get_one("session-intermission")
             .unwrap_or(&"default").parse::<u64>()
             .unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS);
+        let session_timeout_secs = args
+            .get_one("session-timeout")
+            .unwrap_or(&"default")
+            .parse::<u64>()
+            .unwrap_or(module.default_session_timeout_secs());
 
+        let (reload_signaler, mut reload_signal) = mpsc::unbounded_channel::<()>();
         let (end_session_signaler, mut end_session_signal) = mpsc::unbounded_channel::<()>();
         let Ok(mut interrupt_signal) = signal(SignalKind::interrupt()) else {
             error!("Failed to register interrupt signal");
@@ -98,7 +108,7 @@ impl ModuleManager {
 
         let cancel_token = CancellationToken::new();
         let http_cancel_token = cancel_token.clone();
-        
+
         let http_thread = tokio::spawn(async move {
             let server = HttpServer::new(move || {
                 App::new()
@@ -130,6 +140,9 @@ impl ModuleManager {
                         // TODO
                         should_run = false;
                         break;
+                    }
+                    _ = reload_signal.recv() => {
+                        // TODO: reload timeout and other config vars from shared data struct
                     }
                 }
             }
