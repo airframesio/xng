@@ -1,7 +1,8 @@
 use self::systable::SystemTable;
-use super::XngModule;
+use super::{XngModule, PROP_SESSION_TIMEOUT_SEC};
 use actix_web::{web, Resource};
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
+use serde_json::json;
 use std::{io, path::PathBuf};
 
 mod frame;
@@ -16,12 +17,21 @@ const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 600;
 
 const HFDL_COMMAND: &'static str = "hfdl";
 
+const PROP_STALE_TIMEOUT_SEC: &'static str = "stale_timeout_sec";
+const PROP_USE_AIRFRAMES_GS: &'static str = "use_airframes_gs";
+
 #[derive(Default)]
 pub struct HfdlModule {
     name: &'static str,
 
     bin: PathBuf,
     systable: SystemTable,
+
+    bandwidth: u64,
+
+    stale_timeout_secs: u64,
+
+    use_airframes_gs: bool,
 }
 
 impl XngModule for HfdlModule {
@@ -68,21 +78,31 @@ impl XngModule for HfdlModule {
 
         // TODO: parse for --soapy in hfdl-args so we can extract driver=
 
-        let stale_timeout_secs = args
-            .get_one("stale-timeout")
-            .unwrap_or(&"default")
-            .parse::<u64>()
-            .unwrap_or(DEFAULT_STALE_TIMEOUT_SECS);
-
         // TODO: replace 1000 with a default value obtained via rust-soapy
-        let bandwidth = args
+        self.bandwidth = args
             .get_one("bandwidth")
             .unwrap_or(&"default")
             .parse::<u64>()
             .unwrap_or(1000);
 
+        self.stale_timeout_secs = args
+            .get_one("stale-timeout")
+            .unwrap_or(&"default")
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_STALE_TIMEOUT_SECS);
+
         let use_airframes_gs_map = args.get_flag("use-airframes-gs-map");
 
         Ok(())
+    }
+
+    fn load_module_settings(&self, settings: &mut super::ModuleSettings) {
+        settings
+            .props
+            .insert(PROP_STALE_TIMEOUT_SEC, json!(self.stale_timeout_secs));
+
+        settings
+            .props
+            .insert(PROP_USE_AIRFRAMES_GS, json!(self.use_airframes_gs));
     }
 }

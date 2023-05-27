@@ -1,10 +1,14 @@
-use actix_web::{HttpServer, App, web, Resource};
+use actix_web::web::Data;
+use actix_web::{HttpServer, App, middleware};
 use clap::{ArgMatches, Command, arg};
 use log::*;
 use reqwest::Url;
+use serde::Serialize;
+use serde_json::{Value, json};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::select;
-use tokio::sync::mpsc;
+use tokio::sync::RwLock;
+use tokio::sync::mpsc::{self, UnboundedSender};
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
@@ -15,11 +19,15 @@ use std::time::Duration;
 use crate::common;
 
 mod hfdl;
+mod services;
 
 const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
 
 const DEFAULT_LISTEN_HOST: &'static str = "127.0.0.1";
-const DEFAULT_LIST_PORT: u16 = 7871;
+const DEFAULT_LISTEN_PORT: u16 = 7871;
+
+const PROP_SESSION_TIMEOUT_SEC: &'static str = "session_timeout_sec";
+const PROP_SESSION_INTERMISSION_SEC: &'static str = "session_intermission_sec";
 
 pub trait XngModule {
     fn id(&self) -> &'static str;
@@ -28,6 +36,43 @@ pub trait XngModule {
     
     fn get_arguments(&self) -> Command;
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error>;
+
+    fn load_module_settings(&self, settings: &mut ModuleSettings);
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModuleSettings {
+    props: HashMap<&'static str, Value>,
+
+    #[serde(skip_serializing)]
+    disable_api_control: bool, 
+    
+    #[serde(skip_serializing)]
+    api_token: Option<String>,
+    
+    #[serde(skip_serializing)]    
+    reload_signaler: UnboundedSender<()>,
+
+    #[serde(skip_serializing)]
+    end_session_signaler: UnboundedSender<()>,
+}
+
+impl ModuleSettings {
+    pub fn new(
+        reload_signaler: UnboundedSender<()>, 
+        end_session_signaler: UnboundedSender<()>,
+        disable_api_control: bool,
+        api_token: Option<&String>,
+        settings: Vec<(&'static str, Value)>
+    ) -> ModuleSettings {
+        ModuleSettings { 
+            props: settings.into_iter().collect(),
+            disable_api_control,
+            api_token: api_token.map(|v| v.clone()), 
+            reload_signaler, 
+            end_session_signaler 
+        }
+    } 
 }
 
 pub struct ModuleManager {
@@ -75,7 +120,7 @@ impl ModuleManager {
         let api_token: Option<&String> = args.get_one("api-token");
         let disable_cross_site = args.get_flag("disable-cross-site");
         let listen_host = *args.get_one("listen-host").unwrap_or(&DEFAULT_LISTEN_HOST);
-        let listen_port = args.get_one("listen-port").unwrap_or(&"default").parse::<u16>().unwrap_or(DEFAULT_LIST_PORT);
+        let listen_port = args.get_one("listen-port").unwrap_or(&"default").parse::<u16>().unwrap_or(DEFAULT_LISTEN_PORT);
         let disable_api_control = args.get_flag("disable-api-control");
         
         let feed_airframes = args.get_flag("feed-airframes");
@@ -85,10 +130,11 @@ impl ModuleManager {
         let elastic_url: Option<&Url> = args.get_one("elastic");
         
         let station_name: Option<&String> = args.get_one("station-name");
-        let session_intermission_secs = args.get_one("session-intermission")
+        
+        let mut session_intermission_secs = args.get_one("session-intermission")
             .unwrap_or(&"default").parse::<u64>()
             .unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS);
-        let session_timeout_secs = args
+        let mut session_timeout_secs = args
             .get_one("session-timeout")
             .unwrap_or(&"default")
             .parse::<u64>()
@@ -106,17 +152,46 @@ impl ModuleManager {
             return;    
         }
 
+        let mut module_settings = ModuleSettings::new(
+            reload_signaler,
+            end_session_signaler,
+            disable_api_control,
+            api_token,
+            vec![
+                (PROP_SESSION_TIMEOUT_SEC, json!(session_timeout_secs)),
+                (PROP_SESSION_INTERMISSION_SEC, json!(session_intermission_secs))
+            ]    
+        );
+        module.load_module_settings(&mut module_settings);
+
+        let module_settings = Data::new(RwLock::new(module_settings));
+        
         let cancel_token = CancellationToken::new();
         let http_cancel_token = cancel_token.clone();
-
+        let http_module_settings = module_settings.clone();
+        
         let http_thread = tokio::spawn(async move {
             let server = HttpServer::new(move || {
                 App::new()
+                    .app_data(http_module_settings.clone())
+                    .wrap(middleware::DefaultHeaders::new().add(
+                        (
+                            "Access-Control-Allow-Origin", 
+                            if disable_cross_site {
+                                format!("http://{}:{}", listen_host, listen_port)
+                            } else {
+                                "*".to_string()
+                            }
+                        )
+                    ))
+                    .configure(services::config)
             })
-            .bind((listen_host, listen_port))
-            .unwrap()
-            .run();
+                .bind((listen_host, listen_port))
+                .unwrap()
+                .run();
 
+            info!("HTTP thread started and listening on http://{}:{}", listen_host, listen_port);
+            
             select! {
                 _ = server => {},
                 _ = http_cancel_token.cancelled() => {
@@ -142,7 +217,19 @@ impl ModuleManager {
                         break;
                     }
                     _ = reload_signal.recv() => {
-                        // TODO: reload timeout and other config vars from shared data struct
+                        let settings = module_settings.read().await;
+                        
+                        match settings.props.get(PROP_SESSION_TIMEOUT_SEC) {
+                            Some(v) => session_timeout_secs = v.as_u64().unwrap_or(module.default_session_timeout_secs()),
+                            None => warn!("Failed to find session_timeout_secs key in module settings")
+                        }
+
+                        match settings.props.get(PROP_SESSION_INTERMISSION_SEC) {
+                            Some(v) => session_intermission_secs = v.as_u64().unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS),
+                            None => warn!("Failed to find session_intermission_secs key in module settings")
+                        }
+
+                        info!("Module session timeout and intermission props reloaded");
                     }
                 }
             }
