@@ -3,13 +3,12 @@ use actix_web::{HttpServer, App, middleware};
 use clap::{ArgMatches, Command, arg};
 use log::*;
 use reqwest::Url;
-use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::select;
 use tokio::sync::RwLock;
-use tokio::sync::mpsc::{self, UnboundedSender};
-use tokio::time::sleep;
+use tokio::sync::mpsc;
+use tokio::time::{self, sleep, Instant};
 use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
 use std::io;
@@ -17,11 +16,19 @@ use std::process::exit;
 use std::time::Duration;
 
 use crate::common;
+use crate::common::frame::CommonFrame;
+use crate::modules::session::EndSessionReason;
+
+use self::session::Session;
+use self::settings::ModuleSettings;
 
 mod hfdl;
 mod services;
+mod session;
+mod settings;
 
 const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
+const DEFAULT_READ_TIMEOUT_MS: u64 = 1000;
 
 const DEFAULT_LISTEN_HOST: &'static str = "127.0.0.1";
 const DEFAULT_LISTEN_PORT: u16 = 7871;
@@ -38,41 +45,9 @@ pub trait XngModule {
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error>;
 
     fn load_module_settings(&self, settings: &mut ModuleSettings);
-}
 
-#[derive(Debug, Serialize)]
-pub struct ModuleSettings {
-    props: HashMap<String, Value>,
-
-    #[serde(skip_serializing)]
-    disable_api_control: bool, 
-    
-    #[serde(skip_serializing)]
-    api_token: Option<String>,
-    
-    #[serde(skip_serializing)]    
-    reload_signaler: UnboundedSender<()>,
-
-    #[serde(skip_serializing)]
-    end_session_signaler: UnboundedSender<()>,
-}
-
-impl ModuleSettings {
-    pub fn new(
-        reload_signaler: UnboundedSender<()>, 
-        end_session_signaler: UnboundedSender<()>,
-        disable_api_control: bool,
-        api_token: Option<&String>,
-        settings: Vec<(&'static str, Value)>
-    ) -> ModuleSettings {
-        ModuleSettings { 
-            props: settings.into_iter().map(|(x, y)| (x.to_string(), y)).collect(),
-            disable_api_control,
-            api_token: api_token.map(|v| v.clone()), 
-            reload_signaler, 
-            end_session_signaler 
-        }
-    } 
+    fn process_message(&self, msg: &str) -> Result<CommonFrame, io::Error>;
+    fn start_session(&self) -> Result<Box<dyn Session>, io::Error>;
 }
 
 pub struct ModuleManager {
@@ -204,16 +179,71 @@ impl ModuleManager {
         let mut should_run = true;
 
         while should_run {
+            let Ok(mut session) = module.start_session() else {
+                error!("");
+                break;  
+            };
+
+            let mut since_last_msg: Option<Instant> = None;
+            let mut reason = EndSessionReason::None;
+            
             loop {
+                let mut raw_msg = String::new();
+                
                 select! {
+                    Ok(result) = time::timeout(
+                        Duration::from_millis(
+                            if since_last_msg.is_none() {
+                                session_timeout_secs * 1000
+                            } else {
+                                DEFAULT_READ_TIMEOUT_MS    
+                            }
+                        ), 
+                        session.read_message(&mut raw_msg)
+                    ) => {
+                        match result {
+                            Ok(read_size) => {
+                                if read_size == 0 {
+                                    error!("Encountered bad read size of 0, ending session");
+
+                                    // TODO: debug print stderr
+                                    
+                                    reason = EndSessionReason::BadReadSize;
+                                    break    
+                                }
+                                
+                                let frame = match module.process_message(&raw_msg) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        error!("Malformed frame, could not convert to common frame format: {}", e.to_string());
+                                        continue;
+                                    }
+                                };
+
+                                // TODO: Parse ACARS content and ship to processor thread(s)?
+                        
+                                since_last_msg = Some(Instant::now());
+                            }
+                            Err(e) => {
+                                error!("Read failure: {}", e.to_string());
+                                
+                                reason = EndSessionReason::ReadError;
+                                break;
+                            }
+                        };
+                    }
                     _ = end_session_signal.recv() => {
                         debug!("Got request to end current session");
+                        reason = EndSessionReason::UserAPIControl;
                         break;
                     }
                     _ = interrupt_signal.recv() => {
                         error!("Got interrupt, exiting session cleanly...");
-                        // TODO
+                        
+                        // TODO: ??
+                        
                         should_run = false;
+                        reason = EndSessionReason::UserInterrupt;
                         break;
                     }
                     _ = reload_signal.recv() => {
@@ -230,10 +260,28 @@ impl ModuleManager {
                         }
 
                         info!("Module session timeout and intermission props reloaded");
+
+                        if since_last_msg.is_none() {
+                            continue;
+                        }
                     }
                 }
+
+                if let Some(last_msg) = since_last_msg {
+                    if session_timeout_secs > 0 && last_msg.elapsed() >= Duration::from_secs(session_timeout_secs) {
+                        debug!("Seconds since last message ({}s) exceeds timeout, ending session...", session_timeout_secs);
+                        reason = EndSessionReason::SessionTimeout;
+                        break;
+                    }
+                } else {
+                    debug!("Initial read attempt exceeded {}s, ending session...", session_timeout_secs);
+                    reason = EndSessionReason::SessionTimeout;
+                    break;
+                } 
             }
 
+            session.end(reason);
+            
             if session_intermission_secs > 0 {
                 debug!("Session ended, waiting for {} seconds before continuing", session_intermission_secs);
                 sleep(Duration::from_secs(session_intermission_secs)).await;

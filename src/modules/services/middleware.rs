@@ -9,7 +9,7 @@ use actix_web::{Error, FromRequest, HttpRequest};
 use reqwest::Method;
 use tokio::sync::RwLock;
 
-use crate::modules::{self, ModuleSettings};
+use crate::modules::ModuleSettings;
 
 pub struct Authorized;
 

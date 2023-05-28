@@ -1,12 +1,12 @@
 use self::systable::SystemTable;
-use super::{XngModule, PROP_SESSION_TIMEOUT_SEC};
-use actix_web::{web, Resource};
+use super::XngModule;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use serde_json::json;
 use std::{io, path::PathBuf};
 
 mod frame;
 mod module;
+mod session;
 mod systable;
 
 const DEFAULT_BIN_PATH: &'static str = "/usr/bin/dumphfdl";
@@ -27,11 +27,28 @@ pub struct HfdlModule {
     bin: PathBuf,
     systable: SystemTable,
 
+    args: Vec<String>,
     bandwidth: u64,
+    driver: String,
 
     stale_timeout_secs: u64,
 
     use_airframes_gs: bool,
+}
+
+fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
+    let Some(soapy_idx) = args.iter().position(|x| x.eq_ignore_ascii_case("--soapysdr")) else {
+        return None;
+    };
+    if soapy_idx + 1 >= args.len() {
+        return None;
+    }
+    args[soapy_idx + 1]
+        .split(",")
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>()
+        .into_iter()
+        .find(|x| x.to_ascii_lowercase().starts_with("driver="))
 }
 
 impl XngModule for HfdlModule {
@@ -76,9 +93,21 @@ impl XngModule for HfdlModule {
                 .unwrap_or(&DEFAULT_SYSTABLE_PATH.to_string()),
         ))?;
 
-        // TODO: parse for --soapy in hfdl-args so we can extract driver=
+        let Some(hfdl_args) = args.get_many("hfdl-args") else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing required HFDL arguments arguments"));
+        };
+        self.args = hfdl_args
+            .clone()
+            .map(|x: &String| x.to_string())
+            .collect::<Vec<String>>();
+
+        let Some(driver) = extract_soapysdr_driver(&self.args) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing --soapysdr argument with driver= specification"));              
+        };
+        self.driver = driver;
 
         // TODO: replace 1000 with a default value obtained via rust-soapy
+
         self.bandwidth = args
             .get_one("bandwidth")
             .unwrap_or(&"default")
@@ -91,7 +120,7 @@ impl XngModule for HfdlModule {
             .parse::<u64>()
             .unwrap_or(DEFAULT_STALE_TIMEOUT_SECS);
 
-        let use_airframes_gs_map = args.get_flag("use-airframes-gs-map");
+        self.use_airframes_gs = args.get_flag("use-airframes-gs-map");
 
         Ok(())
     }
@@ -106,5 +135,13 @@ impl XngModule for HfdlModule {
             PROP_USE_AIRFRAMES_GS.to_string(),
             json!(self.use_airframes_gs),
         );
+    }
+
+    fn start_session(&self) -> Result<Box<dyn super::session::Session>, io::Error> {
+        todo!();
+    }
+
+    fn process_message(&self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
+        todo!();
     }
 }
