@@ -8,6 +8,6 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         web::resource(settings::ROUTE)
             .guard(guard::Header("content-type", "application/json"))
             .route(web::get().to(settings::get))
-            .route(web::post().to(settings::post)),
+            .route(web::patch().to(settings::patch)),
     );
 }

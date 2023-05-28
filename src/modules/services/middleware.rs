@@ -28,11 +28,10 @@ impl FromRequest for Authorized {
 
         Box::pin(async move {
             let module_config = module_config.read().await;
-            if method == Method::GET || method == Method::HEAD {
-                return Ok(Authorized);
-            }
 
-            if module_config.disable_api_control {
+            if (method == Method::POST || method == Method::PATCH)
+                && module_config.disable_api_control
+            {
                 return Err(ErrorExpectationFailed("API Control is disabled"));
             }
 

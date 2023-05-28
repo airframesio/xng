@@ -42,7 +42,7 @@ pub trait XngModule {
 
 #[derive(Debug, Serialize)]
 pub struct ModuleSettings {
-    props: HashMap<&'static str, Value>,
+    props: HashMap<String, Value>,
 
     #[serde(skip_serializing)]
     disable_api_control: bool, 
@@ -66,7 +66,7 @@ impl ModuleSettings {
         settings: Vec<(&'static str, Value)>
     ) -> ModuleSettings {
         ModuleSettings { 
-            props: settings.into_iter().collect(),
+            props: settings.into_iter().map(|(x, y)| (x.to_string(), y)).collect(),
             disable_api_control,
             api_token: api_token.map(|v| v.clone()), 
             reload_signaler, 

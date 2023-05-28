@@ -97,12 +97,14 @@ impl XngModule for HfdlModule {
     }
 
     fn load_module_settings(&self, settings: &mut super::ModuleSettings) {
-        settings
-            .props
-            .insert(PROP_STALE_TIMEOUT_SEC, json!(self.stale_timeout_secs));
+        settings.props.insert(
+            PROP_STALE_TIMEOUT_SEC.to_string(),
+            json!(self.stale_timeout_secs),
+        );
 
-        settings
-            .props
-            .insert(PROP_USE_AIRFRAMES_GS, json!(self.use_airframes_gs));
+        settings.props.insert(
+            PROP_USE_AIRFRAMES_GS.to_string(),
+            json!(self.use_airframes_gs),
+        );
     }
 }
