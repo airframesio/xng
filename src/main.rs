@@ -5,6 +5,7 @@ use tokio::runtime::Runtime;
 mod common;
 mod modules;
 mod server;
+mod utils;
 
 fn main() {
     let mut manager = modules::ModuleManager::init();

@@ -8,11 +8,13 @@ pub enum EndSessionReason {
     UserAPIControl,
     ReadError,
     BadReadSize,
+    ProcessStartError,
 }
 
 #[async_trait]
 pub trait Session {
-    async fn read_message(&self, msg: &mut String) -> io::Result<usize>;
+    async fn read_message(&mut self, msg: &mut String) -> Result<usize, io::Error>;
 
-    fn end(&mut self, reason: EndSessionReason);
+    async fn get_errors(&self) -> String;
+    async fn end(&mut self, reason: EndSessionReason);
 }

@@ -76,7 +76,6 @@ impl ModuleManager {
                             arg!(--"disable-api-control" "Disable controlling of session from API server"),
                             arg!(--swarm <URL> "xng server instance to connect to (local API server will be disabled)"),
                             arg!(--"feed-airframes" "Feed JSON frames to airframes.io"),
-                            arg!(--"station-name" <NAME> "Sets up a station name for feeding to airframes.io"),
                             arg!(--"session-timeout" <SECONDS> "Elapsed time since last frame before a session is considered stale and requires switching"),
                             arg!(--"session-intermission" <SECONDS> "Time to wait between sessions"),
                             arg!(--"disable-print-frame" "Disable printing JSON frames to STDOUT"), 
@@ -104,8 +103,6 @@ impl ModuleManager {
         let swarm_url: Option<&Url> = args.get_one("swarm");
         let elastic_url: Option<&Url> = args.get_one("elastic");
         
-        let station_name: Option<&String> = args.get_one("station-name");
-        
         let mut session_intermission_secs = args.get_one("session-intermission")
             .unwrap_or(&"default").parse::<u64>()
             .unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS);
@@ -127,9 +124,16 @@ impl ModuleManager {
             return;    
         }
 
+        if swarm_url.is_some() && elastic_url.is_some() {
+            error!("Swarm mode and importing to Elasticsearch are mutually exclusive options");
+            error!("Please choose either swarm mode or importing to Elasticsearch.");
+            return;    
+        }
+
         let mut module_settings = ModuleSettings::new(
             reload_signaler,
             end_session_signaler,
+            swarm_url.is_some(),
             disable_api_control,
             api_token,
             vec![
@@ -175,17 +179,27 @@ impl ModuleManager {
                 }
             }
         });
+
+        if swarm_url.is_none() {
+            // TODO: start SQL writer thread
+            // TODO: start elasticsearch bulk import thread    
+        }
         
         let mut should_run = true;
 
         while should_run {
-            let Ok(mut session) = module.start_session() else {
-                error!("");
-                break;  
-            };
-
-            let mut since_last_msg: Option<Instant> = None;
             let mut reason = EndSessionReason::None;
+
+            let mut session = match module.start_session() {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("Failed to start session: {}", e.to_string());
+                    reason = EndSessionReason::ProcessStartError;
+                    break;
+                }    
+            };
+            
+            let mut since_last_msg: Option<Instant> = None;
             
             loop {
                 let mut raw_msg = String::new();
@@ -205,8 +219,9 @@ impl ModuleManager {
                             Ok(read_size) => {
                                 if read_size == 0 {
                                     error!("Encountered bad read size of 0, ending session");
-
-                                    // TODO: debug print stderr
+                                    debug!("Session Error Messages");
+                                    debug!("======================");
+                                    debug!("{}", session.get_errors().await);
                                     
                                     reason = EndSessionReason::BadReadSize;
                                     break    
@@ -221,7 +236,10 @@ impl ModuleManager {
                                 };
 
                                 // TODO: Parse ACARS content and ship to processor thread(s)?
-                        
+
+                                if !disable_print_frame {
+                                    println!("{}", raw_msg);
+                                }                        
                                 since_last_msg = Some(Instant::now());
                             }
                             Err(e) => {

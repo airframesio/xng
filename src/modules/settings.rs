@@ -9,6 +9,9 @@ pub struct ModuleSettings {
     pub props: HashMap<String, Value>,
 
     #[serde(skip_serializing)]
+    pub swarm_mode: bool,
+
+    #[serde(skip_serializing)]
     pub disable_api_control: bool,
 
     #[serde(skip_serializing)]
@@ -25,6 +28,7 @@ impl ModuleSettings {
     pub fn new(
         reload_signaler: UnboundedSender<()>,
         end_session_signaler: UnboundedSender<()>,
+        swarm_mode: bool,
         disable_api_control: bool,
         api_token: Option<&String>,
         settings: Vec<(&'static str, Value)>,
@@ -35,6 +39,7 @@ impl ModuleSettings {
                 .map(|(x, y)| (x.to_string(), y))
                 .collect(),
             disable_api_control,
+            swarm_mode,
             api_token: api_token.map(|v| v.clone()),
             reload_signaler,
             end_session_signaler,

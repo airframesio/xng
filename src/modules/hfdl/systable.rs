@@ -86,8 +86,10 @@ impl GroundStation {
 
 #[derive(Debug, Default)]
 pub struct SystemTable {
-    version: u8,
-    stations: Vec<GroundStation>,
+    pub path: PathBuf,
+
+    pub version: u8,
+    pub stations: Vec<GroundStation>,
 }
 
 impl SystemTable {
@@ -249,6 +251,10 @@ impl SystemTable {
             }
         }
 
-        Ok(SystemTable { version, stations })
+        Ok(SystemTable {
+            path: path.clone(),
+            version,
+            stations,
+        })
     }
 }

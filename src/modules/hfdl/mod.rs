@@ -1,8 +1,13 @@
-use self::systable::SystemTable;
+use crate::utils::airframes::{AIRFRAMESIO_DUMPHFDL_TCP_PORT, AIRFRAMESIO_HOST};
+
+use self::{session::DumpHFDLSession, systable::SystemTable};
 use super::XngModule;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use serde_json::json;
-use std::{io, path::PathBuf};
+use std::io;
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::{io::BufReader, process};
 
 mod frame;
 mod module;
@@ -34,6 +39,7 @@ pub struct HfdlModule {
     stale_timeout_secs: u64,
 
     use_airframes_gs: bool,
+    feed_airframes: bool,
 }
 
 fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
@@ -73,6 +79,8 @@ impl XngModule for HfdlModule {
     }
 
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error> {
+        self.feed_airframes = args.get_flag("feed-airframes");
+
         let bin_path = PathBuf::from(
             args.get_one::<String>("bin")
                 .unwrap_or(&DEFAULT_BIN_PATH.to_string()),
@@ -106,6 +114,15 @@ impl XngModule for HfdlModule {
         };
         self.driver = driver;
 
+        if self.feed_airframes
+            && !self
+                .args
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case("--station-id"))
+        {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing required --station-id <name> argument when feed airframes.io option is enabled"));
+        }
+
         // TODO: replace 1000 with a default value obtained via rust-soapy
 
         self.bandwidth = args
@@ -138,7 +155,62 @@ impl XngModule for HfdlModule {
     }
 
     fn start_session(&self) -> Result<Box<dyn super::session::Session>, io::Error> {
-        todo!();
+        let mut extra_args = self.args.clone();
+        let output_arg = format!(
+            "decoded:json:tcp:address={},port={}",
+            AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT
+        );
+
+        if let Some(idx) = extra_args
+            .iter()
+            .position(|x| x.eq_ignore_ascii_case(&output_arg))
+        {
+            if idx == 0 || !extra_args[idx - 1].eq_ignore_ascii_case("--output") {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "Invalid addition arguments found at index {}: {:?}",
+                        idx, extra_args
+                    ),
+                ));
+            }
+        } else {
+            extra_args.extend_from_slice(&[String::from("--output"), output_arg]);
+        }
+
+        let mut proc = match process::Command::new(self.bin.clone())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .arg("--system-table")
+            .arg(self.systable.path.to_path_buf())
+            .arg("--sample-rate")
+            .arg(format!("{}", self.bandwidth))
+            .arg("--output")
+            .arg("decoded:json:file:path=-")
+            .args(extra_args)
+            .spawn()
+        {
+            Ok(v) => v,
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to spawn process: {}", e.to_string()),
+                ));
+            }
+        };
+
+        let Some(stdout) = proc.stdout.take() else {
+            return Err(io::Error::new(io::ErrorKind::Other, "Unable to take stdout from child process"));
+        };
+        let Some(stderr) = proc.stderr.take() else {
+            return Err(io::Error::new(io::ErrorKind::Other, "Unable to take stderr from child process"));
+        };
+
+        Ok(Box::new(DumpHFDLSession::new(
+            proc,
+            BufReader::new(stdout),
+            stderr,
+        )))
     }
 
     fn process_message(&self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
