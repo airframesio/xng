@@ -53,11 +53,21 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
         );
     };
 
-    if !value.is_u64() || !data.value.is_u64() {
+    let types_match = match (&value, &data.value) {
+        (Value::Bool(_), Value::Bool(_))
+        | (Value::Number(_), Value::Number(_))
+        | (Value::String(_), Value::String(_)) => true,
+        _ => false,
+    };
+
+    if !types_match {
         return HttpResponse::BadRequest().body(
             serde_json::to_string(&PatchResponse {
                 ok: false,
-                message: Some(format!("Prop {} is not a number", data.prop)),
+                message: Some(format!(
+                    "Provided value for prop {} does not match types.",
+                    data.prop
+                )),
             })
             .unwrap(),
         );
@@ -68,7 +78,7 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
     if let Err(e) = module_settings.reload_signaler.send(()) {
         error!("Failed to signal reload: {}", e.to_string());
     }
-    
+
     HttpResponse::Ok().body(
         serde_json::to_string(&PatchResponse {
             ok: true,

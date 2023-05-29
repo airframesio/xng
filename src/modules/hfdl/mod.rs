@@ -3,6 +3,7 @@ use crate::utils::airframes::{AIRFRAMESIO_DUMPHFDL_TCP_PORT, AIRFRAMESIO_HOST};
 use self::{session::DumpHFDLSession, systable::SystemTable};
 use super::XngModule;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
+use log::*;
 use serde_json::json;
 use std::io;
 use std::path::PathBuf;
@@ -206,6 +207,8 @@ impl XngModule for HfdlModule {
             return Err(io::Error::new(io::ErrorKind::Other, "Unable to take stderr from child process"));
         };
 
+        debug!("New HFDL session started");
+
         Ok(Box::new(DumpHFDLSession::new(
             proc,
             BufReader::new(stdout),
@@ -214,6 +217,7 @@ impl XngModule for HfdlModule {
     }
 
     fn process_message(&self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
+        // serde_json::from_str(msg)
         todo!();
     }
 }

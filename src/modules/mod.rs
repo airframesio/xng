@@ -9,9 +9,9 @@ use tokio::select;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::time::{self, sleep, Instant};
+use tokio::io;
 use tokio_util::sync::CancellationToken;
 use std::collections::HashMap;
-use std::io;
 use std::process::exit;
 use std::time::Duration;
 
@@ -97,7 +97,6 @@ impl ModuleManager {
         let listen_port = args.get_one("listen-port").unwrap_or(&"default").parse::<u16>().unwrap_or(DEFAULT_LISTEN_PORT);
         let disable_api_control = args.get_flag("disable-api-control");
         
-        let feed_airframes = args.get_flag("feed-airframes");
         let disable_print_frame = args.get_flag("disable-print-frame");
         
         let swarm_url: Option<&Url> = args.get_one("swarm");
@@ -107,11 +106,11 @@ impl ModuleManager {
             .unwrap_or(&"default").parse::<u64>()
             .unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS);
         let mut session_timeout_secs = args
-            .get_one("session-timeout")
-            .unwrap_or(&"default")
+            .get_one::<String>("session-timeout")
+            .unwrap_or(&String::from("default"))
             .parse::<u64>()
             .unwrap_or(module.default_session_timeout_secs());
-
+        
         let (reload_signaler, mut reload_signal) = mpsc::unbounded_channel::<()>();
         let (end_session_signaler, mut end_session_signal) = mpsc::unbounded_channel::<()>();
         let Ok(mut interrupt_signal) = signal(SignalKind::interrupt()) else {
@@ -207,8 +206,8 @@ impl ModuleManager {
                 select! {
                     Ok(result) = time::timeout(
                         Duration::from_millis(
-                            if since_last_msg.is_none() {
-                                session_timeout_secs * 1000
+                            if session_timeout_secs > 0 && since_last_msg.is_none() {
+                                session_timeout_secs
                             } else {
                                 DEFAULT_READ_TIMEOUT_MS    
                             }
@@ -222,10 +221,15 @@ impl ModuleManager {
                                     debug!("Session Error Messages");
                                     debug!("======================");
                                     debug!("{}", session.get_errors().await);
+                                    debug!("======================");
                                     
                                     reason = EndSessionReason::BadReadSize;
                                     break    
                                 }
+
+                                if !disable_print_frame {
+                                    println!("{}", raw_msg);
+                                }                        
                                 
                                 let frame = match module.process_message(&raw_msg) {
                                     Ok(v) => v,
@@ -237,9 +241,6 @@ impl ModuleManager {
 
                                 // TODO: Parse ACARS content and ship to processor thread(s)?
 
-                                if !disable_print_frame {
-                                    println!("{}", raw_msg);
-                                }                        
                                 since_last_msg = Some(Instant::now());
                             }
                             Err(e) => {
@@ -256,7 +257,7 @@ impl ModuleManager {
                         break;
                     }
                     _ = interrupt_signal.recv() => {
-                        error!("Got interrupt, exiting session cleanly...");
+                        warn!("Got interrupt, exiting session cleanly...");
                         
                         // TODO: ??
                         
@@ -298,9 +299,9 @@ impl ModuleManager {
                 } 
             }
 
-            session.end(reason);
+            session.end(reason).await;
             
-            if session_intermission_secs > 0 {
+            if should_run && session_intermission_secs > 0 {
                 debug!("Session ended, waiting for {} seconds before continuing", session_intermission_secs);
                 sleep(Duration::from_secs(session_intermission_secs)).await;
             }

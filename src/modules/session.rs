@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use tokio::io;
 
+#[derive(Debug)]
 pub enum EndSessionReason {
     None,
     SessionTimeout,
