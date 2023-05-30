@@ -8,7 +8,7 @@ pub enum EndSessionReason {
     UserInterrupt,
     UserAPIControl,
     ReadError,
-    BadReadSize,
+    ReadEOF,
     ProcessStartError,
 }
 

@@ -33,6 +33,8 @@ pub struct PatchRequest {
 #[derive(Serialize)]
 pub struct PatchResponse {
     ok: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<String>,
 }
 

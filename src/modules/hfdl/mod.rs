@@ -1,14 +1,16 @@
 use crate::utils::airframes::{AIRFRAMESIO_DUMPHFDL_TCP_PORT, AIRFRAMESIO_HOST};
 
 use self::{session::DumpHFDLSession, systable::SystemTable};
-use super::XngModule;
+use super::{settings::ModuleSettings, XngModule};
+use actix_web::web::Data;
+use async_trait::async_trait;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use log::*;
 use serde_json::json;
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::{io::BufReader, process};
+use tokio::{io::BufReader, process, sync::RwLock};
 
 mod frame;
 mod module;
@@ -58,6 +60,7 @@ fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
         .find(|x| x.to_ascii_lowercase().starts_with("driver="))
 }
 
+#[async_trait]
 impl XngModule for HfdlModule {
     fn id(&self) -> &'static str {
         self.name
@@ -143,7 +146,9 @@ impl XngModule for HfdlModule {
         Ok(())
     }
 
-    fn load_module_settings(&self, settings: &mut super::ModuleSettings) {
+    async fn load_module_settings(&self, settings: Data<RwLock<ModuleSettings>>) {
+        let mut settings = settings.write().await;
+
         settings.props.insert(
             PROP_STALE_TIMEOUT_SEC.to_string(),
             json!(self.stale_timeout_secs),

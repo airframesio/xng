@@ -166,8 +166,7 @@ pub async fn start(args: &ArgMatches) {
     loop {
         select! {
             Some(frame) = rx.recv() => {
-                // TODO: do some parsing of CFF?
-                // TODO: send parsed stuff to SQLite thread?
+                // TODO: extract data for SQLite
 
                 if let Some(elastic_url) = elastic_url.as_ref() {
                     let mut batch = frames_batch.lock().await;
@@ -182,6 +181,7 @@ pub async fn start(args: &ArgMatches) {
                             let mut batch = frames_batch.lock().await;
 
                             // TODO: send batch to Elasticsearch
+
                             debug!("Sending {} items in batch to {}", batch.len(), elastic_url);
 
                             batch.clear();
