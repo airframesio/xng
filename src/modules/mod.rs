@@ -18,6 +18,7 @@ use std::process::exit;
 use std::time::Duration;
 
 use crate::common;
+use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
 use crate::modules::session::EndSessionReason;
 
@@ -242,20 +243,15 @@ impl ModuleManager {
                             let es_url = es_url.clone();
 
                             if batch.len() == 0 {
-                                // TODO: modularize this shit
                                 let frames_batch = frames_batch.clone();
 
-                                batcher = Some(tokio::spawn(async move {
-                                    time::sleep(Duration::from_millis(DEFAULT_BATCH_WAIT_MS)).await;
-
-                                    let mut batch = frames_batch.lock().await;
-
-                                    // TODO: send batch to Elasticsearch
-
-                                    debug!("Sending {} items in batch to {}", batch.len(), es_url);
-
-                                    batch.clear();
-                                }));
+                                batcher = Some(
+                                    create_es_batch_task(
+                                        es_url, 
+                                        frames_batch, 
+                                        Duration::from_millis(DEFAULT_BATCH_WAIT_MS)
+                                    )
+                                );
                             }
 
                             batch.push(frame);

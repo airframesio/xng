@@ -2,7 +2,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use actix_web::dev::Payload;
-use actix_web::error::{ErrorExpectationFailed, ErrorUnauthorized};
+use actix_web::error::{
+    ErrorExpectationFailed, ErrorNetworkAuthenticationRequired, ErrorUnauthorized,
+};
 use actix_web::http::header;
 use actix_web::web::Data;
 use actix_web::{Error, FromRequest, HttpRequest};
@@ -39,7 +41,7 @@ impl FromRequest for Authorized {
                   return Ok(Authorized);
             };
             let Some(ref user_token) = headers.get(header::AUTHORIZATION) else {
-                return Err(ErrorUnauthorized("No authorization token provided"));  
+                return Err(ErrorNetworkAuthenticationRequired("Missing authorization token"));  
             };
             match user_token.to_str() {
                 Ok(token) => {

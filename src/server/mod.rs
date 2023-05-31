@@ -13,6 +13,7 @@ use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::common;
+use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
 
 pub const SERVER_COMMAND: &'static str = "server";
@@ -168,24 +169,20 @@ pub async fn start(args: &ArgMatches) {
             Some(frame) = rx.recv() => {
                 // TODO: extract data for SQLite
 
-                if let Some(elastic_url) = elastic_url.as_ref() {
+                if let Some(es_url) = elastic_url.as_ref() {
                     let mut batch = frames_batch.lock().await;
-                    let elastic_url = elastic_url.clone();
+                    let es_url = es_url.clone();
 
                     if batch.len() == 0 {
                         let frames_batch = frames_batch.clone();
 
-                        batcher = Some(tokio::spawn(async move {
-                            time::sleep(Duration::from_millis(DEFAULT_BATCH_WAIT_MS)).await;
-
-                            let mut batch = frames_batch.lock().await;
-
-                            // TODO: send batch to Elasticsearch
-
-                            debug!("Sending {} items in batch to {}", batch.len(), elastic_url);
-
-                            batch.clear();
-                        }));
+                        batcher = Some(
+                            create_es_batch_task(
+                                es_url,
+                                frames_batch,
+                                Duration::from_millis(DEFAULT_BATCH_WAIT_MS)
+                            )
+                        );
                     }
 
                     debug!("Pushing frame to batch...");
