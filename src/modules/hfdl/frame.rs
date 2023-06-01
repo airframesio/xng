@@ -1,10 +1,11 @@
 use serde::Deserialize;
 use serde_valid::Validate;
 
-use crate::common::{
-    formats::{validate_entity_type, Application, EntityType, Timestamp},
-    wkt::WKTPoint,
-};
+use crate::common::formats::{validate_entity_type, Application, EntityType, Timestamp};
+use crate::common::frame;
+use crate::common::wkt::WKTPoint;
+
+use super::systable::SystemTable;
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct AircraftInfo {
@@ -37,15 +38,40 @@ impl Entity {
 
         unreachable!("Validation failed: encountered {}", normalized_type)
     }
+
+    pub fn to_common_frame_entity(&self, systable: &SystemTable) -> frame::Entity {
+        frame::Entity {
+            kind: self.entity_type.to_string(),
+            icao: if let Some(ref ac_info) = self.ac_info {
+                Some(ac_info.icao.clone())
+            } else {
+                None
+            },
+            gs: match (self.kind(), &self.name) {
+                (EntityType::GroundStation, Some(name)) => Some(name.clone()),
+                _ => None,
+            },
+            id: Some(self.id),
+            callsign: None,
+            coords: match (self.kind(), systable.by_id(self.id)) {
+                (EntityType::GroundStation, Some(station)) => Some(WKTPoint {
+                    x: station.position.1,
+                    y: station.position.0,
+                    z: 0.0,
+                }),
+                _ => None,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct FrequencyInfo {
     pub id: u8,
 
-    #[validate(minimum = 2000)]
-    #[validate(maximum = 22000)]
-    pub freq: u64,
+    #[validate(minimum = 200.0)]
+    #[validate(maximum = 22000.0)]
+    pub freq: f64,
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -141,9 +167,9 @@ pub struct SystablePartial {
 pub struct PerfDataFreq {
     pub id: u32,
 
-    #[validate(minimum = 2000)]
-    #[validate(maximum = 22000)]
-    pub freq: Option<u64>,
+    #[validate(minimum = 2000.0)]
+    #[validate(maximum = 22000.0)]
+    pub freq: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -178,7 +204,7 @@ pub struct HFNPDU {
     pub version: Option<u8>,
     pub systable_partial: Option<SystablePartial>,
 
-    pub flight_leg_num: u32,
+    pub flight_leg_num: Option<u32>,
 
     #[validate]
     pub frequency: Option<PerfDataFreq>,
@@ -211,7 +237,7 @@ pub struct LPDU {
     pub ac_info: Option<AircraftInfo>,
 
     pub assigned_ac_id: Option<u8>,
-    pub reason: Reason,
+    pub reason: Option<Reason>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -259,4 +285,10 @@ impl HFDL {
     pub fn freq_as_mhz(&self) -> f64 {
         self.freq as f64 / 1000.0
     }
+}
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct Frame {
+    #[validate]
+    pub hfdl: HFDL,
 }

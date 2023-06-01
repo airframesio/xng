@@ -320,7 +320,7 @@ impl ModuleManager {
                                 }
 
                                 if !disable_print_frame {
-                                    println!("{}", raw_msg);
+                                    println!("{}", raw_msg.trim());
                                 }                        
                                 
                                 let frame = match module.process_message(&raw_msg) {

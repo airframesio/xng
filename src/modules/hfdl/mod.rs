@@ -1,7 +1,11 @@
+use crate::common::frame as cff;
 use crate::utils::airframes::{AIRFRAMESIO_DUMPHFDL_TCP_PORT, AIRFRAMESIO_HOST};
 
-use self::{session::DumpHFDLSession, systable::SystemTable};
-use super::{settings::ModuleSettings, XngModule};
+use self::frame::Frame;
+use self::session::DumpHFDLSession;
+use self::systable::SystemTable;
+use super::settings::ModuleSettings;
+use super::XngModule;
 use actix_web::web::Data;
 use async_trait::async_trait;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
@@ -222,7 +226,47 @@ impl XngModule for HfdlModule {
     }
 
     fn process_message(&self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
-        // serde_json::from_str(msg)
-        todo!();
+        let raw_frame = serde_json::from_str::<Frame>(msg)?;
+        let frame_src: cff::Entity;
+        let mut frame_dst: Option<cff::Entity> = None;
+
+        if let Some(ref spdu) = raw_frame.hfdl.spdu {
+            frame_src = spdu.src.to_common_frame_entity(&self.systable);
+
+            if spdu.systable_version > self.systable.version {
+                warn!("System Table from SPDU is newer than provided! Provided version = {}, SPDU version = {}", self.systable.version, spdu.systable_version);
+            }
+            // TODO: parse ground stations list into metadata?
+            println!("{:?}", spdu);
+        } else if let Some(ref lpdu) = raw_frame.hfdl.lpdu {
+            frame_src = lpdu.src.to_common_frame_entity(&self.systable);
+            frame_dst = Some(lpdu.dst.to_common_frame_entity(&self.systable));
+
+            // TODO: parse HFNPDU
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "HFDL frame missing LPDU/SPDU block",
+            ));
+        }
+
+        Ok(cff::CommonFrame {
+            timestamp: raw_frame.hfdl.ts.to_f64(),
+            freq: raw_frame.hfdl.freq_as_mhz(),
+            signal: raw_frame.hfdl.sig_level as f32,
+
+            err: false,
+
+            paths: None,
+
+            app: cff::AppInfo {
+                name: raw_frame.hfdl.app.name,
+                version: raw_frame.hfdl.app.version,
+            },
+
+            src: frame_src,
+            dst: frame_dst,
+            acars: None,
+        })
     }
 }
