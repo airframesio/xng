@@ -168,6 +168,7 @@ pub async fn start(args: &ArgMatches) {
         select! {
             Some(frame) = rx.recv() => {
                 // TODO: extract data for SQLite
+                info!("{:?}", frame);
 
                 if let Some(es_url) = elastic_url.as_ref() {
                     let mut batch = frames_batch.lock().await;

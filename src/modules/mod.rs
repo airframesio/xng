@@ -5,6 +5,8 @@ use clap::{ArgMatches, Command, arg};
 use log::*;
 use reqwest::Url;
 use serde_json::json;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::select;
 use tokio::sync::{RwLock, Mutex};
@@ -30,9 +32,10 @@ mod services;
 mod session;
 mod settings;
 
+const DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
 const DEFAULT_BATCH_WAIT_MS: u64 = 200;
-
+ 
 const DEFAULT_LISTEN_HOST: &'static str = "127.0.0.1";
 const DEFAULT_LISTEN_PORT: u16 = 7871;
 
@@ -229,15 +232,70 @@ impl ModuleManager {
             let frames_batch: Data<Mutex<Vec<CommonFrame>>> = Data::new(Mutex::new(Vec::new()));
             let mut batcher: Option<JoinHandle<()>> = None;
 
-            // TODO: set up TCP connection for swarm
+            let mut swarm_target: Option<String> = None;
+            let mut swarm_stream: Option<TcpStream> = None;
+            
+            if let Some(ref url) = swarm_url {
+                swarm_target = Some(format!(
+                    "{}:{}",
+                    url.host_str().unwrap_or("0.0.0.0"),
+                    url.port().unwrap_or(0)
+                ));
+            }
+
+            if let Some(ref target) = swarm_target {
+                let start = Instant::now();
+                let mut wait_secs = 1;
+                
+                while start.elapsed() < Duration::from_secs(DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS) {
+                    debug!("Attempting to connect to Swarm target at {}", target);
+                    match TcpStream::connect(target).await {
+                        Ok(stream) => {
+                            swarm_stream = Some(stream);
+                            debug!("Swarm target successfully connected");
+                            break;
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to swarm target, trying again in {} seconds: {}", wait_secs, e.to_string());
+                        }
+                    };
+
+                    time::sleep(Duration::from_secs(wait_secs)).await;
+                    wait_secs *= 2;
+                }
+            }
             
             loop {
                 select! {
                     Some(frame) = rx.recv() => {
                         // TODO: process frame by parsing ACARS content
                     
-                        // TODO: ship frame to swarm target if swarm mode
+                        if let Some(ref mut stream) = swarm_stream {
+                            let raw_json = match serde_json::to_string(&frame) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    error!("Failed to serialize CFF: {}", e.to_string());
+                                    continue;
+                                }
+                            };
 
+                            if let Err(e) = stream.write_all(format!("{}\n", raw_json).as_bytes()).await {
+                                // TODO: do we want to stall and retry or just skip frames?
+                                
+                                match e.kind() {
+                                    io::ErrorKind::BrokenPipe => {
+                                        match TcpStream::connect(swarm_target.as_ref().unwrap()).await {
+                                            Ok(v) => swarm_stream = Some(v),
+                                            Err(e) => {
+                                                warn!("Failed to connect to swarm target: {}", e.to_string());
+                                            }  
+                                        };
+                                    }
+                                    _ => warn!("Failed to proxy frame to Swarm target: {}", e.to_string())
+                                }
+                            }
+                        }
+                        
                         if let Some(ref es_url) = elastic_url {
                             let mut batch = frames_batch.lock().await;
                             let es_url = es_url.clone();
@@ -263,11 +321,17 @@ impl ModuleManager {
                     }
                 }
             }
-
+            
             if let Some(batcher) = batcher {
                 debug!("Batcher is active, waiting for completion before exiting to prevent data loss");
                 if let Err(e) = batcher.await {
                     warn!("Error occurred while waiting for batcher to finish: {}", e.to_string());
+                }
+            }
+
+            if let Some(ref mut stream) = swarm_stream {
+                if let Err(e) = stream.shutdown().await {
+                    warn!("Failed to shutdown Swarm connection: {}", e.to_string());
                 }
             }
         });
@@ -331,8 +395,7 @@ impl ModuleManager {
                                     }
                                 };
 
-                                let out = serde_json::to_string(&frame).unwrap_or(String::from(""));
-                                println!("{}", out);
+                                println!("{:?}", frame);
                                 
                                 if let Err(e) = tx.send(frame).await {
                                     error!("Failed to send common frame to processing thread: {}", e.to_string());                                    
