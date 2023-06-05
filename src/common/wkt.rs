@@ -7,11 +7,21 @@ use serde::de;
 
 struct WKTPointVisitor;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct WKTPoint {
     pub x: f64,
     pub y: f64,
     pub z: f64,
+}
+
+impl WKTPoint {
+    pub fn valid(&self) -> bool {
+        self.x > -180.0 && self.x < 180.0 && self.y > -90.0 && self.y < 90.0
+    }
+
+    pub fn as_tuple(&self) -> (f64, f64, f64) {
+        (self.x, self.y, self.z)
+    }    
 }
 
 fn parse_point_from_matches(m: Captures) -> Option<(f64, f64, f64)> {

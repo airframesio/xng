@@ -53,6 +53,7 @@ impl Entity {
             },
             id: Some(self.id),
             callsign: None,
+            tail: None,
             coords: match (self.kind(), systable.by_id(self.id)) {
                 (EntityType::GroundStation, Some(station)) => Some(WKTPoint {
                     x: station.position.1,
@@ -114,6 +115,10 @@ pub struct ACARS {
     #[validate(max_length = 2)]
     pub label: String,
 
+    pub sublabel: Option<String>,
+    pub cfi: Option<String>,
+    pub mfi: Option<String>,
+
     #[validate(min_length = 1)]
     #[validate(max_length = 1)]
     pub blk_id: String,
@@ -161,6 +166,13 @@ impl Position {
 pub struct SystablePartial {
     pub part_num: u8,
     pub parts_cnt: u8,
+}
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct FreqData {
+    pub gs: Entity,
+    pub listening_on_freqs: Vec<FrequencyInfo>,
+    pub heard_on_freqs: Vec<FrequencyInfo>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -212,6 +224,9 @@ pub struct HFNPDU {
     #[validate]
     pub time: Option<HFNPDUTime>,
 
+    #[validate]
+    pub freq_data: Option<Vec<FreqData>>,
+
     pub last_freq_change_cause: Option<Reason>,
 
     pub request_data: Option<u16>,
@@ -238,6 +253,15 @@ pub struct LPDU {
 
     pub assigned_ac_id: Option<u8>,
     pub reason: Option<Reason>,
+}
+
+impl LPDU {
+    pub fn from_ground_station(&self) -> bool {
+        match self.src.kind() {
+            EntityType::GroundStation => true,
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -283,7 +307,7 @@ pub struct HFDL {
 
 impl HFDL {
     pub fn freq_as_mhz(&self) -> f64 {
-        self.freq as f64 / 1000.0
+        self.freq as f64 / 1000000.0
     }
 }
 

@@ -1,5 +1,9 @@
-use crate::common::frame as cff;
+use crate::common::formats::EntityType;
+use crate::common::frame::{self as cff, Indexed, HFDLGSEntry};
+use crate::common::wkt::WKTPolyline;
 use crate::utils::airframes::{AIRFRAMESIO_DUMPHFDL_TCP_PORT, AIRFRAMESIO_HOST};
+use crate::utils::normalize_tail;
+use crate::utils::timestamp::{split_unix_time_to_utc_datetime, nearest_time_in_past, unix_time_to_utc_datetime};
 
 use self::frame::Frame;
 use self::session::DumpHFDLSession;
@@ -8,6 +12,8 @@ use super::settings::ModuleSettings;
 use super::XngModule;
 use actix_web::web::Data;
 use async_trait::async_trait;
+use chrono::{Utc, SecondsFormat};
+use chrono_tz::UTC;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use log::*;
 use serde_json::json;
@@ -227,22 +233,181 @@ impl XngModule for HfdlModule {
 
     fn process_message(&self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
         let raw_frame = serde_json::from_str::<Frame>(msg)?;
-        let frame_src: cff::Entity;
+        let mut frame_src: cff::Entity;
         let mut frame_dst: Option<cff::Entity> = None;
 
+        let mut acars_content: Option<cff::ACARS> = None;
+
+        let Some(arrival_time) = split_unix_time_to_utc_datetime(
+            raw_frame.hfdl.ts.sec as i64, 
+            (raw_frame.hfdl.ts.usec * 1000) as u32
+        ) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid arrival time",
+            ))
+        };
+
+        let mut paths: Vec<cff::PropagationPath> = Vec::new();
+        let mut metadata: Option<cff::HFDLMetadata> = None;
+        
+        let mut indexed = cff::Indexed {
+            timestamp: arrival_time.to_rfc3339_opts(SecondsFormat::Micros, true),
+        };
+        
         if let Some(ref spdu) = raw_frame.hfdl.spdu {
             frame_src = spdu.src.to_common_frame_entity(&self.systable);
 
             if spdu.systable_version > self.systable.version {
                 warn!("System Table from SPDU is newer than provided! Provided version = {}, SPDU version = {}", self.systable.version, spdu.systable_version);
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Provided HFDL system table is out of date"));
             }
-            // TODO: parse ground stations list into metadata?
-            println!("{:?}", spdu);
+
+            metadata = Some(cff::HFDLMetadata {
+                kind: String::from("Squitter"),
+                heard_on: spdu.gs_status.iter().map(|x| cff::HFDLGSEntry {
+                    kind: x.gs.entity_type.clone(),
+                    id: x.gs.id,
+                    gs: x.gs.name.clone().unwrap_or(String::from("")),
+                    freqs: x.freqs.iter().map(|y| y.freq as f64 / 1000.0).collect(),
+                }).collect(),
+                reason: None,  
+            });
         } else if let Some(ref lpdu) = raw_frame.hfdl.lpdu {
             frame_src = lpdu.src.to_common_frame_entity(&self.systable);
             frame_dst = Some(lpdu.dst.to_common_frame_entity(&self.systable));
+            
+            if let Some(ref hfnpdu) = lpdu.hfnpdu {
+                if let Some(ref flight_id) = hfnpdu.flight_id {
+                    frame_src.callsign = Some(flight_id.clone());
+                }
 
-            // TODO: parse HFNPDU
+                if let Some(ref pos) = hfnpdu.pos {
+                    let pt = pos.as_wkt();
+                    if pt.valid() {
+                        frame_src.coords = Some(pt.clone());
+
+                        if let Some(ref gs_pt) = frame_dst.as_ref().unwrap().coords {
+                            paths.push(cff::PropagationPath {
+                                freqs: vec![raw_frame.hfdl.freq_as_mhz()],
+                                path: WKTPolyline {
+                                    points: vec![pt.as_tuple(), gs_pt.as_tuple()],
+                                },
+                                party: frame_dst.clone().unwrap(),
+                            });
+                        }
+                    }
+                }
+
+                if let Some(ref msg_time) = hfnpdu.time {
+                    let Some(frame_time) = nearest_time_in_past(&arrival_time, msg_time.hour, msg_time.min, msg_time.sec) else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Failed to calculate frame timestamp",
+                        ))
+                    };
+                    indexed.timestamp = frame_time.to_rfc3339_opts(SecondsFormat::Micros, true);
+                }
+
+                if let Some(ref acars) = hfnpdu.acars {
+                    acars_content = Some(cff::ACARS {
+                        mode: acars.mode.clone(),
+                        more: acars.more.clone(),
+                        label: acars.label.clone(),
+                        ack: Some(acars.ack.clone()),
+                        blk_id: Some(acars.blk_id.clone()),
+                        msg_num: acars.msg_num.clone(),
+                        msg_num_seq: acars.msg_num_seq.clone(),
+                        tail: Some(acars.reg.clone()),
+                        flight: acars.flight.clone(),
+                        sublabel: acars.sublabel.clone(),
+                        mfi: acars.mfi.clone(),
+                        cfi: acars.cfi.clone(),
+                        text: Some(acars.msg_text.clone()),
+                    });
+
+                    if lpdu.from_ground_station() {
+                        match frame_dst {
+                            Some(ref mut entity) => {
+                                entity.tail = Some(normalize_tail(acars.reg.clone()))
+                            }
+                            _ => {},
+                        }
+                    } else {
+                        frame_src.tail = Some(normalize_tail(acars.reg.clone()));
+                    }
+                }
+
+                let mut reason: Option<String> = None;
+                if let Some(ref last_change) = hfnpdu.last_freq_change_cause {
+                    reason = Some(last_change.descr.clone());
+                }
+
+                let mut heard_on: Vec<HFDLGSEntry> = vec![];
+                if let Some(ref freq_data) = hfnpdu.freq_data {
+                    heard_on = freq_data.iter().map(|x| cff::HFDLGSEntry {
+                        kind: x.gs.entity_type.clone(),
+                        id: x.gs.id,
+                        gs: x.gs.name.clone().unwrap_or(String::from("")),
+                        freqs: x.heard_on_freqs.iter().map(|y| y.freq as f64 / 1000.0).collect(),
+                    }).collect();
+
+                    if frame_src.coords.is_some() && matches!(lpdu.dst.kind(), EntityType::GroundStation) {
+                        let pt = frame_src.coords.as_ref().unwrap();
+                        let dst = frame_dst.as_ref().unwrap();
+                        for entry in heard_on.iter() {
+                            if dst.id.is_some() && dst.id.unwrap() != entry.id && !entry.freqs.is_empty() {
+                                let Some(gs) = self.systable.by_id(entry.id) else {
+                                    continue
+                                };
+                                paths.push(cff::PropagationPath {
+                                    freqs: entry.freqs.clone(),
+                                    path: WKTPolyline { points: vec![pt.as_tuple(), (gs.position.1, gs.position.0, 0.0)] },
+                                    party: cff::Entity {
+                                        kind: String::from("Ground station"),
+                                        id: Some(gs.id),
+                                        gs: Some(gs.name.clone()),
+                                        icao: None,
+                                        callsign: None,
+                                        tail: None,
+                                        coords: Some(crate::common::wkt::WKTPoint { x: gs.position.1, y: gs.position.0, z: 0.0 }), 
+                                    }, 
+                                });
+                            }
+                        }
+                    }
+                }
+                
+                metadata = Some(cff::HFDLMetadata {
+                    kind: hfnpdu.kind.name.clone(),
+                    heard_on,
+                    reason, 
+                });
+            } else {
+                if let Some(ref ac_info) = lpdu.ac_info {
+                    if lpdu.from_ground_station() {
+                        match frame_dst {
+                            Some(ref mut entity) => entity.icao = Some(ac_info.icao.clone()),
+                            _ => {},
+                        }
+                    }                        
+                }
+
+                if let Some(ref ac_id) = lpdu.assigned_ac_id {
+                    if lpdu.from_ground_station() {
+                        match frame_dst {
+                            Some(ref mut entity) => entity.id = Some(*ac_id),
+                            _ => {},
+                        }
+                    }
+                }
+
+                let mut reason: Option<String> = None;
+                if let Some(ref r) = lpdu.reason {
+                    reason = Some(r.descr.clone());
+                }
+                metadata = Some(cff::HFDLMetadata { kind: lpdu.kind.name.clone(), heard_on: vec![], reason});
+            }
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -251,22 +416,29 @@ impl XngModule for HfdlModule {
         }
 
         Ok(cff::CommonFrame {
-            timestamp: raw_frame.hfdl.ts.to_f64(),
+            timestamp: unix_time_to_utc_datetime(
+                raw_frame.hfdl.ts.to_f64()
+            ).unwrap_or(Utc::now().with_timezone(&UTC)).to_rfc3339_opts(SecondsFormat::Micros, true),
             freq: raw_frame.hfdl.freq_as_mhz(),
             signal: raw_frame.hfdl.sig_level as f32,
 
             err: false,
 
-            paths: None,
+            paths,
 
             app: cff::AppInfo {
                 name: raw_frame.hfdl.app.name,
                 version: raw_frame.hfdl.app.version,
             },
 
+            indexed,
+            metadata: cff::Metadata {
+                hfdl: metadata,  
+            },
+            
             src: frame_src,
             dst: frame_dst,
-            acars: None,
+            acars: acars_content,
         })
     }
 }
