@@ -6,8 +6,11 @@ use crate::utils::normalize_tail;
 use crate::utils::timestamp::{split_unix_time_to_utc_datetime, nearest_time_in_past, unix_time_to_utc_datetime};
 
 use self::frame::Frame;
+use self::method::valid_session_method;
+use self::schedule::{valid_schedule, valid_session_schedule};
 use self::session::DumpHFDLSession;
 use self::systable::SystemTable;
+use self::validators::validate_listening_bands;
 use super::settings::ModuleSettings;
 use super::XngModule;
 use actix_web::web::Data;
@@ -23,9 +26,12 @@ use std::process::Stdio;
 use tokio::{io::BufReader, process, sync::RwLock};
 
 mod frame;
+mod method;
 mod module;
+mod schedule;
 mod session;
 mod systable;
+mod validators;
 
 const DEFAULT_BIN_PATH: &'static str = "/usr/bin/dumphfdl";
 const DEFAULT_SYSTABLE_PATH: &'static str = "/etc/systable.conf";
@@ -37,22 +43,33 @@ const HFDL_COMMAND: &'static str = "hfdl";
 
 const PROP_STALE_TIMEOUT_SEC: &'static str = "stale_timeout_sec";
 const PROP_USE_AIRFRAMES_GS: &'static str = "use_airframes_gs";
+const PROP_SAMPLE_RATE: &'static str = "sample_rate";
+const PROP_LISTENING_BAND: &'static str = "listening_band";
+const PROP_NEXT_SESSION_BAND: &'static str = "next_session_band";
+const PROP_SESSION_SCHEDULE: &'static str = "session_schedule";
+const PROP_SESSION_METHOD: &'static str = "session_method";
 
 #[derive(Default)]
 pub struct HfdlModule {
     name: &'static str,
+    settings: Option<Data<RwLock<ModuleSettings>>>,
 
+    // TODO: have a field to store all valid sample rates for the driver
+    
     bin: PathBuf,
     systable: SystemTable,
 
     args: Vec<String>,
-    bandwidth: u64,
     driver: String,
 
-    stale_timeout_secs: u64,
-
-    use_airframes_gs: bool,
     feed_airframes: bool,
+    
+    sample_rate: u64,
+    stale_timeout_secs: u64,
+    use_airframes_gs: bool,
+    next_session_band: u64,
+    schedule: String,
+    method: String,
 }
 
 fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
@@ -88,6 +105,9 @@ impl XngModule for HfdlModule {
                 arg!(--"stale-timeout" <SECONDS> "Elapsed time since last update before an aircraft and ground station frequency data is considered stale"),
                 arg!(--bandwidth <HERTZ> "Initial bandwidth to use for splitting HFDL spectrum into bands of coverage"),
                 arg!(--"use-airframes-gs-map" "Use airframes.io's live HFDL ground station frequency map"),
+                arg!(--"start-band-contains" <HERTZ> "Initial starting band to listen on. Overrides --schedule if both are configured"),
+                arg!(--schedule <SCHEDULE_FMT> "Session switch schedule in the format of: hour=<HOUR_0_TO_23>,band_contains=<FREQ_HZ>;..."),
+                arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: active-only, random, inc, dec, static")
             ])
             .arg(Arg::new("hfdl-args").action(ArgAction::Append))
     }
@@ -114,7 +134,7 @@ impl XngModule for HfdlModule {
             args.get_one::<String>("systable")
                 .unwrap_or(&DEFAULT_SYSTABLE_PATH.to_string()),
         ))?;
-
+        
         let Some(hfdl_args) = args.get_many("hfdl-args") else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing required HFDL arguments arguments"));
         };
@@ -137,9 +157,9 @@ impl XngModule for HfdlModule {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing required --station-id <name> argument when feed airframes.io option is enabled"));
         }
 
-        // TODO: replace 1000 with a default value obtained via rust-soapy
-
-        self.bandwidth = args
+        // TODO: Populate sample rates from rust-soapy into a field
+        
+        self.sample_rate = args
             .get_one("bandwidth")
             .unwrap_or(&"default")
             .parse::<u64>()
@@ -153,24 +173,61 @@ impl XngModule for HfdlModule {
 
         self.use_airframes_gs = args.get_flag("use-airframes-gs-map");
 
+        let Some(default_band) = self.systable.first_freq_above(13000) else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Systable might be corrupt, unable to find first frequency above 13000"));
+        };
+        let next_band = args.get_one::<String>("start-band-contains").unwrap_or(&String::from("default")).parse::<u16>();
+
+        // TODO: parse schedule and determine if we need to populate initial next_band
+        
+        // TODO: parse method
+
         Ok(())
     }
 
-    async fn load_module_settings(&self, settings: Data<RwLock<ModuleSettings>>) {
+    async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>) {
+        self.settings = Some(settings.clone());
+        
         let mut settings = settings.write().await;
 
         settings.props.insert(
             PROP_STALE_TIMEOUT_SEC.to_string(),
             json!(self.stale_timeout_secs),
         );
-
         settings.props.insert(
             PROP_USE_AIRFRAMES_GS.to_string(),
             json!(self.use_airframes_gs),
         );
+        settings.props.insert(
+            PROP_SAMPLE_RATE.to_string(),
+            json!(self.sample_rate),
+        );
+
+        settings.add_prop_with_validator(
+            PROP_LISTENING_BAND.to_string(), 
+            json!(Vec::new() as Vec<u64>), 
+            validate_listening_bands
+        );
+        settings.add_prop_with_validator(
+            PROP_NEXT_SESSION_BAND.to_string(), 
+            json!(self.next_session_band), 
+            valid_session_method
+        );
+        settings.add_prop_with_validator(
+            PROP_SESSION_SCHEDULE.to_string(), 
+            json!(self.schedule), 
+            valid_session_schedule
+        );
+        settings.add_prop_with_validator(
+            PROP_SESSION_METHOD.to_string(),
+            json!(self.method),
+            valid_session_method
+        );
     }
 
-    fn start_session(&self) -> Result<Box<dyn super::session::Session>, io::Error> {
+    async fn start_session(&mut self) -> Result<Box<dyn super::session::Session>, io::Error> {
+        let settings = self.get_settings()?;
+        
         let mut extra_args = self.args.clone();
         let output_arg = format!(
             "decoded:json:tcp:address={},port={}",
@@ -194,27 +251,87 @@ impl XngModule for HfdlModule {
             extra_args.extend_from_slice(&[String::from("--output"), output_arg]);
         }
 
-        let mut proc = match process::Command::new(self.bin.clone())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .arg("--system-table")
-            .arg(self.systable.path.to_path_buf())
-            .arg("--sample-rate")
-            .arg(format!("{}", self.bandwidth))
-            .arg("--output")
-            .arg("decoded:json:file:path=-")
-            .args(extra_args)
-            .spawn()
+        let mut proc;
         {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to spawn process: {}", e.to_string()),
-                ));
-            }
-        };
+            let mut settings = settings.write().await;
 
+            let sample_rate;
+            {
+                let Some(suggested_sample_rate) = settings.props.get(&PROP_SAMPLE_RATE.to_string()) else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_SAMPLE_RATE prop"));    
+                };
+                match self.nearest_sample_rate(suggested_sample_rate.as_u64().unwrap_or(0)) {
+                    Some(rate) => sample_rate = rate,
+                    None => {
+                        return Err(
+                            io::Error::new(io::ErrorKind::InvalidData, 
+                            format!("Failed to find nearest sample rate to {:?}", suggested_sample_rate))
+                        );
+                    }
+                };
+
+            }
+            
+            let bands: Vec<u64> = Vec::new();
+
+            let next_session_band;
+            {
+                let Some(value) = settings.props.get(&PROP_NEXT_SESSION_BAND.to_string()) else {
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_NEXT_SESSION_BAND prop")
+                    );    
+                };
+                next_session_band = value.as_u64().unwrap_or(0);
+            } 
+
+            if next_session_band > 0 {
+                // TODO: find containing band and use that
+            } else {
+                // TODO: get method+sample rate and use that to determine next freq band
+            }
+
+            // TODO: add extra args for feeding airframes if option is selected
+            proc = match process::Command::new(self.bin.clone())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .arg("--system-table")
+                .arg(self.systable.path.to_path_buf())
+                .arg("--sample-rate")
+                .arg(format!("{}", sample_rate))
+                .arg("--output")
+                .arg("decoded:json:file:path=-")
+                .args(extra_args)
+                .args(bands.iter().map(|x| x.to_string()).collect::<Vec<String>>())
+                .spawn()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to spawn process: {}", e.to_string()),
+                    ));
+                }
+            };
+
+            {
+                let Some(value) = settings.props.get_mut(&PROP_LISTENING_BAND.to_string()) else {
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_LISTENING_BAND prop")
+                    );    
+                };
+                *value = json!(bands);
+            }
+
+            {
+                let Some(value) = settings.props.get_mut(&PROP_NEXT_SESSION_BAND.to_string()) else {
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_NEXT_SESSION_BAND prop")
+                    );    
+                };
+                *value = json!(0);
+            }
+        }
+        
         let Some(stdout) = proc.stdout.take() else {
             return Err(io::Error::new(io::ErrorKind::Other, "Unable to take stdout from child process"));
         };
@@ -231,7 +348,7 @@ impl XngModule for HfdlModule {
         )))
     }
 
-    fn process_message(&self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
+    fn process_message(&mut self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
         let raw_frame = serde_json::from_str::<Frame>(msg)?;
         let mut frame_src: cff::Entity;
         let mut frame_dst: Option<cff::Entity> = None;

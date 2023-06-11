@@ -34,6 +34,7 @@ mod settings;
 
 const DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
+const DEFAULT_FAILED_SESSION_START_WAIT_SECS: u64 = 60;
 const DEFAULT_BATCH_WAIT_MS: u64 = 200;
  
 const DEFAULT_LISTEN_HOST: &'static str = "127.0.0.1";
@@ -53,10 +54,10 @@ pub trait XngModule {
     fn get_arguments(&self) -> Command;
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error>;
 
-    async fn load_module_settings(&self, settings: Data<RwLock<ModuleSettings>>);
+    async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>);
 
-    fn process_message(&self, msg: &str) -> Result<CommonFrame, io::Error>;
-    fn start_session(&self) -> Result<Box<dyn Session>, io::Error>;
+    fn process_message(&mut self, msg: &str) -> Result<CommonFrame, io::Error>;
+    async fn start_session(&mut self) -> Result<Box<dyn Session>, io::Error>;
 }
 
 pub struct ModuleManager {
@@ -185,7 +186,7 @@ impl ModuleManager {
                 )
             )
         );
-        module.load_module_settings(module_settings.clone()).await;
+        module.init(module_settings.clone()).await;
         
         let cancel_token = CancellationToken::new();
         let http_cancel_token = cancel_token.clone();
@@ -249,27 +250,47 @@ impl ModuleManager {
                 
                 while start.elapsed() < Duration::from_secs(DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS) {
                     debug!("Attempting to connect to Swarm target at {}", target);
-                    match TcpStream::connect(target).await {
-                        Ok(stream) => {
-                            swarm_stream = Some(stream);
-                            debug!("Swarm target successfully connected");
-                            break;
-                        }
-                        Err(e) => {
-                            error!("Failed to connect to swarm target, trying again in {} seconds: {}", wait_secs, e.to_string());
-                        }
-                    };
 
-                    time::sleep(Duration::from_secs(wait_secs)).await;
-                    wait_secs *= 2;
+                    select! {
+                        result = TcpStream::connect(target) => {
+                            match result {
+                                Ok(stream) => {
+                                    swarm_stream = Some(stream);
+                                    debug!("Swarm target successfully connected");
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!("Failed to connect to swarm target, trying again in {} seconds: {}", wait_secs, e.to_string());
+                                }
+                            }
+                        }
+                        _ = processor_cancel_token.cancelled() => {
+                            info!("Processor thread got cancel request during initial connect");
+                            return;
+                        }
+                    }
+
+                    if swarm_stream.is_none() {
+                        select! {
+                            _ = time::sleep(Duration::from_secs(wait_secs)) => {
+                                wait_secs *= 2;
+                            }
+                            _ = processor_cancel_token.cancelled() => {
+                                info!("Processor thread got cancel request while waiting for next retry");
+                                return;
+                            }
+                        }
+                    }
                 }
             }
             
             loop {
                 select! {
-                    Some(frame) = rx.recv() => {
-                        // TODO: process frame by parsing ACARS content
-                    
+                    Some(mut frame) = rx.recv() => {
+                        if let Some(ref acars) = frame.acars {
+                            // TODO: enrich frame.indexed with extracted ACARS content
+                        }
+                        
                         if let Some(ref mut stream) = swarm_stream {
                             let raw_json = match serde_json::to_string(&frame) {
                                 Ok(v) => v,
@@ -280,7 +301,7 @@ impl ModuleManager {
                             };
 
                             if let Err(e) = stream.write_all(format!("{}\n", raw_json).as_bytes()).await {
-                                // TODO: do we want to stall and retry or just skip frames?
+                                // NOTE: For now, just skip frames if we fail to write packet to swarm server
                                 
                                 match e.kind() {
                                     io::ErrorKind::BrokenPipe => {
@@ -294,6 +315,8 @@ impl ModuleManager {
                                     _ => warn!("Failed to proxy frame to Swarm target: {}", e.to_string())
                                 }
                             }
+                        } else {
+                            // TODO: sqlite inserts
                         }
                         
                         if let Some(ref es_url) = elastic_url {
@@ -341,12 +364,21 @@ impl ModuleManager {
         while should_run {
             let mut reason = EndSessionReason::None;
 
-            let mut session = match module.start_session() {
+            let mut session = match module.start_session().await {
                 Ok(v) => v,
                 Err(e) => {
                     error!("Failed to start session: {}", e.to_string());
                     reason = EndSessionReason::ProcessStartError;
-                    break;
+
+                    select! {
+                        _ = sleep(Duration::from_secs(DEFAULT_FAILED_SESSION_START_WAIT_SECS)) => {}
+                        _ = interrupt_signal.recv() => {
+                            warn!("Got interrupt during failed session start wait, exiting session cleanly...");
+                            
+                            break;
+                        }
+                    }
+                    continue;
                 }    
             };
             
@@ -445,7 +477,15 @@ impl ModuleManager {
             
             if should_run && session_intermission_secs > 0 {
                 debug!("Session ended, waiting for {} seconds before continuing", session_intermission_secs);
-                sleep(Duration::from_secs(session_intermission_secs)).await;
+                
+                select! {
+                    _ = sleep(Duration::from_secs(session_intermission_secs)) => {}
+                    _ = interrupt_signal.recv() => {
+                        warn!("Got interrupt during session intermission, exiting session cleanly...");
+
+                        break;
+                    }
+                }
             }
         }
 

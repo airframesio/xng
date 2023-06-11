@@ -45,6 +45,22 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
         .write()
         .await;
 
+    if let Some(validator_callback) = module_settings.get_validator(&data.prop) {
+        if let Err(e) = validator_callback(&data.value) {
+            return HttpResponse::BadRequest().body(
+                serde_json::to_string(&PatchResponse {
+                    ok: false,
+                    message: Some(format!(
+                        "Provided value for prop {} failed validation check: {}",
+                        data.prop,
+                        e.to_string(),
+                    )),
+                })
+                .unwrap(),
+            );
+        }
+    }
+
     let Some(value) = module_settings.props.get_mut(&data.prop) else {
         return HttpResponse::BadRequest().body(
             serde_json::to_string(&PatchResponse {
@@ -58,7 +74,8 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
     let types_match = match (&value, &data.value) {
         (Value::Bool(_), Value::Bool(_))
         | (Value::Number(_), Value::Number(_))
-        | (Value::String(_), Value::String(_)) => true,
+        | (Value::String(_), Value::String(_))
+        | (Value::Array(_), Value::Array(_)) => true,
         _ => false,
     };
 

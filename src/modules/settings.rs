@@ -4,7 +4,9 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
-#[derive(Debug, Serialize)]
+pub type ValidatorCallback = fn(&Value) -> Result<(), String>;
+
+#[derive(Serialize)]
 pub struct ModuleSettings {
     pub props: HashMap<String, Value>,
 
@@ -22,6 +24,9 @@ pub struct ModuleSettings {
 
     #[serde(skip_serializing)]
     pub end_session_signaler: UnboundedSender<()>,
+
+    #[serde(skip_serializing)]
+    validators: HashMap<String, ValidatorCallback>,
 }
 
 impl ModuleSettings {
@@ -43,6 +48,21 @@ impl ModuleSettings {
             api_token: api_token.map(|v| v.clone()),
             reload_signaler,
             end_session_signaler,
+            validators: HashMap::new(),
         }
+    }
+
+    pub fn add_prop_with_validator(
+        &mut self,
+        prop: String,
+        value: Value,
+        validator: ValidatorCallback,
+    ) {
+        self.props.insert(prop.clone(), value.clone());
+        self.validators.insert(prop.clone(), validator);
+    }
+
+    pub fn get_validator(&self, prop: &String) -> Option<&ValidatorCallback> {
+        self.validators.get(prop)
     }
 }

@@ -107,6 +107,17 @@ impl SystemTable {
             .find(|x| x.name.eq_ignore_ascii_case(name))
     }
 
+    pub fn first_freq_above(&self, freq: u16) -> Option<u16> {
+        let mut freqs: Vec<u16> = self
+            .stations
+            .iter()
+            .flat_map(|x| x.frequencies.clone())
+            .collect();
+        freqs.sort_unstable();
+
+        freqs.iter().position(|&x| x >= freq).map(|i| freqs[i])
+    }
+
     pub fn bands(&self, max_bandwidth: u32) -> HashMap<String, Vec<u16>> {
         let band_name = |band: &Vec<u16>| -> String {
             let first = band.first().unwrap_or(&0) / 1000;
