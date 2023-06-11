@@ -1,7 +1,6 @@
 use lazy_static::lazy_static;
 use regex::Regex;
 
-pub mod airframes;
 pub mod timestamp;
 
 pub fn normalize_tail(tail: String) -> String {

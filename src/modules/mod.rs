@@ -396,9 +396,13 @@ impl ModuleManager {
                             Ok(v) => v,
                             Err(e) => {
                                 debug!("Timeout encountered: {}", e.to_string());
-                                
-                                reason = EndSessionReason::SessionTimeout;
-                                break;
+
+                                if session.on_timeout().await {
+                                    reason = EndSessionReason::SessionTimeout;
+                                    break;
+                                } else {
+                                    continue;
+                                }
                             }
                         };
                         

@@ -26,6 +26,15 @@ pub struct HFDLGroundStationStatus {
     pub ground_stations: Vec<GroundStationStatus>,
 }
 
+impl HFDLGroundStationStatus {
+    pub fn all_freqs(&self) -> Vec<u16> {
+        self.ground_stations
+            .iter()
+            .flat_map(|x| x.frequencies.active.clone())
+            .collect::<Vec<u16>>()
+    }
+}
+
 pub async fn get_airframes_gs_status() -> io::Result<HFDLGroundStationStatus> {
     let response = match reqwest::get("https://api.airframes.io/hfdl/ground-stations").await {
         Ok(r) => r,

@@ -10,12 +10,18 @@ pub struct DumpHFDLSession {
 
     reader: BufReader<ChildStdout>,
     stderr: ChildStderr,
+
+    end_session_on_timeout: bool,
 }
 
 #[async_trait]
 impl Session for DumpHFDLSession {
     async fn read_message(&mut self, msg: &mut String) -> Result<usize, io::Error> {
         self.reader.read_line(msg).await
+    }
+
+    async fn on_timeout(&mut self) -> bool {
+        self.end_session_on_timeout
     }
 
     async fn get_errors(&self) -> String {
@@ -39,11 +45,13 @@ impl DumpHFDLSession {
         process: Child,
         reader: BufReader<ChildStdout>,
         stderr: ChildStderr,
+        end_session_on_timeout: bool,
     ) -> DumpHFDLSession {
         DumpHFDLSession {
             process,
             reader,
             stderr,
+            end_session_on_timeout,
         }
     }
 }

@@ -2,9 +2,8 @@ use actix_web::web::Data;
 use std::io;
 use tokio::sync::RwLock;
 
-use crate::modules::{settings::ModuleSettings, XngModule};
-
 use super::{HfdlModule, HFDL_COMMAND};
+use crate::modules::{settings::ModuleSettings, XngModule};
 
 impl HfdlModule {
     pub fn new() -> Box<dyn XngModule> {
@@ -22,6 +21,6 @@ impl HfdlModule {
     }
 
     pub fn nearest_sample_rate(&self, sample_rate: u64) -> Option<u64> {
-        todo!()
+        Some(sample_rate)
     }
 }

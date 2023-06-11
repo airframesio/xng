@@ -1,13 +1,14 @@
 use crate::common::formats::EntityType;
 use crate::common::frame::{self as cff, Indexed, HFDLGSEntry};
 use crate::common::wkt::WKTPolyline;
-use crate::utils::airframes::{AIRFRAMESIO_DUMPHFDL_TCP_PORT, AIRFRAMESIO_HOST};
+use crate::modules::hfdl::airframes::{AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT, get_airframes_gs_status};
+use crate::modules::hfdl::utils::{freq_bands_by_sample_rate, first_freq_above_eq};
 use crate::utils::normalize_tail;
 use crate::utils::timestamp::{split_unix_time_to_utc_datetime, nearest_time_in_past, unix_time_to_utc_datetime};
 
 use self::frame::Frame;
 use self::method::valid_session_method;
-use self::schedule::{valid_schedule, valid_session_schedule};
+use self::schedule::valid_session_schedule;
 use self::session::DumpHFDLSession;
 use self::systable::SystemTable;
 use self::validators::validate_listening_bands;
@@ -25,12 +26,14 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::{io::BufReader, process, sync::RwLock};
 
+mod airframes;
 mod frame;
 mod method;
 mod module;
 mod schedule;
 mod session;
 mod systable;
+mod utils;
 mod validators;
 
 const DEFAULT_BIN_PATH: &'static str = "/usr/bin/dumphfdl";
@@ -48,6 +51,7 @@ const PROP_LISTENING_BAND: &'static str = "listening_band";
 const PROP_NEXT_SESSION_BAND: &'static str = "next_session_band";
 const PROP_SESSION_SCHEDULE: &'static str = "session_schedule";
 const PROP_SESSION_METHOD: &'static str = "session_method";
+const PROP_ACTIVE_ONLY: &'static str = "active_only";
 
 #[derive(Default)]
 pub struct HfdlModule {
@@ -103,11 +107,11 @@ impl XngModule for HfdlModule {
                 arg!(--bin <FILE> "Path to dumphfdl binary"),
                 arg!(--systable <FILE> "Path to dumphfdl system table configuration"),
                 arg!(--"stale-timeout" <SECONDS> "Elapsed time since last update before an aircraft and ground station frequency data is considered stale"),
-                arg!(--bandwidth <HERTZ> "Initial bandwidth to use for splitting HFDL spectrum into bands of coverage"),
+                arg!(--"sample-rate" <HERTZ> "Initial sample rate to use for splitting HFDL spectrum into bands of coverage"),
                 arg!(--"use-airframes-gs-map" "Use airframes.io's live HFDL ground station frequency map"),
                 arg!(--"start-band-contains" <HERTZ> "Initial starting band to listen on. Overrides --schedule if both are configured"),
                 arg!(--schedule <SCHEDULE_FMT> "Session switch schedule in the format of: hour=<HOUR_0_TO_23>,band_contains=<FREQ_HZ>;..."),
-                arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: active-only, random, inc, dec, static")
+                arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: random, inc, dec, static")
             ])
             .arg(Arg::new("hfdl-args").action(ArgAction::Append))
     }
@@ -160,27 +164,30 @@ impl XngModule for HfdlModule {
         // TODO: Populate sample rates from rust-soapy into a field
         
         self.sample_rate = args
-            .get_one("bandwidth")
-            .unwrap_or(&"default")
+            .get_one::<String>("sample-rate")
+            .unwrap_or(&String::from("default"))
             .parse::<u64>()
-            .unwrap_or(1000);
+            .unwrap_or(512000);
 
         self.stale_timeout_secs = args
-            .get_one("stale-timeout")
-            .unwrap_or(&"default")
+            .get_one::<String>("stale-timeout")
+            .unwrap_or(&String::from("default"))
             .parse::<u64>()
             .unwrap_or(DEFAULT_STALE_TIMEOUT_SECS);
 
         self.use_airframes_gs = args.get_flag("use-airframes-gs-map");
-
-        let Some(default_band) = self.systable.first_freq_above(13000) else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Systable might be corrupt, unable to find first frequency above 13000"));
-        };
-        let next_band = args.get_one::<String>("start-band-contains").unwrap_or(&String::from("default")).parse::<u16>();
-
-        // TODO: parse schedule and determine if we need to populate initial next_band
         
+        // TODO: parse schedule and determine if we need to populate initial next_band
+        let schedule = args.get_one::<String>("schedule");
+        
+        self.next_session_band = args
+            .get_one::<String>("start-band-contains")
+            .unwrap_or(&String::from("default"))
+            .parse::<u16>()
+            .unwrap_or(0) as u64;
+
         // TODO: parse method
+        let method = args.get_one::<String>("method");
 
         Ok(())
     }
@@ -255,6 +262,12 @@ impl XngModule for HfdlModule {
         {
             let mut settings = settings.write().await;
 
+            let use_airframes_gs;
+            {
+                let value = settings.props.get(&PROP_USE_AIRFRAMES_GS.to_string()).unwrap_or(&json!(false));
+                use_airframes_gs = value.as_bool().unwrap_or(false);
+            }
+            
             let sample_rate;
             {
                 let Some(suggested_sample_rate) = settings.props.get(&PROP_SAMPLE_RATE.to_string()) else {
@@ -269,11 +282,8 @@ impl XngModule for HfdlModule {
                         );
                     }
                 };
-
             }
             
-            let bands: Vec<u64> = Vec::new();
-
             let next_session_band;
             {
                 let Some(value) = settings.props.get(&PROP_NEXT_SESSION_BAND.to_string()) else {
@@ -284,13 +294,50 @@ impl XngModule for HfdlModule {
                 next_session_band = value.as_u64().unwrap_or(0);
             } 
 
-            if next_session_band > 0 {
-                // TODO: find containing band and use that
-            } else {
-                // TODO: get method+sample rate and use that to determine next freq band
+            if next_session_band == 0 {
+                // TODO: use method + sample rate to calculate next_session_band
             }
 
-            // TODO: add extra args for feeding airframes if option is selected
+            let mut all_freqs: Vec<u16> = Vec::new();
+            if use_airframes_gs {
+                match get_airframes_gs_status().await {
+                    Ok(gs_status) => {
+                        all_freqs.extend(gs_status.all_freqs());
+                    }
+                    Err(e) => debug!("Failed to get Airframes HFDL map: {}", e.to_string())
+                }
+            }
+
+            if all_freqs.is_empty() {
+                all_freqs.extend_from_slice(&self.systable.all_freqs());
+            }
+            all_freqs.sort_unstable();
+
+            let bands_for_rate = freq_bands_by_sample_rate(&all_freqs, sample_rate as u32);
+
+            debug!("Available Bands: {:?}", bands_for_rate);
+            
+            let Some(target_freq) = first_freq_above_eq(&all_freqs, next_session_band as u16) else {
+                return Err(
+                    io::Error::new(
+                        io::ErrorKind::InvalidData, 
+                        format!("Failed to find first freq above {:?}", next_session_band)
+                    )
+                );
+            };
+            let Some((_, bands, _)) = bands_for_rate
+                .iter()
+                .map(|(k, v)| (k, v, v.iter().position(|&x| x == target_freq)))
+                .filter(|(_, _, i)| i.is_some())
+                .next() else {
+                return Err(
+                    io::Error::new(
+                        io::ErrorKind::InvalidData, 
+                        format!("Failed to find band in which target frequency belongs in: {:?}", target_freq)
+                    )
+                );
+            };
+
             proc = match process::Command::new(self.bin.clone())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -330,6 +377,8 @@ impl XngModule for HfdlModule {
                 };
                 *value = json!(0);
             }
+
+            debug!("New HFDL session started, requested freq {}, listening: {:?}", next_session_band, bands);            
         }
         
         let Some(stdout) = proc.stdout.take() else {
@@ -339,12 +388,11 @@ impl XngModule for HfdlModule {
             return Err(io::Error::new(io::ErrorKind::Other, "Unable to take stderr from child process"));
         };
 
-        debug!("New HFDL session started");
-
         Ok(Box::new(DumpHFDLSession::new(
             proc,
             BufReader::new(stdout),
             stderr,
+            true, // TODO: only false for method="static"
         )))
     }
 

@@ -107,61 +107,11 @@ impl SystemTable {
             .find(|x| x.name.eq_ignore_ascii_case(name))
     }
 
-    pub fn first_freq_above(&self, freq: u16) -> Option<u16> {
-        let mut freqs: Vec<u16> = self
-            .stations
+    pub fn all_freqs(&self) -> Vec<u16> {
+        self.stations
             .iter()
             .flat_map(|x| x.frequencies.clone())
-            .collect();
-        freqs.sort_unstable();
-
-        freqs.iter().position(|&x| x >= freq).map(|i| freqs[i])
-    }
-
-    pub fn bands(&self, max_bandwidth: u32) -> HashMap<String, Vec<u16>> {
-        let band_name = |band: &Vec<u16>| -> String {
-            let first = band.first().unwrap_or(&0) / 1000;
-            let last = band.last().unwrap_or(&0) / 1000;
-
-            if first == 0 {
-                return format!("{}", last);
-            }
-            if last == 0 || first == last {
-                return format!("{}", first);
-            }
-
-            format!("{}-{}", first, last)
-        };
-        let mut bands: HashMap<String, Vec<u16>> = HashMap::new();
-        let mut freqs: Vec<u16> = self
-            .stations
-            .iter()
-            .flat_map(|x| x.frequencies.clone())
-            .collect();
-        freqs.sort_unstable();
-
-        let max_dist = (((max_bandwidth as f64) * 0.9) / 1000.0) as u16;
-
-        let mut band: Vec<u16> = Vec::new();
-        for freq in freqs.iter() {
-            match band.first() {
-                Some(last_band) => {
-                    if freq - last_band > max_dist {
-                        bands.insert(band_name(&band), band.to_owned());
-                        band.clear();
-                    } else {
-                        band.push(*freq);
-                    }
-                }
-                None => band.push(*freq),
-            }
-        }
-
-        if !band.is_empty() {
-            bands.insert(band_name(&band), band.to_owned());
-        }
-
-        bands
+            .collect()
     }
 
     pub fn load(path: &PathBuf) -> io::Result<Self> {
@@ -251,16 +201,22 @@ impl SystemTable {
                     .map(|x| x.parse::<f64>().unwrap_or(0.0))
                     .collect(),
             ) {
-                debug!("  Station = {:#?}", station);
+                trace!("  Station = {:#?}", station);
                 stations.push(station);
             } else {
-                debug!("Invalid station");
+                trace!("Invalid station");
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("Malformed ground station: {}", path.to_string_lossy()),
                 ));
             }
         }
+
+        debug!(
+            "Parsed {} HFDL ground stations from system table {}",
+            stations.len(),
+            version
+        );
 
         Ok(SystemTable {
             path: path.clone(),
