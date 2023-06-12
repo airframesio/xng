@@ -440,9 +440,17 @@ impl ModuleManager {
                                 since_last_msg = Instant::now();
                             }
                             Err(e) => {
-                                error!("Read failure: {}", e.to_string());
-                                
-                                reason = EndSessionReason::ReadError;
+                                match e.kind() {
+                                    io::ErrorKind::ConnectionReset => {
+                                        debug!("HFDL session ended by schedule");
+                                        reason = EndSessionReason::SessionEnd;
+                                    },
+                                    _ => {
+                                        error!("Read failure: {}", e.to_string());
+                                        reason = EndSessionReason::ReadError;
+                                    }
+                                }
+
                                 break;
                             }
                         };

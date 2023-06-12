@@ -2,6 +2,7 @@ use crate::common::formats::EntityType;
 use crate::common::frame::{self as cff, Indexed, HFDLGSEntry};
 use crate::common::wkt::WKTPolyline;
 use crate::modules::hfdl::airframes::{AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT, get_airframes_gs_status};
+use crate::modules::hfdl::schedule::parse_session_schedule;
 use crate::modules::hfdl::utils::{freq_bands_by_sample_rate, first_freq_above_eq};
 use crate::utils::normalize_tail;
 use crate::utils::timestamp::{split_unix_time_to_utc_datetime, nearest_time_in_past, unix_time_to_utc_datetime};
@@ -16,7 +17,7 @@ use super::settings::ModuleSettings;
 use super::XngModule;
 use actix_web::web::Data;
 use async_trait::async_trait;
-use chrono::{Utc, SecondsFormat};
+use chrono::{Utc, SecondsFormat, DateTime, Local};
 use chrono_tz::UTC;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use log::*;
@@ -51,7 +52,6 @@ const PROP_LISTENING_BAND: &'static str = "listening_band";
 const PROP_NEXT_SESSION_BAND: &'static str = "next_session_band";
 const PROP_SESSION_SCHEDULE: &'static str = "session_schedule";
 const PROP_SESSION_METHOD: &'static str = "session_method";
-const PROP_ACTIVE_ONLY: &'static str = "active_only";
 
 #[derive(Default)]
 pub struct HfdlModule {
@@ -110,7 +110,7 @@ impl XngModule for HfdlModule {
                 arg!(--"sample-rate" <HERTZ> "Initial sample rate to use for splitting HFDL spectrum into bands of coverage"),
                 arg!(--"use-airframes-gs-map" "Use airframes.io's live HFDL ground station frequency map"),
                 arg!(--"start-band-contains" <HERTZ> "Initial starting band to listen on. Overrides --schedule if both are configured"),
-                arg!(--schedule <SCHEDULE_FMT> "Session switch schedule in the format of: hour=<HOUR_0_TO_23>,band_contains=<FREQ_HZ>;..."),
+                arg!(--schedule <SCHEDULE_FMT> "Session switch schedule in the format of: time=<HOUR_0_TO_23>,band_contains=<FREQ_HZ>;..."),
                 arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: random, inc, dec, static")
             ])
             .arg(Arg::new("hfdl-args").action(ArgAction::Append))
@@ -177,8 +177,14 @@ impl XngModule for HfdlModule {
 
         self.use_airframes_gs = args.get_flag("use-airframes-gs-map");
         
-        // TODO: parse schedule and determine if we need to populate initial next_band
-        let schedule = args.get_one::<String>("schedule");
+        let schedule = args.get_one::<String>("schedule").map(|x| x.clone()).unwrap_or(String::from(""));
+        if !schedule.is_empty() {
+            match valid_session_schedule(&json!(schedule)) {
+                Ok(_) => {}
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid schedule format: {}", e.to_string())))
+            };
+        }
+        self.schedule = schedule;
         
         self.next_session_band = args
             .get_one::<String>("start-band-contains")
@@ -234,6 +240,7 @@ impl XngModule for HfdlModule {
 
     async fn start_session(&mut self) -> Result<Box<dyn super::session::Session>, io::Error> {
         let settings = self.get_settings()?;
+        let mut next_session_begin: Option<DateTime<Local>> = None;
         
         let mut extra_args = self.args.clone();
         let output_arg = format!(
@@ -284,7 +291,7 @@ impl XngModule for HfdlModule {
                 };
             }
             
-            let next_session_band;
+            let mut next_session_band;
             {
                 let Some(value) = settings.props.get(&PROP_NEXT_SESSION_BAND.to_string()) else {
                     return Err(
@@ -294,10 +301,31 @@ impl XngModule for HfdlModule {
                 next_session_band = value.as_u64().unwrap_or(0);
             } 
 
+            
+            if next_session_band == 0 && !self.schedule.is_empty() {
+                let schedule = match parse_session_schedule(&self.schedule) {
+                    Ok(x) => x,
+                    Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse schedule: {}", e.to_string())))  
+                };
+
+                debug!("Parsed schedule: {:?}", schedule);
+                
+                if let Some((dt, _)) = schedule.first() {
+                    next_session_begin = Some(*dt);
+
+                    if schedule.len() > 1 {
+                        match schedule.last() {
+                            Some((_, target_freq)) => next_session_band = *target_freq as u64,
+                            None => {}
+                        }                  
+                    }
+                }
+            }
+
             if next_session_band == 0 {
                 // TODO: use method + sample rate to calculate next_session_band
             }
-
+            
             let mut all_freqs: Vec<u16> = Vec::new();
             if use_airframes_gs {
                 match get_airframes_gs_status().await {
@@ -306,13 +334,14 @@ impl XngModule for HfdlModule {
                     }
                     Err(e) => debug!("Failed to get Airframes HFDL map: {}", e.to_string())
                 }
-            }
+            } // TODO: if active_bands is not empty, use that to populate all_freqs
 
             if all_freqs.is_empty() {
                 all_freqs.extend_from_slice(&self.systable.all_freqs());
             }
             all_freqs.sort_unstable();
-
+            all_freqs.dedup();
+            
             let bands_for_rate = freq_bands_by_sample_rate(&all_freqs, sample_rate as u32);
 
             debug!("Available Bands: {:?}", bands_for_rate);
@@ -392,6 +421,7 @@ impl XngModule for HfdlModule {
             proc,
             BufReader::new(stdout),
             stderr,
+            next_session_begin,
             true, // TODO: only false for method="static"
         )))
     }
@@ -428,6 +458,11 @@ impl XngModule for HfdlModule {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Provided HFDL system table is out of date"));
             }
 
+            // TODO: if module settings exists
+            //         1. detect added and deleted frequencies in bands
+            //         2. update active bands
+            //         3. trigger end session
+            
             metadata = Some(cff::HFDLMetadata {
                 kind: String::from("Squitter"),
                 heard_on: spdu.gs_status.iter().map(|x| cff::HFDLGSEntry {

@@ -5,6 +5,7 @@ use tokio::io;
 pub enum EndSessionReason {
     None,
     SessionTimeout,
+    SessionEnd,
     UserInterrupt,
     UserAPIControl,
     ReadError,
