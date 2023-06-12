@@ -57,7 +57,7 @@ pub trait XngModule {
     async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>);
 
     fn process_message(&mut self, msg: &str) -> Result<CommonFrame, io::Error>;
-    async fn start_session(&mut self) -> Result<Box<dyn Session>, io::Error>;
+    async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn Session>, io::Error>;
 }
 
 pub struct ModuleManager {
@@ -360,11 +360,11 @@ impl ModuleManager {
         });
         
         let mut should_run = true;
+        let mut reason = EndSessionReason::None;
 
         while should_run {
-            let mut reason = EndSessionReason::None;
 
-            let mut session = match module.start_session().await {
+            let mut session = match module.start_session(reason).await {
                 Ok(v) => v,
                 Err(e) => {
                     error!("Failed to start session: {}", e.to_string());

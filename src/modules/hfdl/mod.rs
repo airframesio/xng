@@ -13,6 +13,7 @@ use self::schedule::valid_session_schedule;
 use self::session::DumpHFDLSession;
 use self::systable::SystemTable;
 use self::validators::validate_listening_bands;
+use super::session::EndSessionReason;
 use super::settings::ModuleSettings;
 use super::XngModule;
 use actix_web::web::Data;
@@ -238,7 +239,7 @@ impl XngModule for HfdlModule {
         );
     }
 
-    async fn start_session(&mut self) -> Result<Box<dyn super::session::Session>, io::Error> {
+    async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn super::session::Session>, io::Error> {
         let settings = self.get_settings()?;
         let mut next_session_begin: Option<DateTime<Local>> = None;
         
@@ -314,10 +315,10 @@ impl XngModule for HfdlModule {
                     next_session_begin = Some(*dt);
 
                     if schedule.len() > 1 {
-                        match schedule.last() {
-                            Some((_, target_freq)) => next_session_band = *target_freq as u64,
-                            None => {}
-                        }                  
+                        match (last_end_reason, schedule.last()) {
+                            (EndSessionReason::None | EndSessionReason::SessionEnd, Some((_, target_freq))) => next_session_band = *target_freq as u64,
+                            _ => {}
+                        }
                     }
                 }
             }
