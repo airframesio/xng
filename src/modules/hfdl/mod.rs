@@ -16,13 +16,16 @@ use self::validators::validate_listening_bands;
 use super::session::EndSessionReason;
 use super::settings::ModuleSettings;
 use super::XngModule;
+use actix_web::http::header::LastModified;
 use actix_web::web::Data;
 use async_trait::async_trait;
 use chrono::{Utc, SecondsFormat, DateTime, Local};
 use chrono_tz::UTC;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use log::*;
-use serde_json::json;
+use rand::rngs::ThreadRng;
+use rand::Rng;
+use serde_json::{json, Value};
 use std::io;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -43,6 +46,7 @@ const DEFAULT_SYSTABLE_PATH: &'static str = "/etc/systable.conf";
 
 const DEFAULT_STALE_TIMEOUT_SECS: u64 = 1800;
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 600;
+const DEFAULT_SESSION_METHOD: &'static str = "random";
 
 const HFDL_COMMAND: &'static str = "hfdl";
 
@@ -75,6 +79,8 @@ pub struct HfdlModule {
     next_session_band: u64,
     schedule: String,
     method: String,
+
+    last_band_freq: u64,
 }
 
 fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
@@ -193,9 +199,12 @@ impl XngModule for HfdlModule {
             .parse::<u16>()
             .unwrap_or(0) as u64;
 
-        // TODO: parse method
-        let method = args.get_one::<String>("method");
-
+        let method = args.get_one::<String>("method").unwrap_or(&String::from(DEFAULT_SESSION_METHOD)).clone();
+        if let Err(e) = valid_session_method(&json!(method)) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid session method, {}: {}", method, e.to_string())));
+        }
+        self.method = method.to_lowercase();
+        
         Ok(())
     }
 
@@ -242,6 +251,8 @@ impl XngModule for HfdlModule {
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn super::session::Session>, io::Error> {
         let settings = self.get_settings()?;
         let mut next_session_begin: Option<DateTime<Local>> = None;
+
+        let mut end_session_on_timeout = true;
         
         let mut extra_args = self.args.clone();
         let output_arg = format!(
@@ -275,6 +286,19 @@ impl XngModule for HfdlModule {
                 let value = settings.props.get(&PROP_USE_AIRFRAMES_GS.to_string()).unwrap_or(&json!(false));
                 use_airframes_gs = value.as_bool().unwrap_or(false);
             }
+
+            let session_method;
+            {
+                let Some(value) = settings.props.get(&PROP_SESSION_METHOD.to_string()) else {
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_SESSION_METHOD prop")
+                    );
+                };
+                session_method = value.as_str().unwrap_or(DEFAULT_SESSION_METHOD);
+            }
+            if session_method == "static" {
+                end_session_on_timeout = false;
+            }
             
             let sample_rate;
             {
@@ -291,7 +315,7 @@ impl XngModule for HfdlModule {
                     }
                 };
             }
-            
+
             let mut next_session_band;
             {
                 let Some(value) = settings.props.get(&PROP_NEXT_SESSION_BAND.to_string()) else {
@@ -301,7 +325,6 @@ impl XngModule for HfdlModule {
                 };
                 next_session_band = value.as_u64().unwrap_or(0);
             } 
-
             
             if next_session_band == 0 && !self.schedule.is_empty() {
                 let schedule = match parse_session_schedule(&self.schedule) {
@@ -323,10 +346,6 @@ impl XngModule for HfdlModule {
                 }
             }
 
-            if next_session_band == 0 {
-                // TODO: use method + sample rate to calculate next_session_band
-            }
-            
             let mut all_freqs: Vec<u16> = Vec::new();
             if use_airframes_gs {
                 match get_airframes_gs_status().await {
@@ -347,6 +366,68 @@ impl XngModule for HfdlModule {
 
             debug!("Available Bands: {:?}", bands_for_rate);
             
+            if next_session_band == 0 {
+                let mut candidates = bands_for_rate
+                    .iter()
+                    .map(|(_, v)| v.first())
+                    .filter(|x| x.is_some())
+                    .map(|x| x.unwrap())
+                    .collect::<Vec<&u16>>();
+                candidates.sort_unstable();
+                
+                let listening_band = settings.props.get(&PROP_LISTENING_BAND.to_string()).unwrap_or(&Value::Null);
+                let mut last_listening_freq: Option<u64> = None;
+                
+                if !candidates.is_empty() && listening_band.is_array() && session_method != "static" {
+                    let last_band = listening_band
+                        .as_array()
+                        .unwrap() 
+                        .iter()
+                        .map(|x| x.as_u64())
+                        .filter(|x| x.is_some())
+                        .map(|x| x.unwrap())
+                        .collect::<Vec<u64>>();
+                    if let Some(first_freq) = last_band.first() {
+                        last_listening_freq = Some(*first_freq as u64);
+
+                        if let Some(last_idx) = candidates.iter().position(|&x| *x as u64 >= *first_freq) {
+                            let max_idx = candidates.len() - 1;
+                            match session_method {
+                                "inc" => if last_idx + 1 > max_idx {
+                                    next_session_band = *candidates[0] as u64;
+                                } else {
+                                    next_session_band = *candidates[last_idx + 1] as u64;
+                                }                              
+                                "dec" => if last_idx == 0 {
+                                    next_session_band = *candidates[max_idx] as u64;
+                                } else {
+                                    next_session_band = *candidates[last_idx - 1] as u64;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+
+                if next_session_band == 0 && session_method == "random" {
+                    let mut rng = rand::thread_rng();
+                    if let Some(first_freq) = last_listening_freq {
+                        candidates = candidates
+                            .into_iter()
+                            .filter(|&x| *x as u64 != first_freq && *x as u64 != self.last_band_freq)
+                            .collect();
+                        self.last_band_freq = first_freq;
+                    }
+
+                    if !candidates.is_empty() {
+                        let new_idx = rng.gen_range(0..(candidates.len() - 1));
+                        next_session_band = *candidates[new_idx] as u64;
+                    } else {
+                        warn!("Candidate bands pool is empty!");
+                    }
+                }
+            }
+            
             let Some(target_freq) = first_freq_above_eq(&all_freqs, next_session_band as u16) else {
                 return Err(
                     io::Error::new(
@@ -354,7 +435,7 @@ impl XngModule for HfdlModule {
                         format!("Failed to find first freq above {:?}", next_session_band)
                     )
                 );
-            };
+            };            
             let Some((_, bands, _)) = bands_for_rate
                 .iter()
                 .map(|(k, v)| (k, v, v.iter().position(|&x| x == target_freq)))
@@ -423,7 +504,7 @@ impl XngModule for HfdlModule {
             BufReader::new(stdout),
             stderr,
             next_session_begin,
-            true, // TODO: only false for method="static"
+            end_session_on_timeout,
         )))
     }
 
@@ -441,7 +522,7 @@ impl XngModule for HfdlModule {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid arrival time",
-            ))
+            ));
         };
 
         let mut paths: Vec<cff::PropagationPath> = Vec::new();
