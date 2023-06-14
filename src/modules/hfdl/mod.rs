@@ -261,21 +261,23 @@ impl XngModule for HfdlModule {
             AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT
         );
 
-        if let Some(idx) = extra_args
-            .iter()
-            .position(|x| x.eq_ignore_ascii_case(&output_arg))
-        {
-            if idx == 0 || !extra_args[idx - 1].eq_ignore_ascii_case("--output") {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "Invalid addition arguments found at index {}: {:?}",
-                        idx, extra_args
-                    ),
-                ));
+        if self.feed_airframes {
+            if let Some(idx) = extra_args
+                .iter()
+                .position(|x| x.eq_ignore_ascii_case(&output_arg))
+            {
+                if idx == 0 || !extra_args[idx - 1].eq_ignore_ascii_case("--output") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Invalid addition arguments found at index {}: {:?}",
+                            idx, extra_args
+                        ),
+                    ));
+                }
+            } else {
+                extra_args.extend_from_slice(&[String::from("--output"), output_arg]);
             }
-        } else {
-            extra_args.extend_from_slice(&[String::from("--output"), output_arg]);
         }
 
         let mut proc;
