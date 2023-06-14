@@ -248,6 +248,7 @@ impl XngModule for HfdlModule {
         );
     }
 
+    // NOTE: not gonna lie, this code below is pretty gnarly and could use some refactoring...
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn super::session::Session>, io::Error> {
         let settings = self.get_settings()?;
         let mut next_session_begin: Option<DateTime<Local>> = None;

@@ -3,8 +3,7 @@ use clap::{arg, Command};
 pub fn register_common_arguments(cmd: Command) -> Command {
     cmd.args(&[
         arg!(-q --quiet "Silence all output"),
-        arg!(-v --verbose "Verbose mode"),
-        arg!(-d --debug "Extra verbose mode for debugging"),
+        arg!(-v --verbose ... "Verbose level"),
         arg!(--"api-token" <TOKEN> "Sets up an authentication token for API server access"),
         arg!(--"disable-cross-site" "Disable cross site requests"),
         arg!(--"listen-host" <HOST> "Host for API server to listen on"),

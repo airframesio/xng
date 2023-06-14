@@ -31,11 +31,19 @@ fn main() {
     rt.block_on(async {
         match args.subcommand() {
             Some((subcmd, matches)) => {
+                let verbose_level = *matches.get_one::<u8>("verbose").unwrap_or(&0);
+                
                 stderrlog::new()
                     .module(module_path!())
                     .quiet(matches.get_flag("quiet"))
-                    .verbosity(if matches.get_flag("debug") { 3 } else if matches.get_flag("verbose") { 2 } else { 1 })
-                    .timestamp(if matches.get_flag("debug") || matches.get_flag("verbose") { stderrlog::Timestamp::Second } else { stderrlog::Timestamp::Off })
+                    .verbosity((verbose_level as usize) + 1)
+                    .timestamp(
+                        if verbose_level > 1 { 
+                            stderrlog::Timestamp::Second 
+                        } else { 
+                            stderrlog::Timestamp::Off 
+                        }
+                    )
                     .init()
                     .unwrap();
 
