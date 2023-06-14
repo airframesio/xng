@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use tokio::io;
 
+pub const SESSION_SCHEDULED_END: &'static str = "SESSION_SCHEDULED_END";
+
 #[derive(Copy, Clone, Debug)]
 pub enum EndSessionReason {
     None,

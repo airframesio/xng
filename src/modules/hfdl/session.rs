@@ -6,7 +6,7 @@ use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::select;
 use tokio::time::{sleep_until, Duration, Instant};
 
-use crate::modules::session::{EndSessionReason, Session};
+use crate::modules::session::{EndSessionReason, Session, SESSION_SCHEDULED_END};
 
 pub struct DumpHFDLSession {
     process: Child,
@@ -26,7 +26,7 @@ impl Session for DumpHFDLSession {
             select! {
                 _ = sleep_until(self.session_start + session_end) => {
                     return Err(
-                        io::Error::new(io::ErrorKind::ConnectionReset, "Session ended by schedule")
+                        io::Error::new(io::ErrorKind::Other, SESSION_SCHEDULED_END)
                     )
                 }
                 result = self.reader.read_line(msg) => result

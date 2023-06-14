@@ -143,8 +143,24 @@ impl SystemTable {
 
         let mut raw_content = String::new();
         {
-            let mut fd = File::open(path)?;
-            fd.read_to_string(&mut raw_content)?;
+            let Ok(mut fd) = File::open(path) else {
+                return Err(
+                    io::Error::new(
+                        io::ErrorKind::NotFound, 
+                        format!("Could not load {} for parsing", path.to_string_lossy())
+                    )
+                );
+            };
+            
+            match fd.read_to_string(&mut raw_content) {
+                Err(e) => return Err(
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Unable to read {} for parsing: {}", path.to_string_lossy(), e.to_string())
+                    )
+                ),
+                _ => {}
+            };
         }
 
         let content = NEWLINES_FMT.replace_all(&raw_content, "");

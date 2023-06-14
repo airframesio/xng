@@ -22,7 +22,7 @@ use std::time::Duration;
 use crate::common;
 use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
-use crate::modules::session::EndSessionReason;
+use crate::modules::session::{EndSessionReason, SESSION_SCHEDULED_END};
 
 use self::session::Session;
 use self::settings::ModuleSettings;
@@ -440,15 +440,21 @@ impl ModuleManager {
                                 since_last_msg = Instant::now();
                             }
                             Err(e) => {
-                                match e.kind() {
-                                    io::ErrorKind::ConnectionReset => {
+                                if matches!(e.kind(), io::ErrorKind::Other) {
+                                    let Some(inner_err) = e.get_ref() else {
+                                        debug!("Unable to get inner error for ErrorKind::Other");
+                                        reason = EndSessionReason::ReadError;
+                                        break;  
+                                    };
+                                    if inner_err.to_string() == SESSION_SCHEDULED_END {
                                         debug!("HFDL session ended by schedule");
                                         reason = EndSessionReason::SessionEnd;
-                                    },
-                                    _ => {
-                                        error!("Read failure: {}", e.to_string());
-                                        reason = EndSessionReason::ReadError;
                                     }
+                                }
+
+                                if matches!(reason, EndSessionReason::None) {
+                                    error!("Read failure: {}", e.to_string());
+                                    reason = EndSessionReason::ReadError;
                                 }
 
                                 break;
