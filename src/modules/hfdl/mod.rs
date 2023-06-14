@@ -147,7 +147,7 @@ impl XngModule for HfdlModule {
         ))?;
         
         let Some(hfdl_args) = args.get_many("hfdl-args") else {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing required HFDL arguments arguments"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing required HFDL positional arguments"));
         };
         self.args = hfdl_args
             .clone()
