@@ -95,7 +95,14 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
     *value = data.value.clone();
 
     if let Err(e) = module_settings.reload_signaler.send(()) {
-        error!("Failed to signal reload: {}", e.to_string());
+        warn!("Failed to signal reload: {}", e.to_string());
+        return HttpResponse::Ok().body(
+            serde_json::to_string(&PatchResponse {
+                ok: true,
+                message: Some(format!("Could not reload settings: {}", e.to_string())),
+            })
+            .unwrap(),
+        );
     }
 
     HttpResponse::Ok().body(

@@ -53,7 +53,7 @@ pub fn parse_session_schedule(value: &str) -> Result<Vec<(DateTime<Local>, u32)>
     Ok(schedule)
 }
 
-pub fn valid_session_schedule(value: &Value) -> Result<(), String> {
+pub fn validate_session_schedule(value: &Value) -> Result<(), String> {
     let Some(value) = value.as_str() else {
         return Err(format!("Schedule is not a string: {:?}", value));
     };

@@ -8,22 +8,19 @@ use crate::utils::normalize_tail;
 use crate::utils::timestamp::{split_unix_time_to_utc_datetime, nearest_time_in_past, unix_time_to_utc_datetime};
 
 use self::frame::Frame;
-use self::method::valid_session_method;
-use self::schedule::valid_session_schedule;
+use self::schedule::validate_session_schedule;
 use self::session::DumpHFDLSession;
 use self::systable::SystemTable;
-use self::validators::validate_listening_bands;
+use self::validators::{validate_listening_bands, validate_session_method, validate_next_session_band};
 use super::session::EndSessionReason;
 use super::settings::ModuleSettings;
 use super::XngModule;
-use actix_web::http::header::LastModified;
 use actix_web::web::Data;
 use async_trait::async_trait;
 use chrono::{Utc, SecondsFormat, DateTime, Local};
 use chrono_tz::UTC;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use log::*;
-use rand::rngs::ThreadRng;
 use rand::Rng;
 use serde_json::{json, Value};
 use std::io;
@@ -33,7 +30,6 @@ use tokio::{io::BufReader, process, sync::RwLock};
 
 mod airframes;
 mod frame;
-mod method;
 mod module;
 mod schedule;
 mod session;
@@ -186,7 +182,7 @@ impl XngModule for HfdlModule {
         
         let schedule = args.get_one::<String>("schedule").map(|x| x.clone()).unwrap_or(String::from(""));
         if !schedule.is_empty() {
-            match valid_session_schedule(&json!(schedule)) {
+            match validate_session_schedule(&json!(schedule)) {
                 Ok(_) => {}
                 Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid schedule format: {}", e.to_string())))
             };
@@ -200,7 +196,7 @@ impl XngModule for HfdlModule {
             .unwrap_or(0) as u64;
 
         let method = args.get_one::<String>("method").unwrap_or(&String::from(DEFAULT_SESSION_METHOD)).clone();
-        if let Err(e) = valid_session_method(&json!(method)) {
+        if let Err(e) = validate_session_method(&json!(method)) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Invalid session method, {}: {}", method, e.to_string())));
         }
         self.method = method.to_lowercase();
@@ -234,17 +230,17 @@ impl XngModule for HfdlModule {
         settings.add_prop_with_validator(
             PROP_NEXT_SESSION_BAND.to_string(), 
             json!(self.next_session_band), 
-            valid_session_method
+            validate_next_session_band
         );
         settings.add_prop_with_validator(
             PROP_SESSION_SCHEDULE.to_string(), 
             json!(self.schedule), 
-            valid_session_schedule
+            validate_session_schedule
         );
         settings.add_prop_with_validator(
             PROP_SESSION_METHOD.to_string(),
             json!(self.method),
-            valid_session_method
+            validate_session_method
         );
     }
 
