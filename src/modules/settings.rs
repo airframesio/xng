@@ -112,11 +112,9 @@ pub fn update_station_by_frequencies(
         })
         .collect();
     let changed = station.active_frequencies != new_freq_set;
-    station.active_frequencies.extend(new_freq_set);
-
     if changed {
         trace!(
-            "Ground station ID {:?} [{:?}] changed freq set: {:?} -> {:?}",
+            "Ground station ID {} [{}] changed freq set: {:?} -> {:?}",
             station.pretty_id(),
             station.pretty_name(),
             station
@@ -127,6 +125,8 @@ pub fn update_station_by_frequencies(
             freqs
         );
     }
+    station.active_frequencies.extend(new_freq_set);
+
     changed
 }
 
