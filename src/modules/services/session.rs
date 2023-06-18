@@ -3,7 +3,7 @@ use log::*;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use crate::modules::settings::ModuleSettings;
+use crate::modules::{session::EndSessionReason, settings::ModuleSettings};
 
 use super::middleware::Authorized;
 
@@ -24,7 +24,10 @@ pub async fn delete(req: HttpRequest, _: Authorized) -> HttpResponse {
         .read()
         .await;
 
-    if let Err(e) = module_settings.end_session_signaler.send(()) {
+    if let Err(e) = module_settings
+        .end_session_signaler
+        .send(EndSessionReason::UserAPIControl)
+    {
         error!("Failed to end session: {}", e.to_string());
         return HttpResponse::InternalServerError().body(
             serde_json::to_string(&DeleteResponse {

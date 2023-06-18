@@ -8,8 +8,10 @@ pub enum EndSessionReason {
     None,
     SessionTimeout,
     SessionEnd,
+    SessionUpdate,
     UserInterrupt,
     UserAPIControl,
+
     ReadError,
     ReadEOF,
     ProcessStartError,

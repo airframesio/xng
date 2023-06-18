@@ -163,7 +163,8 @@ impl ModuleManager {
         }
         
         let (reload_signaler, mut reload_signal) = mpsc::unbounded_channel::<()>();
-        let (end_session_signaler, mut end_session_signal) = mpsc::unbounded_channel::<()>();
+        let (end_session_signaler, mut end_session_signal) = mpsc::unbounded_channel::<EndSessionReason>();
+        
         let Ok(mut interrupt_signal) = signal(SignalKind::interrupt()) else {
             error!("Failed to register interrupt signal");
             return;
@@ -473,9 +474,9 @@ impl ModuleManager {
                             }
                         };
                     }
-                    _ = end_session_signal.recv() => {
-                        debug!("Got request to end current session");
-                        reason = EndSessionReason::UserAPIControl;
+                    end_session_reason = end_session_signal.recv() => {
+                        debug!("Got request to end current session: {:?}", end_session_reason);
+                        reason = end_session_reason.unwrap_or(EndSessionReason::UserAPIControl);
                         break;
                     }
                     _ = interrupt_signal.recv() => {

@@ -7,6 +7,8 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::RwLockWriteGuard;
 
+use super::session::EndSessionReason;
+
 pub type ValidatorCallback = fn(&Value) -> Result<(), String>;
 
 #[derive(Serialize)]
@@ -131,7 +133,7 @@ pub struct ModuleSettings {
     pub reload_signaler: UnboundedSender<()>,
 
     #[serde(skip_serializing)]
-    pub end_session_signaler: UnboundedSender<()>,
+    pub end_session_signaler: UnboundedSender<EndSessionReason>,
 
     #[serde(skip_serializing)]
     validators: HashMap<String, ValidatorCallback>,
@@ -140,7 +142,7 @@ pub struct ModuleSettings {
 impl ModuleSettings {
     pub fn new(
         reload_signaler: UnboundedSender<()>,
-        end_session_signaler: UnboundedSender<()>,
+        end_session_signaler: UnboundedSender<EndSessionReason>,
         swarm_mode: bool,
         disable_api_control: bool,
         api_token: Option<&String>,

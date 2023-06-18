@@ -79,7 +79,8 @@ pub struct HfdlModule {
     schedule: String,
     method: String,
 
-    last_band_freq: u64,
+    last_req_session_band: u64,
+    last_random_freq_band: u64,
 }
 
 fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
@@ -355,7 +356,12 @@ impl XngModule for HfdlModule {
                 };
                 next_session_band = value.as_u64().unwrap_or(0);
             } 
-            
+
+            // NOTE: always respect user requests to change frequency bands
+            if next_session_band == 0 && matches!(last_end_reason, EndSessionReason::SessionUpdate) {
+                next_session_band = self.last_req_session_band;
+            }
+                
             if next_session_band == 0 && !self.schedule.is_empty() {
                 let schedule = match parse_session_schedule(&self.schedule) {
                     Ok(x) => x,
@@ -459,9 +465,9 @@ impl XngModule for HfdlModule {
                     if let Some(first_freq) = last_listening_freq {
                         candidates = candidates
                             .into_iter()
-                            .filter(|&x| *x as u64 != first_freq && *x as u64 != self.last_band_freq)
+                            .filter(|&x| *x as u64 != first_freq && *x as u64 != self.last_random_freq_band)
                             .collect();
-                        self.last_band_freq = first_freq;
+                        self.last_random_freq_band = first_freq;
                     }
 
                     if !candidates.is_empty() {
@@ -494,6 +500,8 @@ impl XngModule for HfdlModule {
                 );
             };
 
+            self.last_req_session_band = next_session_band;
+            
             proc = match process::Command::new(self.bin.clone())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -643,7 +651,7 @@ impl XngModule for HfdlModule {
                 }
 
                 if (only_use_active || use_airframes_gs) && changed {
-                    if let Err(e) = settings.end_session_signaler.send(()) {
+                    if let Err(e) = settings.end_session_signaler.send(EndSessionReason::SessionUpdate) {
                         warn!("Failed to signal end session after : {}", e.to_string());
                     } else {
                         debug!("Latest SPDU changed frequencies, reloading session to make sure only active frequencies are listened to");
