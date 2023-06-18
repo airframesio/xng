@@ -99,13 +99,10 @@ pub fn update_station_by_frequencies(
             last_heard: Utc::now(),
         })
         .collect();
+    let changed = station.active_frequencies != new_freq_set;
+    station.active_frequencies.extend(new_freq_set);
 
-    if station.active_frequencies != new_freq_set {
-        station.active_frequencies.extend(new_freq_set);
-        return true;
-    }
-
-    false
+    changed
 }
 
 #[derive(Serialize)]

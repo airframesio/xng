@@ -116,7 +116,7 @@ impl XngModule for HfdlModule {
                 arg!(--"stale-timeout" <SECONDS> "Elapsed time since last update before an aircraft and ground station frequency data is considered stale"),
                 arg!(--"sample-rate" <HERTZ> "Initial sample rate to use for splitting HFDL spectrum into bands of coverage"),
                 arg!(--"use-airframes-gs-map" "Use airframes.io's live HFDL ground station frequency map"),
-                arg!(--"only-listen-on-active" "Only listen on active HFDL frequencies"),
+                arg!(--"only-listen-on-active" "Only listen on active HFDL frequencies (NOTE: use --use-airframes-gs-map to avoid rapid initial session ends on new SPDUs)"),
                 arg!(--"start-band-contains" <HERTZ> "Initial starting band to listen on. Overrides --schedule if both are configured"),
                 arg!(--schedule <SCHEDULE_FMT> "Session switch schedule in the format of: time=<HOUR_0_TO_23>,band_contains=<FREQ_HZ>;..."),
                 arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: random, inc, dec, static")
@@ -401,6 +401,23 @@ impl XngModule for HfdlModule {
             if use_airframes_gs {
                 match get_airframes_gs_status().await {
                     Ok(gs_status) => {
+                        trace!("Populating stations with Airframes HFDL map data");
+                        
+                        for station in gs_status.ground_stations.iter() {
+                            let station_freq_set: Vec<u64> = station.frequencies.active
+                                .iter()
+                                .map(|&x| x as u64)
+                                .collect();
+                            
+                            update_station_by_frequencies(
+                                settings.deref_mut(), 
+                                stale_timeout_sec as i64, 
+                                json!(station.id), 
+                                Some(station.name.clone()), 
+                                &station_freq_set
+                            );
+                        }
+                            
                         all_freqs.extend(gs_status.all_freqs());
                     }
                     Err(e) => debug!("Failed to get Airframes HFDL map: {}", e.to_string())

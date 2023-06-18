@@ -423,10 +423,8 @@ impl ModuleManager {
                             Ok(read_size) => {
                                 if read_size == 0 {
                                     error!("Encountered bad read size of 0, ending session");
-                                    debug!("Session Error Messages");
-                                    debug!("======================");
-                                    debug!("{}", session.get_errors().await);
-                                    debug!("======================");
+                                    debug!("Session Error Messages <<<\n{}", session.get_errors().await);
+                                    debug!(">>>");
                                     
                                     reason = EndSessionReason::ReadEOF;
                                     break    
