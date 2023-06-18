@@ -397,8 +397,9 @@ impl XngModule for HfdlModule {
                         .collect::<Vec<u16>>()
                 );
             }
-            
-            if use_airframes_gs {
+
+            // NOTE: avoid doubly updating the stations since SessionUpdate would've just updated
+            if use_airframes_gs && !matches!(last_end_reason, EndSessionReason::SessionUpdate) {
                 match get_airframes_gs_status().await {
                     Ok(gs_status) => {
                         trace!("Populating stations with Airframes HFDL map data");
