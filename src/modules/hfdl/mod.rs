@@ -410,13 +410,23 @@ impl XngModule for HfdlModule {
                                 .map(|&x| x as u64)
                                 .collect();
                             
-                            update_station_by_frequencies(
+                            if let Some(change_event) = update_station_by_frequencies(
                                 settings.deref_mut(), 
                                 stale_timeout_sec as i64, 
                                 json!(station.id), 
                                 Some(station.name.clone()), 
                                 &station_freq_set
-                            );
+                            ) {
+                                trace!(
+                                    "Ground station ID {} [{}] changed frequency set: {:?} -> {:?}",
+                                    change_event.id,
+                                    change_event.name,
+                                    change_event.old_freq_set,
+                                    change_event.new_freq_set,
+                                );
+
+                                // TODO: write event to sqlite
+                            }
                         }
                             
                         all_freqs.extend(gs_status.all_freqs());
@@ -651,13 +661,23 @@ impl XngModule for HfdlModule {
                 
                 for station in spdu.gs_status.iter() {
                     let freq_set: Vec<u64> = station.freqs.iter().map(|x| x.freq as u64).collect();
-                    if update_station_by_frequencies(
+                    if let Some(change_event) = update_station_by_frequencies(
                         settings.deref_mut(),
                         stale_timeout_sec as i64,
                         json!(station.gs.id), 
                         station.gs.name.clone(), 
                         &freq_set
                     ) {
+                        trace!(
+                            "Ground station ID {} [{}] changed frequency set: {:?} -> {:?}",
+                            change_event.id,
+                            change_event.name,
+                            change_event.old_freq_set,
+                            change_event.new_freq_set,
+                        );
+
+                        // TODO: write event to sqlite
+                        
                         changed = true;        
                     }
                 }

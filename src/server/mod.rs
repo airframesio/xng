@@ -16,6 +16,8 @@ use crate::common;
 use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
 
+mod db;
+
 pub const SERVER_COMMAND: &'static str = "server";
 pub const DEFAULT_INGEST_PORT: u16 = 5552;
 pub const DEFAULT_INACTIVE_TIMEOUT_SECS: u64 = 3600;

@@ -1,4 +1,3 @@
-use log::*;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -74,13 +73,20 @@ impl PartialEq for GroundStation {
 }
 impl Eq for GroundStation {}
 
+pub struct GroundStationChangeEvent {
+    pub id: String,
+    pub name: String,
+    pub old_freq_set: Vec<u64>,
+    pub new_freq_set: Vec<u64>,
+}
+
 pub fn update_station_by_frequencies(
     settings: &mut ModuleSettings,
     stale_timeout_secs: i64,
     station_id: Value,
     station_name: Option<String>,
     freqs: &Vec<u64>,
-) -> bool {
+) -> Option<GroundStationChangeEvent> {
     let station: &mut GroundStation;
     {
         match settings
@@ -111,24 +117,25 @@ pub fn update_station_by_frequencies(
             last_updated: Utc::now(),
         })
         .collect();
+    let mut event: Option<GroundStationChangeEvent> = None;
+
     let changed = station.active_frequencies != new_freq_set;
     if changed {
-        trace!(
-            "Ground station ID {} [{}] changed freq set: {:?} -> {:?}",
-            station.pretty_id(),
-            station.pretty_name(),
-            station
+        event = Some(GroundStationChangeEvent {
+            id: station.pretty_id(),
+            name: station.pretty_name(),
+            old_freq_set: station
                 .active_frequencies
                 .iter()
                 .map(|x| x.khz)
                 .collect::<Vec<u64>>(),
-            freqs
-        );
+            new_freq_set: freqs.to_owned(),
+        });
     }
     station.active_frequencies.clear();
     station.active_frequencies.extend(new_freq_set);
 
-    changed
+    event
 }
 
 #[derive(Serialize)]
