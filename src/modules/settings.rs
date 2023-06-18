@@ -46,6 +46,18 @@ impl GroundStation {
         self.active_frequencies
             .retain(|x| (now - x.last_updated) < stale_after);
     }
+
+    pub fn pretty_id(&self) -> String {
+        match &self.id {
+            Value::Number(x) => x.to_string(),
+            Value::String(x) => x.to_owned(),
+            _ => String::from("No ID"),
+        }
+    }
+
+    pub fn pretty_name(&self) -> String {
+        self.name.clone().unwrap_or(String::from("No Name"))
+    }
 }
 
 impl PartialEq for GroundStation {
@@ -105,9 +117,13 @@ pub fn update_station_by_frequencies(
     if changed {
         trace!(
             "Ground station ID {:?} [{:?}] changed freq set: {:?} -> {:?}",
-            station.id,
-            station.name,
-            station.active_frequencies,
+            station.pretty_id(),
+            station.pretty_name(),
+            station
+                .active_frequencies
+                .iter()
+                .map(|x| x.khz)
+                .collect::<Vec<u64>>(),
             freqs
         );
     }
