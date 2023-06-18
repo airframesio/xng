@@ -41,13 +41,6 @@ pub struct GroundStation {
 }
 
 impl GroundStation {
-    pub fn insert(&mut self, freq: u64) -> bool {
-        self.active_frequencies.insert(FreqInfo {
-            khz: freq,
-            last_heard: Utc::now(),
-        })
-    }
-
     pub fn invalidate(&mut self, stale_after: Duration) {
         let now = Utc::now();
         self.active_frequencies
