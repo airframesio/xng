@@ -441,8 +441,6 @@ impl ModuleManager {
                                         continue;
                                     }
                                 };
-
-                                println!("{:?}", frame);
                                 
                                 if let Err(e) = tx.send(frame).await {
                                     error!("Failed to send common frame to processing thread: {}", e.to_string());                                    
