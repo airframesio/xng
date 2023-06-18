@@ -1,5 +1,6 @@
 use std::io;
 
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json;
 
@@ -45,6 +46,25 @@ pub async fn get_airframes_gs_status() -> io::Result<HFDLGroundStationStatus> {
             ))
         }
     };
+
+    match response.status() {
+        StatusCode::BAD_GATEWAY
+        | StatusCode::INTERNAL_SERVER_ERROR
+        | StatusCode::SERVICE_UNAVAILABLE
+        | StatusCode::GATEWAY_TIMEOUT => {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "Airframes could not be reached. Is it down?",
+            ));
+        }
+        StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Airframes API may have changed; failed to get proper response",
+            ));
+        }
+        _ => {}
+    }
 
     let body = match response.text().await {
         Ok(v) => v,
