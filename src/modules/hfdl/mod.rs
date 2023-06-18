@@ -42,7 +42,7 @@ mod validators;
 const DEFAULT_BIN_PATH: &'static str = "/usr/bin/dumphfdl";
 const DEFAULT_SYSTABLE_PATH: &'static str = "/etc/systable.conf";
 
-const DEFAULT_STALE_TIMEOUT_SECS: u64 = 1800;
+const DEFAULT_STALE_TIMEOUT_SECS: u64 = 2700;
 const DEFAULT_SESSION_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SESSION_METHOD: &'static str = "random";
 
