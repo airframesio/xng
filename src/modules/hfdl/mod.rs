@@ -420,7 +420,7 @@ impl XngModule for HfdlModule {
                             
                         all_freqs.extend(gs_status.all_freqs());
                     }
-                    Err(e) => debug!("Failed to get Airframes HFDL map: {}", e.to_string())
+                    Err(e) => warn!("Failed to get Airframes HFDL map: {}", e.to_string())
                 }
             }
 
