@@ -1,3 +1,4 @@
+use log::*;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
@@ -10,7 +11,7 @@ use super::session::EndSessionReason;
 
 pub type ValidatorCallback = fn(&Value) -> Result<(), String>;
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct FreqInfo {
     pub khz: u64,
     pub last_updated: DateTime<Utc>,
@@ -101,6 +102,15 @@ pub fn update_station_by_frequencies(
     let changed = station.active_frequencies != new_freq_set;
     station.active_frequencies.extend(new_freq_set);
 
+    if changed {
+        trace!(
+            "Ground station ID {:?} [{:?}] changed freq set: {:?} -> {:?}",
+            station.id,
+            station.name,
+            station.active_frequencies,
+            freqs
+        );
+    }
     changed
 }
 

@@ -657,12 +657,6 @@ impl XngModule for HfdlModule {
                         station.gs.name.clone(), 
                         &freq_set
                     ) {
-                        trace!(
-                            "Ground station #{} ({}) changed active frequencies: {:?}", 
-                            station.gs.id, 
-                            station.gs.name.as_ref().unwrap_or(&String::from("UNKNOWN")),
-                            freq_set
-                        );
                         changed = true;        
                     }
                 }
