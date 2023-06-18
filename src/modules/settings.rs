@@ -5,7 +5,6 @@ use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::RwLockWriteGuard;
 
 use super::session::EndSessionReason;
 
@@ -14,7 +13,7 @@ pub type ValidatorCallback = fn(&Value) -> Result<(), String>;
 #[derive(Serialize)]
 pub struct FreqInfo {
     pub khz: u64,
-    pub last_heard: DateTime<Utc>,
+    pub last_updated: DateTime<Utc>,
 }
 
 impl Hash for FreqInfo {
@@ -44,7 +43,7 @@ impl GroundStation {
     pub fn invalidate(&mut self, stale_after: Duration) {
         let now = Utc::now();
         self.active_frequencies
-            .retain(|x| (now - x.last_heard) < stale_after);
+            .retain(|x| (now - x.last_updated) < stale_after);
     }
 }
 
@@ -96,7 +95,7 @@ pub fn update_station_by_frequencies(
         .iter()
         .map(|x| FreqInfo {
             khz: *x,
-            last_heard: Utc::now(),
+            last_updated: Utc::now(),
         })
         .collect();
     let changed = station.active_frequencies != new_freq_set;
