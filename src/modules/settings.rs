@@ -124,6 +124,7 @@ pub fn update_station_by_frequencies(
                 .collect::<Vec<u64>>(),
             freqs
         );
+        station.active_frequencies.clear();
     }
     station.active_frequencies.extend(new_freq_set);
 
