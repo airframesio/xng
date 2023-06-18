@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Local};
 use log::*;
-use tokio::io::{self, AsyncBufReadExt, BufReader};
+use tokio::io::{self, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout};
 use tokio::select;
 use tokio::time::{sleep_until, Duration, Instant};
@@ -40,8 +40,13 @@ impl Session for DumpHFDLSession {
         self.end_session_on_timeout
     }
 
-    async fn get_errors(&self) -> String {
-        String::from("")
+    async fn get_errors(&mut self) -> String {
+        let mut errors = String::new();
+        if let Err(e) = self.stderr.read_to_string(&mut errors).await {
+            return format!("Failed to read STDERR: {}", e.to_string());
+        }
+
+        errors
     }
 
     async fn end(&mut self, reason: EndSessionReason) {

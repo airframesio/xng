@@ -1,6 +1,7 @@
 use crate::common::formats::EntityType;
 use crate::common::frame::{self as cff, Indexed, HFDLGSEntry};
 use crate::common::wkt::WKTPolyline;
+use crate::modules::PROP_LISTENING_BAND;
 use crate::modules::hfdl::airframes::{AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT, get_airframes_gs_status};
 use crate::modules::hfdl::schedule::parse_session_schedule;
 use crate::modules::hfdl::utils::{freq_bands_by_sample_rate, first_freq_above_eq};
@@ -11,13 +12,13 @@ use self::frame::Frame;
 use self::schedule::validate_session_schedule;
 use self::session::DumpHFDLSession;
 use self::systable::SystemTable;
-use self::validators::{validate_listening_bands, validate_session_method, validate_next_session_band};
+use self::validators::{validate_session_method, validate_next_session_band};
 use super::session::EndSessionReason;
-use super::settings::ModuleSettings;
+use super::settings::{ModuleSettings, update_station_by_frequencies};
 use super::XngModule;
 use actix_web::web::Data;
 use async_trait::async_trait;
-use chrono::{Utc, SecondsFormat, DateTime, Local};
+use chrono::{Utc, SecondsFormat, DateTime, Local, Duration};
 use chrono_tz::UTC;
 use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use log::*;
@@ -25,6 +26,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 use std::io;
 use std::path::PathBuf;
+use std::ops::DerefMut;
 use std::process::Stdio;
 use tokio::{io::BufReader, process, sync::RwLock};
 
@@ -49,10 +51,10 @@ const HFDL_COMMAND: &'static str = "hfdl";
 const PROP_STALE_TIMEOUT_SEC: &'static str = "stale_timeout_sec";
 const PROP_USE_AIRFRAMES_GS: &'static str = "use_airframes_gs";
 const PROP_SAMPLE_RATE: &'static str = "sample_rate";
-const PROP_LISTENING_BAND: &'static str = "listening_band";
 const PROP_NEXT_SESSION_BAND: &'static str = "next_session_band";
 const PROP_SESSION_SCHEDULE: &'static str = "session_schedule";
 const PROP_SESSION_METHOD: &'static str = "session_method";
+const PROP_ONLY_USE_ACTIVE: &'static str = "only_use_active";
 
 #[derive(Default)]
 pub struct HfdlModule {
@@ -72,6 +74,7 @@ pub struct HfdlModule {
     sample_rate: u64,
     stale_timeout_secs: u64,
     use_airframes_gs: bool,
+    only_use_active: bool,
     next_session_band: u64,
     schedule: String,
     method: String,
@@ -112,6 +115,7 @@ impl XngModule for HfdlModule {
                 arg!(--"stale-timeout" <SECONDS> "Elapsed time since last update before an aircraft and ground station frequency data is considered stale"),
                 arg!(--"sample-rate" <HERTZ> "Initial sample rate to use for splitting HFDL spectrum into bands of coverage"),
                 arg!(--"use-airframes-gs-map" "Use airframes.io's live HFDL ground station frequency map"),
+                arg!(--"only-listen-on-active" "Only listen on active HFDL frequencies"),
                 arg!(--"start-band-contains" <HERTZ> "Initial starting band to listen on. Overrides --schedule if both are configured"),
                 arg!(--schedule <SCHEDULE_FMT> "Session switch schedule in the format of: time=<HOUR_0_TO_23>,band_contains=<FREQ_HZ>;..."),
                 arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: random, inc, dec, static")
@@ -179,6 +183,7 @@ impl XngModule for HfdlModule {
             .unwrap_or(DEFAULT_STALE_TIMEOUT_SECS);
 
         self.use_airframes_gs = args.get_flag("use-airframes-gs-map");
+        self.only_use_active = args.get_flag("only-listen-on-active");
         
         let schedule = args.get_one::<String>("schedule").map(|x| x.clone()).unwrap_or(String::from(""));
         if !schedule.is_empty() {
@@ -218,14 +223,12 @@ impl XngModule for HfdlModule {
             json!(self.use_airframes_gs),
         );
         settings.props.insert(
+            PROP_ONLY_USE_ACTIVE.to_string(),
+            json!(self.only_use_active),  
+        );
+        settings.props.insert(
             PROP_SAMPLE_RATE.to_string(),
             json!(self.sample_rate),
-        );
-
-        settings.add_prop_with_validator(
-            PROP_LISTENING_BAND.to_string(), 
-            json!(Vec::new() as Vec<u64>), 
-            validate_listening_bands
         );
         settings.add_prop_with_validator(
             PROP_NEXT_SESSION_BAND.to_string(), 
@@ -286,6 +289,12 @@ impl XngModule for HfdlModule {
                 use_airframes_gs = value.as_bool().unwrap_or(false);
             }
 
+            let only_use_active;
+            {
+                let value = settings.props.get(&PROP_ONLY_USE_ACTIVE.to_string()).unwrap_or(&json!(false));
+                only_use_active = value.as_bool().unwrap_or(false);
+            }
+            
             let session_method;
             {
                 let Some(value) = settings.props.get(&PROP_SESSION_METHOD.to_string()) else {
@@ -293,7 +302,7 @@ impl XngModule for HfdlModule {
                         io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_SESSION_METHOD prop")
                     );
                 };
-                session_method = value.as_str().unwrap_or(DEFAULT_SESSION_METHOD);
+                session_method = value.as_str().unwrap_or(DEFAULT_SESSION_METHOD).to_string();
             }
             if session_method == "static" {
                 end_session_on_timeout = false;
@@ -308,13 +317,35 @@ impl XngModule for HfdlModule {
                     Some(rate) => sample_rate = rate,
                     None => {
                         return Err(
-                            io::Error::new(io::ErrorKind::InvalidData, 
-                            format!("Failed to find nearest sample rate to {:?}", suggested_sample_rate))
+                            io::Error::new(
+                                io::ErrorKind::InvalidData, 
+                                format!("Failed to find nearest sample rate to {:?}", suggested_sample_rate)
+                            )
                         );
                     }
                 };
             }
-
+            
+            let stale_timeout_sec;
+            {  
+                let Some(value) = settings.props.get(&PROP_STALE_TIMEOUT_SEC.to_string()) else {
+                    return Err(
+                        io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_STALE_TIMEOUT_SEC prop")  
+                    );
+                };
+                match value.as_u64() {
+                    Some(x) => stale_timeout_sec = x,
+                    None => {
+                        return Err(
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "Stale timeout is not a number" 
+                            )
+                        );
+                    }
+                }
+            }
+            
             let mut next_session_band;
             {
                 let Some(value) = settings.props.get(&PROP_NEXT_SESSION_BAND.to_string()) else {
@@ -346,6 +377,21 @@ impl XngModule for HfdlModule {
             }
 
             let mut all_freqs: Vec<u16> = Vec::new();
+
+            if only_use_active {
+                all_freqs.extend(
+                    settings.stations
+                        .iter_mut()
+                        .flat_map(|x| {
+                            x.invalidate(Duration::seconds(stale_timeout_sec as i64));
+                            x.active_frequencies
+                                .iter()
+                                .map(|y| y.khz as u16)
+                        })
+                        .collect::<Vec<u16>>()
+                );
+            }
+            
             if use_airframes_gs {
                 match get_airframes_gs_status().await {
                     Ok(gs_status) => {
@@ -353,7 +399,7 @@ impl XngModule for HfdlModule {
                     }
                     Err(e) => debug!("Failed to get Airframes HFDL map: {}", e.to_string())
                 }
-            } // TODO: if active_bands is not empty, use that to populate all_freqs
+            }
 
             if all_freqs.is_empty() {
                 all_freqs.extend_from_slice(&self.systable.all_freqs());
@@ -391,7 +437,7 @@ impl XngModule for HfdlModule {
 
                         if let Some(last_idx) = candidates.iter().position(|&x| *x as u64 >= *first_freq) {
                             let max_idx = candidates.len() - 1;
-                            match session_method {
+                            match session_method.as_str() {
                                 "inc" => if last_idx + 1 > max_idx {
                                     next_session_band = *candidates[0] as u64;
                                 } else {
@@ -507,7 +553,7 @@ impl XngModule for HfdlModule {
         )))
     }
 
-    fn process_message(&mut self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
+    async fn process_message(&mut self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
         let raw_frame = serde_json::from_str::<Frame>(msg)?;
         let mut frame_src: cff::Entity;
         let mut frame_dst: Option<cff::Entity> = None;
@@ -539,10 +585,71 @@ impl XngModule for HfdlModule {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Provided HFDL system table is out of date"));
             }
 
-            // TODO: if module settings exists
-            //         1. detect added and deleted frequencies in bands
-            //         2. update active bands
-            //         3. trigger end session
+            {
+                let settings = self.get_settings()?;
+                let mut settings = settings.write().await;
+
+                let use_airframes_gs;
+                {
+                    let value = settings.props.get(&PROP_USE_AIRFRAMES_GS.to_string()).unwrap_or(&json!(false));
+                    use_airframes_gs = value.as_bool().unwrap_or(false);
+                }
+
+                let only_use_active;
+                {
+                    let value = settings.props.get(&PROP_ONLY_USE_ACTIVE.to_string()).unwrap_or(&json!(false));
+                    only_use_active = value.as_bool().unwrap_or(false);
+                }
+
+                let stale_timeout_sec;
+                {  
+                    let Some(value) = settings.props.get(&PROP_STALE_TIMEOUT_SEC.to_string()) else {
+                        return Err(
+                            io::Error::new(io::ErrorKind::InvalidData, "Missing PROP_STALE_TIMEOUT_SEC prop")  
+                        );
+                    };
+                    match value.as_u64() {
+                        Some(x) => stale_timeout_sec = x,
+                        None => {
+                            return Err(
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Stale timeout is not a number" 
+                                )
+                            );
+                        }
+                    }
+                }
+
+                let mut changed = false;
+                
+                for station in spdu.gs_status.iter() {
+                    let freq_set: Vec<u64> = station.freqs.iter().map(|x| x.freq as u64).collect();
+                    if update_station_by_frequencies(
+                        settings.deref_mut(),
+                        stale_timeout_sec as i64,
+                        json!(station.gs.id), 
+                        station.gs.name.clone(), 
+                        &freq_set
+                    ) {
+                        trace!(
+                            "Ground station #{} ({}) changed active frequencies: {:?}", 
+                            station.gs.id, 
+                            station.gs.name.as_ref().unwrap_or(&String::from("UNKNOWN")),
+                            freq_set
+                        );
+                        changed = true;        
+                    }
+                }
+
+                if (only_use_active || use_airframes_gs) && changed {
+                    if let Err(e) = settings.end_session_signaler.send(()) {
+                        warn!("Failed to signal end session after : {}", e.to_string());
+                    } else {
+                        debug!("Latest SPDU changed frequencies, reloading session to make sure only active frequencies are listened to");
+                    }
+                }
+            }
             
             metadata = Some(cff::HFDLMetadata {
                 kind: String::from("Squitter"),

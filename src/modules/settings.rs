@@ -1,14 +1,122 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
+use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::RwLockWriteGuard;
 
 pub type ValidatorCallback = fn(&Value) -> Result<(), String>;
 
 #[derive(Serialize)]
+pub struct FreqInfo {
+    pub khz: u64,
+    pub last_heard: DateTime<Utc>,
+}
+
+impl Hash for FreqInfo {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.khz.hash(state);
+    }
+}
+impl PartialEq for FreqInfo {
+    fn eq(&self, other: &Self) -> bool {
+        self.khz == other.khz
+    }
+}
+impl Eq for FreqInfo {}
+
+#[derive(Serialize)]
+pub struct GroundStation {
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub id: Value,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+
+    pub active_frequencies: HashSet<FreqInfo>,
+}
+
+impl GroundStation {
+    pub fn insert(&mut self, freq: u64) -> bool {
+        self.active_frequencies.insert(FreqInfo {
+            khz: freq,
+            last_heard: Utc::now(),
+        })
+    }
+
+    pub fn invalidate(&mut self, stale_after: Duration) {
+        let now = Utc::now();
+        self.active_frequencies
+            .retain(|x| (now - x.last_heard) < stale_after);
+    }
+}
+
+impl PartialEq for GroundStation {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.id, &other.id) {
+            (Value::Null, Value::Null) => true,
+            (Value::Number(x), Value::Number(y)) => *x == *y,
+            (Value::String(x), Value::String(y)) => {
+                x.to_lowercase().trim() == y.to_lowercase().trim()
+            }
+            _ => false,
+        }
+    }
+}
+impl Eq for GroundStation {}
+
+pub fn update_station_by_frequencies(
+    settings: &mut ModuleSettings,
+    stale_timeout_secs: i64,
+    station_id: Value,
+    station_name: Option<String>,
+    freqs: &Vec<u64>,
+) -> bool {
+    let station: &mut GroundStation;
+    {
+        match settings
+            .stations
+            .iter()
+            .position(|x| match (&x.id, &station_id) {
+                (Value::Null, Value::Null) => true,
+                (Value::String(x), Value::String(y)) => *x == *y,
+                (Value::Number(x), Value::Number(y)) => *x == *y,
+                _ => false,
+            }) {
+            Some(idx) => station = &mut settings.stations[idx],
+            None => {
+                settings.stations.push(GroundStation {
+                    id: station_id,
+                    name: station_name,
+                    active_frequencies: HashSet::new(),
+                });
+                station = settings.stations.last_mut().unwrap();
+            }
+        }
+        station.invalidate(Duration::seconds(stale_timeout_secs));
+    }
+    let new_freq_set: HashSet<FreqInfo> = freqs
+        .iter()
+        .map(|x| FreqInfo {
+            khz: *x,
+            last_heard: Utc::now(),
+        })
+        .collect();
+
+    if station.active_frequencies != new_freq_set {
+        station.active_frequencies.extend(new_freq_set);
+        return true;
+    }
+
+    false
+}
+
+#[derive(Serialize)]
 pub struct ModuleSettings {
     pub props: HashMap<String, Value>,
+    pub stations: Vec<GroundStation>,
 
     #[serde(skip_serializing)]
     pub swarm_mode: bool,
@@ -43,6 +151,7 @@ impl ModuleSettings {
                 .into_iter()
                 .map(|(x, y)| (x.to_string(), y))
                 .collect(),
+            stations: Vec::new(),
             disable_api_control,
             swarm_mode,
             api_token: api_token.map(|v| v.clone()),

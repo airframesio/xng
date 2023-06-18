@@ -23,6 +23,7 @@ use crate::common;
 use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
 use crate::modules::session::{EndSessionReason, SESSION_SCHEDULED_END};
+use crate::modules::validators::validate_listening_bands;
 
 use self::session::Session;
 use self::settings::ModuleSettings;
@@ -31,6 +32,7 @@ mod hfdl;
 mod services;
 mod session;
 mod settings;
+mod validators;
 
 const DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
@@ -44,6 +46,7 @@ const DEFAULT_CHANNEL_BUFFER: usize = 2048;
 
 const PROP_SESSION_TIMEOUT_SEC: &'static str = "session_timeout_sec";
 const PROP_SESSION_INTERMISSION_SEC: &'static str = "session_intermission_sec";
+const PROP_LISTENING_BAND: &'static str = "listening_band";
 
 #[async_trait]
 pub trait XngModule {
@@ -56,7 +59,7 @@ pub trait XngModule {
 
     async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>);
 
-    fn process_message(&mut self, msg: &str) -> Result<CommonFrame, io::Error>;
+    async fn process_message(&mut self, msg: &str) -> Result<CommonFrame, io::Error>;
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn Session>, io::Error>;
 }
 
@@ -187,6 +190,15 @@ impl ModuleManager {
             )
         );
         module.init(module_settings.clone()).await;
+
+        {
+            let mut settings = module_settings.write().await;        
+            settings.add_prop_with_validator(
+                PROP_LISTENING_BAND.to_string(), 
+                json!(Vec::new() as Vec<u64>), 
+                validate_listening_bands
+            );
+        }
         
         let cancel_token = CancellationToken::new();
         let http_cancel_token = cancel_token.clone();
@@ -423,7 +435,7 @@ impl ModuleManager {
                                     println!("{}", raw_msg.trim());
                                 }                        
                                 
-                                let frame = match module.process_message(&raw_msg) {
+                                let frame = match module.process_message(&raw_msg).await {
                                     Ok(v) => v,
                                     Err(e) => {
                                         error!("Malformed frame, could not convert to common frame format: {}", e.to_string());
