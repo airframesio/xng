@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use crate::common;
 use crate::common::batcher::create_es_batch_task;
+use crate::common::events::GroundStationChangeEvent;
 use crate::common::frame::CommonFrame;
 use crate::modules::session::{EndSessionReason, SESSION_SCHEDULED_END};
 use crate::modules::validators::validate_listening_bands;
@@ -32,8 +33,9 @@ use self::settings::ModuleSettings;
 mod hfdl;
 mod services;
 mod session;
-mod settings;
 mod validators;
+
+pub mod settings;
 
 const DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
@@ -58,7 +60,7 @@ pub trait XngModule {
     fn get_arguments(&self) -> Command;
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error>;
 
-    async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>);
+    async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>, state_db: Data<RwLock<StateDB>>);
 
     async fn process_message(&mut self, msg: &str) -> Result<CommonFrame, io::Error>;
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn Session>, io::Error>;
@@ -175,6 +177,7 @@ impl ModuleManager {
         
         let (reload_signaler, mut reload_signal) = mpsc::unbounded_channel::<()>();
         let (end_session_signaler, mut end_session_signal) = mpsc::unbounded_channel::<EndSessionReason>();
+        let (change_event_tx, mut change_event_rx) = mpsc::channel::<GroundStationChangeEvent>(DEFAULT_CHANNEL_BUFFER);
         
         let Ok(mut interrupt_signal) = signal(SignalKind::interrupt()) else {
             error!("Failed to register interrupt signal");
@@ -199,6 +202,7 @@ impl ModuleManager {
                 ModuleSettings::new(
                     reload_signaler,
                     end_session_signaler,
+                    change_event_tx,
                     swarm_url.is_some(),
                     disable_api_control,
                     api_token,
@@ -209,7 +213,7 @@ impl ModuleManager {
                 )
             )
         );
-        module.init(module_settings.clone()).await;
+        module.init(module_settings.clone(), state_db.clone()).await;
 
         {
             let mut settings = module_settings.write().await;        
@@ -373,6 +377,12 @@ impl ModuleManager {
                             }
 
                             batch.push(frame);
+                        }
+                    }
+                    Some(ref change_event) = change_event_rx.recv() => {
+                        let state_db = state_db.write().await;
+                        if let Err(e) = state_db.handle_gs_change_event(change_event).await {
+                            warn!("Failed to write ground station change even to state DB: {}", e.to_string());
                         }
                     }
                     _ = processor_cancel_token.cancelled() => {

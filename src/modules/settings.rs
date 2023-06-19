@@ -4,7 +4,9 @@ use std::hash::{Hash, Hasher};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, UnboundedSender};
+
+use crate::common::events::GroundStationChangeEvent;
 
 use super::session::EndSessionReason;
 
@@ -45,18 +47,6 @@ impl GroundStation {
         self.active_frequencies
             .retain(|x| (now - x.last_updated) < stale_after);
     }
-
-    pub fn pretty_id(&self) -> String {
-        match &self.id {
-            Value::Number(x) => x.to_string(),
-            Value::String(x) => x.to_owned(),
-            _ => String::from("No ID"),
-        }
-    }
-
-    pub fn pretty_name(&self) -> String {
-        self.name.clone().unwrap_or(String::from("No Name"))
-    }
 }
 
 impl PartialEq for GroundStation {
@@ -72,14 +62,6 @@ impl PartialEq for GroundStation {
     }
 }
 impl Eq for GroundStation {}
-
-pub struct GroundStationChangeEvent {
-    pub ts: DateTime<Utc>,
-    pub id: String,
-    pub name: String,
-    pub old_freq_set: Vec<u64>,
-    pub new_freq_set: Vec<u64>,
-}
 
 pub fn update_station_by_frequencies(
     settings: &mut ModuleSettings,
@@ -126,14 +108,17 @@ pub fn update_station_by_frequencies(
     if changed {
         event = Some(GroundStationChangeEvent {
             ts: now,
-            id: station.pretty_id(),
-            name: station.pretty_name(),
-            old_freq_set: station
-                .active_frequencies
-                .iter()
-                .map(|x| x.khz)
-                .collect::<Vec<u64>>(),
-            new_freq_set: freqs.to_owned(),
+            id: station.id.clone(),
+            name: station.name.clone(),
+            old: format!(
+                "{:?}",
+                station
+                    .active_frequencies
+                    .iter()
+                    .map(|x| x.khz)
+                    .collect::<Vec<u64>>()
+            ),
+            new: format!("{:?}", freqs),
         });
     }
     station.active_frequencies.clear();
@@ -163,6 +148,9 @@ pub struct ModuleSettings {
     pub end_session_signaler: UnboundedSender<EndSessionReason>,
 
     #[serde(skip_serializing)]
+    pub change_event_tx: Sender<GroundStationChangeEvent>,
+
+    #[serde(skip_serializing)]
     validators: HashMap<String, ValidatorCallback>,
 }
 
@@ -170,6 +158,7 @@ impl ModuleSettings {
     pub fn new(
         reload_signaler: UnboundedSender<()>,
         end_session_signaler: UnboundedSender<EndSessionReason>,
+        change_event_tx: Sender<GroundStationChangeEvent>,
         swarm_mode: bool,
         disable_api_control: bool,
         api_token: Option<&String>,
@@ -186,6 +175,7 @@ impl ModuleSettings {
             api_token: api_token.map(|v| v.clone()),
             reload_signaler,
             end_session_signaler,
+            change_event_tx,
             validators: HashMap::new(),
         }
     }

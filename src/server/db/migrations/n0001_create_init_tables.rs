@@ -12,7 +12,7 @@ impl Migration for CreateInitTables {
         let queries = vec![
             "
                 CREATE TABLE IF NOT EXISTS ground_station (
-                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id              INTEGER PRIMARY KEY,
                     name            TEXT,
                     latitude        REAL,
                     longitude       REAL,
@@ -28,27 +28,26 @@ impl Migration for CreateInitTables {
 
                     ts        DATETIME NOT NULL,
                     type      TEXT NOT NULL,
-                    old       JSON NOT NULL,
-                    new       JSON NOT NULL,
+                    old       TEXT NOT NULL,
+                    new       TEXT NOT NULL,
 
                     FOREIGN KEY(gs_id) REFERENCES ground_station(id)
                 )  
             ",
             "
                 CREATE TABLE IF NOT EXISTS aircraft (
-                    icao         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    icao         INTEGER PRIMARY KEY,
 
                     addr         TEXT NOT NULL,
-                    tail         TEXT,
-            
-                    FOREIGN KEY(gs_id) REFERENCES ground_station(id)
+                    tail         TEXT
                 )  
             ",
             "
                 CREATE TABLE IF NOT EXISTS flight (
                     id             INTEGER PRIMARY KEY AUTOINCREMENT,
                     aircraft_icao  INTEGER,
-            
+
+                    callsign       TEXT NOT NULL,
                     last_heard     DATETIME NOT NULL,
 
                     FOREIGN KEY(aircraft_icao) REFERENCES aircraft(icao)
@@ -61,6 +60,7 @@ impl Migration for CreateInitTables {
                     gs_id         INTEGER NOT NULL,
             
                     ts            DATETIME NOT NULL,
+                    signal        REAL NOT NULL,
                     freq_mhz      REAL NOT NULL,
                     latitude      REAL NOT NULL,
                     longitude     REAL NOT NULL,

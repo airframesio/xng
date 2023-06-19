@@ -5,6 +5,7 @@ use crate::modules::PROP_LISTENING_BAND;
 use crate::modules::hfdl::airframes::{AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT, get_airframes_gs_status};
 use crate::modules::hfdl::schedule::parse_session_schedule;
 use crate::modules::hfdl::utils::{freq_bands_by_sample_rate, first_freq_above_eq};
+use crate::server::db::StateDB;
 use crate::utils::normalize_tail;
 use crate::utils::timestamp::{split_unix_time_to_utc_datetime, nearest_time_in_past, unix_time_to_utc_datetime};
 
@@ -210,7 +211,7 @@ impl XngModule for HfdlModule {
         Ok(())
     }
 
-    async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>) {
+    async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>, state_db: Data<RwLock<StateDB>>) {
         self.settings = Some(settings.clone());
         
         let mut settings = settings.write().await;
@@ -246,6 +247,12 @@ impl XngModule for HfdlModule {
             json!(self.method),
             validate_session_method
         );
+
+        for gs in self.systable.stations.iter() {
+            if let Err(e) = state_db.create_ground_station(gs.id, &gs.name, gs.position.1, gs.position.0).await {
+                warn!("Failed to populate initial ground stations: id={} name={}", gs.id, gs.name);
+            }
+        }
     }
 
     // NOTE: not gonna lie, this code below is pretty gnarly and could use some refactoring...
@@ -418,14 +425,16 @@ impl XngModule for HfdlModule {
                                 &station_freq_set
                             ) {
                                 trace!(
-                                    "Ground station ID {} [{}] changed frequency set: {:?} -> {:?}",
-                                    change_event.id,
-                                    change_event.name,
-                                    change_event.old_freq_set,
-                                    change_event.new_freq_set,
+                                    "Ground station ID {} [{}] changed frequency set: {} -> {}",
+                                    change_event.pretty_id(),
+                                    change_event.pretty_name(),
+                                    change_event.old,
+                                    change_event.new,
                                 );
 
-                                // TODO: write event to sqlite
+                                if let Err(e) = settings.change_event_tx.send(change_event).await {
+                                    warn!("Failed to send ground station change event: {}", e.to_string());                                    
+                                }
                             }
                         }
                             
@@ -669,14 +678,16 @@ impl XngModule for HfdlModule {
                         &freq_set
                     ) {
                         trace!(
-                            "Ground station ID {} [{}] changed frequency set: {:?} -> {:?}",
-                            change_event.id,
-                            change_event.name,
-                            change_event.old_freq_set,
-                            change_event.new_freq_set,
+                            "Ground station ID {} [{}] changed frequency set: {} -> {}",
+                            change_event.pretty_id(),
+                            change_event.pretty_name(),
+                            change_event.old,
+                            change_event.new,
                         );
 
-                        // TODO: write event to sqlite
+                        if let Err(e) = settings.change_event_tx.send(change_event).await {
+                            warn!("Failed to send ground station change event: {}", e.to_string()); 
+                        }
                         
                         changed = true;        
                     }
