@@ -21,6 +21,7 @@ use crate::common::frame::CommonFrame;
 use crate::server::db::StateDB;
 
 pub mod db;
+pub mod services;
 
 const DEFAULT_LISTEN_HOST: &'static str = "0.0.0.0";
 const DEFAULT_STATE_DB_URL: &'static str = "sqlite://state.sqlite3";

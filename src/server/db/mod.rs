@@ -1,10 +1,9 @@
 use log::*;
-use serde_json::Value;
 use sqlx::{migrate::MigrateDatabase, Sqlite, SqlitePool};
 use tokio::io;
 
 use crate::common::events::GroundStationChangeEvent;
-use crate::common::frame::{CommonFrame, Entity};
+use crate::common::frame::CommonFrame;
 
 use self::migrations as db_migrations;
 
@@ -197,13 +196,14 @@ impl StateDB {
                 if let Some(ref coords) = aircraft.coords {
                     let result = sqlx::query(
                         "
-                        INSERT INTO aircraft_events (aircraft_icao, gs_id, callsign, ts, signal, freq_mhz, latitude, longitude, altitude)
+                        INSERT INTO aircraft_events (aircraft_icao, gs_id, callsign, tail, ts, signal, freq_mhz, latitude, longitude, altitude)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         "
                     )
                     .bind(icao_id)
                     .bind(gs_id)
                     .bind(&aircraft.callsign)
+                    .bind(&aircraft.tail)
                     .bind(&frame.indexed.timestamp)
                     .bind(frame.signal)
                     .bind(frame.freq)

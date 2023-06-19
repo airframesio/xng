@@ -51,6 +51,7 @@ impl Migration for CreateInitTables {
                     gs_id         INTEGER NOT NULL,
 
                     callsign      TEXT,
+                    tail          TEXT,
             
                     ts            DATETIME NOT NULL,
                     signal        REAL NOT NULL,
