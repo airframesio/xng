@@ -197,7 +197,7 @@ impl StateDB {
                     let result = sqlx::query(
                         "
                         INSERT INTO aircraft_events (aircraft_icao, gs_id, callsign, tail, ts, signal, freq_mhz, latitude, longitude, altitude)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         "
                     )
                     .bind(icao_id)
