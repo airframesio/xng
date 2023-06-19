@@ -7,16 +7,23 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 
 use crate::common;
+use crate::common::arguments::{
+    parse_elastic_url, parse_listen_host, parse_listen_port, parse_state_db_url,
+};
 use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
+use crate::server::db::StateDB;
 
 pub mod db;
+
+const DEFAULT_LISTEN_HOST: &'static str = "0.0.0.0";
+const DEFAULT_STATE_DB_URL: &'static str = "sqlite://state.sqlite3";
 
 pub const SERVER_COMMAND: &'static str = "server";
 pub const DEFAULT_INGEST_PORT: u16 = 5552;
@@ -37,21 +44,15 @@ pub fn get_server_arguments() -> Command {
 }
 
 pub async fn start(args: &ArgMatches) {
-    let listen_host = args
-        .get_one::<String>("listen-host")
-        .unwrap_or(&"0.0.0.0".to_string())
-        .to_owned();
-    let ingest_port: u16 = args
-        .get_one::<String>("tcp")
-        .unwrap_or(&String::from("default"))
-        .parse::<u16>()
-        .unwrap_or(DEFAULT_INGEST_PORT);
+    let listen_host = parse_listen_host(args, DEFAULT_LISTEN_HOST);
+    let ingest_port: u16 = parse_listen_port(args, DEFAULT_INGEST_PORT);
     let inactive_timeout_secs: u64 = args
         .get_one::<String>("inactive-timeout")
         .unwrap_or(&String::from("default"))
         .parse::<u64>()
         .unwrap_or(DEFAULT_INACTIVE_TIMEOUT_SECS);
-    let elastic_url = if let Some(raw_url) = args.get_one::<String>("elastic") {
+
+    let elastic_url = if let Some(raw_url) = parse_elastic_url(args) {
         match Url::parse(raw_url) {
             Ok(v) => {
                 info!("Elasticsearch bulk indexing enabled: target = {}", raw_url);
@@ -64,6 +65,25 @@ pub async fn start(args: &ArgMatches) {
         }
     } else {
         None
+    };
+
+    let state_db_url = match Url::parse(parse_state_db_url(args, DEFAULT_STATE_DB_URL).as_str()) {
+        Ok(v) => {
+            info!("State DB location at {}", v.as_str());
+            v
+        }
+        Err(e) => {
+            error!("Invalid state DB URL: {}", e.to_string());
+            return;
+        }
+    };
+
+    let state_db = match StateDB::new(state_db_url.to_string()).await {
+        Ok(v) => Data::new(RwLock::new(v)),
+        Err(e) => {
+            error!("Failed to create state DB: {}", e.to_string());
+            return;
+        }
     };
 
     // TODO: Init actix-web server
@@ -169,8 +189,12 @@ pub async fn start(args: &ArgMatches) {
     loop {
         select! {
             Some(frame) = rx.recv() => {
-                // TODO: extract data for SQLite
-                info!("{:?}", frame);
+                {
+                    let state_db = state_db.write().await;
+                    if let Err(e) = state_db.update(&frame).await {
+                        warn!("Failed to updated state DB with frame: {}", e.to_string());
+                    }
+                }
 
                 if let Some(es_url) = elastic_url.as_ref() {
                     let mut batch = frames_batch.lock().await;

@@ -20,6 +20,7 @@ use std::process::exit;
 use std::time::Duration;
 
 use crate::common;
+use crate::common::arguments::{parse_api_token, parse_disable_cross_site, parse_listen_host, parse_listen_port, parse_elastic_url, parse_state_db_url};
 use crate::common::batcher::create_es_batch_task;
 use crate::common::events::GroundStationChangeEvent;
 use crate::common::frame::CommonFrame;
@@ -41,7 +42,7 @@ const DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_SESSION_INTERMISSION_SECS: u64 = 0;
 const DEFAULT_FAILED_SESSION_START_WAIT_SECS: u64 = 60;
 const DEFAULT_BATCH_WAIT_MS: u64 = 200;
- 
+const DEFAULT_STATE_DB_URL: &'static str = "sqlite://state.sqlite3";
 const DEFAULT_LISTEN_HOST: &'static str = "127.0.0.1";
 const DEFAULT_LISTEN_PORT: u16 = 7871;
 
@@ -107,16 +108,12 @@ impl ModuleManager {
             exit(exitcode::CONFIG);   
         };
 
-        let api_token: Option<&String> = args.get_one("api-token");
-        let disable_cross_site = args.get_flag("disable-cross-site");
-        let listen_host = args.get_one::<String>("listen-host").unwrap_or(&DEFAULT_LISTEN_HOST.to_string()).to_owned();
-        let listen_port = args
-            .get_one::<String>("listen-port")
-            .unwrap_or(&String::from("default"))
-            .parse::<u16>()
-            .unwrap_or(DEFAULT_LISTEN_PORT);
-        let disable_api_control = args.get_flag("disable-api-control");
+        let api_token = parse_api_token(args);
+        let disable_cross_site = parse_disable_cross_site(args);
+        let listen_host = parse_listen_host(args, DEFAULT_LISTEN_HOST);
+        let listen_port = parse_listen_port(args, DEFAULT_LISTEN_PORT);
         
+        let disable_api_control = args.get_flag("disable-api-control");
         let disable_print_frame = args.get_flag("disable-print-frame");
         
         let mut session_intermission_secs = args
@@ -144,7 +141,7 @@ impl ModuleManager {
         } else {
             None
         };
-        let elastic_url = if let Some(raw_url) = args.get_one::<String>("elastic") {
+        let elastic_url = if let Some(raw_url) = parse_elastic_url(args) {
             match Url::parse(raw_url) {
                 Ok(v) => {
                     info!("Elasticsearch bulk indexing enabled: target = {}", raw_url);
@@ -158,7 +155,7 @@ impl ModuleManager {
         } else {
             None
         };
-        let state_db_url = match Url::parse(args.get_one::<String>("state-db").unwrap_or(&String::from("sqlite://xng_state.sqlite3"))) {
+        let state_db_url = match Url::parse(parse_state_db_url(args, DEFAULT_STATE_DB_URL).as_str()) {
             Ok(v) => {
                 info!("State DB location at {}", v.as_str());
                 v
