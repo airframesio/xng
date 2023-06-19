@@ -69,9 +69,9 @@ impl Migration for CreateInitTables {
                     aircraft_events_id INTEGER NOT NULL,
                     gs_id              INTEGER NOT NULL,
 
-                    FOREIGN KEY(aircraft_event_id) REFERENCES aircraft_events(id)
+                    FOREIGN KEY(aircraft_events_id) REFERENCES aircraft_events(id)
                     FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
-                    UNIQUE(aircraft_event_id, gs_id)
+                    UNIQUE(aircraft_events_id, gs_id)
                 )
             ",
             "

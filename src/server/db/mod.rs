@@ -219,7 +219,7 @@ impl StateDB {
                         if let Some(gs_id) = path.party.id {
                             sqlx::query(
                                 "
-                                INSERT INTO propagation_events (aircraft_event_id, gs_id) VALUES (?, ?)
+                                INSERT INTO propagation_events (aircraft_events_id, gs_id) VALUES (?, ?)
                                 ON CONFLICT DO NOTHING
                                 "
                             )
