@@ -24,6 +24,7 @@ use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
 use crate::modules::session::{EndSessionReason, SESSION_SCHEDULED_END};
 use crate::modules::validators::validate_listening_bands;
+use crate::server::db::StateDB;
 
 use self::session::Session;
 use self::settings::ModuleSettings;
@@ -155,6 +156,16 @@ impl ModuleManager {
         } else {
             None
         };
+        let state_db_url = match Url::parse(args.get_one::<String>("state-db").unwrap_or(&String::from("sqlite://xng_state.sqlite3"))) {
+            Ok(v) => {
+                info!("State DB location at {}", v.as_str());
+                v
+            },
+            Err(e) => {
+                error!("Invalid state DB URL: {}", e.to_string());
+                return;
+            }   
+        };
                 
         if swarm_url.is_some() && elastic_url.is_some() {
             error!("Swarm mode and importing to Elasticsearch are mutually exclusive options");
@@ -175,6 +186,14 @@ impl ModuleManager {
             return;    
         }
 
+        let state_db = match StateDB::new(state_db_url.to_string()).await {
+            Ok(v) => Data::new(RwLock::new(v)),
+            Err(e) => {
+                error!("Failed to create state DB: {}", e.to_string());
+                return;
+            }
+        };
+             
         let module_settings = Data::new(
             RwLock::new(
                 ModuleSettings::new(
@@ -203,6 +222,7 @@ impl ModuleManager {
         
         let cancel_token = CancellationToken::new();
         let http_cancel_token = cancel_token.clone();
+        let http_state_db = state_db.clone();
         let http_module_settings = module_settings.clone();
         
         let http_thread = tokio::spawn(async move {
@@ -210,6 +230,7 @@ impl ModuleManager {
             
             let server = HttpServer::new(move || {
                 App::new()
+                    .app_data(http_state_db.clone())
                     .app_data(http_module_settings.clone())
                     .wrap(middleware::DefaultHeaders::new().add(
                         (
@@ -301,7 +322,7 @@ impl ModuleManager {
                 select! {
                     Some(mut frame) = rx.recv() => {
                         if let Some(ref acars) = frame.acars {
-                            // TODO: enrich frame.indexed with extracted ACARS content
+                            // TODO: use acars-decoder-rust to decode ACARS content and save it to frame.indexed
                         }
                         
                         if let Some(ref mut stream) = swarm_stream {
@@ -329,7 +350,10 @@ impl ModuleManager {
                                 }
                             }
                         } else {
-                            // TODO: sqlite inserts
+                            let state_db = state_db.write().await;
+                            if let Err(e) = state_db.update(&frame).await {
+                                warn!("Failed to update state DB with frame: {}", e.to_string());
+                            }
                         }
                         
                         if let Some(ref es_url) = elastic_url {
@@ -471,8 +495,8 @@ impl ModuleManager {
                         };
                     }
                     end_session_reason = end_session_signal.recv() => {
-                        debug!("Got request to end current session: {:?}", end_session_reason);
                         reason = end_session_reason.unwrap_or(EndSessionReason::UserAPIControl);
+                        debug!("Got request to end current session: {:?}", reason);
                         break;
                     }
                     _ = interrupt_signal.recv() => {

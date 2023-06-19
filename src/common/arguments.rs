@@ -9,5 +9,6 @@ pub fn register_common_arguments(cmd: Command) -> Command {
         arg!(--"listen-host" <HOST> "Host for API server to listen on"),
         arg!(--"listen-port" <PORT> "Port for API server to listen on"),
         arg!(--elastic <URL> "Export processed common JSON frames to ElasticSearch"),
+        arg!(--"state-db" <URL> "SQLite3 database to store state metrics. URL should begin with sqlite://"),
     ])
 }

@@ -74,6 +74,7 @@ impl PartialEq for GroundStation {
 impl Eq for GroundStation {}
 
 pub struct GroundStationChangeEvent {
+    pub ts: DateTime<Utc>,
     pub id: String,
     pub name: String,
     pub old_freq_set: Vec<u64>,
@@ -110,11 +111,13 @@ pub fn update_station_by_frequencies(
         }
         station.invalidate(Duration::seconds(stale_timeout_secs));
     }
+
+    let now = Utc::now();
     let new_freq_set: HashSet<FreqInfo> = freqs
         .iter()
         .map(|x| FreqInfo {
             khz: *x,
-            last_updated: Utc::now(),
+            last_updated: now,
         })
         .collect();
     let mut event: Option<GroundStationChangeEvent> = None;
@@ -122,6 +125,7 @@ pub fn update_station_by_frequencies(
     let changed = station.active_frequencies != new_freq_set;
     if changed {
         event = Some(GroundStationChangeEvent {
+            ts: now,
             id: station.pretty_id(),
             name: station.pretty_name(),
             old_freq_set: station
