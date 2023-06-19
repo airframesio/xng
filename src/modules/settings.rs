@@ -12,7 +12,7 @@ use super::session::EndSessionReason;
 
 pub type ValidatorCallback = fn(&Value) -> Result<(), String>;
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct FreqInfo {
     pub khz: u64,
     pub last_updated: DateTime<Utc>,
@@ -30,7 +30,7 @@ impl PartialEq for FreqInfo {
 }
 impl Eq for FreqInfo {}
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct GroundStation {
     #[serde(skip_serializing_if = "Value::is_null")]
     pub id: Value,

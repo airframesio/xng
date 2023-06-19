@@ -3,9 +3,9 @@ use log::*;
 use serde::Serialize;
 use tokio::sync::RwLock;
 
-use crate::modules::{session::EndSessionReason, settings::ModuleSettings};
-
-use super::middleware::Authorized;
+use crate::common::middleware::Authorized;
+use crate::modules::session::EndSessionReason;
+use crate::modules::settings::ModuleSettings;
 
 pub const ROUTE: &'static str = "/api/session";
 
@@ -29,20 +29,14 @@ pub async fn delete(req: HttpRequest, _: Authorized) -> HttpResponse {
         .send(EndSessionReason::UserAPIControl)
     {
         error!("Failed to end session: {}", e.to_string());
-        return HttpResponse::InternalServerError().body(
-            serde_json::to_string(&DeleteResponse {
-                ok: false,
-                message: Some(format!("Failed to end session: {}", e.to_string())),
-            })
-            .unwrap(),
-        );
+        return HttpResponse::InternalServerError().json(DeleteResponse {
+            ok: false,
+            message: Some(format!("Failed to end session: {}", e.to_string())),
+        });
     }
 
-    HttpResponse::Ok().body(
-        serde_json::to_string(&DeleteResponse {
-            ok: true,
-            message: None,
-        })
-        .unwrap(),
-    )
+    HttpResponse::Ok().json(DeleteResponse {
+        ok: true,
+        message: None,
+    })
 }

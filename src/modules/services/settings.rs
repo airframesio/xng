@@ -6,11 +6,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
+use crate::common::middleware::Authorized;
 use crate::modules::ModuleSettings;
 
-use super::middleware::Authorized;
-
 pub const ROUTE: &'static str = "/api/settings";
+
+#[derive(Serialize)]
+pub struct GetResponse {
+    ok: bool,
+    body: Value,
+}
 
 pub async fn get(req: HttpRequest) -> HttpResponse {
     let module_settings = req
@@ -21,7 +26,10 @@ pub async fn get(req: HttpRequest) -> HttpResponse {
 
     HttpResponse::Ok()
         .content_type(ContentType::json())
-        .body(serde_json::to_string(&*module_settings).unwrap())
+        .json(GetResponse {
+            ok: true,
+            body: serde_json::to_value(&*module_settings).unwrap(),
+        })
 }
 
 #[derive(Deserialize)]
@@ -47,28 +55,22 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
 
     if let Some(validator_callback) = module_settings.get_validator(&data.prop) {
         if let Err(e) = validator_callback(&data.value) {
-            return HttpResponse::BadRequest().body(
-                serde_json::to_string(&PatchResponse {
-                    ok: false,
-                    message: Some(format!(
-                        "Provided value for prop {} failed validation check: {}",
-                        data.prop,
-                        e.to_string(),
-                    )),
-                })
-                .unwrap(),
-            );
+            return HttpResponse::BadRequest().json(PatchResponse {
+                ok: false,
+                message: Some(format!(
+                    "Provided value for prop {} failed validation check: {}",
+                    data.prop,
+                    e.to_string(),
+                )),
+            });
         }
     }
 
     let Some(value) = module_settings.props.get_mut(&data.prop) else {
-        return HttpResponse::BadRequest().body(
-            serde_json::to_string(&PatchResponse {
-                ok: false,
-                message: Some(format!("Specified property is not valid: {}", data.prop))
-            })
-            .unwrap(),
-        );
+        return HttpResponse::BadRequest().json(PatchResponse {
+            ok: false,
+            message: Some(format!("Specified property is not valid: {}", data.prop))
+        });
     };
 
     let types_match = match (&value, &data.value) {
@@ -80,16 +82,13 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
     };
 
     if !types_match {
-        return HttpResponse::BadRequest().body(
-            serde_json::to_string(&PatchResponse {
-                ok: false,
-                message: Some(format!(
-                    "Provided value for prop {} does not match types.",
-                    data.prop
-                )),
-            })
-            .unwrap(),
-        );
+        return HttpResponse::BadRequest().json(PatchResponse {
+            ok: false,
+            message: Some(format!(
+                "Provided value for prop {} does not match types.",
+                data.prop
+            )),
+        });
     }
 
     *value = data.value.clone();
@@ -105,11 +104,8 @@ pub async fn patch(req: HttpRequest, _: Authorized, data: web::Json<PatchRequest
         );
     }
 
-    HttpResponse::Ok().body(
-        serde_json::to_string(&PatchResponse {
-            ok: true,
-            message: None,
-        })
-        .unwrap(),
-    )
+    HttpResponse::Ok().json(PatchResponse {
+        ok: true,
+        message: None,
+    })
 }

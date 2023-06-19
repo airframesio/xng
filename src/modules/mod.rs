@@ -20,13 +20,14 @@ use std::process::exit;
 use std::time::Duration;
 
 use crate::common;
-use crate::common::arguments::{parse_api_token, parse_disable_cross_site, parse_listen_host, parse_listen_port, parse_elastic_url, parse_state_db_url};
+use crate::common::arguments::{parse_api_token, parse_disable_cross_site, parse_listen_host, parse_listen_port, parse_elastic_url, parse_state_db_url, parse_disable_state_db};
 use crate::common::batcher::create_es_batch_task;
 use crate::common::events::GroundStationChangeEvent;
 use crate::common::frame::CommonFrame;
 use crate::modules::session::{EndSessionReason, SESSION_SCHEDULED_END};
 use crate::modules::validators::validate_listening_bands;
 use crate::server::db::StateDB;
+use crate::server::services as server_services;
 
 use self::session::Session;
 use self::settings::ModuleSettings;
@@ -171,6 +172,8 @@ impl ModuleManager {
             error!("Please choose either swarm mode or importing to Elasticsearch.");
             return;    
         }
+
+        let disable_state_db = parse_disable_state_db(args);
         
         let (reload_signaler, mut reload_signal) = mpsc::unbounded_channel::<()>();
         let (end_session_signaler, mut end_session_signal) = mpsc::unbounded_channel::<EndSessionReason>();
@@ -186,7 +189,17 @@ impl ModuleManager {
             return;    
         }
 
-        let state_db = match StateDB::new(state_db_url.to_string()).await {
+        if disable_state_db {
+            debug!("State DB disabled");
+        }
+        
+        let state_db = match StateDB::new(
+            if disable_state_db { 
+                None 
+            } else { 
+                Some(state_db_url.to_string()) 
+            }
+        ).await {
             Ok(v) => Data::new(RwLock::new(v)),
             Err(e) => {
                 error!("Failed to create state DB: {}", e.to_string());
@@ -244,6 +257,7 @@ impl ModuleManager {
                         )
                     ))
                     .configure(services::config)
+                    .configure(server_services::config)
             })
                 .bind((listen_host.clone(), listen_port))
                 .unwrap()

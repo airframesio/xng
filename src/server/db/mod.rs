@@ -14,7 +14,11 @@ pub struct StateDB {
 }
 
 impl StateDB {
-    pub async fn new(db_url: String) -> Result<StateDB, io::Error> {
+    pub async fn new(db_url: Option<String>) -> Result<StateDB, io::Error> {
+        let Some(db_url) = db_url else {
+            return Ok(StateDB { db: None });  
+        };
+        
         if !Sqlite::database_exists(db_url.as_str())
             .await
             .unwrap_or(false)
@@ -76,6 +80,10 @@ impl StateDB {
         }
 
         Ok(())
+    }
+
+    pub fn db_pool(&self) -> Option<&SqlitePool> {
+        self.db.as_ref()
     }
 
     pub async fn handle_gs_change_event(

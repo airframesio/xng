@@ -14,7 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common;
 use crate::common::arguments::{
-    parse_elastic_url, parse_listen_host, parse_listen_port, parse_state_db_url,
+    parse_disable_state_db, parse_elastic_url, parse_listen_host, parse_listen_port,
+    parse_state_db_url,
 };
 use crate::common::batcher::create_es_batch_task;
 use crate::common::frame::CommonFrame;
@@ -78,8 +79,18 @@ pub async fn start(args: &ArgMatches) {
             return;
         }
     };
+    let disable_state_db = parse_disable_state_db(args);
+    if disable_state_db {
+        debug!("State DB disabled");
+    }
 
-    let state_db = match StateDB::new(state_db_url.to_string()).await {
+    let state_db = match StateDB::new(if disable_state_db {
+        None
+    } else {
+        Some(state_db_url.to_string())
+    })
+    .await
+    {
         Ok(v) => Data::new(RwLock::new(v)),
         Err(e) => {
             error!("Failed to create state DB: {}", e.to_string());

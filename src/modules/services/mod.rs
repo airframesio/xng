@@ -1,6 +1,5 @@
 use actix_web::{guard, web};
 
-mod middleware;
 mod session;
 mod settings;
 

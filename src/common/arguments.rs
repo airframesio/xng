@@ -10,6 +10,7 @@ pub fn register_common_arguments(cmd: Command) -> Command {
         arg!(--"listen-port" <PORT> "Port for API server to listen on"),
         arg!(--elastic <URL> "Export processed common JSON frames to ElasticSearch"),
         arg!(--"state-db" <URL> "SQLite3 database to store state metrics. URL should begin with sqlite://"),
+        arg!(--"disable-state-db" "Disables SQLite3 database to store state metrics."),
     ])
 }
 
@@ -42,4 +43,8 @@ pub fn parse_state_db_url(args: &ArgMatches, default_url: &str) -> String {
     args.get_one::<String>("state-db")
         .unwrap_or(&String::from(default_url))
         .to_owned()
+}
+
+pub fn parse_disable_state_db(args: &ArgMatches) -> bool {
+    args.get_flag("disable-state-db")
 }
