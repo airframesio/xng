@@ -1,8 +1,7 @@
-use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 pub struct GroundStationChangeEvent {
-    pub ts: DateTime<Utc>,
+    pub ts: String,
     pub id: Value,
     pub name: Option<String>,
     pub old: String,

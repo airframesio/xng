@@ -248,9 +248,12 @@ impl XngModule for HfdlModule {
             validate_session_method
         );
 
-        for gs in self.systable.stations.iter() {
-            if let Err(e) = state_db.create_ground_station(gs.id, &gs.name, gs.position.1, gs.position.0).await {
-                warn!("Failed to populate initial ground stations: id={} name={}", gs.id, gs.name);
+        {
+            let state_db = state_db.write().await;
+            for gs in self.systable.stations.iter() {
+                if let Err(e) = state_db.create_ground_station(gs.id as u32, &gs.name, gs.position.0, gs.position.1).await {
+                    warn!("Failed to populate initial ground stations: id={} name={}", gs.id, gs.name);
+                }
             }
         }
     }
@@ -418,7 +421,8 @@ impl XngModule for HfdlModule {
                                 .collect();
                             
                             if let Some(change_event) = update_station_by_frequencies(
-                                settings.deref_mut(), 
+                                settings.deref_mut(),
+                                None, 
                                 stale_timeout_sec as i64, 
                                 json!(station.id), 
                                 Some(station.name.clone()), 
@@ -672,6 +676,7 @@ impl XngModule for HfdlModule {
                     let freq_set: Vec<u64> = station.freqs.iter().map(|x| x.freq as u64).collect();
                     if let Some(change_event) = update_station_by_frequencies(
                         settings.deref_mut(),
+                        Some(arrival_time.to_rfc3339_opts(SecondsFormat::Micros, true)),
                         stale_timeout_sec as i64,
                         json!(station.gs.id), 
                         station.gs.name.clone(), 

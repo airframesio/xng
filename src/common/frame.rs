@@ -90,6 +90,12 @@ pub struct Entity {
     pub coords: Option<WKTPoint>,
 }
 
+impl Entity {
+    pub fn is_ground_station(&self) -> bool {
+        self.kind.to_lowercase() == "ground station"
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize, Validate)]
 pub struct PropagationPath {
     #[validate(minimum = 2.0)]

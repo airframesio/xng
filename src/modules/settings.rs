@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::{Sender, UnboundedSender};
@@ -65,6 +65,7 @@ impl Eq for GroundStation {}
 
 pub fn update_station_by_frequencies(
     settings: &mut ModuleSettings,
+    arrival_time: Option<String>,
     stale_timeout_secs: i64,
     station_id: Value,
     station_name: Option<String>,
@@ -107,7 +108,7 @@ pub fn update_station_by_frequencies(
     let changed = station.active_frequencies != new_freq_set;
     if changed {
         event = Some(GroundStationChangeEvent {
-            ts: now,
+            ts: arrival_time.unwrap_or(now.to_rfc3339_opts(SecondsFormat::Micros, true)),
             id: station.id.clone(),
             name: station.name.clone(),
             old: format!(

@@ -11,7 +11,7 @@ impl Migration for CreateInitTables {
     async fn migrate(&self, db: &SqlitePool) -> Result<(), io::Error> {
         let queries = vec![
             "
-                CREATE TABLE IF NOT EXISTS ground_station (
+                CREATE TABLE IF NOT EXISTS ground_stations (
                     id              INTEGER PRIMARY KEY,
                     name            TEXT,
                     latitude        REAL,
@@ -22,7 +22,7 @@ impl Migration for CreateInitTables {
                 )   
             ",
             "
-                CREATE TABLE IF NOT EXISTS ground_station_change_event (
+                CREATE TABLE IF NOT EXISTS ground_station_change_events (
                     id        INTEGER PRIMARY KEY AUTOINCREMENT,
                     gs_id     INTEGER NOT NULL,
 
@@ -31,33 +31,26 @@ impl Migration for CreateInitTables {
                     old       TEXT NOT NULL,
                     new       TEXT NOT NULL,
 
-                    FOREIGN KEY(gs_id) REFERENCES ground_station(id)
+                    FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
                 )  
             ",
             "
-                CREATE TABLE IF NOT EXISTS aircraft (
+                CREATE TABLE IF NOT EXISTS aircrafts (
                     icao         INTEGER PRIMARY KEY,
 
                     addr         TEXT NOT NULL,
-                    tail         TEXT
+                    tail         TEXT,
+
+                    msg_count    INTEGER NOT NULL
                 )  
             ",
             "
-                CREATE TABLE IF NOT EXISTS flight (
-                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                    aircraft_icao  INTEGER,
-
-                    callsign       TEXT NOT NULL,
-                    last_heard     DATETIME NOT NULL,
-
-                    FOREIGN KEY(aircraft_icao) REFERENCES aircraft(icao)
-                )
-            ",
-            "
-                CREATE TABLE IF NOT EXISTS aircraft_event (
+                CREATE TABLE IF NOT EXISTS aircraft_events (
                     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    aircraft_icao INTEGER NOT NULL,
+                    aircraft_icao INTEGER,
                     gs_id         INTEGER NOT NULL,
+
+                    callsign      TEXT
             
                     ts            DATETIME NOT NULL,
                     signal        REAL NOT NULL,
@@ -66,25 +59,31 @@ impl Migration for CreateInitTables {
                     longitude     REAL NOT NULL,
                     altitude      INTEGER,
                 
-                    FOREIGN KEY(aircraft_icao) REFERENCES aircraft(icao)
-                    FOREIGN KEY(gs_id) REFERENCES ground_station(id)
+                    FOREIGN KEY(aircraft_icao) REFERENCES aircrafts(icao)
+                    FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
                 )    
             ",
             "
-                CREATE TABLE IF NOT EXISTS propagation_event (
+                CREATE TABLE IF NOT EXISTS propagation_events (
                     id                INTEGER PRIMARY KEY AUTOINCREMENT,
                     aircraft_event_id INTEGER NOT NULL,
                     gs_id             INTEGER NOT NULL,
 
-                    FOREIGN KEY(aircraft_event_id) REFERENCES aircraft_event(id)
-                    FOREIGN KEY(gs_id) REFERENCES ground_station(id)
+                    FOREIGN KEY(aircraft_event_id) REFERENCES aircraft_events(id)
+                    FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
+                    UNIQUE(aircraft_event_id, gs_id)
                 )
             ",
             "
-                CREATE TABLE IF NOT EXISTS frequency_stat (
+                CREATE TABLE IF NOT EXISTS frequency_stats (
                     khz        INTEGER PRIMARY KEY,
+                    gs_id      INTEGER NOT NULL,
+            
                     count      INTEGER NOT NULL,
-                    last_heard DATETIME NOT NULL 
+                    last_heard DATETIME NOT NULL,
+
+                    UNIQUE(khz, gs_id)
+                    FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
                 ) 
             ",
         ];
