@@ -50,7 +50,7 @@ impl Migration for CreateInitTables {
                     aircraft_icao INTEGER,
                     gs_id         INTEGER NOT NULL,
 
-                    callsign      TEXT
+                    callsign      TEXT,
             
                     ts            DATETIME NOT NULL,
                     signal        REAL NOT NULL,
@@ -65,9 +65,9 @@ impl Migration for CreateInitTables {
             ",
             "
                 CREATE TABLE IF NOT EXISTS propagation_events (
-                    id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                    aircraft_event_id INTEGER NOT NULL,
-                    gs_id             INTEGER NOT NULL,
+                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                    aircraft_events_id INTEGER NOT NULL,
+                    gs_id              INTEGER NOT NULL,
 
                     FOREIGN KEY(aircraft_event_id) REFERENCES aircraft_events(id)
                     FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
