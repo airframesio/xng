@@ -62,7 +62,7 @@ pub struct HfdlModule {
     name: &'static str,
     settings: Option<Data<RwLock<ModuleSettings>>>,
 
-    // TODO: have a field to store all valid sample rates for the driver
+    sample_rates: Vec<u64>,
     
     bin: PathBuf,
     systable: SystemTable,
@@ -159,7 +159,7 @@ impl XngModule for HfdlModule {
         let Some(driver) = extract_soapysdr_driver(&self.args) else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing --soapysdr argument with driver= specification"));              
         };
-        self.driver = driver;
+        self.driver = driver.clone();
 
         if self.feed_airframes
             && !self
@@ -170,7 +170,14 @@ impl XngModule for HfdlModule {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "Missing required --station-id <name> argument when feed airframes.io option is enabled"));
         }
 
-        // TODO: Populate sample rates from rust-soapy into a field
+        if let Err(e) = self.load_sample_rates(&driver) {
+            return Err(
+                io::Error::new(
+                    io::ErrorKind::InvalidInput, 
+                    format!("Unable to obtain sample rates for SoapySDR device {}: {}", self.driver, e.to_string())
+                )
+            );    
+        }
         
         self.sample_rate = args
             .get_one::<String>("sample-rate")
@@ -252,7 +259,7 @@ impl XngModule for HfdlModule {
             let state_db = state_db.write().await;
             for gs in self.systable.stations.iter() {
                 if let Err(e) = state_db.create_ground_station(gs.id as u32, &gs.name, gs.position.0, gs.position.1).await {
-                    warn!("Failed to populate initial ground stations: id={} name={}", gs.id, gs.name);
+                    warn!("Failed to populate initial ground stations, id={} name={}: {}", gs.id, gs.name, e.to_string());
                 }
             }
         }
@@ -541,6 +548,9 @@ impl XngModule for HfdlModule {
                 );
             };
 
+            let used_sample_rate = self.calculate_actual_sample_rate(bands).unwrap_or(sample_rate);
+            debug!("Using sample rate of {} for listening...", used_sample_rate);
+            
             self.last_req_session_band = next_session_band;
             
             proc = match process::Command::new(self.bin.clone())
@@ -549,7 +559,7 @@ impl XngModule for HfdlModule {
                 .arg("--system-table")
                 .arg(self.systable.path.to_path_buf())
                 .arg("--sample-rate")
-                .arg(format!("{}", sample_rate))
+                .arg(format!("{}", used_sample_rate))
                 .arg("--output")
                 .arg("decoded:json:file:path=-")
                 .args(extra_args)
