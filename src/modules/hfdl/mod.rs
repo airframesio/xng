@@ -723,7 +723,7 @@ impl XngModule for HfdlModule {
             
             if let Some(ref hfnpdu) = lpdu.hfnpdu {
                 if let Some(ref flight_id) = hfnpdu.flight_id {
-                    frame_src.callsign = Some(flight_id.clone());
+                    frame_src.callsign = Some(flight_id.trim().to_string());
                 }
 
                 if let Some(ref pos) = hfnpdu.pos {
@@ -773,12 +773,12 @@ impl XngModule for HfdlModule {
                     if lpdu.from_ground_station() {
                         match frame_dst {
                             Some(ref mut entity) => {
-                                entity.tail = Some(normalize_tail(acars.reg.clone()))
+                                entity.tail = Some(normalize_tail(&acars.reg));
                             }
                             _ => {},
                         }
                     } else {
-                        frame_src.tail = Some(normalize_tail(acars.reg.clone()));
+                        frame_src.tail = Some(normalize_tail(&acars.reg));
                     }
                 }
 

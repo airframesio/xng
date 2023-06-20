@@ -15,8 +15,15 @@ pub struct ServerServiceResponse {
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    // TODO: /api/flight/events/?tail=<>&icao=<>&callsign=<>
     // TODO: /api/freq/stats/
+    // TODO: /api/flight/overview
+    // TODO: /api/flight/{icao,tail,callsign}/:value/path
+
+    cfg.service(
+        web::resource(flight_events::ROUTE)
+            .guard(guard::Header("content-type", "application/json"))
+            .route(web::get().to(flight_events::get)),
+    );
 
     cfg.service(
         web::resource(ground_station_events::ROUTE)

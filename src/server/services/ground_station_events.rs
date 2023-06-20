@@ -1,10 +1,7 @@
-use actix_web::{
-    http::header::ContentType,
-    web::{self, Data},
-    HttpRequest, HttpResponse,
-};
+use actix_web::http::header::ContentType;
+use actix_web::web::{self, Data};
+use actix_web::{HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};
-use log::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::FromRow;
