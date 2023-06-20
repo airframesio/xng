@@ -549,7 +549,7 @@ impl XngModule for HfdlModule {
             };
 
             let used_sample_rate = self.calculate_actual_sample_rate(bands).unwrap_or(sample_rate);
-            debug!("Using sample rate of {} for listening...", used_sample_rate);
+            debug!("Using sample rate of {} for listening", used_sample_rate);
             
             self.last_req_session_band = next_session_band;
             
