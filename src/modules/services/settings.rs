@@ -9,7 +9,7 @@ use tokio::sync::RwLock;
 use crate::common::middleware::Authorized;
 use crate::modules::ModuleSettings;
 
-pub const ROUTE: &'static str = "/api/settings";
+pub const ROUTE: &'static str = "/api/settings/";
 
 #[derive(Serialize)]
 pub struct GetResponse {
