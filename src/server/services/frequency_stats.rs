@@ -12,10 +12,18 @@ use super::ServerServiceResponse;
 
 pub const ROUTE: &'static str = "/api/frequency/stats/";
 
-#[derive(Clone, FromRow, Serialize)]
+#[derive(FromRow)]
+struct EventRow {
+    khz: u32,
+    gs_id: u32,
+
+    count: u32,
+    last_heard: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
 struct FrequencyStats {
-    #[sqlx(rename = "khz")]
-    freq: f64,
+    freq_mhz: f64,
     gs_id: u32,
 
     count: u32,
@@ -36,7 +44,7 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
         .await;
 
     if let Some(db) = state_db.db_pool() {
-        let mut results = match sqlx::query_as::<_, FrequencyStats>(
+        let results = match sqlx::query_as::<_, EventRow>(
             "
             SELECT * FROM frequency_stats f
             ORDER BY f.khz ASC
@@ -57,10 +65,12 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
         HttpResponse::Ok().json(FreqStatsResponse {
             ok: true,
             body: results
-                .iter_mut()
-                .map(|x| {
-                    x.freq /= 1000.0;
-                    x.clone()
+                .into_iter()
+                .map(|result| FrequencyStats {
+                    freq_mhz: result.khz as f64 / 1000.0,
+                    gs_id: result.gs_id,
+                    count: result.count,
+                    last_heard: result.last_heard,
                 })
                 .collect(),
         })

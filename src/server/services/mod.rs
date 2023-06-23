@@ -1,6 +1,7 @@
 use actix_web::{guard, web};
 use serde::Serialize;
 
+mod extremities;
 mod flight_events;
 mod frequency_stats;
 mod ground_station_active;
@@ -18,6 +19,14 @@ pub struct ServerServiceResponse {
 pub fn config(cfg: &mut web::ServiceConfig) {
     // TODO: /api/flight/overview
     // TODO: /api/flight/{icao,tail,callsign}/:value/path
+    // TODO: /api/extremities
+    // TODO: /api/cleanup ; cleans up DB by removing old entries
+
+    cfg.service(
+        web::resource(extremities::ROUTE)
+            .guard(guard::Header("content-type", "application/json"))
+            .route(web::get().to(extremities::get)),
+    );
 
     cfg.service(
         web::resource(flight_events::ROUTE)
@@ -29,7 +38,6 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .guard(guard::Header("content-type", "application/json"))
             .route(web::get().to(frequency_stats::get)),
     );
-
     cfg.service(
         web::resource(ground_station_events::ROUTE)
             .guard(guard::Header("content-type", "application/json"))
