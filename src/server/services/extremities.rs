@@ -60,9 +60,16 @@ enum ExtremityDirection {
 
 #[derive(Serialize)]
 struct ExtremitiesData {
+    #[serde(skip_serializing_if = "Option::is_none")]
     northmost: Option<AircraftEvent>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     eastmost: Option<AircraftEvent>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     southmost: Option<AircraftEvent>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     westmost: Option<AircraftEvent>,
 }
 
