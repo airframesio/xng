@@ -94,23 +94,21 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
             }
         };
 
-        let mut events: Vec<GroundStationChangeEvent> = Vec::new();
-        for result in results {
-            events.push(GroundStationChangeEvent {
-                ts: result.ts,
-                gs_id: result.gs_id as u64,
-                name: result.name,
-                kind: result.kind,
-                old: serde_json::from_str(result.old.as_str()).unwrap_or(Value::Null),
-                new: serde_json::from_str(result.new.as_str()).unwrap_or(Value::Null),
-            });
-        }
-
         HttpResponse::Ok()
             .content_type(ContentType::json())
             .json(GroundStationEventResponse {
                 ok: true,
-                body: events,
+                body: results
+                    .into_iter()
+                    .map(|result| GroundStationChangeEvent {
+                        ts: result.ts,
+                        gs_id: result.gs_id as u64,
+                        name: result.name,
+                        kind: result.kind,
+                        old: serde_json::from_str(result.old.as_str()).unwrap_or(Value::Null),
+                        new: serde_json::from_str(result.new.as_str()).unwrap_or(Value::Null),
+                    })
+                    .collect(),
             })
     } else {
         HttpResponse::NotImplemented().json(ServerServiceResponse {

@@ -2,6 +2,7 @@ use actix_web::{guard, web};
 use serde::Serialize;
 
 mod flight_events;
+mod frequency_stats;
 mod ground_station_active;
 mod ground_station_events;
 mod ground_station_stats;
@@ -15,7 +16,6 @@ pub struct ServerServiceResponse {
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    // TODO: /api/freq/stats/
     // TODO: /api/flight/overview
     // TODO: /api/flight/{icao,tail,callsign}/:value/path
 
@@ -23,6 +23,11 @@ pub fn config(cfg: &mut web::ServiceConfig) {
         web::resource(flight_events::ROUTE)
             .guard(guard::Header("content-type", "application/json"))
             .route(web::get().to(flight_events::get)),
+    );
+    cfg.service(
+        web::resource(frequency_stats::ROUTE)
+            .guard(guard::Header("content-type", "application/json"))
+            .route(web::get().to(frequency_stats::get)),
     );
 
     cfg.service(

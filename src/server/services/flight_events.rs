@@ -145,9 +145,9 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
             )
         };
 
-        let mut events: Vec<FlightEvent> = Vec::new();
-        for result in results {
-            events.push(FlightEvent {
+        HttpResponse::Ok().json(FlightEventsResponse {
+            ok: true,
+            body: results.into_iter().map(|result| FlightEvent {
                 id: result.id,
                 ts: result.ts,
                 icao: result.icao_addr,
@@ -162,12 +162,7 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
                     name: result.gs_name,
                     coords: (result.gs_lon, result.gs_lat),
                 }
-            })
-        }
-
-        HttpResponse::Ok().json(FlightEventsResponse {
-            ok: true,
-            body: events,
+            }).collect(),
         })
     } else {
         HttpResponse::NotImplemented().json(ServerServiceResponse {
