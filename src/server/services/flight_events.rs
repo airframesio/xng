@@ -30,7 +30,7 @@ struct GroundStation {
     #[serde(skip_serializing_if = "Option::is_none")]
     name: Option<String>,
 
-    coords: (f64, f64),
+    coords: Option<(f64, f64)>,
 }
 
 #[derive(Serialize)]
@@ -73,8 +73,8 @@ struct EventRow {
     tail: Option<String>,
     gs_id: u32,
     gs_name: Option<String>,
-    gs_lat: f64,
-    gs_lon: f64,
+    gs_lat: Option<f64>,
+    gs_lon: Option<f64>,
     signal: f64,
     freq_mhz: f64,
     latitude: f64,
@@ -160,7 +160,11 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
                 gs: GroundStation {
                     id: result.gs_id,
                     name: result.gs_name,
-                    coords: (result.gs_lon, result.gs_lat),
+                    coords: if result.gs_lat.is_some() && result.gs_lon.is_some() {
+                        Some((result.gs_lon.unwrap(), result.gs_lat.unwrap()))
+                    } else {
+                        None
+                    },
                 }
             }).collect(),
         })

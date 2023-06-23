@@ -19,12 +19,26 @@ struct EventRow {
 
     count: u32,
     last_heard: DateTime<Utc>,
+
+    name: Option<String>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct GroundStation {
+    id: u32,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+
+    coords: Option<(f64, f64)>,
 }
 
 #[derive(Serialize)]
 struct FrequencyStats {
     freq_mhz: f64,
-    gs_id: u32,
+    gs: GroundStation,
 
     count: u32,
     last_heard: DateTime<Utc>,
@@ -46,7 +60,8 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
     if let Some(db) = state_db.db_pool() {
         let results = match sqlx::query_as::<_, EventRow>(
             "
-            SELECT * FROM frequency_stats f
+            SELECT f.khz, f.gs_id, f.count, f.last_heard, gs.name, gs.latitude, gs.longitude FROM frequency_stats f
+            JOIN ground_stations gs ON f.gs_id = gs.id
             ORDER BY f.khz ASC
             ",
         )
@@ -68,7 +83,15 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
                 .into_iter()
                 .map(|result| FrequencyStats {
                     freq_mhz: result.khz as f64 / 1000.0,
-                    gs_id: result.gs_id,
+                    gs: GroundStation {
+                        id: result.gs_id,
+                        name: result.name,
+                        coords: if result.latitude.is_some() && result.longitude.is_some() {
+                            Some((result.longitude.unwrap(), result.latitude.unwrap()))
+                        } else {
+                            None
+                        },
+                    },
                     count: result.count,
                     last_heard: result.last_heard,
                 })
