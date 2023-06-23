@@ -137,10 +137,17 @@ impl StateDB {
             };
 
             sqlx::query(
-                "
-                INSERT INTO frequency_stats (khz, gs_id, count, last_heard) VALUES (?, ?, 1, ?) 
-                ON CONFLICT (khz) DO UPDATE SET count = count + 1
-                ",
+                if from_ground_station {
+                    "
+                    INSERT INTO frequency_stats (khz, gs_id, from_gs, to_gs, last_heard) VALUES (?, ?, 1, 0, ?) 
+                    ON CONFLICT (khz) DO UPDATE SET from_gs = from_gs + 1
+                    "
+                } else {
+                    "
+                    INSERT INTO frequency_stats (khz, gs_id, from_gs, to_gs, last_heard) VALUES (?, ?, 0, 1, ?) 
+                    ON CONFLICT (khz) DO UPDATE SET to_gs = to_gs + 1
+                    "
+                }
             )
             .bind((frame.freq * 1000.0) as u32)
             .bind(gs_id)
@@ -148,25 +155,20 @@ impl StateDB {
             .execute(db)
             .await?;
 
-            if from_ground_station {
-                sqlx::query(
+            sqlx::query(
+                if from_ground_station {
                     "
                     UPDATE ground_stations SET msgs_heard_from = msgs_heard_from + 1 WHERE id = ?  
-                    ",
-                )
-                .bind(gs_id)
-                .execute(db)
-                .await?;
-            } else {
-                sqlx::query(
+                    "
+                } else {
                     "
                     UPDATE ground_stations SET msgs_heard_to = msgs_heard_to + 1 WHERE id = ?  
-                    ",
-                )
-                .bind(gs_id)
-                .execute(db)
-                .await?;
-            }
+                    "    
+                }
+            )
+            .bind(gs_id)
+            .execute(db)
+            .await?;
 
             if let Some(aircraft) = aircraft {
                 let icao_addr = aircraft.icao.clone();

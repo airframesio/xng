@@ -33,14 +33,21 @@ struct EventRow {
 
 #[derive(Serialize)]
 struct AircraftEvent {
+    #[serde(skip_serializing_if = "Option::is_none")]
     icao: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     callsign: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     tail: Option<String>,
 
     ts: DateTime<Utc>,
     signal: f64,
     freq_mhz: f64,
     coords: (f64, f64),
+
+    #[serde(skip_serializing_if = "Option::is_none")]
     altitude: Option<u32>,
 }
 

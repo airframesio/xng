@@ -17,7 +17,8 @@ struct EventRow {
     khz: u32,
     gs_id: u32,
 
-    count: u32,
+    to_gs: u32,
+    from_gs: u32,
     last_heard: DateTime<Utc>,
 
     name: Option<String>,
@@ -40,7 +41,8 @@ struct FrequencyStats {
     freq_mhz: f64,
     gs: GroundStation,
 
-    count: u32,
+    to_gs: u32,
+    from_gs: u32,
     last_heard: DateTime<Utc>,
 }
 
@@ -60,7 +62,7 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
     if let Some(db) = state_db.db_pool() {
         let results = match sqlx::query_as::<_, EventRow>(
             "
-            SELECT f.khz, f.gs_id, f.count, f.last_heard, gs.name, gs.latitude, gs.longitude FROM frequency_stats f
+            SELECT f.khz, f.gs_id, f.to_gs, f.from_gs, f.last_heard, gs.name, gs.latitude, gs.longitude FROM frequency_stats f
             JOIN ground_stations gs ON f.gs_id = gs.id
             ORDER BY f.khz ASC
             ",
@@ -92,7 +94,8 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
                             None
                         },
                     },
-                    count: result.count,
+                    to_gs: result.to_gs,
+                    from_gs: result.from_gs,
                     last_heard: result.last_heard,
                 })
                 .collect(),

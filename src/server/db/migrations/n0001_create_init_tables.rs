@@ -80,7 +80,8 @@ impl Migration for CreateInitTables {
                     khz        INTEGER PRIMARY KEY,
                     gs_id      INTEGER NOT NULL,
             
-                    count      INTEGER NOT NULL,
+                    to_gs      INTEGER NOT NULL,
+                    from_gs    INTEGER NOT NULL,
                     last_heard DATETIME NOT NULL,
 
                     UNIQUE(khz, gs_id)
