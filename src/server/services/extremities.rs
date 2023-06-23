@@ -84,9 +84,9 @@ async fn get_flight_event(db: &SqlitePool, dir: ExtremityDirection) -> Option<Ai
         "SELECT * FROM aircraft_events ae {} LIMIT 1",
         match dir {
             ExtremityDirection::North => "ORDER BY ae.latitude DESC",
-            ExtremityDirection::East => "ORDER BY ae.longitude ASC",
+            ExtremityDirection::East => "ORDER BY ae.longitude DESC",
             ExtremityDirection::South => "ORDER BY ae.latitude ASC",
-            ExtremityDirection::West => "ORDER BY ae.longitude DESC",
+            ExtremityDirection::West => "ORDER BY ae.longitude ASC",
         }
     );
 
