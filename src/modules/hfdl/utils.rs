@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 pub fn freq_bands_by_sample_rate(freqs: &Vec<u16>, sample_rate: u32) -> HashMap<String, Vec<u16>> {
     let band_name = |band: &Vec<u16>| -> String {
-        let first = band.first().unwrap_or(&0) / 1000;
-        let last = band.last().unwrap_or(&0) / 1000;
+        let first = *band.first().unwrap_or(&0);
+        let last = *band.last().unwrap_or(&0);
 
         if first == 0 {
             return format!("{}", last);
