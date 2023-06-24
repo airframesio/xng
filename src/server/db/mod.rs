@@ -136,22 +136,28 @@ impl StateDB {
                 return Err(sqlx::Error::TypeNotFound { type_name: String::from("Unexpected ground station with no ID") })    
             };
 
-            sqlx::query(
-                if from_ground_station {
+            if from_ground_station {
+                sqlx::query(
                     "
                     INSERT INTO frequency_stats (khz, gs_id, from_gs, to_gs, last_heard) VALUES (?, ?, 1, 0, ?) 
-                    ON CONFLICT (khz) DO UPDATE SET from_gs = from_gs + 1
+                    ON CONFLICT (khz) DO UPDATE SET from_gs = from_gs + 1, last_heard = ?
                     "
-                } else {
+                )
+                .bind((frame.freq * 1000.0) as u32)
+                .bind(gs_id)
+                .bind(&frame.timestamp)
+                .bind(&frame.timestamp)
+            } else {
+                sqlx::query(
                     "
                     INSERT INTO frequency_stats (khz, gs_id, from_gs, to_gs, last_heard) VALUES (?, ?, 0, 1, ?) 
                     ON CONFLICT (khz) DO UPDATE SET to_gs = to_gs + 1
                     "
-                }
-            )
-            .bind((frame.freq * 1000.0) as u32)
-            .bind(gs_id)
-            .bind(&frame.timestamp)
+                )
+                .bind((frame.freq * 1000.0) as u32)
+                .bind(gs_id)
+                .bind(&frame.timestamp)
+            }
             .execute(db)
             .await?;
 
