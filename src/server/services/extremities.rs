@@ -87,12 +87,27 @@ async fn get_flight_event(
     lon: f64,
 ) -> Option<AircraftEvent> {
     let query = format!(
-        "WITH norm_aircraft_events AS (
+        "WITH offset_aircraft_events AS (
             SELECT 
                 ae.latitude-({}) AS norm_latitude, 
                 ae.longitude-({}) AS norm_longitude,
                 ae.*
             FROM aircraft_events ae             
+        ),
+        norm_aircraft_events AS (
+            SELECT
+                CASE 
+                    WHEN oae.norm_latitude >= 90 THEN 180 - oae.norm_latitude
+                    WHEN oae.norm_latitude <= -90 THEN -180 - oae.norm_latitude
+                    ELSE oae.norm_latitude
+                END AS norm_latitude,
+                CASE
+                    WHEN oae.longitude >= 180 THEN 360 - oae.norm_longitude
+                    WHEN oae.longitude <= -180 THEN -360 - oae.norm_longitude
+                    ELSE oae.longitude
+                END AS norm_longitude,
+                oae.*
+            FROM offset_aircraft_events oae 
         )
         SELECT * FROM norm_aircraft_events nae {} LIMIT 1",
         lat,
