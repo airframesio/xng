@@ -1,7 +1,6 @@
 use actix_web::web::{self, Data};
 use actix_web::{HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};
-use log::info;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::sync::RwLock;
@@ -119,7 +118,7 @@ async fn get_flight_event(
             ExtremityDirection::West => "ORDER BY nae.norm_longitude ASC",
         }
     );
-    info!("{}", query);
+
     sqlx::query_as::<_, EventRow>(query.as_str())
         .fetch_one(db)
         .await
