@@ -1,6 +1,7 @@
 use actix_web::web::{self, Data};
 use actix_web::{HttpRequest, HttpResponse};
 use chrono::{DateTime, Utc};
+use log::info;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, SqlitePool};
 use tokio::sync::RwLock;
@@ -88,32 +89,22 @@ async fn get_flight_event(
     let query = format!(
         "WITH norm_aircraft_events AS (
             SELECT 
-                ae.id, 
-                ae.ts, 
-                ae.aircraft_icao, 
-                ae.callsign, 
-                ae.tail, 
-                ae.gs_id, 
-                ae.signal, 
-                ae.freq_mhz, 
                 ae.latitude-({}) AS norm_latitude, 
                 ae.longitude-({}) AS norm_longitude,
-                ae.latitude,
-                ae.longitude,
-                ae.altitude 
+                ae.*
             FROM aircraft_events ae             
         )
-        SELECT * FROM norm_aircraft_events ae {} LIMIT 1",
+        SELECT * FROM norm_aircraft_events nae {} LIMIT 1",
         lat,
         lon,
         match dir {
-            ExtremityDirection::North => "ORDER BY ae.norm_latitude DESC",
-            ExtremityDirection::East => "ORDER BY ae.norm_longitude DESC",
-            ExtremityDirection::South => "ORDER BY ae.norm_latitude ASC",
-            ExtremityDirection::West => "ORDER BY ae.norm_longitude ASC",
+            ExtremityDirection::North => "ORDER BY nae.norm_latitude DESC",
+            ExtremityDirection::East => "ORDER BY nae.norm_longitude DESC",
+            ExtremityDirection::South => "ORDER BY nae.norm_latitude ASC",
+            ExtremityDirection::West => "ORDER BY nae.norm_longitude ASC",
         }
     );
-
+    info!("{}", query);
     sqlx::query_as::<_, EventRow>(query.as_str())
         .fetch_one(db)
         .await
