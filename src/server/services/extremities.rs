@@ -96,8 +96,10 @@ async fn get_flight_event(
                 ae.gs_id, 
                 ae.signal, 
                 ae.freq_mhz, 
-                ae.latitude-{} AS latitude, 
-                ae.longitude-{} AS longitude,
+                ae.latitude-({}) AS norm_latitude, 
+                ae.longitude-({}) AS norm_longitude,
+                ae.latitude,
+                ae.longitude,
                 ae.altitude 
             FROM aircraft_events ae             
         )
@@ -105,10 +107,10 @@ async fn get_flight_event(
         lat,
         lon,
         match dir {
-            ExtremityDirection::North => "ORDER BY ae.latitude DESC",
-            ExtremityDirection::East => "ORDER BY ae.longitude DESC",
-            ExtremityDirection::South => "ORDER BY ae.latitude ASC",
-            ExtremityDirection::West => "ORDER BY ae.longitude ASC",
+            ExtremityDirection::North => "ORDER BY ae.norm_latitude DESC",
+            ExtremityDirection::East => "ORDER BY ae.norm_longitude DESC",
+            ExtremityDirection::South => "ORDER BY ae.norm_latitude ASC",
+            ExtremityDirection::West => "ORDER BY ae.norm_longitude ASC",
         }
     );
 
