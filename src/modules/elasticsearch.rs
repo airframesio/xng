@@ -149,8 +149,6 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
             error!("Creation failed: error code = {:?}", response.status_code());
         }
     }
-
-    todo!()
 }
 
 pub async fn init_es(args: &ArgMatches) {
