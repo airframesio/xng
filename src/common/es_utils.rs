@@ -89,7 +89,9 @@ pub fn get_xng_index_mapping() -> Value {
                         "mapping": {
                             "type": "double"
                         }
-                    },
+                    }
+                },
+                {
                     "coords": {
                         "match_mapping_type": "string",
                         "match": "coords",
@@ -97,6 +99,8 @@ pub fn get_xng_index_mapping() -> Value {
                             "type": "geopoint"
                         }
                     },
+                },
+                {
                     "polylines": {
                         "match_mapping_type": "string",
                         "match": "path",
