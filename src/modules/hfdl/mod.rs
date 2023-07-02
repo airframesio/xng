@@ -872,7 +872,7 @@ impl XngModule for HfdlModule {
         Ok(cff::CommonFrame {
             timestamp: unix_time_to_utc_datetime(
                 raw_frame.hfdl.ts.to_f64()
-            ).unwrap_or(Utc::now().with_timezone(&UTC)).to_rfc3339_opts(SecondsFormat::Micros, true),
+            ).unwrap_or(Utc::now().with_timezone(&UTC)).to_rfc3339_opts(SecondsFormat::Nanos, true),
             freq: raw_frame.hfdl.freq_as_mhz(),
             signal: raw_frame.hfdl.sig_level as f32,
 
