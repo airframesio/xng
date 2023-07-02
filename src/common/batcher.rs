@@ -9,6 +9,7 @@ use tokio::time::sleep;
 
 use super::frame::CommonFrame;
 
+// TODO: have this function take elasticsearch client
 pub fn create_es_batch_task(
     es_url: Url,
     batch: Data<Mutex<Vec<CommonFrame>>>,

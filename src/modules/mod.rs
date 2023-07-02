@@ -20,7 +20,7 @@ use std::process::exit;
 use std::time::Duration;
 
 use crate::common;
-use crate::common::arguments::{parse_api_token, parse_disable_cross_site, parse_listen_host, parse_listen_port, parse_elastic_url, parse_state_db_url, parse_disable_state_db};
+use crate::common::arguments::{parse_api_token, parse_disable_cross_site, parse_listen_host, parse_listen_port, parse_elastic_url, parse_state_db_url, parse_disable_state_db, parse_elastic_index};
 use crate::common::batcher::create_es_batch_task;
 use crate::common::events::GroundStationChangeEvent;
 use crate::common::frame::CommonFrame;
@@ -37,6 +37,7 @@ mod services;
 mod session;
 mod validators;
 
+pub mod elasticsearch;
 pub mod settings;
 
 const DEFAULT_INITIAL_SWARM_CONNECT_TIMEOUT_SECS: u64 = 60;
@@ -156,6 +157,8 @@ impl ModuleManager {
         } else {
             None
         };
+        let elastic_index = parse_elastic_index(args);
+        
         let state_db_url = match Url::parse(parse_state_db_url(args, DEFAULT_STATE_DB_URL).as_str()) {
             Ok(v) => {
                 info!("State DB location at {}", v.as_str());
@@ -274,6 +277,8 @@ impl ModuleManager {
             }
         });
 
+        // TODO: create elasticsearch client as an Option
+        
         let (tx, mut rx) = mpsc::channel::<CommonFrame>(DEFAULT_CHANNEL_BUFFER);
         
         let processor_cancel_token = cancel_token.clone();
@@ -371,6 +376,7 @@ impl ModuleManager {
                             }
                         }
                         
+                        // TODO: use the newly created elasticsearch client option instead of elastic_url
                         if let Some(ref es_url) = elastic_url {
                             let mut batch = frames_batch.lock().await;
                             let es_url = es_url.clone();

@@ -187,6 +187,8 @@ pub async fn start(args: &ArgMatches) {
     let frames_batch: Data<Mutex<Vec<CommonFrame>>> = Data::new(Mutex::new(Vec::new()));
     let mut batcher: Option<JoinHandle<()>> = None;
 
+    // TODO: use elastic_url to setup elasticsearch client as an Option
+
     let mut interrupt_signal = match signal(SignalKind::interrupt()) {
         Ok(v) => v,
         Err(e) => {
@@ -208,6 +210,7 @@ pub async fn start(args: &ArgMatches) {
                     }
                 }
 
+                // TODO: use the newly created elasticsearch client option instead of elastic_url
                 if let Some(es_url) = elastic_url.as_ref() {
                     let mut batch = frames_batch.lock().await;
                     let es_url = es_url.clone();

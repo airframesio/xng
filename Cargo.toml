@@ -11,6 +11,7 @@ async-trait = "0.1.68"
 chrono = { version = "0.4.26", features = ["serde"] }
 chrono-tz = { version = "0.8.2", features = ["serde"] }
 clap = { version = "4.2.7", features = ["cargo"] }
+elasticsearch = { version = "8.5.0-alpha.1", features = ["native-tls"] }
 exitcode = "1.1.2"
 lazy_static = "1.4.0"
 log = "0.4.17"

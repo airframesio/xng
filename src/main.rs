@@ -1,4 +1,5 @@
 use clap::command;
+use modules::elasticsearch;
 use std::process::exit;
 use tokio::runtime::Runtime;
 
@@ -16,7 +17,11 @@ fn main() {
             .subcommand_required(true)
             .arg_required_else_help(true)
             .subcommand(server::get_server_arguments()),
-    );
+    )
+        .subcommands([
+            elasticsearch::get_arguments(elasticsearch::INIT_ES_COMMAND, "Initialize ElasticSearch indices"),
+            elasticsearch::get_arguments(elasticsearch::DELETE_ES_COMMAND, "Delete ElasticSearch indices"),
+        ]);
 
     let args = cmd.get_matches();
     let rt = match Runtime::new() {
@@ -47,10 +52,11 @@ fn main() {
                     .init()
                     .unwrap();
 
-                if subcmd == server::SERVER_COMMAND {
-                    server::start(matches).await;
-                } else {
-                    manager.start(subcmd, matches).await;
+                match subcmd {
+                    server::SERVER_COMMAND => server::start(matches).await,
+                    elasticsearch::INIT_ES_COMMAND => elasticsearch::init_es(matches).await,
+                    elasticsearch::DELETE_ES_COMMAND => elasticsearch::delete_es(matches).await,
+                    _ => manager.start(subcmd, matches).await,
                 }  
             },
             _ => unreachable!("Encountered None when subcommand_required is true; see clap-rs for documentation changes or bug report link"),
