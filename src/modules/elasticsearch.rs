@@ -136,7 +136,7 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
         {
             Ok(x) => x,
             Err(e) => {
-                error!("{}", e.to_string());
+                error!("Failed to create index with mapping: {}", e.to_string());
                 return;
             }
         };
@@ -147,6 +147,10 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
             );
         } else {
             error!("Creation failed: error code = {:?}", response.status_code());
+            debug!(
+                "Error response: {:?}",
+                response.text().await.unwrap_or(String::from(""))
+            );
         }
     }
 }
