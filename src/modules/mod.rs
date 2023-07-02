@@ -2,6 +2,7 @@ use actix_web::web::Data;
 use actix_web::{HttpServer, App, middleware};
 use async_trait::async_trait;
 use clap::{ArgMatches, Command, arg};
+use ::elasticsearch::Elasticsearch;
 use log::*;
 use reqwest::Url;
 use serde_json::json;
@@ -22,6 +23,7 @@ use std::time::Duration;
 use crate::common;
 use crate::common::arguments::{parse_api_token, parse_disable_cross_site, parse_listen_host, parse_listen_port, parse_elastic_url, parse_state_db_url, parse_disable_state_db, parse_elastic_index};
 use crate::common::batcher::create_es_batch_task;
+use crate::common::es_utils::create_es_client;
 use crate::common::events::GroundStationChangeEvent;
 use crate::common::frame::CommonFrame;
 use crate::modules::session::{EndSessionReason, SESSION_SCHEDULED_END};
@@ -143,7 +145,7 @@ impl ModuleManager {
         } else {
             None
         };
-        let elastic_url = if let Some(raw_url) = parse_elastic_url(args) {
+        let mut elastic_url = if let Some(raw_url) = parse_elastic_url(args) {
             match Url::parse(raw_url) {
                 Ok(v) => {
                     info!("Elasticsearch bulk indexing enabled: target = {}", raw_url);
@@ -158,6 +160,7 @@ impl ModuleManager {
             None
         };
         let elastic_index = parse_elastic_index(args);
+        let validate_es_cert = args.get_flag("validate-es-cert");
         
         let state_db_url = match Url::parse(parse_state_db_url(args, DEFAULT_STATE_DB_URL).as_str()) {
             Ok(v) => {
@@ -337,6 +340,14 @@ impl ModuleManager {
                     }
                 }
             }
+
+            let mut es_client: Option<Elasticsearch> = None;
+            if let Some(ref mut es_url) = elastic_url {
+                match create_es_client(es_url, validate_es_cert) {
+                    Ok(client) => es_client = Some(client),
+                    Err(e) => warn!("Failed to create ES client to {}: {}", es_url, e.to_string())
+                }
+            }
             
             loop {
                 select! {
@@ -376,17 +387,16 @@ impl ModuleManager {
                             }
                         }
                         
-                        // TODO: use the newly created elasticsearch client option instead of elastic_url
-                        if let Some(ref es_url) = elastic_url {
+                        if let Some(ref client) = es_client {
                             let mut batch = frames_batch.lock().await;
-                            let es_url = es_url.clone();
 
                             if batch.len() == 0 {
                                 let frames_batch = frames_batch.clone();
 
                                 batcher = Some(
                                     create_es_batch_task(
-                                        es_url, 
+                                        client,
+                                        &elastic_index, 
                                         frames_batch, 
                                         Duration::from_millis(DEFAULT_BATCH_WAIT_MS)
                                     )

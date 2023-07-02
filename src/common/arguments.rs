@@ -10,6 +10,7 @@ pub fn register_common_arguments(cmd: Command) -> Command {
         arg!(--"listen-port" <PORT> "Port for API server to listen on"),
         arg!(--elastic <URL> "Export processed common JSON frames to ElasticSearch"),
         arg!(--"elastic-index" <INDEXNAME> "ElasticSearch Index name to use for storing common JSON frames"),
+        arg!(--"validate-es-cert" "Validate ElasticSearch server certificate"),
         arg!(--"state-db" <URL> "SQLite3 database to store state metrics. URL should begin with sqlite://"),
         arg!(--"disable-state-db" "Disables SQLite3 database to store state metrics."),
     ])
@@ -40,9 +41,10 @@ pub fn parse_elastic_url(args: &ArgMatches) -> Option<&String> {
     args.get_one::<String>("elastic")
 }
 
-pub fn parse_elastic_index(args: &ArgMatches) -> &String {
+pub fn parse_elastic_index(args: &ArgMatches) -> String {
     args.get_one::<String>("elastic-index")
         .unwrap_or(&String::from("xng_acars_db"))
+        .clone()
 }
 
 pub fn parse_state_db_url(args: &ArgMatches, default_url: &str) -> String {

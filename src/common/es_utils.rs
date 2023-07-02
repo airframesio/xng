@@ -1,10 +1,13 @@
 use elasticsearch::auth::Credentials;
 use elasticsearch::cert::CertificateValidation;
 use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
-use elasticsearch::Elasticsearch;
+use elasticsearch::{BulkOperation, Elasticsearch};
 
+use log::warn;
 use reqwest::Url;
 use serde_json::{json, Value};
+
+use super::frame::CommonFrame;
 
 pub fn create_es_client(
     es_url: &mut Url,
@@ -12,23 +15,26 @@ pub fn create_es_client(
 ) -> Result<Elasticsearch, elasticsearch::Error> {
     let credentials = match (es_url.username(), es_url.password()) {
         ("", _) | (_, None) => None,
-        (user, Some(passwd)) => {
-            es_url.set_password(None);
-            es_url.set_username("");
-
-            Some(Credentials::Basic(user.to_string(), passwd.to_string()))
-        }
+        (user, Some(passwd)) => Some(Credentials::Basic(user.to_string(), passwd.to_string())),
     };
 
     let conn_pool = SingleNodeConnectionPool::new(es_url.clone());
     let mut builder = TransportBuilder::new(conn_pool);
 
     builder = match credentials {
-        Some(c) => builder.auth(c).cert_validation(if validate {
-            CertificateValidation::Default
-        } else {
-            CertificateValidation::None
-        }),
+        Some(c) => {
+            #[allow(unused_must_use)]
+            {
+                es_url.set_username("");
+                es_url.set_password(None);
+            }
+
+            builder.auth(c).cert_validation(if validate {
+                CertificateValidation::Default
+            } else {
+                CertificateValidation::None
+            })
+        }
         None => builder,
     };
 
@@ -36,6 +42,70 @@ pub fn create_es_client(
     Ok(Elasticsearch::new(transport))
 }
 
+pub async fn bulk_index(
+    client: &Elasticsearch,
+    index: &String,
+    frames: &Vec<CommonFrame>,
+) -> Result<(), elasticsearch::Error> {
+    let body: Vec<BulkOperation<_>> = frames
+        .iter()
+        .map(|p| BulkOperation::index(p).into())
+        .collect();
+
+    let response = client
+        .bulk(elasticsearch::BulkParts::Index(index.as_str()))
+        .body(body)
+        .send()
+        .await?;
+
+    let json: Value = response.json().await?;
+
+    if json["errors"].as_bool().unwrap() {
+        let failed: Vec<&Value> = json["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| !v["error"].is_null())
+            .collect();
+        warn!("Failed to index {} docs!", failed.len());
+    }
+
+    Ok(())
+}
+
 pub fn get_xng_index_mapping() -> Value {
-    json!({})
+    json!({
+        "mappings": {
+            "dynamic": "true",
+            "dynamic_date_formats": ["strict_date_optional_time_nanos"],
+            "date_detection": false,
+            "numeric_detection": false,
+            "dynamic_templates": [
+                {
+                    "frequency": {
+                        "match_mapping_type": "double",
+                        "match_pattern": "regex",
+                        "match": "^freq[s]{0,1}$",
+                        "mapping": {
+                            "type": "double"
+                        }
+                    },
+                    "coords": {
+                        "match_mapping_type": "string",
+                        "match": "coords",
+                        "mapping": {
+                            "type": "geopoint"
+                        }
+                    },
+                    "polylines": {
+                        "match_mapping_type": "string",
+                        "match": "path",
+                        "mapping": {
+                            "type": "geoshape"
+                        }
+                    }
+                }
+            ]
+        }
+    })
 }

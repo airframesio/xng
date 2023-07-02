@@ -3,10 +3,7 @@ use crate::common::{
     es_utils::{create_es_client, get_xng_index_mapping},
 };
 use clap::{arg, ArgMatches, Command};
-use elasticsearch::indices::{
-    IndicesClose, IndicesCreateDataStreamParts, IndicesCreateParts, IndicesDeleteParts,
-    IndicesExistsParts,
-};
+use elasticsearch::indices::{IndicesCreateParts, IndicesDeleteParts, IndicesExistsParts};
 use log::*;
 use reqwest::{StatusCode, Url};
 
@@ -57,7 +54,7 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
 
     let exists = match client
         .indices()
-        .exists(IndicesExistsParts::Index(&[elastic_index]))
+        .exists(IndicesExistsParts::Index(&[elastic_index.as_str()]))
         .send()
         .await
     {
@@ -89,7 +86,7 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
 
         let delete = match client
             .indices()
-            .delete(IndicesDeleteParts::Index(&[elastic_index]))
+            .delete(IndicesDeleteParts::Index(&[elastic_index.as_str()]))
             .send()
             .await
         {
@@ -132,7 +129,7 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
 
         let response = match client
             .indices()
-            .create(IndicesCreateParts::Index(elastic_index))
+            .create(IndicesCreateParts::Index(elastic_index.as_str()))
             .body(get_xng_index_mapping())
             .send()
             .await

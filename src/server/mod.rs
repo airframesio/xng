@@ -1,5 +1,6 @@
 use actix_web::web::Data;
 use clap::{arg, ArgMatches, Command};
+use elasticsearch::Elasticsearch;
 use log::*;
 use reqwest::Url;
 use serde_valid::Validate;
@@ -14,10 +15,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common;
 use crate::common::arguments::{
-    parse_disable_state_db, parse_elastic_url, parse_listen_host, parse_listen_port,
-    parse_state_db_url,
+    parse_disable_state_db, parse_elastic_index, parse_elastic_url, parse_listen_host,
+    parse_listen_port, parse_state_db_url,
 };
 use crate::common::batcher::create_es_batch_task;
+use crate::common::es_utils::create_es_client;
 use crate::common::frame::CommonFrame;
 use crate::server::db::StateDB;
 
@@ -54,7 +56,7 @@ pub async fn start(args: &ArgMatches) {
         .parse::<u64>()
         .unwrap_or(DEFAULT_INACTIVE_TIMEOUT_SECS);
 
-    let elastic_url = if let Some(raw_url) = parse_elastic_url(args) {
+    let mut elastic_url = if let Some(raw_url) = parse_elastic_url(args) {
         match Url::parse(raw_url) {
             Ok(v) => {
                 info!("Elasticsearch bulk indexing enabled: target = {}", raw_url);
@@ -68,6 +70,8 @@ pub async fn start(args: &ArgMatches) {
     } else {
         None
     };
+    let elastic_index = parse_elastic_index(args);
+    let validate_es_cert = args.get_flag("validate-es-cert");
 
     let state_db_url = match Url::parse(parse_state_db_url(args, DEFAULT_STATE_DB_URL).as_str()) {
         Ok(v) => {
@@ -187,7 +191,17 @@ pub async fn start(args: &ArgMatches) {
     let frames_batch: Data<Mutex<Vec<CommonFrame>>> = Data::new(Mutex::new(Vec::new()));
     let mut batcher: Option<JoinHandle<()>> = None;
 
-    // TODO: use elastic_url to setup elasticsearch client as an Option
+    let mut es_client: Option<Elasticsearch> = None;
+    if let Some(ref mut es_url) = elastic_url {
+        match create_es_client(es_url, validate_es_cert) {
+            Ok(client) => es_client = Some(client),
+            Err(e) => warn!(
+                "Failed to create ES client to {}: {}",
+                es_url,
+                e.to_string()
+            ),
+        }
+    }
 
     let mut interrupt_signal = match signal(SignalKind::interrupt()) {
         Ok(v) => v,
@@ -210,17 +224,16 @@ pub async fn start(args: &ArgMatches) {
                     }
                 }
 
-                // TODO: use the newly created elasticsearch client option instead of elastic_url
-                if let Some(es_url) = elastic_url.as_ref() {
+                if let Some(ref client) = es_client {
                     let mut batch = frames_batch.lock().await;
-                    let es_url = es_url.clone();
 
                     if batch.len() == 0 {
                         let frames_batch = frames_batch.clone();
 
                         batcher = Some(
                             create_es_batch_task(
-                                es_url,
+                                client,
+                                &elastic_index,
                                 frames_batch,
                                 Duration::from_millis(DEFAULT_BATCH_WAIT_MS)
                             )
