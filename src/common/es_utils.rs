@@ -96,7 +96,7 @@ pub fn get_xng_index_mapping() -> Value {
                         "match_mapping_type": "string",
                         "match": "coords",
                         "mapping": {
-                            "type": "geopoint"
+                            "type": "geo_point"
                         }
                     },
                 },
@@ -105,7 +105,7 @@ pub fn get_xng_index_mapping() -> Value {
                         "match_mapping_type": "string",
                         "match": "path",
                         "mapping": {
-                            "type": "geoshape"
+                            "type": "geo_shape"
                         }
                     }
                 }
