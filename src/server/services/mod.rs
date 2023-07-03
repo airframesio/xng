@@ -19,7 +19,6 @@ pub struct ServerServiceResponse {
 pub fn config(cfg: &mut web::ServiceConfig) {
     // TODO: /api/flight/overview
     // TODO: /api/flight/{icao,tail,callsign}/:value/path
-    // TODO: /api/extremities
     // TODO: /api/cleanup ; cleans up DB by removing old entries
 
     cfg.service(
