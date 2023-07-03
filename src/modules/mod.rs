@@ -280,8 +280,6 @@ impl ModuleManager {
             }
         });
 
-        // TODO: create elasticsearch client as an Option
-        
         let (tx, mut rx) = mpsc::channel::<CommonFrame>(DEFAULT_CHANNEL_BUFFER);
         
         let processor_cancel_token = cancel_token.clone();

@@ -16,6 +16,4 @@ pub fn config(cfg: &mut web::ServiceConfig) {
             .guard(guard::Header("content-type", "application/json"))
             .route(web::delete().to(session::delete)),
     );
-
-    // TODO: add service to force end session
 }
