@@ -1,4 +1,5 @@
 use actix_web::web::Data;
+use actix_web::{middleware, App, HttpServer};
 use clap::{arg, ArgMatches, Command};
 use elasticsearch::Elasticsearch;
 use log::*;
@@ -15,18 +16,21 @@ use tokio_util::sync::CancellationToken;
 
 use crate::common;
 use crate::common::arguments::{
-    parse_disable_state_db, parse_elastic_index, parse_elastic_url, parse_listen_host,
-    parse_listen_port, parse_state_db_url,
+    parse_disable_cross_site, parse_disable_state_db, parse_elastic_index, parse_elastic_url,
+    parse_listen_host, parse_listen_port, parse_state_db_url,
 };
 use crate::common::batcher::create_es_batch_task;
 use crate::common::es_utils::create_es_client;
 use crate::common::frame::CommonFrame;
 use crate::server::db::StateDB;
+use crate::server::services as server_services;
 
 pub mod db;
 pub mod services;
 
 const DEFAULT_LISTEN_HOST: &'static str = "0.0.0.0";
+const DEFAULT_LISTEN_PORT: u16 = 7871;
+
 const DEFAULT_STATE_DB_URL: &'static str = "sqlite://state.sqlite3";
 
 pub const SERVER_COMMAND: &'static str = "server";
@@ -49,6 +53,8 @@ pub fn get_server_arguments() -> Command {
 
 pub async fn start(args: &ArgMatches) {
     let listen_host = parse_listen_host(args, DEFAULT_LISTEN_HOST);
+    let listen_port = parse_listen_port(args, DEFAULT_LISTEN_PORT);
+
     let ingest_port: u16 = parse_listen_port(args, DEFAULT_INGEST_PORT);
     let inactive_timeout_secs: u64 = args
         .get_one::<String>("inactive-timeout")
@@ -83,6 +89,8 @@ pub async fn start(args: &ArgMatches) {
             return;
         }
     };
+
+    let disable_cross_site = parse_disable_cross_site(args);
     let disable_state_db = parse_disable_state_db(args);
     if disable_state_db {
         debug!("State DB disabled");
@@ -102,10 +110,47 @@ pub async fn start(args: &ArgMatches) {
         }
     };
 
-    // TODO: Init actix-web server
-
     let cancel_token = CancellationToken::new();
+    let http_cancel_token = cancel_token.clone();
     let ingest_cancel_token = cancel_token.clone();
+
+    let http_state_db = state_db.clone();
+    let http_listen_host = listen_host.clone();
+    let http_listen_port = listen_port.clone();
+
+    let http_thread = tokio::spawn(async move {
+        let restricted_origin = format!("http://{}:{}", http_listen_host, http_listen_port);
+
+        let server = HttpServer::new(move || {
+            App::new()
+                .app_data(http_state_db.clone())
+                .wrap(middleware::DefaultHeaders::new().add((
+                    "Access-Control-Allow-Origin",
+                    if disable_cross_site {
+                        restricted_origin.clone()
+                    } else {
+                        "*".to_string()
+                    },
+                )))
+                .configure(server_services::config)
+        })
+        .bind((http_listen_host.clone(), http_listen_port.clone()))
+        .unwrap()
+        .run();
+
+        info!(
+            "HTTP thread started and listening on http://{}:{}",
+            http_listen_host, http_listen_port
+        );
+
+        select! {
+            _ = server => {},
+            _ = http_cancel_token.cancelled() => {
+                info!("HTTP thread got cancel request");
+                return;
+            }
+        }
+    });
 
     let (tx, mut rx) = mpsc::channel::<CommonFrame>(DEFAULT_CHANNEL_BUFFER);
 
@@ -262,15 +307,12 @@ pub async fn start(args: &ArgMatches) {
         }
     }
 
-    debug!("Signaling ingest thread to cancel");
+    debug!("Signaling HTTP and ingest thread to cancel");
     cancel_token.cancel();
 
-    debug!("Waiting for ingest thread to finish");
-    if let Err(e) = ingest_thread.await {
-        warn!(
-            "Error occurred while waiting for ingest thread to exit: {}",
-            e.to_string()
-        );
+    #[allow(unused_must_use)]
+    {
+        tokio::join!(http_thread, ingest_thread);
     }
 
     info!("Server exited");
