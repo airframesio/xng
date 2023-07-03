@@ -704,7 +704,7 @@ impl XngModule for HfdlModule {
                             warn!("Failed to send ground station change event: {}", e.to_string()); 
                         }
                         
-                        changed = true;        
+                        changed = true;
                     }
                 }
 

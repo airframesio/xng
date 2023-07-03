@@ -25,7 +25,7 @@ pub fn create_es_batch_task(
         let mut batch = batch.lock().await;
 
         if let Err(e) = bulk_index(&client, &index, batch.as_ref()).await {
-            warn!("Failed to bulk index batch: {}", e.to_string());
+            warn!("Bulk index ran into some issues - {}", e.to_string());
         }
 
         batch.clear();

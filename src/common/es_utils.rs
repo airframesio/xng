@@ -3,9 +3,10 @@ use elasticsearch::cert::CertificateValidation;
 use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use elasticsearch::{BulkOperation, Elasticsearch};
 
-use log::{debug, warn};
+use log::warn;
 use reqwest::Url;
 use serde_json::{json, Value};
+use tokio::io;
 
 use super::frame::CommonFrame;
 
@@ -46,20 +47,36 @@ pub async fn bulk_index(
     client: &Elasticsearch,
     index: &String,
     frames: &Vec<CommonFrame>,
-) -> Result<(), elasticsearch::Error> {
+) -> Result<(), io::Error> {
     let body: Vec<BulkOperation<_>> = frames
         .iter()
         .map(|p| BulkOperation::index(p).into())
         .collect();
-    debug!("{:?}", frames);
 
-    let response = client
+    let response = match client
         .bulk(elasticsearch::BulkParts::Index(index.as_str()))
         .body(body)
         .send()
-        .await?;
+        .await
+    {
+        Ok(x) => x,
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Bulk index request failed: {}", e.to_string()),
+            ))
+        }
+    };
 
-    let json: Value = response.json().await?;
+    let json: Value = match response.json().await {
+        Ok(x) => x,
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Failed to parse response JSON: {}", e.to_string()),
+            ))
+        }
+    };
 
     if json["errors"].as_bool().unwrap() {
         let failed: Vec<&Value> = json["items"]
@@ -68,8 +85,11 @@ pub async fn bulk_index(
             .iter()
             .filter(|v| !v["error"].is_null())
             .collect();
-        // TODO: what to do here?
-        warn!("Failed to index {} docs!", failed.len());
+
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("Some documents failed to index: count = {}", failed.len()),
+        ));
     }
 
     Ok(())
