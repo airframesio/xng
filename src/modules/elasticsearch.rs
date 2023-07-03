@@ -109,11 +109,12 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
             );
         } else {
             error!("Deletion failed: error code = {:?}", delete.status_code());
-            trace!(
-                "Deletion error response: {}",
-                delete.text().await.unwrap_or(String::from("None"))
-            );
         }
+
+        trace!(
+            "Response:\n{}",
+            delete.text().await.unwrap_or(String::from("None"))
+        )
     } else if exists.status_code() == StatusCode::NOT_FOUND {
         if delete {
             error!(
@@ -151,11 +152,12 @@ async fn perform_es_index_action(args: &ArgMatches, delete: bool) {
             );
         } else {
             error!("Creation failed: error code = {:?}", response.status_code());
-            trace!(
-                "Creation error response: {}",
-                response.text().await.unwrap_or(String::from("None"))
-            );
         }
+
+        trace!(
+            "Response:\n{}",
+            response.text().await.unwrap_or(String::from("None"))
+        )
     }
 }
 

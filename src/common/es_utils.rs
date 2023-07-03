@@ -3,7 +3,7 @@ use elasticsearch::cert::CertificateValidation;
 use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use elasticsearch::{BulkOperation, Elasticsearch};
 
-use log::warn;
+use log::{debug, warn};
 use reqwest::Url;
 use serde_json::{json, Value};
 
@@ -51,6 +51,7 @@ pub async fn bulk_index(
         .iter()
         .map(|p| BulkOperation::index(p).into())
         .collect();
+    debug!("{:?}", frames);
 
     let response = client
         .bulk(elasticsearch::BulkParts::Index(index.as_str()))
@@ -67,6 +68,7 @@ pub async fn bulk_index(
             .iter()
             .filter(|v| !v["error"].is_null())
             .collect();
+        // TODO: what to do here?
         warn!("Failed to index {} docs!", failed.len());
     }
 
@@ -77,7 +79,6 @@ pub fn get_xng_index_mapping() -> Value {
     json!({
         "mappings": {
             "dynamic": "true",
-            "dynamic_date_formats": ["strict_date_optional_time_nanos"],
             "date_detection": false,
             "numeric_detection": false,
             "dynamic_templates": [
@@ -106,6 +107,16 @@ pub fn get_xng_index_mapping() -> Value {
                         "match": "path",
                         "mapping": {
                             "type": "geo_shape"
+                        }
+                    }
+                },
+                {
+                    "timestamps": {
+                        "match_mapping_type": "string",
+                        "match": "*timestamp",
+                        "mapping": {
+                            "type": "date",
+                            "format": "strict_date_optional_time_nanos"
                         }
                     }
                 }
