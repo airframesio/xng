@@ -111,6 +111,7 @@ impl XngModule for HfdlModule {
 
     fn get_arguments(&self) -> Command {
         Command::new("hfdl")
+            .about("Listen to HFDL messages using dumphfdl")
             .args(&[
                 arg!(--bin <FILE> "Path to dumphfdl binary"),
                 arg!(--systable <FILE> "Path to dumphfdl system table configuration"),

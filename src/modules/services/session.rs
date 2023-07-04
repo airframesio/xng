@@ -7,7 +7,7 @@ use crate::common::middleware::Authorized;
 use crate::modules::session::EndSessionReason;
 use crate::modules::settings::ModuleSettings;
 
-pub const ROUTE: &'static str = "/api/session";
+pub const ROUTE: &'static str = "/api/session/";
 
 #[derive(Serialize)]
 pub struct DeleteResponse {
