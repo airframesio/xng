@@ -1,0 +1,8 @@
+Package: xng
+Version: 0.1
+Depends: libsoapysdr0.8
+Section: utils
+Priority: optional
+Architecture: CURRENT_ARCH
+Maintainer: Andy <andy@airframes.io>
+Description: Next-generation multi-decoder client for SDRs, written in Rust. Currently supports HFDL.
