@@ -10,5 +10,5 @@ cp $(pwd)/target/release/xng ${DEB_BUILD_ROOT}/xng/usr/bin
 sed -e s/CURRENT_ARCH/${DEB_ARCH} packaging/control > ${DEB_BUILD_ROOT}/xng/DEBIAN/control
 
 pushd ${DEB_BUILD_ROOT} && \
-  dpbg-deb --build xng && \
+  dpkg-deb --build xng && \
   popd
