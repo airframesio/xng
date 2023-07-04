@@ -3,6 +3,7 @@ use serde::Serialize;
 
 mod cleanup;
 mod extremities;
+mod flight;
 mod flight_events;
 mod frequency_stats;
 mod ground_station_active;
@@ -18,9 +19,11 @@ pub struct ServerServiceResponse {
 }
 
 pub fn config(cfg: &mut web::ServiceConfig) {
-    // TODO: /api/flight/overview
-    // TODO: /api/flight/{icao,tail,callsign}/:value/path
-
+    cfg.service(
+        web::resource(cleanup::ROUTE)
+            .guard(guard::Header("content-type", "application/json"))
+            .route(web::get().to(flight::get)),
+    );
     cfg.service(
         web::resource(cleanup::ROUTE)
             .guard(guard::Header("content-type", "application/json"))

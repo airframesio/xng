@@ -1,5 +1,5 @@
 Package: xng
-Version: 0.1
+Version: 0.1.0-hfdl
 Depends: libsoapysdr0.8
 Section: utils
 Priority: optional

@@ -4,7 +4,7 @@ DEB_ARCH=$(dpkg --print-architecture)
 DEB_BUILD_ROOT=$(pwd)/build
 
 DEB_PKG_VERSION=$(grep Version $(pwd)/packaging/control | awk '{print $2}')
-DEB_PKG_NAME=xng-${DEB_PKG_VERSION}
+DEB_PKG_NAME=xng-${DEB_PKG_VERSION}-${DEB_ARCH}
 
 mkdir -p ${DEB_BUILD_ROOT}/${DEB_PKG_NAME}/DEBIAN
 mkdir -p ${DEB_BUILD_ROOT}/${DEB_PKG_NAME}/usr/bin

@@ -26,6 +26,6 @@ jobs:
       run: ./build_deb_package.sh
     - uses: actions/upload-artifact@v3
       with:
-        name: artifact-deb
+        name: xng-debian-package-latest
         path: |
           ./build/*.deb
