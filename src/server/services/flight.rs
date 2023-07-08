@@ -23,7 +23,7 @@ pub const VALID_FIELDS: [&'static str; 3] = [FIELD_AIRCRAFT_ICAO, FIELD_CALLSIGN
 struct FlightParams {
     field: Option<String>,
     value: Option<String>,
-    since: DateTime<Utc>,
+    since: Option<DateTime<Utc>>,
 }
 
 #[derive(FromRow)]
