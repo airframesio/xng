@@ -156,7 +156,7 @@ pub async fn get(req: HttpRequest, _: Authorized) -> HttpResponse {
                     ge.*, 
                     ge2.latitude AS prev_latitude, 
                     ge2.longitude AS prev_longitude,
-                    iif(ae.aircraft_icao IS NULL, NULL, printf('%06x', ae.aircraft_icao)) AS icao_addr
+                    iif(ge.aircraft_icao IS NULL, NULL, printf('%06x', ge.aircraft_icao)) AS icao_addr
                 FROM grouped_events ge
                 LEFT JOIN grouped_events ge2 ON ge.{} = ge2.{} AND ge2.row = 2
                 WHERE ge.row = 1 
