@@ -37,13 +37,13 @@ pub async fn delete(req: HttpRequest, _: Authorized) -> HttpResponse {
             (
                 "aircraft events",
                 "
-                DELETE FROM aircraft_events ae WHERE ae.ts < ? 
+                DELETE FROM aircraft_events WHERE ts < ? 
                 ",
             ),
             (
                 "ground station change events",
                 "
-                DELETE FROM ground_station_change_events gsce WHERE gsce.ts < ? 
+                DELETE FROM ground_station_change_events WHERE ts < ? 
                 ",
             ),
         ];
@@ -57,7 +57,7 @@ pub async fn delete(req: HttpRequest, _: Authorized) -> HttpResponse {
                 Err(e) => {
                     msgs.push(format!(
                         "encountered an error while removing {} ({})",
-                        query.1,
+                        query.0,
                         e.to_string()
                     ));
                     ok = false;
