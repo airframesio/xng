@@ -4,7 +4,7 @@ use crate::common::wkt::WKTPolyline;
 use crate::modules::PROP_LISTENING_BAND;
 use crate::modules::hfdl::airframes::{AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT, get_airframes_gs_status};
 use crate::modules::hfdl::schedule::parse_session_schedule;
-use crate::modules::hfdl::utils::{freq_bands_by_sample_rate, first_freq_above_eq};
+use crate::modules::hfdl::utils::{freq_bands_by_sample_rate, first_freq_above_eq, get_max_dist_khz_by_sample_rate};
 use crate::server::db::StateDB;
 use crate::utils::normalize_tail;
 use crate::utils::timestamp::{split_unix_time_to_utc_datetime, nearest_time_in_past, unix_time_to_utc_datetime};
@@ -25,6 +25,7 @@ use clap::{arg, Arg, ArgAction, ArgMatches, Command};
 use log::*;
 use rand::Rng;
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::ops::DerefMut;
@@ -297,6 +298,8 @@ impl XngModule for HfdlModule {
                 extra_args.extend_from_slice(&[String::from("--output"), output_arg]);
             }
         }
+
+        let listening_bands: Vec<u16>;
 
         let mut proc;
         {
@@ -585,6 +588,8 @@ impl XngModule for HfdlModule {
                 *value = json!(bands);
             }
 
+            listening_bands = bands.clone();
+            
             {
                 let Some(value) = settings.props.get_mut(&PROP_NEXT_SESSION_BAND.to_string()) else {
                     return Err(
@@ -608,12 +613,13 @@ impl XngModule for HfdlModule {
             proc,
             BufReader::new(stdout),
             stderr,
+            listening_bands,
             next_session_begin,
             end_session_on_timeout,
         )))
     }
 
-    async fn process_message(&mut self, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
+    async fn process_message(&mut self, current_band: &Vec<u16>, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
         let raw_frame = serde_json::from_str::<Frame>(msg)?;
         let mut frame_src: cff::Entity;
         let mut frame_dst: Option<cff::Entity> = None;
@@ -661,6 +667,12 @@ impl XngModule for HfdlModule {
                     only_use_active = value.as_bool().unwrap_or(false);
                 }
 
+                let sample_rate;
+                {
+                    let value = settings.props.get(&PROP_SAMPLE_RATE.to_string()).unwrap_or(&json!(false));
+                    sample_rate = value.as_u64().unwrap_or(0);    
+                }
+                
                 let stale_timeout_sec;
                 {  
                     let Some(value) = settings.props.get(&PROP_STALE_TIMEOUT_SEC.to_string()) else {
@@ -693,19 +705,58 @@ impl XngModule for HfdlModule {
                         station.gs.name.clone(), 
                         &freq_set
                     ) {
-                        trace!(
+                        debug!(
                             "Ground station ID {} [{}] changed frequency set: {} -> {}",
                             change_event.pretty_id(),
                             change_event.pretty_name(),
                             change_event.old,
                             change_event.new,
                         );
-
-                        if let Err(e) = settings.change_event_tx.send(change_event).await {
+                        
+                        if let Err(e) = settings.change_event_tx.send(change_event.clone()).await {
                             warn!("Failed to send ground station change event: {}", e.to_string()); 
                         }
-                        
-                        changed = true;
+
+                        match (serde_json::from_str::<Vec<u16>>(change_event.old.as_str()), serde_json::from_str::<Vec<u16>>(change_event.new.as_str())) {
+                            (Ok(old_band), Ok(new_band)) => {
+                                let old_band_set: HashSet<&u16> = HashSet::from_iter(old_band.iter());
+                                let new_band_set: HashSet<&u16> = HashSet::from_iter(new_band.iter());
+
+                                let added_or_removed: HashSet<_> = old_band_set.symmetric_difference(&new_band_set).collect();
+                                let max_dist_khz = get_max_dist_khz_by_sample_rate(sample_rate as u32) as u16;
+                                
+                                trace!("Current Band = {:?}, Added/Removed = {:?}, Max Dist kHz = {}", current_band, added_or_removed, max_dist_khz);
+
+                                if added_or_removed.iter().any(|&&x| {
+                                    let Some(first_freq) = current_band.first() else {
+                                        debug!("Current band does not have a first freq: {:?}", current_band);
+                                        return true;
+                                    };
+                                    let Some(last_freq) = current_band.last() else {
+                                        debug!("Current band does not have a last freq: {:?}", current_band);
+                                        return true;
+                                    };
+
+                                    if (*x >= *first_freq && *x <= *last_freq) || 
+                                        (*x < *first_freq && (*last_freq - *x) <= max_dist_khz) ||
+                                        (*x > *last_freq && (*x - *last_freq) <= max_dist_khz) {
+                                        return true;
+                                    }
+                                    
+                                    false
+                                }) {
+                                    changed = true;
+                                }
+                            }
+                            (Err(e), _) => {
+                                debug!("old_band is not valid JSON: {:?} ; error = {}", change_event.old, e.to_string());
+                                changed = true;
+                            }
+                            (_, Err(e)) => {
+                                debug!("new_band is not valid JSON: {:?} ; error = {}", change_event.new, e.to_string());
+                                changed = true;
+                            }
+                        }
                     }
                 }
 

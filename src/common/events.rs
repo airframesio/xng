@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+#[derive(Clone)]
 pub struct GroundStationChangeEvent {
     pub ts: String,
     pub id: Value,

@@ -67,7 +67,7 @@ pub trait XngModule {
 
     async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>, state_db: Data<RwLock<StateDB>>);
 
-    async fn process_message(&mut self, msg: &str) -> Result<CommonFrame, io::Error>;
+    async fn process_message(&mut self, current_band: &Vec<u16>, msg: &str) -> Result<CommonFrame, io::Error>;
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn Session>, io::Error>;
 }
 
@@ -493,7 +493,7 @@ impl ModuleManager {
                                     println!("{}", raw_msg.trim());
                                 }                        
                                 
-                                let frame = match module.process_message(&raw_msg).await {
+                                let frame = match module.process_message(session.get_listening_band(), &raw_msg).await {
                                     Ok(v) => v,
                                     Err(e) => {
                                         error!("Malformed frame, could not convert to common frame format: {}", e.to_string());

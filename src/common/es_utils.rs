@@ -3,7 +3,6 @@ use elasticsearch::cert::CertificateValidation;
 use elasticsearch::http::transport::{SingleNodeConnectionPool, TransportBuilder};
 use elasticsearch::{BulkOperation, Elasticsearch};
 
-use log::warn;
 use reqwest::Url;
 use serde_json::{json, Value};
 use tokio::io;

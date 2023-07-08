@@ -14,6 +14,8 @@ pub struct DumpHFDLSession {
     reader: BufReader<ChildStdout>,
     stderr: ChildStderr,
 
+    bands: Vec<u16>,
+
     session_start: Instant,
     session_end: Option<Duration>,
     end_session_on_timeout: bool,
@@ -49,6 +51,10 @@ impl Session for DumpHFDLSession {
         errors
     }
 
+    fn get_listening_band(&self) -> &Vec<u16> {
+        &self.bands
+    }
+
     async fn end(&mut self, reason: EndSessionReason) {
         debug!("Terminating launched dumphfdl process...");
 
@@ -66,6 +72,7 @@ impl DumpHFDLSession {
         process: Child,
         reader: BufReader<ChildStdout>,
         stderr: ChildStderr,
+        bands: Vec<u16>,
         session_end_datetime: Option<DateTime<Local>>,
         end_session_on_timeout: bool,
     ) -> DumpHFDLSession {
@@ -84,6 +91,7 @@ impl DumpHFDLSession {
             process,
             reader,
             stderr,
+            bands,
             end_session_on_timeout,
             session_start: Instant::now(),
             session_end,

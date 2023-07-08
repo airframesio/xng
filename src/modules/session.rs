@@ -23,5 +23,8 @@ pub trait Session {
 
     async fn on_timeout(&mut self) -> bool;
     async fn get_errors(&mut self) -> String;
+
+    fn get_listening_band(&self) -> &Vec<u16>;
+
     async fn end(&mut self, reason: EndSessionReason);
 }
