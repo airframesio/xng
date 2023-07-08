@@ -9,7 +9,7 @@ pub struct CreateInitTables;
 #[async_trait]
 impl Migration for CreateInitTables {
     async fn migrate(&self, db: &SqlitePool) -> Result<(), io::Error> {
-        let queries = vec![
+        let queries = [
             "
                 CREATE TABLE IF NOT EXISTS ground_stations (
                     id              INTEGER PRIMARY KEY,

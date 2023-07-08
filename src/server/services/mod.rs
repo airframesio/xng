@@ -20,7 +20,7 @@ pub struct ServerServiceResponse {
 
 pub fn config(cfg: &mut web::ServiceConfig) {
     cfg.service(
-        web::resource(cleanup::ROUTE)
+        web::resource(flight::ROUTE)
             .guard(guard::Header("content-type", "application/json"))
             .route(web::get().to(flight::get)),
     );
