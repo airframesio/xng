@@ -74,7 +74,7 @@ curl -H "Content-Type: application/json" -X DELETE "http://localhost:7871/api/se
 - [x] Web API endpoint to show detailed flight path by ICAO/tail/callsign
 
 - [ ] Fancy verbose frame status messages
-- [ ] More documentation detailing more advanced session settings like scheduling and next session frequency strategies
+- [ ] More documentation detailing advanced session settings like scheduling and next session frequency strategies
 - [ ] Simple front-end UI to graphically view aircraft events
 - [ ] Add support for `dumpvdl2` via `aoa` subcommand
 - [ ] Add support for `acarsdec` via `poa` subcommand
