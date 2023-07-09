@@ -64,9 +64,9 @@ Forcible end session (can be used in conjunction with update application setting
 curl -H "Content-Type: application/json" -X DELETE "http://localhost:7871/api/session/"
 ```
 ## TODO
-- [ ] Web API endpoint to clean up state DB by clearing aircraft/ground station events older than a certain date
-- [ ] Web API endpoint to show flight overview (latest position from all callsign/ICAO combinations)
-- [ ] Web API endpoint to show detailed flight path by ICAO/tail/callsign
+- [x] Web API endpoint to clean up state DB by clearing aircraft/ground station events older than a certain date
+- [x] Web API endpoint to show flight overview (latest position from all callsign/ICAO combinations)
+- [x] Web API endpoint to show detailed flight path by ICAO/tail/callsign
 
 - [ ] Fancy verbose frame status messages
 - [ ] More documentation detailing more advanced session settings like scheduling and next session frequency strategies
