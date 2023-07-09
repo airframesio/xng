@@ -49,17 +49,22 @@ Examine all non-stale (as determined by timeout value configurable by the user) 
 curl -H "Content-Type: application/json" "http://localhost:7871/api/ground-station/active/" | jq
 ```
 
+Delete all aircraft events and ground station change events before a specific time (such as July 1, 2023 at 00:00 UTC in this example)
+```bash
+curl -H "Content-Type: application/json" -X DELETE "http://localhost:7871/api/cleanup/?before=2023-07-01T00:00:00Z"
+```
+
 Examine application settings -- all items in `props` are modifiable via `PATCH` (see next example)
 ```bash
 curl -H "Content-Type: application/json" "http://localhost:7871/api/settings/" | jq
 ```
 
-Update application settings
+Update application settings (such as the next session's frequency band)
 ```bash
 curl -H "Content-Type: application/json" -X PATCH -d '{"prop":"next_session_band","value":17000}' "http://localhost:7871/api/settings/"
 ```
 
-Forcible end session (can be used in conjunction with update application settings to manually force a listening frequencies change)
+Force end session (can be used in conjunction with update application settings to manually force a listening frequencies change)
 ```bash
 curl -H "Content-Type: application/json" -X DELETE "http://localhost:7871/api/session/"
 ```
