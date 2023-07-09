@@ -60,7 +60,7 @@ impl Migration for CreateInitTables {
                     longitude     REAL NOT NULL,
                     altitude      INTEGER,
                 
-                    FOREIGN KEY(aircraft_icao) REFERENCES aircrafts(icao)
+                    FOREIGN KEY(aircraft_icao) REFERENCES aircrafts(icao) ON DELETE CASCADE
                     FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
                 )    
             ",
@@ -70,7 +70,7 @@ impl Migration for CreateInitTables {
                     aircraft_events_id INTEGER NOT NULL,
                     gs_id              INTEGER NOT NULL,
 
-                    FOREIGN KEY(aircraft_events_id) REFERENCES aircraft_events(id)
+                    FOREIGN KEY(aircraft_events_id) REFERENCES aircraft_events(id) ON DELETE CASCADE
                     FOREIGN KEY(gs_id) REFERENCES ground_stations(id)
                     UNIQUE(aircraft_events_id, gs_id)
                 )
