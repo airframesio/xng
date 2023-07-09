@@ -101,7 +101,7 @@ async fn get_flight_event(
                     ELSE oae.trans_latitude
                 END AS norm_latitude,
                 CASE
-                    WHEN oae.trans_longitude >= 180 THEN -360 - oae.trans_longitude
+                    WHEN oae.trans_longitude >= 180 THEN -360 + oae.trans_longitude
                     WHEN oae.trans_longitude <= -180 THEN 360 - oae.trans_longitude
                     ELSE oae.trans_longitude
                 END AS norm_longitude,
