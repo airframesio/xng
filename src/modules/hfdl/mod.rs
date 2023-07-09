@@ -724,8 +724,9 @@ impl XngModule for HfdlModule {
 
                                 let added_or_removed: HashSet<_> = old_band_set.symmetric_difference(&new_band_set).collect();
                                 let max_dist_khz = get_max_dist_khz_by_sample_rate(sample_rate as u32) as u16;
-                                
-                                trace!("Current Band = {:?}, Added/Removed = {:?}, Max Dist kHz = {}", current_band, added_or_removed, max_dist_khz);
+
+                                trace!("  current_band = {:?}", current_band);
+                                trace!("  changed_freqs = {:?}; max_dist_khz = {}", added_or_removed, max_dist_khz);
 
                                 if added_or_removed.iter().any(|&&x| {
                                     let Some(first_freq) = current_band.first() else {
