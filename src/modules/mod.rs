@@ -68,7 +68,7 @@ pub trait XngModule {
 
     async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>, state_db: Data<RwLock<StateDB>>);
 
-    async fn process_message(&mut self, current_band: &Vec<u16>, msg: &str) -> Result<CommonFrame, io::Error>;
+    async fn process_message(&mut self, current_band: &Vec<u64>, msg: &str) -> Result<CommonFrame, io::Error>;
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn Session>, io::Error>;
 }
 
