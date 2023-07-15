@@ -10,6 +10,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tokio::{io, process};
 
+use self::frame::Frame;
 use self::session::DumpVDL2Session;
 use self::validators::validate_next_session_band;
 
@@ -21,6 +22,7 @@ use crate::common::{AIRFRAMESIO_DUMPVDL2_UDP_PORT, AIRFRAMESIO_HOST};
 use crate::modules::PROP_LISTENING_BAND;
 use crate::server::db::StateDB;
 
+mod frame;
 mod ground_station_db;
 mod module;
 mod session;
@@ -257,6 +259,10 @@ impl XngModule for AoaModule {
         current_band: &Vec<u64>,
         msg: &str,
     ) -> Result<crate::common::frame::CommonFrame, io::Error> {
-        todo!()
+        let raw_frame = serde_json::from_str::<Frame>(msg)?;
+
+        info!("{:?}", raw_frame);
+        
+        Err(io::Error::new(io::ErrorKind::Other, "not implemented yet"))
     }
 }

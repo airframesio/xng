@@ -474,6 +474,7 @@ impl ModuleManager {
                                     reason = EndSessionReason::SessionTimeout;
                                     break;
                                 } else {
+                                    since_last_msg = Instant::now();
                                     continue;
                                 }
                             }
