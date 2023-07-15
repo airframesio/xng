@@ -30,7 +30,9 @@ use std::io;
 use std::path::PathBuf;
 use std::ops::DerefMut;
 use std::process::Stdio;
-use tokio::{io::BufReader, process, sync::RwLock};
+use tokio::io::BufReader;
+use tokio::process;
+use tokio::sync::RwLock;
 
 mod airframes;
 mod frame;
@@ -111,7 +113,7 @@ impl XngModule for HfdlModule {
     }
 
     fn get_arguments(&self) -> Command {
-        Command::new("hfdl")
+        Command::new(HFDL_COMMAND)
             .about("Listen to HFDL messages using dumphfdl")
             .args(&[
                 arg!(--bin <FILE> "Path to dumphfdl binary"),
@@ -783,6 +785,14 @@ impl XngModule for HfdlModule {
             frame_src = lpdu.src.to_common_frame_entity(&self.systable);
             frame_dst = Some(lpdu.dst.to_common_frame_entity(&self.systable));
             
+            if let Some(ref ac_info) = lpdu.ac_info {
+                match (lpdu.from_ground_station(), &mut frame_src, &mut frame_dst) {
+                    (true, _, Some(ref mut dst)) => dst.icao = Some(ac_info.icao.clone()),
+                    (false, src, _) => src.icao = Some(ac_info.icao.clone()),
+                    (_, _, _) => {}
+                }
+            }
+
             if let Some(ref hfnpdu) = lpdu.hfnpdu {
                 if let Some(ref flight_id) = hfnpdu.flight_id {
                     frame_src.callsign = Some(flight_id.trim().to_string());
@@ -890,15 +900,6 @@ impl XngModule for HfdlModule {
                     reason, 
                 });
             } else {
-                if let Some(ref ac_info) = lpdu.ac_info {
-                    if lpdu.from_ground_station() {
-                        match frame_dst {
-                            Some(ref mut entity) => entity.icao = Some(ac_info.icao.clone()),
-                            _ => {},
-                        }
-                    }                        
-                }
-
                 if let Some(ref ac_id) = lpdu.assigned_ac_id {
                     if lpdu.from_ground_station() {
                         match frame_dst {
