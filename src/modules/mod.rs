@@ -34,6 +34,7 @@ use crate::server::services as server_services;
 use self::session::Session;
 use self::settings::ModuleSettings;
 
+mod aoa;
 mod hfdl;
 mod services;
 mod session;
@@ -79,7 +80,7 @@ impl ModuleManager {
     pub fn init() -> ModuleManager {
         ModuleManager {
             modules: HashMap::from_iter(
-                [hfdl::HfdlModule::new()]
+                [aoa::AoaModule::new(), hfdl::HfdlModule::new()]
                     .map(|m| (m.id(), m))
                     .into_iter()
                     .collect::<Vec<(&'static str, Box<dyn XngModule>)>>(),
