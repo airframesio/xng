@@ -90,6 +90,23 @@ pub struct XID {
     pub vdl_params: Vec<VDLParam>,
 }
 
+#[derive(Debug, Deserialize, Validate)]
+pub struct CLNP {
+    pub err: bool,
+    // pub adsc_v2
+}
+
+#[derive(Debug, Deserialize, Validate)]
+pub struct X25 {
+    pub err: bool,
+    pub pkt_type: u32,
+    pub pkt_type_name: String,
+    pub chan_group: u32,
+    pub chan_num: u16,
+    pub more: bool,
+    pub clnp: Option<CLNP>,
+}
+
 // "adsc_v2": {"adsc_report": {"choice": "demand-report", "data": {"on_demand_report": {"report_data": {"position": {"lat": {"deg": 50, "min": 7, "sec": 53.9, "dir": "north"}, "lon": {"deg": 8, "min": 8, "sec":50.7, "dir": "east"}, "alt": {"val": 35980.0, "unit": "ft"}}, "timestamp": {"date": {"year": 2022, "month": 7, "day": 12}, "time": {"hour": 22, "min": 25, "sec": 53}}, ... }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -108,7 +125,7 @@ pub struct AVLC {
 
     pub acars: Option<ACARS>,
     pub xid: Option<XID>,
-    // pub adsc_v2
+    pub x25: Option<X25>,
 }
 
 #[derive(Debug, Deserialize, Validate)]
