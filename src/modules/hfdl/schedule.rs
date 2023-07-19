@@ -8,7 +8,7 @@ use serde_json::Value;
 pub fn parse_session_schedule(value: &str) -> Result<Vec<(DateTime<Local>, u32)>, String> {
     lazy_static! {
         static ref SCHEDULE_ENTRY_FMT: Regex =
-            Regex::new(r"time=([0-9]|[01][1-9]|2[0-3]):([0-5][0-9]),band_contains=([0-9]{4,5})")
+            Regex::new(r"time=([0-9]|[01][0-9]|2[0-3]):([0-5][0-9]),band_contains=([0-9]{4,5})")
                 .unwrap();
     }
 
