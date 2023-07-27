@@ -38,7 +38,7 @@ jobs:
     steps:
     - name: Get version
       id: version
-      run: echo "::set-output name=version::$(cat ${{ github.workspace }}/build/version)"
+      run: echo "version=$(cat ${{ github.workspace }}/build/version)" >> $GITHUB_STATE
     - name: Create release
       id: create_release
       uses: actions/create-release@v1
@@ -49,6 +49,9 @@ jobs:
         release_name: Release ${{ github.ref }}
         draft: false
         prerelease: false
+    - name: List assets
+      run: |
+        ls -la ${{ github.workspace }}/build
     - name: Upload Debian package
       uses: actions/upload-release-asset@v1
       env:
