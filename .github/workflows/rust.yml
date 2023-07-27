@@ -51,7 +51,7 @@ jobs:
         prerelease: false
     - name: List assets
       run: |
-        ls -la ${{ github.workspace }}/build
+        ls -la ${{ github.workspace }}
     - name: Upload Debian package
       uses: actions/upload-release-asset@v1
       env:
