@@ -49,9 +49,14 @@ jobs:
         release_name: Release ${{ github.ref }}
         draft: false
         prerelease: false
+    - name: Download artifact from previous job
+      uses: actions/download-artifact@v2
+      with:
+        name: xng-debian-package-latest
+        path: ${{ github.workspace }}/build
     - name: List assets
       run: |
-        ls -la ${{ github.workspace }}
+        ls -la ${{ github.workspace }}/build
     - name: Upload Debian package
       uses: actions/upload-release-asset@v1
       env:
