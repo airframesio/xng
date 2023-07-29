@@ -1,11 +1,11 @@
-FROM rust:1.70-bookworm
+FROM rust:bookworm AS builder
 
 RUN apt-get update
-RUN apt-get install pkg-config libssl-dev -y
-RUN apt-get install libsoapysdr-dev python3-soapysdr soapysdr-module-all soapysdr-tools  -y
+RUN apt-get install -y pkg-config libssl-dev libclang-dev
+RUN apt-get install -y libsoapysdr-dev python3-soapysdr soapysdr-module-all soapysdr-tools
 
 WORKDIR /usr/src/app
 COPY . .
 RUN cargo install --path .
 
-CMD ["xng"]
+CMD ["xng", "--version"]
