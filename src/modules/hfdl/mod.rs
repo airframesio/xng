@@ -396,7 +396,6 @@ impl XngModule for HfdlModule {
                     next_session_begin = Some(*dt);
             
                     if let Some((_, target_freq)) = schedule.last() {
-                        debug!("last_end_reason={:?} next_session_band={:?}", last_end_reason, next_session_band);
                         match (last_end_reason, next_session_band) {
                             (_, 0) | (EndSessionReason::SessionEnd, _) => next_session_band = *target_freq as u64,
                             _ => {}
