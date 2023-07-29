@@ -69,6 +69,8 @@ pub trait XngModule {
 
     async fn process_message(&mut self, current_band: &Vec<u16>, msg: &str) -> Result<CommonFrame, io::Error>;
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn Session>, io::Error>;
+
+    async fn reload(&mut self) -> Result<(), io::Error>;
 }
 
 pub struct ModuleManager {
@@ -542,19 +544,27 @@ impl ModuleManager {
                         break;
                     }
                     _ = reload_signal.recv() => {
-                        let settings = module_settings.read().await;
-                        
-                        match settings.props.get(PROP_SESSION_TIMEOUT_SEC) {
-                            Some(v) => session_timeout_secs = v.as_u64().unwrap_or(module.default_session_timeout_secs()),
-                            None => warn!("Failed to find session_timeout_secs key in module settings")
+                        {
+                            let settings = module_settings.read().await;
+
+                            match settings.props.get(PROP_SESSION_TIMEOUT_SEC) {
+                                Some(v) => session_timeout_secs = v.as_u64().unwrap_or(module.default_session_timeout_secs()),
+                                None => warn!("Failed to find session_timeout_secs key in module settings")
+                            }
+
+                            match settings.props.get(PROP_SESSION_INTERMISSION_SEC) {
+                                Some(v) => session_intermission_secs = v.as_u64().unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS),
+                                None => warn!("Failed to find session_intermission_secs key in module settings")
+                            }
+
+                            info!("Module session timeout, intermission wait time props reloaded");
                         }
 
-                        match settings.props.get(PROP_SESSION_INTERMISSION_SEC) {
-                            Some(v) => session_intermission_secs = v.as_u64().unwrap_or(DEFAULT_SESSION_INTERMISSION_SECS),
-                            None => warn!("Failed to find session_intermission_secs key in module settings")
+                        if let Err(e) = module.reload().await {
+                            warn!("Failed to reload settings for {} module: {}", module.id(), e.to_string());
+                        } else {
+                            info!("Settings for module {} reloaded", module.id());
                         }
-
-                        info!("Module session timeout and intermission props reloaded");
                     }
                 } 
             }

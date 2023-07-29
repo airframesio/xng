@@ -58,5 +58,9 @@ pub fn validate_session_schedule(value: &Value) -> Result<(), String> {
         return Err(format!("Schedule is not a string: {:?}", value));
     };
 
+    if value.is_empty() {
+        // NOTE: always ok to set to empty string as a means of having no schedule
+        return Ok(());
+    }
     parse_session_schedule(value).map(|_| ())
 }

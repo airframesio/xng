@@ -64,6 +64,11 @@ Update application settings (such as the next session's frequency band)
 curl -H "Content-Type: application/json" -X PATCH -d '{"prop":"next_session_band","value":17000}' "http://localhost:7871/api/settings/"
 ```
 
+Update application settings (setting a session schedule that sets the listening band to 21000 at 9am and 8000 at 8pm)
+```bash
+curl -H "Content-Type: application/json" -X PATCH -d '{"prop":"session_schedule","value":"time=9:00,band_contains=21000;time=20:00,band_contains=8000"}' "http://localhost:7871/api/settings/"
+```
+
 Force end session (can be used in conjunction with update application settings to manually force a listening frequencies change)
 ```bash
 curl -H "Content-Type: application/json" -X DELETE "http://localhost:7871/api/session/"

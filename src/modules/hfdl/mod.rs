@@ -26,11 +26,10 @@ use log::*;
 use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::io;
 use std::path::PathBuf;
 use std::ops::DerefMut;
 use std::process::Stdio;
-use tokio::io::BufReader;
+use tokio::io::{self, BufReader};
 use tokio::process;
 use tokio::sync::RwLock;
 
@@ -384,8 +383,8 @@ impl XngModule for HfdlModule {
             if next_session_band == 0 && matches!(last_end_reason, EndSessionReason::SessionUpdate) {
                 next_session_band = self.last_req_session_band;
             }
-                
-            if next_session_band == 0 && !self.schedule.is_empty() {
+
+            if !self.schedule.is_empty() {
                 let schedule = match parse_session_schedule(&self.schedule) {
                     Ok(x) => x,
                     Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Failed to parse schedule: {}", e.to_string())))  
@@ -395,10 +394,11 @@ impl XngModule for HfdlModule {
                 
                 if let Some((dt, _)) = schedule.first() {
                     next_session_begin = Some(*dt);
-
-                    if schedule.len() > 1 {
-                        match (last_end_reason, schedule.last()) {
-                            (EndSessionReason::None | EndSessionReason::SessionEnd, Some((_, target_freq))) => next_session_band = *target_freq as u64,
+            
+                    if let Some((_, target_freq)) = schedule.last() {
+                        debug!("last_end_reason={:?} next_session_band={:?}", last_end_reason, next_session_band);
+                        match (last_end_reason, next_session_band) {
+                            (_, 0) | (EndSessionReason::SessionEnd, _) => next_session_band = *target_freq as u64,
                             _ => {}
                         }
                     }
@@ -948,4 +948,24 @@ impl XngModule for HfdlModule {
             acars: acars_content,
         })
     }
+
+    async fn reload(&mut self) -> Result<(), io::Error> {
+        let settings = self.get_settings()?;
+        {
+            let settings = settings.read().await;
+
+            let Some(schedule) = settings.props.get(PROP_SESSION_SCHEDULE) else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Session schedule prop value does not exist")))
+            };
+
+            if let Some(schedule) = schedule.as_str() {
+                // NOTE: schedule is already validated on being set
+                self.schedule = schedule.to_string();
+            } else {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("Session schedule prop value is not a string")))
+            }
+        }
+
+        Ok(())
+    } 
 }
