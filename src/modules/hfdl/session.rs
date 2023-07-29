@@ -79,7 +79,10 @@ impl DumpHFDLSession {
         let mut session_end: Option<Duration> = None;
         if let Some(dt) = session_end_datetime {
             match (dt - Local::now()).to_std() {
-                Ok(x) => session_end = Some(x),
+                Ok(x) => {
+                    session_end = Some(x);
+                    debug!("Session set to terminate at {:?} (in {:?})", dt, x);
+                }
                 Err(e) => warn!(
                     "New session failed to set session end time: {}",
                     e.to_string()
