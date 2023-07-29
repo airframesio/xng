@@ -265,4 +265,8 @@ impl XngModule for AoaModule {
         
         Err(io::Error::new(io::ErrorKind::Other, "not implemented yet"))
     }
+
+    async fn reload(&mut self) -> Result<(), io::Error> {
+        Ok(())
+    }
 }
