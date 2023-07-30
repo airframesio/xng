@@ -10,7 +10,7 @@ Notable features:
  * Web API for controlling session settings and exposing stats + metrics
  * and more...
 
-For Ubuntu/Debian, check out GitHub Actions of `amd64` packages.
+For Ubuntu/Debian, check out GitHub Actions for `amd64` packages.
 
 ## Building
  1. Install a stable [Rust](https://www.rust-lang.org/learn/get-started) toolchain. Make sure the `cargo` command is in `PATH` environment variable after completion.
