@@ -26,6 +26,11 @@ cargo build --release
  5. Compiled binary should be built in `./target/release/xng`
 
 ## How To Run
+**NOTE:** If you want to index received frames to a local ElasticSearch instance, run the following command first:
+```bash
+xng init_es --elastic "http://my-es-server:9200" --elastic-index xng_acars_db
+```
+
 Following example starts a HFDL listening session on the 8MHz band (as determined by splitting the `systable.conf` bands into sample rate wide frequency ranges) with the following options:
  * Feed all received HFDL frames to Airframes with a station name of `MY-STATION-ID`
  * Use Airframes active HFDL frequencies API to determine active frequencies
@@ -33,11 +38,6 @@ Following example starts a HFDL listening session on the 8MHz band (as determine
  * Store frequencies/aircraft events stats into a local DB file, `xng_state.db`
  * Index the frames into the `xng_acars_db` index on the Elasticsearch server at `https://my-es-server:9200`
  * Use the SoapySDR `airspyhf` driver
-
-**NOTE:** If you want to index received frames to a local ElasticSearch instance, run the following command first:
-```bash
-xng init_es --elastic "http://my-es-server:9200" --elastic-index xng_acars_db
-```
 
 ```bash
 xng hfdl -vvv --systable /etc/systable.conf --sample-rate 512000 --start-band-contains 8000 --use-airframes-gs-map --method random --only-listen-on-active --state-db xng_state.db --feed-airframes --elastic "https://my-es-server:9200" --elastic-index xng_acars_db  -- --soapysdr driver=airspyhf --station-id "MY-STATION-ID"
