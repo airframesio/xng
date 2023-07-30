@@ -354,7 +354,7 @@ impl ModuleManager {
                 select! {
                     Some(mut frame) = rx.recv() => {
                         if let Some(ref acars) = frame.acars {
-                            // TODO: use acars-decoder-rust to decode ACARS content and save it to frame.indexed
+                            // TODO[ACARS]: use acars-decoder-rust to decode ACARS content and save it to frame.indexed
                         }
                         
                         if let Some(ref mut stream) = swarm_stream {
@@ -504,7 +504,7 @@ impl ModuleManager {
                                         continue;
                                     }
                                 };
-                                
+                                info!("{:?}", frame);
                                 if let Err(e) = tx.send(frame).await {
                                     error!("Failed to send common frame to processing thread: {}", e.to_string());                                    
                                 }

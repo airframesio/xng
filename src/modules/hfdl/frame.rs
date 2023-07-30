@@ -41,7 +41,7 @@ impl Entity {
 
     pub fn to_common_frame_entity(&self, systable: &SystemTable) -> frame::Entity {
         frame::Entity {
-            kind: self.entity_type.to_string(),
+            kind: self.entity_type.clone(),
             icao: if let Some(ref ac_info) = self.ac_info {
                 Some(ac_info.icao.clone())
             } else {
@@ -51,7 +51,7 @@ impl Entity {
                 (EntityType::GroundStation, Some(name)) => Some(name.clone()),
                 _ => None,
             },
-            id: Some(self.id),
+            id: Some(self.id.into()),
             callsign: None,
             tail: None,
             coords: match (self.kind(), systable.by_id(self.id)) {

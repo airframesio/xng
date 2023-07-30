@@ -2,7 +2,10 @@ use serde::Deserialize;
 use serde_json::Value;
 use serde_valid::Validate;
 
-use crate::common::formats::{validate_entity_type, Application, Timestamp};
+use super::ground_station_db::GroundStationDB;
+use crate::common::formats::{validate_entity_type, Application, EntityType, Timestamp};
+use crate::common::frame;
+use crate::common::wkt::WKTPoint;
 
 #[derive(Debug, Deserialize, Validate)]
 pub struct Entity {
@@ -13,6 +16,53 @@ pub struct Entity {
     pub entity_type: String,
 
     pub status: Option<String>,
+}
+
+impl Entity {
+    pub fn kind(&self) -> EntityType {
+        let normalized_type = self.entity_type.to_lowercase();
+        if normalized_type == "aircraft" {
+            EntityType::Aircraft
+        } else if normalized_type == "ground station" {
+            EntityType::GroundStation
+        } else {
+            EntityType::Reserved
+        }
+    }
+
+    pub fn to_common_frame_entity(&self, stations: Option<&GroundStationDB>) -> frame::Entity {
+        let norm_addr = self.addr.to_uppercase();
+        let mut gs_id = u32::from_str_radix(&norm_addr, 16).ok();
+
+        let mut gs: Option<String> = None;
+        let mut coords: Option<WKTPoint> = None;
+
+        match self.kind() {
+            EntityType::GroundStation => {
+                if let Some(stations) = stations {
+                    if let Some(station) = stations.get(&norm_addr) {
+                        gs = Some(format!(
+                            "{} ({}/{})",
+                            station.airport_name, station.airport_iata, station.airport_icao
+                        ));
+                        coords = Some(station.coords.clone());
+                    }
+                }
+            }
+            _ => gs_id = None,
+        }
+
+        frame::Entity {
+            kind: self.entity_type.clone(),
+            icao: Some(norm_addr),
+            gs,
+            coords,
+
+            id: gs_id,
+            callsign: None,
+            tail: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Validate)]
@@ -71,6 +121,28 @@ pub struct VDLParamLocation {
 }
 // TODO: to-WKTPoint
 
+#[derive(Debug, Deserialize)]
+pub struct ParamACLocationCoord {
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ParamACLocation {
+    loc: ParamACLocationCoord,
+    alt: u32,
+}
+
+impl ParamACLocation {
+    pub fn wkt(&self) -> WKTPoint {
+        WKTPoint {
+            x: self.loc.lon,
+            y: self.loc.lat,
+            z: self.alt as f64,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Validate)]
 pub struct VDLParam {
     pub name: String,
@@ -128,6 +200,15 @@ pub struct AVLC {
     pub x25: Option<X25>,
 }
 
+impl AVLC {
+    pub fn from_ground_station(&self) -> bool {
+        match self.src.kind() {
+            EntityType::GroundStation => true,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Validate)]
 pub struct VDL2 {
     pub app: Application,
@@ -147,6 +228,12 @@ pub struct VDL2 {
 
     #[validate]
     pub avlc: Option<AVLC>,
+}
+
+impl VDL2 {
+    pub fn freq_as_mhz(&self) -> f64 {
+        self.freq as f64 / 1000000.0
+    }
 }
 
 #[derive(Debug, Deserialize, Validate)]
