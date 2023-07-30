@@ -397,6 +397,7 @@ impl XngModule for HfdlModule {
             
                     if let Some((_, target_freq)) = schedule.last() {
                         match (last_end_reason, next_session_band) {
+                            (EndSessionReason::SessionTimeout, 0) => info!("Scheduled session band timed out, trying others until next scheduled switch"),
                             (_, 0) | (EndSessionReason::SessionEnd, _) => next_session_band = *target_freq as u64,
                             _ => {}
                         }
