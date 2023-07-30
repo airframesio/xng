@@ -1,6 +1,6 @@
 Package: xng
 Version: 0.1.0-hfdl
-Depends: libsoapysdr0.8, libssl
+Depends: libsoapysdr0.8 (>= 0.8), libssl3 (>= 3)
 Section: utils
 Priority: optional
 Architecture: CURRENT_ARCH
