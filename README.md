@@ -1,7 +1,7 @@
 # xng
 [![Rust](https://github.com/airframesio/xng/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/airframesio/xng/actions/workflows/rust.yml)
 
-Next-generation multi-decoder client for SDRs, written in Rust for Linux.
+Next-generation multi-decoder client for SDRs, written in Rust for Linux, Windows, MacOS.
 
 Notable features:
  * Deep integration with [airframes.io](https://airframes.io); feed data using a single flag or use Airframes to seed initial active HFDL frequencies
