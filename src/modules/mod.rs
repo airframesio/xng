@@ -34,6 +34,7 @@ use crate::server::services as server_services;
 use self::session::Session;
 use self::settings::ModuleSettings;
 
+mod aoa;
 mod hfdl;
 mod services;
 mod session;
@@ -67,7 +68,7 @@ pub trait XngModule {
 
     async fn init(&mut self, settings: Data<RwLock<ModuleSettings>>, state_db: Data<RwLock<StateDB>>);
 
-    async fn process_message(&mut self, current_band: &Vec<u16>, msg: &str) -> Result<CommonFrame, io::Error>;
+    async fn process_message(&mut self, current_band: &Vec<u64>, msg: &str) -> Result<CommonFrame, io::Error>;
     async fn start_session(&mut self, last_end_reason: EndSessionReason) -> Result<Box<dyn Session>, io::Error>;
 
     async fn reload(&mut self) -> Result<(), io::Error>;
@@ -81,7 +82,7 @@ impl ModuleManager {
     pub fn init() -> ModuleManager {
         ModuleManager {
             modules: HashMap::from_iter(
-                [hfdl::HfdlModule::new()]
+                [aoa::AoaModule::new(), hfdl::HfdlModule::new()]
                     .map(|m| (m.id(), m))
                     .into_iter()
                     .collect::<Vec<(&'static str, Box<dyn XngModule>)>>(),
@@ -353,7 +354,7 @@ impl ModuleManager {
                 select! {
                     Some(mut frame) = rx.recv() => {
                         if let Some(ref acars) = frame.acars {
-                            // TODO: use acars-decoder-rust to decode ACARS content and save it to frame.indexed
+                            // TODO[ACARS]: use acars-decoder-rust to decode ACARS content and save it to frame.indexed
                         }
                         
                         if let Some(ref mut stream) = swarm_stream {
@@ -475,6 +476,7 @@ impl ModuleManager {
                                     reason = EndSessionReason::SessionTimeout;
                                     break;
                                 } else {
+                                    since_last_msg = Instant::now();
                                     continue;
                                 }
                             }
@@ -502,7 +504,7 @@ impl ModuleManager {
                                         continue;
                                     }
                                 };
-                                
+                                info!("{:?}", frame);
                                 if let Err(e) = tx.send(frame).await {
                                     error!("Failed to send common frame to processing thread: {}", e.to_string());                                    
                                 }

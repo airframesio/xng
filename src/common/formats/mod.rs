@@ -4,6 +4,7 @@ use serde_valid::Validate;
 pub enum EntityType {
     Aircraft,
     GroundStation,
+    Reserved,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,7 +30,7 @@ impl Timestamp {
 }
 
 pub fn validate_entity_type(val: &String) -> Result<(), serde_valid::validation::Error> {
-    if vec!["aircraft", "ground station"]
+    if vec!["aircraft", "ground station", "reserved"]
         .iter()
         .any(|&x| x == val.to_lowercase())
     {

@@ -14,7 +14,7 @@ pub struct DumpHFDLSession {
     reader: BufReader<ChildStdout>,
     stderr: ChildStderr,
 
-    bands: Vec<u16>,
+    bands: Vec<u64>,
 
     session_start: Instant,
     session_end: Option<Duration>,
@@ -51,7 +51,7 @@ impl Session for DumpHFDLSession {
         errors
     }
 
-    fn get_listening_band(&self) -> &Vec<u16> {
+    fn get_listening_band(&self) -> &Vec<u64> {
         &self.bands
     }
 
@@ -94,7 +94,7 @@ impl DumpHFDLSession {
             process,
             reader,
             stderr,
-            bands,
+            bands: bands.into_iter().map(|x| x as u64).collect(),
             end_session_on_timeout,
             session_start: Instant::now(),
             session_end,

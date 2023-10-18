@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{arg, ArgMatches, Command};
 
 pub fn register_common_arguments(cmd: Command) -> Command {
@@ -14,6 +16,21 @@ pub fn register_common_arguments(cmd: Command) -> Command {
         arg!(--"state-db" <URL> "SQLite3 database to store state metrics. URL should begin with sqlite://"),
         arg!(--"disable-state-db" "Disables SQLite3 database to store state metrics."),
     ])
+}
+
+pub fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
+    let Some(soapy_idx) = args.iter().position(|x| x.eq_ignore_ascii_case("--soapysdr")) else {
+        return None;
+    };
+    if soapy_idx + 1 >= args.len() {
+        return None;
+    }
+    args[soapy_idx + 1]
+        .split(",")
+        .map(|x| x.to_string())
+        .collect::<Vec<String>>()
+        .into_iter()
+        .find(|x| x.to_ascii_lowercase().starts_with("driver="))
 }
 
 pub fn parse_api_token(args: &ArgMatches) -> Option<&String> {
@@ -55,4 +72,11 @@ pub fn parse_state_db_url(args: &ArgMatches, default_url: &str) -> String {
 
 pub fn parse_disable_state_db(args: &ArgMatches) -> bool {
     args.get_flag("disable-state-db")
+}
+
+pub fn parse_bin_path(args: &ArgMatches, default_path: &str) -> PathBuf {
+    PathBuf::from(
+        args.get_one::<String>("bin")
+            .unwrap_or(&default_path.to_string()),
+    )
 }

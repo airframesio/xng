@@ -1,8 +1,10 @@
+use crate::common::{AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT};
+use crate::common::arguments::{extract_soapysdr_driver, parse_bin_path};
 use crate::common::formats::EntityType;
 use crate::common::frame::{self as cff, Indexed, HFDLGSEntry};
 use crate::common::wkt::WKTPolyline;
 use crate::modules::PROP_LISTENING_BAND;
-use crate::modules::hfdl::airframes::{AIRFRAMESIO_HOST, AIRFRAMESIO_DUMPHFDL_TCP_PORT, get_airframes_gs_status};
+use crate::modules::hfdl::airframes::get_airframes_gs_status;
 use crate::modules::hfdl::schedule::parse_session_schedule;
 use crate::modules::hfdl::utils::{freq_bands_by_sample_rate, first_freq_above_eq, get_max_dist_khz_by_sample_rate};
 use crate::server::db::StateDB;
@@ -86,21 +88,6 @@ pub struct HfdlModule {
     last_random_freq_band: u64,
 }
 
-fn extract_soapysdr_driver(args: &Vec<String>) -> Option<String> {
-    let Some(soapy_idx) = args.iter().position(|x| x.eq_ignore_ascii_case("--soapysdr")) else {
-        return None;
-    };
-    if soapy_idx + 1 >= args.len() {
-        return None;
-    }
-    args[soapy_idx + 1]
-        .split(",")
-        .map(|x| x.to_string())
-        .collect::<Vec<String>>()
-        .into_iter()
-        .find(|x| x.to_ascii_lowercase().starts_with("driver="))
-}
-
 #[async_trait]
 impl XngModule for HfdlModule {
     fn id(&self) -> &'static str {
@@ -131,10 +118,7 @@ impl XngModule for HfdlModule {
     fn parse_arguments(&mut self, args: &ArgMatches) -> Result<(), io::Error> {
         self.feed_airframes = args.get_flag("feed-airframes");
 
-        let bin_path = PathBuf::from(
-            args.get_one::<String>("bin")
-                .unwrap_or(&DEFAULT_BIN_PATH.to_string()),
-        );
+        let bin_path = parse_bin_path(args, DEFAULT_BIN_PATH);
         if !bin_path.is_file() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -621,7 +605,7 @@ impl XngModule for HfdlModule {
         )))
     }
 
-    async fn process_message(&mut self, current_band: &Vec<u16>, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
+    async fn process_message(&mut self, current_band: &Vec<u64>, msg: &str) -> Result<crate::common::frame::CommonFrame, io::Error> {
         let raw_frame = serde_json::from_str::<Frame>(msg)?;
         let mut frame_src: cff::Entity;
         let mut frame_dst: Option<cff::Entity> = None;
@@ -639,11 +623,14 @@ impl XngModule for HfdlModule {
         };
 
         let mut paths: Vec<cff::PropagationPath> = Vec::new();
-        let mut metadata: Option<cff::HFDLMetadata> = None;
+        let metadata: Option<cff::HFDLMetadata>;
         
         let mut indexed = cff::Indexed {
             timestamp: arrival_time.to_rfc3339_opts(SecondsFormat::Micros, true),
+
+            ..Default::default()
         };
+        let mut has_err = false;
         
         if let Some(ref spdu) = raw_frame.hfdl.spdu {
             frame_src = spdu.src.to_common_frame_entity(&self.systable);
@@ -725,7 +712,7 @@ impl XngModule for HfdlModule {
                                 let new_band_set: HashSet<&u16> = HashSet::from_iter(new_band.iter());
 
                                 let added_or_removed: HashSet<_> = old_band_set.symmetric_difference(&new_band_set).collect();
-                                let max_dist_khz = get_max_dist_khz_by_sample_rate(sample_rate as u32) as u16;
+                                let max_dist_khz = get_max_dist_khz_by_sample_rate(sample_rate as u32) as u64;
 
                                 trace!("  changed_freqs = {:?}; max_dist_khz = {}", added_or_removed, max_dist_khz);
 
@@ -739,9 +726,9 @@ impl XngModule for HfdlModule {
                                         return true;
                                     };
 
-                                    if (*x >= *first_freq && *x <= *last_freq) || 
-                                        (*x < *first_freq && (*last_freq - *x) <= max_dist_khz) ||
-                                        (*x > *last_freq && (*x - *last_freq) <= max_dist_khz) {
+                                    if ((*x as u64) >= *first_freq && (*x as u64) <= *last_freq) || 
+                                        ((*x as u64) < *first_freq && (*last_freq - (*x as u64)) <= max_dist_khz) ||
+                                        ((*x as u64) > *last_freq && ((*x as u64) - *last_freq) <= max_dist_khz) {
                                         return true;
                                     }
                                     
@@ -826,6 +813,7 @@ impl XngModule for HfdlModule {
                 }
 
                 if let Some(ref acars) = hfnpdu.acars {
+                    has_err = acars.err;
                     acars_content = Some(cff::ACARS {
                         mode: acars.mode.clone(),
                         more: acars.more.clone(),
@@ -872,7 +860,7 @@ impl XngModule for HfdlModule {
                         let pt = frame_src.coords.as_ref().unwrap();
                         let dst = frame_dst.as_ref().unwrap();
                         for entry in heard_on.iter() {
-                            if dst.id.is_some() && dst.id.unwrap() != entry.id && !entry.freqs.is_empty() {
+                            if dst.id.is_some() && dst.id.unwrap() != (entry.id as u32) && !entry.freqs.is_empty() {
                                 let Some(gs) = self.systable.by_id(entry.id) else {
                                     continue
                                 };
@@ -881,7 +869,7 @@ impl XngModule for HfdlModule {
                                     path: WKTPolyline { points: vec![pt.as_tuple(), (gs.position.1, gs.position.0, 0.0)] },
                                     party: cff::Entity {
                                         kind: String::from("Ground station"),
-                                        id: Some(gs.id),
+                                        id: Some(gs.id.into()),
                                         gs: Some(gs.name.clone()),
                                         icao: None,
                                         callsign: None,
@@ -903,7 +891,7 @@ impl XngModule for HfdlModule {
                 if let Some(ref ac_id) = lpdu.assigned_ac_id {
                     if lpdu.from_ground_station() {
                         match frame_dst {
-                            Some(ref mut entity) => entity.id = Some(*ac_id),
+                            Some(ref mut entity) => entity.id = Some((*ac_id).into()),
                             _ => {},
                         }
                     }
@@ -929,7 +917,7 @@ impl XngModule for HfdlModule {
             freq: raw_frame.hfdl.freq_as_mhz(),
             signal: raw_frame.hfdl.sig_level as f32,
 
-            err: false,
+            err: has_err,
 
             paths,
 

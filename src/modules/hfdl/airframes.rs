@@ -4,11 +4,6 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json;
 
-pub const AIRFRAMESIO_HOST: &'static str = "feed.acars.io";
-
-pub const AIRFRAMESIO_DUMPHFDL_TCP_PORT: u16 = 5556;
-pub const AIRFRAMESIO_DUMPVDL2_UDP_PORT: u16 = 5552;
-
 #[derive(Debug, Deserialize)]
 pub struct GroundStationFreqInfo {
     pub active: Vec<u16>,
