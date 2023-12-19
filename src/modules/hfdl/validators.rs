@@ -2,10 +2,15 @@ use serde_json::Value;
 
 pub fn validate_session_method(value: &Value) -> Result<(), String> {
     let Some(method) = value.as_str() else {
-        return Err(format!("Expected string"));  
+        return Err(format!("Expected string"));
     };
 
-    match method.to_lowercase().as_str() {
+    let norm = method.to_lowercase();
+    if norm.starts_with("track:") {
+        return Ok(());
+    }
+
+    match norm.as_str() {
         "random" | "static" | "inc" | "dec" => Ok(()),
         _ => Err(format!("Unknown method type")),
     }

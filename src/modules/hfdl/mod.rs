@@ -114,7 +114,7 @@ impl XngModule for HfdlModule {
                 arg!(--"only-listen-on-active" "Only listen on active HFDL frequencies (NOTE: use --use-airframes-gs-map to avoid rapid initial session ends on new SPDUs)"),
                 arg!(--"start-band-contains" <HERTZ> "Initial starting band to listen on. Overrides --schedule if both are configured"),
                 arg!(--schedule <SCHEDULE_FMT> "Session switch schedule in the format of: time=<HOUR_0_TO_23>,band_contains=<FREQ_HZ>;..."),
-                arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: random, inc, dec, static")
+                arg!(--method <METHOD_TYPE> "Session switching methods to use. Default method is random. Valid methods: random, inc, dec, static, track:GS_ID")
             ])
             .arg(Arg::new("hfdl-args").action(ArgAction::Append))
     }
