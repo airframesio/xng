@@ -590,7 +590,19 @@ impl XngModule for HfdlModule {
                     }
                 }
 
-                if next_session_band == 0 && session_method.starts_with("track:") {
+                if next_session_band == 0
+                    && listening_band.is_array()
+                    && session_method.starts_with("track:")
+                {
+                    let last_band = listening_band
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|x| x.as_u64())
+                        .filter(|x| x.is_some())
+                        .map(|x| x.unwrap())
+                        .collect::<Vec<u64>>();
+
                     if let Ok(gs_id) = &session_method[6..].parse::<u32>() {
                         if let Some(station) =
                             settings.stations.iter().find(|&x| x.id == json!(gs_id))
@@ -600,6 +612,7 @@ impl XngModule for HfdlModule {
                             next_session_band = station
                                 .active_frequencies
                                 .iter()
+                                .filter(|x| !last_band.iter().any(|y| *y == x.khz))
                                 .map(|x| x.khz)
                                 .collect::<Vec<u64>>()[new_idx];
                         } else {
@@ -909,6 +922,8 @@ impl XngModule for HfdlModule {
                 }
 
                 if (only_use_active || use_airframes_gs) && changed {
+                    // TODO: consider forcing session end if target track GS_ID changes
+
                     if let Err(e) = settings
                         .end_session_signaler
                         .send(EndSessionReason::SessionUpdate)
