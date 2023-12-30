@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read};
 use std::path::PathBuf;
+use std::str::from_utf8;
 
 #[derive(Debug)]
 pub struct GroundStation {
@@ -18,7 +19,7 @@ pub struct GroundStation {
 impl GroundStation {
     pub fn new(
         id: u8,
-        name: &str,
+        name: String,
         lat: f64,
         lon: f64,
         frequencies: Vec<f64>,
@@ -129,13 +130,15 @@ impl SystemTable {
             static ref STATIONS_FMT: Regex = Regex::new(
                 r#"(?x)
                 \{
-                    \s*id\s*=\s*([0-9]+)\s*;
-                    \s*name\s*:\s*"([\w\s,-]+?)"
-                    \s*lat\s*=\s*(-{0,1}[0-9]{1,2}(?:\.[0-9]{1,6}){0,1})\s*;
-                    \s*lon\s*=\s*(-{0,1}[0-9]{1,3}(?:\.[0-9]{1,6}){0,1})\s*;
-                    \s*frequencies\s*=\s*\(\s*((?:[0-9]{4,5}(?:\.0){0,1}\s*,{0,1}\s*)+)\)\s*;
+                    \s*(.+?)\s*
                     \s*
                 \}
+                "#
+            )
+            .unwrap();
+            static ref STATION_FIELD_FMT: Regex = Regex::new(
+                r#"(?x)
+                    \s*(\w+?)\s*=\s*(.+?)\s*;
                 "#
             )
             .unwrap();
@@ -194,28 +197,49 @@ impl SystemTable {
 
         let mut stations: Vec<GroundStation> = Vec::new();
         let station_content = m.get(2).map_or("", |x| x.as_str());
+        
         for c in STATIONS_FMT.captures_iter(&station_content) {
+            let mut station_id: Option<u8> = None;
+            let mut station_name: Option<String> = None;
+            let mut station_lat: Option<f64> = None;
+            let mut station_lon: Option<f64> = None;
+            let mut station_freqs: Vec<f64> = vec![];
+            
+            let raw_fields = c.get(1).map_or("", |x| x.as_str());
+            for raw_field in STATION_FIELD_FMT.captures_iter(&raw_fields) {
+                let key = raw_field.get(1).map_or("", |x| x.as_str()).to_lowercase();
+                match key.trim() {
+                    "id" => station_id = raw_field.get(2).map_or("", |x| x.as_str()).parse::<u8>().ok(),
+                    "name" => {
+                        let raw_value = raw_field.get(2).map_or("", |x| x.as_str());
+                        let bytes = raw_value.as_bytes();
+
+                        if bytes.len() > 1 && bytes[0] == b'"' && bytes[bytes.len()-1] == b'"' {
+                            station_name = from_utf8(&bytes[1..(bytes.len()-1)]).map(|x| x.to_string()).ok();
+                        }
+                    },
+                    "lat" => station_lat = raw_field.get(2).map_or("", |x| x.as_str()).trim().parse::<f64>().ok(),
+                    "lon" =>  station_lon = raw_field.get(2).map_or("", |x| x.as_str()).trim().parse::<f64>().ok(),
+                    "frequencies" => {
+                        let raw_value = raw_field.get(2).map_or("", |x| x.as_str()).replace(" ", "");
+                        let bytes = raw_value.as_bytes();
+
+                        if bytes.len() > 1 && bytes[0] == b'(' && bytes[bytes.len()-1] == b')' {
+                            if let Ok(value) = from_utf8(&bytes[1..(bytes.len()-1)]) {
+                                station_freqs = value.split(",").into_iter().map(|x| x.parse::<f64>().unwrap_or(0.0)).collect();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
             if let Some(station) = GroundStation::new(
-                c.get(1)
-                    .map_or("", |x| x.as_str())
-                    .parse::<u8>()
-                    .unwrap_or(0),
-                c.get(2).map_or("", |x| x.as_str()),
-                c.get(3)
-                    .map_or("", |x| x.as_str())
-                    .parse::<f64>()
-                    .unwrap_or(180.0),
-                c.get(4)
-                    .map_or("", |x| x.as_str())
-                    .parse::<f64>()
-                    .unwrap_or(180.0),
-                c.get(5)
-                    .map_or("", |x| x.as_str())
-                    .replace(" ", "")
-                    .split(",")
-                    .into_iter()
-                    .map(|x| x.parse::<f64>().unwrap_or(0.0))
-                    .collect(),
+                station_id.unwrap_or(0),
+                station_name.unwrap_or("".to_string()),
+                station_lat.unwrap_or(180.0),
+                station_lon.unwrap_or(180.0),
+                station_freqs,
             ) {
                 trace!("  Station = {:#?}", station);
                 stations.push(station);
