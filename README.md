@@ -12,6 +12,10 @@ Notable features:
 
 For Ubuntu/Debian, check out GitHub Actions for `amd64` packages.
 
+## Requirements
+ * Install [dumphfdl](https://github.com/szpajder/dumphfdl)
+ * Install [dumpvdl2](https://github.com/szpajder/dumpvdl2)
+ 
 ## Building
  1. Install a stable [Rust](https://www.rust-lang.org/learn/get-started) toolchain. Make sure the `cargo` command is in `PATH` environment variable after completion.
  2. Make sure to install `SoapySDR` development files either by compiling manually or installing the package provided by your Linux distribution's package manager.
@@ -26,6 +30,15 @@ cargo build --release
  5. Compiled binary should be built in `./target/release/xng`
 
 ## How To Run
+### No fuss "I want to run this to feed HFDL now"
+If you've followed the previous instructions and the current directory is the `xng` repo root, run the following (assuming an Airspy HF SDR):
+```bash
+./target/release/xng hfdl -vvv --systable /etc/systable.conf --sample-rate 512000 --start-band-contains 8000 --use-airframes-gs-map --method random --only-listen-on-active --feed-airframes -- --soapysdr driver=airspyhf --station-id "MY-STATION-ID"
+```
+
+This quick example starts a HFDL listening session using the SoapySDR `airspyhf` driver to listen to all active HFDL stations in the range of 8Mhz. While feeding to Airframes as station `MY-STATION-ID`.
+
+### Fancy options with ElasticSearch backend
 **NOTE:** If you want to index received frames to a local ElasticSearch instance, run the following command first:
 ```bash
 xng init_es --elastic "http://my-es-server:9200" --elastic-index xng_acars_db
@@ -40,7 +53,7 @@ Following example starts a HFDL listening session on the 8MHz band (as determine
  * Use the SoapySDR `airspyhf` driver
 
 ```bash
-xng hfdl -vvv --systable /etc/systable.conf --sample-rate 512000 --start-band-contains 8000 --use-airframes-gs-map --method random --only-listen-on-active --state-db xng_state.db --feed-airframes --elastic "https://my-es-server:9200" --elastic-index xng_acars_db  -- --soapysdr driver=airspyhf --station-id "MY-STATION-ID"
+xng hfdl -vvv --systable /etc/systable.conf --sample-rate 512000 --start-band-contains 8000 --use-airframes-gs-map --method random --only-listen-on-active --feed-airframes --elastic "https://my-es-server:9200" --elastic-index xng_acars_db  -- --soapysdr driver=airspyhf --station-id "MY-STATION-ID"
 ```
 
 ## Web API Endpoints
