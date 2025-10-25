@@ -265,3 +265,224 @@ impl SystemTable {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ground_station_new_valid() {
+        let gs = GroundStation::new(
+            1,
+            "San Francisco".to_string(),
+            37.7749,
+            -122.4194,
+            vec![5508.0, 8927.0, 10081.0],
+        );
+
+        assert!(gs.is_some());
+        let gs = gs.unwrap();
+        assert_eq!(gs.id, 1);
+        assert_eq!(gs.name, "San Francisco");
+        assert_eq!(gs.short, "SFO");
+        assert_eq!(gs.position, (37.7749, -122.4194));
+        assert_eq!(gs.frequencies, vec![5508, 8927, 10081]);
+    }
+
+    #[test]
+    fn test_ground_station_new_known_short_name() {
+        let gs = GroundStation::new(
+            7,
+            "Shannon".to_string(),
+            52.6186,
+            -8.9244,
+            vec![5508.0],
+        ).unwrap();
+
+        assert_eq!(gs.short, "SNN");
+    }
+
+    #[test]
+    fn test_ground_station_new_unknown_short_name() {
+        let gs = GroundStation::new(
+            99,
+            "Unknown".to_string(),
+            40.0,
+            -100.0,
+            vec![5508.0],
+        ).unwrap();
+
+        assert_eq!(gs.short, "???");
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_id_zero() {
+        let gs = GroundStation::new(
+            0,
+            "Test".to_string(),
+            37.7749,
+            -122.4194,
+            vec![5508.0],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_name_empty() {
+        let gs = GroundStation::new(
+            1,
+            "".to_string(),
+            37.7749,
+            -122.4194,
+            vec![5508.0],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_latitude_too_high() {
+        let gs = GroundStation::new(
+            1,
+            "Test".to_string(),
+            90.0,
+            -122.4194,
+            vec![5508.0],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_latitude_too_low() {
+        let gs = GroundStation::new(
+            1,
+            "Test".to_string(),
+            -90.0,
+            -122.4194,
+            vec![5508.0],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_longitude_too_high() {
+        let gs = GroundStation::new(
+            1,
+            "Test".to_string(),
+            37.7749,
+            180.0,
+            vec![5508.0],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_longitude_too_low() {
+        let gs = GroundStation::new(
+            1,
+            "Test".to_string(),
+            37.7749,
+            -180.0,
+            vec![5508.0],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_frequencies_empty() {
+        let gs = GroundStation::new(
+            1,
+            "Test".to_string(),
+            37.7749,
+            -122.4194,
+            vec![],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_ground_station_new_invalid_frequencies_contains_zero() {
+        let gs = GroundStation::new(
+            1,
+            "Test".to_string(),
+            37.7749,
+            -122.4194,
+            vec![5508.0, 0.0, 10081.0],
+        );
+        assert!(gs.is_none());
+    }
+
+    #[test]
+    fn test_system_table_by_id() {
+        let mut systable = SystemTable::default();
+        systable.stations.push(GroundStation::new(
+            1,
+            "SFO".to_string(),
+            37.7749,
+            -122.4194,
+            vec![5508.0],
+        ).unwrap());
+
+        let result = systable.by_id(1);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().id, 1);
+
+        let result = systable.by_id(99);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_system_table_by_name() {
+        let mut systable = SystemTable::default();
+        systable.stations.push(GroundStation::new(
+            1,
+            "San Francisco".to_string(),
+            37.7749,
+            -122.4194,
+            vec![5508.0],
+        ).unwrap());
+
+        let result = systable.by_name("San Francisco");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().name, "San Francisco");
+
+        // Test case-insensitive search
+        let result = systable.by_name("SAN FRANCISCO");
+        assert!(result.is_some());
+
+        let result = systable.by_name("Unknown");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_system_table_all_freqs() {
+        let mut systable = SystemTable::default();
+        systable.stations.push(GroundStation::new(
+            1,
+            "SFO".to_string(),
+            37.7749,
+            -122.4194,
+            vec![5508.0, 8927.0],
+        ).unwrap());
+        systable.stations.push(GroundStation::new(
+            2,
+            "MKK".to_string(),
+            21.1539,
+            -157.0960,
+            vec![6559.0, 10027.0],
+        ).unwrap());
+
+        let freqs = systable.all_freqs();
+        assert_eq!(freqs.len(), 4);
+        assert!(freqs.contains(&5508));
+        assert!(freqs.contains(&8927));
+        assert!(freqs.contains(&6559));
+        assert!(freqs.contains(&10027));
+    }
+
+    #[test]
+    fn test_system_table_get_version() {
+        let mut systable = SystemTable::default();
+        systable.version = 52;
+        assert_eq!(systable.get_version(), 52);
+    }
+}

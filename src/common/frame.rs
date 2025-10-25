@@ -184,3 +184,122 @@ pub struct CommonFrame {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acars: Option<ACARS>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_entity_is_ground_station_lowercase() {
+        let entity = Entity {
+            kind: "ground station".to_string(),
+            icao: None,
+            gs: Some("SFO".to_string()),
+            id: Some(1),
+            callsign: None,
+            tail: None,
+            coords: None,
+        };
+        assert!(entity.is_ground_station());
+    }
+
+    #[test]
+    fn test_entity_is_ground_station_uppercase() {
+        let entity = Entity {
+            kind: "Ground Station".to_string(),
+            icao: None,
+            gs: Some("SFO".to_string()),
+            id: Some(1),
+            callsign: None,
+            tail: None,
+            coords: None,
+        };
+        assert!(entity.is_ground_station());
+    }
+
+    #[test]
+    fn test_entity_is_ground_station_mixed_case() {
+        let entity = Entity {
+            kind: "GROUND STATION".to_string(),
+            icao: None,
+            gs: Some("SFO".to_string()),
+            id: Some(1),
+            callsign: None,
+            tail: None,
+            coords: None,
+        };
+        assert!(entity.is_ground_station());
+    }
+
+    #[test]
+    fn test_entity_is_not_ground_station_aircraft() {
+        let entity = Entity {
+            kind: "Aircraft".to_string(),
+            icao: Some("ABC123".to_string()),
+            gs: None,
+            id: None,
+            callsign: Some("AAL123".to_string()),
+            tail: None,
+            coords: None,
+        };
+        assert!(!entity.is_ground_station());
+    }
+
+    #[test]
+    fn test_entity_is_not_ground_station_invalid() {
+        let entity = Entity {
+            kind: "Unknown".to_string(),
+            icao: None,
+            gs: None,
+            id: None,
+            callsign: None,
+            tail: None,
+            coords: None,
+        };
+        assert!(!entity.is_ground_station());
+    }
+
+    #[test]
+    fn test_indexed_timestamp_validation() {
+        // Valid timestamp
+        let indexed = Indexed {
+            timestamp: "2025-10-21T15:30:45.123456Z".to_string(),
+            dst_airport: None,
+            src_airport: None,
+        };
+        assert!(indexed.validate().is_ok());
+    }
+
+    #[test]
+    fn test_indexed_timestamp_validation_min_precision() {
+        // Valid timestamp with millisecond precision
+        let indexed = Indexed {
+            timestamp: "2025-10-21T15:30:45.123Z".to_string(),
+            dst_airport: None,
+            src_airport: None,
+        };
+        assert!(indexed.validate().is_ok());
+    }
+
+    #[test]
+    fn test_indexed_timestamp_validation_invalid_format() {
+        // Invalid timestamp format
+        let indexed = Indexed {
+            timestamp: "2025-10-21 15:30:45".to_string(),
+            dst_airport: None,
+            src_airport: None,
+        };
+        assert!(indexed.validate().is_err());
+    }
+
+    #[test]
+    fn test_indexed_timestamp_validation_invalid_year() {
+        // Year out of range (2050 is > 2049)
+        let indexed = Indexed {
+            timestamp: "2050-10-21T15:30:45.123Z".to_string(),
+            dst_airport: None,
+            src_airport: None,
+        };
+        assert!(indexed.validate().is_err());
+    }
+}

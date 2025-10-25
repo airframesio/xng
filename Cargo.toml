@@ -5,6 +5,14 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "xng"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xng"
+path = "src/main.rs"
+
 [dependencies]
 actix-web = "4.3.1"
 async-trait = "0.1.68"
@@ -27,3 +35,6 @@ sqlx = { version = "0.6.3", features = ["sqlite", "chrono", "runtime-tokio-nativ
 stderrlog = "0.5.4"
 tokio = { version = "1.28.0", features = ["process", "macros", "time", "rt-multi-thread", "io-util", "net", "signal"] }
 tokio-util = "0.7.8"
+
+[dev-dependencies]
+# Test dependencies are the same as regular dependencies for this project

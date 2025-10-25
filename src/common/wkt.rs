@@ -165,3 +165,132 @@ impl<'de> Deserialize<'de> for WKTPolyline {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json;
+
+    #[test]
+    fn test_wkt_point_valid() {
+        let point = WKTPoint { x: -122.5, y: 37.8, z: 100.0 };
+        assert!(point.valid());
+    }
+
+    #[test]
+    fn test_wkt_point_invalid_longitude() {
+        let point = WKTPoint { x: 200.0, y: 37.8, z: 100.0 };
+        assert!(!point.valid());
+
+        let point = WKTPoint { x: -200.0, y: 37.8, z: 100.0 };
+        assert!(!point.valid());
+    }
+
+    #[test]
+    fn test_wkt_point_invalid_latitude() {
+        let point = WKTPoint { x: -122.5, y: 95.0, z: 100.0 };
+        assert!(!point.valid());
+
+        let point = WKTPoint { x: -122.5, y: -95.0, z: 100.0 };
+        assert!(!point.valid());
+    }
+
+    #[test]
+    fn test_wkt_point_as_tuple() {
+        let point = WKTPoint { x: -122.5, y: 37.8, z: 100.0 };
+        assert_eq!(point.as_tuple(), (-122.5, 37.8, 100.0));
+    }
+
+    #[test]
+    fn test_wkt_point_serialize() {
+        let point = WKTPoint { x: -122.5, y: 37.8, z: 100.0 };
+        let serialized = serde_json::to_string(&point).unwrap();
+        assert_eq!(serialized, "\"POINT (-122.5 37.8 100)\"");
+    }
+
+    #[test]
+    fn test_wkt_point_deserialize() {
+        let json = "\"POINT (-122.5 37.8 100)\"";
+        let point: WKTPoint = serde_json::from_str(json).unwrap();
+        assert_eq!(point.x, -122.5);
+        assert_eq!(point.y, 37.8);
+        assert_eq!(point.z, 100.0);
+    }
+
+    #[test]
+    fn test_wkt_point_deserialize_with_spaces() {
+        let json = "\"POINT (  -122.5   37.8   100  )\"";
+        let point: WKTPoint = serde_json::from_str(json).unwrap();
+        assert_eq!(point.x, -122.5);
+        assert_eq!(point.y, 37.8);
+        assert_eq!(point.z, 100.0);
+    }
+
+    #[test]
+    fn test_wkt_point_deserialize_negative_coords() {
+        let json = "\"POINT (-122.5 -37.8 -100)\"";
+        let point: WKTPoint = serde_json::from_str(json).unwrap();
+        assert_eq!(point.x, -122.5);
+        assert_eq!(point.y, -37.8);
+        assert_eq!(point.z, -100.0);
+    }
+
+    #[test]
+    fn test_wkt_point_deserialize_integers() {
+        let json = "\"POINT (122 37 100)\"";
+        let point: WKTPoint = serde_json::from_str(json).unwrap();
+        assert_eq!(point.x, 122.0);
+        assert_eq!(point.y, 37.0);
+        assert_eq!(point.z, 100.0);
+    }
+
+    #[test]
+    fn test_wkt_point_deserialize_invalid_format() {
+        let json = "\"INVALID (-122.5 37.8 100)\"";
+        let result: Result<WKTPoint, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wkt_polyline_serialize() {
+        let polyline = WKTPolyline {
+            points: vec![(-122.5, 37.8, 100.0), (-122.6, 37.9, 150.0)],
+        };
+        let serialized = serde_json::to_string(&polyline).unwrap();
+        assert_eq!(serialized, "\"LINESTRING (-122.5 37.8 100, -122.6 37.9 150)\"");
+    }
+
+    #[test]
+    fn test_wkt_polyline_deserialize() {
+        let json = "\"LINESTRING (-122.5 37.8 100, -122.6 37.9 150)\"";
+        let polyline: WKTPolyline = serde_json::from_str(json).unwrap();
+        assert_eq!(polyline.points.len(), 2);
+        assert_eq!(polyline.points[0], (-122.5, 37.8, 100.0));
+        assert_eq!(polyline.points[1], (-122.6, 37.9, 150.0));
+    }
+
+    #[test]
+    fn test_wkt_polyline_deserialize_single_point() {
+        let json = "\"LINESTRING (-122.5 37.8 100)\"";
+        let polyline: WKTPolyline = serde_json::from_str(json).unwrap();
+        assert_eq!(polyline.points.len(), 1);
+        assert_eq!(polyline.points[0], (-122.5, 37.8, 100.0));
+    }
+
+    #[test]
+    fn test_wkt_polyline_deserialize_multiple_points() {
+        let json = "\"LINESTRING (-122.5 37.8 100, -122.6 37.9 150, -122.7 38.0 200)\"";
+        let polyline: WKTPolyline = serde_json::from_str(json).unwrap();
+        assert_eq!(polyline.points.len(), 3);
+        assert_eq!(polyline.points[0], (-122.5, 37.8, 100.0));
+        assert_eq!(polyline.points[1], (-122.6, 37.9, 150.0));
+        assert_eq!(polyline.points[2], (-122.7, 38.0, 200.0));
+    }
+
+    #[test]
+    fn test_wkt_polyline_deserialize_invalid_format() {
+        let json = "\"INVALID (-122.5 37.8 100, -122.6 37.9 150)\"";
+        let result: Result<WKTPolyline, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+}
+
