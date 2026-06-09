@@ -9,6 +9,11 @@ pub const AIRFRAMESIO_HOST: &'static str = "feed.acars.io";
 pub const AIRFRAMESIO_DUMPHFDL_TCP_PORT: u16 = 5556;
 pub const AIRFRAMESIO_DUMPVDL2_UDP_PORT: u16 = 5552;
 
+pub const APP_ID: &'static str = "0b4154de-2bec-11ee-9e28-8f5d91c45e23";
+
+pub const AIRFRAMESIO_GROUND_STATIONS_URL: &'static str =
+    "https://api.airframes.io/hfdl/ground-stations?aid=${?APP_ID}";
+
 #[derive(Debug, Deserialize)]
 pub struct GroundStationFreqInfo {
     pub active: Vec<u16>,
@@ -37,7 +42,7 @@ impl HFDLGroundStationStatus {
 }
 
 pub async fn get_airframes_gs_status() -> io::Result<HFDLGroundStationStatus> {
-    let response = match reqwest::get("https://api.airframes.io/hfdl/ground-stations").await {
+    let response = match reqwest::get(AIRFRAMESIO_GROUND_STATIONS_URL).await {
         Ok(r) => r,
         Err(e) => {
             return Err(io::Error::new(

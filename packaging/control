@@ -1,8 +1,8 @@
 Package: xng
-Version: 0.1.0-hfdl
+Version: 0.2.0
 Depends: libsoapysdr0.8
 Section: utils
 Priority: optional
 Architecture: CURRENT_ARCH
-Maintainer: Andy <andy@airframes.io>
-Description: Next-generation multi-decoder client for SDRs, written in Rust. Currently supports HFDL.
+Maintainer: Kevin Elliott <kevin@airframes.io>
+Description: Next-generation multi-mode SDR decoder, written in Rust. Native decode cores for ACARS, VDL2, HFDL, satcom, AIS, and more.
