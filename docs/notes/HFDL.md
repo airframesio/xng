@@ -71,11 +71,10 @@ Lfsr15 matches the VDL2 derivation.)
 - Convolutional K=7 rate 1/2, classic 171/133 octal (Karn's 0x6d/0x4f
   are bit-reversed forms). Encoder zero-start, zero-flush (tail inside
   the fixed payload size); decoder traceback to state 0.
-  **CAVEAT (2026-06): verify the within-pair output order against an
-  off-air capture.** Aero's off-air validation showed the pair order is
-  133-first (libcorrect convention), opposite to our synthetic
-  assumption — loopback tests cannot catch this. dumphfdl also uses the
-  Karn/libcorrect forms, so HFDL likely transmits 133-first too.
+  **Pair order confirmed off-air (2026-06): 133-output first** in each
+  coded pair (libcorrect convention), same as Aero. Verified against the
+  sigidwiki 21931 kHz capture — with 171-first no FCS validates; with
+  133-first the SPDU matches dumphfdl field-for-field.
 - Deinterleaver: 40 rows × C cols, C = chips/40 ∈ {54,108,162} single,
   {126,252,378} double. Push (per received chip, soft, MSB-first within
   symbol): write (row,col); row++; on row wrap col++; then every push
