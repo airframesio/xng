@@ -30,7 +30,7 @@ fn demodulates_gr_iridium_test_burst() {
     let mut demod = IridiumDemod::new(CHANNEL_RATE);
     let bursts = demod.process(&samples);
     assert_eq!(bursts.len(), 1, "exactly one burst expected");
-    let bits = &bursts[0];
+    let bits = &bursts[0].bits;
     assert_eq!(&bits[..24], &frame::ACCESS_DL[..], "downlink access code");
     let payload = &bits[24..];
     assert!(payload.len() >= 300, "payload length {}", payload.len());
