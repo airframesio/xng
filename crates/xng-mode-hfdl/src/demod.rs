@@ -1,5 +1,5 @@
-//! HFDL burst demodulator (v1: per-T-segment phase tracking instead of
-//! an LMS equalizer — see PROVENANCE.md).
+//! HFDL burst demodulator: LMS equalizer trained on the T segments plus
+//! decision-directed carrier tracking (see PROVENANCE.md).
 //!
 //! Hunt: differential correlation against the 127-chip A sequence (CFO-
 //! immune); the correlation phase gives the per-symbol carrier rotation,
@@ -28,6 +28,57 @@ enum State {
     Hunt,
     /// A1 found at this absolute position (first A1 symbol center).
     Collect { a1_pos: f64, theta: f32, needed_syms: Option<(Setting, usize)> },
+}
+
+/// T/2-spaced 15-tap LMS feed-forward equalizer (dumphfdl runs liquid's
+/// eqlms_cccf the same way: push at 2 samples/symbol, output at symbol
+/// instants, train on the known T training symbols).
+struct Lms {
+    w: Vec<Complex<f32>>,
+    x: Vec<Complex<f32>>,
+    pos: usize,
+    mu: f32,
+}
+
+impl Lms {
+    fn new(taps: usize, mu: f32) -> Self {
+        // Identity initialization (unit center tap): the equalizer starts
+        // as a pass-through of the symbol-center sample — exactly the
+        // pre-equalizer behavior — and training can only improve on it.
+        // (dumphfdl initializes as a lowpass instead, but its input is
+        // matched-filtered at 2 samples/symbol; ours is not.)
+        let mut w = vec![Complex::new(0.0f32, 0.0); taps];
+        w[taps / 2] = Complex::new(1.0, 0.0);
+        Self { w, x: vec![Complex::new(0.0, 0.0); taps], pos: 0, mu }
+    }
+
+    fn push(&mut self, s: Complex<f32>) {
+        self.pos = (self.pos + 1) % self.x.len();
+        self.x[self.pos] = s;
+    }
+
+    /// Equalizer output for the current window.
+    fn exec(&self) -> Complex<f32> {
+        let n = self.x.len();
+        let mut y = Complex::new(0.0f32, 0.0);
+        for k in 0..n {
+            y += self.w[k] * self.x[(self.pos + n - k) % n];
+        }
+        y
+    }
+
+    /// One LMS step toward reference `d` given output `y`.
+    fn step(&mut self, d: Complex<f32>, y: Complex<f32>) {
+        let n = self.x.len();
+        let e = d - y;
+        let energy: f32 =
+            self.x.iter().map(|v| v.norm_sqr()).sum::<f32>().max(1e-9);
+        let g = self.mu / energy;
+        for k in 0..n {
+            let xk = self.x[(self.pos + n - k) % n];
+            self.w[k] += g * e * xk.conj();
+        }
+    }
 }
 
 pub struct HfdlDemod {
@@ -192,7 +243,10 @@ impl HfdlDemod {
         // Global π ambiguity: sign of the coherent correlation.
         let c1r = self.coherent(a1_pos, &a, theta)?;
         let flip = if c1r.re < 0.0 { -1.0f32 } else { 1.0 };
-        let mut phase = (c1r * flip).arg();
+        let phase = (c1r * flip).arg();
+        // Mean symbol amplitude from the A correlation, for normalizing
+        // the equalizer input to a unit constellation.
+        let amp = (c1r.norm() / 127.0).max(1e-9);
 
         // Verify M1 with the refined carrier (sanity).
         let m1_pos = a1_pos + 254.0 * self.sps;
@@ -202,19 +256,74 @@ impl HfdlDemod {
             return None;
         }
 
-        // Walk the burst: phase re-estimated at each T segment. The
-        // measured phase includes the carrier ramp up to the segment
-        // start, so data symbols are derotated RELATIVE to the segment
-        // where the phase was measured.
+        // Walk the burst with a T/2-spaced LMS equalizer (15 taps, as in
+        // dumphfdl): CFO is removed by derotating with theta relative to
+        // a1_pos; the equalizer absorbs the constant phase, the global pi
+        // flip (its training references include `flip`), and multipath
+        // ISI. It trains on the 9 preamble T segments and retrains on
+        // every embedded T segment, which replaces the previous per-T
+        // phase re-estimation.
+        // Remove CFO ramp, constant phase, the global pi flip, and the
+        // amplitude — the equalizer then starts from a unit constellation
+        // and the identity-initialized taps are already correct. `extra`
+        // carries the decision-directed carrier correction: the A1→A2
+        // theta refinement aliases at ±pi/127 per symbol, so a residual
+        // rotation of up to ~0.025 rad/symbol can survive it (observed on
+        // synthetic bursts); the DD loop below tracks it out.
+        let derot_at = |this: &Self, p: f64, extra: f32| -> Option<Complex<f32>> {
+            let y = this.sample(p)?;
+            let rel = ((p - a1_pos) / this.sps) as f32;
+            Some(y * Complex::from_polar(flip / amp, -theta * rel - phase - extra))
+        };
+        let mut eq = Lms::new(7, 0.10);
+        // Decision-directed 2nd-order carrier loop (per symbol), applied
+        // to the equalizer input.
+        let mut carr_ph = 0.0f32;
+        let mut carr_fr = 0.0f32;
+        // Symbol-spaced (T-spaced) taps with the decision at the window
+        // center: the delay line runs 3 symbols ahead of the symbol being
+        // decided.
         let seg0 = a1_pos + (127.0 * 2.0 + 127.0 + 15.0) * self.sps;
-        let mut pos = seg0;
-        let mut phase_ref = a1_pos; // position where `phase` was measured
+        let mut tap_pos = seg0 - 3.0 * self.sps;
+        for _ in 0..7 {
+            eq.push(derot_at(self, tap_pos, carr_ph)?);
+            tap_pos += self.sps;
+        }
+
+        let step = std::f32::consts::TAU / (1u32 << s.bps_per_sym) as f32;
+        // Process one symbol: window already contains the lookahead;
+        // exec, train (known T bit) or slice (data), update the carrier
+        // loop, push the next sample.
+        let mut symbol = |this: &Self,
+                          eq: &mut Lms,
+                          tap_pos: &mut f64,
+                          train: Option<u8>|
+         -> Option<Complex<f32>> {
+            let y = eq.exec();
+            let perr = match train {
+                Some(bit) => {
+                    let d = Complex::new(if bit == 1 { -1.0 } else { 1.0 }, 0.0);
+                    eq.step(d, y);
+                    (y * d.conj()).arg()
+                }
+                None => {
+                    // Phase error to the nearest constellation point.
+                    let ang = y.arg();
+                    ang - (ang / step).round() * step
+                }
+            };
+            carr_fr += 0.002 * perr;
+            carr_ph += carr_fr + 0.08 * perr;
+            eq.push(derot_at(this, *tap_pos, carr_ph)?);
+            *tap_pos += this.sps;
+            Some(y)
+        };
+
+        // Train over the 9 preamble T segments (135 known BPSK symbols).
         for _ in 0..9 {
-            if let Some(c) = self.coherent(pos, &t, theta) {
-                phase = (c * flip).arg();
-                phase_ref = pos;
+            for &tb in t.iter() {
+                symbol(self, &mut eq, &mut tap_pos, Some(tb))?;
             }
-            pos += 15.0 * self.sps;
         }
 
         let flips = fec::scramble_flips(s.data_segments() * 30);
@@ -222,13 +331,9 @@ impl HfdlDemod {
         let mut soft: Vec<f32> = Vec::with_capacity(s.chips());
         let mut data_idx = 0usize;
         for _ in 0..s.data_segments() {
-            for k in 0..30 {
-                let sp = pos + k as f64 * self.sps;
-                let y = self.sample(sp)?;
-                let rel_syms = ((sp - phase_ref) / self.sps) as f32;
-                let derot =
-                    y * Complex::from_polar(1.0, -(theta * rel_syms) - phase) * flip;
-                let mut ang = derot.arg();
+            for _ in 0..30 {
+                let y = symbol(self, &mut eq, &mut tap_pos, None)?;
+                let mut ang = y.arg();
                 if flips[data_idx] == 1 {
                     ang += PI;
                 }
@@ -238,14 +343,10 @@ impl HfdlDemod {
                     soft.push(gray_soft(ang, m_levels, bit));
                 }
             }
-            pos += 30.0 * self.sps;
-            if let Some((c, m)) = self.coherent_with_energy(pos, &t, theta) {
-                if m > 0.3 {
-                    phase = (c * flip).arg();
-                    phase_ref = pos;
-                }
+            // Retrain on the embedded T segment.
+            for &tb in t.iter() {
+                symbol(self, &mut eq, &mut tap_pos, Some(tb))?;
             }
-            pos += 15.0 * self.sps;
         }
 
         // Deinterleave → (rate-1/4 average) → Viterbi → LSB-first bytes.
@@ -314,7 +415,9 @@ impl HfdlDemod {
                         }
                     }
                     let (s, total) = needed_syms.unwrap();
-                    let end = a1_pos + (total as f64 + 2.0) * self.sps;
+                    // +6 symbols: the LMS equalizer looks 3.5 symbols ahead of the
+                    // last trained T symbol.
+                    let end = a1_pos + (total as f64 + 6.0) * self.sps;
                     if self.sample(end).is_none() {
                         self.state = State::Collect { a1_pos, theta, needed_syms };
                         break;
@@ -372,4 +475,48 @@ fn gray_soft(ang: f32, m: u32, bit: u32) -> f32 {
         }
     }
     ((d0 - d1) / 2.0).clamp(-1.0, 1.0)
+}
+
+#[cfg(test)]
+mod lms_tests {
+    use super::*;
+
+    #[test]
+    fn lms_converges_on_scalar_channel() {
+        // Channel = pure rotation+gain (1.46j); BPSK symbols; the eq must
+        // converge to y ≈ d within ~100 trained symbols.
+        let h = Complex::new(0.0, 1.46f32);
+        let mut rng = 0x12345u64;
+        let mut bit = || {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) & 1) as u8
+        };
+        let mut eq = Lms::new(7, 0.10);
+        // Prime 7 samples.
+        let mut syms: Vec<f32> = Vec::new();
+        for _ in 0..7 {
+            let b = bit();
+            let s = if b == 1 { -1.0 } else { 1.0 };
+            syms.push(s);
+            eq.push(h * s);
+        }
+        // The decision corresponds to the window center (3 lookahead).
+        let mut errs = Vec::new();
+        for n in 0..200 {
+            let y = eq.exec();
+            let d_sym = syms[syms.len() - 4]; // center of 7-tap window
+            let d = Complex::new(d_sym, 0.0);
+            eq.step(d, y);
+            errs.push((d - y).norm());
+            let b = bit();
+            let s = if b == 1 { -1.0 } else { 1.0 };
+            syms.push(s);
+            eq.push(h * s);
+            let _ = n;
+        }
+        let early: f32 = errs[..20].iter().sum::<f32>() / 20.0;
+        let late: f32 = errs[180..].iter().sum::<f32>() / 20.0;
+        eprintln!("early err {early:.3} late err {late:.3}");
+        assert!(late < 0.2, "LMS must converge (late err {late})");
+    }
 }
