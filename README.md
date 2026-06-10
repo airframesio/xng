@@ -6,11 +6,13 @@
 
 xng decodes **ACARS, VDL Mode 2, HFDL, Inmarsat Aero, Inmarsat STD-C/EGC,
 Iridium, AIS, and Mode S/ADS-B** in a single Rust binary — replacing
-acarsdec, vdlm2dec, dumpvdl2, dumphfdl, JAERO, Scytale-C, and
-gr-iridium/iridium-toolkit with consistent, tested decode cores that share
-one capture, one message model, one application layer, and one set of
-outputs (including first-class [airframes.io](https://airframes.io)
-feeding).
+acarsdec, vdlm2dec, dumpvdl2, dumphfdl, JAERO, Scytale-C, gr-iridium, and
+iridium-toolkit with consistent, tested decode cores that share one
+capture, one message model, one application layer, and one set of outputs
+(including first-class [airframes.io](https://airframes.io) feeding).
+All nine modes are implemented, validated, and merged — including the
+complete Iridium stack (ring alerts through ACARS-over-SBD with a
+wideband burst-hunting front end).
 
 ```bash
 # Two ACARS channels from one RTL-SDR, fed to Airframes:
@@ -51,7 +53,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air |
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
-| Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**; wideband burst hunting | Bit-perfect vs gr-iridium's reference burst + iridium-toolkit oracle |
+| Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle |
 | AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM | Canonical published test vector |
 | Mode S / ADS-B | `adsb` | 1090 MHz | Ident/altitude extended squitters | Published frames; zero false positives on noise |
 
@@ -119,7 +121,10 @@ xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
 xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
     --channels 1537.700,1537.100
 
-# Iridium ring alerts: live satellite positions from the simplex channels
+# Iridium: live satellite positions from the ring-alert simplex channels.
+# (ACARS-over-SBD rides duplex channels across the band; the wideband
+# burst-hunting front end for that lives in xng-mode-iridium::wideband —
+# CLI wiring is the next step.)
 xng listen --sdr driver=rtlsdr --mode iridium -r 2000000 -c 1626.250M \
     --channels 1626.271,1626.104
 
