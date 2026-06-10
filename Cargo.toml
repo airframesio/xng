@@ -37,7 +37,9 @@ tonic = "0.12"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
+rustls-pemfile = "2"
 tokio-stream = "0.1"
+webpki-roots = "0.26"
 
 # DSP loopback tests are too slow unoptimized.
 [profile.test]
@@ -80,4 +82,6 @@ tonic.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
+rustls-pemfile.workspace = true
 tokio-stream.workspace = true
+webpki-roots.workspace = true

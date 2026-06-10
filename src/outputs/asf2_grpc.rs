@@ -12,6 +12,19 @@ use xng_types::Message;
 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 const MAX_BATCH: usize = 64;
 
+/// Drop everything pending on the bus (the policy while disconnected);
+/// returns true when the bus is closed and the output should exit.
+/// Shared with the QUIC output.
+pub(crate) fn drain_while_disconnected(rx: &mut broadcast::Receiver<Arc<Message>>) -> bool {
+    loop {
+        match rx.try_recv() {
+            Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(broadcast::error::TryRecvError::Empty) => return false,
+            Err(broadcast::error::TryRecvError::Closed) => return true,
+        }
+    }
+}
+
 /// Collect one message (blocking) plus whatever else is immediately
 /// available, as a single batch. Returns None when the bus closes.
 /// Shared with the QUIC output.
@@ -53,6 +66,10 @@ pub async fn run(
         let mut client = match AirframesFeedClient::connect(url.clone()).await {
             Ok(c) => c,
             Err(e) => {
+                if drain_while_disconnected(&mut rx) {
+                    tracing::info!("asf2 grpc output to {url}: session ended while disconnected");
+                    return Ok(());
+                }
                 tracing::warn!("asf2 grpc connect to {url} failed: {e}; retrying in {RECONNECT_DELAY:?}");
                 tokio::time::sleep(RECONNECT_DELAY).await;
                 continue;
@@ -62,6 +79,9 @@ pub async fn run(
         let inbound = match client.stream(ReceiverStream::new(stream_rx)).await {
             Ok(r) => r.into_inner(),
             Err(e) => {
+                if drain_while_disconnected(&mut rx) {
+                    return Ok(());
+                }
                 tracing::warn!("asf2 grpc stream to {url} failed: {e}; retrying");
                 tokio::time::sleep(RECONNECT_DELAY).await;
                 continue;

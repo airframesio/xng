@@ -65,14 +65,33 @@ struct OutputOpts {
     /// Stream asf-2.0 over gRPC to this ingest URL (e.g. http://127.0.0.1:6001)
     #[arg(long)]
     asf2_grpc: Option<String>,
-    /// Stream asf-2.0 over QUIC to host:port (dev mode: certificate
-    /// verification is skipped)
+    /// Stream asf-2.0 over QUIC to host:port (TLS verified against
+    /// system roots by default)
     #[arg(long)]
     asf2_quic: Option<String>,
+    /// PEM file with the ingest's certificate/CA to trust for
+    /// --asf2-quic (see `xng ingest --quic-cert-out`)
+    #[arg(long)]
+    asf2_quic_ca: Option<PathBuf>,
+    /// DANGEROUS: disable TLS certificate verification for --asf2-quic.
+    /// The feed can be intercepted or spoofed. Lab use only.
+    #[arg(long)]
+    asf2_quic_insecure: bool,
 }
 
 impl OutputOpts {
     fn build(&self) -> anyhow::Result<(runtime::OutputConfig, String)> {
+        anyhow::ensure!(
+            !(self.asf2_quic_insecure && self.asf2_quic_ca.is_some()),
+            "--asf2-quic-insecure and --asf2-quic-ca are mutually exclusive"
+        );
+        let quic_trust = if self.asf2_quic_insecure {
+            outputs::asf2_quic::TrustMode::Insecure
+        } else if let Some(ca) = &self.asf2_quic_ca {
+            outputs::asf2_quic::TrustMode::CaFile(ca.clone())
+        } else {
+            outputs::asf2_quic::TrustMode::SystemRoots
+        };
         let mut udp = self.udp.clone();
         if self.feed_airframes {
             anyhow::ensure!(
@@ -89,6 +108,7 @@ impl OutputOpts {
                 udp,
                 asf2_grpc: self.asf2_grpc.clone(),
                 asf2_quic: self.asf2_quic.clone(),
+                asf2_quic_trust: quic_trust,
             },
             ident,
         ))
@@ -151,9 +171,13 @@ enum Command {
         #[arg(long)]
         grpc: Option<String>,
         /// QUIC listen address (e.g. 0.0.0.0:6011); uses a self-signed
-        /// dev certificate
+        /// certificate unless one is provided
         #[arg(long)]
         quic: Option<String>,
+        /// Write the QUIC certificate (PEM) here so feeders can pin it
+        /// via --asf2-quic-ca
+        #[arg(long)]
+        quic_cert_out: Option<PathBuf>,
     },
     /// Run the built-in pipeline self-test (bus + outputs + DSP sanity)
     Selftest {
@@ -226,7 +250,9 @@ fn main() -> anyhow::Result<()> {
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
         }
-        Command::Ingest { grpc, quic } => commands::ingest::run(grpc, quic),
+        Command::Ingest { grpc, quic, quic_cert_out } => {
+            commands::ingest::run(grpc, quic, quic_cert_out.as_deref())
+        }
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
     }
 }

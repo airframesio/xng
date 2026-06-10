@@ -1,14 +1,33 @@
 //! asf-2.0 QUIC output: length-prefixed Envelopes over one bidirectional
-//! quinn stream (ALPN `asf2`). Certificate verification is skipped (dev
-//! mode) — production trust configuration arrives with deployment.
+//! quinn stream (ALPN `asf2`).
+//!
+//! Certificate verification is ON by default (system roots). For
+//! self-hosted ingests with self-signed certificates, pin the server
+//! certificate with `--asf2-quic-ca` (see `xng ingest --quic-cert-out`).
+//! `--asf2-quic-insecure` disables verification entirely and exists for
+//! throwaway lab setups only.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use xng_types::Message;
 
 const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// rustls verifier that accepts any server certificate (dev/self-signed).
+/// How the client validates the ingest's certificate.
+#[derive(Clone)]
+pub enum TrustMode {
+    /// System/webpki roots (public ingests, e.g. feed.airframes.io).
+    SystemRoots,
+    /// Trust exactly the certificate(s) in this PEM file (self-signed
+    /// ingest pinning).
+    CaFile(PathBuf),
+    /// No verification. Lab use only.
+    Insecure,
+}
+
+/// rustls verifier that accepts any server certificate. Only reachable
+/// via the explicit `--asf2-quic-insecure` flag.
 #[derive(Debug)]
 struct AcceptAnyCert(rustls::crypto::CryptoProvider);
 
@@ -47,13 +66,41 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-fn client_endpoint() -> anyhow::Result<quinn::Endpoint> {
+fn client_endpoint(trust: &TrustMode) -> anyhow::Result<quinn::Endpoint> {
     let provider = rustls::crypto::ring::default_provider();
-    let mut crypto = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
-        .with_safe_default_protocol_versions()?
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
-        .with_no_client_auth();
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+        .with_safe_default_protocol_versions()?;
+
+    let mut crypto = match trust {
+        TrustMode::SystemRoots => {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+        TrustMode::CaFile(path) => {
+            let pem = std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("cannot read --asf2-quic-ca {}: {e}", path.display()))?;
+            let mut roots = rustls::RootCertStore::empty();
+            let mut added = 0;
+            for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
+                roots.add(cert?)?;
+                added += 1;
+            }
+            anyhow::ensure!(added > 0, "no certificates found in {}", path.display());
+            builder.with_root_certificates(roots).with_no_client_auth()
+        }
+        TrustMode::Insecure => {
+            tracing::warn!(
+                "asf2 quic: TLS certificate verification is DISABLED \
+                 (--asf2-quic-insecure). Feeds can be intercepted or spoofed; \
+                 use --asf2-quic-ca with the ingest's certificate instead."
+            );
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+                .with_no_client_auth()
+        }
+    };
     crypto.alpn_protocols = vec![xng_proto::ALPN.to_vec()];
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
@@ -67,7 +114,9 @@ async fn connect(endpoint: &quinn::Endpoint, target: &str) -> anyhow::Result<qui
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve {target}"))?;
-    let conn = endpoint.connect(addr, "asf2-ingest")?.await?;
+    // SNI / certificate name = the host part of the target.
+    let host = target.rsplit_once(':').map(|(h, _)| h).unwrap_or(target);
+    let conn = endpoint.connect(addr, host)?.await?;
     let (send, _recv) = conn.open_bi().await?;
     Ok(send)
 }
@@ -75,10 +124,20 @@ async fn connect(endpoint: &quinn::Endpoint, target: &str) -> anyhow::Result<qui
 pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     target: String,
+    trust: TrustMode,
     station_id: String,
     station_ident: String,
 ) -> std::io::Result<()> {
-    let endpoint = match client_endpoint() {
+    if matches!(trust, TrustMode::Insecure) {
+        let loopback = target.starts_with("127.") || target.starts_with("localhost:") || target.starts_with("[::1]");
+        if !loopback {
+            tracing::warn!(
+                "asf2 quic: --asf2-quic-insecure with a non-loopback target ({target}) — \
+                 anyone on the path can read or forge this feed"
+            );
+        }
+    }
+    let endpoint = match client_endpoint(&trust) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!("asf2 quic endpoint setup failed: {e}");
@@ -91,6 +150,10 @@ pub async fn run(
         let mut stream = match connect(&endpoint, &target).await {
             Ok(s) => s,
             Err(e) => {
+                if super::asf2_grpc::drain_while_disconnected(&mut rx) {
+                    tracing::info!("asf2 quic output to {target}: session ended while disconnected");
+                    return Ok(());
+                }
                 tracing::warn!("asf2 quic connect to {target} failed: {e}; retrying in {RECONNECT_DELAY:?}");
                 tokio::time::sleep(RECONNECT_DELAY).await;
                 continue;
@@ -98,6 +161,9 @@ pub async fn run(
         };
         let hello = xng_proto::frame_envelope(&xng_proto::hello(&station_id, &station_ident, ""));
         if stream.write_all(&hello).await.is_err() {
+            if super::asf2_grpc::drain_while_disconnected(&mut rx) {
+                return Ok(());
+            }
             tokio::time::sleep(RECONNECT_DELAY).await;
             continue;
         }

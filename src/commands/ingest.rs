@@ -110,8 +110,23 @@ impl AirframesFeed for FeedService {
     }
 }
 
-async fn quic_server(listen: std::net::SocketAddr) -> anyhow::Result<()> {
-    let cert = rcgen::generate_simple_self_signed(vec!["asf2-ingest".into(), "localhost".into()])?;
+async fn quic_server(
+    listen: std::net::SocketAddr,
+    cert_out: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    let cert = rcgen::generate_simple_self_signed(vec![
+        "asf2-ingest".into(),
+        "localhost".into(),
+        "127.0.0.1".into(),
+        "::1".into(),
+    ])?;
+    if let Some(path) = &cert_out {
+        std::fs::write(path, cert.cert.pem())?;
+        tracing::info!(
+            "quic certificate written to {} — feeders pin it with --asf2-quic-ca",
+            path.display()
+        );
+    }
     let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
     let key_der = rustls::pki_types::PrivateKeyDer::try_from(cert.key_pair.serialize_der())
         .map_err(|e| anyhow::anyhow!("key encoding: {e}"))?;
@@ -165,7 +180,11 @@ async fn quic_server(listen: std::net::SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(grpc: Option<String>, quic: Option<String>) -> anyhow::Result<()> {
+pub fn run(
+    grpc: Option<String>,
+    quic: Option<String>,
+    quic_cert_out: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
     anyhow::ensure!(grpc.is_some() || quic.is_some(), "enable at least one of --grpc / --quic");
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
@@ -183,7 +202,7 @@ pub fn run(grpc: Option<String>, quic: Option<String>) -> anyhow::Result<()> {
         }
         if let Some(addr) = quic {
             let addr: std::net::SocketAddr = addr.parse()?;
-            tasks.push(tokio::spawn(quic_server(addr)));
+            tasks.push(tokio::spawn(quic_server(addr, quic_cert_out.map(|p| p.to_owned()))));
         }
         tokio::signal::ctrl_c().await?;
         tracing::info!("ingest shutting down");

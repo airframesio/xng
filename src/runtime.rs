@@ -25,6 +25,8 @@ pub struct OutputConfig {
     pub asf2_grpc: Option<String>,
     /// asf-2.0 QUIC ingest host:port.
     pub asf2_quic: Option<String>,
+    /// Certificate trust for the QUIC output.
+    pub asf2_quic_trust: crate::outputs::asf2_quic::TrustMode,
 }
 
 pub struct SessionConfig {
@@ -175,8 +177,9 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         }
         if let Some(target) = cfg.outputs.asf2_quic.clone() {
             let rx = bus.subscribe();
+            let trust = cfg.outputs.asf2_quic_trust.clone();
             let (id, ident) = (station.id.to_string(), station.ident.clone());
-            output_tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(rx, target, id, ident)));
+            output_tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(rx, target, trust, id, ident)));
         }
 
         // Ctrl-C → graceful stop.

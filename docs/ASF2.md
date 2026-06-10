@@ -49,11 +49,16 @@ the protobuf frame), over one bidirectional QUIC stream (stream opened by
 the client; server replies on the same stream). Connection migration and
 no head-of-line blocking make this the preferred transport for flaky
 feeder links. Per-channel QUIC streams are reserved for a future revision
-(`Hello.flags`). TLS is mandatory in QUIC; feeders connecting to
-self-hosted/dev ingests may use `--insecure` to skip certificate
-verification.
+(`Hello.flags`).
 
 ALPN: `asf2`.
+
+**TLS trust** (mandatory in QUIC): verification is on by default against
+system roots. Self-hosted ingests with self-signed certificates are
+pinned via `--asf2-quic-ca <pem>` (the reference ingest exports its
+certificate with `--quic-cert-out`). `--asf2-quic-insecure` disables
+verification entirely, exists for throwaway lab setups, warns loudly,
+and is mutually exclusive with `--asf2-quic-ca`.
 
 ## Compatibility
 
@@ -68,7 +73,9 @@ ALPN: `asf2`.
 ## Open items
 
 - Auth: token issuance/validation (Airframes account service) — schema
-  field exists, enforcement TBD.
+  field exists, enforcement TBD. Tokens are bearer credentials: they must
+  be CSPRNG-generated and only ever sent on a certificate-verified
+  connection (never with `--asf2-quic-insecure`).
 - Server hints: schema includes the variant; semantics defined per-mode as
   the server side lands.
 - Per-channel QUIC streams and batching/compression tuning after real
