@@ -10,6 +10,7 @@ pub mod ddc;
 pub mod fir;
 pub mod nco;
 pub mod rs;
+pub mod scramble;
 pub mod viterbi;
 pub mod window;
 

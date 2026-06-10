@@ -17,9 +17,9 @@ roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
 xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
 still buildable standalone.
 
-## Current state (M5 — ACARS, VDL2, AIS, and ADS-B native)
+## Current state (M6 in progress — five native decode cores)
 
-Four native decode cores are in, all clean-room:
+Five native decode cores are in:
 
 - **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
   sync/parity/CRC deframing, parity-guided single-bit error correction.
@@ -37,6 +37,11 @@ Four native decode cores are in, all clean-room:
   ACARS-over-AVLC into the shared application layer. Verified against
   spec-derived vectors (scrambler keystream, header FEC, unique word) and
   RF loopback; off-air validation pending usable VDL2 RF at this site.
+- **Inmarsat Aero L-band** (ported from MIT-licensed JAERO): A-BPSK/MSK
+  P-channels at 600 and 1200 bps (both rates decoded in parallel per
+  channel), K=7 Viterbi, 64-row interleaver, signal-unit layer with
+  ISU/SSU reassembly, ACARS into the shared application layer. R/T
+  bursts, 10.5 kbps A-QPSK, C-band, and STD-C are next.
 - **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
   CRC-24 validation with an ICAO cache for address-overlaid parity,
   extended-squitter ident/altitude decode — verified against published
@@ -64,6 +69,10 @@ xng listen --sdr driver=rtlsdr --mode adsb -r 2000000 -c 1090.000M --channels 10
 # VDL Mode 2: four channels incl. the worldwide CSC
 xng listen --sdr driver=rtlsdr --mode vdl2 -r 2400000 -c 136.800M \
     --channels 136.650,136.800,136.925,136.975
+
+# Inmarsat Aero L-band P-channels (patch antenna + LNA at 1545-1547 MHz)
+xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
+    --channels 1545.880,1546.045
 
 # Generate a synthetic test capture (no hardware needed)
 cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32
