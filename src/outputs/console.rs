@@ -27,7 +27,18 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
             }
             Some(format!("ADS-C {}", tags.first()?.get("tag")?.as_str()?))
         }
-        "cpdlc" => Some(format!("CPDLC {}", app.get("imi")?.as_str()?)),
+        "cpdlc" => {
+            // Decoded element text when available, IMI fallback otherwise.
+            if let Some(text) = app.get("text").and_then(|t| t.as_str()) {
+                let more = app
+                    .get("more_elements")
+                    .and_then(|m| m.as_bool())
+                    .unwrap_or(false);
+                Some(format!("CPDLC {text}{}", if more { " (+more)" } else { "" }))
+            } else {
+                Some(format!("CPDLC {}", app.get("imi")?.as_str()?))
+            }
+        }
         "media_advisory" => Some("MEDIA-ADV".to_owned()),
         _ => None,
     }

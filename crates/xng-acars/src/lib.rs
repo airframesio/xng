@@ -10,6 +10,7 @@ mod bits;
 
 pub mod adsc;
 pub mod arinc622;
+pub mod cpdlc;
 pub mod block;
 pub mod media_adv;
 pub mod sublabel;
@@ -27,11 +28,14 @@ pub enum AcarsApp {
         #[serde(flatten)]
         message: adsc::AdscMessage,
     },
-    /// CPDLC (FANS-1/A) message in an ARINC 622 envelope. The payload has
-    /// passed the envelope CRC; ASN.1 PER body decoding lands later.
+    /// CPDLC (FANS-1/A) message in an ARINC 622 envelope: header and the
+    /// first message element identified from the unaligned-PER body
+    /// (element arguments are a planned follow-up).
     Cpdlc {
         #[serde(flatten)]
         envelope: arinc622::Envelope,
+        #[serde(flatten, skip_serializing_if = "Option::is_none")]
+        message: Option<cpdlc::CpdlcMessage>,
         payload_hex: String,
     },
     /// Media advisory (label SA): datalink availability report.
