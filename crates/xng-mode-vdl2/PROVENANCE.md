@@ -75,3 +75,17 @@ that RS (at capacity, fixed=3 on k=6 rows) miscorrects into a nearby
 codeword. Phase-gain and sampling-offset sweeps are already at their
 optima; closing this needs a matched filter + symbol-timing tracking in
 the demod (planned).
+
+## Coherent preamble sync (2026-06, demod v2 step 1)
+
+The UW hunt's quarter-sample differential refinement is replaced by a
+coherent joint fit (dumpvdl2's sync in least-squares form): over a fine
+timing grid, the unwrapped per-symbol phase trajectory of all 16 UW
+symbols is compared against the known cumulative UW phase ramp and fit
+to residual ≈ a + b·k, weighted by sample energy. The minimum-cost grid
+point yields timing and the per-symbol CFO (b) jointly — far less noisy
+than the differential correlation argument, which uses 15 transitions
+non-coherently. Off-air result: 13 frames (from 10), including the
+ground-station XID bursts whose symbol errors previously drove RS into
+miscorrection. Remaining gap to dumpvdl2 is hunt trigger sensitivity on
+the weakest bursts.

@@ -60,3 +60,13 @@ ffmpeg -i "VDL2 IQ.wav" -f f32le -ac 2 -ar 105000 vdl2_105k.f32
 The same investigation applies to HFDL's weak-burst gap (31/37 vs
 dumphfdl): its A1 hunt is also differential-then-refine; a coherent
 preamble fit would sharpen acquisition there too.
+
+## Progress (same day)
+
+The coherent preamble fit is implemented (weighted least-squares over
+the 16-symbol phase trajectory, ±3 samples in 0.25 steps) at the
+existing 50 kHz channel rate — the rate bump turned out unnecessary for
+this step. Result on the capture: **13 frames (from 10)**, including
+the GS XID bursts (`XID len=75` from 2D4918) that previously RS-
+miscorrected. The remaining gap to dumpvdl2 (41) is burst *detection* —
+hunt trigger sensitivity on the weakest bursts — not decode quality.
