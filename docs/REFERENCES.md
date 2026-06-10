@@ -28,7 +28,7 @@ attribution. GPL projects are listed as fact references only.
 
 | Project | License | How used | URL |
 |---|---|---|---|
-| libacars (szpajder) | MIT | **Ported** (attributed): ARINC 622 envelope, ADS-C decoder, media advisory, sublabel/MFI rules; 4 real ADS-C test vectors from examples/adsc_get_position.c | https://github.com/szpajder/libacars |
+| libacars (szpajder) | MIT | **Ported** (attributed): ARINC 622 envelope, ADS-C decoder, media advisory, sublabel/MFI rules; CPDLC FANS-1/A element tables + UPER layout from the asn1c-generated FANSAC* constraint tables and asn1-format-cpdlc-text.c labels; 4 real ADS-C test vectors from examples/adsc_get_position.c | https://github.com/szpajder/libacars |
 | JAERO (jontio) | MIT | **Ported** (attributed): P-channel framing, interleaver, scrambler, SU/ISU/SSU layer, ACARS carriage; 10.5k OQPSK demod ported from oqpskdemodulator.cpp + coarsefreqestimate.cpp (square-law timing, tanh cross-product carrier loop, squared-signal two-tone coarse CFO); 600/1200 MSK demod intentionally diverges (see xng-mode-aero/PROVENANCE.md). Off-air samples **used for validation** (600bps: 11 ACARS decoded; 10.5k: 144 ACARS decoded; 12 s vendored as CI fixture with attribution) | https://github.com/jontio/JAERO |
 | iridium-toolkit (muccc) | BSD-2 | Planned port source for Iridium frame parsing (wave 2) | https://github.com/muccc/iridium-toolkit |
 | acars crate (xoolive) | MIT | Inspected for API/coverage comparison; test fixtures noted as borrowable | https://crates.io/crates/acars |

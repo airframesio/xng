@@ -138,6 +138,13 @@ pub fn parse(text: &str, downlink: bool) -> Option<AcarsApp> {
             envelope,
         },
         Imi::At1 | Imi::Cr1 | Imi::Cc1 | Imi::Dr1 => AcarsApp::Cpdlc {
+            // Only AT1 carries ATCDownlink/UplinkMessage; CR1/CC1/DR1 are
+            // context-management bodies (different ASN.1, not decoded yet).
+            message: if imi == Imi::At1 {
+                crate::cpdlc::decode(body, downlink)
+            } else {
+                None
+            },
             envelope,
             payload_hex: body.iter().map(|b| format!("{b:02x}")).collect(),
         },
@@ -162,6 +169,42 @@ mod tests {
         assert_eq!(envelope.air_reg, ".VT-ANB");
         assert_eq!(envelope.imi, Imi::Ads);
         assert!(envelope.crc_ok, "real off-air message must pass CRC");
+    }
+
+    #[test]
+    fn cpdlc_wilco_end_to_end() {
+        // UPER ATCDownlinkMessage: no extra elements, no msgRef, no
+        // timestamp, msgId = 5, element 0 (dM0NULL = WILCO):
+        // bits 0,0,0 | 000101 | 00000000 → 0x02 0x80 0x00.
+        let body = [0x02u8, 0x80, 0x00];
+        // Find the CRC trailer that satisfies the ARINC residue.
+        let crc_bytes = (0..=u16::MAX)
+            .map(u16::to_be_bytes)
+            .find(|x| {
+                let mut d = ARINC_CRC.digest();
+                d.update(b"AT1");
+                d.update(b".N123AB");
+                d.update(&body);
+                d.update(x);
+                d.finalize() == ARINC_CRC_GOOD
+            })
+            .expect("a valid CRC trailer exists");
+        let hex: String = body
+            .iter()
+            .chain(&crc_bytes)
+            .map(|b| format!("{b:02X}"))
+            .collect();
+        let app = parse(&format!("/MSTEC7X.AT1.N123AB{hex}"), true).expect("parses");
+        let AcarsApp::Cpdlc { envelope, message, .. } = &app else {
+            panic!("expected CPDLC");
+        };
+        assert!(envelope.crc_ok);
+        assert_eq!(envelope.imi, Imi::At1);
+        let m = message.as_ref().expect("CPDLC body decodes");
+        assert_eq!(m.msg_id, 5);
+        assert_eq!(m.element, "dM0NULL");
+        assert_eq!(m.text, "WILCO");
+        assert!(!m.more_elements);
     }
 
     #[test]
