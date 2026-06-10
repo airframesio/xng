@@ -62,7 +62,10 @@ pub struct FrameDecoder {
 
 impl FrameDecoder {
     pub fn new() -> Self {
-        Self { viterbi: Viterbi::k7() }
+        // 133-output first in each coded pair — the same on-air order
+        // off-air validation established for Aero and HFDL; confirmed
+        // for STD-C against the sigidwiki EGC capture.
+        Self { viterbi: Viterbi::new(7, 0o133, 0o171) }
     }
 
     /// Decode one aligned frame of 10368 soft symbols (+1.0 = bit 1).
@@ -109,7 +112,7 @@ pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
 
     let bits: Vec<u8> =
         bytes.iter().flat_map(|&b| (0..8).map(move |k| (b >> k) & 1)).collect();
-    let coded = Viterbi::k7().encode(&bits);
+    let coded = Viterbi::new(7, 0o133, 0o171).encode(&bits);
     debug_assert_eq!(coded.len(), ROWS * (COLS - 2));
 
     // Interleave: coded stream was read column-wise on RX, so write

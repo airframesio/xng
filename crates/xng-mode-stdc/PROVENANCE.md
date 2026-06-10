@@ -30,3 +30,20 @@ seconds of the continuous carrier to converge, which deployment always
 provides. Definitive demod validation target: the public sigidwiki
 capture (Inmarsat-C_TDM_EGC_IQ.zip), stage-by-stage against SatDump's
 .frm output.
+
+## Off-air validation (2026-06)
+
+Validated against the sigidwiki Inmarsat-C TDM/EGC IQ recording
+(CC BY-SA, 49 s, AOR-E, TDM carrier at +216 Hz in the capture). The
+demod chain (coarse AFC, Costas, Gardner, UW frame sync) worked on the
+real signal as-is — the UW scored 128/128 on the first frame. The one
+convention fix: **coded pair order is 133-output first** (the same
+finding as Aero and HFDL); with 171-first the deinterleaved frame
+decodes to pseudorandom bytes and no packet checksum passes, with
+133-first every packet in the frame validates.
+
+Result: 51 packets from the capture — bulletin boards with consecutive
+TDM frame numbers (5987, 5988, ...), logical-channel announcements with
+MES IDs and LES routing (AOR-E), confirmations, and signalling-channel
+descriptors. A 14 s slice (one full frame) is vendored as a CI fixture
+(tests/data/, attributed) guarded by tests/offair.rs.
