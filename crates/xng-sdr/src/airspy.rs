@@ -89,6 +89,21 @@ pub fn enumerate() -> Result<Vec<u64>, SdrError> {
 pub const FREQ_MIN_HZ: u64 = 24_000_000;
 pub const FREQ_MAX_HZ: u64 = 1_750_000_000;
 
+/// The sample rates a connected device advertises (briefly opens it).
+pub fn device_rates(serial: Option<u64>) -> Result<Vec<u32>, SdrError> {
+    let mut dev: *mut ffi::Device = std::ptr::null_mut();
+    let ret = match serial {
+        Some(sn) => unsafe { ffi::airspy_open_sn(&mut dev, sn) },
+        None => unsafe { ffi::airspy_open(&mut dev) },
+    };
+    if ret != ffi::AIRSPY_SUCCESS {
+        return Err(SdrError::Device(format!("airspy_open: error {ret}")));
+    }
+    let rates = supported_rates(dev);
+    unsafe { ffi::airspy_close(dev) };
+    Ok(rates)
+}
+
 /// Map a requested dB gain onto the R820T linearity-optimized composite gain
 /// (22 steps spanning roughly 0..45 dB).
 pub fn linearity_index(gain_db: f64) -> u8 {

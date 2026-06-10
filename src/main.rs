@@ -333,13 +333,32 @@ fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, f64, u64, Vec
 }
 
 /// Zero-config tuning for the tui: anything omitted is derived from the
-/// mode's built-in frequency plan — sample rate from the plan, channels
-/// from the densest capture window that fits it (trimmed to a CPU
-/// budget, core channels first), center from the chosen channels.
-fn resolve_tune_auto(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, f64, u64, Vec<u64>)> {
+/// mode's built-in frequency plan — sample rate from the plan (checked
+/// against the device's advertised rates where a native backend can
+/// tell us), channels from the densest capture window that fits it
+/// (trimmed to a CPU budget, core channels first), center from the
+/// chosen channels.
+fn resolve_tune_auto(
+    tune: &TuneOpts,
+    sdr: &str,
+) -> anyhow::Result<(xng_types::Mode, f64, u64, Vec<u64>)> {
     let mode: xng_types::Mode = tune.mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let (plan_rate, plan_channels) = commands::scan::plan(mode);
-    let rate = tune.sample_rate.unwrap_or(plan_rate);
+    let rate = match tune.sample_rate {
+        Some(r) => r,
+        None => {
+            let advertised = probe_device_rates(sdr);
+            let r = commands::scan::pick_auto_rate(&advertised, mode, plan_rate);
+            if r != plan_rate {
+                tracing::info!(
+                    "auto-tune: device prefers {} S/s over the plan's {} S/s",
+                    r as u64,
+                    plan_rate as u64
+                );
+            }
+            r
+        }
+    };
 
     // Explicit channels: only the center may need deriving.
     if !tune.channels.is_empty() {
@@ -387,6 +406,24 @@ fn resolve_tune_auto(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, f64, u
         rate as u64
     );
     Ok((mode, rate, center, channels))
+}
+
+/// Advertised sample rates of the device `--sdr` selects, where a native
+/// backend can ask (empty when it can't — SoapySDR devices generally
+/// accept the plan rates).
+fn probe_device_rates(sdr: &str) -> Vec<u32> {
+    let args = sdr_args::SdrArgs::parse(sdr);
+    if args.force_soapy {
+        return Vec::new();
+    }
+    let serial = args.serial.as_deref().and_then(|s| sdr_args::parse_airspy_serial(s).ok());
+    match args.driver.as_deref() {
+        #[cfg(feature = "airspy")]
+        Some("airspy") => xng_sdr::airspy::device_rates(serial).unwrap_or_default(),
+        #[cfg(feature = "airspyhf")]
+        Some("airspyhf") => xng_sdr::airspyhf::device_rates(serial).unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// Midpoint of a channel set, nudged off any exact channel so no carrier
@@ -490,7 +527,7 @@ fn main() -> anyhow::Result<()> {
             commands::scan::run(&sdr, gain, &modes, dwell, out.as_deref())
         }
         Command::Tui { sdr, gain, file, format, tune } => {
-            let (mode, rate, center_hz, channels_hz) = resolve_tune_auto(&tune)?;
+            let (mode, rate, center_hz, channels_hz) = resolve_tune_auto(&tune, &sdr)?;
             let source: Box<dyn xng_sdr::IqSource> = match file {
                 Some(path) => {
                     let fmt = match format.as_deref() {
