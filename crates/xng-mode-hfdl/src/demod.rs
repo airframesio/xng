@@ -51,7 +51,10 @@ impl HfdlDemod {
             noise: 1e-6,
             state: State::Hunt,
             level: 0.0,
-            viterbi: Viterbi::k7(),
+            // 133-output first in each coded pair, as off-air validation
+            // showed for Aero; confirmed for HFDL against the sigidwiki
+            // 21931 kHz capture (171-first yields no valid FCS).
+            viterbi: Viterbi::new(7, 0o133, 0o171),
         }
     }
 
@@ -97,13 +100,29 @@ impl HfdlDemod {
     /// Coherent correlation against a ±1 sequence with rotation `theta`
     /// per symbol from `pos`. Returns the complex correlation.
     fn coherent(&self, pos: f64, bits: &[u8], theta: f32) -> Option<Complex<f32>> {
+        self.coherent_with_energy(pos, bits, theta).map(|(c, _)| c)
+    }
+
+    /// Coherent correlation plus a scale-invariant quality metric in
+    /// 0..1 (|corr| normalized by the window's signal energy) — gates
+    /// must not depend on absolute signal amplitude (off-air captures
+    /// are far below the synthetic unit level).
+    fn coherent_with_energy(
+        &self,
+        pos: f64,
+        bits: &[u8],
+        theta: f32,
+    ) -> Option<(Complex<f32>, f32)> {
         let mut corr = Complex::new(0.0f32, 0.0);
+        let mut energy = 0.0f32;
         for (j, &b) in bits.iter().enumerate() {
             let s = self.sample(pos + j as f64 * self.sps)?;
+            energy += s.norm_sqr();
             let derot = s * Complex::from_polar(1.0, -theta * j as f32);
             corr += if b == 1 { -derot } else { derot };
         }
-        Some(corr)
+        let metric = corr.norm() / (energy * bits.len() as f32).sqrt().max(1e-12);
+        Some((corr, metric))
     }
 
     fn hunt(&mut self) -> Option<(f64, f32)> {
@@ -135,7 +154,24 @@ impl HfdlDemod {
                         }
                     }
                     let (_, theta2) = self.a_diff_correlate(best.1).unwrap_or((0.0, theta));
-                    return Some((best.1, theta2));
+                    // The differential metric's peak is broad and can sit
+                    // a couple of samples off the true symbol timing —
+                    // enough to collapse the coherent M1 correlation at
+                    // 6.67 samples/symbol (observed on the off-air 21931
+                    // kHz capture: a 3-sample error nulled M1). Refine to
+                    // quarter-sample timing on the coherent A correlation.
+                    let a_bits = fec::bits_of(fec::A_BITS);
+                    let mut fine = (0.0f32, best.1);
+                    let mut k = -4.0f64;
+                    while k <= 4.0 {
+                        if let Some((_, m)) = self.coherent_with_energy(best.1 + k, &a_bits, theta2) {
+                            if m > fine.0 {
+                                fine = (m, best.1 + k);
+                            }
+                        }
+                        k += 0.25;
+                    }
+                    return Some((fine.1, theta2));
                 }
             }
         }
@@ -161,8 +197,8 @@ impl HfdlDemod {
         // Verify M1 with the refined carrier (sanity).
         let m1_pos = a1_pos + 254.0 * self.sps;
         let m1_bits: Vec<u8> = (0..127).map(|j| m[(s.m1_shift + j) % 127]).collect();
-        let cm = self.coherent(m1_pos, &m1_bits, theta)?;
-        if cm.norm() / 127.0 < 0.2 {
+        let (_, m1_metric) = self.coherent_with_energy(m1_pos, &m1_bits, theta)?;
+        if m1_metric < 0.2 {
             return None;
         }
 
@@ -203,10 +239,9 @@ impl HfdlDemod {
                 }
             }
             pos += 30.0 * self.sps;
-            if let Some(c) = self.coherent(pos, &t, theta) {
-                let cf = c * flip;
-                if cf.norm() / 15.0 > 0.1 {
-                    phase = cf.arg();
+            if let Some((c, m)) = self.coherent_with_energy(pos, &t, theta) {
+                if m > 0.3 {
+                    phase = (c * flip).arg();
                     phase_ref = pos;
                 }
             }
@@ -258,8 +293,7 @@ impl HfdlDemod {
                         for s in &SETTINGS {
                             let bits: Vec<u8> =
                                 (0..127).map(|j| m[(s.m1_shift + j) % 127]).collect();
-                            if let Some(c) = self.coherent(m1_pos, &bits, theta) {
-                                let metric = c.norm() / 127.0;
+                            if let Some((_, metric)) = self.coherent_with_energy(m1_pos, &bits, theta) {
                                 if best.map(|(b, _)| metric > b).unwrap_or(true) {
                                     best = Some((metric, *s));
                                 }

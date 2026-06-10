@@ -21,7 +21,7 @@ pub fn burst_symbols(payload: &[u8], s: &Setting) -> Vec<f64> {
     assert!(bits.len() <= s.payload_bits());
     bits.resize(s.payload_bits(), 0);
 
-    let mut chips = Viterbi::k7().encode(&bits);
+    let mut chips = Viterbi::new(7, 0o133, 0o171).encode(&bits); // 133-first, as on air
     if s.rate_quarter {
         chips = chips.iter().flat_map(|&c| [c, c]).collect();
     }
