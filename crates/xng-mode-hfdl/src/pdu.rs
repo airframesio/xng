@@ -26,11 +26,13 @@ pub struct HfdlEvent {
     pub raw: Vec<u8>,
 }
 
-pub struct PduParser;
+pub struct PduParser {
+    systable: crate::systable::SystableAssembler,
+}
 
 impl PduParser {
     pub fn new() -> Self {
-        Self
+        Self { systable: crate::systable::SystableAssembler::new() }
     }
 
     /// Parse one decoded burst payload (one SPDU or MPDU + padding).
@@ -198,17 +200,24 @@ impl PduParser {
                     raw: h.to_vec(),
                 });
             }
-            0xD0 => out.push(HfdlEvent {
-                kind: "systable-partial".into(),
-                details: json!({
-                    "seq": h[2] & 0x0F,
-                    "total": (h[2] >> 4) + 1,
-                    "version": (h.get(3).copied().unwrap_or(0) as u16 >> 4)
-                        | ((h.get(4).copied().unwrap_or(0) as u16) << 4),
-                }),
-                acars: None,
-                raw: h.to_vec(),
-            }),
+            0xD0 if h.len() >= 5 => {
+                let (seq, total) = (h[2] & 0x0F, (h[2] >> 4) + 1);
+                let version = (h[3] as u16 >> 4) | ((h[4] as u16) << 4);
+                out.push(HfdlEvent {
+                    kind: "systable-partial".into(),
+                    details: json!({ "seq": seq, "total": total, "version": version }),
+                    acars: None,
+                    raw: h.to_vec(),
+                });
+                if let Some(table) = self.systable.store(version, seq, total, &h[5..]) {
+                    out.push(HfdlEvent {
+                        kind: "systable-complete".into(),
+                        details: serde_json::to_value(&table).unwrap_or_default(),
+                        acars: None,
+                        raw: Vec::new(),
+                    });
+                }
+            }
             t => out.push(HfdlEvent {
                 kind: "hfnpdu".into(),
                 details: json!({ "type": t, "who": who }),
@@ -243,6 +252,13 @@ pub fn build_spdu(gs_id: u8, frame_index: u16, systable_version: u16) -> Vec<u8>
     p[53] = (systable_version & 0xFF) as u8;
     p[54] = ((systable_version >> 8) & 0x0F) as u8 | 0x10; // freq bit 0
     with_fcs(p)
+}
+
+/// Unnumbered-data LPDU carrying an arbitrary HFNPDU.
+pub fn build_lpdu_hfnpdu(hfnpdu: &[u8]) -> Vec<u8> {
+    let mut l = vec![0x0D];
+    l.extend_from_slice(hfnpdu);
+    with_fcs(l)
 }
 
 /// LPDU carrying an enveloped ACARS HFNPDU.
@@ -304,6 +320,33 @@ mod tests {
         assert!(b.crc_ok);
         assert_eq!(b.core.label, "B6");
         assert_eq!(b.core.app.as_ref().unwrap()["app"], "adsc");
+    }
+
+    #[test]
+    fn systable_reassembles_across_mpdus() {
+        let stations = vec![crate::systable::GroundStation {
+            gs_id: 4,
+            utc_sync: true,
+            lat: 40.88,
+            lon: -72.64,
+            spdu_version: 2,
+            frequencies: vec![
+                crate::systable::GsFrequency { freq_hz: 21_931_000, master_frame_slot: 2 },
+                crate::systable::GsFrequency { freq_hz: 11_387_000, master_frame_slot: 5 },
+            ],
+        }];
+        let body = crate::systable::build_gs_record(&stations[0]);
+        let pdus = crate::systable::build_systable_hfnpdus(77, &body, 2);
+        let mut parser = PduParser::new();
+        let ev1 = parser.parse(&build_mpdu_downlink(4, 0xC7, &[build_lpdu_hfnpdu(&pdus[0])]), 300);
+        assert_eq!(ev1.len(), 1);
+        assert_eq!(ev1[0].kind, "systable-partial");
+        let ev2 = parser.parse(&build_mpdu_downlink(4, 0xC7, &[build_lpdu_hfnpdu(&pdus[1])]), 300);
+        assert_eq!(ev2.len(), 2);
+        assert_eq!(ev2[1].kind, "systable-complete");
+        assert_eq!(ev2[1].details["version"], 77);
+        assert_eq!(ev2[1].details["stations"][0]["gs_id"], 4);
+        assert_eq!(ev2[1].details["stations"][0]["frequencies"][0]["freq_hz"], 21_931_000);
     }
 
     #[test]
