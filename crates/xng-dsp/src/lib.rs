@@ -10,6 +10,7 @@ pub mod ddc;
 pub mod fir;
 pub mod nco;
 pub mod rs;
+pub mod viterbi;
 pub mod window;
 
 pub use channelizer::PfbChannelizer;
