@@ -78,6 +78,13 @@ message AisBody {
   optional uint32 mmsi = 3;
 }
 
+message StdcBody {
+  string name = 1;
+  optional string text = 2;
+  // Packet details as JSON.
+  string details_json = 3;
+}
+
 message ModeSBody {
   uint32 df = 1;
   optional string icao = 2;
@@ -100,6 +107,7 @@ message DecodedMessage {
     AisBody ais = 11;
     ModeSBody mode_s = 12;
     bool undecoded = 13;
+    StdcBody stdc = 14;
   }
 }
 

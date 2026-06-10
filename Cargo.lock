@@ -2522,6 +2522,7 @@ dependencies = [
  "xng-mode-adsb",
  "xng-mode-aero",
  "xng-mode-ais",
+ "xng-mode-stdc",
  "xng-mode-vdl2",
  "xng-proto",
  "xng-sdr",
@@ -2588,6 +2589,19 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "num-complex",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-stdc"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "rustfft",
+ "serde",
+ "serde_json",
  "xng-dsp",
  "xng-types",
 ]

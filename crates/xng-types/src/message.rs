@@ -93,6 +93,13 @@ pub enum MessageBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         altitude_ft: Option<i32>,
     },
+    /// Inmarsat STD-C / EGC packet (SafetyNET, FleetNET, system).
+    StdC {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        details: serde_json::Value,
+    },
     /// A frame decoded at link layer but with no (or not-yet-implemented)
     /// application-layer interpretation.
     Undecoded,

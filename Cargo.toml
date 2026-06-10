@@ -35,6 +35,7 @@ xng-proto = { path = "crates/xng-proto" }
 xng-acars = { path = "crates/xng-acars" }
 xng-mode-vdl2 = { path = "crates/xng-mode-vdl2" }
 xng-mode-aero = { path = "crates/xng-mode-aero" }
+xng-mode-stdc = { path = "crates/xng-mode-stdc" }
 prost = "0.13"
 tonic = "0.12"
 quinn = "0.11"
@@ -83,6 +84,7 @@ xng-proto.workspace = true
 xng-acars.workspace = true
 xng-mode-vdl2.workspace = true
 xng-mode-aero.workspace = true
+xng-mode-stdc.workspace = true
 prost.workspace = true
 tonic.workspace = true
 quinn.workspace = true

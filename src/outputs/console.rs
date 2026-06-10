@@ -63,6 +63,21 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::StdC { name, text, details } => {
+                    let svc = details.get("service").and_then(|v| v.as_str()).unwrap_or("");
+                    let pri = details.get("priority").and_then(|v| v.as_str()).unwrap_or("");
+                    let mut s = format!("STD-C {name}");
+                    if !svc.is_empty() {
+                        s.push_str(&format!(" {svc}"));
+                    }
+                    if !pri.is_empty() {
+                        s.push_str(&format!(" [{pri}]"));
+                    }
+                    if let Some(t) = text {
+                        s.push_str(&format!(" | {}", t.replace('\n', "·")));
+                    }
+                    s
+                }
                 MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
             };
             format!(

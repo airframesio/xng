@@ -13,6 +13,7 @@ use xng_mode_acars::AcarsChannelDecoder;
 use xng_mode_adsb::AdsbDecoder;
 use xng_mode_aero::{AeroBurstDecoder, AeroChannelDecoder};
 use xng_mode_ais::AisChannelDecoder;
+use xng_mode_stdc::StdcChannelDecoder;
 use xng_mode_vdl2::Vdl2ChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, Mode, Provenance, SdrInfo, StationIdentity};
@@ -50,6 +51,7 @@ enum ModeChannel {
     Vdl2(Vdl2ChannelDecoder),
     Aero(AeroChannelDecoder),
     AeroBurst(AeroBurstDecoder),
+    StdC(StdcChannelDecoder),
 }
 
 impl ModeChannel {
@@ -60,6 +62,7 @@ impl ModeChannel {
             Mode::Vdl2 => Ok(Self::Vdl2(Vdl2ChannelDecoder::new(sample_rate, offset)?)),
             Mode::AeroL => Ok(Self::Aero(AeroChannelDecoder::new(sample_rate, offset)?)),
             Mode::AeroC => Ok(Self::AeroBurst(AeroBurstDecoder::new(sample_rate, offset)?)),
+            Mode::StdC => Ok(Self::StdC(StdcChannelDecoder::new(sample_rate, offset)?)),
             Mode::Adsb => {
                 if offset.abs() > 1e-6 {
                     return Err("Mode S uses the whole capture: tune -c to 1090.000M and pass --channels 1090".into());
@@ -75,6 +78,7 @@ impl ModeChannel {
             Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
             Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
             Mode::AeroL | Mode::AeroC => xng_mode_aero::CHANNEL_PASSBAND_HZ,
+            Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
             Mode::Adsb => 0.0, // wideband: offset must be 0, no DDC
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
@@ -86,6 +90,7 @@ impl ModeChannel {
             Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
             Self::Vdl2(_) => xng_mode_vdl2::CHANNEL_RATE,
             Self::Aero(_) | Self::AeroBurst(_) => xng_mode_aero::CHANNEL_RATE,
+            Self::StdC(_) => xng_mode_stdc::CHANNEL_RATE,
             Self::Adsb(_) => 2_000_000.0,
         }
     }
@@ -155,6 +160,17 @@ impl ModeChannel {
                 let msgs = events
                     .iter()
                     .map(|e| xng_mode_aero::to_message(e, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, ok)
+            }
+            Self::StdC(dec) => {
+                let packets = dec.process(iq);
+                let seen = packets.len() as u64;
+                let level = dec.level_dbfs();
+                let ok = packets.iter().filter(|p| p.checksum_ok).count() as u64;
+                let msgs = packets
+                    .iter()
+                    .map(|p| xng_mode_stdc::to_message(p, freq, level, prov.clone()))
                     .collect();
                 (msgs, seen, ok)
             }

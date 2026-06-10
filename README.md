@@ -17,9 +17,9 @@ roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
 xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
 still buildable standalone.
 
-## Current state (M6 in progress — five native decode cores)
+## Current state (M6 — six native decode cores)
 
-Five native decode cores are in:
+Six native decode cores are in:
 
 - **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
   sync/parity/CRC deframing, parity-guided single-bit error correction.
@@ -42,7 +42,13 @@ Five native decode cores are in:
   and C-band R/T-channel bursts (`--mode aero-c`: burst gating, carrier
   CFO estimation, R-SU and T-burst signal-unit layers), K=7 Viterbi,
   64-row interleaver, ISU/SSU reassembly, ACARS into the shared
-  application layer. 10.5 kbps A-QPSK and STD-C are next.
+  application layer. 10.5 kbps A-QPSK is next.
+- **Inmarsat STD-C / EGC** (clean-room from cross-verified facts; first
+  coherent demod in the codebase — square-law AFC, Costas, Gardner):
+  NCS frames (UW sync both polarities, row depermutation, 64×162
+  deinterleave, Viterbi, group descrambler), packet layer with Fletcher
+  checksums, multiframe and logical-channel assembly, and EGC SafetyNET/
+  FleetNET messages with service/priority decoding (`--mode std-c`).
 - **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
   CRC-24 validation with an ICAO cache for address-overlaid parity,
   extended-squitter ident/altitude decode — verified against published
@@ -74,6 +80,10 @@ xng listen --sdr driver=rtlsdr --mode vdl2 -r 2400000 -c 136.800M \
 # Inmarsat Aero L-band P-channels (patch antenna + LNA at 1545-1547 MHz)
 xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
     --channels 1545.880,1546.045
+
+# Inmarsat STD-C / EGC (SafetyNET maritime safety broadcasts)
+xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
+    --channels 1537.700,1537.100
 
 # Generate a synthetic test capture (no hardware needed)
 cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32
