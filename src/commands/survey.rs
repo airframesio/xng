@@ -153,6 +153,8 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     let deadline = started + Duration::from_secs(opts.duration_secs);
     let mut next_interim = started + Duration::from_secs(opts.interim_secs);
     let mut gi = 0usize;
+    let mut ever_ok = false;
+    let mut consec_fail = 0usize;
     while Instant::now() < deadline && !abort.load(Ordering::Relaxed) {
         let (center, group) = &groups[gi % groups.len()];
         gi += 1;
@@ -175,6 +177,8 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
         let t0 = Instant::now();
         match dwell(&opts.sdr, gain, mode, rate, *center, group, visit, &abort, &bus) {
             Ok(stats) => {
+                ever_ok = true;
+                consec_fail = 0;
                 let secs = t0.elapsed().as_secs_f64();
                 for (freq, frames, ok, level) in stats {
                     let a = acc.entry(freq).or_default();
@@ -185,6 +189,14 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
                 }
             }
             Err(e) => {
+                consec_fail += 1;
+                // Before any window has ever worked, a full rotation of
+                // failures means the configuration itself is bad (wrong
+                // sample rate, missing device): retrying forever just
+                // spams the same error.
+                if !ever_ok && consec_fail >= groups.len().max(2) {
+                    anyhow::bail!("every capture window is failing (last error: {e})");
+                }
                 println!("window @ {:.3} MHz skipped: {e}", *center as f64 / 1e6);
                 std::thread::sleep(Duration::from_secs(2));
             }
