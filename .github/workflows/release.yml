@@ -1,0 +1,123 @@
+name: Release
+
+# Tag a version (e.g. v0.9.0) to build binaries for every supported
+# platform/architecture and publish a GitHub release with the assets.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            deb: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            deb: true
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y libsoapysdr-dev libairspy-dev libairspyhf-dev protobuf-compiler
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install soapysdr airspy airspyhf protobuf
+      - name: Build
+        run: cargo build --release --features airspy,airspyhf
+      - name: Package tarball
+        run: |
+          PKG=xng-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p dist/${PKG}
+          cp target/release/xng README.md LICENSE-MIT LICENSE-APACHE dist/${PKG}/
+          tar -C dist -czf dist/${PKG}.tar.gz ${PKG}
+          rm -r dist/${PKG}
+      - name: Build Debian package
+        if: matrix.deb
+        run: |
+          ./build_deb_package.sh
+          cp build/*.deb dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - name: Release notes
+        run: |
+          cat > notes.md <<'EOF'
+          **xng** is a single native decoder for the radio side of aviation
+          and maritime data: ACARS, VDL Mode 2, HFDL, Inmarsat Aero (L/C),
+          Inmarsat STD-C/EGC, Iridium (ring alerts, broadcasts, ACARS over
+          SBD with wideband burst hunting), AIS, and Mode S/ADS-B — one CLI,
+          every output (console, JSON/JSONL, acarsdec-compatible UDP,
+          Airframes feeding, Prometheus, asf-2.0 gRPC/QUIC), and a built-in
+          application layer (ADS-C, CPDLC rendered as text, media advisory).
+
+          Every decode core is validated against real off-air recordings or
+          reference-implementation test vectors, vendored into CI. The VHF
+          ACARS chain is validated end-to-end into production Airframes from
+          a live station.
+
+          ## Assets
+
+          | Asset | Platform |
+          |---|---|
+          | `xng-*-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
+          | `xng-*-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 (Pi 4/5 64-bit) |
+          | `xng-*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+          | `xng-*-x86_64-apple-darwin.tar.gz` | macOS Intel |
+          | `xng_*.deb` | Debian/Ubuntu packages (x86_64 + arm64) |
+
+          Binaries are built with SoapySDR plus the native Airspy backends;
+          they need `libsoapysdr` (and `libairspy`/`libairspyhf` for native
+          Airspy) at runtime — the .deb declares these. Multi-arch Docker
+          images (amd64/arm64/armv7) are published to
+          `ghcr.io/airframesio/xng` for the same tag.
+
+          Quick start:
+
+          ```bash
+          xng devices
+          xng scan --sdr driver=rtlsdr --gain 28 --modes acars,vdl2,ais
+          xng survey --sdr driver=rtlsdr --mode acars --tune-gain
+          xng listen --sdr driver=rtlsdr --mode acars -r 2400000 -c 130.940M \
+              --channels 130.025,131.550,131.725 \
+              --feed-airframes --station-id XX-YOUR-STATION
+          ```
+          EOF
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "xng $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag

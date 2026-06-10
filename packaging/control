@@ -1,6 +1,6 @@
 Package: xng
-Version: 0.2.0
-Depends: libsoapysdr0.8
+Version: CURRENT_VERSION
+Depends: libsoapysdr0.8, libairspy0, libairspyhf1
 Section: utils
 Priority: optional
 Architecture: CURRENT_ARCH

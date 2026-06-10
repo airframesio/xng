@@ -211,7 +211,8 @@ fn draw(
     list_state.select(app.selected);
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(format!(
-            " messages {} ",
+            " xng v{} — messages {} ",
+            env!("CARGO_PKG_VERSION"),
             if app.follow { "(follow)" } else { "(paused)" }
         )))
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD));
