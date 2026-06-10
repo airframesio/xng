@@ -108,6 +108,56 @@ fn read_speed(b: &mut Bits) -> Option<String> {
     })
 }
 
+/// Constrained IA5 string: `len_bits`-bit length (offset from `min`),
+/// then 7-bit characters.
+fn read_ia5(b: &mut Bits, len_bits: usize, min: u32) -> Option<String> {
+    let n = min + if len_bits > 0 { b.read(len_bits)? } else { 0 };
+    let mut s = String::new();
+    for _ in 0..n {
+        let c = b.read(7)? as u8;
+        if !(0x20..0x7F).contains(&c) {
+            return None;
+        }
+        s.push(c as char);
+    }
+    Some(s)
+}
+
+/// FANSPosition CHOICE (3-bit index): fix name, navaid, airport,
+/// latitude/longitude (degrees + optional tenths-of-minutes +
+/// direction), or place-bearing-distance (not decoded).
+fn read_position(b: &mut Bits) -> Option<String> {
+    match b.read(3)? {
+        0 => read_ia5(b, 3, 1), // fixName SIZE(1..5)
+        1 => read_ia5(b, 2, 1), // navaid SIZE(1..4)
+        2 => read_ia5(b, 0, 4), // airport SIZE(4)
+        3 => {
+            let lat_has_min = b.read(1)? == 1;
+            let lat_deg = b.read(7)?;
+            let lat_min = if lat_has_min { Some(b.read(10)?) } else { None };
+            let ns = if b.read(1)? == 1 { 'S' } else { 'N' };
+            let lon_has_min = b.read(1)? == 1;
+            let lon_deg = b.read(8)?;
+            let lon_min = if lon_has_min { Some(b.read(10)?) } else { None };
+            let ew = if b.read(1)? == 1 { 'W' } else { 'E' };
+            if lat_deg > 90 || lon_deg > 180 {
+                return None;
+            }
+            let fmt = |deg: u32, min: Option<u32>, dir: char| match min {
+                Some(m) => format!("{deg}°{:.1}'{dir}", m as f32 / 10.0),
+                None => format!("{deg}°{dir}"),
+            };
+            Some(format!(
+                "{} {}",
+                fmt(lat_deg, lat_min, ns),
+                fmt(lon_deg, lon_min, ew)
+            ))
+        }
+        // placeBearingDistance: not decoded.
+        _ => None,
+    }
+}
+
 /// FANSTime: hours (0..23, 5 bits) + minutes (0..59, 6 bits).
 fn read_time(b: &mut Bits) -> Option<String> {
     let h = b.read(5)?;
@@ -132,6 +182,8 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
         "Time" => Some(vec![read_time(b)?]),
         "Speed" => Some(vec![read_speed(b)?]),
         "SpeedSpeed" => Some(vec![read_speed(b)?, read_speed(b)?]),
+        "Position" => Some(vec![read_position(b)?]),
+        "PositionPosition" => Some(vec![read_position(b)?, read_position(b)?]),
         _ => None,
     }
 }
@@ -300,12 +352,67 @@ mod tests {
 
     #[test]
     fn undecoded_argument_keeps_template() {
-        // dM22Position = "REQUEST DIRECT TO [position]" — position args
-        // are not decoded; the bracketed template must survive.
-        let m = decode(&build(2, None, None, 22, false), true).unwrap();
-        assert_eq!(m.element, "dM22Position");
+        // dM21Frequency = "REQUEST VOICE CONTACT [frequency]" —
+        // frequency args are not decoded; the template must survive.
+        let m = decode(&build(2, None, None, 21, false), true).unwrap();
+        assert_eq!(m.element, "dM21Frequency");
         assert!(m.args.is_empty());
-        assert!(m.text.contains("[position]"), "{}", m.text);
+        assert!(m.text.contains("[frequency]"), "{}", m.text);
+    }
+
+    #[test]
+    fn position_arguments_render() {
+        let mut bits: Vec<u8> = Vec::new();
+        let mut push = |v: u32, n: usize, bits: &mut Vec<u8>| {
+            for k in (0..n).rev() {
+                bits.push(((v >> k) & 1) as u8);
+            }
+        };
+        // dM22Position = "REQUEST DIRECT TO [position]", fixName "TULSA".
+        push(0, 1, &mut bits); // no extra elements
+        push(0, 1, &mut bits); // no msgRef
+        push(0, 1, &mut bits); // no timestamp
+        push(9, 6, &mut bits); // msg id
+        push(22, 8, &mut bits); // dM22Position
+        push(0, 3, &mut bits); // position CHOICE: fixName
+        push(4, 3, &mut bits); // length 5 (offset from 1)
+        for c in b"TULSA" {
+            push(*c as u32, 7, &mut bits);
+        }
+        let mut body = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &v) in bits.iter().enumerate() {
+            body[i / 8] |= v << (7 - i % 8);
+        }
+        let m = decode(&body, true).unwrap();
+        assert_eq!(m.text, "REQUEST DIRECT TO TULSA");
+
+        // Same element with a latitude/longitude: 52°18.5'N 4°46.0'E.
+        let mut bits: Vec<u8> = Vec::new();
+        let mut push = |v: u32, n: usize, bits: &mut Vec<u8>| {
+            for k in (0..n).rev() {
+                bits.push(((v >> k) & 1) as u8);
+            }
+        };
+        push(0, 1, &mut bits);
+        push(0, 1, &mut bits);
+        push(0, 1, &mut bits);
+        push(10, 6, &mut bits);
+        push(22, 8, &mut bits);
+        push(3, 3, &mut bits); // latitudeLongitude
+        push(1, 1, &mut bits); // lat minutes present
+        push(52, 7, &mut bits);
+        push(185, 10, &mut bits);
+        push(0, 1, &mut bits); // N
+        push(1, 1, &mut bits); // lon minutes present
+        push(4, 8, &mut bits);
+        push(460, 10, &mut bits);
+        push(0, 1, &mut bits); // E
+        let mut body = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &v) in bits.iter().enumerate() {
+            body[i / 8] |= v << (7 - i % 8);
+        }
+        let m = decode(&body, true).unwrap();
+        assert_eq!(m.text, "REQUEST DIRECT TO 52°18.5'N 4°46.0'E");
     }
 
     #[test]
