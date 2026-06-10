@@ -76,7 +76,7 @@ pub struct Entity {
     pub icao: Option<String>,
 
     pub gs: Option<String>,
-    pub id: Option<u8>,
+    pub id: Option<u32>,
 
     #[validate(max_length = 8)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,12 +108,15 @@ pub struct PropagationPath {
     pub party: Entity,
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Default, Deserialize, Serialize, Validate)]
 pub struct Indexed {
     #[validate(
         pattern = r"^20[1-4][0-9]-(0[0-9]|1[0-2])-([0-2][0-9]|3[0-1])T([0-1][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3,6}Z$"
     )]
     pub timestamp: String,
+
+    pub dst_airport: Option<String>,
+    pub src_airport: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate)]

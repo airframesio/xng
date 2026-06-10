@@ -21,7 +21,10 @@ impl HfdlModule {
 
     pub fn get_settings(&self) -> Result<Data<RwLock<ModuleSettings>>, io::Error> {
         let Some(ref settings) = self.settings else {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "ModuleSettings is None"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "ModuleSettings is None",
+            ));
         };
         Ok(settings.clone())
     }
@@ -126,7 +129,7 @@ impl HfdlModule {
     }
 
     pub fn nearest_sample_rate(&self, sample_rate: u64) -> Option<u64> {
-        if let Some(idx) = self.sample_rates.iter().position(|&x| sample_rate >= x) {
+        if let Some(idx) = self.sample_rates.iter().position(|&x| x >= sample_rate) {
             Some(self.sample_rates[idx])
         } else {
             None
@@ -139,7 +142,7 @@ impl HfdlModule {
 
         match (bands.first(), bands.last()) {
             (Some(min_freq), Some(max_freq)) => {
-                self.nearest_sample_rate(((max_freq - min_freq) as f64 * 0.8) as u64)
+                self.nearest_sample_rate(((max_freq - min_freq) as f64 * 1.2) as u64 * 1000)
             }
             _ => None,
         }
