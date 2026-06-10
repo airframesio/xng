@@ -5,6 +5,7 @@
 pub mod demod;
 pub mod frame;
 pub mod ira;
+pub mod sbd;
 pub mod modulate;
 
 use chrono::Utc;
@@ -23,6 +24,8 @@ pub struct IridiumChannelDecoder {
     ddc: Option<Ddc>,
     demod: demod::IridiumDemod,
     channel_buf: Vec<Complex<f32>>,
+    sbd: sbd::SbdReassembler,
+    samples_seen: u64,
 }
 
 impl IridiumChannelDecoder {
@@ -36,6 +39,8 @@ impl IridiumChannelDecoder {
             ddc,
             demod: demod::IridiumDemod::new(CHANNEL_RATE),
             channel_buf: Vec::new(),
+            sbd: sbd::SbdReassembler::new(),
+            samples_seen: 0,
         })
     }
 
@@ -48,10 +53,40 @@ impl IridiumChannelDecoder {
             }
             None => input,
         };
+        self.samples_seen += channel.len() as u64;
+        let time = self.samples_seen as f64 / CHANNEL_RATE;
         let mut out = Vec::new();
         for bits in self.demod.process(channel) {
             if let Some(f) = decode_bits(&bits) {
                 out.push(f);
+                continue;
+            }
+            // LCW-bearing duplex frames: DA (SBD data) → reassembly →
+            // SBD transport → ACARS.
+            if let Some((da, raw)) = decode_da_bits(&bits) {
+                out.push(ira::IridiumFrame {
+                    kind: "ida",
+                    details: serde_json::json!({
+                        "cont": da.continuation,
+                        "ctr": da.ctr,
+                        "len": da.len,
+                        "crc_ok": da.crc_ok,
+                        "data_hex": da.data[..da.len.min(20) as usize]
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>(),
+                    }),
+                    acars: None,
+                    raw_bits: raw,
+                });
+                if let Some(msg) = self.sbd.push(&da, time) {
+                    out.push(ira::IridiumFrame {
+                        kind: "sbd",
+                        details: msg.details.clone(),
+                        acars: msg.acars,
+                        raw_bits: Vec::new(),
+                    });
+                }
             }
         }
         out
@@ -97,6 +132,26 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
     }
 }
 
+/// Decode an LCW-bearing burst's DA frame, if it is one (ft == 2).
+pub fn decode_da_bits(bits: &[u8]) -> Option<(frame::DaFrame, Vec<u8>)> {
+    let data = if bits.len() > 24 && bits[..24] == frame::ACCESS_DL[..] {
+        &bits[24..]
+    } else if bits.len() > 24 && bits[..24] == frame::ACCESS_UL[..] {
+        &bits[24..]
+    } else {
+        return None;
+    };
+    if frame::classify(data) != frame::FrameKind::Lw {
+        return None;
+    }
+    let (ft, _, _, _) = frame::decode_lcw(data)?;
+    if ft != 2 {
+        return None;
+    }
+    let da = frame::decode_da(&data[46..])?;
+    Some((da, bits.to_vec()))
+}
+
 /// Convert a decoded frame into the normalized message model.
 pub fn to_message(
     f: &ira::IridiumFrame,
@@ -104,13 +159,28 @@ pub fn to_message(
     level_dbfs: f32,
     source: Provenance,
 ) -> Message {
+    // SBD-carried ACARS surfaces as a first-class ACARS message (like
+    // the HFDL/Aero carriers), so downstream consumers treat it as
+    // ACARS traffic.
+    let (body, crc_ok, errors) = match &f.acars {
+        Some(b) => (
+            MessageBody::Acars(b.core.clone()),
+            b.crc_ok,
+            Some(b.parity_errors),
+        ),
+        None => (
+            MessageBody::Iridium { kind: f.kind.to_string(), details: f.details.clone() },
+            true,
+            None,
+        ),
+    };
     Message {
         mode: Mode::Iridium,
         timestamp: Utc::now(),
         frequency_hz,
         signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
-        decode: DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
-        body: MessageBody::Iridium { kind: f.kind.to_string(), details: f.details.clone() },
+        decode: DecodeQuality { crc_ok, fec_corrected: None, errors },
+        body,
         raw: None,
         source,
     }

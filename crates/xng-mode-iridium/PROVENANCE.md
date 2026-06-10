@@ -33,6 +33,18 @@ least squares over the 12 known UW symbols) developed for the VDL2 and
 HFDL demods in this codebase, plus a decision-directed phase trim
 (α=0.2 as in gr-iridium).
 
+Additional ports from iridium-toolkit (BSD-2) for the SBD chain:
+the 46-bit LCW permutation + BCH components (polys 29/465/41, the
+transmitted-bit-short lcw2), the DA frame block mapping (124-bit
+chunks → 2-way deinterleave → BCH(31,20) poly 3545 blocks in
+[b4,b2,b3,b1] order), DA field layout + CRC-CCITT placement, the IDA
+fragment reassembly rules (counter continuity, expiry) and the SBD
+transport framing (0x0600/0x76xx types, prehdr variants, 0x10
+len/count header, multi-message merge) from
+iridiumtk/reassembler/{ida,sbd}.py. The ACARS payload is a standard
+SOH-prefixed parity ACARS block, parsed by xng-acars and emitted as a
+first-class ACARS message.
+
 ## Validation
 
 - **Oracle-validated against iridium-toolkit**: a generated ring-alert
@@ -54,5 +66,9 @@ HFDL demods in this codebase, plus a decision-directed phase trim
   CI fixture (tests/data/, 32 KB) guarded by tests/crossval.rs. With
   the toolkit oracle covering layer 2, both layers are validated
   against their reference implementations.
+- **DA layer also oracle-validated**: a generated ft==2 burst decodes
+  in bitsparser as `IDA: cont=0 ctr=000 len=20 [..] CRC:OK` with every
+  byte identical to our decode (LCW encode, DA block mapping,
+  BCH(31,20), CRC all agree); vector vendored in tests.
 - Off-air validation pending an L-band capture of the ring-alert
   channel (1626.270833 MHz; bursts every few seconds worldwide).

@@ -174,6 +174,8 @@ pub enum FrameKind {
     Bc,
     /// Messaging header seen (payload not parsed in v1).
     Ms,
+    /// LCW-bearing duplex frame (DA/voice/IP/sync by frame type).
+    Lw,
     Unknown,
 }
 
@@ -189,6 +191,19 @@ pub fn classify(data: &[u8]) -> FrameKind {
             && ndivide(RINGALERT_BCH_POLY, &b2[..31]) == 0
         {
             return FrameKind::Bc;
+        }
+    }
+    if data.len() > 64 {
+        // LCW: zero-syndrome check on its three BCH components.
+        let lcw: Vec<u8> = LCW_TABLE.iter().map(|&i| data[i - 1]).collect();
+        if ndivide(HDR_POLY, &lcw[..7]) == 0 && ndivide(LCW3_POLY, &lcw[20..]) == 0 {
+            let mut b2a: Vec<u8> = lcw[7..20].to_vec();
+            b2a.push(0);
+            let mut b2b: Vec<u8> = lcw[7..20].to_vec();
+            b2b.push(1);
+            if ndivide(LCW2_POLY, &b2a) == 0 || ndivide(LCW2_POLY, &b2b) == 0 {
+                return FrameKind::Lw;
+            }
         }
     }
     if data.len() >= 96 {
@@ -220,6 +235,18 @@ pub fn ra_blocks(data: &[u8]) -> Vec<Vec<u8>> {
 }
 
 // ── transmit side (loopback/testing) ────────────────────────────────────
+
+/// BCH-encode data bits with `check` check bits (no parity bit).
+pub fn bch_encode_raw(poly: u32, data: &[u8], check: usize) -> Vec<u8> {
+    let mut padded: Vec<u8> = data.to_vec();
+    padded.extend(std::iter::repeat(0).take(check));
+    let rem = ndivide(poly, &padded);
+    let mut block: Vec<u8> = data.to_vec();
+    for k in (0..check).rev() {
+        block.push(((rem >> k) & 1) as u8);
+    }
+    block
+}
 
 /// BCH-encode 21 data bits into a 32-bit block (21 data + 10 check +
 /// even parity).
@@ -319,4 +346,203 @@ mod tests {
         assert_eq!(bch_repair(RINGALERT_BCH_POLY, &mut b31), Some(2));
         assert_eq!(&b31[..21], &data[..]);
     }
+}
+
+// ── LCW (link control word) + DA frames (iridium-toolkit, BSD-2) ────────
+
+/// LCW deinterleave permutation (1-based bit indices into the 46-bit
+/// post-access stream; toolkit `de_interleave_lcw`).
+const LCW_TABLE: [usize; 46] = [
+    40, 39, 36, 35, 32, 31, 28, 27, 24, 23, 20, 19, 16, 15, 12, 11, 8, 7, 4, 3,
+    41, 38, 37, 34, 33, 30, 29, 26, 25, 22, 21, 18, 17, 14, 13, 10, 9, 6, 5, 2,
+    1, 46, 45, 44, 43, 42,
+];
+
+pub const LCW2_POLY: u32 = 465;
+pub const LCW3_POLY: u32 = 41;
+pub const ACCH_BCH_POLY: u32 = 3545;
+
+/// Decode the 46-bit LCW: returns (frame type, lcw2 data, lcw3 data,
+/// corrected bits) or None when any component is uncorrectable.
+pub fn decode_lcw(bits: &[u8]) -> Option<(u8, u32, u32, u32)> {
+    if bits.len() < 46 {
+        return None;
+    }
+    let lcw: Vec<u8> = LCW_TABLE.iter().map(|&i| bits[i - 1]).collect();
+    let (o1, o2, o3) = (&lcw[..7], &lcw[7..20], &lcw[20..]);
+
+    let mut b1 = o1.to_vec();
+    let e1 = bch_repair(HDR_POLY, &mut b1)?;
+    // lcw2 is transmitted with one bit missing; try both completions.
+    let mut b2a: Vec<u8> = o2.to_vec();
+    b2a.push(0);
+    let r2a = bch_repair(LCW2_POLY, &mut b2a);
+    let mut b2b: Vec<u8> = o2.to_vec();
+    b2b.push(1);
+    let r2b = bch_repair(LCW2_POLY, &mut b2b);
+    let (e2, b2) = match (r2a, r2b) {
+        (Some(a), Some(b)) if b < a => (b, b2b),
+        (Some(a), _) => (a, b2a),
+        (None, Some(b)) => (b, b2b),
+        (None, None) => return None,
+    };
+    let mut b3 = o3.to_vec();
+    let e3 = bch_repair(LCW3_POLY, &mut b3)?;
+
+    let ft = b1[..3].iter().fold(0u8, |v, &b| (v << 1) | b);
+    let lcw2 = b2[..6].iter().fold(0u32, |v, &b| (v << 1) | b as u32);
+    let lcw3 = b3[..21].iter().fold(0u32, |v, &b| (v << 1) | b as u32);
+    Some((ft, lcw2, lcw3, e1 + e2 + e3))
+}
+
+/// A decoded DA (SBD data) frame.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DaFrame {
+    /// More fragments follow.
+    pub continuation: bool,
+    /// 3-bit fragment counter.
+    pub ctr: u8,
+    /// Used payload bytes (≤ 20).
+    pub len: u8,
+    /// The 20 payload bytes.
+    pub data: [u8; 20],
+    pub crc_ok: bool,
+    pub bch_corrected: u32,
+}
+
+/// Decode the post-LCW payload of an ft==2 frame (312 bits) into a DA
+/// frame: 124-bit chunks → 2-way deinterleave → 31-bit BCH blocks in
+/// order [b4,b2,b3,b1] (final 64-bit chunk: two blocks, first bit
+/// dropped) → BCH(31,21) poly 3545 → 200 data bits.
+pub fn decode_da(data: &[u8]) -> Option<DaFrame> {
+    if data.len() < 312 {
+        return None;
+    }
+    let data = &data[..312];
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    for chunk in data[..248].chunks_exact(124) {
+        let (b1, b2) = de_interleave2(chunk);
+        let all: Vec<u8> = b1.iter().chain(&b2).copied().collect();
+        let q: Vec<Vec<u8>> = all.chunks_exact(31).map(|c| c.to_vec()).collect();
+        blocks.push(q[3].clone());
+        blocks.push(q[1].clone());
+        blocks.push(q[2].clone());
+        blocks.push(q[0].clone());
+    }
+    let (b1, b2) = de_interleave2(&data[248..312]);
+    blocks.push(b2[1..].to_vec());
+    blocks.push(b1[1..].to_vec());
+
+    let mut bits = Vec::with_capacity(200);
+    let mut fixed = 0u32;
+    for block in &mut blocks {
+        let errs = bch_repair(ACCH_BCH_POLY, block)?;
+        if errs > 0 {
+            fixed += 1;
+        }
+        bits.extend_from_slice(&block[..20]);
+    }
+
+    let field = |r: std::ops::Range<usize>| bits[r].iter().fold(0u32, |v, &b| (v << 1) | b as u32);
+    let continuation = bits[3] == 1;
+    let ctr = field(5..8) as u8;
+    let len = field(11..16) as u8;
+    if field(17..20) != 0 || field(196..200) != 0 {
+        return None;
+    }
+    let mut payload = [0u8; 20];
+    for (i, byte) in bits[20..180].chunks_exact(8).enumerate() {
+        payload[i] = byte.iter().fold(0u8, |v, &b| (v << 1) | b);
+    }
+    // CRC-CCITT-FALSE over bits[0..20] + 12 zero bits + bits[20..196];
+    // result must be zero.
+    let mut crc_stream: Vec<u8> = bits[..20].to_vec();
+    crc_stream.extend(std::iter::repeat(0).take(12));
+    crc_stream.extend_from_slice(&bits[20..196]);
+    let crc_bytes: Vec<u8> = crc_stream
+        .chunks_exact(8)
+        .map(|c| c.iter().fold(0u8, |v, &b| (v << 1) | b))
+        .collect();
+    let crc = crc::Crc::<u16>::new(&crc::CRC_16_IBM_3740);
+    let crc_ok = len > 0 && crc.checksum(&crc_bytes) == 0;
+
+    Some(DaFrame { continuation, ctr, len, data: payload, crc_ok, bch_corrected: fixed })
+}
+
+/// TX (loopback/testing): inverse LCW interleave — place the three
+/// BCH-encoded LCW parts back into transmitted bit positions. lcw2 is
+/// transmitted with its final bit dropped.
+pub fn encode_lcw(ft: u8, lcw2_data: u32, lcw3_data: u32) -> Vec<u8> {
+    let ft_bits: Vec<u8> = (0..3).rev().map(|k| (ft >> k) & 1).collect();
+    let p1 = bch_encode_raw(HDR_POLY, &ft_bits, 4);
+    let d2: Vec<u8> = (0..6).rev().map(|k| ((lcw2_data >> k) & 1) as u8).collect();
+    let mut p2 = bch_encode_raw(LCW2_POLY, &d2, 8);
+    p2.pop(); // the missing transmitted bit
+    let d3: Vec<u8> = (0..21).rev().map(|k| ((lcw3_data >> k) & 1) as u8).collect();
+    let p3 = bch_encode_raw(LCW3_POLY, &d3, 5);
+    let lcw: Vec<u8> = p1.into_iter().chain(p2).chain(p3).collect();
+    let mut out = vec![0u8; 46];
+    for (k, &b) in lcw.iter().enumerate() {
+        out[LCW_TABLE[k] - 1] = b;
+    }
+    out
+}
+
+/// TX: build the 312 transmitted bits of a DA frame from its 200 data
+/// bits (inverse of `decode_da`'s block mapping).
+pub fn encode_da_payload(bits200: &[u8]) -> Vec<u8> {
+    debug_assert_eq!(bits200.len(), 200);
+    let blocks: Vec<Vec<u8>> = bits200
+        .chunks_exact(20)
+        .map(|d| bch_encode_raw(ACCH_BCH_POLY, d, 11))
+        .collect();
+    let mut out = Vec::with_capacity(312);
+    // Chunks of 4 blocks → de_interleave order [b4,b2,b3,b1] reversed:
+    // stream blocks q0..q3 = [blk3, blk1, blk2, blk0] of each group.
+    for grp in blocks[..8].chunks_exact(4) {
+        let q: Vec<&Vec<u8>> = vec![&grp[3], &grp[1], &grp[2], &grp[0]];
+        let all: Vec<u8> = q.into_iter().flatten().copied().collect();
+        out.extend(interleave2(&all[..62], &all[62..]));
+    }
+    // Final pair: [b2[1:], b1[1:]] with a dropped leading bit each.
+    let mut b1 = vec![0u8];
+    b1.extend_from_slice(&blocks[9]);
+    let mut b2 = vec![0u8];
+    b2.extend_from_slice(&blocks[8]);
+    out.extend(interleave2(&b1, &b2));
+    out
+}
+
+/// TX: build a DA frame's 200 data bits from fields + payload, with a
+/// valid CRC.
+pub fn build_da_bits(cont: bool, ctr: u8, len: u8, payload: &[u8; 20]) -> Vec<u8> {
+    let mut bits = vec![0u8; 200];
+    bits[3] = cont as u8;
+    for k in 0..3 {
+        bits[5 + k] = (ctr >> (2 - k)) & 1;
+    }
+    for k in 0..5 {
+        bits[11 + k] = (len >> (4 - k)) & 1;
+    }
+    for (i, &b) in payload.iter().enumerate() {
+        for k in 0..8 {
+            bits[20 + i * 8 + k] = (b >> (7 - k)) & 1;
+        }
+    }
+    // CRC over bits[0..20] + 12 zeros + bits[20..180]; stored at 180..196
+    // such that the check stream (with the CRC at 180..196 included via
+    // bits[20..196]) divides to zero.
+    let crc = crc::Crc::<u16>::new(&crc::CRC_16_IBM_3740);
+    let mut stream: Vec<u8> = bits[..20].to_vec();
+    stream.extend(std::iter::repeat(0).take(12));
+    stream.extend_from_slice(&bits[20..180]);
+    let bytes: Vec<u8> = stream
+        .chunks_exact(8)
+        .map(|c| c.iter().fold(0u8, |v, &b| (v << 1) | b))
+        .collect();
+    let c = crc.checksum(&bytes);
+    for k in 0..16 {
+        bits[180 + k] = ((c >> (15 - k)) & 1) as u8;
+    }
+    bits
 }

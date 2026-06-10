@@ -8,6 +8,9 @@ use serde_json::json;
 pub struct IridiumFrame {
     pub kind: &'static str,
     pub details: serde_json::Value,
+    /// ACARS carried over SBD, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acars: Option<xng_acars::block::AcarsBlock>,
     #[serde(skip_serializing)]
     pub raw_bits: Vec<u8>,
 }
@@ -62,6 +65,7 @@ pub fn parse_ra(data: &[u8], fixed: u32, raw_bits: &[u8]) -> Option<IridiumFrame
 
     Some(IridiumFrame {
         kind: "ring-alert",
+        acars: None,
         details: json!({
             "sat": sat,
             "beam": beam,
@@ -92,6 +96,7 @@ pub fn parse_bc(bc_type: u32, data: &[u8], fixed: u32, raw_bits: &[u8]) -> Iridi
         .collect();
     IridiumFrame {
         kind: "broadcast",
+        acars: None,
         details: json!({
             "bc_type": bc_type,
             "data_hex": hex,
