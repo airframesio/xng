@@ -29,8 +29,15 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     mmsi.map_or("?".into(), |m| m.to_string()),
                     nmea.first().map(String::as_str).unwrap_or("")
                 ),
-                MessageBody::ModeS { df, icao } => {
-                    format!("MODE-S df={} icao={}", df, icao.as_deref().unwrap_or("-"))
+                MessageBody::ModeS { df, icao, callsign, altitude_ft } => {
+                    let mut s = format!("MODE-S df={} icao={}", df, icao.as_deref().unwrap_or("-"));
+                    if let Some(c) = callsign {
+                        s.push_str(&format!(" ident={c}"));
+                    }
+                    if let Some(a) = altitude_ft {
+                        s.push_str(&format!(" alt={a}ft"));
+                    }
+                    s
                 }
                 MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
             };

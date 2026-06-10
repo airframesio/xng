@@ -1,8 +1,8 @@
 //! Frequency argument parsing.
 
 /// Parse a frequency string into Hz. Accepts `131550000`, `131.55M`,
-/// `131.55MHz`, `136975K`, or a bare number `< 1000` treated as MHz
-/// (the common way ACARS channels are written, e.g. `131.550`).
+/// `131.55MHz`, `136975K`, or a bare number `< 10000` treated as MHz
+/// (the common way channels are written, e.g. `131.550` or `1090`).
 pub fn parse_hz(s: &str) -> anyhow::Result<u64> {
     let t = s.trim().to_ascii_lowercase();
     let (num, mult) = if let Some(p) = t.strip_suffix("mhz").or_else(|| t.strip_suffix('m')) {
@@ -17,7 +17,7 @@ pub fn parse_hz(s: &str) -> anyhow::Result<u64> {
     let v: f64 = num.trim().parse().map_err(|_| anyhow::anyhow!("invalid frequency: {s}"))?;
     let hz = if mult > 0.0 {
         v * mult
-    } else if v < 1000.0 {
+    } else if v < 10_000.0 {
         v * 1e6
     } else {
         v
@@ -36,6 +36,7 @@ mod tests {
         assert_eq!(parse_hz("131.55M").unwrap(), 131_550_000);
         assert_eq!(parse_hz("131.55MHz").unwrap(), 131_550_000);
         assert_eq!(parse_hz("131.550").unwrap(), 131_550_000);
+        assert_eq!(parse_hz("1090").unwrap(), 1_090_000_000);
         assert_eq!(parse_hz("136975k").unwrap(), 136_975_000);
         assert!(parse_hz("bogus").is_err());
     }

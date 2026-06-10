@@ -17,10 +17,9 @@ roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
 xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
 still buildable standalone.
 
-## Current state (M2 in progress — ACARS + AIS native)
+## Current state (M2 complete — ACARS, AIS, and ADS-B native)
 
-Two native decode cores are in, both clean-room and both decoding any
-number of channels from one SDR capture:
+Three native decode cores are in, all clean-room:
 
 - **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
   sync/parity/CRC deframing, parity-guided single-bit error correction.
@@ -29,6 +28,13 @@ number of channels from one SDR capture:
 - **AIS** (ITU-R M.1371): GMSK demod with carrier-offset tracking, HDLC
   deframing with destuffing, CRC-16/X-25, NMEA AIVDM output — verified
   against the canonical published AIVDM test vector.
+- **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
+  CRC-24 validation with an ICAO cache for address-overlaid parity,
+  extended-squitter ident/altitude decode — verified against published
+  Mode S frames; zero false positives on off-air noise.
+
+ACARS and AIS decode any number of channels from one SDR capture;
+Mode S consumes the whole capture at 1090 MHz.
 
 ```bash
 # Live: two ACARS channels from one RTL-SDR capture, feeding Airframes
@@ -42,6 +48,9 @@ xng decode capture.cf32 -r 2400000 -c 131.500M --channels 131.550,131.425
 # AIS: both channels from one capture
 xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
     --channels 161.975,162.025
+
+# ADS-B / Mode S
+xng listen --sdr driver=rtlsdr --mode adsb -r 2000000 -c 1090.000M --channels 1090
 
 # Generate a synthetic test capture (no hardware needed)
 cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32
@@ -57,8 +66,9 @@ feed.airframes.io:5550). The asf-2.0 gRPC/QUIC output lands in M3.
 
 Workspace crates so far: `xng-types` (normalized message model),
 `xng-dsp` (PFB channelizer, DDC, FIR/NCO, CRCs), `xng-sdr` (SoapySDR +
-IQ-file sources), `xng-mode-acars` and `xng-mode-ais` (decode cores, each
-with a spec-faithful modulator for loopback tests). Remaining modes land
+IQ-file sources), `xng-mode-acars`, `xng-mode-ais`, and
+`xng-mode-adsb` (decode cores, each with a spec-faithful modulator for
+loopback tests). Remaining modes land
 in milestone order: see the
 [roadmap](docs/ARCHITECTURE.md#5-roadmap).
 

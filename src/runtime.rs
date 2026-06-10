@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use xng_mode_acars::AcarsChannelDecoder;
+use xng_mode_adsb::AdsbDecoder;
 use xng_mode_ais::AisChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, Mode, Provenance, SdrInfo, StationIdentity};
@@ -37,6 +38,7 @@ const READ_CHUNK: usize = 65_536;
 enum ModeChannel {
     Acars(AcarsChannelDecoder),
     Ais(AisChannelDecoder),
+    Adsb(AdsbDecoder),
 }
 
 impl ModeChannel {
@@ -44,6 +46,12 @@ impl ModeChannel {
         match mode {
             Mode::AcarsPoa => Ok(Self::Acars(AcarsChannelDecoder::new(sample_rate, offset)?)),
             Mode::Ais => Ok(Self::Ais(AisChannelDecoder::new(sample_rate, offset, freq)?)),
+            Mode::Adsb => {
+                if offset.abs() > 1e-6 {
+                    return Err("Mode S uses the whole capture: tune -c to 1090.000M and pass --channels 1090".into());
+                }
+                Ok(Self::Adsb(AdsbDecoder::new(sample_rate)?))
+            }
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -51,6 +59,7 @@ impl ModeChannel {
     fn passband_hz(mode: Mode) -> f64 {
         match mode {
             Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
+            Mode::Adsb => 0.0, // wideband: offset must be 0, no DDC
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -59,6 +68,7 @@ impl ModeChannel {
         match self {
             Self::Acars(_) => xng_mode_acars::CHANNEL_RATE,
             Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
+            Self::Adsb(_) => 2_000_000.0,
         }
     }
 
@@ -86,6 +96,16 @@ impl ModeChannel {
                     .map(|(f, nmea)| xng_mode_ais::to_message(&f, nmea, freq, level, prov.clone()))
                     .collect();
                 // The AIS deframer only surfaces CRC-valid frames.
+                (msgs, seen, seen)
+            }
+            Self::Adsb(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_adsb::to_message(f, freq, prov.clone()))
+                    .collect();
+                // The validator only surfaces parity-valid frames.
                 (msgs, seen, seen)
             }
         }

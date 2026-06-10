@@ -77,8 +77,15 @@ pub enum MessageBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         mmsi: Option<u32>,
     },
-    /// Mode S / ADS-B frame summary (extended later).
-    ModeS { df: u8, icao: Option<String> },
+    /// Mode S / ADS-B frame summary (positions/BDS depth land later).
+    ModeS {
+        df: u8,
+        icao: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        callsign: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        altitude_ft: Option<i32>,
+    },
     /// A frame decoded at link layer but with no (or not-yet-implemented)
     /// application-layer interpretation.
     Undecoded,
