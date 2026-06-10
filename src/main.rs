@@ -5,6 +5,7 @@
 
 mod bus;
 mod commands;
+mod tui;
 mod freq;
 mod outputs;
 mod runtime;
@@ -165,6 +166,23 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         fft_size: usize,
     },
+    /// Interactive TUI: live decode with message browser, spectrum, stats
+    Tui {
+        /// SoapySDR device args (live mode)
+        #[arg(long, default_value = "")]
+        sdr: String,
+        /// Tuner gain in dB (hardware AGC when omitted)
+        #[arg(short, long)]
+        gain: Option<f64>,
+        /// Replay a recorded IQ file instead of live SDR input
+        #[arg(long)]
+        file: Option<PathBuf>,
+        /// Sample format for --file (guessed from extension if omitted)
+        #[arg(short, long)]
+        format: Option<String>,
+        #[command(flatten)]
+        tune: TuneOpts,
+    },
     /// Run a reference asf-2.0 ingest server (gRPC and/or QUIC)
     Ingest {
         /// gRPC listen address (e.g. 0.0.0.0:6001)
@@ -250,11 +268,64 @@ fn main() -> anyhow::Result<()> {
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
         }
+        Command::Tui { sdr, gain, file, format, tune } => {
+            let (mode, center_hz, channels_hz) = parse_tune(&tune)?;
+            let source: Box<dyn xng_sdr::IqSource> = match file {
+                Some(path) => {
+                    let fmt = match format.as_deref() {
+                        Some(f) => f.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+                        None => IqFormat::from_extension(&path).ok_or_else(|| {
+                            anyhow::anyhow!("cannot guess IQ format; pass --format")
+                        })?,
+                    };
+                    Box::new(FileIqSource::open(&path, fmt, tune.sample_rate, center_hz)?)
+                }
+                None => open_sdr(&sdr, tune.sample_rate, center_hz, gain)?,
+            };
+            tui::run(
+                source,
+                runtime::SessionConfig {
+                    mode,
+                    center_hz,
+                    channels_hz,
+                    station_ident: "XNG-TUI".into(),
+                    sdr: None,
+                    outputs: runtime::OutputConfig {
+                        console: ConsoleFormat::Pretty,
+                        jsonl: None,
+                        udp: vec![],
+                        asf2_grpc: None,
+                        asf2_quic: None,
+                        asf2_quic_trust: outputs::asf2_quic::TrustMode::SystemRoots,
+                    },
+                },
+            )
+        }
         Command::Ingest { grpc, quic, quic_cert_out } => {
             commands::ingest::run(grpc, quic, quic_cert_out.as_deref())
         }
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
     }
+}
+
+#[cfg(feature = "soapy")]
+fn open_sdr(
+    sdr: &str,
+    sample_rate: f64,
+    center_hz: u64,
+    gain: Option<f64>,
+) -> anyhow::Result<Box<dyn xng_sdr::IqSource>> {
+    Ok(Box::new(xng_sdr::soapy::SoapyIqSource::open(sdr, sample_rate, center_hz, gain)?))
+}
+
+#[cfg(not(feature = "soapy"))]
+fn open_sdr(
+    _sdr: &str,
+    _sample_rate: f64,
+    _center_hz: u64,
+    _gain: Option<f64>,
+) -> anyhow::Result<Box<dyn xng_sdr::IqSource>> {
+    anyhow::bail!("built without SDR support; use --file or rebuild with --features soapy")
 }
 
 #[cfg(feature = "soapy")]

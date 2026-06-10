@@ -44,8 +44,34 @@ pub struct SessionConfig {
 
 const READ_CHUNK: usize = 65_536;
 
+/// Live session state shared with the TUI.
+pub struct LiveState {
+    /// Per channel: (freq_hz, frames, crc_ok, level_dbfs).
+    pub stats: std::sync::Mutex<Vec<(u64, u64, u64, f32)>>,
+    pub spectrum: std::sync::Mutex<Option<SpectrumFrame>>,
+    pub samples: std::sync::atomic::AtomicU64,
+}
+
+pub struct SpectrumFrame {
+    pub bins_db: Vec<f32>,
+    #[allow(dead_code)]
+    pub center_hz: u64,
+    #[allow(dead_code)]
+    pub span_hz: f64,
+}
+
+impl LiveState {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stats: std::sync::Mutex::new(Vec::new()),
+            spectrum: std::sync::Mutex::new(None),
+            samples: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+}
+
 /// One mode-specific per-channel decoder.
-enum ModeChannel {
+pub(crate) enum ModeChannel {
     Acars(AcarsChannelDecoder),
     Ais(AisChannelDecoder),
     Adsb(AdsbDecoder),
@@ -97,6 +123,19 @@ impl ModeChannel {
             Self::StdC(_) => xng_mode_stdc::CHANNEL_RATE,
             Self::Hfdl(_) => xng_mode_hfdl::CHANNEL_RATE,
             Self::Adsb(_) => 2_000_000.0,
+        }
+    }
+
+    fn level(&self) -> f32 {
+        match self {
+            Self::Acars(d) => d.level_dbfs(),
+            Self::Ais(d) => d.level_dbfs(),
+            Self::Adsb(d) => d.level_dbfs(),
+            Self::Vdl2(d) => d.level_dbfs(),
+            Self::Aero(d) => d.level_dbfs(),
+            Self::AeroBurst(d) => d.level_dbfs(),
+            Self::StdC(d) => d.level_dbfs(),
+            Self::Hfdl(d) => d.level_dbfs(),
         }
     }
 
@@ -286,7 +325,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         let decode = tokio::task::spawn_blocking({
             let bus = bus.clone();
             let stop = stop.clone();
-            move || decode_loop(&mut *source, decoders, station, cfg.sdr, bus, stop)
+            move || decode_loop(&mut *source, decoders, station, cfg.sdr, bus, stop, None)
         });
         let stats = decode.await??;
 
@@ -309,14 +348,18 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
     })
 }
 
-fn decode_loop(
+pub(crate) fn decode_loop(
     source: &mut dyn IqSource,
     mut decoders: Vec<(u64, ModeChannel)>,
     station: StationIdentity,
     sdr: Option<SdrInfo>,
     bus: MessageBus,
     stop: Arc<AtomicBool>,
+    live: Option<(Arc<LiveState>, u64, f64)>,
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
+    use std::sync::atomic::Ordering as AtomOrd;
+    let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
+    let mut chunk_count: u64 = 0;
     let mut buf = vec![Complex::new(0.0f32, 0.0f32); READ_CHUNK];
     let mut stats: Vec<(u64, u64, u64)> = decoders.iter().map(|(f, _)| (*f, 0, 0)).collect();
     let mut consecutive_errors: u32 = 0;
@@ -339,6 +382,40 @@ fn decode_loop(
                 continue;
             }
         };
+        if let Some((state, center_hz, sample_rate)) = &live {
+            state.samples.fetch_add(n as u64, AtomOrd::Relaxed);
+            chunk_count += 1;
+            if chunk_count % 4 == 1 && n >= 512 {
+                let fft = spectrum_fft
+                    .get_or_insert_with(|| {
+                        rustfft::FftPlanner::new().plan_fft_forward(512)
+                    })
+                    .clone();
+                let mut fbuf: Vec<Complex<f32>> = buf[..512]
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &x)| {
+                        let w = 0.54
+                            - 0.46
+                                * (std::f32::consts::TAU * k as f32 / 511.0).cos();
+                        x * w
+                    })
+                    .collect();
+                fft.process(&mut fbuf);
+                // FFT-shift and convert to dB.
+                let bins_db: Vec<f32> = (0..512)
+                    .map(|k| {
+                        let idx = (k + 256) % 512;
+                        10.0 * (fbuf[idx].norm_sqr() / (512.0 * 512.0)).max(1e-12).log10()
+                    })
+                    .collect();
+                *state.spectrum.lock().unwrap() = Some(SpectrumFrame {
+                    bins_db,
+                    center_hz: *center_hz,
+                    span_hz: *sample_rate,
+                });
+            }
+        }
         for (i, (freq, dec)) in decoders.iter_mut().enumerate() {
             let prov = Provenance {
                 station: station.clone(),
@@ -356,7 +433,45 @@ fn decode_loop(
             for msg in msgs {
                 bus.publish(msg);
             }
+            if let Some((state, _, _)) = &live {
+                let mut ls = state.stats.lock().unwrap();
+                if ls.len() <= i {
+                    ls.resize(decoders_len_hint(i), (0, 0, 0, 0.0));
+                }
+                ls[i] = (stats[i].0, stats[i].1, stats[i].2, dec_level_after(dec));
+            }
         }
     }
     Ok(stats)
+}
+
+fn decoders_len_hint(i: usize) -> usize {
+    i + 1
+}
+
+fn dec_level_after(dec: &ModeChannel) -> f32 {
+    dec.level()
+}
+
+/// Build the per-channel decoders for a session config (shared between
+/// the console runtime and the TUI).
+pub(crate) fn build_decoders(
+    sample_rate: f64,
+    capture_center: u64,
+    cfg: &SessionConfig,
+) -> anyhow::Result<Vec<(u64, ModeChannel)>> {
+    let mut decoders = Vec::new();
+    for &freq in &cfg.channels_hz {
+        let offset = freq as f64 - capture_center as f64;
+        if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+            anyhow::bail!(
+                "channel {:.3} MHz is outside the capture",
+                freq as f64 / 1e6
+            );
+        }
+        let dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
+            .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
+        decoders.push((freq, dec));
+    }
+    Ok(decoders)
 }

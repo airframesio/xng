@@ -41,6 +41,7 @@ prost = "0.13"
 tonic = "0.12"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+ratatui = "0.30"
 rcgen = "0.13"
 rustls-pemfile = "2"
 tokio-stream = "0.1"
@@ -91,6 +92,7 @@ prost.workspace = true
 tonic.workspace = true
 quinn.workspace = true
 rustls.workspace = true
+ratatui.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true
 tokio-stream.workspace = true

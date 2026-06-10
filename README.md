@@ -105,6 +105,15 @@ xng iq-info capture.cf32 -r 2000000 -c 131500000   # power, spectral peaks
 xng selftest                    # end-to-end pipeline self-test
 ```
 
+**Interactive TUI** (`xng tui`): live message browser with JSON detail
+pane, per-channel statistics, spectrum with channel markers, and a
+waterfall — over a live SDR or a replayed IQ file:
+
+```bash
+xng tui --sdr driver=rtlsdr -r 2400000 -c 131.500M --channels 131.550,131.125
+xng tui --file capture.cf32 -r 2400000 -c 131.500M --channels 131.550
+```
+
 Outputs: pretty console, raw JSON, JSONL files, acarsdec-compatible JSON
 over UDP (`--udp host:port`, `--feed-airframes` → feed.airframes.io:5550),
 and the new **asf-2.0** protocol ([docs/ASF2.md](docs/ASF2.md)): one
