@@ -2,7 +2,7 @@
 //! JAERO `burstmskdemodulator.cpp` + `aerol.h` RTChannelDeleaveFECScram).
 //!
 //! Burst layout: unmodulated carrier section → alternating 1010 section →
-//! differentially-encoded data starting with the UW (within ~250 bits).
+//! data starting with the UW (within ~250 bits).
 //! After the UW: one 64×5 interleaver section (→ 20 decoded bytes), then
 //! 64×3 sections (→ 12 bytes each). The first section holds either one
 //! 19-byte R-channel SU or a 6-byte T-burst header + the first 12-byte
@@ -66,7 +66,7 @@ impl BurstPacketizer {
 
     /// Process one demodulated burst bit stream (soft, hard).
     pub fn process(&mut self, bits: &[(f32, u8)]) -> Option<BurstResult> {
-        // UW hunt (the differential demod has no polarity ambiguity).
+        // UW hunt (the discriminator demod has no polarity ambiguity).
         let mut shift: u32 = 0;
         let mut uw_end = None;
         for (i, &(_, hard)) in bits.iter().enumerate().take(UW_SEARCH_BITS + 32) {
