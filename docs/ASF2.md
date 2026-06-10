@@ -1,6 +1,9 @@
 # asf-2.0 — Airframes Standard Format, version 2
 
-**Status:** draft, implemented by xng (client + reference ingest) as of M3.
+**Status:** implemented by xng (client + reference ingest); schema
+`proto/asf2.proto` is canonical. Per-mode bodies as of v0.9.0: ACARS,
+AIS, Mode S, STD-C, HFDL, Iridium, VDL2 (AVLC link events / XID), plus
+`undecoded` with raw bytes always preserved.
 
 One protobuf schema (`proto/asf2.proto`), two transports. Replaces the
 port-per-decoder JSON zoo with a single multiplexed, typed, versioned feed
