@@ -21,6 +21,10 @@ pub struct OutputConfig {
     pub jsonl: Option<PathBuf>,
     /// acarsdec-JSON UDP targets (host:port).
     pub udp: Vec<String>,
+    /// asf-2.0 gRPC ingest URL.
+    pub asf2_grpc: Option<String>,
+    /// asf-2.0 QUIC ingest host:port.
+    pub asf2_quic: Option<String>,
 }
 
 pub struct SessionConfig {
@@ -163,6 +167,16 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         for target in cfg.outputs.udp.clone() {
             let rx = bus.subscribe();
             output_tasks.push(tokio::spawn(acarsdec_json::run(rx, target)));
+        }
+        if let Some(url) = cfg.outputs.asf2_grpc.clone() {
+            let rx = bus.subscribe();
+            let (id, ident) = (station.id.to_string(), station.ident.clone());
+            output_tasks.push(tokio::spawn(crate::outputs::asf2_grpc::run(rx, url, id, ident)));
+        }
+        if let Some(target) = cfg.outputs.asf2_quic.clone() {
+            let rx = bus.subscribe();
+            let (id, ident) = (station.id.to_string(), station.ident.clone());
+            output_tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(rx, target, id, ident)));
         }
 
         // Ctrl-C → graceful stop.

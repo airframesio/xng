@@ -1,0 +1,19 @@
+[package]
+name = "xng-proto"
+description = "asf-2.0 protobuf schema (prost/tonic codegen) and conversions from the xng message model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+prost = "0.13"
+tonic = "0.12"
+xng-types.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+
+[build-dependencies]
+tonic-build = "0.12"

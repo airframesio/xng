@@ -62,6 +62,13 @@ struct OutputOpts {
     /// Station ident (e.g. XX-KSEA-ACARS1)
     #[arg(long)]
     station_id: Option<String>,
+    /// Stream asf-2.0 over gRPC to this ingest URL (e.g. http://127.0.0.1:6001)
+    #[arg(long)]
+    asf2_grpc: Option<String>,
+    /// Stream asf-2.0 over QUIC to host:port (dev mode: certificate
+    /// verification is skipped)
+    #[arg(long)]
+    asf2_quic: Option<String>,
 }
 
 impl OutputOpts {
@@ -80,6 +87,8 @@ impl OutputOpts {
                 console: if self.json { ConsoleFormat::Json } else { ConsoleFormat::Pretty },
                 jsonl: self.jsonl.clone(),
                 udp,
+                asf2_grpc: self.asf2_grpc.clone(),
+                asf2_quic: self.asf2_quic.clone(),
             },
             ident,
         ))
@@ -135,6 +144,16 @@ enum Command {
         /// FFT size for the power spectrum
         #[arg(long, default_value_t = 4096)]
         fft_size: usize,
+    },
+    /// Run a reference asf-2.0 ingest server (gRPC and/or QUIC)
+    Ingest {
+        /// gRPC listen address (e.g. 0.0.0.0:6001)
+        #[arg(long)]
+        grpc: Option<String>,
+        /// QUIC listen address (e.g. 0.0.0.0:6011); uses a self-signed
+        /// dev certificate
+        #[arg(long)]
+        quic: Option<String>,
     },
     /// Run the built-in pipeline self-test (bus + outputs + DSP sanity)
     Selftest {
@@ -207,6 +226,7 @@ fn main() -> anyhow::Result<()> {
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
         }
+        Command::Ingest { grpc, quic } => commands::ingest::run(grpc, quic),
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
     }
 }

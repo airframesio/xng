@@ -1,0 +1,135 @@
+// asf-2.0 — Airframes Standard Format, version 2.
+// See docs/ASF2.md for the protocol description.
+
+syntax = "proto3";
+
+package asf.v2;
+
+// Everything on the wire is an Envelope (both transports).
+message Envelope {
+  oneof kind {
+    Hello hello = 1;
+    MessageBatch batch = 2;
+    StationStats stats = 3;
+    Ack ack = 4;
+    ServerHint hint = 5;
+  }
+}
+
+message Hello {
+  uint32 protocol_version = 1; // 2
+  string station_id = 2;       // UUID
+  string station_ident = 3;    // human ident, e.g. XX-KSEA-ACARS1
+  App app = 4;
+  string auth_token = 5;       // optional; enforcement TBD
+  uint64 flags = 6;            // reserved
+}
+
+message App {
+  string name = 1;
+  string version = 2;
+}
+
+message SdrInfo {
+  string id = 1;     // user-assigned id within the station config
+  string driver = 2; // rtlsdr, airspyhf, sdrplay, file, ...
+  string serial = 3;
+}
+
+message ChannelInfo {
+  uint32 index = 1;
+  uint64 frequency_hz = 2;
+  double sample_rate = 3;
+}
+
+message SignalQuality {
+  optional float rssi_db = 1;
+  optional float snr_db = 2;
+  optional float noise_db = 3;
+  optional float freq_skew_hz = 4;
+}
+
+message DecodeQuality {
+  bool crc_ok = 1;
+  optional uint32 fec_corrected = 2;
+  optional uint32 errors = 3;
+}
+
+// ACARS application layer (any carrier: POA, AOA, HFDL, Aero, Iridium).
+message AcarsBody {
+  string mode = 1;
+  optional string tail = 2;
+  string label = 3;
+  optional string sublabel = 4;
+  optional string block_id = 5;
+  optional string ack = 6;
+  optional string flight = 7;
+  optional string msg_num = 8;
+  string text = 9;
+  bool more_to_come = 10;
+}
+
+message AisBody {
+  repeated string nmea = 1;
+  optional uint32 msg_type = 2;
+  optional uint32 mmsi = 3;
+}
+
+message ModeSBody {
+  uint32 df = 1;
+  optional string icao = 2;
+  optional string callsign = 3;
+  optional int32 altitude_ft = 4;
+}
+
+message DecodedMessage {
+  string mode = 1;          // acars | vdl2 | hfdl | aero-l | aero-c |
+                            // std-c | ais | adsb | iridium | extern
+  uint64 timestamp_ns = 2;  // unix epoch nanoseconds
+  uint64 frequency_hz = 3;
+  SignalQuality signal = 4;
+  DecodeQuality decode = 5;
+  bytes raw = 6;            // link-layer payload, always preserved
+  SdrInfo sdr = 7;
+  ChannelInfo channel = 8;
+  oneof body {
+    AcarsBody acars = 10;
+    AisBody ais = 11;
+    ModeSBody mode_s = 12;
+    bool undecoded = 13;
+  }
+}
+
+message MessageBatch {
+  uint64 seq = 1;
+  repeated DecodedMessage messages = 2;
+}
+
+// Periodic per-channel counters.
+message ChannelStats {
+  ChannelInfo channel = 1;
+  string mode = 2;
+  uint64 frames_total = 3;
+  uint64 frames_crc_ok = 4;
+  optional float noise_floor_db = 5;
+}
+
+message StationStats {
+  uint64 uptime_seconds = 1;
+  uint64 messages_total = 2;
+  repeated ChannelStats channels = 3;
+}
+
+message Ack {
+  uint64 seq = 1; // highest batch seq received
+}
+
+// Server → client configuration hints (semantics defined per mode).
+message ServerHint {
+  string kind = 1;   // e.g. "hfdl.active-frequencies"
+  bytes payload = 2; // kind-specific encoding
+}
+
+service AirframesFeed {
+  rpc Stream(stream Envelope) returns (stream Envelope);
+}

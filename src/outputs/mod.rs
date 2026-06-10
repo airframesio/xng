@@ -3,5 +3,7 @@
 //! land in M3).
 
 pub mod acarsdec_json;
+pub mod asf2_grpc;
+pub mod asf2_quic;
 pub mod console;
 pub mod jsonl;

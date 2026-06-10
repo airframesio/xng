@@ -16,7 +16,7 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Install dependencies
-      run: sudo apt install -y libsoapysdr-dev
+      run: sudo apt install -y libsoapysdr-dev protobuf-compiler
     - name: Build
       run: cargo build --verbose --release
     - name: Version

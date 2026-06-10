@@ -31,6 +31,13 @@ xng-sdr = { path = "crates/xng-sdr" }
 xng-mode-acars = { path = "crates/xng-mode-acars" }
 xng-mode-ais = { path = "crates/xng-mode-ais" }
 xng-mode-adsb = { path = "crates/xng-mode-adsb" }
+xng-proto = { path = "crates/xng-proto" }
+prost = "0.13"
+tonic = "0.12"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+tokio-stream = "0.1"
 
 # DSP loopback tests are too slow unoptimized.
 [profile.test]
@@ -67,3 +74,10 @@ xng-sdr.workspace = true
 xng-mode-acars.workspace = true
 xng-mode-ais.workspace = true
 xng-mode-adsb.workspace = true
+xng-proto.workspace = true
+prost.workspace = true
+tonic.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
+tokio-stream.workspace = true

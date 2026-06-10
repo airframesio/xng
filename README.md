@@ -60,11 +60,19 @@ xng iq-info capture.cf32 -r 2000000 -c 131500000   # power, spectral peaks
 xng selftest                    # end-to-end pipeline self-test
 ```
 
-Outputs: pretty console, raw JSON, JSONL files, and acarsdec-compatible
-JSON over UDP (`--udp host:port`, `--feed-airframes` →
-feed.airframes.io:5550). The asf-2.0 gRPC/QUIC output lands in M3.
+Outputs: pretty console, raw JSON, JSONL files, acarsdec-compatible JSON
+over UDP (`--udp host:port`, `--feed-airframes` → feed.airframes.io:5550),
+and the new **asf-2.0** protocol ([docs/ASF2.md](docs/ASF2.md)): one
+protobuf schema over gRPC (`--asf2-grpc URL`) and QUIC (`--asf2-quic
+host:port`), multiplexing every channel/SDR/mode over a single connection.
+`xng ingest` runs the reference ingest server for both transports:
+
+```bash
+xng ingest --grpc 0.0.0.0:6001 --quic 0.0.0.0:6011   # receive asf-2.0 feeds
+```
 
 Workspace crates so far: `xng-types` (normalized message model),
+`xng-proto` (asf-2.0 schema + conversions),
 `xng-dsp` (PFB channelizer, DDC, FIR/NCO, CRCs), `xng-sdr` (SoapySDR +
 IQ-file sources), `xng-mode-acars`, `xng-mode-ais`, and
 `xng-mode-adsb` (decode cores, each with a spec-faithful modulator for
