@@ -14,7 +14,6 @@ use num_complex::Complex;
 use std::f32::consts::PI;
 
 pub const SYMBOL_RATE: f64 = 25_000.0;
-const SPS: f64 = 10.0;
 /// UW absolute QPSK symbol phases (units of π/2).
 const UW_DL: [u8; 12] = [0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2];
 const UW_UL: [u8; 12] = [2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2];

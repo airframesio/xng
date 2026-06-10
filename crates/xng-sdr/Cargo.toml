@@ -12,11 +12,18 @@ default = []
 # SoapySDR-backed device capture. Requires libSoapySDR development files.
 # SoapySDR is the multi-vendor path (and the only path for SDRplay).
 soapy = ["dep:soapysdr"]
+# Native Airspy R2/Mini capture via libairspy (no SoapyAirspy module needed).
+airspy = []
+# Native Airspy HF+ / Discovery capture via libairspyhf.
+airspyhf = []
 
 [dependencies]
 num-complex.workspace = true
 thiserror.workspace = true
 soapysdr = { version = "0.4", optional = true }
+
+[build-dependencies]
+pkg-config = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

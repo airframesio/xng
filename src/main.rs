@@ -9,6 +9,7 @@ mod tui;
 mod freq;
 mod outputs;
 mod runtime;
+mod sdr_args;
 
 use clap::{Args, Parser, Subcommand};
 use outputs::console::ConsoleFormat;
@@ -142,7 +143,9 @@ enum Command {
     },
     /// Decode live from an SDR (multi-channel, mode via --mode)
     Listen {
-        /// SoapySDR device args, e.g. "driver=rtlsdr" or "driver=airspy,serial=..."
+        /// SDR device args, e.g. "driver=rtlsdr" (SoapySDR) or
+        /// "driver=airspyhf,serial=..." (native backend when built with
+        /// --features airspy/airspyhf; add backend=soapy to override)
         #[arg(long, default_value = "")]
         sdr: String,
         /// Tuner gain in dB (hardware AGC when omitted)
@@ -327,7 +330,7 @@ fn main() -> anyhow::Result<()> {
                     };
                     Box::new(FileIqSource::open(&path, fmt, tune.sample_rate, center_hz)?)
                 }
-                None => open_sdr(&sdr, tune.sample_rate, center_hz, gain)?,
+                None => open_sdr(&sdr, tune.sample_rate, center_hz, gain)?.0,
             };
             tui::run(
                 source,
@@ -356,33 +359,81 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(feature = "soapy")]
+/// Open an SDR from `--sdr` args, returning the source and the backend that
+/// served it. `driver=airspy` / `driver=airspyhf` use the native backends
+/// when compiled in (falling through to SoapySDR otherwise, where a
+/// SoapyAirspy module may exist); `backend=soapy` forces the fallthrough.
 fn open_sdr(
     sdr: &str,
     sample_rate: f64,
     center_hz: u64,
     gain: Option<f64>,
-) -> anyhow::Result<Box<dyn xng_sdr::IqSource>> {
-    Ok(Box::new(xng_sdr::soapy::SoapyIqSource::open(sdr, sample_rate, center_hz, gain)?))
-}
-
-#[cfg(not(feature = "soapy"))]
-fn open_sdr(
-    _sdr: &str,
-    _sample_rate: f64,
-    _center_hz: u64,
-    _gain: Option<f64>,
-) -> anyhow::Result<Box<dyn xng_sdr::IqSource>> {
-    anyhow::bail!("built without SDR support; use --file or rebuild with --features soapy")
+) -> anyhow::Result<(Box<dyn xng_sdr::IqSource>, &'static str)> {
+    let args = sdr_args::SdrArgs::parse(sdr);
+    match args.driver.as_deref() {
+        Some("airspy") if !args.force_soapy => {
+            #[cfg(feature = "airspy")]
+            {
+                let serial =
+                    args.serial.as_deref().map(sdr_args::parse_airspy_serial).transpose()?;
+                let src = xng_sdr::airspy::AirspyIqSource::open(
+                    serial,
+                    sample_rate,
+                    center_hz,
+                    gain,
+                    args.bias,
+                )?;
+                return Ok((Box::new(src), "airspy"));
+            }
+        }
+        Some("airspyhf") if !args.force_soapy => {
+            #[cfg(feature = "airspyhf")]
+            {
+                let serial =
+                    args.serial.as_deref().map(sdr_args::parse_airspy_serial).transpose()?;
+                let src = xng_sdr::airspyhf::AirspyHfIqSource::open(
+                    serial,
+                    sample_rate,
+                    center_hz,
+                    gain,
+                    args.bias,
+                )?;
+                return Ok((Box::new(src), "airspyhf"));
+            }
+        }
+        _ => {}
+    }
+    open_soapy(&args.soapy, sample_rate, center_hz, gain)
 }
 
 #[cfg(feature = "soapy")]
+fn open_soapy(
+    args: &str,
+    sample_rate: f64,
+    center_hz: u64,
+    gain: Option<f64>,
+) -> anyhow::Result<(Box<dyn xng_sdr::IqSource>, &'static str)> {
+    let src = xng_sdr::soapy::SoapyIqSource::open(args, sample_rate, center_hz, gain)?;
+    Ok((Box::new(src), "soapysdr"))
+}
+
+#[cfg(not(feature = "soapy"))]
+fn open_soapy(
+    _args: &str,
+    _sample_rate: f64,
+    _center_hz: u64,
+    _gain: Option<f64>,
+) -> anyhow::Result<(Box<dyn xng_sdr::IqSource>, &'static str)> {
+    anyhow::bail!("built without SDR support; use --file or rebuild with --features soapy")
+}
+
 fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
     let (mode, center_hz, channels_hz) = parse_tune(tune)?;
     let (outputs, station_ident) = output.build()?;
-    let source = xng_sdr::soapy::SoapyIqSource::open(sdr, tune.sample_rate, center_hz, gain)?;
+    let serial = sdr_args::SdrArgs::parse(sdr).serial;
+    let (source, driver) = open_sdr(sdr, tune.sample_rate, center_hz, gain)?;
     runtime::run_session(
-        Box::new(source),
+        source,
         runtime::SessionConfig {
             mode,
             center_hz,
@@ -390,15 +441,10 @@ fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) ->
             station_ident,
             sdr: Some(xng_types::SdrInfo {
                 id: sdr.to_owned(),
-                driver: "soapysdr".into(),
-                serial: None,
+                driver: driver.into(),
+                serial,
             }),
             outputs,
         },
     )
-}
-
-#[cfg(not(feature = "soapy"))]
-fn listen(_sdr: &str, _gain: Option<f64>, _tune: &TuneOpts, _output: &OutputOpts) -> anyhow::Result<()> {
-    anyhow::bail!("xng was built without SDR device support; rebuild with --features soapy")
 }

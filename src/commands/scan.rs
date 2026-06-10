@@ -279,7 +279,7 @@ fn scan_group(
     channels: &[u64],
     dwell_secs: u64,
 ) -> anyhow::Result<(Vec<ChannelResult>, Vec<serde_json::Value>)> {
-    let mut source = crate::open_sdr(sdr, rate, center, gain)?;
+    let (mut source, _) = crate::open_sdr(sdr, rate, center, gain)?;
     let cfg = SessionConfig {
         mode,
         center_hz: center,
