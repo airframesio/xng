@@ -30,3 +30,27 @@ Items flagged for live-capture verification (free spec ambiguity):
 which 2/4 of the 6 RS check octets are transmitted for short rows
 (assumed: first by transmission order), and AVLC FCS octet order (both
 orders accepted, which one matched is recorded).
+
+## Off-air validation (2026-06)
+
+Validated against the sigidwiki VDL-M2 IQ recording (CC BY-SA, 46.9 s,
+Amsterdam area; the capture's I/Q convention is inverted — dumpvdl2
+2.6.0 also decodes nothing until the spectrum is conjugated). With
+dumpvdl2 as ground truth (41 frames), two real-signal fixes:
+
+1. **Quarter-sample UW timing refinement** (the broad differential-peak
+   bias seen on HFDL): a 1-2 sample error at 4.76 samples/symbol
+   degrades every later symbol decision, failing the header FEC or RS.
+2. **Consistency gate relaxed 0.25 → 0.01·mean**: symbol-spaced
+   interpolations legitimately dip on phase transitions, and the strict
+   gate rejected most real preambles (2 frames decoded vs 11 after).
+   The remaining weak gate still kills burst-edge false locks, and a
+   false lock that passes the header FEC with a bogus length no longer
+   swallows the real burst (re-hunt resumes at the false UW start).
+
+Result: 11 frames decoded including CRC-valid ACARS from HB-IJW
+(label B9, /EHAM.TI2/...) and TC-JRA, plus AVLC supervisory traffic —
+all also present in dumpvdl2's output. dumpvdl2 decodes 41 frames from
+the same file; the gap is acquisition sensitivity (proper symbol-timing
+recovery is the planned follow-up). A 6 s slice is vendored as a CI
+fixture (tests/data/, attributed) guarded by tests/offair.rs.
