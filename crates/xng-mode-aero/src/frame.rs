@@ -46,11 +46,25 @@ fn interleave_block(bits: &[u8], cols: usize, out: &mut Vec<u8>) {
 }
 
 pub(crate) fn cols_for(rate_bps: u32) -> usize {
-    if rate_bps >= 1200 {
-        9
-    } else {
-        6
+    match rate_bps {
+        10500 => 78,
+        r if r >= 1200 => 9,
+        _ => 6,
     }
+}
+
+/// Coded bits per frame for a rate (600/1200: 1152; 10.5k: 4992).
+pub fn coded_bits_for(rate_bps: u32) -> usize {
+    if rate_bps == 10500 {
+        64 * 78
+    } else {
+        CODED_BITS
+    }
+}
+
+/// SU payload bytes per frame.
+pub fn frame_bytes_for(rate_bps: u32) -> usize {
+    coded_bits_for(rate_bps) / 2 / 8
 }
 
 impl FrameDecoder {
@@ -58,10 +72,10 @@ impl FrameDecoder {
         Self { rate_bps, viterbi: Viterbi::k7(), tail: vec![0.0; OVERLAP] }
     }
 
-    /// Decode one frame's 1152 coded soft bits (after UW + header) into
-    /// 72 descrambled SU bytes.
+    /// Decode one frame's coded soft bits (after UW + header) into
+    /// descrambled SU bytes.
     pub fn decode(&mut self, coded_soft: &[f32]) -> Vec<u8> {
-        debug_assert_eq!(coded_soft.len(), CODED_BITS);
+        debug_assert_eq!(coded_soft.len(), coded_bits_for(self.rate_bps));
         let cols = cols_for(self.rate_bps);
         let block = 64 * cols;
 
@@ -77,7 +91,8 @@ impl FrameDecoder {
         self.tail.copy_from_slice(&deleaved[deleaved.len() - OVERLAP..]);
         let decoded = self.viterbi.decode(&input);
         let skip = OVERLAP / 2;
-        let mut bits: Vec<u8> = decoded[skip..skip + DECODED_BITS].to_vec();
+        let n_decoded = coded_bits_for(self.rate_bps) / 2;
+        let mut bits: Vec<u8> = decoded[skip..skip + n_decoded].to_vec();
 
         // Descramble (LFSR reset per frame) and pack LSB-first.
         Lfsr15::new().apply(&mut bits);
@@ -101,10 +116,12 @@ impl FrameEncoder {
         Self { rate_bps, viterbi: Viterbi::k7(), state_bits: vec![0; 6] }
     }
 
-    /// Encode 72 SU bytes into a full 1200-bit frame (UW + header +
-    /// interleaved coded bits), hard bits.
+    /// Encode one frame of SU bytes (72 at 600/1200, 312 at 10.5k) into
+    /// the frame bit stream (UW + header + interleaved coded bits).
+    /// At 10.5k the UW/dummy sections are handled by the OQPSK modulator;
+    /// this emits the low-rate layout (32-bit UW + 16-bit header).
     pub fn encode(&mut self, su_bytes: &[u8], frame_counter: u8) -> Vec<u8> {
-        debug_assert_eq!(su_bytes.len(), DECODED_BITS / 8);
+        debug_assert_eq!(su_bytes.len(), frame_bytes_for(self.rate_bps));
         // Bytes → bits LSB-first, scramble (reset per frame).
         let mut bits: Vec<u8> =
             su_bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> i) & 1)).collect();
@@ -117,7 +134,7 @@ impl FrameEncoder {
         self.state_bits = bits[bits.len() - 6..].to_vec();
         let coded_all = self.viterbi.encode(&input);
         let coded = &coded_all[6 * 2..];
-        debug_assert_eq!(coded.len(), CODED_BITS);
+        debug_assert_eq!(coded.len(), coded_bits_for(self.rate_bps));
 
         let cols = cols_for(self.rate_bps);
         let block = 64 * cols;
@@ -133,7 +150,7 @@ impl FrameEncoder {
         for chunk in coded.chunks_exact(block) {
             interleave_block(chunk, cols, &mut out);
         }
-        debug_assert_eq!(out.len(), FRAME_BITS);
+        debug_assert_eq!(out.len(), 48 + coded_bits_for(self.rate_bps));
         out
     }
 }

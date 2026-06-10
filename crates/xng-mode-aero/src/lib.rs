@@ -9,6 +9,7 @@
 
 pub mod burst;
 pub mod demod;
+pub mod oqpsk;
 pub mod frame;
 pub mod modulate;
 pub mod su;
@@ -85,6 +86,17 @@ pub struct AeroChannelDecoder {
     ddc: Option<Ddc>,
     chains: Vec<RateChain>,
     channel_buf: Vec<Complex<f32>>,
+    /// 10.5 kbps OQPSK chain on its own 48 kHz channel (only when the
+    /// input rate can carry it).
+    hr: Option<HrChain>,
+}
+
+struct HrChain {
+    ddc: Option<Ddc>,
+    demod: oqpsk::OqpskDemod,
+    framer: oqpsk::HrFramer,
+    buf: Vec<Complex<f32>>,
+    bits: Vec<(f32, u8)>,
 }
 
 impl AeroChannelDecoder {
@@ -103,7 +115,31 @@ impl AeroChannelDecoder {
                 bits: Vec::new(),
             })
             .collect();
-        Ok(Self { ddc, chains, channel_buf: Vec::new() })
+        let hr = if (input_rate - oqpsk::CHANNEL_RATE_HR).abs() < 1e-6
+            && freq_offset_hz.abs() < 1e-6
+        {
+            Some(HrChain {
+                ddc: None,
+                demod: oqpsk::OqpskDemod::new(oqpsk::CHANNEL_RATE_HR),
+                framer: oqpsk::HrFramer::new(),
+                buf: Vec::new(),
+                bits: Vec::new(),
+            })
+        } else if input_rate >= oqpsk::CHANNEL_RATE_HR {
+            // Ignore an hr-incapable rate rather than failing the mode.
+            Ddc::new(input_rate, oqpsk::CHANNEL_RATE_HR, freq_offset_hz, 6_500.0)
+                .ok()
+                .map(|ddc| HrChain {
+                    ddc: Some(ddc),
+                    demod: oqpsk::OqpskDemod::new(oqpsk::CHANNEL_RATE_HR),
+                    framer: oqpsk::HrFramer::new(),
+                    buf: Vec::new(),
+                    bits: Vec::new(),
+                })
+        } else {
+            None
+        };
+        Ok(Self { ddc, chains, channel_buf: Vec::new(), hr })
     }
 
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<AeroEvent> {
@@ -126,6 +162,28 @@ impl AeroChannelDecoder {
             for user in users {
                 let acars = su::parse_acars(&user.data);
                 out.push(AeroEvent { user, acars, bit_rate: chain.rate });
+            }
+        }
+
+        // 10.5 kbps OQPSK chain.
+        if let Some(hr) = &mut self.hr {
+            let hr_channel: &[Complex<f32>] = match &mut hr.ddc {
+                Some(ddc) => {
+                    hr.buf.clear();
+                    ddc.process(input, &mut hr.buf);
+                    &hr.buf
+                }
+                None => input,
+            };
+            hr.bits.clear();
+            hr.demod.process(hr_channel, &mut hr.bits);
+            let mut hr_users = Vec::new();
+            for &(soft, hard) in &hr.bits {
+                hr.framer.push(soft, hard, &mut hr_users);
+            }
+            for user in hr_users {
+                let acars = su::parse_acars(&user.data);
+                out.push(AeroEvent { user, acars, bit_rate: oqpsk::BIT_RATE });
             }
         }
         out

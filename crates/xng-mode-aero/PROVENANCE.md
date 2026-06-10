@@ -40,3 +40,10 @@ Divergence from JAERO (documented intentionally):
 Conformance anchors: JAERO ships real off-air samples
 (`samples/600bps_sample.ogg` etc.) usable for cross-validation; loopback
 tests here exercise the full chain bit-exactly.
+
+10.5 kbps A-QPSK status: the framing layer (dual-rail UW with per-rail
+inversion hypotheses, 16+178-bit header/dummy skip, 64x78 interleaver,
+shared Viterbi/descrambler/SU path) is implemented and bit-level tested;
+the coherent OQPSK demodulator does not yet achieve carrier lock and its
+RF loopback tests are #[ignore]d pending a focused demod session
+(JAERO's tanh cross-product loop is the port reference).

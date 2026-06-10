@@ -42,7 +42,8 @@ Six native decode cores are in:
   and C-band R/T-channel bursts (`--mode aero-c`: burst gating, carrier
   CFO estimation, R-SU and T-burst signal-unit layers), K=7 Viterbi,
   64-row interleaver, ISU/SSU reassembly, ACARS into the shared
-  application layer. 10.5 kbps A-QPSK is next.
+  application layer. 10.5 kbps A-QPSK: framing complete (bit-level
+  tested); OQPSK demod in progress.
 - **Inmarsat STD-C / EGC** (clean-room from cross-verified facts; first
   coherent demod in the codebase — square-law AFC, Costas, Gardner):
   NCS frames (UW sync both polarities, row depermutation, 64×162
