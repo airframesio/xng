@@ -14,7 +14,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Install dependencies
       run: sudo apt install -y libsoapysdr-dev protobuf-compiler
     - name: Build
@@ -22,10 +22,10 @@ jobs:
     - name: Version
       run: echo "::set-output name=version::$(cargo run -- --version)"
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --workspace --verbose
     - name: Build Debian package
       run: ./build_deb_package.sh
-    - uses: actions/upload-artifact@v3
+    - uses: actions/upload-artifact@v4
       with:
         name: xng-debian-package-latest
         path: |
@@ -50,7 +50,7 @@ jobs:
         draft: false
         prerelease: false
     - name: Download artifact from previous job
-      uses: actions/download-artifact@v2
+      uses: actions/download-artifact@v4
       with:
         name: xng-debian-package-latest
         path: ${{ github.workspace }}/build
