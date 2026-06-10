@@ -1,0 +1,17 @@
+[package]
+name = "xng-mode-vdl2"
+description = "Native VDL Mode 2 decode core for xng: D8PSK burst demod, RS(255,249), AVLC, ACARS-over-AVLC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xng-acars.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true

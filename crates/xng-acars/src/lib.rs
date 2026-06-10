@@ -10,6 +10,7 @@ mod bits;
 
 pub mod adsc;
 pub mod arinc622;
+pub mod block;
 pub mod media_adv;
 pub mod sublabel;
 

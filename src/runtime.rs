@@ -12,6 +12,7 @@ use std::sync::Arc;
 use xng_mode_acars::AcarsChannelDecoder;
 use xng_mode_adsb::AdsbDecoder;
 use xng_mode_ais::AisChannelDecoder;
+use xng_mode_vdl2::Vdl2ChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, Mode, Provenance, SdrInfo, StationIdentity};
 
@@ -45,6 +46,7 @@ enum ModeChannel {
     Acars(AcarsChannelDecoder),
     Ais(AisChannelDecoder),
     Adsb(AdsbDecoder),
+    Vdl2(Vdl2ChannelDecoder),
 }
 
 impl ModeChannel {
@@ -52,6 +54,7 @@ impl ModeChannel {
         match mode {
             Mode::AcarsPoa => Ok(Self::Acars(AcarsChannelDecoder::new(sample_rate, offset)?)),
             Mode::Ais => Ok(Self::Ais(AisChannelDecoder::new(sample_rate, offset, freq)?)),
+            Mode::Vdl2 => Ok(Self::Vdl2(Vdl2ChannelDecoder::new(sample_rate, offset)?)),
             Mode::Adsb => {
                 if offset.abs() > 1e-6 {
                     return Err("Mode S uses the whole capture: tune -c to 1090.000M and pass --channels 1090".into());
@@ -65,6 +68,7 @@ impl ModeChannel {
     fn passband_hz(mode: Mode) -> f64 {
         match mode {
             Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
+            Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
             Mode::Adsb => 0.0, // wideband: offset must be 0, no DDC
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
@@ -74,6 +78,7 @@ impl ModeChannel {
         match self {
             Self::Acars(_) => xng_mode_acars::CHANNEL_RATE,
             Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
+            Self::Vdl2(_) => xng_mode_vdl2::CHANNEL_RATE,
             Self::Adsb(_) => 2_000_000.0,
         }
     }
@@ -103,6 +108,20 @@ impl ModeChannel {
                     .collect();
                 // The AIS deframer only surfaces CRC-valid frames.
                 (msgs, seen, seen)
+            }
+            Self::Vdl2(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let ok = frames
+                    .iter()
+                    .filter(|f| f.acars.as_ref().map(|a| a.crc_ok).unwrap_or(true))
+                    .count() as u64;
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_vdl2::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, ok)
             }
             Self::Adsb(dec) => {
                 let frames = dec.process(iq);

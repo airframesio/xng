@@ -17,9 +17,9 @@ roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
 xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
 still buildable standalone.
 
-## Current state (M2 complete — ACARS, AIS, and ADS-B native)
+## Current state (M5 — ACARS, VDL2, AIS, and ADS-B native)
 
-Three native decode cores are in, all clean-room:
+Four native decode cores are in, all clean-room:
 
 - **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
   sync/parity/CRC deframing, parity-guided single-bit error correction.
@@ -31,6 +31,12 @@ Three native decode cores are in, all clean-room:
 - **AIS** (ITU-R M.1371): GMSK demod with carrier-offset tracking, HDLC
   deframing with destuffing, CRC-16/X-25, NMEA AIVDM output — verified
   against the canonical published AIVDM test vector.
+- **VDL Mode 2** (ICAO Annex 10 Vol III / ETSI EN 301 841): D8PSK burst
+  demod with unique-word acquisition and carrier-offset tracking,
+  RS(255,249) errors-and-erasures FEC, scrambler, AVLC link layer,
+  ACARS-over-AVLC into the shared application layer. Verified against
+  spec-derived vectors (scrambler keystream, header FEC, unique word) and
+  RF loopback; off-air validation pending usable VDL2 RF at this site.
 - **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
   CRC-24 validation with an ICAO cache for address-overlaid parity,
   extended-squitter ident/altitude decode — verified against published
@@ -54,6 +60,10 @@ xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
 
 # ADS-B / Mode S
 xng listen --sdr driver=rtlsdr --mode adsb -r 2000000 -c 1090.000M --channels 1090
+
+# VDL Mode 2: four channels incl. the worldwide CSC
+xng listen --sdr driver=rtlsdr --mode vdl2 -r 2400000 -c 136.800M \
+    --channels 136.650,136.800,136.925,136.975
 
 # Generate a synthetic test capture (no hardware needed)
 cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32

@@ -9,6 +9,7 @@ pub mod checksum;
 pub mod ddc;
 pub mod fir;
 pub mod nco;
+pub mod rs;
 pub mod window;
 
 pub use channelizer::PfbChannelizer;

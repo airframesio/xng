@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Args)]
 struct TuneOpts {
-    /// Decode mode: acars or ais (more cores land per the roadmap)
+    /// Decode mode: acars, vdl2, ais, or adsb
     #[arg(short, long, default_value = "acars")]
     mode: String,
     /// Capture sample rate in Hz (must be an integer multiple of the
