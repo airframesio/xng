@@ -7,6 +7,7 @@
 //! descramble) → 12-byte SUs → [`su::Reassembler`] → ACARS via
 //! [`xng_acars::block`] → [`xng_types::Message`].
 
+pub mod burst;
 pub mod demod;
 pub mod frame;
 pub mod modulate;
@@ -132,6 +133,63 @@ impl AeroChannelDecoder {
 
     pub fn level_dbfs(&self) -> f32 {
         self.chains[0].demod.level_dbfs()
+    }
+}
+
+/// C-band R/T burst decoder (both rates tried per burst).
+pub struct AeroBurstDecoder {
+    ddc: Option<Ddc>,
+    gate: burst::BurstGate,
+    packetizers: [burst::BurstPacketizer; 2],
+    channel_buf: Vec<Complex<f32>>,
+    level: f32,
+}
+
+impl AeroBurstDecoder {
+    pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let ddc = if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+            None
+        } else {
+            Some(Ddc::new(input_rate, CHANNEL_RATE, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
+        };
+        Ok(Self {
+            ddc,
+            // Longest plausible burst: a few seconds at 24 kHz.
+            gate: burst::BurstGate::new(4 * CHANNEL_RATE as usize),
+            packetizers: [burst::BurstPacketizer::new(), burst::BurstPacketizer::new()],
+            channel_buf: Vec::new(),
+            level: 0.0,
+        })
+    }
+
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<AeroEvent> {
+        let channel: &[Complex<f32>] = match &mut self.ddc {
+            Some(ddc) => {
+                self.channel_buf.clear();
+                ddc.process(input, &mut self.channel_buf);
+                &self.channel_buf
+            }
+            None => input,
+        };
+        let mut out = Vec::new();
+        for b in self.gate.process(channel) {
+            self.level = b.iter().map(|x| x.norm_sqr()).sum::<f32>() / b.len() as f32;
+            for (i, &rate) in [600u32, 1200].iter().enumerate() {
+                let bits = burst::demod_burst(&b, CHANNEL_RATE, rate as f64);
+                if let Some(result) = self.packetizers[i].process(&bits) {
+                    for user in result.users {
+                        let acars = su::parse_acars(&user.data);
+                        out.push(AeroEvent { user, acars, bit_rate: rate });
+                    }
+                    break; // one rate decoded this burst
+                }
+            }
+        }
+        out
+    }
+
+    pub fn level_dbfs(&self) -> f32 {
+        10.0 * self.level.max(1e-12).log10()
     }
 }
 

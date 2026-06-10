@@ -37,11 +37,12 @@ Five native decode cores are in:
   ACARS-over-AVLC into the shared application layer. Verified against
   spec-derived vectors (scrambler keystream, header FEC, unique word) and
   RF loopback; off-air validation pending usable VDL2 RF at this site.
-- **Inmarsat Aero L-band** (ported from MIT-licensed JAERO): A-BPSK/MSK
-  P-channels at 600 and 1200 bps (both rates decoded in parallel per
-  channel), K=7 Viterbi, 64-row interleaver, signal-unit layer with
-  ISU/SSU reassembly, ACARS into the shared application layer. R/T
-  bursts, 10.5 kbps A-QPSK, C-band, and STD-C are next.
+- **Inmarsat Aero** (ported from MIT-licensed JAERO): L-band A-BPSK/MSK
+  P-channels at 600/1200 bps (both rates decoded in parallel per channel)
+  and C-band R/T-channel bursts (`--mode aero-c`: burst gating, carrier
+  CFO estimation, R-SU and T-burst signal-unit layers), K=7 Viterbi,
+  64-row interleaver, ISU/SSU reassembly, ACARS into the shared
+  application layer. 10.5 kbps A-QPSK and STD-C are next.
 - **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
   CRC-24 validation with an ICAO cache for address-overlaid parity,
   extended-squitter ident/altitude decode — verified against published

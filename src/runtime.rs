@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use xng_mode_acars::AcarsChannelDecoder;
 use xng_mode_adsb::AdsbDecoder;
-use xng_mode_aero::AeroChannelDecoder;
+use xng_mode_aero::{AeroBurstDecoder, AeroChannelDecoder};
 use xng_mode_ais::AisChannelDecoder;
 use xng_mode_vdl2::Vdl2ChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
@@ -49,6 +49,7 @@ enum ModeChannel {
     Adsb(AdsbDecoder),
     Vdl2(Vdl2ChannelDecoder),
     Aero(AeroChannelDecoder),
+    AeroBurst(AeroBurstDecoder),
 }
 
 impl ModeChannel {
@@ -58,6 +59,7 @@ impl ModeChannel {
             Mode::Ais => Ok(Self::Ais(AisChannelDecoder::new(sample_rate, offset, freq)?)),
             Mode::Vdl2 => Ok(Self::Vdl2(Vdl2ChannelDecoder::new(sample_rate, offset)?)),
             Mode::AeroL => Ok(Self::Aero(AeroChannelDecoder::new(sample_rate, offset)?)),
+            Mode::AeroC => Ok(Self::AeroBurst(AeroBurstDecoder::new(sample_rate, offset)?)),
             Mode::Adsb => {
                 if offset.abs() > 1e-6 {
                     return Err("Mode S uses the whole capture: tune -c to 1090.000M and pass --channels 1090".into());
@@ -72,7 +74,7 @@ impl ModeChannel {
         match mode {
             Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
             Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
-            Mode::AeroL => xng_mode_aero::CHANNEL_PASSBAND_HZ,
+            Mode::AeroL | Mode::AeroC => xng_mode_aero::CHANNEL_PASSBAND_HZ,
             Mode::Adsb => 0.0, // wideband: offset must be 0, no DDC
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
@@ -83,7 +85,7 @@ impl ModeChannel {
             Self::Acars(_) => xng_mode_acars::CHANNEL_RATE,
             Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
             Self::Vdl2(_) => xng_mode_vdl2::CHANNEL_RATE,
-            Self::Aero(_) => xng_mode_aero::CHANNEL_RATE,
+            Self::Aero(_) | Self::AeroBurst(_) => xng_mode_aero::CHANNEL_RATE,
             Self::Adsb(_) => 2_000_000.0,
         }
     }
@@ -129,6 +131,20 @@ impl ModeChannel {
                 (msgs, seen, ok)
             }
             Self::Aero(dec) => {
+                let events = dec.process(iq);
+                let seen = events.len() as u64;
+                let level = dec.level_dbfs();
+                let ok = events
+                    .iter()
+                    .filter(|e| e.acars.as_ref().map(|a| a.crc_ok).unwrap_or(true))
+                    .count() as u64;
+                let msgs = events
+                    .iter()
+                    .map(|e| xng_mode_aero::to_message(e, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, ok)
+            }
+            Self::AeroBurst(dec) => {
                 let events = dec.process(iq);
                 let seen = events.len() as u64;
                 let level = dec.level_dbfs();
