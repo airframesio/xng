@@ -134,12 +134,25 @@ fn decode_loop(
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
     let mut buf = vec![Complex::new(0.0f32, 0.0f32); READ_CHUNK];
     let mut stats: Vec<(u64, u64, u64)> = decoders.iter().map(|(f, _)| (*f, 0, 0)).collect();
+    let mut consecutive_errors: u32 = 0;
 
     while !stop.load(Ordering::Relaxed) {
         let n = match source.read(&mut buf) {
-            Ok(n) => n,
+            Ok(n) => {
+                consecutive_errors = 0;
+                n
+            }
             Err(SdrError::EndOfStream) => break,
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                // Transient device hiccups (overflows, timeouts) are routine
+                // on live streams; only give up if they persist.
+                consecutive_errors += 1;
+                if consecutive_errors >= 10 {
+                    return Err(anyhow::anyhow!("giving up after {consecutive_errors} consecutive read errors: {e}"));
+                }
+                tracing::warn!("read error ({consecutive_errors}/10): {e}");
+                continue;
+            }
         };
         for (i, (freq, dec)) in decoders.iter_mut().enumerate() {
             for frame in dec.process(&buf[..n]) {
