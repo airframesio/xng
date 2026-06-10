@@ -45,5 +45,14 @@ HFDL demods in this codebase, plus a decision-directed phase trim
 - RF loopback: tone+UW+payload burst with CFO and noise through the
   full chain (burst gate, tone CFO, UW fit, DQPSK, deinterleave, BCH,
   field parse).
+- **PHY cross-validated against gr-iridium**: the reference
+  implementation's own generated test burst
+  (test-data/prbs15-2M-20dB.sigmf-data, a synthetic frame with PRBS15
+  payload at 20 dB channel SNR ≈ 3 dB full-band) demodulates
+  bit-perfectly — access code recognized, zero PRBS15 recurrence
+  violations across the whole payload. The DDC'd burst is vendored as a
+  CI fixture (tests/data/, 32 KB) guarded by tests/crossval.rs. With
+  the toolkit oracle covering layer 2, both layers are validated
+  against their reference implementations.
 - Off-air validation pending an L-band capture of the ring-alert
   channel (1626.270833 MHz; bursts every few seconds worldwide).
