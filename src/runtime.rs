@@ -31,6 +31,8 @@ pub struct OutputConfig {
     pub asf2_quic: Option<String>,
     /// Certificate trust for the QUIC output.
     pub asf2_quic_trust: crate::outputs::asf2_quic::TrustMode,
+    /// Prometheus metrics listen address (host:port).
+    pub metrics: Option<String>,
 }
 
 pub struct SessionConfig {
@@ -277,10 +279,20 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
 
     let station = StationIdentity::new(cfg.station_ident.clone());
     let stop = Arc::new(AtomicBool::new(false));
+    let live = LiveState::new();
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let bus = MessageBus::new();
+        if let Some(addr) = cfg.outputs.metrics.clone() {
+            let live = live.clone();
+            let mode = cfg.mode.as_str().to_string();
+            tokio::spawn(async move {
+                if let Err(e) = crate::outputs::metrics::serve(addr, live, mode).await {
+                    tracing::warn!("metrics endpoint failed: {e}");
+                }
+            });
+        }
         let mut output_tasks = Vec::new();
         output_tasks.push(tokio::spawn({
             let rx = bus.subscribe();
@@ -325,7 +337,20 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         let decode = tokio::task::spawn_blocking({
             let bus = bus.clone();
             let stop = stop.clone();
-            move || decode_loop(&mut *source, decoders, station, cfg.sdr, bus, stop, None)
+            {
+                let live = live.clone();
+                move || {
+                    decode_loop(
+                        &mut *source,
+                        decoders,
+                        station,
+                        cfg.sdr,
+                        bus,
+                        stop,
+                        Some((live, capture_center, sample_rate)),
+                    )
+                }
+            }
         });
         let stats = decode.await??;
 

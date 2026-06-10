@@ -7,3 +7,4 @@ pub mod asf2_grpc;
 pub mod asf2_quic;
 pub mod console;
 pub mod jsonl;
+pub mod metrics;

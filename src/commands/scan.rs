@@ -250,6 +250,7 @@ fn scan_group(
             asf2_grpc: None,
             asf2_quic: None,
             asf2_quic_trust: crate::outputs::asf2_quic::TrustMode::SystemRoots,
+            metrics: None,
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;

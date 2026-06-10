@@ -78,6 +78,9 @@ struct OutputOpts {
     /// The feed can be intercepted or spoofed. Lab use only.
     #[arg(long)]
     asf2_quic_insecure: bool,
+    /// Serve Prometheus metrics on this address (e.g. 0.0.0.0:9090)
+    #[arg(long)]
+    metrics: Option<String>,
 }
 
 impl OutputOpts {
@@ -110,6 +113,7 @@ impl OutputOpts {
                 asf2_grpc: self.asf2_grpc.clone(),
                 asf2_quic: self.asf2_quic.clone(),
                 asf2_quic_trust: quic_trust,
+                metrics: self.metrics.clone(),
             },
             ident,
         ))
@@ -165,6 +169,18 @@ enum Command {
         /// FFT size for the power spectrum
         #[arg(long, default_value_t = 4096)]
         fft_size: usize,
+    },
+    /// Wrap an external decoder (second-class): normalize its JSON
+    /// output onto the xng bus and outputs
+    Extern {
+        /// Input format: dumphfdl, dumpvdl2, or acarsdec
+        #[arg(long)]
+        format: String,
+        #[command(flatten)]
+        output: OutputOpts,
+        /// External decoder command line (after --); stdin when omitted
+        #[arg(last = true)]
+        command: Vec<String>,
     },
     /// Auto-scan known frequency plans and propose a configuration
     Scan {
@@ -286,6 +302,12 @@ fn main() -> anyhow::Result<()> {
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
         }
+        Command::Extern { format, output, command } => {
+            let fmt: commands::extern_cmd::ExternFormat =
+                format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let (outputs, station_ident) = output.build()?;
+            commands::extern_cmd::run(fmt, &command, station_ident, outputs)
+        }
         Command::Scan { sdr, gain, modes, dwell, out } => {
             let modes: Vec<xng_types::Mode> = modes
                 .iter()
@@ -322,6 +344,7 @@ fn main() -> anyhow::Result<()> {
                         asf2_grpc: None,
                         asf2_quic: None,
                         asf2_quic_trust: outputs::asf2_quic::TrustMode::SystemRoots,
+                        metrics: None,
                     },
                 },
             )
