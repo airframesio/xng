@@ -92,6 +92,21 @@ pub enum MessageBody {
         callsign: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         altitude_ft: Option<i32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        squawk: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lat: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        lon: Option<f64>,
+        /// Knots; see `speed_type` ("GS" ground / "AS" airspeed).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speed_kt: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        speed_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        track_deg: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vertical_rate_fpm: Option<i32>,
     },
     /// Iridium frame (ring alert, broadcast, ...).
     Iridium {

@@ -105,6 +105,13 @@ message ModeSBody {
   optional string icao = 2;
   optional string callsign = 3;
   optional int32 altitude_ft = 4;
+  optional string squawk = 5;
+  optional double lat = 6;
+  optional double lon = 7;
+  optional double speed_kt = 8;     // see speed_type
+  optional string speed_type = 9;   // GS | AS
+  optional double track_deg = 10;
+  optional sint32 vertical_rate_fpm = 11;
 }
 
 message DecodedMessage {

@@ -7,6 +7,7 @@
 //! verifiable only against addresses learned from squitters, kept in a
 //! recent-ICAO cache.
 
+use crate::decode::{self, Cpr, Velocity};
 use std::collections::HashMap;
 use xng_dsp::checksum::mode_s_crc;
 
@@ -25,8 +26,18 @@ pub struct AdsbFrame {
     pub bytes: Vec<u8>,
     /// Identification (TC 1–4), trailing spaces trimmed.
     pub callsign: Option<String>,
-    /// Barometric altitude (TC 9–18, Q-bit format).
+    /// Barometric altitude: TC 9–18 (Q-bit or Gillham) or the DF0/4/16/20
+    /// AC field.
     pub altitude_ft: Option<i32>,
+    /// Transponder code (DF5/21 identity field).
+    pub squawk: Option<String>,
+    /// CPR-encoded position awaiting global/local resolution (TC 5–8
+    /// surface, 9–18 / 20–22 airborne).
+    pub cpr: Option<Cpr>,
+    /// TC 19 velocity.
+    pub velocity: Option<Velocity>,
+    /// Resolved position (filled by the per-aircraft tracker).
+    pub position: Option<(f64, f64)>,
     /// Signal level at decode time.
     pub level_dbfs: f32,
 }
@@ -84,13 +95,33 @@ impl FrameValidator {
             _ => return None,
         };
 
-        let (callsign, altitude_ft) = if df == 17 || df == 18 {
-            decode_extended_squitter(&bytes[4..11])
-        } else {
-            (None, None)
+        let mut f = AdsbFrame {
+            df,
+            icao,
+            bytes: bytes.to_vec(),
+            callsign: None,
+            altitude_ft: None,
+            squawk: None,
+            cpr: None,
+            velocity: None,
+            position: None,
+            level_dbfs,
         };
-
-        Some(AdsbFrame { df, icao, bytes: bytes.to_vec(), callsign, altitude_ft, level_dbfs })
+        match df {
+            17 | 18 => decode_extended_squitter(&bytes[4..11], &mut f),
+            // Surveillance altitude reply: 13-bit AC field (bits 20–32).
+            0 | 4 | 16 | 20 => {
+                let ac = ((bytes[2] as u32 & 0x1F) << 8) | bytes[3] as u32;
+                f.altitude_ft = decode::altitude13(ac);
+            }
+            // Surveillance identity reply: 13-bit ID field → squawk.
+            5 | 21 => {
+                let id = ((bytes[2] as u32 & 0x1F) << 8) | bytes[3] as u32;
+                f.squawk = Some(decode::squawk13(id));
+            }
+            _ => {}
+        }
+        Some(f)
     }
 
     fn learn(&mut self, icao: u32) {
@@ -109,9 +140,8 @@ impl Default for FrameValidator {
     }
 }
 
-/// Decode ident (TC 1–4) or barometric altitude (TC 9–18) from the 7-byte
-/// ME field.
-fn decode_extended_squitter(me: &[u8]) -> (Option<String>, Option<i32>) {
+/// Decode the 7-byte ME field of an extended squitter into the frame.
+fn decode_extended_squitter(me: &[u8], f: &mut AdsbFrame) {
     let bit = |i: usize| (me[i / 8] >> (7 - i % 8)) & 1;
     let field = |start: usize, len: usize| -> u32 {
         (start..start + len).fold(0u32, |v, i| (v << 1) | bit(i) as u32)
@@ -123,19 +153,32 @@ fn decode_extended_squitter(me: &[u8]) -> (Option<String>, Option<i32>) {
                 .map(|i| IDENT_CHARSET[field(8 + 6 * i, 6) as usize] as char)
                 .collect();
             let s = s.trim_end().to_owned();
-            (if s.is_empty() || s.contains('#') { None } else { Some(s) }, None)
+            if !s.is_empty() && !s.contains('#') {
+                f.callsign = Some(s);
+            }
         }
+        // Surface position: CPR over a quarter-globe span; movement and
+        // ground track are present but coarse — position is the value.
+        5..=8 => {
+            f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: true });
+        }
+        // Airborne position with barometric altitude.
         9..=18 => {
             let alt12 = field(8, 12);
             let q = (alt12 >> 4) & 1;
             if q == 1 {
                 let n = ((alt12 & 0xFE0) >> 1) | (alt12 & 0x00F);
-                (None, Some((n as i32) * 25 - 1000))
-            } else {
-                (None, None) // 100 ft Gillham coding: rare above FL500, skip
+                f.altitude_ft = Some((n as i32) * 25 - 1000);
             }
+            f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false });
         }
-        _ => (None, None),
+        19 => f.velocity = decode::velocity(me),
+        // Airborne position with GNSS height: take the position; the
+        // altitude encoding differs (HAE) and is left undecoded.
+        20..=22 => {
+            f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false });
+        }
+        _ => {}
     }
 }
 
