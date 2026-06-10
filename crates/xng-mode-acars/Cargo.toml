@@ -1,0 +1,14 @@
+[package]
+name = "xng-mode-acars"
+description = "Native ACARS (VHF plain-old ACARS, ARINC 618) decode core for xng"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+num-complex.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true

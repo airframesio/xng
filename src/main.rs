@@ -1,14 +1,20 @@
 //! xng — next-generation multi-mode SDR decoder.
 //!
-//! M0 foundation: CLI skeleton, message bus, console/JSONL outputs, IQ file
-//! tooling. Decode cores land per `docs/ARCHITECTURE.md` §5.
+//! M1: native ACARS decoding from SDR hardware or IQ recordings, with
+//! console/JSONL outputs and acarsdec-compatible Airframes feeding.
 
 mod bus;
 mod commands;
+mod freq;
 mod outputs;
+mod runtime;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use outputs::console::ConsoleFormat;
 use std::path::PathBuf;
+use xng_sdr::{FileIqSource, IqFormat};
+
+const AIRFRAMES_ACARS_UDP: &str = "feed.airframes.io:5550";
 
 #[derive(Parser)]
 #[command(name = "xng", version, about = "Next-generation multi-mode SDR decoder (ACARS, VDL2, HFDL, satcom, AIS, ...)")]
@@ -21,6 +27,61 @@ struct Cli {
     command: Command,
 }
 
+#[derive(Args)]
+struct TuneOpts {
+    /// Capture sample rate in Hz (must be an integer multiple of 24000 for
+    /// ACARS, e.g. 2400000)
+    #[arg(short = 'r', long)]
+    sample_rate: f64,
+    /// Capture center frequency (e.g. 131.500M)
+    #[arg(short = 'c', long)]
+    center_freq: String,
+    /// Channel frequencies, comma separated (e.g. 131.550,131.725)
+    #[arg(long, value_delimiter = ',', required = true)]
+    channels: Vec<String>,
+}
+
+#[derive(Args)]
+struct OutputOpts {
+    /// Print messages as raw JSON instead of pretty one-liners
+    #[arg(long)]
+    json: bool,
+    /// Append normalized messages to a JSONL file
+    #[arg(long)]
+    jsonl: Option<PathBuf>,
+    /// Send acarsdec-compatible JSON datagrams to host:port (repeatable)
+    #[arg(long)]
+    udp: Vec<String>,
+    /// Feed Airframes (acarsdec JSON to feed.airframes.io:5550); requires --station-id
+    #[arg(long)]
+    feed_airframes: bool,
+    /// Station ident (e.g. XX-KSEA-ACARS1)
+    #[arg(long)]
+    station_id: Option<String>,
+}
+
+impl OutputOpts {
+    fn build(&self) -> anyhow::Result<(runtime::OutputConfig, String)> {
+        let mut udp = self.udp.clone();
+        if self.feed_airframes {
+            anyhow::ensure!(
+                self.station_id.is_some(),
+                "--feed-airframes requires --station-id (e.g. XX-KSEA-ACARS1)"
+            );
+            udp.push(AIRFRAMES_ACARS_UDP.to_owned());
+        }
+        let ident = self.station_id.clone().unwrap_or_else(|| "XNG-DEV".to_owned());
+        Ok((
+            runtime::OutputConfig {
+                console: if self.json { ConsoleFormat::Json } else { ConsoleFormat::Pretty },
+                jsonl: self.jsonl.clone(),
+                udp,
+            },
+            ident,
+        ))
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// List available SDR devices (SoapySDR)
@@ -28,6 +89,31 @@ enum Command {
         /// SoapySDR filter args, e.g. "driver=rtlsdr"
         #[arg(default_value = "")]
         filter: String,
+    },
+    /// Decode ACARS from a recorded IQ file
+    Decode {
+        /// Path to the IQ file
+        file: PathBuf,
+        /// Sample format (cf32, cs16, cs8, cu8); guessed from extension if omitted
+        #[arg(short, long)]
+        format: Option<String>,
+        #[command(flatten)]
+        tune: TuneOpts,
+        #[command(flatten)]
+        output: OutputOpts,
+    },
+    /// Decode ACARS live from an SDR
+    Listen {
+        /// SoapySDR device args, e.g. "driver=rtlsdr" or "driver=airspy,serial=..."
+        #[arg(long, default_value = "")]
+        sdr: String,
+        /// Tuner gain in dB (hardware AGC when omitted)
+        #[arg(short, long)]
+        gain: Option<f64>,
+        #[command(flatten)]
+        tune: TuneOpts,
+        #[command(flatten)]
+        output: OutputOpts,
     },
     /// Inspect a recorded IQ file: duration, power, spectral peaks
     IqInfo {
@@ -55,20 +141,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Start decode sessions (native cores land in M1+)
-    Listen,
 }
 
 fn init_logging(verbose: u8) {
     let level = match verbose {
-        0 => "warn",
-        1 => "info",
-        2 => "debug",
+        0 => "info",
+        1 => "debug",
         _ => "trace",
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+}
+
+fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(u64, Vec<u64>)> {
+    let center = freq::parse_hz(&tune.center_freq)?;
+    let channels = tune
+        .channels
+        .iter()
+        .map(|c| freq::parse_hz(c))
+        .collect::<anyhow::Result<Vec<u64>>>()?;
+    Ok((center, channels))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -77,15 +170,63 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Devices { filter } => commands::devices::run(&filter),
+        Command::Decode { file, format, tune, output } => {
+            let fmt = match format.as_deref() {
+                Some(f) => f.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+                None => IqFormat::from_extension(&file).ok_or_else(|| {
+                    anyhow::anyhow!("cannot guess IQ format; pass --format (cf32|cs16|cs8|cu8)")
+                })?,
+            };
+            let (center_hz, channels_hz) = parse_tune(&tune)?;
+            let (outputs, station_ident) = output.build()?;
+            let source = FileIqSource::open(&file, fmt, tune.sample_rate, center_hz)?;
+            runtime::run_acars_session(
+                Box::new(source),
+                runtime::SessionConfig {
+                    center_hz,
+                    channels_hz,
+                    station_ident,
+                    sdr: Some(xng_types::SdrInfo {
+                        id: "file".into(),
+                        driver: "file".into(),
+                        serial: None,
+                    }),
+                    outputs,
+                },
+            )
+        }
+        Command::Listen { sdr, gain, tune, output } => {
+            listen(&sdr, gain, &tune, &output)
+        }
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
         }
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
-        Command::Listen => {
-            anyhow::bail!(
-                "native decode cores land starting with M1 (ACARS); see docs/ARCHITECTURE.md §5. \
-                 The legacy dumphfdl wrapper lives in legacy/ until the extern module returns in M10."
-            )
-        }
     }
+}
+
+#[cfg(feature = "soapy")]
+fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
+    let (center_hz, channels_hz) = parse_tune(tune)?;
+    let (outputs, station_ident) = output.build()?;
+    let source = xng_sdr::soapy::SoapyIqSource::open(sdr, tune.sample_rate, center_hz, gain)?;
+    runtime::run_acars_session(
+        Box::new(source),
+        runtime::SessionConfig {
+            center_hz,
+            channels_hz,
+            station_ident,
+            sdr: Some(xng_types::SdrInfo {
+                id: sdr.to_owned(),
+                driver: "soapysdr".into(),
+                serial: None,
+            }),
+            outputs,
+        },
+    )
+}
+
+#[cfg(not(feature = "soapy"))]
+fn listen(_sdr: &str, _gain: Option<f64>, _tune: &TuneOpts, _output: &OutputOpts) -> anyhow::Result<()> {
+    anyhow::bail!("xng was built without SDR device support; rebuild with --features soapy")
 }

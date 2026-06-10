@@ -45,6 +45,16 @@ mod tests {
     }
 
     #[test]
+    fn arinc_618_worked_example() {
+        // ARINC 618 §2.2.10: the string "K7" with odd parity = octets
+        // 0xCB 0x37; the spec gives the BCS as 3E 6B (MSB-first), i.e.
+        // CRC value 0x6B3E, low byte transmitted first.
+        assert_eq!(acars_crc(&[0xCB, 0x37]), 0x6B3E);
+        // Verification residue: CRC over message + BCS bytes (low first) == 0
+        assert_eq!(acars_crc(&[0xCB, 0x37, 0x3E, 0x6B]), 0x0000);
+    }
+
+    #[test]
     fn hdlc_frame_verification() {
         let mut frame = CHECK.to_vec();
         let fcs = hdlc_fcs(CHECK);

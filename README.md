@@ -17,25 +17,38 @@ roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
 xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
 still buildable standalone.
 
-## Current state (M0 — foundation)
+## Current state (M1 — native ACARS)
 
-- Cargo workspace with the first foundation crates:
-  - **`xng-types`** — the normalized message model (in-process form of the
-    future asf-2.0 envelope)
-  - **`xng-dsp`** — polyphase filter-bank channelizer, FIR/NCO primitives,
-    CRC variants used by the decode cores
-  - **`xng-sdr`** — `IqSource` abstraction: SoapySDR capture (feature
-    `soapy`, on by default) and IQ file replay (cf32/cs16/cs8/cu8)
-- `xng` binary with the message bus and console/JSONL outputs
+The first native decode core is in: **multi-channel VHF ACARS** (ARINC 618),
+implemented clean-room — MSK discriminator demod, differential decode,
+sync/parity/CRC deframing — with any number of channels decoded from one
+SDR capture.
 
 ```bash
-xng devices                                   # enumerate SDRs via SoapySDR
-xng iq-info capture.cf32 -r 2000000 \
-    --center-freq 131550000                   # inspect a recording: power, peaks
-xng selftest --jsonl out.jsonl                # end-to-end pipeline self-test
+# Live: two ACARS channels from one RTL-SDR capture, feeding Airframes
+xng listen --sdr driver=rtlsdr -r 2400000 -c 131.500M \
+    --channels 131.550,131.725 \
+    --feed-airframes --station-id XX-KSEA-ACARS1
+
+# From a recording
+xng decode capture.cf32 -r 2400000 -c 131.500M --channels 131.550,131.425
+
+# Generate a synthetic test capture (no hardware needed)
+cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32
+
+xng devices                     # enumerate SDRs via SoapySDR
+xng iq-info capture.cf32 -r 2000000 -c 131500000   # power, spectral peaks
+xng selftest                    # end-to-end pipeline self-test
 ```
 
-Native decode cores land in milestone order (ACARS first): see the
+Outputs: pretty console, raw JSON, JSONL files, and acarsdec-compatible
+JSON over UDP (`--udp host:port`, `--feed-airframes` →
+feed.airframes.io:5550). The asf-2.0 gRPC/QUIC output lands in M3.
+
+Workspace crates so far: `xng-types` (normalized message model),
+`xng-dsp` (PFB channelizer, DDC, FIR/NCO, CRCs), `xng-sdr` (SoapySDR +
+IQ-file sources), `xng-mode-acars` (ARINC 618 core + modulator for
+loopback tests). Remaining modes land in milestone order: see the
 [roadmap](docs/ARCHITECTURE.md#5-roadmap).
 
 ## Building

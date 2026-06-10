@@ -6,11 +6,13 @@
 
 pub mod channelizer;
 pub mod checksum;
+pub mod ddc;
 pub mod fir;
 pub mod nco;
 pub mod window;
 
 pub use channelizer::PfbChannelizer;
+pub use ddc::Ddc;
 pub use fir::{lowpass_taps, Fir};
 pub use nco::Nco;
 

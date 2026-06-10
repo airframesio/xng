@@ -1269,6 +1269,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "xng-dsp",
+ "xng-mode-acars",
  "xng-sdr",
  "xng-types",
 ]
@@ -1280,6 +1281,16 @@ dependencies = [
  "crc",
  "num-complex",
  "rustfft",
+]
+
+[[package]]
+name = "xng-mode-acars"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "xng-dsp",
+ "xng-types",
 ]
 
 [[package]]
