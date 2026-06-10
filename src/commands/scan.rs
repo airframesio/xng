@@ -92,6 +92,20 @@ struct ScanReport<'a> {
     dwell_secs: u64,
     results: &'a [ChannelResult],
     proposals: Vec<String>,
+    /// HFDL system tables decoded over the air during the scan.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    systables: Vec<serde_json::Value>,
+}
+
+/// Frequencies advertised in a decoded HFDL system table (Hz).
+fn systable_freqs(table: &serde_json::Value) -> Vec<u64> {
+    table["stations"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|gs| gs["frequencies"].as_array().into_iter().flatten())
+        .filter_map(|f| f["freq_hz"].as_u64())
+        .collect()
 }
 
 pub fn run(
@@ -129,13 +143,39 @@ pub fn run(
         groups_total as u64 * (dwell_secs + 2)
     );
 
+    let mut systables: Vec<serde_json::Value> = Vec::new();
     for (mode, rate, groups) in plans {
-        for (center, channels) in groups {
+        let mut known: std::collections::BTreeSet<u64> =
+            groups.iter().flat_map(|(_, g)| g.iter().copied()).collect();
+        let mut queue: std::collections::VecDeque<(u64, Vec<u64>)> = groups.into();
+        while let Some((center, channels)) = queue.pop_front() {
             let span: Vec<String> =
                 channels.iter().map(|&c| format!("{:.3}", c as f64 / 1e6)).collect();
             println!("→ {mode} @ {:.3} MHz: {}", center as f64 / 1e6, span.join(", "));
             match scan_group(sdr, gain, mode, rate, center, &channels, dwell_secs) {
-                Ok(mut group_results) => results.append(&mut group_results),
+                Ok((mut group_results, tables)) => {
+                    results.append(&mut group_results);
+                    // A decoded system table extends the plan with any
+                    // frequencies the network advertises that we aren't
+                    // already scanning.
+                    for table in tables {
+                        let fresh: Vec<u64> = systable_freqs(&table)
+                            .into_iter()
+                            .filter(|f| *f > 0 && known.insert(*f))
+                            .collect();
+                        println!(
+                            "  system table v{}: {} station(s), {} new frequency(ies)",
+                            table["version"],
+                            table["stations"].as_array().map_or(0, |s| s.len()),
+                            fresh.len()
+                        );
+                        if !fresh.is_empty() {
+                            let passband = xng_mode_hfdl::CHANNEL_PASSBAND_HZ;
+                            queue.extend(group_channels(&fresh, rate, passband));
+                        }
+                        systables.push(table);
+                    }
+                }
                 Err(e) => println!("  group skipped: {e}"),
             }
         }
@@ -220,7 +260,7 @@ pub fn run(
     }
 
     if let Some(path) = out_json {
-        let report = ScanReport { dwell_secs, results: &results, proposals };
+        let report = ScanReport { dwell_secs, results: &results, proposals, systables };
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
         println!("\nreport written to {}", path.display());
     }
@@ -235,7 +275,7 @@ fn scan_group(
     center: u64,
     channels: &[u64],
     dwell_secs: u64,
-) -> anyhow::Result<Vec<ChannelResult>> {
+) -> anyhow::Result<(Vec<ChannelResult>, Vec<serde_json::Value>)> {
     let mut source = crate::open_sdr(sdr, rate, center, gain)?;
     let cfg = SessionConfig {
         mode,
@@ -255,7 +295,7 @@ fn scan_group(
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;
     let bus = MessageBus::new();
-    let _keep = bus.subscribe(); // keep the bus open; messages are counted via stats
+    let mut rx = bus.subscribe(); // counted via stats; drained for systables after the dwell
     let live = runtime::LiveState::new();
     let stop = Arc::new(AtomicBool::new(false));
     let station = StationIdentity::new("XNG-SCAN");
@@ -281,8 +321,17 @@ fn scan_group(
     )?;
     let _ = stop_thread.join();
 
+    let mut systables = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        if let xng_types::MessageBody::Hfdl { kind, details } = &msg.body {
+            if kind == "systable-complete" {
+                systables.push(details.clone());
+            }
+        }
+    }
+
     let levels = live.stats.lock().unwrap().clone();
-    Ok(stats
+    let results = stats
         .iter()
         .enumerate()
         .map(|(i, &(freq, frames, ok))| ChannelResult {
@@ -293,5 +342,6 @@ fn scan_group(
             level_dbfs: levels.get(i).map(|l| l.3).unwrap_or(-120.0),
             verdict: "quiet",
         })
-        .collect())
+        .collect();
+    Ok((results, systables))
 }
