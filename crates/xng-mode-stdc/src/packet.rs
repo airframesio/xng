@@ -144,9 +144,32 @@ fn parse_egc(desc: u8, p: &[u8]) -> Option<EgcPart> {
     })
 }
 
+/// True when the payload is overwhelmingly printable 7-bit text — the
+/// same pragmatic test inmarsatc applies (presentation codes are not
+/// always trustworthy on air).
+fn looks_textual(payload: &[u8]) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    let printable = payload
+        .iter()
+        .filter(|&&c| {
+            let c = c & 0x7F;
+            (0x20..0x7F).contains(&c) || c == b'\r' || c == b'\n' || c == 0x07
+        })
+        .count();
+    printable * 100 >= payload.len() * 85
+}
+
 fn decode_payload(presentation: u8, payload: &[u8]) -> (Option<String>, serde_json::Value) {
     match presentation {
         0 => (Some(ia5(payload)), json!({})),
+        // Unknown presentation codes: decode as IA5 when the bytes are
+        // overwhelmingly printable, otherwise keep hex.
+        _ if looks_textual(payload) => (
+            Some(ia5(payload)),
+            json!({ "presentation_heuristic": true }),
+        ),
         _ => (None, json!({ "payload_hex": hex(payload) })),
     }
 }
@@ -241,11 +264,18 @@ impl PacketParser {
                     "channel_type": body.get(6).map(|b| b >> 5),
                 }),
             ),
-            0x27 if body.len() >= 8 => ("logical-channel-clear", None, json!({
-                "mes_id": format!("{:02X}{:02X}{:02X}", body[1], body[2], body[3]),
-                "sat_les": sat_les(body[4]),
-                "lcn": body[5],
-            })),
+            0x27 if body.len() >= 8 => {
+                // The clear terminates the logical channel: emit any
+                // message-data assembled on that LCN.
+                if let Some(done) = self.finish_lcn(body[5]) {
+                    out.push(done);
+                }
+                ("logical-channel-clear", None, json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[1], body[2], body[3]),
+                    "sat_les": sat_les(body[4]),
+                    "lcn": body[5],
+                }))
+            }
             0x81 if body.len() >= 10 => ("announcement", None, json!({
                 "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
                 "sat_les": sat_les(body[5]),
@@ -271,7 +301,11 @@ impl PacketParser {
                         c.parts.push((seq, data));
                     }
                 }
-                ("message-data", None, json!({ "lcn": body[3], "pkt_seq": body[4] }))
+                ("message-data", None, json!({
+                    "sat_les": sat_les(body[2]),
+                    "lcn": body[3],
+                    "pkt_seq": body[4],
+                }))
             }
             0xB0 | 0xB1 | 0xB2 => {
                 if let Some(part) = parse_egc(desc, body) {
@@ -313,9 +347,19 @@ impl PacketParser {
             }
             0x92 => ("login-ack", None, json!({})),
             0xA8 => ("confirmation", None, json!({})),
-            0xAB => ("network-update", None, json!({})),
+            0xAB => ("les-list", None, json!({})),
             0x08 => ("ack-request", None, json!({})),
             0x6C => ("signalling-channel", None, json!({})),
+            0x2A => ("inbound-message-ack", None, json!({})),
+            0x91 => ("distress-alert-ack", None, json!({})),
+            0x9A => ("enhanced-data-report-ack", None, json!({})),
+            0xA0 => ("distress-test-request", None, json!({})),
+            0xA3 if body.len() >= 8 => ("individual-poll", None, json!({
+                "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                "sat_les": sat_les(body[5]),
+            })),
+            0xAC => ("request-status", None, json!({})),
+            0xAD => ("test-result", None, json!({})),
             _ => ("unknown", None, json!({ "hex": hex(body) })),
         };
         out.push(StdcPacket {
@@ -326,6 +370,39 @@ impl PacketParser {
             details,
             raw: pkt.to_vec(),
         });
+    }
+
+    /// Assemble and emit the message accumulated on a logical channel
+    /// (called when the channel is cleared).
+    fn finish_lcn(&mut self, lcn: u8) -> Option<StdcPacket> {
+        let idx = self.channels.iter().position(|c| c.lcn == lcn)?;
+        let mut c = self.channels.swap_remove(idx);
+        if c.parts.is_empty() {
+            return None;
+        }
+        c.parts.sort_by_key(|(s, _)| *s);
+        let mut payload = Vec::new();
+        for (_, p) in &c.parts {
+            payload.extend_from_slice(p);
+        }
+        let (text, extra) = decode_payload(0xFF, &payload);
+        let mut details = json!({
+            "lcn": lcn,
+            "parts": c.parts.len(),
+        });
+        if let (Some(obj), Some(eobj)) = (details.as_object_mut(), extra.as_object()) {
+            for (k, v) in eobj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        Some(StdcPacket {
+            descriptor: 0xAA,
+            name: "message",
+            checksum_ok: true,
+            text,
+            details,
+            raw: payload,
+        })
     }
 
     fn push_egc(&mut self, part: EgcPart) -> Option<StdcPacket> {
@@ -429,6 +506,39 @@ mod tests {
         body.extend(text);
         body[1] = (body.len() + 2 - 2) as u8; // medium length = total-2
         build_packet(&body)
+    }
+
+    #[test]
+    fn lcn_message_assembled_on_channel_clear() {
+        let mut parser = PacketParser::new();
+        // Two message-data packets on LCN 7 (out of order), then the
+        // channel clear that terminates the message.
+        // Medium format: b[1] = total length - 2 (incl. checksum).
+        let p2 = build_packet(&[&[0xAA, 11, 0x65, 7, 1][..], b" WORLD"].concat());
+        let p1 = build_packet(&[&[0xAA, 10, 0x65, 7, 0][..], b"HELLO"].concat());
+        // Short format: total length = (desc & 0x0F) + 1 = 8 incl. checksum.
+        let clear = build_packet(&[0x27, 0x01, 0x02, 0x03, 0x65, 7]);
+        let frame: Vec<u8> = [p2, p1, clear].concat();
+        let mut padded = frame.clone();
+        padded.resize(640, 0);
+        let out = parser.parse_frame(&padded);
+        let msg = out.iter().find(|p| p.name == "message").expect("assembled message");
+        assert_eq!(msg.text.as_deref(), Some("HELLO WORLD"));
+        assert_eq!(msg.details["lcn"], 7);
+        assert_eq!(msg.details["parts"], 2);
+        assert!(out.iter().any(|p| p.name == "logical-channel-clear"));
+    }
+
+    #[test]
+    fn individual_poll_fields() {
+        let mut parser = PacketParser::new();
+        // Medium format: b[1] = total length - 2.
+        let poll = build_packet(&[0xA3, 8, 0xC1, 0x24, 0xBB, 0x55, 0x01, 0x03]);
+        let mut padded = poll.clone();
+        padded.resize(640, 0);
+        let out = parser.parse_frame(&padded);
+        let p = out.iter().find(|p| p.name == "individual-poll").expect("poll parses");
+        assert_eq!(p.details["mes_id"], "C124BB");
     }
 
     #[test]
