@@ -9,6 +9,22 @@ fn push_field(bits: &mut Vec<u8>, v: u32, n: usize) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("da") {
+        let mut payload = [0u8; 20];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i as u8) * 11 + 5;
+        }
+        let mut bits: Vec<u8> = frame::ACCESS_DL.to_vec();
+        bits.extend(frame::encode_lcw(2, 0, 0x1FF));
+        bits.extend(frame::encode_da_payload(&frame::build_da_bits(false, 0, 20, &payload)));
+        let bitstr: String = bits.iter().map(|&b| char::from(b'0' + b)).collect();
+        let (da, _) = xng_mode_iridium::decode_da_bits(&bits).expect("decodes");
+        println!("{bitstr}");
+        println!("{{\"ctr\":{},\"len\":{},\"crc_ok\":{},\"data\":\"{}\"}}",
+            da.ctr, da.len, da.crc_ok,
+            da.data.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        return;
+    }
     let mut d = Vec::new();
     push_field(&mut d, 75, 7); // sat
     push_field(&mut d, 21, 6); // beam
