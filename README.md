@@ -47,7 +47,7 @@ conventions — invisible to loopback testing — were caught only this way).
 
 | Mode | `--mode` | Band | What you get | Validation |
 |---|---|---|---|---|
-| VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + applications | Live off-air (RTL-SDR), CRC-verified |
+| VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + applications | Live off-air (RTL-SDR), CRC-verified, **fed to production Airframes end-to-end** |
 | VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | AVLC, ACARS-over-AVLC, XID | Off-air capture vs dumpvdl2 ground truth |
 | HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons, positions, ACARS, **over-the-air system table** | Off-air 21 931 kHz capture, field-exact vs dumphfdl |
 | Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air |
