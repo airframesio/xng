@@ -1,0 +1,13 @@
+[package]
+name = "xng-dsp"
+description = "DSP primitives for the xng multi-mode SDR decoder: polyphase channelizer, FIR/NCO, FEC and CRC building blocks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+crc.workspace = true
+num-complex.workspace = true
+rustfft.workspace = true

@@ -1,29 +1,99 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["legacy"]
+resolver = "2"
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/airframesio/xng"
+authors = ["Kevin Elliott", "xng contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+crc = "3"
+crossbeam-channel = "0.8"
+num-complex = "0.4"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "io-util", "net", "signal", "sync", "fs", "process", "io-std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+xng-types = { path = "crates/xng-types" }
+xng-dsp = { path = "crates/xng-dsp" }
+xng-sdr = { path = "crates/xng-sdr" }
+xng-mode-acars = { path = "crates/xng-mode-acars" }
+xng-mode-ais = { path = "crates/xng-mode-ais" }
+xng-mode-adsb = { path = "crates/xng-mode-adsb" }
+xng-proto = { path = "crates/xng-proto" }
+xng-acars = { path = "crates/xng-acars" }
+xng-mode-vdl2 = { path = "crates/xng-mode-vdl2" }
+xng-mode-aero = { path = "crates/xng-mode-aero" }
+xng-mode-stdc = { path = "crates/xng-mode-stdc" }
+xng-mode-hfdl = { path = "crates/xng-mode-hfdl" }
+prost = "0.13"
+tonic = "0.12"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+ratatui = "0.30"
+rcgen = "0.13"
+rustls-pemfile = "2"
+tokio-stream = "0.1"
+webpki-roots = "0.26"
+
+# DSP loopback tests are too slow unoptimized.
+[profile.test]
+opt-level = 2
+
 [package]
 name = "xng"
-version = "0.1.0"
-edition = "2021"
+description = "Next-generation multi-mode SDR decoder for ACARS, VDL2, HFDL, satcom, AIS, and more"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[features]
+default = ["soapy"]
+soapy = ["xng-sdr/soapy"]
 
 [dependencies]
-actix-web = "4.3.1"
-async-trait = "0.1.68"
-chrono = { version = "0.4.26", features = ["serde"] }
-chrono-tz = { version = "0.8.2", features = ["serde"] }
-clap = { version = "4.2.7", features = ["cargo"] }
-csv = "1.2.2"
-elasticsearch = { version = "8.5.0-alpha.1", features = ["native-tls"] }
-exitcode = "1.1.2"
-lazy_static = "1.4.0"
-log = "0.4.17"
-rand = "0.8.5"
-regex = "1.8.1"
-reqwest = "0.11.17"
-serde = { version = "1.0.162", features = ["derive"] }
-serde_json = "1.0.96"
-serde_valid = "0.16.1"
-soapysdr = "0.3.2"
-sqlx = { version = "0.6.3", features = ["sqlite", "chrono", "runtime-tokio-native-tls"] }
-stderrlog = "0.5.4"
-tokio = { version = "1.28.0", features = ["process", "macros", "time", "rt-multi-thread", "io-util", "net", "signal"] }
-tokio-util = "0.7.8"
+anyhow.workspace = true
+chrono.workspace = true
+clap = { version = "4", features = ["derive"] }
+num-complex.workspace = true
+rustfft.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+xng-types.workspace = true
+xng-dsp.workspace = true
+xng-sdr.workspace = true
+xng-mode-acars.workspace = true
+xng-mode-ais.workspace = true
+xng-mode-adsb.workspace = true
+xng-proto.workspace = true
+xng-acars.workspace = true
+xng-mode-vdl2.workspace = true
+xng-mode-aero.workspace = true
+xng-mode-stdc.workspace = true
+xng-mode-hfdl.workspace = true
+prost.workspace = true
+tonic.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+ratatui.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+tokio-stream.workspace = true
+webpki-roots.workspace = true

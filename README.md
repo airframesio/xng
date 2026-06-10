@@ -1,104 +1,179 @@
 # xng
+
 [![Rust](https://github.com/airframesio/xng/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/airframesio/xng/actions/workflows/rust.yml)
 
-Next-generation multi-decoder client for SDRs, written in Rust for Linux, Windows, MacOS.
+Next-generation **multi-mode SDR decoder**, written in Rust.
 
-Notable features:
- * Deep integration with [airframes.io](https://airframes.io); feed data using a single flag or use Airframes to seed initial active HFDL frequencies
- * Integration with [SoapySDR](https://github.com/pothosware/SoapySDR) for determining valid sample rates
- * Efficient listening -- no need to burn CPU listening to inactive frequencies; session restarts on detection of new active frequencies to keep listening band up-to-date
- * Web API for controlling session settings and exposing stats + metrics
- * and more...
+One binary that natively decodes ACARS, VDL Mode 2, HFDL, Inmarsat Aero +
+STD-C, AIS, ADS-B (and later Iridium) — replacing acarsdec, vdlm2dec,
+dumpvdl2, dumphfdl, JAERO, and friends with consistent decode cores, shared
+SDR captures with multi-channel decode, first-class
+[airframes.io](https://airframes.io) feeding (including the new gRPC/QUIC
+`asf-2.0` output), rich statistics, a strong CLI, and an interactive TUI with
+realtime diagnostics and auto-scanning.
 
-For Ubuntu/Debian, check out GitHub Actions for `amd64` packages.
+**Status: ground-up rewrite in progress.** The architecture, research, and
+roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
+xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
+still buildable standalone.
 
-## Requirements
- * Install [dumphfdl](https://github.com/szpajder/dumphfdl)
- * Install [dumpvdl2](https://github.com/szpajder/dumpvdl2)
- 
+## Current state (M7 — seven native decode cores; wave 1 complete)
+
+Seven native decode cores are in:
+
+- **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
+  sync/parity/CRC deframing, parity-guided single-bit error correction.
+  Validated off-air against an RTL-SDR (live United/American frames,
+  CRC-verified). Application layer via **`xng-acars`** (libacars port, MIT):
+  ARINC 622 envelopes with CRC, full **ADS-C** decode (positions!), media
+  advisory, H1 sublabel/MFI — conformance-tested against real off-air
+  ADS-C messages.
+- **AIS** (ITU-R M.1371): GMSK demod with carrier-offset tracking, HDLC
+  deframing with destuffing, CRC-16/X-25, NMEA AIVDM output — verified
+  against the canonical published AIVDM test vector.
+- **VDL Mode 2** (ICAO Annex 10 Vol III / ETSI EN 301 841): D8PSK burst
+  demod with unique-word acquisition and carrier-offset tracking,
+  RS(255,249) errors-and-erasures FEC, scrambler, AVLC link layer,
+  ACARS-over-AVLC into the shared application layer. Verified against
+  spec-derived vectors (scrambler keystream, header FEC, unique word) and
+  RF loopback; off-air validation pending usable VDL2 RF at this site.
+- **Inmarsat Aero** (ported from MIT-licensed JAERO): L-band A-BPSK/MSK
+  P-channels at 600/1200 bps (both rates decoded in parallel per channel)
+  and C-band R/T-channel bursts (`--mode aero-c`: burst gating, carrier
+  CFO estimation, R-SU and T-burst signal-unit layers), K=7 Viterbi,
+  64-row interleaver, ISU/SSU reassembly, ACARS into the shared
+  application layer. 10.5 kbps A-QPSK: framing complete (bit-level
+  tested); OQPSK demod in progress.
+- **Inmarsat STD-C / EGC** (clean-room from cross-verified facts; first
+  coherent demod in the codebase — square-law AFC, Costas, Gardner):
+  NCS frames (UW sync both polarities, row depermutation, 64×162
+  deinterleave, Viterbi, group descrambler), packet layer with Fletcher
+  checksums, multiframe and logical-channel assembly, and EGC SafetyNET/
+  FleetNET messages with service/priority decoding (`--mode std-c`).
+- **HFDL** (ICAO Annex 10 Vol III Ch. 11 / ARINC 635 — the first native
+  Rust HFDL decoder): M-PSK burst demod at all four rates (300/600/1200/
+  1800 bps; BPSK/4PSK/8PSK with rate-1/4 chip doubling), A1/A2/M1
+  preamble acquisition with cyclic-shift rate detection, per-T-segment
+  phase tracking, 40-row interleaver, shared Viterbi, SPDU squitters,
+  MPDU/LPDU/HFNPDU with enveloped ACARS into the shared application
+  layer (`--mode hfdl`).
+- **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
+  CRC-24 validation with an ICAO cache for address-overlaid parity,
+  extended-squitter ident/altitude decode — verified against published
+  Mode S frames; zero false positives on off-air noise.
+
+ACARS and AIS decode any number of channels from one SDR capture;
+Mode S consumes the whole capture at 1090 MHz.
+
+```bash
+# Live: two ACARS channels from one RTL-SDR capture, feeding Airframes
+xng listen --sdr driver=rtlsdr -r 2400000 -c 131.500M \
+    --channels 131.550,131.725 \
+    --feed-airframes --station-id XX-KSEA-ACARS1
+
+# From a recording
+xng decode capture.cf32 -r 2400000 -c 131.500M --channels 131.550,131.425
+
+# AIS: both channels from one capture
+xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
+    --channels 161.975,162.025
+
+# ADS-B / Mode S
+xng listen --sdr driver=rtlsdr --mode adsb -r 2000000 -c 1090.000M --channels 1090
+
+# VDL Mode 2: four channels incl. the worldwide CSC
+xng listen --sdr driver=rtlsdr --mode vdl2 -r 2400000 -c 136.800M \
+    --channels 136.650,136.800,136.925,136.975
+
+# Inmarsat Aero L-band P-channels (patch antenna + LNA at 1545-1547 MHz)
+xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
+    --channels 1545.880,1546.045
+
+# Inmarsat STD-C / EGC (SafetyNET maritime safety broadcasts)
+xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
+    --channels 1537.700,1537.100
+
+# HFDL (needs an HF-capable SDR/upconverter; channels from systable)
+xng listen --sdr driver=sdrplay --mode hfdl -r 768000 -c 10060.000k \
+    --channels 10027k,10060k,10063k,10081k,10084k,10087k
+
+# Generate a synthetic test capture (no hardware needed)
+cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32
+
+xng devices                     # enumerate SDRs via SoapySDR
+xng iq-info capture.cf32 -r 2000000 -c 131500000   # power, spectral peaks
+xng selftest                    # end-to-end pipeline self-test
+```
+
+**Auto-scanner** (`xng scan`): steps the SDR across built-in frequency
+plans (ACARS, VDL2, AIS, ADS-B, STD-C, HFDL per the public system
+table), runs the real decoders as signature detectors for a dwell
+period, and proposes ready-to-run configurations — the Airwaves OS
+site-survey foundation:
+
+```bash
+xng scan --sdr driver=rtlsdr --gain 28 --modes acars,vdl2,ais --dwell 120 --out scan.json
+```
+
+**Interactive TUI** (`xng tui`): live message browser with JSON detail
+pane, per-channel statistics, spectrum with channel markers, and a
+waterfall — over a live SDR or a replayed IQ file:
+
+```bash
+xng tui --sdr driver=rtlsdr -r 2400000 -c 131.500M --channels 131.550,131.125
+xng tui --file capture.cf32 -r 2400000 -c 131.500M --channels 131.550
+```
+
+**Wrapped external decoders** (`xng extern`, second-class): pipe or
+spawn dumphfdl/dumpvdl2/acarsdec and normalize their JSON onto the xng
+bus — wrapped decoders get every output (asf-2.0, feeds, JSONL) and the
+xng application layer (ADS-C decodes even from wrapped ACARS):
+
+```bash
+dumpvdl2 ... | xng extern --format dumpvdl2 --asf2-grpc http://ingest:6001
+xng extern --format dumphfdl --feed-airframes --station-id XX-... -- dumphfdl --soapysdr driver=sdrplay ...
+```
+
+**Prometheus metrics**: `--metrics 0.0.0.0:9090` on listen/decode serves
+per-channel frame/CRC counters and signal levels.
+
+Outputs: pretty console, raw JSON, JSONL files, acarsdec-compatible JSON
+over UDP (`--udp host:port`, `--feed-airframes` → feed.airframes.io:5550),
+and the new **asf-2.0** protocol ([docs/ASF2.md](docs/ASF2.md)): one
+protobuf schema over gRPC (`--asf2-grpc URL`) and QUIC (`--asf2-quic
+host:port`), multiplexing every channel/SDR/mode over a single connection.
+`xng ingest` runs the reference ingest server for both transports:
+
+```bash
+xng ingest --grpc 0.0.0.0:6001 --quic 0.0.0.0:6011   # receive asf-2.0 feeds
+```
+
+Workspace crates so far: `xng-types` (normalized message model),
+`xng-proto` (asf-2.0 schema + conversions), `xng-acars` (ACARS
+application layer: ARINC 622/ADS-C, shared by five modes),
+`xng-dsp` (PFB channelizer, DDC, FIR/NCO, CRCs), `xng-sdr` (SoapySDR +
+IQ-file sources), `xng-mode-acars`, `xng-mode-ais`, and
+`xng-mode-adsb` (decode cores, each with a spec-faithful modulator for
+loopback tests). Remaining modes land
+in milestone order: see the
+[roadmap](docs/ARCHITECTURE.md#5-roadmap).
+
 ## Building
- 1. Install a stable [Rust](https://www.rust-lang.org/learn/get-started) toolchain. Make sure the `cargo` command is in `PATH` environment variable after completion.
- 2. Make sure to install `SoapySDR` development files either by compiling manually or installing the package provided by your Linux distribution's package manager.
- 3. Clone the xng repository:
-```bash
-git clone https://github.com/airframesio/xng
-```
- 4. Compile and build `xng`:
-```bash
-cargo build --release
-```
- 5. Compiled binary should be built in `./target/release/xng`
 
-## How To Run
-### No fuss "I want to run this to feed HFDL now"
-If you've followed the previous instructions and the current directory is the `xng` repo root, run the following (assuming an Airspy HF SDR):
-```bash
-./target/release/xng hfdl -vvv --systable /etc/systable.conf --sample-rate 512000 --start-band-contains 8000 --use-airframes-gs-map --method random --only-listen-on-active --feed-airframes -- --soapysdr driver=airspyhf --station-id "MY-STATION-ID"
-```
-
-This quick example starts a HFDL listening session using the SoapySDR `airspyhf` driver to listen to all active HFDL stations in the range of 8Mhz. While feeding to Airframes as station `MY-STATION-ID`.
-
-### Fancy options with ElasticSearch backend
-**NOTE:** If you want to index received frames to a local ElasticSearch instance, run the following command first:
-```bash
-xng init_es --elastic "http://my-es-server:9200" --elastic-index xng_acars_db
-```
-
-Following example starts a HFDL listening session on the 8MHz band (as determined by splitting the `systable.conf` bands into sample rate wide frequency ranges) with the following options:
- * Feed all received HFDL frames to Airframes with a station name of `MY-STATION-ID`
- * Use Airframes active HFDL frequencies API to determine active frequencies
- * Only listen on active HFDL frequencies
- * Store frequencies/aircraft events stats into a local DB file, `xng_state.db`
- * Index the frames into the `xng_acars_db` index on the Elasticsearch server at `https://my-es-server:9200`
- * Use the SoapySDR `airspyhf` driver
+1. Install a stable [Rust](https://www.rust-lang.org/learn/get-started) toolchain.
+2. Install SoapySDR development files (`libsoapysdr-dev` on Debian/Ubuntu,
+   `soapysdr` via Homebrew on macOS) plus the vendor modules for your
+   hardware. Or build without hardware support: `cargo build --no-default-features`.
+3. Build:
 
 ```bash
-xng hfdl -vvv --systable /etc/systable.conf --sample-rate 512000 --start-band-contains 8000 --use-airframes-gs-map --method random --only-listen-on-active --feed-airframes --elastic "https://my-es-server:9200" --elastic-index xng_acars_db  -- --soapysdr driver=airspyhf --station-id "MY-STATION-ID"
+cargo build --release    # binary at ./target/release/xng
+cargo test --workspace
 ```
 
-## Web API Endpoints
-Examine which frequencies have been heard from and from which ground stations they were from or meant to go to. 
-```bash
-curl -H "Content-Type: application/json" "http://localhost:7871/api/frequency/stats/" | jq
-```
+## License
 
-Examine all non-stale (as determined by timeout value configurable by the user) ground stations 
-```bash
-curl -H "Content-Type: application/json" "http://localhost:7871/api/ground-station/active/" | jq
-```
-
-Delete all aircraft events and ground station change events before a specific time (such as July 1, 2023 at 00:00 UTC in this example)
-```bash
-curl -H "Content-Type: application/json" -X DELETE "http://localhost:7871/api/cleanup/?before=2023-07-01T00:00:00Z"
-```
-
-Examine application settings -- all items in `props` are modifiable via `PATCH` (see next example)
-```bash
-curl -H "Content-Type: application/json" "http://localhost:7871/api/settings/" | jq
-```
-
-Update application settings (such as the next session's frequency band)
-```bash
-curl -H "Content-Type: application/json" -X PATCH -d '{"prop":"next_session_band","value":17000}' "http://localhost:7871/api/settings/"
-```
-
-Update application settings (setting a session schedule that sets the listening band to 21000 at 9am and 8000 at 8pm)
-```bash
-curl -H "Content-Type: application/json" -X PATCH -d '{"prop":"session_schedule","value":"time=9:00,band_contains=21000;time=20:00,band_contains=8000"}' "http://localhost:7871/api/settings/"
-```
-
-Force end session (can be used in conjunction with update application settings to manually force a listening frequencies change)
-```bash
-curl -H "Content-Type: application/json" -X DELETE "http://localhost:7871/api/session/"
-```
-## TODO
-- [x] Web API endpoint to clean up state DB by clearing aircraft/ground station events older than a certain date
-- [x] Web API endpoint to show flight overview (latest position from all callsign/ICAO combinations)
-- [x] Web API endpoint to show detailed flight path by ICAO/tail/callsign
-
-- [ ] Fancy verbose frame status messages
-- [ ] More documentation detailing advanced session settings like scheduling and next session frequency strategies
-- [ ] Simple front-end UI to graphically view aircraft events
-- [ ] Add support for `dumpvdl2` via `aoa` subcommand
-- [ ] Add support for `acarsdec` via `poa` subcommand
-- [ ] Add support for `gr-iridium` via `irdm` subcommand
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
+your option. Decode cores are implemented clean-room from public standards
+(ICAO, ARINC, ITU-R) or ported from permissively licensed projects — see
+`docs/ARCHITECTURE.md` §6 for provenance rules.

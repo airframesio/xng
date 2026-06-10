@@ -1,0 +1,14 @@
+[package]
+name = "xng-mode-adsb"
+description = "Native Mode S / ADS-B (1090 MHz) decode core for xng: PPM demod, CRC-24 validation, basic extended-squitter decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+num-complex.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true
