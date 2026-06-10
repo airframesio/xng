@@ -3545,6 +3545,7 @@ dependencies = [
  "xng-mode-aero",
  "xng-mode-ais",
  "xng-mode-hfdl",
+ "xng-mode-iridium",
  "xng-mode-stdc",
  "xng-mode-vdl2",
  "xng-proto",
@@ -3623,6 +3624,21 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "num-complex",
+ "serde",
+ "serde_json",
+ "xng-acars",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-iridium"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "crc",
+ "num-complex",
+ "rustfft",
  "serde",
  "serde_json",
  "xng-acars",

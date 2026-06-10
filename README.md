@@ -121,10 +121,15 @@ xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
 xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
     --channels 1537.700,1537.100
 
-# Iridium: live satellite positions from the ring-alert simplex channels.
-# (ACARS-over-SBD rides duplex channels across the band; the wideband
-# burst-hunting front end for that lives in xng-mode-iridium::wideband —
-# CLI wiring is the next step.)
+# Iridium, wideband: point at the band, get everything — bursts are
+# hunted across the whole capture (ring alerts, broadcasts, and the
+# duplex-hopping SBD/ACARS traffic). Triggered by --channels equal to
+# the capture center:
+xng listen --sdr driver=rtlsdr --mode iridium -r 2000000 -c 1626.000M \
+    --channels 1626.000
+
+# Iridium, fixed channels: just the simplex ring-alert/messaging
+# frequencies (cheaper; live satellite positions every few seconds)
 xng listen --sdr driver=rtlsdr --mode iridium -r 2000000 -c 1626.250M \
     --channels 1626.271,1626.104
 

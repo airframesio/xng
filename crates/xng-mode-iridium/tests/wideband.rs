@@ -97,6 +97,39 @@ fn finds_bursts_across_the_band() {
 }
 
 #[test]
+fn wideband_decoder_emits_frames_with_offsets() {
+    use xng_mode_iridium::IridiumWidebandDecoder;
+    let fs = 2_000_000.0;
+    let off = -450_000.0f64;
+    let bits = ira_bits(77);
+    let burst = modulate::modulate(&bits, 64, fs, off, 0.4);
+    let mut sig = vec![Complex::new(0.0f32, 0.0); (0.2 * fs) as usize];
+    sig.extend(burst);
+    sig.extend(std::iter::repeat(Complex::new(0.0f32, 0.0)).take((0.2 * fs) as usize));
+    let mut noise = 0x4242_4242_4242_4242u64;
+    for s in &mut sig {
+        noise ^= noise << 13;
+        noise ^= noise >> 7;
+        noise ^= noise << 17;
+        let n1 = (noise as f32 / u64::MAX as f32) - 0.5;
+        noise ^= noise << 13;
+        noise ^= noise >> 7;
+        noise ^= noise << 17;
+        let n2 = (noise as f32 / u64::MAX as f32) - 0.5;
+        *s += Complex::new(n1 * 0.01, n2 * 0.01);
+    }
+    let mut dec = IridiumWidebandDecoder::new(fs).unwrap();
+    let mut frames = Vec::new();
+    for chunk in sig.chunks(65_536) {
+        frames.extend(dec.process(chunk));
+    }
+    let (o, f) = frames.first().expect("frame decoded");
+    assert!((o - off).abs() < 5_000.0, "offset {o}");
+    assert_eq!(f.kind, "ring-alert");
+    assert_eq!(f.details["sat"], 77);
+}
+
+#[test]
 fn decodes_gr_iridium_capture_via_wideband() {
     // The vendored channel-rate fixture proves the demod; this test
     // reuses the same burst re-upconverted into a 2 MHz band at an

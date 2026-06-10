@@ -58,38 +58,7 @@ impl IridiumChannelDecoder {
         let time = self.samples_seen as f64 / CHANNEL_RATE;
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
-            let bits = burst.bits;
-            if let Some(f) = decode_bits(&bits) {
-                out.push(f);
-                continue;
-            }
-            // LCW-bearing duplex frames: DA (SBD data) → reassembly →
-            // SBD transport → ACARS.
-            if let Some((da, raw)) = decode_da_bits(&bits) {
-                out.push(ira::IridiumFrame {
-                    kind: "ida",
-                    details: serde_json::json!({
-                        "cont": da.continuation,
-                        "ctr": da.ctr,
-                        "len": da.len,
-                        "crc_ok": da.crc_ok,
-                        "data_hex": da.data[..da.len.min(20) as usize]
-                            .iter()
-                            .map(|b| format!("{b:02x}"))
-                            .collect::<String>(),
-                    }),
-                    acars: None,
-                    raw_bits: raw,
-                });
-                if let Some(msg) = self.sbd.push(&da, time) {
-                    out.push(ira::IridiumFrame {
-                        kind: "sbd",
-                        details: msg.details.clone(),
-                        acars: msg.acars,
-                        raw_bits: Vec::new(),
-                    });
-                }
-            }
+            handle_bits(&burst.bits, time, &mut self.sbd, &mut out);
         }
         out
     }
@@ -131,6 +100,92 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
             Some(ira::parse_bc(bc_type, &payload, fixed, bits))
         }
         _ => None,
+    }
+}
+
+/// Decode one demodulated burst's bit stream into frames, feeding DA
+/// fragments through the SBD reassembler (shared by the single-channel
+/// and wideband decoders).
+fn handle_bits(
+    bits: &[u8],
+    time: f64,
+    sbd: &mut sbd::SbdReassembler,
+    out: &mut Vec<ira::IridiumFrame>,
+) {
+    if let Some(f) = decode_bits(bits) {
+        out.push(f);
+        return;
+    }
+    // LCW-bearing duplex frames: DA (SBD data) → reassembly → SBD
+    // transport → ACARS.
+    if let Some((da, raw)) = decode_da_bits(bits) {
+        out.push(ira::IridiumFrame {
+            kind: "ida",
+            details: serde_json::json!({
+                "cont": da.continuation,
+                "ctr": da.ctr,
+                "len": da.len,
+                "crc_ok": da.crc_ok,
+                "data_hex": da.data[..da.len.min(20) as usize]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>(),
+            }),
+            acars: None,
+            raw_bits: raw,
+        });
+        if let Some(msg) = sbd.push(&da, time) {
+            out.push(ira::IridiumFrame {
+                kind: "sbd",
+                details: msg.details.clone(),
+                acars: msg.acars,
+                raw_bits: Vec::new(),
+            });
+        }
+    }
+}
+
+/// Wideband decoder: hunts bursts across the whole capture (no channel
+/// list needed) and decodes them through the same frame/SBD chain.
+/// Returns each frame with the burst's frequency offset from the
+/// capture center.
+pub struct IridiumWidebandDecoder {
+    wb: wideband::IridiumWideband,
+    sbd: sbd::SbdReassembler,
+    samples_seen: u64,
+    input_rate: f64,
+    level: f32,
+}
+
+impl IridiumWidebandDecoder {
+    /// `input_rate` must be an integer multiple of 250 kHz.
+    pub fn new(input_rate: f64) -> Result<Self, String> {
+        Ok(Self {
+            wb: wideband::IridiumWideband::new(input_rate)?,
+            sbd: sbd::SbdReassembler::new(),
+            samples_seen: 0,
+            input_rate,
+            level: 0.0,
+        })
+    }
+
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<(f64, ira::IridiumFrame)> {
+        for x in input {
+            self.level += 1e-5 * (x.norm_sqr() - self.level);
+        }
+        self.samples_seen += input.len() as u64;
+        let time = self.samples_seen as f64 / self.input_rate;
+        let mut out = Vec::new();
+        for burst in self.wb.process(input) {
+            let mut frames = Vec::new();
+            handle_bits(&burst.bits, time, &mut self.sbd, &mut frames);
+            out.extend(frames.into_iter().map(|f| (burst.offset_hz, f)));
+        }
+        out
+    }
+
+    pub fn level_dbfs(&self) -> f32 {
+        10.0 * self.level.max(1e-12).log10()
     }
 }
 
