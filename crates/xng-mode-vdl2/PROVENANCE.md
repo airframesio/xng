@@ -54,3 +54,24 @@ all also present in dumpvdl2's output. dumpvdl2 decodes 41 frames from
 the same file; the gap is acquisition sensitivity (proper symbol-timing
 recovery is the planned follow-up). A 6 s slice is vendored as a CI
 fixture (tests/data/, attributed) guarded by tests/offair.rs.
+
+## Sensitivity investigation round 2 (2026-06)
+
+Fixed a decode livelock: a burst whose RS decode failed was re-hunted
+from one sample past its UW, deterministically re-refined to the same
+position, and retried — ~1700 times per burst, escaping only when the
+(symmetric) noise-floor EMA rose above the burst. The retry storms also
+consumed the timeline so later bursts were never hunted. The demod now
+remembers the last RS-failed UW position and skips past it on
+re-detection. Result: every burst in the sigidwiki capture that passes
+the header now also passes RS (14 bursts, 0 RS row failures), and the
+wasted work is gone.
+
+Remaining gap to dumpvdl2 on the same capture: four ground-station XID
+bursts decode RS-"clean" but fail the AVLC FCS — running dumpvdl2's
+exact destuffing algorithm over our post-RS bits fails identically, so
+the corruption is upstream: our symbol decisions carry enough errors
+that RS (at capacity, fixed=3 on k=6 rows) miscorrects into a nearby
+codeword. Phase-gain and sampling-offset sweeps are already at their
+optima; closing this needs a matched filter + symbol-timing tracking in
+the demod (planned).

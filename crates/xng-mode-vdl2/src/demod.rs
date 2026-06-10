@@ -66,6 +66,11 @@ enum State {
 }
 
 pub struct Vdl2Demod {
+    /// Refined UW position of the last collection that failed RS: a
+    /// re-hunt that refines back to the same position is skipped past
+    /// instead of retried (the decode is deterministic — retrying the
+    /// identical burst livelocks until the noise floor rises).
+    last_rs_fail: f64,
     sps: f64,
     /// Channel samples; index 0 is absolute sample `start_abs`.
     buf: Vec<Complex<f32>>,
@@ -92,6 +97,7 @@ impl Vdl2Demod {
             cursor: 0.0,
             noise: 1e-6,
             state: State::Hunt,
+            last_rs_fail: f64::NEG_INFINITY,
             level: 0.0,
         }
     }
@@ -228,6 +234,11 @@ impl Vdl2Demod {
         loop {
             match std::mem::replace(&mut self.state, State::Hunt) {
                 State::Hunt => match self.hunt() {
+                    Some(uw_pos) if (uw_pos - self.last_rs_fail).abs() < 1.0 => {
+                        // Deterministic re-detection of a burst that
+                        // already failed RS: skip past its UW entirely.
+                        self.cursor = uw_pos + 17.0 * self.sps;
+                    }
                     Some(uw_pos) => {
                         let (_, theta) = self.uw_correlate(uw_pos).unwrap();
                         let last_uw = uw_pos + 15.0 * self.sps;
@@ -264,6 +275,7 @@ impl Vdl2Demod {
                                 self.cursor = c.next_pos; // skip past the burst
                             }
                             None => {
+                                self.last_rs_fail = c.uw_start;
                                 // A false UW lock (e.g. on a burst edge) can
                                 // pass the header FEC with a bogus length and
                                 // swallow the real burst; resume right after
