@@ -74,6 +74,24 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::Iridium { kind, details } => {
+                    let mut s = format!("IRIDIUM {kind}");
+                    for key in ["sat", "beam"] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {key}={v}"));
+                        }
+                    }
+                    if let (Some(lat), Some(lon)) = (
+                        details.get("lat").and_then(|v| v.as_f64()),
+                        details.get("lon").and_then(|v| v.as_f64()),
+                    ) {
+                        s.push_str(&format!(" pos={lat:.2},{lon:.2}"));
+                    }
+                    if let Some(p) = details.get("pages").and_then(|v| v.as_array()) {
+                        s.push_str(&format!(" pages={}", p.len()));
+                    }
+                    s
+                }
                 MessageBody::Hfdl { kind, details } => {
                     let mut s = format!("HFDL {kind}");
                     for key in ["gs_id", "flight", "icao", "frame_index"] {

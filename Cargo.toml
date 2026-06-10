@@ -37,6 +37,7 @@ xng-mode-vdl2 = { path = "crates/xng-mode-vdl2" }
 xng-mode-aero = { path = "crates/xng-mode-aero" }
 xng-mode-stdc = { path = "crates/xng-mode-stdc" }
 xng-mode-hfdl = { path = "crates/xng-mode-hfdl" }
+xng-mode-iridium = { path = "crates/xng-mode-iridium" }
 prost = "0.13"
 tonic = "0.12"
 quinn = "0.11"
@@ -88,6 +89,7 @@ xng-mode-vdl2.workspace = true
 xng-mode-aero.workspace = true
 xng-mode-stdc.workspace = true
 xng-mode-hfdl.workspace = true
+xng-mode-iridium.workspace = true
 prost.workspace = true
 tonic.workspace = true
 quinn.workspace = true

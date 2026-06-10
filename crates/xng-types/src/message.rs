@@ -93,6 +93,11 @@ pub enum MessageBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         altitude_ft: Option<i32>,
     },
+    /// Iridium frame (ring alert, broadcast, ...).
+    Iridium {
+        kind: String,
+        details: serde_json::Value,
+    },
     /// HFDL non-ACARS event (squitter, logon, performance data, ...).
     Hfdl {
         kind: String,
