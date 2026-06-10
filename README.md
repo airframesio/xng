@@ -17,12 +17,18 @@ roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
 xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
 still buildable standalone.
 
-## Current state (M1 — native ACARS)
+## Current state (M2 in progress — ACARS + AIS native)
 
-The first native decode core is in: **multi-channel VHF ACARS** (ARINC 618),
-implemented clean-room — MSK discriminator demod, differential decode,
-sync/parity/CRC deframing — with any number of channels decoded from one
-SDR capture.
+Two native decode cores are in, both clean-room and both decoding any
+number of channels from one SDR capture:
+
+- **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
+  sync/parity/CRC deframing, parity-guided single-bit error correction.
+  Validated off-air against an RTL-SDR (live United/American frames,
+  CRC-verified).
+- **AIS** (ITU-R M.1371): GMSK demod with carrier-offset tracking, HDLC
+  deframing with destuffing, CRC-16/X-25, NMEA AIVDM output — verified
+  against the canonical published AIVDM test vector.
 
 ```bash
 # Live: two ACARS channels from one RTL-SDR capture, feeding Airframes
@@ -32,6 +38,10 @@ xng listen --sdr driver=rtlsdr -r 2400000 -c 131.500M \
 
 # From a recording
 xng decode capture.cf32 -r 2400000 -c 131.500M --channels 131.550,131.425
+
+# AIS: both channels from one capture
+xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
+    --channels 161.975,162.025
 
 # Generate a synthetic test capture (no hardware needed)
 cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32
@@ -47,8 +57,9 @@ feed.airframes.io:5550). The asf-2.0 gRPC/QUIC output lands in M3.
 
 Workspace crates so far: `xng-types` (normalized message model),
 `xng-dsp` (PFB channelizer, DDC, FIR/NCO, CRCs), `xng-sdr` (SoapySDR +
-IQ-file sources), `xng-mode-acars` (ARINC 618 core + modulator for
-loopback tests). Remaining modes land in milestone order: see the
+IQ-file sources), `xng-mode-acars` and `xng-mode-ais` (decode cores, each
+with a spec-faithful modulator for loopback tests). Remaining modes land
+in milestone order: see the
 [roadmap](docs/ARCHITECTURE.md#5-roadmap).
 
 ## Building

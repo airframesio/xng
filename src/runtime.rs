@@ -10,8 +10,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use xng_mode_acars::AcarsChannelDecoder;
+use xng_mode_ais::AisChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
-use xng_types::{AppInfo, ChannelInfo, Message, Provenance, SdrInfo, StationIdentity};
+use xng_types::{AppInfo, ChannelInfo, Message, Mode, Provenance, SdrInfo, StationIdentity};
 
 pub struct OutputConfig {
     /// Console format (always on).
@@ -22,6 +23,7 @@ pub struct OutputConfig {
 }
 
 pub struct SessionConfig {
+    pub mode: Mode,
     pub center_hz: u64,
     pub channels_hz: Vec<u64>,
     pub station_ident: String,
@@ -31,11 +33,67 @@ pub struct SessionConfig {
 
 const READ_CHUNK: usize = 65_536;
 
-/// Run an ACARS decode session until the source ends or `stop` is set.
-pub fn run_acars_session(
-    mut source: Box<dyn IqSource>,
-    cfg: SessionConfig,
-) -> anyhow::Result<()> {
+/// One mode-specific per-channel decoder.
+enum ModeChannel {
+    Acars(AcarsChannelDecoder),
+    Ais(AisChannelDecoder),
+}
+
+impl ModeChannel {
+    fn new(mode: Mode, sample_rate: f64, offset: f64, freq: u64) -> Result<Self, String> {
+        match mode {
+            Mode::AcarsPoa => Ok(Self::Acars(AcarsChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Ais => Ok(Self::Ais(AisChannelDecoder::new(sample_rate, offset, freq)?)),
+            other => Err(format!("mode {other} has no native core yet")),
+        }
+    }
+
+    fn passband_hz(mode: Mode) -> f64 {
+        match mode {
+            Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
+            _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
+        }
+    }
+
+    fn channel_rate(&self) -> f64 {
+        match self {
+            Self::Acars(_) => xng_mode_acars::CHANNEL_RATE,
+            Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
+        }
+    }
+
+    /// Decode a capture chunk into normalized messages.
+    /// Returns (messages, frames_seen, frames_crc_ok).
+    fn process(&mut self, iq: &[Complex<f32>], freq: u64, prov: &Provenance) -> (Vec<Message>, u64, u64) {
+        match self {
+            Self::Acars(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let ok = frames.iter().filter(|f| f.crc_ok).count() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_acars::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, ok)
+            }
+            Self::Ais(dec) => {
+                let found = dec.process(iq);
+                let seen = found.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = found
+                    .into_iter()
+                    .map(|(f, nmea)| xng_mode_ais::to_message(&f, nmea, freq, level, prov.clone()))
+                    .collect();
+                // The AIS deframer only surfaces CRC-valid frames.
+                (msgs, seen, seen)
+            }
+        }
+    }
+}
+
+/// Run a decode session until the source ends or `stop` is set.
+pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<()> {
     let sample_rate = source.sample_rate();
     let capture_center = if cfg.center_hz > 0 { cfg.center_hz } else { source.center_freq_hz() };
 
@@ -43,9 +101,7 @@ pub fn run_acars_session(
     let mut decoders = Vec::new();
     for &freq in &cfg.channels_hz {
         let offset = freq as f64 - capture_center as f64;
-        let dec = AcarsChannelDecoder::new(sample_rate, offset)
-            .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
-        if 2.0 * (offset.abs() + xng_mode_acars::CHANNEL_PASSBAND_HZ) > sample_rate {
+        if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
             anyhow::bail!(
                 "channel {:.3} MHz is outside the capture (center {:.3} MHz, rate {} S/s)",
                 freq as f64 / 1e6,
@@ -53,10 +109,13 @@ pub fn run_acars_session(
                 sample_rate
             );
         }
+        let dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
+            .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
         decoders.push((freq, dec));
     }
     tracing::info!(
-        "acars session: {} channel(s) from a {:.0} S/s capture centered at {:.3} MHz",
+        "{} session: {} channel(s) from a {:.0} S/s capture centered at {:.3} MHz",
+        cfg.mode,
         decoders.len(),
         sample_rate,
         capture_center as f64 / 1e6
@@ -126,7 +185,7 @@ pub fn run_acars_session(
 
 fn decode_loop(
     source: &mut dyn IqSource,
-    mut decoders: Vec<(u64, AcarsChannelDecoder)>,
+    mut decoders: Vec<(u64, ModeChannel)>,
     station: StationIdentity,
     sdr: Option<SdrInfo>,
     bus: MessageBus,
@@ -155,26 +214,20 @@ fn decode_loop(
             }
         };
         for (i, (freq, dec)) in decoders.iter_mut().enumerate() {
-            for frame in dec.process(&buf[..n]) {
-                stats[i].1 += 1;
-                if frame.crc_ok {
-                    stats[i].2 += 1;
-                }
-                let msg: Message = xng_mode_acars::to_message(
-                    &frame,
-                    *freq,
-                    dec.level_dbfs(),
-                    Provenance {
-                        station: station.clone(),
-                        app: AppInfo::xng(),
-                        sdr: sdr.clone(),
-                        channel: Some(ChannelInfo {
-                            index: i as u32,
-                            frequency_hz: *freq,
-                            sample_rate: xng_mode_acars::CHANNEL_RATE,
-                        }),
-                    },
-                );
+            let prov = Provenance {
+                station: station.clone(),
+                app: AppInfo::xng(),
+                sdr: sdr.clone(),
+                channel: Some(ChannelInfo {
+                    index: i as u32,
+                    frequency_hz: *freq,
+                    sample_rate: dec.channel_rate(),
+                }),
+            };
+            let (msgs, seen, ok) = dec.process(&buf[..n], *freq, &prov);
+            stats[i].1 += seen;
+            stats[i].2 += ok;
+            for msg in msgs {
                 bus.publish(msg);
             }
         }

@@ -23,7 +23,12 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     let text = if a.text.is_empty() { String::new() } else { format!(" | {}", a.text.replace('\n', "·")) };
                     format!("ACARS {} {} lbl={} {}{}", tail, flight, a.label, quality, text)
                 }
-                MessageBody::Ais { nmea } => format!("AIS {} sentence(s)", nmea.len()),
+                MessageBody::Ais { nmea, msg_type, mmsi } => format!(
+                    "AIS type={} mmsi={} {}",
+                    msg_type.map_or("?".into(), |t| t.to_string()),
+                    mmsi.map_or("?".into(), |m| m.to_string()),
+                    nmea.first().map(String::as_str).unwrap_or("")
+                ),
                 MessageBody::ModeS { df, icao } => {
                     format!("MODE-S df={} icao={}", df, icao.as_deref().unwrap_or("-"))
                 }

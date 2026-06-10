@@ -1270,6 +1270,7 @@ dependencies = [
  "uuid",
  "xng-dsp",
  "xng-mode-acars",
+ "xng-mode-ais",
  "xng-sdr",
  "xng-types",
 ]
@@ -1285,6 +1286,16 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-acars"
+version = "0.2.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-ais"
 version = "0.2.0"
 dependencies = [
  "chrono",

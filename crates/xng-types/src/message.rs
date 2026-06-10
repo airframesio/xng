@@ -69,8 +69,14 @@ pub struct AcarsCore {
 pub enum MessageBody {
     /// An ACARS message (any carrier: POA, AOA, HFDL, Aero, Iridium).
     Acars(AcarsCore),
-    /// AIS: raw NMEA sentences plus decoded essentials (extended later).
-    Ais { nmea: Vec<String> },
+    /// AIS: NMEA AIVDM sentences plus decoded essentials (extended later).
+    Ais {
+        nmea: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        msg_type: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mmsi: Option<u32>,
+    },
     /// Mode S / ADS-B frame summary (extended later).
     ModeS { df: u8, icao: Option<String> },
     /// A frame decoded at link layer but with no (or not-yet-implemented)

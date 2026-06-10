@@ -29,6 +29,7 @@ xng-types = { path = "crates/xng-types" }
 xng-dsp = { path = "crates/xng-dsp" }
 xng-sdr = { path = "crates/xng-sdr" }
 xng-mode-acars = { path = "crates/xng-mode-acars" }
+xng-mode-ais = { path = "crates/xng-mode-ais" }
 
 # DSP loopback tests are too slow unoptimized.
 [profile.test]
@@ -63,3 +64,4 @@ xng-types.workspace = true
 xng-dsp.workspace = true
 xng-sdr.workspace = true
 xng-mode-acars.workspace = true
+xng-mode-ais.workspace = true

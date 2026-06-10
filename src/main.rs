@@ -29,8 +29,12 @@ struct Cli {
 
 #[derive(Args)]
 struct TuneOpts {
-    /// Capture sample rate in Hz (must be an integer multiple of 24000 for
-    /// ACARS, e.g. 2400000)
+    /// Decode mode: acars or ais (more cores land per the roadmap)
+    #[arg(short, long, default_value = "acars")]
+    mode: String,
+    /// Capture sample rate in Hz (must be an integer multiple of the
+    /// mode's channel rate: 24 kHz for ACARS, 48 kHz for AIS; 2400000
+    /// works for both)
     #[arg(short = 'r', long)]
     sample_rate: f64,
     /// Capture center frequency (e.g. 131.500M)
@@ -90,7 +94,7 @@ enum Command {
         #[arg(default_value = "")]
         filter: String,
     },
-    /// Decode ACARS from a recorded IQ file
+    /// Decode from a recorded IQ file (multi-channel, mode via --mode)
     Decode {
         /// Path to the IQ file
         file: PathBuf,
@@ -102,7 +106,7 @@ enum Command {
         #[command(flatten)]
         output: OutputOpts,
     },
-    /// Decode ACARS live from an SDR
+    /// Decode live from an SDR (multi-channel, mode via --mode)
     Listen {
         /// SoapySDR device args, e.g. "driver=rtlsdr" or "driver=airspy,serial=..."
         #[arg(long, default_value = "")]
@@ -154,14 +158,15 @@ fn init_logging(verbose: u8) {
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 }
 
-fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(u64, Vec<u64>)> {
+fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, u64, Vec<u64>)> {
+    let mode: xng_types::Mode = tune.mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
     let center = freq::parse_hz(&tune.center_freq)?;
     let channels = tune
         .channels
         .iter()
         .map(|c| freq::parse_hz(c))
         .collect::<anyhow::Result<Vec<u64>>>()?;
-    Ok((center, channels))
+    Ok((mode, center, channels))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -177,12 +182,13 @@ fn main() -> anyhow::Result<()> {
                     anyhow::anyhow!("cannot guess IQ format; pass --format (cf32|cs16|cs8|cu8)")
                 })?,
             };
-            let (center_hz, channels_hz) = parse_tune(&tune)?;
+            let (mode, center_hz, channels_hz) = parse_tune(&tune)?;
             let (outputs, station_ident) = output.build()?;
             let source = FileIqSource::open(&file, fmt, tune.sample_rate, center_hz)?;
-            runtime::run_acars_session(
+            runtime::run_session(
                 Box::new(source),
                 runtime::SessionConfig {
+                    mode,
                     center_hz,
                     channels_hz,
                     station_ident,
@@ -207,12 +213,13 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(feature = "soapy")]
 fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
-    let (center_hz, channels_hz) = parse_tune(tune)?;
+    let (mode, center_hz, channels_hz) = parse_tune(tune)?;
     let (outputs, station_ident) = output.build()?;
     let source = xng_sdr::soapy::SoapyIqSource::open(sdr, tune.sample_rate, center_hz, gain)?;
-    runtime::run_acars_session(
+    runtime::run_session(
         Box::new(source),
         runtime::SessionConfig {
+            mode,
             center_hz,
             channels_hz,
             station_ident,
