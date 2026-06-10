@@ -66,6 +66,32 @@ Divergence from JAERO (documented intentionally):
 - Per-frame Viterbi with overlap instead of JAERO's streaming
   libcorrect decode (equivalent output, simpler state).
 
+Off-air conventions (established against JAERO's real recordings,
+2026-06; these are invisible to synthetic loopback because a matched
+modulator/demodulator pair cancels them):
+
+- A-BPSK data maps **directly** onto the deviation sign (bit 1 = +90°
+  phase advance); there is no differential layer. The UW appears in true
+  polarity at 1200-bit spacing in the discriminator's bit stream.
+- The coded pair order on air is **(0o133 output, 0o171 output)** per
+  data bit — libcorrect's 109/79 polynomial order in JAERO. With this
+  order the off-air frames decode with zero Viterbi residual and all SU
+  CRCs pass; with 171-first they are pseudorandom.
+- Frame layout, 64×6 per-384-bit-block deinterleaving, the shared LFSR15
+  scrambler reset per frame, LSB-first packing, and the X-25 SU CRC are
+  all confirmed exactly as implemented.
+
+Off-air validation results (JAERO samples):
+
+- `600bps_sample.ogg` (78 s, carrier ~1066 Hz): 11 CRC-valid ACARS from
+  real traffic (B-16333 METAR uplink, HL8217 ADS, B-HNF CPA509 PDC
+  clearance, B-LIC, 37981S).
+- `10.5k_sample.ogg` (240 s, carrier ~5761 Hz, resampled 44.1→48 kHz):
+  188 events / 144 CRC-valid ACARS through the OQPSK demod (A7-AEE
+  CPDLC AT1 among them).
+- A 12 s slice of the 600 bps recording is vendored as a CI fixture
+  (tests/data/, attributed) and guarded by tests/offair.rs.
+
 Conformance anchors: JAERO ships real off-air samples
 (`samples/600bps_sample.ogg` etc.) usable for cross-validation; loopback
 tests here exercise the full chain bit-exactly.

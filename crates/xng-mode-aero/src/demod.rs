@@ -1,11 +1,14 @@
 //! Aero A-BPSK (MSK-class) demodulator, discriminator-based.
 //!
 //! A-BPSK is BPSK with sinusoidal transitions — an MSK-class signal with
-//! ±fb/4 deviation. The signal is differentially encoded at the
-//! transmitter, so a frequency discriminator with per-bit integration
-//! yields the data directly (level change = 1). This is simpler than
-//! JAERO's coherent OQPSK-decomposition demod at a sensitivity cost of a
-//! couple of dB (see PROVENANCE.md); the soft outputs feed the Viterbi.
+//! ±fb/4 deviation. The data maps directly onto the deviation sign
+//! (bit 1 = +90° phase advance over the bit), so a frequency
+//! discriminator with per-bit integration yields the data with no
+//! differential step — validated against JAERO's off-air 600 bps
+//! recording (UW appears in true polarity at 1200-bit frame spacing).
+//! This is simpler than JAERO's coherent OQPSK-decomposition demod at a
+//! sensitivity cost of a couple of dB (see PROVENANCE.md); the soft
+//! outputs feed the Viterbi.
 
 use num_complex::Complex;
 use xng_dsp::{lowpass_taps, Fir};
@@ -29,8 +32,6 @@ pub struct MskDemod {
     timing: f64,
     acc: f32,
     acc_n: u32,
-    /// Previous bit-integral (for differential soft output).
-    prev_level: f32,
     /// Running mean |integral| for normalization.
     mag: f32,
     level: f32,
@@ -49,7 +50,6 @@ impl MskDemod {
             timing: 0.0,
             acc: 0.0,
             acc_n: 0,
-            prev_level: 0.0,
             mag: 1e-3,
             level: 0.0,
         }
@@ -81,10 +81,8 @@ impl MskDemod {
                 self.acc = 0.0;
                 self.acc_n = 0;
                 self.mag += MAG_ALPHA * (l.abs() - self.mag);
-                // Differential: level change = 1. Soft = -l·l_prev scaled.
-                let soft = (-(l * self.prev_level) / (self.mag * self.mag).max(1e-9))
-                    .clamp(-1.0, 1.0);
-                self.prev_level = l;
+                // Direct mapping: deviation sign is the bit.
+                let soft = (l / self.mag.max(1e-9)).clamp(-1.0, 1.0);
                 out.push((soft, (soft > 0.0) as u8));
             }
         }

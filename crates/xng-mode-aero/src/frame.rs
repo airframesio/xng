@@ -69,7 +69,15 @@ pub fn frame_bytes_for(rate_bps: u32) -> usize {
 
 impl FrameDecoder {
     pub fn new(rate_bps: u32) -> Self {
-        Self { rate_bps, viterbi: Viterbi::k7(), tail: vec![0.0; OVERLAP] }
+        Self {
+            rate_bps,
+            // The Aero code transmits the 0o133 output first in each coded
+            // pair (libcorrect polynomial order 109/79 in JAERO; confirmed
+            // against the off-air 600 bps recording, where this order
+            // decodes with zero Viterbi residual and all SU CRCs pass).
+            viterbi: Viterbi::new(7, 0o133, 0o171),
+            tail: vec![0.0; OVERLAP],
+        }
     }
 
     /// Decode one frame's coded soft bits (after UW + header) into
@@ -113,7 +121,7 @@ pub struct FrameEncoder {
 
 impl FrameEncoder {
     pub fn new(rate_bps: u32) -> Self {
-        Self { rate_bps, viterbi: Viterbi::k7(), state_bits: vec![0; 6] }
+        Self { rate_bps, viterbi: Viterbi::new(7, 0o133, 0o171), state_bits: vec![0; 6] }
     }
 
     /// Encode one frame of SU bytes (72 at 600/1200, 312 at 10.5k) into

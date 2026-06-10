@@ -76,7 +76,9 @@ impl Framer {
             // immediately (UW of the next frame follows directly).
         }
         self.shift = (self.shift << 1) | hard as u32;
-        if self.collecting.is_none() && self.shift == frame::UW {
+        // Tolerate a couple of UW bit errors (off-air bits are not clean;
+        // a false trigger costs one frame and dies at the SU CRCs).
+        if self.collecting.is_none() && (self.shift ^ frame::UW).count_ones() <= 2 {
             self.collecting = Some(Vec::with_capacity(frame::HEADER_BITS + frame::CODED_BITS));
         }
     }
