@@ -13,7 +13,7 @@ use xng_types::{Mode, StationIdentity};
 
 /// Built-in frequency plans (kHz). Curated, worldwide-common channels;
 /// the HFDL list follows the public system table.
-fn plan(mode: Mode) -> (f64, Vec<u64>) {
+pub(crate) fn plan(mode: Mode) -> (f64, Vec<u64>) {
     let k = |v: &[u32]| v.iter().map(|&f| f as u64 * 1_000).collect::<Vec<u64>>();
     match mode {
         Mode::AcarsPoa => (
@@ -50,8 +50,40 @@ fn plan(mode: Mode) -> (f64, Vec<u64>) {
     }
 }
 
+/// Channels worth watching even when a short scan finds them quiet:
+/// the worldwide/primary frequencies where traffic eventually shows up.
+/// (A 90 s dwell routinely undersells a site — observed first-hand: the
+/// channels busiest over 30 minutes had been scored quiet.)
+pub(crate) fn core_channels(mode: Mode) -> Vec<u64> {
+    let k = |v: &[u32]| v.iter().map(|&f| f as u64 * 1_000).collect::<Vec<u64>>();
+    match mode {
+        // Worldwide primary + the common US/EU secondaries.
+        Mode::AcarsPoa => k(&[131_550, 130_025, 131_725, 131_125]),
+        // The worldwide Common Signaling Channel + busiest secondary.
+        Mode::Vdl2 => k(&[136_975, 136_650]),
+        Mode::Ais => k(&[161_975, 162_025]),
+        Mode::Adsb => k(&[1_090_000]),
+        // Primary ring-alert channel.
+        Mode::Iridium => k(&[1_626_271]),
+        _ => Vec::new(),
+    }
+}
+
+/// Per-channel passband the DDC must preserve, by mode.
+pub(crate) fn passband(mode: Mode) -> f64 {
+    match mode {
+        Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
+        Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
+        Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
+        Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
+        Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
+        Mode::Adsb => 0.0,
+        _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
+    }
+}
+
 /// Cluster channels into capture-width groups.
-fn group_channels(channels: &[u64], sample_rate: f64, passband: f64) -> Vec<(u64, Vec<u64>)> {
+pub(crate) fn group_channels(channels: &[u64], sample_rate: f64, passband: f64) -> Vec<(u64, Vec<u64>)> {
     let usable = sample_rate * 0.8 - 2.0 * passband;
     let mut sorted = channels.to_vec();
     sorted.sort_unstable();
@@ -126,16 +158,7 @@ pub fn run(
             tracing::warn!("no built-in frequency plan for mode {mode}; skipping");
             continue;
         }
-        let passband = match mode {
-            Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
-            Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
-            Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
-            Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
-            Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
-            Mode::Adsb => 0.0,
-            _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
-        };
-        let groups = group_channels(&channels, rate, passband);
+        let groups = group_channels(&channels, rate, passband(mode));
         groups_total += groups.len();
         plans.push((mode, rate, groups));
     }
@@ -270,7 +293,7 @@ pub fn run(
     Ok(())
 }
 
-fn scan_group(
+pub(crate) fn scan_group(
     sdr: &str,
     gain: Option<f64>,
     mode: Mode,

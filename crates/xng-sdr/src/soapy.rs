@@ -67,6 +67,15 @@ impl SoapyIqSource {
     }
 }
 
+impl Drop for SoapyIqSource {
+    fn drop(&mut self) {
+        // Deactivate before the stream closes: skipping this leaves some
+        // drivers (rtlsdr) wedged for the next open — observed as
+        // stream-read timeouts when sequential dwells reuse one dongle.
+        let _ = self.stream.deactivate(None);
+    }
+}
+
 impl IqSource for SoapyIqSource {
     fn sample_rate(&self) -> f64 {
         self.sample_rate

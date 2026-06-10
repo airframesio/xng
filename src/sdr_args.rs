@@ -49,6 +49,7 @@ impl SdrArgs {
 
 /// Airspy serials are 64-bit values conventionally printed as 16 hex digits
 /// (as by `airspy_info` and `xng devices`).
+#[cfg_attr(not(any(feature = "airspy", feature = "airspyhf")), allow(dead_code))]
 pub fn parse_airspy_serial(s: &str) -> anyhow::Result<u64> {
     let t = s.trim().trim_start_matches("0x").trim_start_matches("0X");
     u64::from_str_radix(t, 16)
