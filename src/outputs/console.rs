@@ -92,6 +92,40 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::Vdl2 { kind, details } => {
+                    let addr = |k: &str| {
+                        details
+                            .get(k)
+                            .and_then(|a| a.get("addr"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?")
+                            .to_owned()
+                    };
+                    let mut s =
+                        format!("VDL2 {} {}→{}", kind.to_uppercase(), addr("src"), addr("dst"));
+                    if let Some(nr) = details.pointer("/control/nr").and_then(|v| v.as_u64()) {
+                        s.push_str(&format!(" nr={nr}"));
+                    }
+                    if let Some(p) = details.get("protocol").and_then(|v| v.as_str()) {
+                        s.push_str(&format!(" [{p}]"));
+                    }
+                    if let Some(params) = details.get("params").and_then(|v| v.as_array()) {
+                        let named: Vec<String> = params
+                            .iter()
+                            .filter_map(|p| {
+                                let name = p.get("name")?.as_str()?;
+                                match p.get("text").and_then(|t| t.as_str()) {
+                                    Some(t) => Some(format!("{name}={t}")),
+                                    None => Some(name.to_string()),
+                                }
+                            })
+                            .collect();
+                        if !named.is_empty() {
+                            s.push_str(&format!(" | {}", named.join(", ")));
+                        }
+                    }
+                    s
+                }
                 MessageBody::Hfdl { kind, details } => {
                     let mut s = format!("HFDL {kind}");
                     for key in ["gs_id", "flight", "icao", "frame_index"] {

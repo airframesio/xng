@@ -18,6 +18,8 @@ attribution. GPL projects are listed as fact references only.
 | ARINC 618-6 (Air/Ground Character-Oriented Protocol) | ACARS framing: differential MSK (§4.4.2), odd parity LSB-first (§4.4.2.1), preamble (§4.2-4.3), block format (§2.1-2.3), BCS CRC + "K7" worked example (§2.2.10) | public copy: https://pdfcoffee.com/324981622-618-6-airground-character-oriented-protocol-specification-pdfpdf-pdf-free.html |
 | ETSI EN 301 841-1 V1.4.1 | VDL2 radio conformance (mirrors Annex 10) | https://www.etsi.org/deliver/etsi_en/301800_301899/30184101/01.04.01_60/en_30184101v010401p.pdf |
 | ETSI EN 301 841-2 V1.2.1 | AVLC link layer: frame structure (Table 5.1a), addresses (Table 5.2/5.3), control field (Table 5.5) | https://www.etsi.org/deliver/etsi_en/301800_301899/30184102/01.02.01_60/en_30184102v010201p.pdf |
+| ICAO Doc 9776 (VDL2 Technical Manual) | XID: VDL private parameter set identifiers/names (connection management, destination airport, autotune, timers) | public ICAO manual |
+| ISO/IEC 8885 | XID frame structure: FI octet, GI/GL groups, PI/PL/PV parameters | via Doc 9776 and EN 301 841-2 citations |
 | ITU-R M.1371-5 | AIS: GMSK/NRZI, HDLC framing, training sequence, message bit ordering | freely published by ITU |
 | ISO/IEC 13239 | HDLC framing conventions (flags, stuffing, FCS) referenced by AVLC and AIS | via EN 301 841-2 citations |
 | ISO/IEC TR 9577 | AVLC payload protocol identification (0xFF ACARS escape, 0x81 CLNP, 0x82 ES-IS, 0x83 IDRP) | via Wiley excerpt + GE patent below |

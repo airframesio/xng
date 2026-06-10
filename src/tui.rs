@@ -24,6 +24,8 @@ struct App {
     messages: VecDeque<Message>,
     selected: Option<usize>,
     follow: bool,
+    /// Detail pane shows a human-readable summary; 'v' toggles raw JSON.
+    detail_json: bool,
     waterfall: VecDeque<Vec<f32>>,
     started: Instant,
     session_line: String,
@@ -63,6 +65,7 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
         messages: VecDeque::new(),
         selected: None,
         follow: true,
+        detail_json: false,
         waterfall: VecDeque::new(),
         started: Instant::now(),
         session_line: format!(
@@ -133,6 +136,9 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
                         }
                         KeyCode::End | KeyCode::Char('G') | KeyCode::Char('f') => {
                             app.follow = true;
+                        }
+                        KeyCode::Char('v') => {
+                            app.detail_json = !app.detail_json;
                         }
                         KeyCode::Char('c') => {
                             app.messages.clear();
@@ -221,12 +227,19 @@ fn draw(
     let detail = app
         .selected
         .and_then(|i| app.messages.get(i))
-        .map(|m| serde_json::to_string_pretty(m).unwrap_or_default())
+        .map(|m| {
+            if app.detail_json {
+                serde_json::to_string_pretty(m).unwrap_or_default()
+            } else {
+                detail_pretty(m)
+            }
+        })
         .unwrap_or_else(|| "no message selected".into());
+    let title = if app.detail_json { " detail (json — v: pretty) " } else { " detail (v: json) " };
     f.render_widget(
         Paragraph::new(detail)
             .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" detail ")),
+            .block(Block::default().borders(Borders::ALL).title(title)),
         main[1],
     );
 
@@ -239,7 +252,7 @@ fn draw(
     draw_stats(f, stats, bottom[1]);
 
     f.render_widget(
-        Paragraph::new(" q quit | j/k scroll | f follow | c clear ")
+        Paragraph::new(" q quit | j/k scroll | f follow | v detail view | c clear ")
             .style(Style::default().fg(Color::DarkGray)),
         outer[3],
     );
@@ -347,4 +360,95 @@ fn draw_stats(f: &mut Frame, stats: &[(u64, u64, u64, f32)], area: Rect) {
         Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" channels ")),
         area,
     );
+}
+
+/// Human-readable detail pane: the message's vitals, the same summary
+/// line the console prints, and the body's fields walked out as
+/// indented `key: value` lines (raw JSON is one `v` press away).
+fn detail_pretty(m: &Message) -> String {
+    use xng_types::MessageBody;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{}  {}  {:.3} MHz\n",
+        m.timestamp.format("%H:%M:%S%.3f"),
+        m.mode,
+        m.frequency_hz as f64 / 1e6
+    ));
+    if let Some(rssi) = m.signal.rssi_db {
+        out.push_str(&format!("signal   {rssi:.1} dBFS\n"));
+    }
+    let fec = m.decode.fec_corrected.unwrap_or(0);
+    out.push_str(&format!(
+        "decode   CRC {}{}\n",
+        if m.decode.crc_ok { "ok" } else { "FAILED" },
+        if fec > 0 { format!(" · {fec} FEC-corrected") } else { String::new() }
+    ));
+    out.push('\n');
+    out.push_str(&format_message(m, ConsoleFormat::Pretty));
+    out.push('\n');
+
+    match &m.body {
+        MessageBody::Acars(a) => {
+            if !a.text.is_empty() {
+                out.push('\n');
+                out.push_str(&a.text);
+                out.push('\n');
+            }
+        }
+        MessageBody::Vdl2 { details, .. }
+        | MessageBody::Hfdl { details, .. }
+        | MessageBody::Iridium { details, .. }
+        | MessageBody::StdC { details, .. } => {
+            out.push('\n');
+            walk_json(details, 0, &mut out);
+        }
+        _ => {}
+    }
+
+    if let Some(raw) = &m.raw {
+        let shown = &raw[..raw.len().min(48)];
+        out.push_str(&format!(
+            "\nraw      {}{} ({} bytes)\n",
+            shown.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            if raw.len() > shown.len() { "…" } else { "" },
+            raw.len()
+        ));
+    }
+    out
+}
+
+fn walk_json(v: &serde_json::Value, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                match val {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        out.push_str(&format!("{pad}{k}:\n"));
+                        walk_json(val, indent + 1, out);
+                    }
+                    _ => out.push_str(&format!("{pad}{k}: {}\n", scalar(val))),
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                match item {
+                    serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                        out.push_str(&format!("{pad}-\n"));
+                        walk_json(item, indent + 1, out);
+                    }
+                    _ => out.push_str(&format!("{pad}- {}\n", scalar(item))),
+                }
+            }
+        }
+        _ => out.push_str(&format!("{pad}{}\n", scalar(v))),
+    }
+}
+
+fn scalar(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }

@@ -118,6 +118,83 @@ pub struct AvlcFrame {
     pub raw: Vec<u8>,
 }
 
+/// One XID parameter (ISO 8885 group structure; VDL-specific parameter
+/// names per ICAO Doc 9776).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct XidParam {
+    /// Group identifier (0x80 = ISO 8885 general, 0xF0 = VDL private).
+    pub group: u8,
+    pub id: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<&'static str>,
+    pub value_hex: String,
+    /// Printable interpretation where the value is plain text (e.g. the
+    /// destination airport parameter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+/// VDL private parameter set names (ICAO Doc 9776 Table 5-3 area).
+fn vdl_param_name(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0x00 => "parameter-set-id",
+        0x01 => "connection-management",
+        0x02 => "signal-quality",
+        0x03 => "xid-sequencing",
+        0x04 => "avlc-options",
+        0x05 => "expedited-sn-connection",
+        0x06 => "lcr-cause",
+        0x40 => "modulation-support",
+        0x41 => "acceptable-alternate-ground-stations",
+        0x42 => "destination-airport",
+        0x43 => "aircraft-position",
+        0x44 => "autotune-frequency",
+        0x45 => "replacement-ground-stations",
+        0x46 => "timer-t4",
+        0x47 => "mac-persistence",
+        0x48 => "counter-m1",
+        0x49 => "timer-tm2",
+        _ => return None,
+    })
+}
+
+/// Parse an XID information field: FI octet, then groups of
+/// `GI | GL(2, big endian) | params{PI, PL, PV}` (ISO 8885).
+pub fn parse_xid(info: &[u8]) -> Option<Vec<XidParam>> {
+    if info.is_empty() {
+        return None;
+    }
+    let mut params = Vec::new();
+    let mut pos = 1; // skip the format identifier octet
+    while pos + 3 <= info.len() {
+        let group = info[pos];
+        let glen = u16::from_be_bytes([info[pos + 1], info[pos + 2]]) as usize;
+        pos += 3;
+        let end = (pos + glen).min(info.len());
+        while pos + 2 <= end {
+            let id = info[pos];
+            let plen = info[pos + 1] as usize;
+            pos += 2;
+            if pos + plen > end {
+                return None; // malformed; don't emit half-parsed garbage
+            }
+            let value = &info[pos..pos + plen];
+            pos += plen;
+            let printable = value.len() >= 2
+                && value.iter().all(|&b| (0x20..0x7F).contains(&b));
+            params.push(XidParam {
+                group,
+                id,
+                name: if group == 0xF0 { vdl_param_name(id) } else { None },
+                value_hex: value.iter().map(|b| format!("{b:02x}")).collect(),
+                text: printable.then(|| String::from_utf8_lossy(value).into_owned()),
+            });
+        }
+        pos = end;
+    }
+    if params.is_empty() { None } else { Some(params) }
+}
+
 /// Scan a descrambled, RS-corrected bit stream for AVLC frames.
 pub fn scan(bits: &[u8]) -> Vec<AvlcFrame> {
     let mut frames = Vec::new();
@@ -310,5 +387,46 @@ mod tests {
         // Flip a payload bit mid-frame (avoid creating a flag/abort).
         bits[8 * 12 + 2] ^= 1;
         assert!(scan(&bits).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+
+    #[test]
+    fn off_air_s_frame_parses_as_rr() {
+        // The exact 11-byte frame a live Airspy session surfaced as
+        // "undecoded": dst/src addresses + control 0xA1 + FCS.
+        let octets = [0x14u8, 0x22, 0xcc, 0x54, 0xb2, 0x0c, 0x42, 0xb5, 0xa1];
+        let bits = build(&[octets.to_vec()]);
+        let frames = scan(&bits);
+        assert_eq!(frames.len(), 1);
+        let f = &frames[0];
+        assert_eq!(f.control, Control::Supervisory { kind: "RR", nr: 5, poll: false });
+        assert_eq!(f.payload, Payload::Empty);
+        assert!(f.info.is_empty());
+    }
+
+    #[test]
+    fn xid_parameters_decode_with_names_and_text() {
+        // FI 0x82, VDL private group 0xF0, two params:
+        // parameter-set-id = "V", destination-airport = "KSMF".
+        let info = [
+            0x82, 0xF0, 0x00, 0x09, 0x00, 0x01, b'V', 0x42, 0x04, b'K', b'S', b'M', b'F',
+        ];
+        let params = parse_xid(&info).expect("params");
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].name, Some("parameter-set-id"));
+        assert_eq!(params[1].name, Some("destination-airport"));
+        assert_eq!(params[1].text.as_deref(), Some("KSMF"));
+        assert_eq!(params[1].value_hex, "4b534d46");
+    }
+
+    #[test]
+    fn malformed_xid_returns_none() {
+        // Param claims more bytes than the group holds.
+        let info = [0x82, 0xF0, 0x00, 0x04, 0x42, 0x40];
+        assert!(parse_xid(&info).is_none());
     }
 }
