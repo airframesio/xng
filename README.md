@@ -80,6 +80,15 @@ cargo build --release
 cargo test --workspace
 ```
 
+Airspy owners can skip the SoapyAirspy shim: native backends for the
+R2/Mini (libairspy) and the HF+ / Discovery (libairspyhf) are built in
+with feature flags:
+
+```bash
+sudo apt install libairspy-dev libairspyhf-dev   # or: brew install airspy airspyhf
+cargo build --release --features airspy,airspyhf
+```
+
 No hardware? Everything works from IQ recordings (`xng decode`,
 `xng tui --file`), and `cargo build --no-default-features` skips SoapySDR
 entirely. A Dockerfile and a Debian packaging script are included.
@@ -111,6 +120,12 @@ xng listen --sdr driver=rtlsdr --mode vdl2 -r 2400000 -c 136.800M \
 
 # HFDL on an HF-capable SDR (channels per the public system table)
 xng listen --sdr driver=sdrplay --mode hfdl -r 768000 -c 10060.000k \
+    --channels 10027k,10060k,10063k,10081k,10084k,10087k
+
+# Same, on an Airspy HF+ Discovery via the native backend (no Soapy
+# module needed; build with --features airspyhf). Hardware AGC unless
+# --gain is given; add serial=... to pick among several units.
+xng listen --sdr driver=airspyhf --mode hfdl -r 768000 -c 10060.000k \
     --channels 10027k,10060k,10063k,10081k,10084k,10087k
 
 # Inmarsat Aero L-band (patch antenna + LNA)
@@ -214,7 +229,7 @@ ACARS from any carrier flows through one application layer
 |---|---|
 | `xng-types` | Normalized message model shared by everything |
 | `xng-dsp` | Channelizer, DDC, FIR/NCO, Viterbi, Reed-Solomon, CRCs, scramblers |
-| `xng-sdr` | SoapySDR + IQ-file sample sources |
+| `xng-sdr` | SoapySDR, native Airspy (libairspy/libairspyhf), and IQ-file sample sources |
 | `xng-acars` | ACARS application layer (ARINC 622, ADS-C, CPDLC, media advisory) |
 | `xng-proto` | asf-2.0 protobuf schema + conversions |
 | `xng-mode-*` | One decode core per mode, each with a spec-faithful modulator for loopback tests, vendored validation fixtures, and a `PROVENANCE.md` |

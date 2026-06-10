@@ -16,13 +16,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Install dependencies
-      run: sudo apt install -y libsoapysdr-dev protobuf-compiler
+      run: sudo apt install -y libsoapysdr-dev libairspy-dev libairspyhf-dev protobuf-compiler
     - name: Build
       run: cargo build --verbose --release
     - name: Version
       run: echo "::set-output name=version::$(cargo run -- --version)"
     - name: Run tests
       run: cargo test --workspace --verbose
+    - name: Run tests (native Airspy backends)
+      run: cargo test --workspace --features airspy,airspyhf --verbose
     - name: Build Debian package
       run: ./build_deb_package.sh
     - uses: actions/upload-artifact@v4

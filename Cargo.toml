@@ -64,6 +64,10 @@ authors.workspace = true
 [features]
 default = ["soapy"]
 soapy = ["xng-sdr/soapy"]
+# Native Airspy R2/Mini support (libairspy) — no SoapyAirspy module needed.
+airspy = ["xng-sdr/airspy"]
+# Native Airspy HF+ / Discovery support (libairspyhf).
+airspyhf = ["xng-sdr/airspyhf"]
 
 [dependencies]
 anyhow.workspace = true

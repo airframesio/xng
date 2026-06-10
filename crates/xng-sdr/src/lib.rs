@@ -1,11 +1,19 @@
 //! SDR capture and IQ replay sources.
 //!
 //! Everything downstream of this crate consumes the [`IqSource`] trait, so
-//! decode cores are agnostic to whether samples come from hardware (SoapySDR,
-//! behind the `soapy` feature) or recorded IQ files (always available — the
-//! basis for regression testing decode cores against golden captures).
+//! decode cores are agnostic to whether samples come from hardware — SoapySDR
+//! behind the `soapy` feature, or native Airspy backends behind `airspy`
+//! (R2/Mini, libairspy) and `airspyhf` (HF+/Discovery, libairspyhf) — or from
+//! recorded IQ files (always available — the basis for regression testing
+//! decode cores against golden captures).
 
+#[cfg(feature = "airspy")]
+pub mod airspy;
+#[cfg(feature = "airspyhf")]
+pub mod airspyhf;
 pub mod file;
+#[cfg(any(feature = "airspy", feature = "airspyhf"))]
+mod pump;
 #[cfg(feature = "soapy")]
 pub mod soapy;
 
