@@ -13,6 +13,11 @@ pub fn format_acarsdec(msg: &Message) -> Option<serde_json::Value> {
     let MessageBody::Acars(a) = &msg.body else {
         return None;
     };
+    // Feed only verified frames (acarsdec likewise emits only frames whose
+    // CRC checks out, possibly after correction).
+    if !msg.decode.crc_ok {
+        return None;
+    }
     let ts = msg.timestamp.timestamp() as f64 + msg.timestamp.timestamp_subsec_micros() as f64 / 1e6;
     let mut v = serde_json::json!({
         "app": { "name": "xng", "ver": env!("CARGO_PKG_VERSION") },
@@ -21,7 +26,7 @@ pub fn format_acarsdec(msg: &Message) -> Option<serde_json::Value> {
         "channel": msg.source.channel.map(|c| c.index).unwrap_or(0),
         "freq": (msg.frequency_hz as f64 / 1e6 * 1000.0).round() / 1000.0,
         "level": msg.signal.rssi_db.map(|l| (l as f64 * 10.0).round() / 10.0).unwrap_or(0.0),
-        "error": msg.decode.errors.unwrap_or(0),
+        "error": msg.decode.fec_corrected.unwrap_or(0) + msg.decode.errors.unwrap_or(0),
         "mode": a.mode.to_string(),
         "label": a.label,
         // acarsdec emits `false` for NAK, the ack character otherwise.

@@ -8,6 +8,14 @@
 //! Characters are LSB-first with odd parity in bit 8. The BCS is
 //! CRC-16/KERMIT over the parity-bearing octets from Mode through ETX/ETB
 //! inclusive; appending the two received BCS bytes must leave residue 0.
+//!
+//! Error correction: a single bit error in a character breaks both that
+//! character's odd parity and the CRC, so bad-parity characters localize
+//! the search — we try one bit flip per suspect character (8 candidates
+//! each, up to 3 suspects) and accept the combination that restores CRC
+//! residue 0. If the body is parity-clean but the CRC fails, the error may
+//! be in the parity-less BCS bytes themselves; those 16 single-bit flips
+//! are tried too.
 
 use xng_dsp::checksum::acars_crc;
 
@@ -22,10 +30,17 @@ const DEL: u8 = 0x7F;
 /// SYN SYN SOH, LSB-first transmit order, oldest bit in bit 0.
 const SYNC_PATTERN: u32 = (SOH as u32) << 16 | (SYN as u32) << 8 | SYN as u32;
 const SYNC_MASK: u32 = 0xFF_FFFF;
+/// Bit errors tolerated in the sync pattern.
+const SYNC_MAX_ERRORS: u32 = 1;
 /// Header length: mode + address(7) + ack + label(2) + block id.
 const HEADER_LEN: usize = 12;
 /// Header + STX + max text (220) + suffix, with margin.
 const MAX_CHARS: usize = 250;
+/// Most bad-parity characters the corrector will attempt to repair.
+const MAX_CORRECTABLE: usize = 3;
+/// Frames that fail CRC with more parity errors than this are discarded as
+/// noise (tolerant sync makes false frame starts more common).
+const MAX_REPORTED_PARITY_ERRORS: usize = 8;
 
 /// A decoded ACARS frame (single block).
 #[derive(Debug, Clone, PartialEq)]
@@ -50,9 +65,13 @@ pub struct AcarsFrame {
     /// True when the block ended with ETB (more blocks follow).
     pub more_to_come: bool,
     pub crc_ok: bool,
-    /// Characters with bad parity (excluding BCS, which carries none).
+    /// Characters with bad parity after correction (excluding BCS, which
+    /// carries none).
     pub parity_errors: u32,
-    /// Raw octets from Mode through suffix + BCS (parity bits intact).
+    /// Bits repaired by parity+CRC error correction.
+    pub fixed_bits: u32,
+    /// Octets from Mode through suffix + BCS (parity bits intact,
+    /// post-correction when a repair succeeded).
     pub raw: Vec<u8>,
 }
 
@@ -73,7 +92,8 @@ pub struct Deframer {
     cur: u8,
     nbits: u8,
     chars: Vec<u8>,
-    parity_errors: u32,
+    /// Indices (into `chars`) of characters that failed odd parity.
+    parity_bad: Vec<usize>,
 }
 
 impl Deframer {
@@ -85,7 +105,7 @@ impl Deframer {
             cur: 0,
             nbits: 0,
             chars: Vec::with_capacity(MAX_CHARS),
-            parity_errors: 0,
+            parity_bad: Vec::new(),
         }
     }
 
@@ -95,9 +115,10 @@ impl Deframer {
 
         match self.state {
             State::Hunt => {
-                if self.shift & SYNC_MASK == SYNC_PATTERN {
+                let w = self.shift & SYNC_MASK;
+                if (w ^ SYNC_PATTERN).count_ones() <= SYNC_MAX_ERRORS {
                     self.start_collect(0);
-                } else if (!self.shift) & SYNC_MASK == SYNC_PATTERN {
+                } else if (w ^ SYNC_PATTERN ^ SYNC_MASK).count_ones() <= SYNC_MAX_ERRORS {
                     // Differential polarity flipped: decode inverted.
                     self.start_collect(1);
                 }
@@ -126,7 +147,7 @@ impl Deframer {
                 }
 
                 if octet.count_ones() % 2 == 0 {
-                    self.parity_errors += 1;
+                    self.parity_bad.push(self.chars.len() - 1);
                 }
 
                 let value = octet & 0x7F;
@@ -150,17 +171,29 @@ impl Deframer {
         self.cur = 0;
         self.nbits = 0;
         self.chars.clear();
-        self.parity_errors = 0;
+        self.parity_bad.clear();
     }
 
     fn finish(&mut self) -> Option<AcarsFrame> {
-        let chars = &self.chars;
         // chars = Mode .. suffix + 2 BCS bytes; CRC residue over all == 0.
-        let n = chars.len();
+        let n = self.chars.len();
         if n < HEADER_LEN + 1 + 2 {
             return None;
         }
-        let crc_ok = acars_crc(chars) == 0;
+        let mut chars = self.chars.clone();
+        let mut parity_errors = self.parity_bad.len() as u32;
+        let mut fixed_bits = 0u32;
+        let mut crc_ok = acars_crc(&chars) == 0;
+        if !crc_ok {
+            if let Some(fixed) = correct_errors(&mut chars, &self.parity_bad) {
+                fixed_bits = fixed;
+                parity_errors = 0;
+                crc_ok = true;
+            } else if self.parity_bad.len() > MAX_REPORTED_PARITY_ERRORS {
+                // Unrecoverable noise (likely a false sync) — drop silently.
+                return None;
+            }
+        }
         let suffix = chars[n - 3] & 0x7F;
         let body: Vec<u8> = chars[..n - 3].iter().map(|c| c & 0x7F).collect();
 
@@ -211,9 +244,63 @@ impl Deframer {
             text,
             more_to_come: suffix == ETB,
             crc_ok,
-            parity_errors: self.parity_errors,
-            raw: self.chars.clone(),
+            parity_errors,
+            fixed_bits,
+            raw: chars,
         })
+    }
+}
+
+/// Try to repair a frame that failed its CRC. `suspects` are indices of
+/// characters with bad parity: each is assumed to hold exactly one flipped
+/// bit, searched jointly (8 candidates per suspect) until the CRC residue
+/// is 0. With no parity suspects, the error may be in the parity-less BCS
+/// bytes — try those 16 single-bit flips. Returns the number of repaired
+/// bits, with `chars` left corrected.
+fn correct_errors(chars: &mut [u8], suspects: &[usize]) -> Option<u32> {
+    let n = chars.len();
+    if suspects.is_empty() {
+        // Body is parity-clean: try a single bit error in the BCS.
+        for idx in [n - 2, n - 1] {
+            for bit in 0..8 {
+                chars[idx] ^= 1 << bit;
+                if acars_crc(chars) == 0 {
+                    return Some(1);
+                }
+                chars[idx] ^= 1 << bit;
+            }
+        }
+        return None;
+    }
+    if suspects.len() > MAX_CORRECTABLE {
+        return None;
+    }
+    // One flipped bit per suspect: walk the 8^k combinations.
+    let k = suspects.len();
+    let mut bits = vec![0u8; k];
+    loop {
+        for (i, &idx) in suspects.iter().enumerate() {
+            chars[idx] ^= 1 << bits[i];
+        }
+        if acars_crc(chars) == 0 {
+            return Some(k as u32);
+        }
+        for (i, &idx) in suspects.iter().enumerate() {
+            chars[idx] ^= 1 << bits[i];
+        }
+        // Increment the base-8 counter.
+        let mut i = 0;
+        loop {
+            if i == k {
+                return None;
+            }
+            bits[i] += 1;
+            if bits[i] < 8 {
+                break;
+            }
+            bits[i] = 0;
+            i += 1;
+        }
     }
 }
 
@@ -324,6 +411,66 @@ mod tests {
         let frames = run(&bits);
         assert_eq!(frames.len(), 1);
         assert!(!frames[0].crc_ok);
+    }
+
+    #[test]
+    fn corrects_single_bit_error_in_body() {
+        let mut bits = vec![1u8; 40];
+        bits.extend(bits_lsb_first(&[SYN, SYN, SOH]));
+        let mut octets = frame_octets(&downlink_spec());
+        octets[15] ^= 0x04; // one bit in a text char → parity + CRC both break
+        bits.extend(bits_lsb_first(&octets));
+        let frames = run(&bits);
+        assert_eq!(frames.len(), 1);
+        let f = &frames[0];
+        assert!(f.crc_ok, "single-bit error should be repaired");
+        assert_eq!(f.fixed_bits, 1);
+        assert_eq!(f.parity_errors, 0);
+        assert_eq!(f.text, "TEST MESSAGE", "text must be restored");
+    }
+
+    #[test]
+    fn corrects_two_separate_single_bit_errors() {
+        let mut bits = vec![1u8; 40];
+        bits.extend(bits_lsb_first(&[SYN, SYN, SOH]));
+        let mut octets = frame_octets(&downlink_spec());
+        octets[2] ^= 0x40; // one bit in the address
+        octets[16] ^= 0x01; // one bit in the text
+        bits.extend(bits_lsb_first(&octets));
+        let frames = run(&bits);
+        assert_eq!(frames.len(), 1);
+        let f = &frames[0];
+        assert!(f.crc_ok, "two single-bit errors should be repaired");
+        assert_eq!(f.fixed_bits, 2);
+        assert_eq!(f.tail.as_deref(), Some("N471XG"));
+        assert_eq!(f.text, "TEST MESSAGE");
+    }
+
+    #[test]
+    fn corrects_bit_error_in_bcs() {
+        let mut bits = vec![1u8; 40];
+        bits.extend(bits_lsb_first(&[SYN, SYN, SOH]));
+        let mut octets = frame_octets(&downlink_spec());
+        let n = octets.len();
+        octets[n - 1] ^= 0x10; // flip a bit in the (parity-less) BCS
+        bits.extend(bits_lsb_first(&octets));
+        let frames = run(&bits);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].crc_ok);
+        assert_eq!(frames[0].fixed_bits, 1);
+    }
+
+    #[test]
+    fn tolerates_one_bit_error_in_sync() {
+        let mut sync = [SYN, SYN, SOH];
+        sync[1] ^= 0x20;
+        let mut bits = vec![1u8; 40];
+        bits.extend(bits_lsb_first(&sync));
+        bits.extend(bits_lsb_first(&frame_octets(&downlink_spec())));
+        let frames = run(&bits);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].crc_ok);
+        assert_eq!(frames[0].text, "TEST MESSAGE");
     }
 
     #[test]

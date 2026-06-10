@@ -91,7 +91,7 @@ pub fn to_message(
         signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
         decode: DecodeQuality {
             crc_ok: f.crc_ok,
-            fec_corrected: None,
+            fec_corrected: Some(f.fixed_bits),
             errors: Some(f.parity_errors),
         },
         body: MessageBody::Acars(AcarsCore {
