@@ -45,6 +45,9 @@ const NOISE_ALPHA: f32 = 1e-4;
 const PHASE_GAIN: f32 = 0.1;
 
 struct Collecting {
+    /// Start of the UW that began this collection (+1 sample is the
+    /// re-hunt point when the burst turns out to be a false lock).
+    uw_start: f64,
     /// Absolute sample position of the next symbol center.
     next_pos: f64,
     /// Per-symbol carrier rotation estimate (radians).
@@ -129,8 +132,15 @@ impl Vdl2Demod {
         if norm < 1e-9 {
             return None;
         }
+        // Weak per-symbol energy consistency gate: a lock straddling the
+        // burst edge has near-zero products against silence (kill it), but
+        // at 4.76 samples/symbol real preambles legitimately dip on phase
+        // transitions — the original 0.25·mean gate rejected most off-air
+        // bursts on the sigidwiki capture (2 vs 11 frames decoded), and
+        // even 0.05 costs real bursts; 0.01 keeps the edge protection
+        // without the sensitivity loss.
         let mean_d = norm / (UW_DELTAS.len() - 1) as f32;
-        if min_d < 0.25 * mean_d {
+        if min_d < 0.01 * mean_d {
             return Some((0.0, 0.0));
         }
         Some((corr.norm() / norm, corr.arg()))
@@ -151,13 +161,19 @@ impl Vdl2Demod {
             }
             if let Some((metric, _)) = self.uw_correlate(pos) {
                 if metric > CORR_THRESHOLD {
+                    // Quarter-sample refinement: at 4.76 samples/symbol a
+                    // 1-2 sample timing error degrades every later symbol
+                    // decision (header FEC and RS then fail) — the same
+                    // broad-differential-peak effect seen on HFDL off-air.
                     let mut best = (metric, pos);
-                    for k in [-2.0f64, -1.0, -0.5, 0.5, 1.0, 2.0] {
+                    let mut k = -4.0f64;
+                    while k <= 4.0 {
                         if let Some((m, _)) = self.uw_correlate(pos + k) {
                             if m > best.0 {
                                 best = (m, pos + k);
                             }
                         }
+                        k += 0.25;
                     }
                     return Some(best.1);
                 }
@@ -217,6 +233,7 @@ impl Vdl2Demod {
                         let last_uw = uw_pos + 15.0 * self.sps;
                         let prev = self.sample(last_uw).unwrap();
                         self.state = State::Collect(Box::new(Collecting {
+                            uw_start: uw_pos,
                             next_pos: last_uw + self.sps,
                             theta,
                             prev,
@@ -240,12 +257,22 @@ impl Vdl2Demod {
                         let n = c.needed.unwrap();
                         let hdr: [u8; HEADER_BITS] = c.bits[..HEADER_BITS].try_into().unwrap();
                         let tl_bits = header::decode(&hdr).unwrap() as usize;
-                        if let Some((avlc_bits, fixed)) =
-                            interleave::deinterleave(&c.bits[HEADER_BITS..n], tl_bits, rs)
+                        match interleave::deinterleave(&c.bits[HEADER_BITS..n], tl_bits, rs)
                         {
-                            out.push(Burst { bits: avlc_bits, rs_corrected: fixed });
+                            Some((avlc_bits, fixed)) => {
+                                out.push(Burst { bits: avlc_bits, rs_corrected: fixed });
+                                self.cursor = c.next_pos; // skip past the burst
+                            }
+                            None => {
+                                // A false UW lock (e.g. on a burst edge) can
+                                // pass the header FEC with a bogus length and
+                                // swallow the real burst; resume right after
+                                // the false UW start so the true preamble
+                                // (which may begin within those 16 symbols)
+                                // is retried.
+                                self.cursor = c.uw_start + 1.0;
+                            }
                         }
-                        self.cursor = c.next_pos; // skip past the burst
                         self.state = State::Hunt;
                     }
                 },
