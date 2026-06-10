@@ -27,9 +27,18 @@ fn hr_bits_with_acars() -> Vec<u8> {
         sus.push(su::fill_su());
     }
     let mut enc = FrameEncoder::new(BIT_RATE);
-    // Idle + two frames (the payload fits in one; the second keeps the
-    // stream alive past the decoder's pipeline).
-    let mut bits: Vec<u8> = (0..600).map(|i| (i % 2) as u8).collect();
+    // Run-in + two frames (the payload fits in one; the second keeps the
+    // stream alive past the decoder's pipeline). The run-in models the
+    // always-on P channel preceding our frame: pseudorandom (scrambled
+    // idle) bits long enough for the demod's coarse CFO acquisition and
+    // carrier lock (~1.5 s).
+    let mut idle = 0x1234_5678_9abc_def0u64;
+    let mut bits: Vec<u8> = (0..18_000)
+        .map(|_| {
+            idle = idle.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((idle >> 33) & 1) as u8
+        })
+        .collect();
     for (f, chunk) in sus.chunks(26).enumerate() {
         let mut frame_bytes = Vec::with_capacity(312);
         for s in chunk {
@@ -76,7 +85,6 @@ fn hr_framing_rail_inversion() {
 }
 
 #[test]
-#[ignore = "OQPSK demodulator is WIP (carrier loop does not yet lock); framing is validated bit-level above"]
 fn decodes_acars_at_10500() {
     let bits = hr_bits_with_acars();
     let mut iq = modulate_oqpsk(&bits, CHANNEL_RATE_HR, 120.0, 0.5);
@@ -98,7 +106,6 @@ fn decodes_acars_at_10500() {
 }
 
 #[test]
-#[ignore = "OQPSK demodulator is WIP; see decodes_acars_at_10500"]
 fn decodes_from_wideband_capture() {
     let bits = hr_bits_with_acars();
     let fs = 2_400_000.0;
