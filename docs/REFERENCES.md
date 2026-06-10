@@ -39,7 +39,8 @@ attribution. GPL projects are listed as fact references only.
 | AIS-catcher (jvde-github) | GPL-3 | Facts only (landscape research) | https://github.com/jvde-github/AIS-catcher |
 | gr-iridium (muccc) | GPL-3 | Facts only (wave 2 planning) | https://github.com/muccc/gr-iridium |
 | SatDump | GPL-3 | Facts only (landscape research) | https://github.com/SatDump/SatDump |
-| Scytale-C | GPL-3 | STD-C facts reference (M6) | https://bitbucket.org/scytalec/scytalec |
+| Scytale-C | GPL-3 | STD-C facts reference (see docs/notes/STDC.md) | https://bitbucket.org/scytalec/scytalec |
+| inmarsatc (cropinghigh) | GPL-3 | STD-C facts reference (Scytale-C port; constants cross-verified) | https://github.com/cropinghigh/inmarsatc |
 | dump1090-fa / readsb | GPL | Facts only (landscape research) | https://github.com/flightaware/dump1090 |
 
 ## Protocol documentation and articles
@@ -55,6 +56,8 @@ attribution. GPL projects are listed as fact references only.
 | GE Patent US2016/0134682A1 — https://patents.google.com/patent/US20160134682A1/en | AOA 0xFF IPI + SOH EPI structure |
 | Wiley *Aeronautical Air-Ground Data Link Communications* excerpt — https://catalogimages.wiley.com/images/db/pdf/9781848217416.excerpt.pdf | AOA vs ATN multiplexing on AVLC |
 | J.-M. Friedt SDRA-2020 ACARS slides — http://jmfriedt.free.fr/sdra_acars.pdf | Preamble waveform cross-check |
+| sigidwiki Inmarsat-C TDM — https://www.sigidwiki.com/wiki/Inmarsat-C_TDM | STD-C IQ test capture (Inmarsat-C_TDM_EGC_IQ.zip) |
+| IMO/IHO SafetyNET manual — https://iho.int/uploads/user/Inter-Regional%20Coordination/WWNWS/Document%20Review/DRWG17/DRWG17_2019_3_EN-Inmarsat_SafetyNET_Manual-30.09.2018-track_Change.pdf | EGC area address bit layouts |
 
 ## Airframes ecosystem (ingest/compat targets)
 
