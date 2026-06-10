@@ -95,3 +95,15 @@ shape, or fit ramp amplitude jointly), or gate on the fit cost of the
 SECOND half of the UW only (past the ramp). Each false acceptance is
 expensive — a bogus header length drains the buffer past real bursts —
 so the discriminator must be strong, not just statistical.
+
+## Trigger sensitivity v3 (resolved, 2026-06)
+
+The missing piece was never the discriminator — it was making false
+acceptances harmless. The buffer retention policy now keeps samples
+back to the collecting burst's UW start, so when a false header decode
+with a bogus length fails RS, the rewind to uw_start+1 still has every
+sample of any real burst inside the consumed span. With that, the
+trigger threshold drops 0.88 → 0.6 with the fit-cost gate (< 0.25 rad²)
+arbitrating, and weak bursts get attempted safely: **16 frames** on the
+capture (13 before; plateau holds down to thr 0.4). The remaining gap
+to dumpvdl2 is genuine SNR reach at 4.76 samples/symbol.
