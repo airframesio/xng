@@ -152,10 +152,86 @@ impl Vdl2Demod {
         Some((corr.norm() / norm, corr.arg()))
     }
 
+    /// Coherent preamble fit (dumpvdl2's approach, in least-squares
+    /// form): over a fine timing grid around `pos`, compare the
+    /// unwrapped per-symbol phase trajectory of the 16 UW symbols
+    /// against the known cumulative UW phase ramp, and fit
+    /// residual ≈ a + b·k weighted by sample energy. The minimum-cost
+    /// grid point jointly yields timing, carrier phase (a, absorbed by
+    /// the differential decisions) and per-symbol CFO (b) — far less
+    /// noisy than the argument of the differential correlation, which
+    /// only uses 15 transitions non-coherently.
+    /// Returns (uw_pos, theta) or None when the buffer cannot cover the
+    /// search window yet.
+    fn preamble_fit(&self, pos: f64) -> Option<(f64, f32)> {
+        let mut pr = [0.0f32; 16];
+        for k in 1..16 {
+            pr[k] = pr[k - 1] + UW_DELTAS[k] as f32 * PI / 4.0;
+        }
+        let mut best: Option<(f32, f64, f32)> = None; // (cost, pos, theta)
+        let mut t = -3.0f64;
+        while t <= 3.0 {
+            let cand = pos + t;
+            t += 0.25;
+            if cand < self.start_abs {
+                continue;
+            }
+            let mut r = [0.0f32; 16];
+            let mut w = [0.0f32; 16];
+            for k in 0..16 {
+                let s = self.sample(cand + k as f64 * self.sps)?;
+                r[k] = s.arg() - pr[k];
+                w[k] = s.norm_sqr();
+            }
+            // Sequential unwrap of the residual trajectory.
+            for k in 1..16 {
+                let mut d = r[k] - r[k - 1];
+                while d > PI {
+                    r[k] -= 2.0 * PI;
+                    d = r[k] - r[k - 1];
+                }
+                while d < -PI {
+                    r[k] += 2.0 * PI;
+                    d = r[k] - r[k - 1];
+                }
+            }
+            // Weighted least squares r_k ≈ a + b·k.
+            let sw: f32 = w.iter().sum();
+            if sw < 1e-12 {
+                continue;
+            }
+            let kbar = w.iter().enumerate().map(|(k, &wk)| wk * k as f32).sum::<f32>() / sw;
+            let rbar = w.iter().zip(&r).map(|(&wk, &rk)| wk * rk).sum::<f32>() / sw;
+            let mut num = 0.0f32;
+            let mut den = 0.0f32;
+            for k in 0..16 {
+                let dk = k as f32 - kbar;
+                num += w[k] * dk * (r[k] - rbar);
+                den += w[k] * dk * dk;
+            }
+            if den < 1e-12 {
+                continue;
+            }
+            let b = num / den;
+            let a = rbar - b * kbar;
+            let mut cost = 0.0f32;
+            for k in 0..16 {
+                let e = r[k] - a - b * k as f32;
+                cost += w[k] * e * e;
+            }
+            cost /= sw;
+            if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
+                best = Some((cost, cand, b));
+            }
+        }
+        best.map(|(_, p, th)| (p, th))
+    }
+
     /// Hunt for a UW; returns the refined first-UW-symbol position.
-    fn hunt(&mut self) -> Option<f64> {
-        let span = 18.0 * self.sps;
-        let end_abs = self.start_abs + self.buf.len() as f64 - span - 2.0;
+    fn hunt(&mut self) -> Option<(f64, f32)> {
+        // Span covers the preamble-fit search window (pos+3 + 15 symbols).
+        let span = 19.0 * self.sps;
+        let end_abs = self.start_abs + self.buf.len() as f64 - span - 4.0;
         while self.cursor < end_abs {
             let pos = self.cursor;
             self.cursor += 1.0;
@@ -167,21 +243,13 @@ impl Vdl2Demod {
             }
             if let Some((metric, _)) = self.uw_correlate(pos) {
                 if metric > CORR_THRESHOLD {
-                    // Quarter-sample refinement: at 4.76 samples/symbol a
-                    // 1-2 sample timing error degrades every later symbol
-                    // decision (header FEC and RS then fail) — the same
-                    // broad-differential-peak effect seen on HFDL off-air.
-                    let mut best = (metric, pos);
-                    let mut k = -4.0f64;
-                    while k <= 4.0 {
-                        if let Some((m, _)) = self.uw_correlate(pos + k) {
-                            if m > best.0 {
-                                best = (m, pos + k);
-                            }
-                        }
-                        k += 0.25;
+                    // Coherent refinement: joint timing/CFO fit over the
+                    // whole preamble (the differential metric's peak is
+                    // broad and its CFO estimate noisy — both degrade
+                    // every later symbol decision).
+                    if let Some(fit) = self.preamble_fit(pos) {
+                        return Some(fit);
                     }
-                    return Some(best.1);
                 }
             }
         }
@@ -234,13 +302,12 @@ impl Vdl2Demod {
         loop {
             match std::mem::replace(&mut self.state, State::Hunt) {
                 State::Hunt => match self.hunt() {
-                    Some(uw_pos) if (uw_pos - self.last_rs_fail).abs() < 1.0 => {
+                    Some((uw_pos, _)) if (uw_pos - self.last_rs_fail).abs() < 1.5 => {
                         // Deterministic re-detection of a burst that
                         // already failed RS: skip past its UW entirely.
                         self.cursor = uw_pos + 17.0 * self.sps;
                     }
-                    Some(uw_pos) => {
-                        let (_, theta) = self.uw_correlate(uw_pos).unwrap();
+                    Some((uw_pos, theta)) => {
                         let last_uw = uw_pos + 15.0 * self.sps;
                         let prev = self.sample(last_uw).unwrap();
                         self.state = State::Collect(Box::new(Collecting {
