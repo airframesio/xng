@@ -39,7 +39,11 @@ pub const GRAY_INV: [(u8, u8, u8); 8] = [
     (1, 0, 0),
 ];
 
-const CORR_THRESHOLD: f32 = 0.88;
+const CORR_THRESHOLD: f32 = 0.6;
+/// Maximum weighted residual variance (rad²) of the coherent preamble
+/// fit for a candidate to count as a UW (true preambles on the off-air
+/// capture fit below ~0.11; random data above ~0.5).
+const FIT_COST_MAX: f32 = 0.25;
 const ENERGY_FACTOR: f32 = 6.0;
 const NOISE_ALPHA: f32 = 1e-4;
 const PHASE_GAIN: f32 = 0.1;
@@ -163,7 +167,7 @@ impl Vdl2Demod {
     /// only uses 15 transitions non-coherently.
     /// Returns (uw_pos, theta) or None when the buffer cannot cover the
     /// search window yet.
-    fn preamble_fit(&self, pos: f64) -> Option<(f64, f32)> {
+    fn preamble_fit(&self, pos: f64) -> Option<(f64, f32, f32)> {
         let mut pr = [0.0f32; 16];
         for k in 1..16 {
             pr[k] = pr[k - 1] + UW_DELTAS[k] as f32 * PI / 4.0;
@@ -224,7 +228,7 @@ impl Vdl2Demod {
                 best = Some((cost, cand, b));
             }
         }
-        best.map(|(_, p, th)| (p, th))
+        best.map(|(c, p, th)| (p, th, c))
     }
 
     /// Hunt for a UW; returns the refined first-UW-symbol position.
@@ -246,9 +250,14 @@ impl Vdl2Demod {
                     // Coherent refinement: joint timing/CFO fit over the
                     // whole preamble (the differential metric's peak is
                     // broad and its CFO estimate noisy — both degrade
-                    // every later symbol decision).
-                    if let Some(fit) = self.preamble_fit(pos) {
-                        return Some(fit);
+                    // every later symbol decision). The fit residual
+                    // arbitrates true UWs; with collection-time buffer
+                    // retention, an accepted false candidate costs only
+                    // wasted work, never a lost burst.
+                    if let Some((p, th, cost)) = self.preamble_fit(pos) {
+                        if cost < FIT_COST_MAX {
+                            return Some((p, th));
+                        }
                     }
                 }
             }
@@ -359,8 +368,14 @@ impl Vdl2Demod {
         }
 
         // Drop consumed samples (keep a tail behind the active position).
+        // While collecting, retain everything back to the UW that started
+        // the collection: if the header was a false decode with a bogus
+        // length, the RS failure rewinds the hunt to uw_start + 1, and
+        // any real burst inside the consumed span must still be in the
+        // buffer. Worst case (max TL ≈ 6240 symbols) this holds ~150 KB
+        // of samples at the 50 kHz channel rate.
         let active = match &self.state {
-            State::Collect(c) => c.next_pos,
+            State::Collect(c) => c.uw_start.min(c.next_pos),
             State::Hunt => self.cursor,
         };
         let keep_from = (active - self.start_abs - 4.0 * self.sps).max(0.0) as usize;
