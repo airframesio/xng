@@ -61,6 +61,23 @@ All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
 second-class path — they get every xng output and the application layer.
 
+## Supported hardware
+
+| Device | `--sdr` | Backend | Notes |
+|---|---|---|---|
+| RTL-SDR | `driver=rtlsdr` | SoapySDR | The budget workhorse for VHF (ACARS, VDL2, AIS) and — with an L-band antenna + LNA — Aero, STD-C, Iridium, ADS-B |
+| Airspy R2 / Mini | `driver=airspy` | **native** (libairspy, `--features airspy`) | 24 MHz–1.75 GHz, 12-bit; `serial=…` (hex) selects a unit, `bias=1` powers an LNA |
+| Airspy HF+ / Discovery | `driver=airspyhf` | **native** (libairspyhf, `--features airspyhf`) | The classic HFDL receiver; 768 kS/s divides cleanly into every xng HF/VHF channel rate |
+| SDRplay (RSP series) | `driver=sdrplay` | SoapySDR | The Soapy module wraps the proprietary API |
+| Anything else | per its Soapy module | SoapySDR | HackRF, LimeSDR, USRP, BladeRF, … |
+
+`--gain` is in dB everywhere, and omitting it selects hardware AGC. The
+native Airspy backends map dB sensibly onto the actual hardware controls
+(R2/Mini: 22-step linearity gain; HF+: attenuator/preamp, bigger = more
+gain). With a native backend compiled in, its driver name routes to it
+automatically; add `backend=soapy` to force SoapySDR instead. IQ-file
+input (`xng decode`) needs no hardware or SDR libraries at all.
+
 ## Building
 
 Requirements: a stable [Rust](https://rustup.rs) toolchain, a **protobuf
