@@ -41,8 +41,20 @@ pub struct CpdlcMessage {
     /// argument structure is one we decode; see `decode`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Additional decoded elements beyond the first (reachable only
+    /// while every preceding element's argument shape is decodable).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional: Vec<CpdlcElement>,
     /// The message carries additional elements beyond the first.
     pub more_elements: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CpdlcElement {
+    pub element: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 struct Bits<'a> {
@@ -79,6 +91,23 @@ fn read_altitude(b: &mut Bits) -> Option<String> {
     })
 }
 
+/// FANSSpeed CHOICE (3-bit index; widths/offsets and value semantics —
+/// English speeds in tens of knots, metric in tens of km/h, Mach in
+/// hundredths — from libacars's generated constraints and formatters).
+fn read_speed(b: &mut Bits) -> Option<String> {
+    Some(match b.read(3)? {
+        0 => format!("{} kt", (7 + b.read(5)?) * 10),     // indicated (7..38)
+        1 => format!("{} km/h", (10 + b.read(7)?) * 10),  // indicated metric
+        2 => format!("{} kt", (7 + b.read(6)?) * 10),     // true (7..70)
+        3 => format!("{} km/h", (10 + b.read(7)?) * 10),  // true metric
+        4 => format!("{} kt GS", (7 + b.read(6)?) * 10),  // ground (7..70)
+        5 => format!("{} km/h GS", (10 + b.read(8)?) * 10), // ground metric
+        6 => format!("M{:.2}", (61 + b.read(5)?) as f32 / 100.0), // mach (61..92)
+        7 => format!("M{:.2}", (93 + b.read(9)?) as f32 / 100.0), // mach large
+        _ => unreachable!(),
+    })
+}
+
 /// FANSTime: hours (0..23, 5 bits) + minutes (0..59, 6 bits).
 fn read_time(b: &mut Bits) -> Option<String> {
     let h = b.read(5)?;
@@ -98,9 +127,11 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
     match ty {
         "NULL" => Some(Vec::new()),
         "Altitude" => Some(vec![read_altitude(b)?]),
-        // SEQUENCE SIZE(2..2) OF Altitude: fixed size, no length bits.
+        // SEQUENCE SIZE(2..2): fixed size, no length bits.
         "AltitudeAltitude" => Some(vec![read_altitude(b)?, read_altitude(b)?]),
         "Time" => Some(vec![read_time(b)?]),
+        "Speed" => Some(vec![read_speed(b)?]),
+        "SpeedSpeed" => Some(vec![read_speed(b)?, read_speed(b)?]),
         _ => None,
     }
 }
@@ -140,8 +171,32 @@ pub fn decode(body: &[u8], downlink: bool) -> Option<CpdlcMessage> {
         if downlink { &DOWNLINK_ELEMENTS } else { &UPLINK_ELEMENTS };
     let idx = b.read(8)? as usize;
     let (tag, label) = table.get(idx).copied()?;
-    let args = read_args(tag, &mut b).unwrap_or_default();
+    let first_args = read_args(tag, &mut b);
+    let args = first_args.clone().unwrap_or_default();
     let text = if args.is_empty() { label.to_string() } else { render(label, &args) };
+
+    // Additional elements (SEQUENCE SIZE(1..4), 2-bit count) are only
+    // reachable while every preceding element's argument shape decodes
+    // (UPER has no per-element length prefix).
+    let mut additional = Vec::new();
+    if has_more && first_args.is_some() {
+        if let Some(count) = b.read(2).map(|v| v + 1) {
+            for _ in 0..count {
+                let Some(idx) = b.read(8).map(|v| v as usize) else { break };
+                let Some((tag, label)) = table.get(idx).copied() else { break };
+                let elem_args = read_args(tag, &mut b);
+                let a = elem_args.clone().unwrap_or_default();
+                additional.push(CpdlcElement {
+                    element: tag.to_string(),
+                    text: if a.is_empty() { label.to_string() } else { render(label, &a) },
+                    args: a,
+                });
+                if elem_args.is_none() {
+                    break; // cannot advance past an undecoded shape
+                }
+            }
+        }
+    }
     Some(CpdlcMessage {
         msg_id,
         msg_ref,
@@ -149,6 +204,7 @@ pub fn decode(body: &[u8], downlink: bool) -> Option<CpdlcMessage> {
         element: tag.to_string(),
         text,
         args,
+        additional,
         more_elements: has_more,
     })
 }
@@ -250,6 +306,38 @@ mod tests {
         assert_eq!(m.element, "dM22Position");
         assert!(m.args.is_empty());
         assert!(m.text.contains("[position]"), "{}", m.text);
+    }
+
+    #[test]
+    fn speed_and_multi_element() {
+        // dM18Speed = "REQUEST [speed]" with Mach 0.84 (choice 6,
+        // offset 84-61=23), followed by one additional element:
+        // dM0NULL (WILCO). Header: more=1.
+        let mut bits: Vec<u8> = Vec::new();
+        let mut push = |v: u32, n: usize, bits: &mut Vec<u8>| {
+            for k in (0..n).rev() {
+                bits.push(((v >> k) & 1) as u8);
+            }
+        };
+        push(1, 1, &mut bits); // has additional elements
+        push(0, 1, &mut bits); // no msgRef
+        push(0, 1, &mut bits); // no timestamp
+        push(22, 6, &mut bits); // msg id
+        push(18, 8, &mut bits); // dM18Speed
+        push(6, 3, &mut bits); // speed CHOICE: mach
+        push(23, 5, &mut bits); // M0.84
+        push(0, 2, &mut bits); // seq count - 1 = 0 -> one element
+        push(0, 8, &mut bits); // dM0NULL
+        let mut body = vec![0u8; bits.len().div_ceil(8)];
+        for (i, &v) in bits.iter().enumerate() {
+            body[i / 8] |= v << (7 - i % 8);
+        }
+        let m = decode(&body, true).unwrap();
+        assert_eq!(m.element, "dM18Speed");
+        assert_eq!(m.text, "REQUEST M0.84");
+        assert_eq!(m.additional.len(), 1);
+        assert_eq!(m.additional[0].element, "dM0NULL");
+        assert_eq!(m.additional[0].text, "WILCO");
     }
 
     #[test]
