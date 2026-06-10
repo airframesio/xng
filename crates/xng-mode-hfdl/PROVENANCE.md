@@ -62,3 +62,15 @@ rotation of up to ~0.025 rad/symbol can survive acquisition — per-T
 re-estimation papered over it, the DD loop removes it. Off-air result
 on the sigidwiki 21931 kHz capture: 31 events vs 28 before (dumphfdl:
 37; the rest is weak-burst acquisition sensitivity).
+
+## Coherent A1 sync (2026-06, demod v2 step 2)
+
+The quarter-sample coherent-correlation refinement after the
+differential A1 hunt is replaced by the same coherent joint fit that
+recovered the VDL2 XID bursts: over a fine timing grid, the per-symbol
+phases of the 127 known BPSK chips (signs removed, residual rotation
+pre-subtracted using the differential estimate) are unwrapped and fit
+to residual ≈ a + b·k weighted by sample energy. The minimum-cost grid
+point yields timing and per-symbol CFO jointly, with none of the
+2π/127-per-symbol aliasing of the A1→A2 dphi refinement. Off-air
+result: 33 events on the 21931 kHz capture (from 31; dumphfdl: 37).
