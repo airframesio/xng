@@ -94,18 +94,23 @@ pub fn to_message(
             fec_corrected: Some(f.fixed_bits),
             errors: Some(f.parity_errors),
         },
-        body: MessageBody::Acars(AcarsCore {
-            mode: f.mode,
-            tail: f.tail.clone(),
-            label: f.label.clone(),
-            sublabel: None,
-            block_id: f.block_id,
-            ack: f.ack,
-            flight: f.flight.clone(),
-            msg_num: f.msg_num.clone(),
-            text: f.text.clone(),
-            more_to_come: f.more_to_come,
-        }),
+        body: {
+            let appdec = xng_acars::decode(&f.label, &f.text, f.downlink);
+            MessageBody::Acars(AcarsCore {
+                mode: f.mode,
+                tail: f.tail.clone(),
+                label: f.label.clone(),
+                sublabel: appdec.sublabel,
+                mfi: appdec.mfi,
+                block_id: f.block_id,
+                ack: f.ack,
+                flight: f.flight.clone(),
+                msg_num: f.msg_num.clone(),
+                text: f.text.clone(),
+                more_to_come: f.more_to_come,
+                app: appdec.app.map(|a| serde_json::to_value(&a).unwrap_or_default()),
+            })
+        },
         raw: Some(f.raw.clone()),
         source,
     }

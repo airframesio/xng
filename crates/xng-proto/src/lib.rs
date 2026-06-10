@@ -53,6 +53,8 @@ impl From<&Message> for asf2::DecodedMessage {
                     tail: a.tail.clone(),
                     label: a.label.clone(),
                     sublabel: a.sublabel.clone(),
+                    mfi: a.mfi.clone(),
+                    app_json: a.app.as_ref().map(|v| v.to_string()),
                     block_id: a.block_id.map(|c| c.to_string()),
                     ack: a.ack.map(|c| c.to_string()),
                     flight: a.flight.clone(),

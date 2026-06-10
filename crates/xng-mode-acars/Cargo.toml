@@ -9,6 +9,8 @@ authors.workspace = true
 
 [dependencies]
 chrono.workspace = true
+serde_json.workspace = true
+xng-acars.workspace = true
 num-complex.workspace = true
 xng-dsp.workspace = true
 xng-types.workspace = true

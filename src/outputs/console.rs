@@ -10,6 +10,29 @@ pub enum ConsoleFormat {
     Json,
 }
 
+/// Best-effort one-liner from the decoded application layer JSON.
+fn app_summary(app: &serde_json::Value) -> Option<String> {
+    match app.get("app")?.as_str()? {
+        "adsc" => {
+            let tags = app.get("tags")?.as_array()?;
+            for t in tags {
+                if t.get("tag")?.as_str()? == "report" {
+                    return Some(format!(
+                        "ADS-C {:.4} {:.4} {} ft",
+                        t.get("lat")?.as_f64()?,
+                        t.get("lon")?.as_f64()?,
+                        t.get("alt_ft")?.as_i64()?
+                    ));
+                }
+            }
+            Some(format!("ADS-C {}", tags.first()?.get("tag")?.as_str()?))
+        }
+        "cpdlc" => Some(format!("CPDLC {}", app.get("imi")?.as_str()?)),
+        "media_advisory" => Some("MEDIA-ADV".to_owned()),
+        _ => None,
+    }
+}
+
 pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
     match fmt {
         ConsoleFormat::Json => serde_json::to_string(msg).unwrap_or_else(|e| format!("<serialize error: {e}>")),
@@ -21,7 +44,8 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     let tail = a.tail.as_deref().unwrap_or("-");
                     let flight = a.flight.as_deref().unwrap_or("-");
                     let text = if a.text.is_empty() { String::new() } else { format!(" | {}", a.text.replace('\n', "·")) };
-                    format!("ACARS {} {} lbl={} {}{}", tail, flight, a.label, quality, text)
+                    let app = a.app.as_ref().and_then(app_summary).map(|s| format!(" [{s}]")).unwrap_or_default();
+                    format!("ACARS {} {} lbl={} {}{}{}", tail, flight, a.label, quality, text, app)
                 }
                 MessageBody::Ais { nmea, msg_type, mmsi } => format!(
                     "AIS type={} mmsi={} {}",

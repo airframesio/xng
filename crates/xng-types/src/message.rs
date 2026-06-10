@@ -35,7 +35,7 @@ pub struct DecodeQuality {
 
 /// The ACARS application-layer fields common to POA, VDL2 (AOA), HFDL
 /// (HFNPDU), Aero and Iridium carriage. ARINC 618 naming.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AcarsCore {
     /// ACARS mode character (e.g. '2').
     pub mode: char,
@@ -46,6 +46,9 @@ pub struct AcarsCore {
     pub label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sublabel: Option<String>,
+    /// Multi-function identifier (follows the sublabel on H1 messages).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mfi: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub block_id: Option<char>,
     /// Technical ack character; `None` = NAK ('!').
@@ -59,6 +62,10 @@ pub struct AcarsCore {
     pub text: String,
     /// True when more blocks follow (ETB rather than ETX).
     pub more_to_come: bool,
+    /// Decoded application layer (ADS-C, CPDLC envelope, media advisory,
+    /// ...), as produced by xng-acars.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app: Option<serde_json::Value>,
 }
 
 /// Typed per-mode message bodies. Deliberately minimal for M0; each mode core

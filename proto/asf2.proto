@@ -67,6 +67,9 @@ message AcarsBody {
   optional string msg_num = 8;
   string text = 9;
   bool more_to_come = 10;
+  optional string mfi = 11;
+  // Decoded application layer (ADS-C etc.) as JSON, when present.
+  optional string app_json = 12;
 }
 
 message AisBody {

@@ -49,15 +49,41 @@ fn main() -> std::io::Result<()> {
         -75_000.0,
         0.35,
     );
+    // A real off-air ADS-C downlink (libacars example, MIT) on a third
+    // channel — exercises the ARINC 622 / ADS-C application layer.
+    let burst_c = burst_iq(
+        &FrameSpec {
+            mode: '2',
+            tail: "VT-ANB",
+            ack: None,
+            label: "B6",
+            block_id: '4',
+            msg_num: Some("M11A"),
+            flight: Some("AI0142"),
+            text: "/BOMASAI.ADS.VT-ANB072501A070A988CA73248F0E5DC10200000F5EE1ABC000102B885E0A19F5",
+            etb: false,
+        },
+        fs,
+        150_000.0,
+        0.35,
+    );
 
     let b_delay = 120_000; // 50 ms in
-    let total = burst_a.len().max(burst_b.len() + b_delay) + 48_000;
+    let c_delay = 60_000;
+    let total = burst_a
+        .len()
+        .max(burst_b.len() + b_delay)
+        .max(burst_c.len() + c_delay)
+        + 48_000;
     let mut iq = vec![Complex::new(0.0f32, 0.0f32); total];
     for (i, s) in burst_a.iter().enumerate() {
         iq[i + 24_000] += s;
     }
     for (i, s) in burst_b.iter().enumerate() {
         iq[i + b_delay] += s;
+    }
+    for (i, s) in burst_c.iter().enumerate() {
+        iq[i + c_delay] += s;
     }
     // Light deterministic noise.
     let mut state = 0x2545_f491_4f6c_dd1du64;

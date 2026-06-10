@@ -1,0 +1,13 @@
+[package]
+name = "xng-acars"
+description = "ACARS application-layer decoding for xng: ARINC 622 envelopes, ADS-C (FANS-1/A), media advisory, sublabel/MFI — a Rust port of libacars concepts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+crc.workspace = true
+serde.workspace = true
+serde_json.workspace = true

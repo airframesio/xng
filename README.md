@@ -24,7 +24,10 @@ Three native decode cores are in, all clean-room:
 - **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
   sync/parity/CRC deframing, parity-guided single-bit error correction.
   Validated off-air against an RTL-SDR (live United/American frames,
-  CRC-verified).
+  CRC-verified). Application layer via **`xng-acars`** (libacars port, MIT):
+  ARINC 622 envelopes with CRC, full **ADS-C** decode (positions!), media
+  advisory, H1 sublabel/MFI — conformance-tested against real off-air
+  ADS-C messages.
 - **AIS** (ITU-R M.1371): GMSK demod with carrier-offset tracking, HDLC
   deframing with destuffing, CRC-16/X-25, NMEA AIVDM output — verified
   against the canonical published AIVDM test vector.
@@ -72,7 +75,8 @@ xng ingest --grpc 0.0.0.0:6001 --quic 0.0.0.0:6011   # receive asf-2.0 feeds
 ```
 
 Workspace crates so far: `xng-types` (normalized message model),
-`xng-proto` (asf-2.0 schema + conversions),
+`xng-proto` (asf-2.0 schema + conversions), `xng-acars` (ACARS
+application layer: ARINC 622/ADS-C, shared by five modes),
 `xng-dsp` (PFB channelizer, DDC, FIR/NCO, CRCs), `xng-sdr` (SoapySDR +
 IQ-file sources), `xng-mode-acars`, `xng-mode-ais`, and
 `xng-mode-adsb` (decode cores, each with a spec-faithful modulator for

@@ -2516,6 +2516,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots 0.26.11",
+ "xng-acars",
  "xng-dsp",
  "xng-mode-acars",
  "xng-mode-adsb",
@@ -2523,6 +2524,15 @@ dependencies = [
  "xng-proto",
  "xng-sdr",
  "xng-types",
+]
+
+[[package]]
+name = "xng-acars"
+version = "0.2.0"
+dependencies = [
+ "crc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2540,6 +2550,8 @@ version = "0.2.0"
 dependencies = [
  "chrono",
  "num-complex",
+ "serde_json",
+ "xng-acars",
  "xng-dsp",
  "xng-types",
 ]
