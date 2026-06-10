@@ -82,6 +82,39 @@ pub(crate) fn passband(mode: Mode) -> f64 {
     }
 }
 
+/// Per-channel decoder input rate, by mode: an acceptable capture rate
+/// must be an integer multiple of this (the DDC decimates by integers).
+pub(crate) fn channel_rate(mode: Mode) -> f64 {
+    match mode {
+        Mode::Ais => xng_mode_ais::CHANNEL_RATE,
+        Mode::Vdl2 => xng_mode_vdl2::CHANNEL_RATE,
+        Mode::Hfdl => xng_mode_hfdl::CHANNEL_RATE,
+        Mode::StdC => xng_mode_stdc::CHANNEL_RATE,
+        Mode::Iridium => xng_mode_iridium::CHANNEL_RATE,
+        // Consumes the whole capture at its native rate.
+        Mode::Adsb => 1.0,
+        _ => xng_mode_acars::CHANNEL_RATE,
+    }
+}
+
+/// Choose a capture rate the device can actually do: the smallest
+/// advertised rate that divides the mode's channel rate cleanly (CPU
+/// scales with rate). Falls back to the plan rate when nothing matches
+/// or nothing was probed.
+pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> f64 {
+    let ch = channel_rate(mode);
+    let mut rates: Vec<u32> = advertised.to_vec();
+    rates.sort_unstable();
+    if rates.iter().any(|&r| r as f64 == plan_rate && (plan_rate / ch).fract().abs() < 1e-9) {
+        return plan_rate;
+    }
+    rates
+        .iter()
+        .map(|&r| r as f64)
+        .find(|r| (r / ch).fract().abs() < 1e-9)
+        .unwrap_or(plan_rate)
+}
+
 /// Cluster channels into capture-width groups.
 pub(crate) fn group_channels(channels: &[u64], sample_rate: f64, passband: f64) -> Vec<(u64, Vec<u64>)> {
     let usable = sample_rate * 0.8 - 2.0 * passband;
@@ -396,6 +429,18 @@ pub(crate) fn scan_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_rate_prefers_smallest_divisible_advertised_rate() {
+        // Airspy Mini advertises 6/3 Msps: VDL2 (50 kHz channels) and
+        // ACARS (24 kHz) both divide 3 Msps, so the cheaper rate wins.
+        assert_eq!(pick_auto_rate(&[6_000_000, 3_000_000], Mode::Vdl2, 2_400_000.0), 3_000_000.0);
+        assert_eq!(pick_auto_rate(&[6_000_000, 3_000_000], Mode::AcarsPoa, 2_400_000.0), 3_000_000.0);
+        // Device that advertises the plan rate keeps it.
+        assert_eq!(pick_auto_rate(&[2_400_000], Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
+        // Nothing probed (SoapySDR path): plan rate.
+        assert_eq!(pick_auto_rate(&[], Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
+    }
 
     #[test]
     fn auto_window_picks_densest_group_and_keeps_core_first() {

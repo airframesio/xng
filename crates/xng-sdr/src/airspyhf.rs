@@ -81,6 +81,21 @@ pub fn enumerate() -> Result<Vec<u64>, SdrError> {
     Ok(serials)
 }
 
+/// The sample rates a connected device advertises (briefly opens it).
+pub fn device_rates(serial: Option<u64>) -> Result<Vec<u32>, SdrError> {
+    let mut dev: *mut ffi::Device = std::ptr::null_mut();
+    let ret = match serial {
+        Some(sn) => unsafe { ffi::airspyhf_open_sn(&mut dev, sn) },
+        None => unsafe { ffi::airspyhf_open(&mut dev) },
+    };
+    if ret != ffi::AIRSPYHF_SUCCESS {
+        return Err(SdrError::Device(format!("airspyhf_open: error {ret}")));
+    }
+    let rates = supported_rates(dev);
+    unsafe { ffi::airspyhf_close(dev) };
+    Ok(rates)
+}
+
 /// Manual gain settings derived from a requested dB value.
 ///
 /// The HF+ front end has no conventional gain knob — only a 0..48 dB
