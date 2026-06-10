@@ -89,3 +89,16 @@ non-coherently. Off-air result: 13 frames (from 10), including the
 ground-station XID bursts whose symbol errors previously drove RS into
 miscorrection. Remaining gap to dumpvdl2 is hunt trigger sensitivity on
 the weakest bursts.
+
+## AVLC structured bodies + XID parameters (2026-06)
+
+Non-ACARS frames emit structured bodies (addresses, control, payload
+class) — all from the existing EN 301 841-2 clean-room parse. The XID
+parameter walk (FI octet, GI/GL groups, PI/PL/PV) follows ISO/IEC 8885
+as cited by EN 301 841-2; the VDL private parameter set names
+(connection-management, destination-airport, autotune-frequency, ...)
+are from ICAO Doc 9776 (public manual). Values are rendered as hex plus
+printable text where applicable; binary parameter layouts we have not
+verified against the spec are deliberately left as hex rather than
+guessed. ATN payloads are labeled by IPI per ISO TR 9577 (0x81 CLNP,
+0x82 ES-IS, 0x83 IDRP).

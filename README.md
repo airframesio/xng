@@ -1,6 +1,7 @@
 # xng
 
 [![Rust](https://github.com/airframesio/xng/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/airframesio/xng/actions/workflows/rust.yml)
+[![Release](https://img.shields.io/github/v/release/airframesio/xng)](https://github.com/airframesio/xng/releases/latest)
 
 **One native SDR decoder for the whole aviation + maritime radio stack.**
 
@@ -12,7 +13,9 @@ capture, one message model, one application layer, and one set of outputs
 (including first-class [airframes.io](https://airframes.io) feeding).
 All nine modes are implemented, validated, and merged — including the
 complete Iridium stack (ring alerts through ACARS-over-SBD with a
-wideband burst-hunting front end).
+wideband burst-hunting front end) — and shipped as tagged releases with
+binaries for Linux (x86_64/arm64, tarball + .deb), macOS Apple Silicon,
+and multi-arch Docker images.
 
 ```bash
 # Two ACARS channels from one RTL-SDR, fed to Airframes:
@@ -48,7 +51,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Mode | `--mode` | Band | What you get | Validation |
 |---|---|---|---|---|
 | VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + applications | Live off-air (RTL-SDR), CRC-verified, **fed to production Airframes end-to-end** |
-| VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | AVLC, ACARS-over-AVLC, XID | Off-air capture vs dumpvdl2 ground truth |
+| VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | ACARS-over-AVLC, AVLC link events with addresses, XID with decoded handoff parameters, ATN protocol labels | Off-air capture vs dumpvdl2 ground truth |
 | HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons, positions, ACARS, **over-the-air system table** | Off-air 21 931 kHz capture, field-exact vs dumphfdl |
 | Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air |
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
@@ -66,7 +69,7 @@ second-class path — they get every xng output and the application layer.
 | Device | `--sdr` | Backend | Notes |
 |---|---|---|---|
 | RTL-SDR | `driver=rtlsdr` | SoapySDR | The budget workhorse for VHF (ACARS, VDL2, AIS) and — with an L-band antenna + LNA — Aero, STD-C, Iridium, ADS-B |
-| Airspy R2 / Mini | `driver=airspy` | **native** (libairspy, `--features airspy`) | 24 MHz–1.75 GHz, 12-bit; `serial=…` (hex) selects a unit, `bias=1` powers an LNA |
+| Airspy R2 / Mini | `driver=airspy` | **native** (libairspy, `--features airspy`) | 24 MHz–1.75 GHz, 12-bit; `serial=…` (hex) selects a unit, `bias=1` powers an LNA. Validated live (Mini: off-air ACARS at 6 MS/s) |
 | Airspy HF+ / Discovery | `driver=airspyhf` | **native** (libairspyhf, `--features airspyhf`) | The classic HFDL receiver; 768 kS/s divides cleanly into every xng HF/VHF channel rate |
 | SDRplay (RSP series) | `driver=sdrplay` | SoapySDR | The Soapy module wraps the proprietary API |
 | Anything else | per its Soapy module | SoapySDR | HackRF, LimeSDR, USRP, BladeRF, … |
@@ -77,6 +80,26 @@ native Airspy backends map dB sensibly onto the actual hardware controls
 gain). With a native backend compiled in, its driver name routes to it
 automatically; add `backend=soapy` to force SoapySDR instead. IQ-file
 input (`xng decode`) needs no hardware or SDR libraries at all.
+
+## Installing
+
+Grab a [release](https://github.com/airframesio/xng/releases/latest) —
+tarballs for Linux x86_64/arm64 and macOS Apple Silicon, `.deb` packages
+for Debian/Ubuntu (which declare the runtime libraries), and `SHA256SUMS`.
+The binaries need `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf`
+for native Airspy):
+
+```bash
+sudo apt install ./xng_0.9.0_arm64.deb     # pulls runtime deps
+# or
+tar xzf xng-v0.9.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng-*/xng /usr/local/bin/
+```
+
+Multi-arch Docker images (amd64/arm64/armv7) are published per tag:
+
+```bash
+docker run --rm ghcr.io/airframesio/xng:latest --version
+```
 
 ## Building
 
@@ -210,15 +233,18 @@ xng decode vdl2.cf32 --mode vdl2 -r 50000 -c 136.975M --channels 136.975 --json
 
 ### Interactive TUI
 
-Live message browser with a JSON detail pane, per-channel statistics,
-spectrum with channel markers, and a waterfall — over a live SDR or a
-replayed file:
+Live message browser with a detail pane (press `v` to flip between a
+human-readable rendering and raw JSON), per-channel statistics, spectrum
+with channel markers, and a waterfall — over a live SDR or a replayed
+file:
 
 ```bash
 # Zero config: channels, center, and sample rate come from the mode's
-# built-in plan — as many channels as fit the capture width and CPU
+# built-in plan — as many channels as fit the capture width and CPU.
+# Native-backend devices are asked which rates they support (an Airspy
+# Mini gets 3 MS/s automatically, not the plan's 2.4):
 xng tui --sdr driver=rtlsdr
-xng tui --sdr driver=rtlsdr --mode vdl2
+xng tui --sdr driver=airspy --mode vdl2
 
 # Explicit tuning still works (and is required for --file replay)
 xng tui --sdr driver=rtlsdr -r 2400000 -c 131.500M --channels 131.550,131.125

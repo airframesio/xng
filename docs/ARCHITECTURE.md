@@ -1,7 +1,12 @@
 # xng — Next-Generation Multi-Mode SDR Decoder
 
-**Status:** Architecture blueprint (2026-06-09). This document records the research,
-the decisions made, and the target architecture for the xng rewrite.
+**Status:** Architecture blueprint (2026-06-09), preserved as the design
+record. The rewrite shipped: all nine modes are implemented and validated
+(off-air or reference vectors), the VHF ACARS chain is proven end-to-end
+into production Airframes from a live station, and v0.9.0 is the first
+tagged release with per-platform binaries. The README is the current
+user-facing truth; `docs/REFERENCES.md` and per-crate `PROVENANCE.md`
+track sourcing.
 
 ## 1. Vision
 

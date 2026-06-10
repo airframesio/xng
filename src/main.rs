@@ -127,9 +127,10 @@ impl OutputOpts {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List available SDR devices (SoapySDR)
+    /// List available SDR devices (native Airspy backends + SoapySDR)
     Devices {
-        /// SoapySDR filter args, e.g. "driver=rtlsdr"
+        /// SoapySDR filter args, e.g. "driver=rtlsdr" (native devices
+        /// are always listed)
         #[arg(default_value = "")]
         filter: String,
     },
