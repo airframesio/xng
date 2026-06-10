@@ -411,7 +411,7 @@ fn resolve_tune_auto(
 /// Advertised sample rates of the device `--sdr` selects, where a native
 /// backend can ask (empty when it can't — SoapySDR devices generally
 /// accept the plan rates).
-fn probe_device_rates(sdr: &str) -> Vec<u32> {
+pub(crate) fn probe_device_rates(sdr: &str) -> Vec<u32> {
     let args = sdr_args::SdrArgs::parse(sdr);
     if args.force_soapy {
         return Vec::new();

@@ -206,11 +206,19 @@ pub fn run(
     let mut results: Vec<ChannelResult> = Vec::new();
     let mut groups_total = 0usize;
     let mut plans = Vec::new();
+    // Plan rates target common hardware (RTL-SDR); devices with a fixed
+    // rate list (Airspy) get the smallest advertised rate that divides
+    // the mode's channel rate.
+    let advertised = crate::probe_device_rates(sdr);
     for &mode in modes {
-        let (rate, channels) = plan(mode);
+        let (plan_rate, channels) = plan(mode);
         if channels.is_empty() {
             tracing::warn!("no built-in frequency plan for mode {mode}; skipping");
             continue;
+        }
+        let rate = pick_auto_rate(&advertised, mode, plan_rate);
+        if rate != plan_rate {
+            tracing::info!("{mode}: device prefers {} S/s over the plan's {} S/s", rate as u64, plan_rate as u64);
         }
         let groups = group_channels(&channels, rate, passband(mode));
         groups_total += groups.len();
@@ -316,7 +324,7 @@ pub fn run(
         if active.is_empty() {
             continue;
         }
-        let (rate, _) = plan(mode);
+        let rate = pick_auto_rate(&advertised, mode, plan(mode).0);
         let freqs: Vec<u64> = active.iter().map(|r| r.frequency_hz).collect();
         let center = (freqs.iter().min().unwrap() + freqs.iter().max().unwrap()) / 2;
         let center = if freqs.contains(&center) { center + 25_000 } else { center };
