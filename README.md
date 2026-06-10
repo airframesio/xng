@@ -35,7 +35,7 @@ xng listen --sdr driver=rtlsdr -r 2400000 -c 131.500M \
 | **Validation** | Varies | Every decode core is validated against **real off-air recordings** or the reference implementation's own test vectors, with the captures vendored into CI so conventions can never silently regress |
 | **Application layer** | libacars bolted on, or nothing | Built-in ARINC 622 (ADS-C positions, **CPDLC rendered as readable text** — `REQUEST CLIMB TO FL360`), media advisory, H1 sublabels — shared by every ACARS carrier (VHF, VDL2, HFDL, Aero, Iridium SBD) |
 | **Outputs** | Per-tool formats | Pretty console, JSON/JSONL, acarsdec-compatible UDP, Airframes feeding, Prometheus metrics, and the multiplexed gRPC/QUIC **asf-2.0** protocol — identical across all modes |
-| **Tooling** | None | Interactive TUI (spectrum, waterfall, message browser), auto-scanner that proposes ready-to-run configs, IQ-file inspection, built-in self-test |
+| **Tooling** | None | Interactive TUI (spectrum, waterfall, message browser), auto-scanner that proposes ready-to-run configs, site survey/soak reports with gain tuning, IQ-file inspection, built-in self-test |
 | **License** | Mostly GPL | MIT/Apache-2.0 dual license; cores are clean-room from public specs or ported from MIT/BSD projects with attribution |
 
 The provenance discipline is part of the engineering: every core has a
@@ -124,6 +124,11 @@ xng selftest                      # end-to-end pipeline sanity check
 xng scan --sdr driver=rtlsdr --gain 28 --modes acars,vdl2,ais --dwell 120 --out scan.json
 # → prints verdicts per channel and ready-to-paste `xng listen` command lines.
 #   For HFDL it even learns new frequencies from the over-the-air system table.
+
+# Then qualify the site properly: a 15-minute soak across the whole ACARS
+# plan, with an empirical gain sweep first, ending in a per-channel report
+# (frames, CRC rate, levels) plus reception advice:
+xng survey --sdr driver=rtlsdr --mode acars --tune-gain --out survey.json
 ```
 
 ## Examples
@@ -171,6 +176,28 @@ xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
 
 # Mode S / ADS-B (consumes the whole capture)
 xng listen --sdr driver=rtlsdr --mode adsb -r 2000000 -c 1090.000M --channels 1090
+```
+
+### Site survey / soak test
+
+`xng survey` qualifies a site for one mode: it monitors every channel in
+the mode's plan (rotating capture windows when the plan exceeds the SDR
+bandwidth), prints interim tables as it goes, and ends with per-channel
+statistics — frames, CRC pass rate, frames/min, levels — plus reception
+advice and a ready-to-run `listen` command. Ctrl-C ends early but still
+reports.
+
+```bash
+# 15-minute ACARS soak over the full plan, gain picked empirically
+xng survey --sdr driver=rtlsdr --mode acars --tune-gain --out survey.json
+
+# Scan first, then soak only active channels — plus the mode's core
+# worldwide channels, which short scans routinely undersell
+xng survey --sdr driver=rtlsdr --gain 28 --mode vdl2 --scan --duration 1800
+
+# Specific channels, live message output, messages archived to JSONL
+xng survey --sdr driver=rtlsdr --gain 28 --mode acars --duration 3600 \
+    --channels 130.025,131.550,131.725 --show-messages --jsonl soak.jsonl
 ```
 
 ### Recordings

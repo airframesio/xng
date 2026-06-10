@@ -185,6 +185,58 @@ enum Command {
         #[arg(last = true)]
         command: Vec<String>,
     },
+    /// Soak-test one mode: monitor all channels that fit the SDR bandwidth
+    /// for a sustained period, then report per-channel statistics and
+    /// reception advice
+    Survey {
+        /// SDR device args (as for listen)
+        #[arg(long, default_value = "")]
+        sdr: String,
+        /// Tuner gain in dB (hardware AGC when omitted; see --tune-gain)
+        #[arg(short, long)]
+        gain: Option<f64>,
+        /// Mode to survey: acars, vdl2, hfdl, aero, std-c, ais, adsb, iridium
+        #[arg(short, long, default_value = "acars")]
+        mode: String,
+        /// Capture sample rate in Hz (the mode's plan default when omitted)
+        #[arg(short = 'r', long)]
+        sample_rate: Option<f64>,
+        /// Survey only these channels (MHz/k/M suffixes accepted);
+        /// the full built-in plan when omitted
+        #[arg(long, value_delimiter = ',')]
+        channels: Vec<String>,
+        /// Total survey duration in seconds
+        #[arg(long, default_value_t = 900)]
+        duration: u64,
+        /// Print an interim statistics table every N seconds
+        #[arg(long, default_value_t = 300)]
+        interim: u64,
+        /// Run a scan pre-pass and keep active channels (plus the mode's
+        /// core worldwide channels, which short scans routinely undersell)
+        #[arg(long)]
+        scan: bool,
+        /// Dwell per capture window during the scan pre-pass, seconds
+        #[arg(long, default_value_t = 90)]
+        scan_dwell: u64,
+        /// Sweep gain settings empirically first and use the best
+        #[arg(long)]
+        tune_gain: bool,
+        /// Dwell per gain step during --tune-gain, seconds
+        #[arg(long, default_value_t = 20)]
+        tune_dwell: u64,
+        /// Dwell per visit when rotating between capture windows, seconds
+        #[arg(long, default_value_t = 60)]
+        rotate_dwell: u64,
+        /// Print decoded messages live during the survey
+        #[arg(long)]
+        show_messages: bool,
+        /// Also write decoded messages to this JSONL file
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
+        /// Write the full survey report as JSON
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Auto-scan known frequency plans and propose a configuration
     Scan {
         /// SoapySDR device args
@@ -310,6 +362,46 @@ fn main() -> anyhow::Result<()> {
                 format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (outputs, station_ident) = output.build()?;
             commands::extern_cmd::run(fmt, &command, station_ident, outputs)
+        }
+        Command::Survey {
+            sdr,
+            gain,
+            mode,
+            sample_rate,
+            channels,
+            duration,
+            interim,
+            scan,
+            scan_dwell,
+            tune_gain,
+            tune_dwell,
+            rotate_dwell,
+            show_messages,
+            jsonl,
+            out,
+        } => {
+            let mode: xng_types::Mode = mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+            let channels = channels
+                .iter()
+                .map(|c| freq::parse_hz(c))
+                .collect::<anyhow::Result<Vec<u64>>>()?;
+            commands::survey::run(commands::survey::SurveyOpts {
+                sdr,
+                gain,
+                mode,
+                sample_rate,
+                channels,
+                duration_secs: duration,
+                interim_secs: interim,
+                scan_first: scan,
+                scan_dwell_secs: scan_dwell,
+                tune_gain,
+                tune_dwell_secs: tune_dwell,
+                rotate_dwell_secs: rotate_dwell,
+                show_messages,
+                jsonl,
+                out_json: out,
+            })
         }
         Command::Scan { sdr, gain, modes, dwell, out } => {
             let modes: Vec<xng_types::Mode> = modes
