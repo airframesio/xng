@@ -105,6 +105,16 @@ xng iq-info capture.cf32 -r 2000000 -c 131500000   # power, spectral peaks
 xng selftest                    # end-to-end pipeline self-test
 ```
 
+**Auto-scanner** (`xng scan`): steps the SDR across built-in frequency
+plans (ACARS, VDL2, AIS, ADS-B, STD-C, HFDL per the public system
+table), runs the real decoders as signature detectors for a dwell
+period, and proposes ready-to-run configurations — the Airwaves OS
+site-survey foundation:
+
+```bash
+xng scan --sdr driver=rtlsdr --gain 28 --modes acars,vdl2,ais --dwell 120 --out scan.json
+```
+
 **Interactive TUI** (`xng tui`): live message browser with JSON detail
 pane, per-channel statistics, spectrum with channel markers, and a
 waterfall — over a live SDR or a replayed IQ file:

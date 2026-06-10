@@ -166,6 +166,24 @@ enum Command {
         #[arg(long, default_value_t = 4096)]
         fft_size: usize,
     },
+    /// Auto-scan known frequency plans and propose a configuration
+    Scan {
+        /// SoapySDR device args
+        #[arg(long, default_value = "")]
+        sdr: String,
+        /// Tuner gain in dB (hardware AGC when omitted)
+        #[arg(short, long)]
+        gain: Option<f64>,
+        /// Modes to scan, comma separated (default: acars,vdl2,ais)
+        #[arg(long, value_delimiter = ',', default_values_t = ["acars".to_string(), "vdl2".to_string(), "ais".to_string()])]
+        modes: Vec<String>,
+        /// Seconds to dwell on each capture group
+        #[arg(long, default_value_t = 20)]
+        dwell: u64,
+        /// Write the full scan report as JSON
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Interactive TUI: live decode with message browser, spectrum, stats
     Tui {
         /// SoapySDR device args (live mode)
@@ -267,6 +285,13 @@ fn main() -> anyhow::Result<()> {
         }
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
+        }
+        Command::Scan { sdr, gain, modes, dwell, out } => {
+            let modes: Vec<xng_types::Mode> = modes
+                .iter()
+                .map(|m| m.parse().map_err(|e: String| anyhow::anyhow!(e)))
+                .collect::<anyhow::Result<_>>()?;
+            commands::scan::run(&sdr, gain, &modes, dwell, out.as_deref())
         }
         Command::Tui { sdr, gain, file, format, tune } => {
             let (mode, center_hz, channels_hz) = parse_tune(&tune)?;
