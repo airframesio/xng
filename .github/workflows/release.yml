@@ -27,8 +27,6 @@ jobs:
             deb: true
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
-            target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies (Linux)
@@ -93,8 +91,11 @@ jobs:
           | `xng-*-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
           | `xng-*-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 (Pi 4/5 64-bit) |
           | `xng-*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
-          | `xng-*-x86_64-apple-darwin.tar.gz` | macOS Intel |
           | `xng_*.deb` | Debian/Ubuntu packages (x86_64 + arm64) |
+
+          Intel macOS: build from source (GitHub retired its free Intel
+          macOS runners) — `brew install soapysdr airspy airspyhf protobuf
+          && cargo build --release --features airspy,airspyhf`.
 
           Binaries are built with SoapySDR plus the native Airspy backends;
           they need `libsoapysdr` (and `libairspy`/`libairspyhf` for native
