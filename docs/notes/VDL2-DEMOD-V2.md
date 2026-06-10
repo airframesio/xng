@@ -70,3 +70,28 @@ this step. Result on the capture: **13 frames (from 10)**, including
 the GS XID bursts (`XID len=75` from 2D4918) that previously RS-
 miscorrected. The remaining gap to dumpvdl2 (41) is burst *detection* —
 hunt trigger sensitivity on the weakest bursts — not decode quality.
+
+## Trigger sensitivity investigation (negative results, 2026-06)
+
+Attempted lowering the trigger threshold (0.88 → 0.5) with the fit
+residual as the UW arbiter. The cost separation is real and promising —
+true preambles fit below ~0.11 rad², random data above ~0.5, and at low
+thresholds the fit surfaces real weak bursts the 0.88 trigger never
+attempts (e.g. the old RS-failure at sample 406887, cost 0.010). But
+making it safe needs an edge/straddle discriminator that none of the
+quick heuristics provide:
+
+- Global-noise-floor sample gates reject true preambles (D8PSK
+  transition dips legitimately cross any global threshold, and the
+  symmetric noise EMA rides up during bursts).
+- Front/back half-energy ratio rejects true preambles too: the UW sits
+  at burst start, inside the TX power ramp, so the ratio is naturally
+  skewed.
+- Trigger peak-picking alone doesn't help; false triggers sit farther
+  from true UWs than the pick window.
+
+The v3 direction: model the TX ramp (weight the fit by expected ramp
+shape, or fit ramp amplitude jointly), or gate on the fit cost of the
+SECOND half of the UW only (past the ramp). Each false acceptance is
+expensive — a bogus header length drains the buffer past real bursts —
+so the discriminator must be strong, not just statistical.
