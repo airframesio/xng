@@ -93,6 +93,11 @@ pub enum MessageBody {
         #[serde(skip_serializing_if = "Option::is_none")]
         altitude_ft: Option<i32>,
     },
+    /// HFDL non-ACARS event (squitter, logon, performance data, ...).
+    Hfdl {
+        kind: String,
+        details: serde_json::Value,
+    },
     /// Inmarsat STD-C / EGC packet (SafetyNET, FleetNET, system).
     StdC {
         name: String,

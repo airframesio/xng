@@ -6,6 +6,7 @@
 //! stripped here.
 
 use crc::{Crc, CRC_16_KERMIT};
+use serde::Serialize;
 use xng_types::AcarsCore;
 
 const ACARS_CRC: Crc<u16> = Crc::<u16>::new(&CRC_16_KERMIT);
@@ -18,7 +19,7 @@ const ETB: u8 = 0x17;
 const DEL: u8 = 0x7F;
 const HEADER_LEN: usize = 12;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AcarsBlock {
     pub core: AcarsCore,
     pub downlink: bool,

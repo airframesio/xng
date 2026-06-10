@@ -63,6 +63,20 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::Hfdl { kind, details } => {
+                    let mut s = format!("HFDL {kind}");
+                    for key in ["gs_id", "flight", "icao", "frame_index"] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {key}={v}"));
+                        }
+                    }
+                    if let (Some(lat), Some(lon)) =
+                        (details.get("lat").and_then(|v| v.as_f64()), details.get("lon").and_then(|v| v.as_f64()))
+                    {
+                        s.push_str(&format!(" pos={lat:.4},{lon:.4}"));
+                    }
+                    s
+                }
                 MessageBody::StdC { name, text, details } => {
                     let svc = details.get("service").and_then(|v| v.as_str()).unwrap_or("");
                     let pri = details.get("priority").and_then(|v| v.as_str()).unwrap_or("");

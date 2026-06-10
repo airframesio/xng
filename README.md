@@ -17,9 +17,9 @@ roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
 xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
 still buildable standalone.
 
-## Current state (M6 — six native decode cores)
+## Current state (M7 — seven native decode cores; wave 1 complete)
 
-Six native decode cores are in:
+Seven native decode cores are in:
 
 - **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
   sync/parity/CRC deframing, parity-guided single-bit error correction.
@@ -50,6 +50,13 @@ Six native decode cores are in:
   deinterleave, Viterbi, group descrambler), packet layer with Fletcher
   checksums, multiframe and logical-channel assembly, and EGC SafetyNET/
   FleetNET messages with service/priority decoding (`--mode std-c`).
+- **HFDL** (ICAO Annex 10 Vol III Ch. 11 / ARINC 635 — the first native
+  Rust HFDL decoder): M-PSK burst demod at all four rates (300/600/1200/
+  1800 bps; BPSK/4PSK/8PSK with rate-1/4 chip doubling), A1/A2/M1
+  preamble acquisition with cyclic-shift rate detection, per-T-segment
+  phase tracking, 40-row interleaver, shared Viterbi, SPDU squitters,
+  MPDU/LPDU/HFNPDU with enveloped ACARS into the shared application
+  layer (`--mode hfdl`).
 - **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
   CRC-24 validation with an ICAO cache for address-overlaid parity,
   extended-squitter ident/altitude decode — verified against published
@@ -85,6 +92,10 @@ xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
 # Inmarsat STD-C / EGC (SafetyNET maritime safety broadcasts)
 xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
     --channels 1537.700,1537.100
+
+# HFDL (needs an HF-capable SDR/upconverter; channels from systable)
+xng listen --sdr driver=sdrplay --mode hfdl -r 768000 -c 10060.000k \
+    --channels 10027k,10060k,10063k,10081k,10084k,10087k
 
 # Generate a synthetic test capture (no hardware needed)
 cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32

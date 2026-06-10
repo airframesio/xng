@@ -29,7 +29,7 @@ struct Cli {
 
 #[derive(Args)]
 struct TuneOpts {
-    /// Decode mode: acars, vdl2, aero (L-band P-channels), aero-c (C-band R/T bursts), std-c (EGC), ais, or adsb
+    /// Decode mode: acars, vdl2, hfdl, aero, aero-c, std-c, ais, or adsb
     #[arg(short, long, default_value = "acars")]
     mode: String,
     /// Capture sample rate in Hz (must be an integer multiple of the
