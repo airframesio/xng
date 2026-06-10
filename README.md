@@ -2,178 +2,232 @@
 
 [![Rust](https://github.com/airframesio/xng/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/airframesio/xng/actions/workflows/rust.yml)
 
-Next-generation **multi-mode SDR decoder**, written in Rust.
+**One native SDR decoder for the whole aviation + maritime radio stack.**
 
-One binary that natively decodes ACARS, VDL Mode 2, HFDL, Inmarsat Aero +
-STD-C, AIS, ADS-B (and later Iridium) — replacing acarsdec, vdlm2dec,
-dumpvdl2, dumphfdl, JAERO, and friends with consistent decode cores, shared
-SDR captures with multi-channel decode, first-class
-[airframes.io](https://airframes.io) feeding (including the new gRPC/QUIC
-`asf-2.0` output), rich statistics, a strong CLI, and an interactive TUI with
-realtime diagnostics and auto-scanning.
-
-**Status: ground-up rewrite in progress.** The architecture, research, and
-roadmap live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The previous
-xng (a dumphfdl session wrapper) is preserved in [`legacy/`](legacy/) and
-still buildable standalone.
-
-## Current state (M7 — seven native decode cores; wave 1 complete)
-
-Seven native decode cores are in:
-
-- **VHF ACARS** (ARINC 618): MSK discriminator demod, differential decode,
-  sync/parity/CRC deframing, parity-guided single-bit error correction.
-  Validated off-air against an RTL-SDR (live United/American frames,
-  CRC-verified). Application layer via **`xng-acars`** (libacars port, MIT):
-  ARINC 622 envelopes with CRC, full **ADS-C** decode (positions!), media
-  advisory, H1 sublabel/MFI — conformance-tested against real off-air
-  ADS-C messages.
-- **AIS** (ITU-R M.1371): GMSK demod with carrier-offset tracking, HDLC
-  deframing with destuffing, CRC-16/X-25, NMEA AIVDM output — verified
-  against the canonical published AIVDM test vector.
-- **VDL Mode 2** (ICAO Annex 10 Vol III / ETSI EN 301 841): D8PSK burst
-  demod with unique-word acquisition and carrier-offset tracking,
-  RS(255,249) errors-and-erasures FEC, scrambler, AVLC link layer,
-  ACARS-over-AVLC into the shared application layer. Verified against
-  spec-derived vectors (scrambler keystream, header FEC, unique word) and
-  RF loopback; off-air validation pending usable VDL2 RF at this site.
-- **Inmarsat Aero** (ported from MIT-licensed JAERO): L-band A-BPSK/MSK
-  P-channels at 600/1200 bps (both rates decoded in parallel per channel)
-  and C-band R/T-channel bursts (`--mode aero-c`: burst gating, carrier
-  CFO estimation, R-SU and T-burst signal-unit layers), K=7 Viterbi,
-  64-row interleaver, ISU/SSU reassembly, ACARS into the shared
-  application layer. 10.5 kbps A-QPSK: framing complete (bit-level
-  tested); OQPSK demod in progress.
-- **Inmarsat STD-C / EGC** (clean-room from cross-verified facts; first
-  coherent demod in the codebase — square-law AFC, Costas, Gardner):
-  NCS frames (UW sync both polarities, row depermutation, 64×162
-  deinterleave, Viterbi, group descrambler), packet layer with Fletcher
-  checksums, multiframe and logical-channel assembly, and EGC SafetyNET/
-  FleetNET messages with service/priority decoding (`--mode std-c`).
-- **HFDL** (ICAO Annex 10 Vol III Ch. 11 / ARINC 635 — the first native
-  Rust HFDL decoder): M-PSK burst demod at all four rates (300/600/1200/
-  1800 bps; BPSK/4PSK/8PSK with rate-1/4 chip doubling), A1/A2/M1
-  preamble acquisition with cyclic-shift rate detection, per-T-segment
-  phase tracking, 40-row interleaver, shared Viterbi, SPDU squitters,
-  MPDU/LPDU/HFNPDU with enveloped ACARS into the shared application
-  layer (`--mode hfdl`).
-- **Mode S / ADS-B** (ICAO Annex 10 Vol IV): magnitude-domain PPM demod,
-  CRC-24 validation with an ICAO cache for address-overlaid parity,
-  extended-squitter ident/altitude decode — verified against published
-  Mode S frames; zero false positives on off-air noise.
-
-ACARS and AIS decode any number of channels from one SDR capture;
-Mode S consumes the whole capture at 1090 MHz.
+xng decodes **ACARS, VDL Mode 2, HFDL, Inmarsat Aero, Inmarsat STD-C/EGC,
+Iridium, AIS, and Mode S/ADS-B** in a single Rust binary — replacing
+acarsdec, vdlm2dec, dumpvdl2, dumphfdl, JAERO, Scytale-C, gr-iridium, and
+iridium-toolkit with consistent, tested decode cores that share one
+capture, one message model, one application layer, and one set of outputs
+(including first-class [airframes.io](https://airframes.io) feeding).
+All nine modes are implemented, validated, and merged — including the
+complete Iridium stack (ring alerts through ACARS-over-SBD with a
+wideband burst-hunting front end).
 
 ```bash
-# Live: two ACARS channels from one RTL-SDR capture, feeding Airframes
+# Two ACARS channels from one RTL-SDR, fed to Airframes:
 xng listen --sdr driver=rtlsdr -r 2400000 -c 131.500M \
     --channels 131.550,131.725 \
     --feed-airframes --station-id XX-KSEA-ACARS1
+```
 
-# From a recording
-xng decode capture.cf32 -r 2400000 -c 131.500M --channels 131.550,131.425
+```text
+12:01:13.402 [acars] 131.550 MHz ACARS N401UA UA1989 lbl=H1 ok | #M1B...
+12:01:14.118 [acars] 131.725 MHz ACARS N831UA UA0233 lbl=B6 ok [ADS-C 47.5512 -122.3052 34000 ft]
+```
+
+## Why xng
+
+| | Existing tools | xng |
+|---|---|---|
+| **Decoders** | One binary per mode (acarsdec, dumpvdl2, dumphfdl, JAERO, …), each with its own CLI, output format, and quirks | One binary, one CLI, every mode |
+| **SDR usage** | One SDR per decoder | Many channels of one mode from a single capture; one dongle can watch 12 ACARS channels |
+| **Validation** | Varies | Every decode core is validated against **real off-air recordings** or the reference implementation's own test vectors, with the captures vendored into CI so conventions can never silently regress |
+| **Application layer** | libacars bolted on, or nothing | Built-in ARINC 622 (ADS-C positions, **CPDLC rendered as readable text** — `REQUEST CLIMB TO FL360`), media advisory, H1 sublabels — shared by every ACARS carrier (VHF, VDL2, HFDL, Aero, Iridium SBD) |
+| **Outputs** | Per-tool formats | Pretty console, JSON/JSONL, acarsdec-compatible UDP, Airframes feeding, Prometheus metrics, and the multiplexed gRPC/QUIC **asf-2.0** protocol — identical across all modes |
+| **Tooling** | None | Interactive TUI (spectrum, waterfall, message browser), auto-scanner that proposes ready-to-run configs, IQ-file inspection, built-in self-test |
+| **License** | Mostly GPL | MIT/Apache-2.0 dual license; cores are clean-room from public specs or ported from MIT/BSD projects with attribution |
+
+The provenance discipline is part of the engineering: every core has a
+`PROVENANCE.md` recording exactly what came from where, and the off-air
+validation campaigns are documented finding-by-finding (several on-air
+conventions — invisible to loopback testing — were caught only this way).
+
+## Supported modes
+
+| Mode | `--mode` | Band | What you get | Validation |
+|---|---|---|---|---|
+| VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + applications | Live off-air (RTL-SDR), CRC-verified |
+| VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | AVLC, ACARS-over-AVLC, XID | Off-air capture vs dumpvdl2 ground truth |
+| HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons, positions, ACARS, **over-the-air system table** | Off-air 21 931 kHz capture, field-exact vs dumphfdl |
+| Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air |
+| Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
+| Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
+| Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle |
+| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM | Canonical published test vector |
+| Mode S / ADS-B | `adsb` | 1090 MHz | Ident/altitude extended squitters | Published frames; zero false positives on noise |
+
+All multi-channel modes decode any number of channels from one capture.
+Wrapped external decoders (`xng extern`) remain available as a
+second-class path — they get every xng output and the application layer.
+
+## Building
+
+Requirements: a stable [Rust](https://rustup.rs) toolchain, a **protobuf
+compiler**, and (for live SDR use) **SoapySDR** with your vendor module.
+
+```bash
+# Debian / Ubuntu
+sudo apt install protobuf-compiler libsoapysdr-dev soapysdr-module-all
+
+# macOS
+brew install protobuf soapysdr
+
+# Build (binary at ./target/release/xng)
+cargo build --release
+
+# Run the test suite (includes the vendored off-air captures)
+cargo test --workspace
+```
+
+No hardware? Everything works from IQ recordings (`xng decode`,
+`xng tui --file`), and `cargo build --no-default-features` skips SoapySDR
+entirely. A Dockerfile and a Debian packaging script are included.
+
+```bash
+docker build -t xng . && docker run --rm xng --version
+```
+
+## Quick start
+
+```bash
+xng devices                       # what SDRs are attached?
+xng selftest                      # end-to-end pipeline sanity check
+
+# No idea what's receivable at your site? Let the scanner find out:
+xng scan --sdr driver=rtlsdr --gain 28 --modes acars,vdl2,ais --dwell 120 --out scan.json
+# → prints verdicts per channel and ready-to-paste `xng listen` command lines.
+#   For HFDL it even learns new frequencies from the over-the-air system table.
+```
+
+## Examples
+
+### Live decoding
+
+```bash
+# VDL Mode 2: four channels including the worldwide CSC
+xng listen --sdr driver=rtlsdr --mode vdl2 -r 2400000 -c 136.800M \
+    --channels 136.650,136.800,136.925,136.975
+
+# HFDL on an HF-capable SDR (channels per the public system table)
+xng listen --sdr driver=sdrplay --mode hfdl -r 768000 -c 10060.000k \
+    --channels 10027k,10060k,10063k,10081k,10084k,10087k
+
+# Inmarsat Aero L-band (patch antenna + LNA)
+xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
+    --channels 1545.880,1546.045
+
+# Inmarsat STD-C: maritime safety broadcasts in plain text
+xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
+    --channels 1537.700,1537.100
+
+# Iridium: live satellite positions from the ring-alert simplex channels.
+# (ACARS-over-SBD rides duplex channels across the band; the wideband
+# burst-hunting front end for that lives in xng-mode-iridium::wideband —
+# CLI wiring is the next step.)
+xng listen --sdr driver=rtlsdr --mode iridium -r 2000000 -c 1626.250M \
+    --channels 1626.271,1626.104
 
 # AIS: both channels from one capture
 xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
     --channels 161.975,162.025
 
-# ADS-B / Mode S
+# Mode S / ADS-B (consumes the whole capture)
 xng listen --sdr driver=rtlsdr --mode adsb -r 2000000 -c 1090.000M --channels 1090
-
-# VDL Mode 2: four channels incl. the worldwide CSC
-xng listen --sdr driver=rtlsdr --mode vdl2 -r 2400000 -c 136.800M \
-    --channels 136.650,136.800,136.925,136.975
-
-# Inmarsat Aero L-band P-channels (patch antenna + LNA at 1545-1547 MHz)
-xng listen --sdr driver=rtlsdr --mode aero -r 2400000 -c 1546.000M \
-    --channels 1545.880,1546.045
-
-# Inmarsat STD-C / EGC (SafetyNET maritime safety broadcasts)
-xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
-    --channels 1537.700,1537.100
-
-# HFDL (needs an HF-capable SDR/upconverter; channels from systable)
-xng listen --sdr driver=sdrplay --mode hfdl -r 768000 -c 10060.000k \
-    --channels 10027k,10060k,10063k,10081k,10084k,10087k
-
-# Generate a synthetic test capture (no hardware needed)
-cargo run -p xng-mode-acars --example gen_capture -- /tmp/acars.cf32
-
-xng devices                     # enumerate SDRs via SoapySDR
-xng iq-info capture.cf32 -r 2000000 -c 131500000   # power, spectral peaks
-xng selftest                    # end-to-end pipeline self-test
 ```
 
-**Auto-scanner** (`xng scan`): steps the SDR across built-in frequency
-plans (ACARS, VDL2, AIS, ADS-B, STD-C, HFDL per the public system
-table), runs the real decoders as signature detectors for a dwell
-period, and proposes ready-to-run configurations — the Airwaves OS
-site-survey foundation:
+### Recordings
 
 ```bash
-xng scan --sdr driver=rtlsdr --gain 28 --modes acars,vdl2,ais --dwell 120 --out scan.json
+xng iq-info capture.cf32 -r 2000000 -c 131500000      # duration, power, spectral peaks
+xng decode capture.cf32 -r 2400000 -c 131.500M --channels 131.550,131.425
+xng decode vdl2.cf32 --mode vdl2 -r 50000 -c 136.975M --channels 136.975 --json
 ```
 
-**Interactive TUI** (`xng tui`): live message browser with JSON detail
-pane, per-channel statistics, spectrum with channel markers, and a
-waterfall — over a live SDR or a replayed IQ file:
+### Interactive TUI
+
+Live message browser with a JSON detail pane, per-channel statistics,
+spectrum with channel markers, and a waterfall — over a live SDR or a
+replayed file:
 
 ```bash
 xng tui --sdr driver=rtlsdr -r 2400000 -c 131.500M --channels 131.550,131.125
 xng tui --file capture.cf32 -r 2400000 -c 131.500M --channels 131.550
 ```
 
-**Wrapped external decoders** (`xng extern`, second-class): pipe or
-spawn dumphfdl/dumpvdl2/acarsdec and normalize their JSON onto the xng
-bus — wrapped decoders get every output (asf-2.0, feeds, JSONL) and the
-xng application layer (ADS-C decodes even from wrapped ACARS):
+### Feeding and outputs
+
+Every mode and every command shares the same output options:
+
+```bash
+--feed-airframes --station-id XX-KSEA-ACARS1   # Airframes (feed.airframes.io)
+--udp host:5550                                # acarsdec-compatible JSON
+--json                                         # raw JSON to stdout
+--jsonl messages.jsonl                         # JSONL file
+--metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels)
+--asf2-grpc http://ingest:6001                 # asf-2.0 over gRPC
+--asf2-quic ingest:6011                        # asf-2.0 over QUIC (TLS verified)
+```
+
+**asf-2.0** ([docs/ASF2.md](docs/ASF2.md)) is xng's multiplexed feeding
+protocol: one protobuf schema carrying every channel/SDR/mode over a
+single gRPC or QUIC connection, with reconnect and backpressure handling.
+`xng ingest` is the reference server:
+
+```bash
+xng ingest --grpc 0.0.0.0:6001 --quic 0.0.0.0:6011
+```
+
+### Wrapped external decoders
+
+Existing decoder deployments can join the xng bus (and get asf-2.0,
+Airframes feeding, and the application layer — ADS-C and CPDLC decode
+even from wrapped ACARS):
 
 ```bash
 dumpvdl2 ... | xng extern --format dumpvdl2 --asf2-grpc http://ingest:6001
-xng extern --format dumphfdl --feed-airframes --station-id XX-... -- dumphfdl --soapysdr driver=sdrplay ...
+xng extern --format dumphfdl --feed-airframes --station-id XX-... \
+    -- dumphfdl --soapysdr driver=sdrplay ...
 ```
 
-**Prometheus metrics**: `--metrics 0.0.0.0:9090` on listen/decode serves
-per-channel frame/CRC counters and signal levels.
+## The application layer
 
-Outputs: pretty console, raw JSON, JSONL files, acarsdec-compatible JSON
-over UDP (`--udp host:port`, `--feed-airframes` → feed.airframes.io:5550),
-and the new **asf-2.0** protocol ([docs/ASF2.md](docs/ASF2.md)): one
-protobuf schema over gRPC (`--asf2-grpc URL`) and QUIC (`--asf2-quic
-host:port`), multiplexing every channel/SDR/mode over a single connection.
-`xng ingest` runs the reference ingest server for both transports:
+ACARS from any carrier flows through one application layer
+(`xng-acars`, ported from MIT libacars):
 
-```bash
-xng ingest --grpc 0.0.0.0:6001 --quic 0.0.0.0:6011   # receive asf-2.0 feeds
-```
+- **ADS-C** (ARINC 622): full decode — positions, altitudes, contract
+  tags — conformance-tested against real off-air messages.
+- **CPDLC** (FANS-1/A): controller↔pilot datalink rendered as readable
+  text with decoded arguments: `REQUEST CLIMB TO FL360`,
+  `AT 14:32 EXPECT M0.84`, `REQUEST DIRECT TO 52°18.5'N 4°46.0'E`,
+  multi-element messages included.
+- Media advisory, H1 sublabel/MFI handling.
 
-Workspace crates so far: `xng-types` (normalized message model),
-`xng-proto` (asf-2.0 schema + conversions), `xng-acars` (ACARS
-application layer: ARINC 622/ADS-C, shared by five modes),
-`xng-dsp` (PFB channelizer, DDC, FIR/NCO, CRCs), `xng-sdr` (SoapySDR +
-IQ-file sources), `xng-mode-acars`, `xng-mode-ais`, and
-`xng-mode-adsb` (decode cores, each with a spec-faithful modulator for
-loopback tests). Remaining modes land
-in milestone order: see the
-[roadmap](docs/ARCHITECTURE.md#5-roadmap).
+## Workspace layout
 
-## Building
+| Crate | Role |
+|---|---|
+| `xng-types` | Normalized message model shared by everything |
+| `xng-dsp` | Channelizer, DDC, FIR/NCO, Viterbi, Reed-Solomon, CRCs, scramblers |
+| `xng-sdr` | SoapySDR + IQ-file sample sources |
+| `xng-acars` | ACARS application layer (ARINC 622, ADS-C, CPDLC, media advisory) |
+| `xng-proto` | asf-2.0 protobuf schema + conversions |
+| `xng-mode-*` | One decode core per mode, each with a spec-faithful modulator for loopback tests, vendored validation fixtures, and a `PROVENANCE.md` |
 
-1. Install a stable [Rust](https://www.rust-lang.org/learn/get-started) toolchain.
-2. Install SoapySDR development files (`libsoapysdr-dev` on Debian/Ubuntu,
-   `soapysdr` via Homebrew on macOS) plus the vendor modules for your
-   hardware. Or build without hardware support: `cargo build --no-default-features`.
-3. Build:
+Each core also ships `examples/` harnesses (`offair`, `dumpbits`, …) used
+for the validation campaigns — point them at your own captures.
 
-```bash
-cargo build --release    # binary at ./target/release/xng
-cargo test --workspace
-```
+Architecture, research notes, and the roadmap live in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
+[`docs/notes/`](docs/notes/). The pre-rewrite xng (a dumphfdl session
+wrapper) is preserved in [`legacy/`](legacy/).
 
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at
 your option. Decode cores are implemented clean-room from public standards
-(ICAO, ARINC, ITU-R) or ported from permissively licensed projects — see
-`docs/ARCHITECTURE.md` §6 for provenance rules.
+(ICAO, ARINC, ITU-R, ETSI) or ported from permissively licensed projects
+(libacars, JAERO, iridium-toolkit — MIT/BSD) with attribution; GPL
+projects are used as *fact* references only, and the full sourcing record
+is in [`docs/REFERENCES.md`](docs/REFERENCES.md) plus per-crate
+`PROVENANCE.md` files.
