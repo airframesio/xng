@@ -111,6 +111,27 @@ pub(crate) fn group_channels(channels: &[u64], sample_rate: f64, passband: f64) 
         .collect()
 }
 
+/// Pick the capture window and channel set for zero-config tuning: the
+/// densest window of the mode's plan, trimmed to a CPU budget with the
+/// core (worldwide-primary) channels kept first, then nearest-to-center.
+pub(crate) fn auto_window(mode: Mode, rate: f64, max_channels: usize) -> Option<(u64, Vec<u64>)> {
+    let (_, plan_channels) = plan(mode);
+    if plan_channels.is_empty() {
+        return None;
+    }
+    let groups = group_channels(&plan_channels, rate, passband(mode));
+    let (center, mut chans) = groups.into_iter().max_by_key(|(_, g)| g.len())?;
+    if chans.len() > max_channels {
+        let core = core_channels(mode);
+        chans.sort_by_key(|f| {
+            (!core.contains(f), (*f as i64 - center as i64).unsigned_abs())
+        });
+        chans.truncate(max_channels);
+        chans.sort_unstable();
+    }
+    Some((center, chans))
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelResult {
     pub mode: String,
@@ -370,4 +391,38 @@ pub(crate) fn scan_group(
         })
         .collect();
     Ok((results, systables))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_window_picks_densest_group_and_keeps_core_first() {
+        // The ACARS plan spans ~2.7 MHz: at 2.4 MS/s it splits into two
+        // windows, and the upper one (8 channels) must win.
+        let (center, chans) = auto_window(Mode::AcarsPoa, 2_400_000.0, 64).unwrap();
+        assert!(chans.len() >= 8, "{chans:?}");
+        assert!(chans.contains(&131_550_000));
+        assert!(center > 130_000_000 && center < 132_000_000);
+
+        // A tight budget keeps the core channels in the window.
+        let (_, capped) = auto_window(Mode::AcarsPoa, 2_400_000.0, 3).unwrap();
+        assert_eq!(capped.len(), 3);
+        assert!(capped.contains(&131_550_000), "core channel evicted: {capped:?}");
+        assert!(capped.contains(&131_725_000), "core channel evicted: {capped:?}");
+    }
+
+    #[test]
+    fn auto_window_handles_single_channel_modes() {
+        let (center, chans) = auto_window(Mode::Adsb, 2_000_000.0, 8).unwrap();
+        assert_eq!(chans, vec![1_090_000_000]);
+        // Center is nudged off the channel to keep it away from DC.
+        assert_ne!(center, 1_090_000_000);
+    }
+
+    #[test]
+    fn auto_window_none_for_planless_modes() {
+        assert!(auto_window(Mode::AeroL, 2_400_000.0, 8).is_none());
+    }
 }

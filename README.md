@@ -215,6 +215,12 @@ spectrum with channel markers, and a waterfall — over a live SDR or a
 replayed file:
 
 ```bash
+# Zero config: channels, center, and sample rate come from the mode's
+# built-in plan — as many channels as fit the capture width and CPU
+xng tui --sdr driver=rtlsdr
+xng tui --sdr driver=rtlsdr --mode vdl2
+
+# Explicit tuning still works (and is required for --file replay)
 xng tui --sdr driver=rtlsdr -r 2400000 -c 131.500M --channels 131.550,131.125
 xng tui --file capture.cf32 -r 2400000 -c 131.500M --channels 131.550
 ```
