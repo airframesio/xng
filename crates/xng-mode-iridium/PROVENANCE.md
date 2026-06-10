@@ -72,3 +72,24 @@ first-class ACARS message.
   BCH(31,20), CRC all agree); vector vendored in tests.
 - Off-air validation pending an L-band capture of the ring-alert
   channel (1626.270833 MHz; bursts every few seconds worldwide).
+
+## Wideband front end (2026-06)
+
+`wideband::IridiumWideband` hunts bursts across a whole capture
+(gr-iridium's architecture, facts from iridium-sniffer's
+ARCHITECTURE.md): per-frame FFT (~1 kHz bins, Blackman window), per-bin
+noise floor as a slow symmetric EMA (a 512-frame-average equivalent —
+an asymmetric min-tracker sits far below the mean of exponentially
+distributed noise bins and fires constantly), 16 dB threshold,
+contiguous hot-bin grouping with small-gap bridging, multi-frame burst
+tracking, duplicate suppression for leakage-split detections, and
+per-burst downmix (mix + boxcar decimate) into the existing 250 kHz
+single-channel demodulator. Reported burst frequency = detection
+centroid + the demod's fitted CFO. The demod's coarse tone scan covers
+±30 kHz so leakage-skewed detection centroids still pull in.
+
+Validated: three synthetic IRA bursts at −700/+123/+651 kHz in a 2 MHz
+band all decode with correct satellite ids and offsets; gr-iridium's
+real reference burst, re-upconverted to an arbitrary offset in a 2 MHz
+band, is found and demodulates bit-perfectly (PRBS15) through the
+wideband path.

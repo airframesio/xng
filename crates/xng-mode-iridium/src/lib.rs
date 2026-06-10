@@ -6,6 +6,7 @@ pub mod demod;
 pub mod frame;
 pub mod ira;
 pub mod sbd;
+pub mod wideband;
 pub mod modulate;
 
 use chrono::Utc;
@@ -56,7 +57,8 @@ impl IridiumChannelDecoder {
         self.samples_seen += channel.len() as u64;
         let time = self.samples_seen as f64 / CHANNEL_RATE;
         let mut out = Vec::new();
-        for bits in self.demod.process(channel) {
+        for burst in self.demod.process(channel) {
+            let bits = burst.bits;
             if let Some(f) = decode_bits(&bits) {
                 out.push(f);
                 continue;

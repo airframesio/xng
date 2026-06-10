@@ -36,8 +36,8 @@ fn main() {
     // Flush: the hunt needs max-burst lookahead beyond the last burst.
     let mut channel = channel;
     channel.extend(std::iter::repeat(Complex::new(0.0f32, 0.0)).take((CHANNEL_RATE * 0.15) as usize));
-    for bits in demod.process(&channel) {
-        let s: String = bits.iter().map(|&b| char::from(b'0' + b)).collect();
+    for burst in demod.process(&channel) {
+        let s: String = burst.bits.iter().map(|&b| char::from(b'0' + b)).collect();
         println!("{s}");
     }
 }
