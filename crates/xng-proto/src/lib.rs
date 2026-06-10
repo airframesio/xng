@@ -84,6 +84,12 @@ impl From<&Message> for asf2::DecodedMessage {
                     details_json: details.to_string(),
                 }))
             }
+            MessageBody::Vdl2 { kind, details } => {
+                Some(asf2::decoded_message::Body::Vdl2(asf2::Vdl2Body {
+                    kind: kind.clone(),
+                    details_json: details.to_string(),
+                }))
+            }
             MessageBody::Hfdl { kind, details } => {
                 Some(asf2::decoded_message::Body::Hfdl(asf2::HfdlBody {
                     kind: kind.clone(),

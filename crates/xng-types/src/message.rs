@@ -98,6 +98,12 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// VDL2 non-ACARS frame: AVLC link events (acks, XID handoffs) and
+    /// ATN traffic, with addresses and decoded parameters.
+    Vdl2 {
+        kind: String,
+        details: serde_json::Value,
+    },
     /// HFDL non-ACARS event (squitter, logon, performance data, ...).
     Hfdl {
         kind: String,

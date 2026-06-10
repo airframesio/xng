@@ -92,7 +92,7 @@ pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Pro
             b.crc_ok,
             Some(b.parity_errors),
         ),
-        None => (MessageBody::Undecoded, true, None),
+        None => (avlc_body(&f.avlc), true, None),
     };
     Message {
         mode: Mode::Vdl2,
@@ -108,4 +108,42 @@ pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Pro
         raw: Some(f.avlc.raw.clone()),
         source,
     }
+}
+
+/// Structured body for non-ACARS AVLC frames: the link layer is always
+/// fully parsed (addresses, control), XID parameters are decoded, and
+/// ATN payloads are at least labeled by protocol.
+fn avlc_body(frame: &avlc::AvlcFrame) -> MessageBody {
+    use avlc::{Control, Payload};
+    let kind = match (&frame.control, &frame.payload) {
+        (Control::Unnumbered { kind: "XID", .. }, _) => "xid".to_string(),
+        (Control::Unnumbered { kind, .. }, _) => format!("avlc-{}", kind.to_lowercase()),
+        (Control::Supervisory { kind, .. }, _) => format!("avlc-{}", kind.to_lowercase()),
+        (Control::Info { .. }, Payload::Atn { .. }) => "atn".to_string(),
+        (Control::Info { .. }, _) => "avlc-i".to_string(),
+    };
+    let mut details = serde_json::json!({
+        "dst": frame.dst,
+        "src": frame.src,
+        "control": frame.control,
+    });
+    if let Payload::Atn { ipi } = frame.payload {
+        details["protocol"] = serde_json::json!(match ipi {
+            0x81 => "CLNP",
+            0x82 => "ES-IS",
+            _ => "IDRP",
+        });
+    }
+    if matches!(frame.control, Control::Unnumbered { kind: "XID", .. }) {
+        if let Some(params) = avlc::parse_xid(&frame.info) {
+            details["params"] = serde_json::json!(params);
+        }
+    }
+    if !frame.info.is_empty() {
+        let shown = &frame.info[..frame.info.len().min(64)];
+        details["info_hex"] =
+            serde_json::json!(shown.iter().map(|b| format!("{b:02x}")).collect::<String>());
+        details["info_len"] = serde_json::json!(frame.info.len());
+    }
+    MessageBody::Vdl2 { kind, details }
 }

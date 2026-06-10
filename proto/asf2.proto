@@ -83,6 +83,11 @@ message HfdlBody {
   string details_json = 2;
 }
 
+message Vdl2Body {
+  string kind = 1;          // xid | avlc-rr | avlc-i | avlc-ua | ...
+  string details_json = 2;  // addresses, control, decoded parameters
+}
+
 message IridiumBody {
   string kind = 1;
   string details_json = 2;
@@ -120,6 +125,7 @@ message DecodedMessage {
     StdcBody stdc = 14;
     HfdlBody hfdl = 15;
     IridiumBody iridium = 16;
+    Vdl2Body vdl2 = 17;
   }
 }
 
