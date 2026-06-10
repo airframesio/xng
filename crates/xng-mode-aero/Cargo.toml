@@ -13,5 +13,6 @@ num-complex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 xng-acars.workspace = true
+rustfft.workspace = true
 xng-dsp.workspace = true
 xng-types.workspace = true

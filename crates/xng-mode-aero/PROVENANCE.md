@@ -27,13 +27,42 @@ Ported facts/structures (from `aerol.cpp/.h`, `mskdemodulator.cpp`,
   registration/label/mode/AES/GES with alphabetically incrementing block
   ids.
 
+10.5 kbps OQPSK demodulator (`oqpsk.rs::OqpskDemod`) ported from
+`oqpskdemodulator.cpp` + `coarsefreqestimate.cpp`:
+
+- RRC(β=1) matched filter at 48 kHz; AGC with 2.84 clip.
+- Non-data-aided square-law symbol timing: 1-sample power differentiator,
+  T/4+T/4 delay-difference detector, narrow 10 500 Hz IIR resonator
+  (JAERO's 48 kHz coefficients), quadrature phase detector against a
+  strobed timing oscillator (±0.1 Hz pull) — the clock acquires
+  independently of the carrier.
+- Strobes at 10 500/s alternate rails; consecutive strobes pair into
+  de-offset QPSK points; carrier tracked by JAERO's "BPSK 2x" tanh
+  cross-product discriminator `tanh(I_d)·Q_d − tanh(Q)·I` through the
+  2nd-order loop filter (48 kHz coefficients), with the slow
+  moving-average bias rotation.
+- Coarse CFO: squaring OQPSK yields spectral lines at 2f0 ± 5250 Hz; a
+  two-tone matched search over the smoothed 2^14 spectrum of the squared
+  signal locates 2f0 (JAERO folds the same spectrum against
+  `expectedpeakbin = fb/2`). Applied only while unlocked; lock = low
+  constellation MSE *and* a stationary 4th-power statistic (a spinning
+  constellation has deceptively low MSE).
+- Sign note: the discriminator slope w.r.t. constellation rotation is
+  negative once the off-rail (transitional) component statistics are
+  taken into account; the correction signs in this port reflect that and
+  are verified by the locks_and_demodulates_with_cfo test (BER 0 at
+  CFO 0/±120/−250 Hz).
+
 Divergence from JAERO (documented intentionally):
 
-- Demodulator: JAERO uses a coherent OQPSK-decomposition MSK demod with
-  FFT square-law coarse AFC; xng v1 uses a frequency-discriminator MSK
-  demod with offset tracking (simpler, ~2 dB less sensitive; the
-  differential encoding makes discriminator output the data bits
-  directly). Coherent upgrade is a planned improvement.
+- 600/1200 bps demodulator: JAERO uses a coherent OQPSK-decomposition MSK
+  demod with FFT square-law coarse AFC; xng v1 uses a
+  frequency-discriminator MSK demod with offset tracking (simpler, ~2 dB
+  less sensitive; the differential encoding makes discriminator output
+  the data bits directly). Coherent upgrade is a planned improvement.
+- No AFC of the channel center / DCD interplay (JAERO's
+  FreqOffsetEstimateSlot state machine); xng channels are DDC-tuned and
+  the unlocked-only coarse correction covers reacquisition.
 - Per-frame Viterbi with overlap instead of JAERO's streaming
   libcorrect decode (equivalent output, simpler state).
 
