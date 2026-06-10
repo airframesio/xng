@@ -48,3 +48,17 @@ out of it, none visible to synthetic loopback:
 
 An 8 s slice is vendored as a CI fixture (tests/data/, attributed) and
 guarded by tests/offair.rs against dumphfdl's field values.
+
+## LMS equalizer + decision-directed carrier loop (2026-06)
+
+The per-T-segment phase re-estimation is replaced by the structure
+dumphfdl uses: a symbol-spaced 7-tap LMS feed-forward equalizer
+(identity-initialized, decision at the window center, trained on the 9
+preamble T segments and retrained on every embedded T segment) plus a
+2nd-order decision-directed carrier loop running on every symbol. The
+carrier loop matters more than the equalizer taps: the A1→A2 carrier
+refinement is ambiguous modulo 2*pi/127 per symbol, so a residual
+rotation of up to ~0.025 rad/symbol can survive acquisition — per-T
+re-estimation papered over it, the DD loop removes it. Off-air result
+on the sigidwiki 21931 kHz capture: 31 events vs 28 before (dumphfdl:
+37; the rest is weak-burst acquisition sensitivity).
