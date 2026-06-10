@@ -25,6 +25,13 @@ const MAX_BURST_SYMS: usize = 2_250;
 /// Preamble tone length to search across (long preamble = 64 symbols).
 const PRE_SYMS: f64 = 64.0;
 
+/// One demodulated burst: bits (beginning at the access code) and the
+/// measured carrier offset within the channel.
+pub struct DemodBurst {
+    pub bits: Vec<u8>,
+    pub cfo_hz: f64,
+}
+
 pub struct IridiumDemod {
     sps: f64,
     buf: Vec<Complex<f32>>,
@@ -78,9 +85,11 @@ impl IridiumDemod {
             return None;
         }
         let mut best = (0.0f32, 0.0f64);
-        // Coarse DFT scan ±12 kHz in 50 Hz steps (tone is strong).
-        let mut f = -12_000.0;
-        while f <= 12_000.0 {
+        // Coarse DFT scan ±30 kHz in 50 Hz steps (tone is strong; the
+        // wideband front end's detection centroid can sit tens of kHz
+        // off the true channel center under spectral leakage).
+        let mut f = -30_000.0;
+        while f <= 30_000.0 {
             let mut acc = Complex::new(0.0f32, 0.0);
             let step = -2.0 * std::f64::consts::PI * f / (SYMBOL_RATE * self.sps / 1.0);
             for (k, s) in self.buf[rel..rel + n].iter().enumerate() {
@@ -154,9 +163,8 @@ impl IridiumDemod {
         best
     }
 
-    /// Feed channel samples; returns demodulated burst bit streams
-    /// (each beginning at the access code).
-    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Vec<u8>> {
+    /// Feed channel samples; returns demodulated bursts.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<DemodBurst> {
         self.buf.extend_from_slice(input);
         for x in input {
             self.level += 1e-4 * (x.norm_sqr() - self.level);
@@ -280,7 +288,9 @@ impl IridiumDemod {
             }
             // Sanity: access code must match what the UW fit promised.
             if bits.len() >= 24 && bits[..24] == access[..] {
-                out.push(bits);
+                // Total carrier offset: per-symbol rotation → Hz.
+                let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
+                out.push(DemodBurst { bits, cfo_hz });
             }
             self.cursor = uw_pos + symbols.len() as f64 * self.sps;
         }
