@@ -36,14 +36,18 @@ struct TuneOpts {
     mode: String,
     /// Capture sample rate in Hz (must be an integer multiple of the
     /// mode's channel rate: 24 kHz for ACARS, 48 kHz for AIS; 2400000
-    /// works for both)
+    /// works for both). The tui derives it from the mode's plan when
+    /// omitted; decode/listen require it.
     #[arg(short = 'r', long)]
-    sample_rate: f64,
-    /// Capture center frequency (e.g. 131.500M)
+    sample_rate: Option<f64>,
+    /// Capture center frequency (e.g. 131.500M). The tui derives it from
+    /// the channel set when omitted; decode/listen require it.
     #[arg(short = 'c', long)]
-    center_freq: String,
-    /// Channel frequencies, comma separated (e.g. 131.550,131.725)
-    #[arg(long, value_delimiter = ',', required = true)]
+    center_freq: Option<String>,
+    /// Channel frequencies, comma separated (e.g. 131.550,131.725). The
+    /// tui falls back to the mode's built-in plan (as many channels as
+    /// fit the capture width and CPU budget); decode/listen require it.
+    #[arg(long, value_delimiter = ',')]
     channels: Vec<String>,
 }
 
@@ -308,15 +312,89 @@ fn init_logging(verbose: u8) {
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 }
 
-fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, u64, Vec<u64>)> {
+/// Strict tune parsing for decode/listen: everything must be explicit.
+fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, f64, u64, Vec<u64>)> {
     let mode: xng_types::Mode = tune.mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let center = freq::parse_hz(&tune.center_freq)?;
+    let rate = tune
+        .sample_rate
+        .ok_or_else(|| anyhow::anyhow!("missing -r/--sample-rate"))?;
+    let center = tune
+        .center_freq
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("missing -c/--center-freq"))?;
+    let center = freq::parse_hz(center)?;
+    anyhow::ensure!(!tune.channels.is_empty(), "missing --channels");
     let channels = tune
         .channels
         .iter()
         .map(|c| freq::parse_hz(c))
         .collect::<anyhow::Result<Vec<u64>>>()?;
-    Ok((mode, center, channels))
+    Ok((mode, rate, center, channels))
+}
+
+/// Zero-config tuning for the tui: anything omitted is derived from the
+/// mode's built-in frequency plan — sample rate from the plan, channels
+/// from the densest capture window that fits it (trimmed to a CPU
+/// budget, core channels first), center from the chosen channels.
+fn resolve_tune_auto(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, f64, u64, Vec<u64>)> {
+    let mode: xng_types::Mode = tune.mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let (plan_rate, plan_channels) = commands::scan::plan(mode);
+    let rate = tune.sample_rate.unwrap_or(plan_rate);
+
+    // Explicit channels: only the center may need deriving.
+    if !tune.channels.is_empty() {
+        let channels = tune
+            .channels
+            .iter()
+            .map(|c| freq::parse_hz(c))
+            .collect::<anyhow::Result<Vec<u64>>>()?;
+        let center = match &tune.center_freq {
+            Some(c) => freq::parse_hz(c)?,
+            None => centroid_off_dc(&channels),
+        };
+        return Ok((mode, rate, center, channels));
+    }
+
+    // Explicit center, channels from the plan: keep plan channels that
+    // fit the capture around that center.
+    if let Some(c) = &tune.center_freq {
+        let center = freq::parse_hz(c)?;
+        let half = (rate * 0.4) as i64; // 80% usable width, half each side
+        let channels: Vec<u64> = plan_channels
+            .iter()
+            .copied()
+            .filter(|f| (*f as i64 - center as i64).abs() <= half)
+            .collect();
+        anyhow::ensure!(
+            !channels.is_empty(),
+            "no {mode} plan channels within the capture around {:.3} MHz; pass --channels",
+            center as f64 / 1e6
+        );
+        return Ok((mode, rate, center, channels));
+    }
+
+    // Fully automatic. DDC-per-channel is cheap, but a small box should
+    // not be saddled with a worldwide plan: budget ~4 channels per core.
+    let budget = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 4;
+    let (center, channels) = commands::scan::auto_window(mode, rate, budget)
+        .ok_or_else(|| {
+            anyhow::anyhow!("mode {mode} has no built-in frequency plan; pass --channels")
+        })?;
+    tracing::info!(
+        "auto-tune: {} channel(s) around {:.3} MHz at {} S/s (budget {budget})",
+        channels.len(),
+        center as f64 / 1e6,
+        rate as u64
+    );
+    Ok((mode, rate, center, channels))
+}
+
+/// Midpoint of a channel set, nudged off any exact channel so no carrier
+/// sits at DC.
+fn centroid_off_dc(channels: &[u64]) -> u64 {
+    let center =
+        (channels.iter().min().unwrap() + channels.iter().max().unwrap()) / 2;
+    if channels.contains(&center) { center + 25_000 } else { center }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -333,9 +411,9 @@ fn main() -> anyhow::Result<()> {
                     anyhow::anyhow!("cannot guess IQ format; pass --format (cf32|cs16|cs8|cu8)")
                 })?,
             };
-            let (mode, center_hz, channels_hz) = parse_tune(&tune)?;
+            let (mode, rate, center_hz, channels_hz) = parse_tune(&tune)?;
             let (outputs, station_ident) = output.build()?;
-            let source = FileIqSource::open(&file, fmt, tune.sample_rate, center_hz)?;
+            let source = FileIqSource::open(&file, fmt, rate, center_hz)?;
             runtime::run_session(
                 Box::new(source),
                 runtime::SessionConfig {
@@ -412,7 +490,7 @@ fn main() -> anyhow::Result<()> {
             commands::scan::run(&sdr, gain, &modes, dwell, out.as_deref())
         }
         Command::Tui { sdr, gain, file, format, tune } => {
-            let (mode, center_hz, channels_hz) = parse_tune(&tune)?;
+            let (mode, rate, center_hz, channels_hz) = resolve_tune_auto(&tune)?;
             let source: Box<dyn xng_sdr::IqSource> = match file {
                 Some(path) => {
                     let fmt = match format.as_deref() {
@@ -421,9 +499,13 @@ fn main() -> anyhow::Result<()> {
                             anyhow::anyhow!("cannot guess IQ format; pass --format")
                         })?,
                     };
-                    Box::new(FileIqSource::open(&path, fmt, tune.sample_rate, center_hz)?)
+                    // A recording's rate can't be derived from a plan.
+                    let rate = tune.sample_rate.ok_or_else(|| {
+                        anyhow::anyhow!("--file needs an explicit -r/--sample-rate")
+                    })?;
+                    Box::new(FileIqSource::open(&path, fmt, rate, center_hz)?)
                 }
-                None => open_sdr(&sdr, tune.sample_rate, center_hz, gain)?.0,
+                None => open_sdr(&sdr, rate, center_hz, gain)?.0,
             };
             tui::run(
                 source,
@@ -521,10 +603,10 @@ fn open_soapy(
 }
 
 fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
-    let (mode, center_hz, channels_hz) = parse_tune(tune)?;
+    let (mode, rate, center_hz, channels_hz) = parse_tune(tune)?;
     let (outputs, station_ident) = output.build()?;
     let serial = sdr_args::SdrArgs::parse(sdr).serial;
-    let (source, driver) = open_sdr(sdr, tune.sample_rate, center_hz, gain)?;
+    let (source, driver) = open_sdr(sdr, rate, center_hz, gain)?;
     runtime::run_session(
         source,
         runtime::SessionConfig {
