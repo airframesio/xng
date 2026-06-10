@@ -165,9 +165,12 @@ impl AirspyIqSource {
 
         let rate = sample_rate.round() as u32;
         if unsafe { ffi::airspy_set_samplerate(dev, rate) } != ffi::AIRSPY_SUCCESS {
+            // Verified on a Mini running the final firmware (v1.0.0-rc10-6):
+            // off-list rates are refused even though libairspy forwards
+            // them, so the advertised list is the only safe guidance.
             let supported = supported_rates(dev);
             return Err(SdrError::Config(format!(
-                "device refused {rate} S/s (advertised rates: {}; arbitrary rates need firmware >= 1.0.7)",
+                "device refused {rate} S/s; use one of its supported rates: {}",
                 supported.iter().map(|r| r.to_string()).collect::<Vec<_>>().join(", ")
             )));
         }

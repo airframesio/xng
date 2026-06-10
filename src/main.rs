@@ -322,6 +322,7 @@ fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, u64, Vec<u64>
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
+    tracing::info!("xng v{}", env!("CARGO_PKG_VERSION"));
 
     match cli.command {
         Command::Devices { filter } => commands::devices::run(&filter),
