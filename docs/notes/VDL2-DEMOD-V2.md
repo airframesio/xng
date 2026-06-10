@@ -1,0 +1,62 @@
+# VDL2 demod v2 — design notes for the sensitivity upgrade
+
+Status 2026-06: the native demod decodes 14/18-ish bursts on the
+sigidwiki off-air capture (10 AVLC frames; dumpvdl2 gets 41 frames from
+the same file, counting multi-frame bursts per frame). Every burst that
+passes the header passes RS; the remaining losses are four
+ground-station XID bursts whose symbol decisions carry enough errors
+that RS at capacity (3 corrections on k=6 rows) miscorrects into a
+nearby codeword — dumpvdl2's exact destuffing algorithm fails
+identically on our post-RS bits, so the gap is entirely in the
+demodulator front end. Phase-gain (0.05–0.1 plateau) and sampling-offset
+(0 optimal) sweeps are exhausted.
+
+## What dumpvdl2 actually does differently (facts from src/demod.c)
+
+It does NOT use a matched filter. Its symbol decisions are single-sample
+`atan2` phases, like ours. The edges are architectural:
+
+1. **10 samples/symbol** (105 kHz channel rate vs our 50 kHz / 4.76 sps).
+   Finer timing grid and more samples to average over the preamble.
+2. **Preamble phase-pattern sync**: a buffer of per-sample phases spans
+   the whole 16-symbol preamble; sync compares the phase *trajectory*
+   against the known UW phase ramp (`pr_phase[]` = cumulative expected
+   phases) and picks the sample where the error vector is most constant.
+   The constant value of that error vector simultaneously yields the
+   carrier phase. This uses all 16 symbols coherently — our differential
+   correlation uses 15 transitions non-coherently.
+3. **Explicit per-sample CFO (`dphi`)**: estimated from the preamble
+   (slope of the error vector), applied as `phi - prev_phi - dphi` in
+   every symbol decision, carried across bursts (`prev_dphi`) and
+   reported as a ppm error. Our `theta` is per-symbol rotation from the
+   differential correlation argument — same idea, noisier estimate, and
+   our decision-directed `PHASE_GAIN` residual tracking is the only
+   in-burst adaptation.
+
+## v2 plan
+
+- Raise `CHANNEL_RATE` to 105_000 (Ddc from wideband input; the
+  sigidwiki capture resamples to 105 kHz losslessly for the test path).
+- Replace the differential UW hunt's refinement with the phase-pattern
+  sync over the full preamble: coarse trigger can stay differential
+  (CFO-immune), then fit phase trajectory for (sync point, carrier
+  phase, dphi) jointly.
+- Per-symbol decisions as today, but derotated by the fitted dphi;
+  keep the decision-directed residual tracking on top.
+- Regression assets: `examples/offair.rs` against the conjugated
+  sigidwiki capture (expect ≥14 bursts / 10 frames before, target the
+  four XID bursts: tl_bits 372, 489, 572, 573 — XID heads
+  `F6/F2 FE FE FE 94 AC 48 …` must pass AVLC FCS after the upgrade);
+  the vendored 6 s fixture; the full synthetic suite.
+
+Capture regeneration:
+
+```
+curl -L https://www.sigidwiki.com/images/d/df/VDL-M2_IQ.zip -o vdl2.zip && unzip vdl2.zip
+ffmpeg -i "VDL2 IQ.wav" -f f32le -ac 2 -ar 105000 vdl2_105k.f32
+# NOTE: capture has inverted I/Q — negate Q before decoding.
+```
+
+The same investigation applies to HFDL's weak-burst gap (31/37 vs
+dumphfdl): its A1 hunt is also differential-then-refine; a coherent
+preamble fit would sharpen acquisition there too.
