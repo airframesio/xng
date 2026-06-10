@@ -83,6 +83,11 @@ message HfdlBody {
   string details_json = 2;
 }
 
+message IridiumBody {
+  string kind = 1;
+  string details_json = 2;
+}
+
 message StdcBody {
   string name = 1;
   optional string text = 2;
@@ -114,6 +119,7 @@ message DecodedMessage {
     bool undecoded = 13;
     StdcBody stdc = 14;
     HfdlBody hfdl = 15;
+    IridiumBody iridium = 16;
   }
 }
 

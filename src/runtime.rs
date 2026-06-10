@@ -14,6 +14,7 @@ use xng_mode_adsb::AdsbDecoder;
 use xng_mode_aero::{AeroBurstDecoder, AeroChannelDecoder};
 use xng_mode_ais::AisChannelDecoder;
 use xng_mode_hfdl::HfdlChannelDecoder;
+use xng_mode_iridium::IridiumChannelDecoder;
 use xng_mode_stdc::StdcChannelDecoder;
 use xng_mode_vdl2::Vdl2ChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
@@ -82,6 +83,7 @@ pub(crate) enum ModeChannel {
     AeroBurst(AeroBurstDecoder),
     StdC(StdcChannelDecoder),
     Hfdl(HfdlChannelDecoder),
+    Iridium(IridiumChannelDecoder),
 }
 
 impl ModeChannel {
@@ -94,6 +96,7 @@ impl ModeChannel {
             Mode::AeroC => Ok(Self::AeroBurst(AeroBurstDecoder::new(sample_rate, offset)?)),
             Mode::StdC => Ok(Self::StdC(StdcChannelDecoder::new(sample_rate, offset)?)),
             Mode::Hfdl => Ok(Self::Hfdl(HfdlChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Iridium => Ok(Self::Iridium(IridiumChannelDecoder::new(sample_rate, offset)?)),
             Mode::Adsb => {
                 if offset.abs() > 1e-6 {
                     return Err("Mode S uses the whole capture: tune -c to 1090.000M and pass --channels 1090".into());
@@ -111,6 +114,7 @@ impl ModeChannel {
             Mode::AeroL | Mode::AeroC => xng_mode_aero::CHANNEL_PASSBAND_HZ,
             Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
             Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
+            Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
             Mode::Adsb => 0.0, // wideband: offset must be 0, no DDC
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
@@ -124,6 +128,7 @@ impl ModeChannel {
             Self::Aero(_) | Self::AeroBurst(_) => xng_mode_aero::CHANNEL_RATE,
             Self::StdC(_) => xng_mode_stdc::CHANNEL_RATE,
             Self::Hfdl(_) => xng_mode_hfdl::CHANNEL_RATE,
+            Self::Iridium(_) => xng_mode_iridium::CHANNEL_RATE,
             Self::Adsb(_) => 2_000_000.0,
         }
     }
@@ -138,6 +143,7 @@ impl ModeChannel {
             Self::AeroBurst(d) => d.level_dbfs(),
             Self::StdC(d) => d.level_dbfs(),
             Self::Hfdl(d) => d.level_dbfs(),
+            Self::Iridium(d) => d.level_dbfs(),
         }
     }
 
@@ -219,6 +225,16 @@ impl ModeChannel {
                     .map(|p| xng_mode_stdc::to_message(p, freq, level, prov.clone()))
                     .collect();
                 (msgs, seen, ok)
+            }
+            Self::Iridium(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_iridium::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
             }
             Self::Hfdl(dec) => {
                 let events = dec.process(iq);

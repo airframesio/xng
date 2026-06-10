@@ -30,7 +30,8 @@ attribution. GPL projects are listed as fact references only.
 |---|---|---|---|
 | libacars (szpajder) | MIT | **Ported** (attributed): ARINC 622 envelope, ADS-C decoder, media advisory, sublabel/MFI rules; CPDLC FANS-1/A element tables + UPER layout from the asn1c-generated FANSAC* constraint tables and asn1-format-cpdlc-text.c labels; 4 real ADS-C test vectors from examples/adsc_get_position.c | https://github.com/szpajder/libacars |
 | JAERO (jontio) | MIT | **Ported** (attributed): P-channel framing, interleaver, scrambler, SU/ISU/SSU layer, ACARS carriage; 10.5k OQPSK demod ported from oqpskdemodulator.cpp + coarsefreqestimate.cpp (square-law timing, tanh cross-product carrier loop, squared-signal two-tone coarse CFO); 600/1200 MSK demod intentionally diverges (see xng-mode-aero/PROVENANCE.md). Off-air samples **used for validation** (600bps: 11 ACARS decoded; 10.5k: 144 ACARS decoded; 12 s vendored as CI fixture with attribution) | https://github.com/jontio/JAERO |
-| iridium-toolkit (muccc) | BSD-2 | Planned port source for Iridium frame parsing (wave 2) | https://github.com/muccc/iridium-toolkit |
+| iridium-toolkit (muccc) | BSD-2 | **Ported** (attributed): access codes, symbol-pair deinterleavers, BCH(31,21) blocks + parity, FILL removal, frame classification, IRA field layout; bitsparser.py used as a decode oracle (generated frames must parse bit-identically) | https://github.com/muccc/iridium-toolkit |
+| iridium-sniffer (alphafox02) | GPL-3 | **Facts only**: ARCHITECTURE.md + iridium.h read for the full pipeline parameters (burst detect, downmix, demod, UW patterns, dqpsk_map, IDA/SBD→ACARS chain for wave 2) | https://github.com/alphafox02/iridium-sniffer |
 | acars crate (xoolive) | MIT | Inspected for API/coverage comparison; test fixtures noted as borrowable | https://crates.io/crates/acars |
 | ship162 (xoolive) | MIT | Noted as AIS reference (our core ended up independent) | https://github.com/xoolive/ship162 |
 | rs1090/jet1090 (xoolive) | MIT | Architectural comparison; candidate dep for deep Mode S decode | https://github.com/xoolive/jet1090 |
@@ -41,7 +42,7 @@ attribution. GPL projects are listed as fact references only.
 | sigidwiki Inmarsat-C TDM sample | CC BY-SA | Off-air STD-C TDM/EGC IQ capture (AOR-E) used for STD-C validation; 14 s vendored as CI fixture with attribution | https://www.sigidwiki.com/wiki/Inmarsat-C_TDM |
 | acarsdec (TLeconte / f00b4r0) | LGPL/GPL-2 | Facts only (display conventions) | https://github.com/TLeconte/acarsdec |
 | AIS-catcher (jvde-github) | GPL-3 | Facts only (landscape research) | https://github.com/jvde-github/AIS-catcher |
-| gr-iridium (muccc) | GPL-3 | Facts only (wave 2 planning) | https://github.com/muccc/gr-iridium |
+| gr-iridium (muccc) | GPL-3 | Facts only: PHY parameters (25 ksym/s DQPSK, channel/burst structure, PLL α, UW symbol patterns) | https://github.com/muccc/gr-iridium |
 | SatDump | GPL-3 | Facts only (landscape research) | https://github.com/SatDump/SatDump |
 | Scytale-C | GPL-3 | STD-C facts reference (see docs/notes/STDC.md) | https://bitbucket.org/scytalec/scytalec |
 | inmarsatc (cropinghigh) | GPL-3 | STD-C facts reference (Scytale-C port; constants cross-verified) | https://github.com/cropinghigh/inmarsatc |

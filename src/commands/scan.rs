@@ -28,6 +28,8 @@ fn plan(mode: Mode) -> (f64, Vec<u64>) {
         Mode::Ais => (2_400_000.0, k(&[161_975, 162_025])),
         Mode::Adsb => (2_000_000.0, k(&[1_090_000])),
         Mode::StdC => (2_400_000.0, k(&[1_537_100, 1_537_700, 1_541_450])),
+        // Simplex ring-alert + primary messaging channels.
+        Mode::Iridium => (2_400_000.0, k(&[1_626_271, 1_626_437, 1_626_104])),
         Mode::Hfdl => (
             768_000.0,
             k(&[2_941, 2_944, 2_992, 2_998, 3_007, 3_016, 3_455, 3_497, 4_654,
@@ -129,6 +131,7 @@ pub fn run(
             Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
             Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
             Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
+            Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
             Mode::Adsb => 0.0,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         };

@@ -78,6 +78,12 @@ impl From<&Message> for asf2::DecodedMessage {
                     altitude_ft: *altitude_ft,
                 }))
             }
+            MessageBody::Iridium { kind, details } => {
+                Some(asf2::decoded_message::Body::Iridium(asf2::IridiumBody {
+                    kind: kind.clone(),
+                    details_json: details.to_string(),
+                }))
+            }
             MessageBody::Hfdl { kind, details } => {
                 Some(asf2::decoded_message::Body::Hfdl(asf2::HfdlBody {
                     kind: kind.clone(),
