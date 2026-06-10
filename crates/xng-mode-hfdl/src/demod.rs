@@ -176,6 +176,73 @@ impl HfdlDemod {
         Some((corr, metric))
     }
 
+    /// Coherent A1 fit: over a fine timing grid around `pos`, take the
+    /// per-symbol phases of the 127 known BPSK chips (sign removed),
+    /// unwrap, and fit residual ≈ a + b·k weighted by sample energy.
+    /// The minimum-cost grid point yields timing and per-symbol CFO (b)
+    /// jointly — the same coherent preamble sync that recovered the VDL2
+    /// XID bursts, and unlike the A1→A2 dphi refinement it has no
+    /// 2π/127-per-symbol aliasing.
+    fn a1_fit(&self, pos: f64, theta0: f32) -> Option<(f64, f32)> {
+        let a = fec::bits_of(fec::A_BITS);
+        let mut best: Option<(f32, f64, f32)> = None;
+        let mut t = -4.0f64;
+        while t <= 4.0 {
+            let cand = pos + t;
+            t += 0.25;
+            if cand < self.start_abs {
+                continue;
+            }
+            let mut r = vec![0.0f32; 127];
+            let mut w = vec![0.0f32; 127];
+            let mut prev = 0.0f32;
+            for k in 0..127 {
+                let s = self.sample(cand + k as f64 * self.sps)?;
+                let sign = if a[k] == 1 { -1.0f32 } else { 1.0 };
+                // Remove the expected per-symbol rotation estimate so the
+                // unwrap only has to track the residual.
+                let mut ph = (s * Complex::from_polar(sign, -theta0 * k as f32)).arg();
+                while ph - prev > PI {
+                    ph -= 2.0 * PI;
+                }
+                while ph - prev < -PI {
+                    ph += 2.0 * PI;
+                }
+                prev = ph;
+                r[k] = ph;
+                w[k] = s.norm_sqr();
+            }
+            let sw: f32 = w.iter().sum();
+            if sw < 1e-12 {
+                continue;
+            }
+            let kbar = w.iter().enumerate().map(|(k, &wk)| wk * k as f32).sum::<f32>() / sw;
+            let rbar = w.iter().zip(&r).map(|(&wk, &rk)| wk * rk).sum::<f32>() / sw;
+            let mut num = 0.0f32;
+            let mut den = 0.0f32;
+            for k in 0..127 {
+                let dk = k as f32 - kbar;
+                num += w[k] * dk * (r[k] - rbar);
+                den += w[k] * dk * dk;
+            }
+            if den < 1e-12 {
+                continue;
+            }
+            let b = num / den;
+            let aoff = rbar - b * kbar;
+            let mut cost = 0.0f32;
+            for (k, (&wk, &rk)) in w.iter().zip(&r).enumerate() {
+                let e = rk - aoff - b * k as f32;
+                cost += wk * e * e;
+            }
+            cost /= sw;
+            if best.map(|(c, _, _)| cost < c).unwrap_or(true) {
+                best = Some((cost, cand, theta0 + b));
+            }
+        }
+        best.map(|(_, p, th)| (p, th))
+    }
+
     fn hunt(&mut self) -> Option<(f64, f32)> {
         let span = 130.0 * self.sps;
         let end_abs = self.start_abs + self.buf.len() as f64 - span - 2.0;
@@ -205,24 +272,15 @@ impl HfdlDemod {
                         }
                     }
                     let (_, theta2) = self.a_diff_correlate(best.1).unwrap_or((0.0, theta));
-                    // The differential metric's peak is broad and can sit
-                    // a couple of samples off the true symbol timing —
-                    // enough to collapse the coherent M1 correlation at
-                    // 6.67 samples/symbol (observed on the off-air 21931
-                    // kHz capture: a 3-sample error nulled M1). Refine to
-                    // quarter-sample timing on the coherent A correlation.
-                    let a_bits = fec::bits_of(fec::A_BITS);
-                    let mut fine = (0.0f32, best.1);
-                    let mut k = -4.0f64;
-                    while k <= 4.0 {
-                        if let Some((_, m)) = self.coherent_with_energy(best.1 + k, &a_bits, theta2) {
-                            if m > fine.0 {
-                                fine = (m, best.1 + k);
-                            }
-                        }
-                        k += 0.25;
+                    // Coherent joint timing/CFO refinement over the whole
+                    // A1 (the differential peak is broad; a ~3-sample
+                    // timing error nulls the coherent M1 correlation at
+                    // 6.67 samples/symbol, and the differential CFO
+                    // estimate is noisy).
+                    if let Some(fit) = self.a1_fit(best.1, theta2) {
+                        return Some(fit);
                     }
-                    return Some((fine.1, theta2));
+                    return Some((best.1, theta2));
                 }
             }
         }
