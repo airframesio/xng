@@ -88,7 +88,17 @@ struct ChanAcc {
 pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     let mode = opts.mode;
     let (plan_rate, plan_channels) = scan::plan(mode);
-    let rate = opts.sample_rate.unwrap_or(plan_rate);
+    let rate = match opts.sample_rate {
+        Some(r) => r,
+        None => {
+            let advertised = crate::probe_device_rates(&opts.sdr);
+            let r = scan::pick_auto_rate(&advertised, mode, plan_rate);
+            if r != plan_rate {
+                println!("device prefers {} S/s over the plan's {} S/s", r as u64, plan_rate as u64);
+            }
+            r
+        }
+    };
     let passband = scan::passband(mode);
 
     // Ctrl-C ends the survey early but still produces the report.
