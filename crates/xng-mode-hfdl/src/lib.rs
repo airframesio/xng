@@ -4,6 +4,7 @@ pub mod demod;
 pub mod fec;
 pub mod modulate;
 pub mod pdu;
+pub mod systable;
 
 use chrono::Utc;
 use num_complex::Complex;

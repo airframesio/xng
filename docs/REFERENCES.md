@@ -34,7 +34,8 @@ attribution. GPL projects are listed as fact references only.
 | acars crate (xoolive) | MIT | Inspected for API/coverage comparison; test fixtures noted as borrowable | https://crates.io/crates/acars |
 | ship162 (xoolive) | MIT | Noted as AIS reference (our core ended up independent) | https://github.com/xoolive/ship162 |
 | rs1090/jet1090 (xoolive) | MIT | Architectural comparison; candidate dep for deep Mode S decode | https://github.com/xoolive/jet1090 |
-| dumpvdl2, dumphfdl (szpajder) | GPL-3 | **Facts only** (not read for xng so far; clean-room held for VDL2) | https://github.com/szpajder/dumpvdl2 |
+| dumpvdl2 (szpajder) | GPL-3 | **Facts only** (not read for xng so far; clean-room held for VDL2) | https://github.com/szpajder/dumpvdl2 |
+| dumphfdl (szpajder) | GPL-3 | **Facts only**: src/systable.c + src/hfnpdu.c read for the system-table wire layout (0xD0 partial header, GS record fields, BCD frequency encoding, reassembly semantics); all xng code re-derived | https://github.com/szpajder/dumphfdl |
 | acarsdec (TLeconte / f00b4r0) | LGPL/GPL-2 | Facts only (display conventions) | https://github.com/TLeconte/acarsdec |
 | AIS-catcher (jvde-github) | GPL-3 | Facts only (landscape research) | https://github.com/jvde-github/AIS-catcher |
 | gr-iridium (muccc) | GPL-3 | Facts only (wave 2 planning) | https://github.com/muccc/gr-iridium |
