@@ -62,6 +62,9 @@ pub struct AcarsCore {
     pub text: String,
     /// True when more blocks follow (ETB rather than ETX).
     pub more_to_come: bool,
+    /// True when `text` was reassembled from multiple blocks.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reassembled: bool,
     /// Decoded application layer (ADS-C, CPDLC envelope, media advisory,
     /// ...), as produced by xng-acars.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -49,6 +49,7 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
         let live = live.clone();
         let sdr = cfg.sdr.clone();
         move || {
+            let mut reasm = xng_acars::reasm::Reassembler::new(300.0);
             runtime::decode_loop(
                 &mut *source,
                 decoders,
@@ -57,6 +58,7 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
                 bus,
                 stop,
                 Some((live, capture_center, sample_rate)),
+                Some(&mut reasm),
             )
         }
     });

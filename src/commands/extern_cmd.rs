@@ -132,6 +132,7 @@ pub fn parse_line(line: &str, format: ExternFormat, station: &StationIdentity) -
                 msg_num: str_of(a, &["msg_num", "msgno"]).map(String::from),
                 text,
                 more_to_come: false,
+                reassembled: false,
                 app: appdec.app.map(|x| serde_json::to_value(&x).unwrap_or_default()),
             })
         }

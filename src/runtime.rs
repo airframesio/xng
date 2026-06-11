@@ -18,7 +18,7 @@ use xng_mode_iridium::{IridiumChannelDecoder, IridiumWidebandDecoder};
 use xng_mode_stdc::StdcChannelDecoder;
 use xng_mode_vdl2::Vdl2ChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
-use xng_types::{AppInfo, ChannelInfo, Message, Mode, Provenance, SdrInfo, StationIdentity};
+use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
 
 pub struct OutputConfig {
     /// Console format (always on).
@@ -386,7 +386,14 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
             let stop = stop.clone();
             {
                 let live = live.clone();
+                // Satellite/HF ACARS blocks arrive minutes apart; VHF
+                // bearers are quick (libacars timeout profiles).
+                let reasm_timeout = match cfg.mode {
+                    Mode::AcarsPoa | Mode::Vdl2 => 120.0,
+                    _ => 660.0,
+                };
                 move || {
+                    let mut reasm = xng_acars::reasm::Reassembler::new(reasm_timeout);
                     decode_loop(
                         &mut *source,
                         decoders,
@@ -395,6 +402,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                         bus,
                         stop,
                         Some((live, capture_center, sample_rate)),
+                        Some(&mut reasm),
                     )
                 }
             }
@@ -428,6 +436,7 @@ pub(crate) fn decode_loop(
     bus: MessageBus,
     stop: Arc<AtomicBool>,
     live: Option<(Arc<LiveState>, u64, f64)>,
+    mut reasm: Option<&mut xng_acars::reasm::Reassembler>,
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
     use std::sync::atomic::Ordering as AtomOrd;
     let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
@@ -502,7 +511,10 @@ pub(crate) fn decode_loop(
             let (msgs, seen, ok) = dec.process(&buf[..n], *freq, &prov);
             stats[i].1 += seen;
             stats[i].2 += ok;
-            for msg in msgs {
+            for mut msg in msgs {
+                if let Some(r) = reasm.as_deref_mut() {
+                    apply_reassembly(&mut msg, r);
+                }
                 bus.publish(msg);
             }
             if let Some((state, _, _)) = &live {
@@ -515,6 +527,28 @@ pub(crate) fn decode_loop(
         }
     }
     Ok(stats)
+}
+
+/// Offer ACARS bodies to the multi-block reassembler; when a message
+/// completes, replace the text with the full assembly and re-run the
+/// application layer over it (long CPDLC/OHMA/MIAM payloads only decode
+/// from complete text).
+fn apply_reassembly(msg: &mut Message, r: &mut xng_acars::reasm::Reassembler) {
+    use xng_acars::reasm::Reasm;
+    let MessageBody::Acars(core) = &mut msg.body else { return };
+    if !msg.decode.crc_ok {
+        return;
+    }
+    let now = msg.timestamp.timestamp_millis() as f64 / 1e3;
+    if let Reasm::Complete(full) = r.push(core, now) {
+        let downlink = core.block_id.is_some_and(|b| b.is_ascii_digit());
+        let dec = xng_acars::decode(&core.label, &full, downlink);
+        core.text = full;
+        core.reassembled = true;
+        if let Some(app) = dec.app {
+            core.app = serde_json::to_value(&app).ok();
+        }
+    }
 }
 
 fn decoders_len_hint(i: usize) -> usize {

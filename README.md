@@ -298,6 +298,13 @@ ACARS from any carrier flows through one application layer
   text with decoded arguments: `REQUEST CLIMB TO FL360`,
   `AT 14:32 EXPECT M0.84`, `REQUEST DIRECT TO 52°18.5'N 4°46.0'E`,
   multi-element messages included.
+- **MIAM** (ARINC 841): single-transfer CORE PDUs decompressed
+  (DEFLATE), file-transfer signalling decoded.
+- **OHMA**: Boeing aircraft-health JSON unwrapped (base64 + zlib) into
+  structured output.
+- **Multi-block reassembly**: long messages spanning ACARS blocks are
+  stitched back together (libacars-equivalent keying and timeouts), and
+  the application layer re-runs over the complete text.
 - Media advisory, H1 sublabel/MFI handling.
 
 ## Workspace layout
