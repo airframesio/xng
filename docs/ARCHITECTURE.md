@@ -1,11 +1,13 @@
 # xng — Next-Generation Multi-Mode SDR Decoder
 
 **Status:** Architecture blueprint (2026-06-09), preserved as the design
-record. The rewrite shipped: all nine modes are implemented and validated
-(off-air or reference vectors), the VHF ACARS chain is proven end-to-end
-into production Airframes from a live station, and v0.9.0 is the first
-tagged release with per-platform binaries. The README is the current
-user-facing truth; `docs/REFERENCES.md` and per-crate `PROVENANCE.md`
+record. The rewrite shipped and has since passed its oracles: all nine
+modes implemented and validated, VHF ACARS proven end-to-end into
+production Airframes from a live station, and off-air decode counts at
+or beyond the reference decoders (VDL2 44 vs dumpvdl2's 41; Mode S 161
+vs dump1090-fa's 162 — see `docs/notes/BENCHMARKS.md` and the `bench/`
+CI gate). Current release: v0.14.0. The README is the user-facing
+truth; `docs/REFERENCES.md` and per-crate `PROVENANCE.md`
 track sourcing.
 
 ## 1. Vision
