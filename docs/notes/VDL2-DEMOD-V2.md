@@ -159,3 +159,26 @@ decoded burst (hundreds of known symbols instead of 16) and re-decode;
 apply only when pass 1 fails RS. That spends CPU exclusively on the 43
 RS failures and cannot regress the 25 already-good bursts. The funnel
 counters (demod::STAT_*) are kept for that work.
+
+## Two-pass decode attempt (2026-06, reverted)
+
+Implemented the two-pass blueprint and measured both reference
+strategies on the off-air capture:
+
+1. **Pass-1 decisions as training refs**: 3 of 43 RS failures
+   "decoded" on the second pass — all three were RS miscorrections
+   producing zero FCS-valid AVLC frames. Lesson: with RS at capacity
+   on noisy decisions, an RS pass alone is NOT acceptance — the AVLC
+   FCS gate is load-bearing, and training on partly-wrong references
+   mostly teaches the equalizer the errors.
+2. **Row-corrected refs (partial deinterleave)**: engages never —
+   the capture's failing bursts are single-RS-row (short AVLC), so
+   there are no individually-decoded rows to train from when the
+   burst fails. The strategy only helps multi-row (long) bursts.
+
+Conclusion: the remaining 17-vs-41 gap is soft-decision territory —
+per-symbol confidence into RS erasure marking (the decoder corrects
+2t erasures vs t errors: flagging the 3-4 least-confident octets per
+row doubles the correction budget exactly where it is needed), or
+confidence-driven re-decision of boundary symbols. That is the v4
+direction; the funnel counters remain in place for it.
