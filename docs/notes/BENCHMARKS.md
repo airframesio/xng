@@ -56,6 +56,27 @@ FM-discriminator GMSK path cannot. Recovering ~11 % of the oracle's
 haul makes this the largest measured demod gap in xng — larger than
 ADS-B (72 %) and VDL2 (~46 % off-air).
 
+**Update (same day): coherent burst path shipped.** A parallel
+weak-signal demodulator (power gate → preamble+flag template anchor →
+fine CFO from the template phase slope → 8-state MSK phase-trellis
+Viterbi with decision-directed phase tracking) raised the synthetic
+sensitivity by **+11–12 dB** (discriminator dies at ~12 dB SNR;
+coherent path runs 40/40 at 6.2 dB and 30/40 at 0.9 dB) and the
+off-air capture from 6 to **24 unique payloads** (45 % of
+AIS-catcher, still a clean subset). The remaining gap is timing
+refinement (the anchor is integer-sample), GMSK-pulse-exact branch
+metrics, and multi-hypothesis decoding of colliding bursts.
+
+Hard-won implementation notes: the template-correlation anchor MUST
+reject peaks near the search-window edge (the rising shoulder of a
+burst still entering the window anchors mistimed and then skips the
+real peak), the hunt cursor must never advance past a region whose
+template window isn't fully buffered (chunk-boundary bursts are
+otherwise silently skipped — same hazard class as the VDL2
+stream-end swallow), and a coarse CFO grid alone is fatal (±75 Hz
+residual ≈ 2 rad of drift across one burst; the fine estimate +
+decision-directed trim are both load-bearing).
+
 Reproduce:
 
 ```

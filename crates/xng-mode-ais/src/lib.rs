@@ -8,6 +8,7 @@
 //!
 //! See PROVENANCE.md for the clean-room sourcing of every protocol fact.
 
+pub mod coherent;
 pub mod demod;
 pub mod fields;
 pub mod frame;
@@ -36,6 +37,13 @@ pub fn channel_letter(frequency_hz: u64) -> char {
 /// Decodes one AIS channel out of a wideband capture.
 pub struct AisChannelDecoder {
     ddc: Option<Ddc>,
+    coherent: coherent::CoherentDemod,
+    /// Recently emitted frames (bits, channel-sample time) so the
+    /// streaming and coherent paths don't double-report one burst —
+    /// the coherent path buffers a whole burst and can emit a chunk
+    /// or two later.
+    recent: Vec<(Vec<u8>, u64)>,
+    channel_samples: u64,
     demod: demod::GmskDemod,
     deframer: frame::HdlcDeframer,
     nmea: nmea::SentenceBuilder,
@@ -57,6 +65,9 @@ impl AisChannelDecoder {
         };
         Ok(Self {
             ddc,
+            coherent: coherent::CoherentDemod::new(CHANNEL_RATE),
+            recent: Vec::new(),
+            channel_samples: 0,
             demod: demod::GmskDemod::new(),
             deframer: frame::HdlcDeframer::new(),
             nmea: nmea::SentenceBuilder::new(),
@@ -76,13 +87,39 @@ impl AisChannelDecoder {
             }
             None => input,
         };
+        self.channel_samples += channel.len() as u64;
+        let now = self.channel_samples;
+        // One AIS slot is 256 bits ≈ 1280 channel samples; expire dedup
+        // entries after a generous four slots.
+        self.recent.retain(|(_, t)| now - t < 5_200);
+
         self.bit_buf.clear();
         self.demod.process(channel, &mut self.bit_buf);
         let mut out = Vec::new();
         for &bit in &self.bit_buf {
             if let Some(f) = self.deframer.push_bit(bit) {
+                self.recent.push((f.message_bits.clone(), now));
                 let sentences = self.nmea.encode(&f.message_bits, self.channel);
                 out.push((f, sentences));
+            }
+        }
+        // Coherent weak-signal path: independently hunted bursts run
+        // through a fresh HDLC deframer (a synthetic opening flag re-arms
+        // it, since the coherent decoder starts right after the flag).
+        for bits in self.coherent.process(channel) {
+            let mut df = frame::HdlcDeframer::new();
+            for &b in &[0u8, 1, 1, 1, 1, 1, 1, 0] {
+                df.push_bit(b);
+            }
+            for &b in &bits {
+                if let Some(f) = df.push_bit(b) {
+                    if !self.recent.iter().any(|(m, _)| *m == f.message_bits) {
+                        self.recent.push((f.message_bits.clone(), now));
+                        let sentences = self.nmea.encode(&f.message_bits, self.channel);
+                        out.push((f, sentences));
+                    }
+                    break;
+                }
             }
         }
         out
