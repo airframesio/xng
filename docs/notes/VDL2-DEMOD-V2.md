@@ -182,3 +182,25 @@ per-symbol confidence into RS erasure marking (the decoder corrects
 row doubles the correction budget exactly where it is needed), or
 confidence-driven re-decision of boundary symbols. That is the v4
 direction; the funnel counters remain in place for it.
+
+## v4: soft-decision RS erasures (2026-06, shipped with caveats)
+
+Implemented: per-symbol |residual| confidence → on RS row failure,
+retry once with the two least-confident transmitted octets erased
+(2e+f ≤ 6 keeps a two-error margin; flagged octets must have residual
+> 0.20 rad). Erasure-assisted decodes never advance the hunt cursor
+past the burst (rewind, like a failure) so a miscorrection can
+never swallow a later burst — that guard was earned the hard way: an
+unbounded erasure ladder "decoded" every burst (rs_fail 43 → 0) while
+real frames DROPPED 17 → 10 from cursor skips over hallucinated
+codewords.
+
+Off-air result: 13 of 43 RS failures now pass RS, **all 13 rejected by
+the AVLC FCS** — zero verified gain on this capture. Third independent
+confirmation (after the equalizer and two-pass studies) that the
+capture's failing bursts are pervasively weak rather than marginal:
+the 17-vs-41 gap to dumpvdl2 lives in raw demodulation quality
+(filtering/sync ahead of the slicer), not in FEC headroom. The
+machinery ships because it is free on the happy path, regression-proof
+by construction, observable live (soft_ok counter), and exactly
+targets the 4-bad-octet bursts that real reception produces.

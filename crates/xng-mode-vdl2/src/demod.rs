@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
 pub static STAT_FIT_PASS: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_HDR_FAIL: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_RS_FAIL: AtomicUsize = AtomicUsize::new(0);
+pub static STAT_SOFT_OK: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_BURST_OK: AtomicUsize = AtomicUsize::new(0);
 use xng_dsp::rs::ReedSolomon;
 
@@ -66,6 +67,9 @@ struct Collecting {
     prev: Complex<f32>,
     /// Descrambled bits collected so far.
     bits: Vec<u8>,
+    /// Per-symbol decision confidence: |phase residual| at the π/4 grid
+    /// (small = confident). One entry per data symbol.
+    conf: Vec<f32>,
     scr: Scrambler,
     /// Total bits to collect once the header is decoded.
     needed: Option<usize>,
@@ -306,6 +310,7 @@ impl Vdl2Demod {
             let idx = (idx_f as i32).rem_euclid(8) as usize;
             let residual = ph - idx_f * (PI / 4.0);
             c.theta += PHASE_GAIN * residual;
+            c.conf.push(residual.abs());
             let (x, y, z) = GRAY_INV[idx];
             for b in [x, y, z] {
                 c.bits.push(b ^ c.scr.next_bit());
@@ -337,6 +342,7 @@ impl Vdl2Demod {
                             theta,
                             prev,
                             bits: Vec::new(),
+                            conf: Vec::new(),
                             scr: Scrambler::new(),
                             needed: None,
                         }));
@@ -357,12 +363,30 @@ impl Vdl2Demod {
                         let n = c.needed.unwrap();
                         let hdr: [u8; HEADER_BITS] = c.bits[..HEADER_BITS].try_into().unwrap();
                         let tl_bits = header::decode(&hdr).unwrap() as usize;
-                        match interleave::deinterleave(&c.bits[HEADER_BITS..n], tl_bits, rs)
-                        {
-                            Some((avlc_bits, fixed)) => {
+                        match interleave::deinterleave_soft(
+                            &c.bits[HEADER_BITS..n],
+                            &c.conf,
+                            HEADER_BITS,
+                            tl_bits,
+                            rs,
+                        ) {
+                            Some((avlc_bits, fixed, soft)) => {
                                 STAT_BURST_OK.fetch_add(1, AOrd::Relaxed);
+                                if soft {
+                                    STAT_SOFT_OK.fetch_add(1, AOrd::Relaxed);
+                                }
                                 out.push(Burst { bits: avlc_bits, rs_corrected: fixed });
-                                self.cursor = c.next_pos; // skip past the burst
+                                // An erasure-assisted pass may be a
+                                // miscorrection (the AVLC FCS arbitrates);
+                                // never let it swallow a later burst —
+                                // rewind like an RS failure instead of
+                                // skipping ahead.
+                                if soft {
+                                    self.last_rs_fail = c.uw_start;
+                                    self.cursor = c.uw_start + 1.0;
+                                } else {
+                                    self.cursor = c.next_pos; // skip past the burst
+                                }
                             }
                             None => {
                                 STAT_RS_FAIL.fetch_add(1, AOrd::Relaxed);

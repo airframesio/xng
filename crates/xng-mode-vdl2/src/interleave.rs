@@ -104,16 +104,51 @@ pub fn interleave(data_bits: &[u8], rs: &ReedSolomon) -> Vec<u8> {
 
 /// RX: transmitted post-header bits → corrected data bits (TL of them).
 /// Returns (data_bits, rs_corrected_octets) or None if uncorrectable.
+/// Hard-decision deinterleave (kept for loopback tests and as the
+/// zero-confidence fallback).
 pub fn deinterleave(tx_bits: &[u8], tl_bits: usize, rs: &ReedSolomon) -> Option<(Vec<u8>, usize)> {
+    deinterleave_soft(tx_bits, &[], 0, tl_bits, rs).map(|(b, c, _)| (b, c))
+}
+
+/// Deinterleave with soft-decision erasure retries: each RS row is
+/// first tried as-is; on failure, the transmitted octets with the
+/// lowest decision confidence are marked as erasures and the row is
+/// retried (RS(255,249) trades one error of budget for two erasures:
+/// 2·errors + erasures ≤ 6, with untransmitted check octets already
+/// consuming part of the budget). The AVLC FCS downstream rejects any
+/// miscorrection this invites.
+///
+/// `sym_conf` holds |phase residual| per burst symbol (3 bits each);
+/// `bit_offset` is `tx_bits[0]`'s position in the burst bit stream
+/// (the header is not symbol-aligned). Empty conf = hard decisions.
+pub fn deinterleave_soft(
+    tx_bits: &[u8],
+    sym_conf: &[f32],
+    bit_offset: usize,
+    tl_bits: usize,
+    rs: &ReedSolomon,
+) -> Option<(Vec<u8>, usize, bool)> {
     let lay = layout(tl_bits)?;
     if tx_bits.len() < lay.total_tx_bits {
         return None;
     }
     let octets = bits_to_octets(&tx_bits[..lay.total_tx_bits]);
+    // Worst-bit confidence per TX octet (symbols are 3 bits; an octet
+    // spans 2-4 symbols — take the largest residual touching it).
+    let octet_conf: Vec<f32> = (0..octets.len())
+        .map(|o| {
+            let first_sym = (bit_offset + o * 8) / 3;
+            let last_sym = (bit_offset + o * 8 + 7) / 3;
+            (first_sym..=last_sym)
+                .map(|s| sym_conf.get(s).copied().unwrap_or(0.0))
+                .fold(0.0f32, f32::max)
+        })
+        .collect();
 
     let c = lay.rows.len();
     let mut grid: Vec<Vec<u8>> = vec![vec![0u8; 255]; c];
-    let mut it = octets.iter();
+    let mut cgrid: Vec<Vec<f32>> = vec![vec![0.0f32; 255]; c];
+    let mut it = octets.iter().zip(&octet_conf);
     for col in 0..255 {
         for r in 0..c {
             let n = lay.rows[r];
@@ -121,27 +156,68 @@ pub fn deinterleave(tx_bits: &[u8], tl_bits: usize, rs: &ReedSolomon) -> Option<
             let transmitted =
                 (col < n) || (col >= ROW_DATA_OCTETS && col < ROW_DATA_OCTETS + k);
             if transmitted {
-                grid[r][col] = *it.next()?;
+                let (&o, &cf) = it.next()?;
+                grid[r][col] = o;
+                cgrid[r][col] = cf;
             }
         }
     }
 
     let mut corrected = 0usize;
+    let mut soft_assisted = false;
     let mut data_octets = Vec::new();
     for (r, row) in grid.iter_mut().enumerate() {
         let n = lay.rows[r];
         let k = lay.checks[r];
         if k > 0 {
-            // Untransmitted check octets are erasures.
-            let erasures: Vec<usize> = (ROW_DATA_OCTETS + k..255).collect();
-            match rs.correct(row, &erasures) {
-                Ok(fixed) => corrected += fixed.saturating_sub(erasures.len()),
-                Err(()) => return None,
+            // Untransmitted check octets are always erasures.
+            let base: Vec<usize> = (ROW_DATA_OCTETS + k..255).collect();
+            let budget = 6usize.saturating_sub(base.len());
+            // Transmitted positions ranked least-confident first.
+            let mut ranked: Vec<usize> = (0..255)
+                .filter(|&col| (col < n) || (col >= ROW_DATA_OCTETS && col < ROW_DATA_OCTETS + k))
+                .collect();
+            ranked.sort_by(|&a, &b| {
+                cgrid[r][b].partial_cmp(&cgrid[r][a]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let mut done = false;
+            // One erasure rung only: erasing the two least-confident
+            // octets keeps a two-error margin (2e + f ≤ 6). Wider rungs
+            // measurably hallucinate codewords (see demod notes).
+            for extra in [0usize, 2] {
+                if extra > budget {
+                    break;
+                }
+                let mut attempt = row.clone();
+                let mut erasures = base.clone();
+                if extra > 0 {
+                    // Only erase genuinely doubtful decisions (residual
+                    // beyond ~half the decision region).
+                    if ranked.len() < extra
+                        || ranked.iter().take(extra).any(|&p| cgrid[r][p] < 0.20)
+                    {
+                        break;
+                    }
+                    erasures.extend(ranked.iter().take(extra).copied());
+                }
+                if let Ok(fixed) = rs.correct(&mut attempt, &erasures) {
+                    corrected += fixed.saturating_sub(base.len());
+                    if extra > 0 {
+                        soft_assisted = true;
+                    }
+                    *row = attempt;
+                    done = true;
+                    break;
+                }
+            }
+            if !done {
+                return None;
             }
         }
         data_octets.extend_from_slice(&row[..n]);
     }
-    Some((octets_to_bits(&data_octets, tl_bits), corrected))
+    Some((octets_to_bits(&data_octets, tl_bits), corrected, soft_assisted))
 }
 
 #[cfg(test)]
