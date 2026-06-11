@@ -90,6 +90,10 @@ struct OutputOpts {
     /// Mode S/ADS-B messages only)
     #[arg(long)]
     sbs: Option<String>,
+    /// Send raw NMEA AIVDM sentences to host:port over UDP (repeatable;
+    /// AIS messages only — the format marine aggregators ingest)
+    #[arg(long)]
+    nmea_udp: Vec<String>,
 }
 
 impl OutputOpts {
@@ -124,6 +128,7 @@ impl OutputOpts {
                 asf2_quic_trust: quic_trust,
                 metrics: self.metrics.clone(),
                 sbs: self.sbs.clone(),
+                nmea_udp: self.nmea_udp.clone(),
             },
             ident,
         ))
@@ -568,6 +573,7 @@ fn main() -> anyhow::Result<()> {
                         asf2_quic_trust: outputs::asf2_quic::TrustMode::SystemRoots,
                         metrics: None,
                         sbs: None,
+                        nmea_udp: vec![],
                     },
                 },
             )

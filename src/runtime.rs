@@ -36,6 +36,8 @@ pub struct OutputConfig {
     pub metrics: Option<String>,
     /// SBS-1 (BaseStation, dump1090 port-30003 style) TCP server address.
     pub sbs: Option<String>,
+    /// Raw NMEA (AIVDM) UDP targets for marine aggregators.
+    pub nmea_udp: Vec<String>,
 }
 
 pub struct SessionConfig {
@@ -356,6 +358,10 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         if let Some(addr) = cfg.outputs.sbs.clone() {
             let rx = bus.subscribe();
             output_tasks.push(tokio::spawn(crate::outputs::sbs::run(rx, addr)));
+        }
+        for target in cfg.outputs.nmea_udp.clone() {
+            let rx = bus.subscribe();
+            output_tasks.push(tokio::spawn(crate::outputs::nmea_udp::run(rx, target)));
         }
         if let Some(url) = cfg.outputs.asf2_grpc.clone() {
             let rx = bus.subscribe();

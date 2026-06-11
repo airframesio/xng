@@ -58,12 +58,35 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     let app = a.app.as_ref().and_then(app_summary).map(|s| format!(" [{s}]")).unwrap_or_default();
                     format!("ACARS {} {} lbl={} {}{}{}", tail, flight, a.label, quality, text, app)
                 }
-                MessageBody::Ais { nmea, msg_type, mmsi } => format!(
-                    "AIS type={} mmsi={} {}",
-                    msg_type.map_or("?".into(), |t| t.to_string()),
-                    mmsi.map_or("?".into(), |m| m.to_string()),
-                    nmea.first().map(String::as_str).unwrap_or("")
-                ),
+                MessageBody::Ais { nmea, msg_type, mmsi, details } => {
+                    let mut s = format!(
+                        "AIS type={} mmsi={}",
+                        msg_type.map_or("?".into(), |t| t.to_string()),
+                        mmsi.map_or("?".into(), |m| m.to_string()),
+                    );
+                    if let Some(d) = details {
+                        if let Some(n) = d.get("name").and_then(|v| v.as_str()) {
+                            s.push_str(&format!(" name={n}"));
+                        }
+                        if let (Some(lat), Some(lon)) = (
+                            d.get("lat").and_then(|v| v.as_f64()),
+                            d.get("lon").and_then(|v| v.as_f64()),
+                        ) {
+                            s.push_str(&format!(" pos={lat:.5},{lon:.5}"));
+                        }
+                        if let Some(v) = d.get("sog_kt").and_then(|v| v.as_f64()) {
+                            s.push_str(&format!(" sog={v}kt"));
+                        }
+                        if let Some(v) = d.get("nav_status").and_then(|v| v.as_str()) {
+                            s.push_str(&format!(" [{v}]"));
+                        }
+                        if let Some(v) = d.get("destination").and_then(|v| v.as_str()) {
+                            s.push_str(&format!(" dest={v}"));
+                        }
+                    }
+                    s.push_str(&format!(" {}", nmea.first().map(String::as_str).unwrap_or("")));
+                    s
+                }
                 MessageBody::ModeS {
                     df,
                     icao,

@@ -421,6 +421,7 @@ fn dwell(
             asf2_quic_trust: crate::outputs::asf2_quic::TrustMode::SystemRoots,
             metrics: None,
             sbs: None,
+            nmea_udp: vec![],
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;

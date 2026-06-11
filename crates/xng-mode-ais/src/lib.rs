@@ -10,6 +10,7 @@
 
 pub mod demod;
 pub mod frame;
+pub mod fields;
 pub mod modulate;
 pub mod nmea;
 
@@ -111,6 +112,7 @@ pub fn to_message(
             nmea,
             msg_type: Some(f.msg_type),
             mmsi: Some(f.mmsi),
+            details: fields::decode(f.msg_type, &f.message_bits),
         },
         raw: Some(f.wire_bytes.clone()),
         source,

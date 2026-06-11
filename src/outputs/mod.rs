@@ -8,4 +8,5 @@ pub mod asf2_quic;
 pub mod console;
 pub mod jsonl;
 pub mod metrics;
+pub mod nmea_udp;
 pub mod sbs;

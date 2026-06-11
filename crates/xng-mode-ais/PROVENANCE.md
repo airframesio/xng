@@ -19,3 +19,12 @@ The end-to-end test is anchored to a widely published example AIVDM
 sentence (type 1, MMSI 477553000) reconstructed back to wire bits, so the
 bit-order/armoring conventions are verified against real-world data, not
 just self-consistency.
+
+## Field-level decode (2026-06)
+
+Message-type field layouts (1-5, 9, 18/19, 21, 24, 27: positions at
+1/600000 deg, SOG tenths of knots, 6-bit ASCII strings, nav-status
+table) implemented from ITU-R M.1371-5 as already referenced. Validated
+against pyais (MIT) as a decode oracle: the canonical type 1, two-part
+type 5, and type 18 sentences decode field-identically (vendored as
+unit vectors with the oracle outputs recorded, 2026-06-10).
