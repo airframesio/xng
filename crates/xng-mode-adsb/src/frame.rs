@@ -9,7 +9,36 @@
 
 use crate::decode::{self, Cpr, Velocity};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use xng_dsp::checksum::mode_s_crc;
+
+/// Syndrome → bit-position table for single-bit errors in 112-bit
+/// frames (the Mode S CRC is linear; bit i alone yields syndrome
+/// crc(e_i)). 56-bit frames reuse the table tail.
+fn single_bit_fix(syndrome: u32, nbytes: usize) -> Option<usize> {
+    static TABLE: OnceLock<std::collections::HashMap<u32, usize>> = OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        let mut map = std::collections::HashMap::new();
+        for bit in 0..112usize {
+            let mut msg = [0u8; 14];
+            msg[bit / 8] = 0x80 >> (bit % 8);
+            let syn = mode_s_crc(&msg[..11])
+                ^ u32::from_be_bytes([0, msg[11], msg[12], msg[13]]);
+            map.insert(syn, bit);
+        }
+        map
+    });
+    let bit = *table.get(&syndrome)?;
+    // For 56-bit frames the error must land within the short frame.
+    let total_bits = nbytes * 8;
+    if total_bits == 112 {
+        Some(bit)
+    } else {
+        // 56-bit short frame: its bit k corresponds to long-frame bit
+        // k + 56 in CRC terms (the polynomial acts on the tail).
+        bit.checked_sub(56).filter(|&b| b < total_bits)
+    }
+}
 
 /// Identification charset (TC 1–4): index 1–26 = A–Z, 32 = space,
 /// 48–57 = digits.
@@ -67,11 +96,27 @@ impl FrameValidator {
         let expected = mode_s_crc(&bytes[..n - 3]);
         let received = u32::from_be_bytes([0, bytes[n - 3], bytes[n - 2], bytes[n - 1]]);
         let syndrome = expected ^ received;
+        let mut bytes = bytes.to_vec();
+        let mut syndrome = syndrome;
         let icao = match df {
             // Extended squitter: clean parity; address in AA field.
+            // The CRC is linear, so a single bit error has a unique,
+            // precomputable syndrome — repair it (the parity then
+            // re-verifies clean) instead of dropping the frame.
             17 | 18 => {
                 if syndrome != 0 {
-                    return None;
+                    let Some(bit) = single_bit_fix(syndrome, bytes.len()) else {
+                        return None;
+                    };
+                    bytes[bit / 8] ^= 0x80 >> (bit % 8);
+                    let n = bytes.len();
+                    let expected = mode_s_crc(&bytes[..n - 3]);
+                    let received =
+                        u32::from_be_bytes([0, bytes[n - 3], bytes[n - 2], bytes[n - 1]]);
+                    syndrome = expected ^ received;
+                    if syndrome != 0 || bytes[0] >> 3 != df {
+                        return None;
+                    }
                 }
                 let icao = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]);
                 self.learn(icao);
@@ -100,7 +145,7 @@ impl FrameValidator {
         let mut f = AdsbFrame {
             df,
             icao,
-            bytes: bytes.to_vec(),
+            bytes: bytes.clone(),
             callsign: None,
             altitude_ft: None,
             squawk: None,
@@ -219,10 +264,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_corrupted_squitter() {
-        let mut bad = ID_FRAME;
-        bad[6] ^= 0x01;
-        assert!(FrameValidator::new().validate(&bad, -20.0).is_none());
+    fn repairs_single_bit_rejects_double() {
+        // One flipped bit: the syndrome identifies it and the frame
+        // repairs to the original.
+        let mut one = ID_FRAME;
+        one[6] ^= 0x01;
+        let f = FrameValidator::new().validate(&one, -20.0).expect("repaired");
+        assert_eq!(f.bytes, &ID_FRAME);
+        // Two flipped bits: not repairable, rejected.
+        let mut two = ID_FRAME;
+        two[6] ^= 0x01;
+        two[9] ^= 0x10;
+        assert!(FrameValidator::new().validate(&two, -20.0).is_none());
     }
 
     #[test]
