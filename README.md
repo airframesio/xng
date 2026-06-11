@@ -294,10 +294,11 @@ ACARS from any carrier flows through one application layer
 
 - **ADS-C** (ARINC 622): full decode — positions, altitudes, contract
   tags — conformance-tested against real off-air messages.
-- **CPDLC** (FANS-1/A): controller↔pilot datalink rendered as readable
-  text with decoded arguments: `REQUEST CLIMB TO FL360`,
-  `AT 14:32 EXPECT M0.84`, `REQUEST DIRECT TO 52°18.5'N 4°46.0'E`,
-  multi-element messages included.
+- **CPDLC, both dialects**: FANS-1/A (over ACARS) and ATN-B1
+  (over VDL2/CLNP) rendered as readable text with decoded arguments —
+  `REQUEST CLIMB TO FL360`, `AT 14:32 EXPECT M0.84`, free text,
+  vertical rates, headings, multi-element messages, and **route
+  clearances** (`ASSIGNED ROUTE DEST KSFO, ROUTE J501 OAK`).
 - **MIAM** (ARINC 841): single-transfer CORE PDUs decompressed
   (DEFLATE), file-transfer signalling decoded.
 - **OHMA**: Boeing aircraft-health JSON unwrapped (base64 + zlib) into
