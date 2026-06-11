@@ -76,6 +76,7 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     speed_type,
                     track_deg,
                     vertical_rate_fpm,
+                    comm_b,
                 } => {
                     let mut s = format!("MODE-S df={} icao={}", df, icao.as_deref().unwrap_or("-"));
                     if let Some(c) = callsign {
@@ -98,6 +99,20 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     if let Some(vr) = vertical_rate_fpm {
                         s.push_str(&format!(" vr={vr:+}fpm"));
+                    }
+                    if let Some(cb) = comm_b {
+                        if let Some(b) = cb.get("bds").and_then(|v| v.as_str()) {
+                            s.push_str(&format!(" bds={b}"));
+                        }
+                        if let Some(c) = cb.get("callsign").and_then(|v| v.as_str()) {
+                            s.push_str(&format!(" ident={c}"));
+                        }
+                        if let Some(a) = cb.get("selected_altitude_mcp") {
+                            s.push_str(&format!(" sel_alt={a}ft"));
+                        }
+                        if let Some(h) = cb.get("magnetic_heading").and_then(|v| v.as_f64()) {
+                            s.push_str(&format!(" hdg={h:.0}"));
+                        }
                     }
                     s
                 }

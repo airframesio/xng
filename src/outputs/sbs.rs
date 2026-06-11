@@ -111,6 +111,7 @@ mod tests {
                 speed_type: None,
                 track_deg: None,
                 vertical_rate_fpm: None,
+                comm_b: None,
             },
             raw: None,
             source: Provenance {

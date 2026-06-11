@@ -412,6 +412,7 @@ fn dwell(
         channels_hz: channels.to_vec(),
         station_ident: "XNG-SURVEY".into(),
         sdr: None,
+        receiver_pos: None,
         outputs: runtime::OutputConfig {
             console: ConsoleFormat::Pretty,
             jsonl: None,

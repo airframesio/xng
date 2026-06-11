@@ -371,6 +371,7 @@ pub(crate) fn scan_group(
         channels_hz: channels.to_vec(),
         station_ident: "XNG-SCAN".into(),
         sdr: None,
+        receiver_pos: None,
         outputs: runtime::OutputConfig {
             console: crate::outputs::console::ConsoleFormat::Pretty,
             jsonl: None,

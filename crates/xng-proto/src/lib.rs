@@ -83,6 +83,7 @@ impl From<&Message> for asf2::DecodedMessage {
                 speed_type,
                 track_deg,
                 vertical_rate_fpm,
+                comm_b,
             } => {
                 Some(asf2::decoded_message::Body::ModeS(asf2::ModeSBody {
                     df: u32::from(*df),
@@ -96,6 +97,7 @@ impl From<&Message> for asf2::DecodedMessage {
                     speed_type: speed_type.clone(),
                     track_deg: *track_deg,
                     vertical_rate_fpm: *vertical_rate_fpm,
+                    comm_b_json: comm_b.as_ref().map(|v| v.to_string()),
                 }))
             }
             MessageBody::Iridium { kind, details } => {

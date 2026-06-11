@@ -45,6 +45,8 @@ pub struct SessionConfig {
     pub station_ident: String,
     pub sdr: Option<SdrInfo>,
     pub outputs: OutputConfig,
+    /// Receiver location (lat, lon) — enables ADS-B surface decode.
+    pub receiver_pos: Option<(f64, f64)>,
 }
 
 const READ_CHUNK: usize = 65_536;
@@ -308,8 +310,11 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 sample_rate
             );
         }
-        let dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
+        if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
+            d.set_receiver_position(lat, lon);
+        }
         decoders.push((freq, dec));
     }
     tracing::info!(
@@ -618,8 +623,11 @@ pub(crate) fn build_decoders(
                 freq as f64 / 1e6
             );
         }
-        let dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
+        if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
+            d.set_receiver_position(lat, lon);
+        }
         decoders.push((freq, dec));
     }
     Ok(decoders)
