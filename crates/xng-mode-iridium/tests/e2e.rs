@@ -141,3 +141,102 @@ fn oracle_validated_vector() {
     assert_eq!(f.details["pages"][1]["tmsi"], "00c0ffee");
     assert_eq!(f.details["pages"][0]["msc_id"], 7);
 }
+
+/// Build an IMS pager burst: ACCESS + messaging header + 2-way
+/// interleaved BCH(31,21) blocks (messaging polynomial).
+fn ims_bits(blocks21: &[Vec<u8>]) -> Vec<u8> {
+    let enc: Vec<Vec<u8>> = blocks21
+        .iter()
+        .map(|d| frame::bch_encode(frame::MESSAGING_BCH_POLY, d))
+        .collect();
+    let mut bits: Vec<u8> = frame::ACCESS_DL.to_vec();
+    bits.extend(frame::HEADER_MESSAGING.iter().copied());
+    for pair in enc.chunks_exact(2) {
+        bits.extend(frame::interleave2(&pair[0], &pair[1]));
+    }
+    bits
+}
+
+/// 21-bit pager blocks for a single-part ASCII page (mirrors the ms.rs
+/// unit-test builder).
+fn pager_blocks(ric: u32, text: &str) -> Vec<Vec<u8>> {
+    fn push_int(v: &mut Vec<u8>, val: u32, n: usize) {
+        for k in (0..n).rev() {
+            v.push(((val >> k) & 1) as u8);
+        }
+    }
+    let mut rest: Vec<u8> = Vec::new();
+    for k in 0..22 {
+        rest.push(((ric >> k) & 1) as u8);
+    }
+    push_int(&mut rest, 5, 5);
+    push_int(&mut rest, 7, 6);
+    push_int(&mut rest, 0, 4);
+    push_int(&mut rest, 0, 6);
+    push_int(&mut rest, 0, 4);
+    rest.push(0);
+    rest.push(0);
+    push_int(&mut rest, 0, 7);
+    for c in text.bytes() {
+        push_int(&mut rest, c as u32, 7);
+    }
+    push_int(&mut rest, 3, 7);
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    for chunk in rest.chunks(20) {
+        let mut b = vec![0u8];
+        b.extend_from_slice(chunk);
+        b.resize(21, 0);
+        blocks.push(b);
+    }
+    let total_halves = 1 + blocks.len();
+    let bch_blocks = (total_halves + 1) / 2;
+    let mut h = Vec::new();
+    h.push(0);
+    push_int(&mut h, 0, 4);
+    push_int(&mut h, 3, 4);
+    push_int(&mut h, 9, 6);
+    push_int(&mut h, bch_blocks as u32, 4);
+    push_int(&mut h, 1, 2);
+    let mut out = vec![h];
+    out.extend(blocks);
+    if out.len() % 2 == 1 {
+        out.push(vec![1u8; 21]);
+    }
+    out
+}
+
+#[test]
+fn ims_pager_bits_decode() {
+    let bits = ims_bits(&pager_blocks(1234567, "CALL OPS +14155550100"));
+    let f = xng_mode_iridium::decode_bits(&bits).expect("frame");
+    assert_eq!(f.kind, "msg");
+    assert_eq!(f.details.pointer("/body/ric").and_then(|v| v.as_u64()), Some(1234567));
+    assert_eq!(
+        f.details.pointer("/body/text").and_then(|v| v.as_str()),
+        Some("CALL OPS +14155550100")
+    );
+}
+
+/// Oracle-validated IMS vector: iridium-toolkit bitsparser.py parses
+/// these exact bits as IridiumMessagingAscii with
+/// `3:1:09 len:06 ric:1234567 fmt:05 seq:07 TXT: CALL OPS +14155550100`
+/// (run 2026-06-10 with the vendored toolkit harness). Our decode must
+/// agree field-for-field.
+#[test]
+fn oracle_validated_ims_vector() {
+    const BITS: &str = "00110000001100001111001100110011111100110011001111110011111001111011000111110011010001111001100011100101001000001100100011100111001000011101000000001000000000110010000000100010000000101101001111001100110110001101110010110100001100000100000101111000101000100100010101100000010001001001100100101101010110001000101010000110101110111101100001101011100110011101011001100100101110000100001011110000010000000011000000000001011010100000001100000000";
+    let bits: Vec<u8> = BITS.bytes().map(|b| b - b'0').collect();
+    let f = xng_mode_iridium::decode_bits(&bits).expect("frame");
+    assert_eq!(f.kind, "msg");
+    let d = &f.details;
+    assert_eq!(d.pointer("/block").and_then(|v| v.as_u64()), Some(3));
+    assert_eq!(d.pointer("/group").and_then(|v| v.as_str()), Some("1"));
+    assert_eq!(d.pointer("/frame").and_then(|v| v.as_u64()), Some(9));
+    assert_eq!(d.pointer("/body/ric").and_then(|v| v.as_u64()), Some(1234567));
+    assert_eq!(d.pointer("/body/format").and_then(|v| v.as_u64()), Some(5));
+    assert_eq!(d.pointer("/body/seq").and_then(|v| v.as_u64()), Some(7));
+    assert_eq!(
+        d.pointer("/body/text").and_then(|v| v.as_str()),
+        Some("CALL OPS +14155550100")
+    );
+}
