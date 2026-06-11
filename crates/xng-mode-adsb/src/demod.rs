@@ -21,7 +21,7 @@ const PREAMBLE_PULSES: [usize; 4] = [0, 2, 7, 9];
 const PREAMBLE_QUIET: [usize; 6] = [1, 3, 5, 11, 13, 15];
 /// Candidate gate: mean pulse energy must exceed this multiple of the
 /// worst quiet slot.
-const PULSE_QUIET_RATIO: f32 = 1.0;
+const PULSE_QUIET_RATIO: f32 = 0.5;
 /// Long frame length in bits (DF >= 16).
 const LONG_BITS: usize = 112;
 const SHORT_BITS: usize = 56;
@@ -31,19 +31,19 @@ const NOISE_ALPHA: f32 = 1e-4;
 pub struct PpmDemod {
     /// Samples per half µs.
     half: usize,
-    /// Second timing phase active (2 MS/s input): a pulse landing
+    /// Fractional timing phases active (2 MS/s input): a pulse landing
     /// between samples splits its energy across two half-µs slots and
     /// weak frames decide wrong. The original grid is scanned exactly
-    /// as before; a midpoint-interpolated half-shifted grid is scanned
-    /// independently and its *additional* frames merged in — never
+    /// as before; quarter-sample-shifted interpolated grids are scanned
+    /// independently and their *additional* frames merged in — never
     /// replacing an on-grid decode (interpolation blurs pulse/quiet
     /// contrast, measured −35 frames when used alone).
     two_phase: bool,
     last_sample: Complex<f32>,
     /// Power (|x|²) carry buffer across process() calls.
     power: Vec<f32>,
-    /// Half-shifted power buffer (midpoint complex interpolation).
-    power_mid: Vec<f32>,
+    /// Fractionally shifted power buffers (⅛-sample offset grid).
+    power_frac: [Vec<f32>; 7],
     validator: FrameValidator,
     noise: f32,
 }
@@ -63,7 +63,7 @@ impl PpmDemod {
             two_phase,
             last_sample: Complex::new(0.0, 0.0),
             power: Vec::new(),
-            power_mid: Vec::new(),
+            power_frac: std::array::from_fn(|_| Vec::new()),
             validator: FrameValidator::new(),
             noise: 1e-6,
         })
@@ -94,7 +94,7 @@ impl PpmDemod {
 
             let pulses: f32 =
                 PREAMBLE_PULSES.iter().map(|&p| Self::slot(power, half, i, p)).sum::<f32>() / 4.0;
-            if pulses < *noise * half as f32 * 2.0 {
+            if pulses < *noise * half as f32 * 1.2 {
                 i += 1;
                 continue;
             }
@@ -140,9 +140,16 @@ impl PpmDemod {
         self.power.extend(input.iter().map(|x| x.norm_sqr()));
         if self.two_phase {
             let mut prev = self.last_sample;
-            self.power_mid.reserve(input.len());
+            for v in &mut self.power_frac {
+                v.reserve(input.len());
+            }
             for &x in input {
-                self.power_mid.push(((prev + x) * 0.5).norm_sqr());
+                for (j, frac) in
+                    [0.125f32, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875].iter().enumerate()
+                {
+                    let interp = prev * (1.0 - frac) + x * *frac;
+                    self.power_frac[j].push(interp.norm_sqr());
+                }
                 prev = x;
             }
             if let Some(&last) = input.last() {
@@ -166,23 +173,26 @@ impl PpmDemod {
             true,
         );
         if self.two_phase {
-            let mid = Self::scan(
-                &self.power_mid,
-                self.half,
-                end.min(self.power_mid.len().saturating_sub(frame_samples)),
-                &mut self.noise,
-                &mut self.validator,
-                false,
-            );
-            // Merge: keep half-shifted decodes only when the on-grid scan
-            // didn't already produce the same bytes nearby (legitimate
-            // repeats of identical messages are many frame-lengths apart).
-            for (pos, f) in mid {
-                let dup = found.iter().any(|(p, g)| {
-                    g.bytes == f.bytes && (*p as i64 - pos as i64).unsigned_abs() < frame_samples as u64
-                });
-                if !dup {
-                    found.push((pos, f));
+            for grid in &self.power_frac {
+                let frames = Self::scan(
+                    grid,
+                    self.half,
+                    end.min(grid.len().saturating_sub(frame_samples)),
+                    &mut self.noise,
+                    &mut self.validator,
+                    false,
+                );
+                // Merge: keep shifted decodes only when no equal-bytes
+                // frame was already found nearby (legitimate repeats of
+                // identical messages are many frame-lengths apart).
+                for (pos, f) in frames {
+                    let dup = found.iter().any(|(p, g)| {
+                        g.bytes == f.bytes
+                            && (*p as i64 - pos as i64).unsigned_abs() < frame_samples as u64
+                    });
+                    if !dup {
+                        found.push((pos, f));
+                    }
                 }
             }
         }
@@ -192,8 +202,10 @@ impl PpmDemod {
         // Keep the unscanned tail for the next call.
         self.power.drain(..end.min(self.power.len()));
         if self.two_phase {
-            let n = end.min(self.power_mid.len());
-            self.power_mid.drain(..n);
+            for v in &mut self.power_frac {
+                let n = end.min(v.len());
+                v.drain(..n);
+            }
         }
         out
     }
