@@ -51,4 +51,12 @@ fn main() {
         }
     }
     println!("total: {n} frames");
+    use std::sync::atomic::Ordering;
+    eprintln!(
+        "stats: fit_pass={} hdr_fail={} rs_fail={} burst_ok={}",
+        xng_mode_vdl2::demod::STAT_FIT_PASS.load(Ordering::Relaxed),
+        xng_mode_vdl2::demod::STAT_HDR_FAIL.load(Ordering::Relaxed),
+        xng_mode_vdl2::demod::STAT_RS_FAIL.load(Ordering::Relaxed),
+        xng_mode_vdl2::demod::STAT_BURST_OK.load(Ordering::Relaxed),
+    );
 }
