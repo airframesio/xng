@@ -228,3 +228,31 @@ Remaining gap (19 vs 41): the oracle decodes multiple frames from
 burst sequences we still partially miss; next instrumentation step is
 time-aligning our decoded burst list against dumpvdl2's per-burst
 timestamps to see exactly which transmissions remain.
+
+## Failure forensics round 2 (2026-06, all rescue ladders falsified)
+
+With the gated estimator in (19 frames), the remaining oracle gap was
+chased through three more measured hypotheses:
+
+- **Content diff vs dumpvdl2**: we decode the short frames (11-octet
+  RRs) of conversations whose long I-frames we miss, plus zero of the
+  six GSIF broadcast XIDs. Pattern: long bursts fail, short ones pass.
+- **Clock-skew re-walk** (±25..100 ppm): zero rescues. Falsified.
+- **Symbol-offset re-walk** (±1, ±2 symbols): six "rescues" — every
+  one RS-passing garbage with zero FCS-valid frames and no 0x7E flags
+  in the bytes. Cause: low-redundancy RS rows (2 check octets ≈ 0.4%
+  random-pass odds) pass deterministically once lucky. Falsified, and
+  a hazard quantified: **on short/low-k rows an RS pass is weak
+  evidence — never emit or change control flow on it without FCS.**
+- **Residual trajectories on real failures**: flat head-to-tail (no
+  drift), and several failures show GOOD residuals (0.10-0.12 rad
+  mean) — the constellation locks while the bits are wrong.
+
+Locked-constellation-with-wrong-bits and a clean residual leaves one
+suspect standing: the 25-bit header FEC accepting a near-codeword with
+a wrong transmission length (collection length and interleaver layout
+both wrong → clean symbols, garbage deinterleave). Next experiment:
+on RS failure, ladder over the header codewords within FEC distance
+of the received header bits and retry the deinterleave per candidate
+length (data is already collected for the longest). FCS-arbitrated as
+always.
