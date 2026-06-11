@@ -27,6 +27,17 @@ const GATE_FACTOR: f32 = 2.0;
 const CORR_THRESHOLD: f32 = 0.72;
 const NOISE_ALPHA: f32 = 5e-4;
 
+/// Linearly interpolated sample at fractional position `pos`.
+#[inline]
+fn sample_frac(w: &[Complex<f32>], pos: f32) -> Complex<f32> {
+    let i = pos.floor().max(0.0) as usize;
+    if i + 1 >= w.len() {
+        return *w.last().unwrap_or(&Complex::new(0.0, 0.0));
+    }
+    let f = pos - i as f32;
+    w[i] * (1.0 - f) + w[i + 1] * f
+}
+
 /// NRZI level sequence (±1) for a bit pattern, starting from +1.
 fn nrzi_levels(bits: &[u8]) -> Vec<f32> {
     let mut level = 1.0f32;
@@ -217,6 +228,31 @@ impl CoherentDemod {
             cfo += CFO_STEP_HZ;
         }
         let (_, cfo, _) = best?;
+        // Fractional timing: the anchor is integer-sample, but at 5
+        // samples/bit a ±0.5-sample offset already skews every bit
+        // correlation by ±10 % of a bit. Evaluate the template at
+        // sub-sample offsets (linear interpolation) and keep the best;
+        // the whole window is then resampled at that offset.
+        let mut best_frac = (0.0f32, 0.0f32); // (|corr|, frac)
+        for k in -2i32..=2 {
+            let frac = k as f32 * 0.25;
+            let mut corr = Complex::new(0.0f32, 0.0);
+            for (i, &t) in self.template.iter().enumerate() {
+                let x = sample_frac(window, i as f32 + frac);
+                corr += x * t.conj();
+            }
+            if corr.norm() > best_frac.0 {
+                best_frac = (corr.norm(), frac);
+            }
+        }
+        let window: Vec<Complex<f32>> = if best_frac.1 != 0.0 {
+            (0..window.len())
+                .map(|i| sample_frac(window, i as f32 + best_frac.1))
+                .collect()
+        } else {
+            window.to_vec()
+        };
+        let window = &window[..];
         // Fine CFO: phase slope between the two template halves at the
         // grid winner (the coarse grid leaves up to ±75 Hz, which would
         // integrate to radians of drift across a 26 ms burst).
