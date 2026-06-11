@@ -226,6 +226,29 @@ fn parse_esis(b: &[u8]) -> Value {
 }
 
 /// IDRP (ISO 10747) BISPDU header: length, type, sequence numbers.
+/// IDRP path-attribute type names (ISO 10747 §7.12).
+fn idrp_attr_name(t: u8) -> &'static str {
+    match t {
+        1 => "route",
+        2 => "ext-info",
+        3 => "rd-path",
+        4 => "next-hop",
+        5 => "distribute-list-incl",
+        6 => "distribute-list-excl",
+        7 => "multi-exit-disc",
+        8 => "transit-delay",
+        9 => "residual-error",
+        10 => "expense",
+        11 => "locally-defined-qos",
+        12 => "hierarchical-recording",
+        13 => "rd-hop-count",
+        14 => "security",
+        15 => "capacity",
+        16 => "priority",
+        _ => "unknown",
+    }
+}
+
 fn parse_idrp(b: &[u8]) -> Value {
     let mut out = json!({ "protocol": "IDRP", "payload_len": b.len() });
     if b.len() < 4 {
@@ -233,18 +256,140 @@ fn parse_idrp(b: &[u8]) -> Value {
     }
     let len = u16::from_be_bytes([b[1], b[2]]);
     out["bispdu_len"] = json!(len);
-    out["type"] = json!(match b.get(3) {
-        Some(1) => "OPEN",
-        Some(2) => "UPDATE",
-        Some(3) => "ERROR",
-        Some(4) => "KEEPALIVE",
-        Some(5) => "CEASE",
+    let pdu_type = b[3];
+    out["type"] = json!(match pdu_type {
+        1 => "OPEN",
+        2 => "UPDATE",
+        3 => "ERROR",
+        4 => "KEEPALIVE",
+        5 => "CEASE",
         _ => "?",
     });
     if b.len() >= 12 {
         out["sequence"] = json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]));
+        out["ack"] = json!(u32::from_be_bytes([b[8], b[9], b[10], b[11]]));
+    }
+    // BISPDU common header is 30 octets (pid, len, type, seq, ack,
+    // credit offered/available, 16-octet validation).
+    let body = match b.get(30..) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => return out,
+    };
+    match pdu_type {
+        2 => {
+            if let Some(v) = parse_idrp_update(body) {
+                out["update"] = v;
+            }
+        }
+        3 => {
+            out["error_code"] = json!(body[0]);
+            if body.len() >= 2 {
+                out["error_subcode"] = json!(body[1]);
+            }
+        }
+        _ => {}
     }
     out
+}
+
+/// UPDATE BISPDU body: withdrawn route IDs, path attributes
+/// (flag, type, u16 length, value), then NLRI entries.
+fn parse_idrp_update(b: &[u8]) -> Option<Value> {
+    let mut out = json!({});
+    let mut pos = 0usize;
+    let num_withdrawn = u16::from_be_bytes([*b.first()?, *b.get(1)?]) as usize;
+    pos += 2;
+    if num_withdrawn > 0 {
+        let mut withdrawn = Vec::new();
+        for _ in 0..num_withdrawn {
+            let id = b.get(pos..pos + 4)?;
+            withdrawn.push(format!(
+                "{:08x}",
+                u32::from_be_bytes([id[0], id[1], id[2], id[3]])
+            ));
+            pos += 4;
+        }
+        out["withdrawn_routes"] = json!(withdrawn);
+    }
+    let mut attrib_len = u16::from_be_bytes([*b.get(pos)?, *b.get(pos + 1)?]) as usize;
+    pos += 2;
+    if attrib_len > 0 {
+        let mut attrs = Vec::new();
+        while attrib_len > 4 {
+            // flag octet skipped; type, then u16 value length
+            let t = *b.get(pos + 1)?;
+            let alen = u16::from_be_bytes([*b.get(pos + 2)?, *b.get(pos + 3)?]) as usize;
+            pos += 4;
+            attrib_len = attrib_len.saturating_sub(4);
+            let val = b.get(pos..pos + alen)?;
+            let mut a = json!({
+                "type": idrp_attr_name(t),
+                "type_code": t,
+            });
+            match t {
+                7..=10 | 13 | 16 if alen == 1 => a["value"] = json!(val[0]),
+                _ if !val.is_empty() => {
+                    a["value_hex"] =
+                        json!(val.iter().map(|x| format!("{x:02x}")).collect::<String>());
+                }
+                _ => {}
+            }
+            attrs.push(a);
+            pos += alen;
+            attrib_len = attrib_len.saturating_sub(alen);
+        }
+        out["path_attributes"] = json!(attrs);
+    }
+    // NLRI: proto_type(1), proto id length(1) + id, then address info
+    // length (u16) + prefixes (length-prefixed in half-octets).
+    let mut nlri = Vec::new();
+    while pos < b.len() {
+        let rest = &b[pos..];
+        if rest.len() < 7 {
+            break;
+        }
+        let proto_type = rest[0];
+        let proto_len = rest[1] as usize;
+        if 2 + proto_len + 2 > rest.len() {
+            break;
+        }
+        let proto_id = &rest[2..2 + proto_len];
+        let addr_len = u16::from_be_bytes([rest[2 + proto_len], rest[3 + proto_len]]) as usize;
+        let addr_start = 4 + proto_len;
+        if addr_start + addr_len > rest.len() {
+            break;
+        }
+        let addrs = &rest[addr_start..addr_start + addr_len];
+        // CLNP NLRI: proto_type 1 with protocol id 0x81.
+        let is_clnp = proto_type == 1 && proto_id == [0x81];
+        let mut prefixes = Vec::new();
+        let mut apos = 0usize;
+        while apos < addrs.len() {
+            let nbits = addrs[apos] as usize; // prefix length in semi-octets·4
+            let nbytes = nbits.div_ceil(8);
+            if apos + 1 + nbytes > addrs.len() {
+                break;
+            }
+            prefixes.push(format!(
+                "{}/{nbits}",
+                addrs[apos + 1..apos + 1 + nbytes]
+                    .iter()
+                    .map(|x| format!("{x:02x}"))
+                    .collect::<String>()
+            ));
+            apos += 1 + nbytes;
+        }
+        nlri.push(json!({
+            "proto_type": proto_type,
+            "clnp": is_clnp,
+            "prefixes": prefixes,
+        }));
+        pos += addr_start + addr_len;
+    }
+    if !nlri.is_empty() {
+        out["nlri"] = json!(nlri);
+    }
+    Some(out)
 }
 
 /// X.25 facilities: TLVs with class-coded lengths (bits 7-8 of the
@@ -397,6 +542,47 @@ mod tests {
         assert_eq!(v["type"], "ISH");
         assert_eq!(v["holding_time_s"], 600);
         assert_eq!(v["addresses"][0], "470027");
+    }
+
+    #[test]
+    fn idrp_update_attributes_and_nlri() {
+        // 30-octet common header: pid, len, type=UPDATE(2), seq, ack,
+        // credits, 16-octet validation; then the UPDATE body.
+        let mut b = vec![0x83, 0x00, 0x00, 0x02];
+        b.extend(7u32.to_be_bytes()); // seq
+        b.extend(3u32.to_be_bytes()); // ack
+        b.extend([0, 0]); // credits
+        b.extend([0u8; 16]); // validation
+        // body: 1 withdrawn route, attrs: multi-exit-disc(7)=5,
+        // rd-hop-count(13)=2; NLRI: CLNP, prefix 47.0027 (24 bits)
+        b.extend([0x00, 0x01]); // num withdrawn
+        b.extend(0xDEADBEEFu32.to_be_bytes());
+        let attrs: &[u8] = &[
+            0x00, 7, 0x00, 0x01, 5, // flag, type 7, len 1, val 5
+            0x00, 13, 0x00, 0x01, 2, // type 13 = rd-hop-count
+        ];
+        b.extend((attrs.len() as u16).to_be_bytes());
+        b.extend(attrs);
+        // NLRI: proto_type 1, proto_len 1, id 0x81, addr_len, prefixes
+        let prefixes: &[u8] = &[24, 0x47, 0x00, 0x27];
+        b.extend([1, 1, 0x81]);
+        b.extend((prefixes.len() as u16).to_be_bytes());
+        b.extend(prefixes);
+        let total = b.len() as u16;
+        b[1..3].copy_from_slice(&total.to_be_bytes());
+
+        let v = parse_network(&b).unwrap();
+        assert_eq!(v["type"], "UPDATE");
+        assert_eq!(v["sequence"], 7);
+        assert_eq!(v["ack"], 3);
+        let u = &v["update"];
+        assert_eq!(u["withdrawn_routes"][0], "deadbeef");
+        assert_eq!(u["path_attributes"][0]["type"], "multi-exit-disc");
+        assert_eq!(u["path_attributes"][0]["value"], 5);
+        assert_eq!(u["path_attributes"][1]["type"], "rd-hop-count");
+        assert_eq!(u["path_attributes"][1]["value"], 2);
+        assert_eq!(u["nlri"][0]["clnp"], true);
+        assert_eq!(u["nlri"][0]["prefixes"][0], "470027/24");
     }
 
     #[test]
