@@ -222,13 +222,23 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
         let mut el = json!({ "element": name, "phrase": phrase });
         if arg_ty != "NULL" {
             el["argument_type"] = json!(arg_ty);
-            // Argument value decoding lands next (FANS-1/A path);
-            // without it, later elements cannot be located.
-            if k + 1 < count {
-                el["note"] = json!("remaining elements undecoded (argument sizes unknown)");
+            match read_argument(&mut p, arg_ty) {
+                Some(vals) => {
+                    el["text"] = json!(fill_phrase(phrase, &vals));
+                    el["arguments"] = json!(vals);
+                }
+                None => {
+                    // Unknown argument size: later elements unreachable.
+                    if k + 1 < count {
+                        el["note"] =
+                            json!("remaining elements undecoded (argument type unsupported)");
+                    }
+                    elements.push(el);
+                    break;
+                }
             }
-            elements.push(el);
-            break;
+        } else {
+            el["text"] = json!(phrase);
         }
         elements.push(el);
     }
@@ -240,6 +250,181 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
         "logical_ack": ack,
         "elements": elements,
     }))
+}
+
+
+/// Render a decoded argument into the phrase template's placeholder.
+fn fill_phrase(phrase: &str, vals: &[String]) -> String {
+    let mut out = String::new();
+    let mut vi = 0;
+    let mut rest = phrase;
+    while let Some(i) = rest.find('[') {
+        out.push_str(&rest[..i]);
+        match rest[i..].find(']') {
+            Some(j) => {
+                if let Some(v) = vals.get(vi) {
+                    out.push_str(v);
+                } else {
+                    out.push_str(&rest[i..i + j + 1]);
+                }
+                vi += 1;
+                rest = &rest[i + j + 1..];
+            }
+            None => {
+                rest = &rest[i..];
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode an element argument by its ASN.1 type name. Returns the
+/// human-readable value strings (one per phrase placeholder) — `None`
+/// when the type is not yet supported (decoding must stop there, since
+/// the argument's size is then unknown).
+fn read_argument(p: &mut Per, ty: &str) -> Option<Vec<String>> {
+    Some(match ty {
+        "Level" => vec![read_level(p)?],
+        "LevelLevel" => vec![read_level(p)?, read_level(p)?],
+        "Time" => vec![read_time(p)?],
+        "TimeTime" => vec![read_time(p)?, read_time(p)?],
+        "Position" => vec![read_position(p)?],
+        "PositionPosition" => vec![read_position(p)?, read_position(p)?],
+        "Speed" => vec![read_speed(p)?],
+        "SpeedSpeed" => vec![read_speed(p)?, read_speed(p)?],
+        "Degrees" => vec![read_degrees(p)?],
+        "Airport" => vec![p.ia5(4, 4)?],
+        "LevelPosition" => vec![read_level(p)?, read_position(p)?],
+        "LevelTime" => vec![read_level(p)?, read_time(p)?],
+        "LevelSpeed" => vec![read_level(p)?, read_speed(p)?, read_speed(p)?],
+        "PositionLevel" => vec![read_position(p)?, read_level(p)?],
+        "PositionTime" => vec![read_position(p)?, read_time(p)?],
+        "PositionSpeed" => vec![read_position(p)?, read_speed(p)?],
+        "PositionDegrees" => vec![read_position(p)?, read_degrees(p)?],
+        "TimeLevel" => vec![read_time(p)?, read_level(p)?],
+        "TimePosition" => vec![read_time(p)?, read_position(p)?],
+        "DirectionDegrees" => vec![read_direction(p)?, read_degrees(p)?],
+        _ => return None,
+    })
+}
+
+fn read_level(p: &mut Per) -> Option<String> {
+    // Level ::= CHOICE {singleLevel LevelType, blockLevel SEQ SIZE(2)}.
+    if p.bit()? == 0 {
+        read_level_type(p)
+    } else {
+        Some(format!("{} TO {}", read_level_type(p)?, read_level_type(p)?))
+    }
+}
+
+fn read_level_type(p: &mut Per) -> Option<String> {
+    Some(match p.uint(2)? {
+        0 => format!("{} FT", p.constrained(-60, 7000)? * 10),
+        1 => format!("{} M", p.constrained(-30, 25_000)?),
+        2 => format!("FL{}", p.constrained(30, 700)?),
+        _ => format!("{} M", p.constrained(100, 2500)? * 10),
+    })
+}
+
+fn read_time(p: &mut Per) -> Option<String> {
+    Some(format!("{:02}:{:02}", p.constrained(0, 23)?, p.constrained(0, 59)?))
+}
+
+fn read_speed(p: &mut Per) -> Option<String> {
+    Some(match p.uint(3)? {
+        0 => format!("{} KT IAS", p.constrained(0, 400)?),
+        1 => format!("{} KM/H IAS", p.constrained(0, 800)?),
+        2 => format!("{} KT TAS", p.constrained(0, 2000)?),
+        3 => format!("{} KM/H TAS", p.constrained(0, 4000)?),
+        4 => format!("{} KT GS", p.constrained(-50, 2000)?),
+        5 => format!("{} KM/H GS", p.constrained(-100, 4000)?),
+        6 => format!("M{:.3}", p.constrained(500, 4000)? as f64 / 1000.0),
+        _ => return None,
+    })
+}
+
+fn read_degrees(p: &mut Per) -> Option<String> {
+    let mag = p.bit()? == 0;
+    Some(format!(
+        "{}°{}",
+        p.constrained(1, 360)?,
+        if mag { "M" } else { "T" }
+    ))
+}
+
+fn read_direction(p: &mut Per) -> Option<String> {
+    const DIRS: [&str; 11] = [
+        "LEFT", "RIGHT", "EITHER SIDE", "NORTH", "SOUTH", "EAST", "WEST",
+        "NORTH-EAST", "NORTH-WEST", "SOUTH-EAST", "SOUTH-WEST",
+    ];
+    DIRS.get(p.constrained(0, 10)? as usize).map(|s| s.to_string())
+}
+
+fn read_position(p: &mut Per) -> Option<String> {
+    match p.uint(3)? {
+        0 => {
+            // FixName: Fix IA5(1..5) + optional latlon.
+            let has_ll = p.bit()? == 1;
+            let name = p.ia5(1, 5)?;
+            if has_ll {
+                let ll = read_latlon(p)?;
+                Some(format!("{name} ({ll})"))
+            } else {
+                Some(name)
+            }
+        }
+        1 => {
+            let has_ll = p.bit()? == 1;
+            let name = p.ia5(1, 4)?;
+            if has_ll {
+                let ll = read_latlon(p)?;
+                Some(format!("{name} ({ll})"))
+            } else {
+                Some(name)
+            }
+        }
+        2 => p.ia5(4, 4),
+        3 => read_latlon(p),
+        _ => None, // placeBearingDistance: not yet
+    }
+}
+
+fn read_latlon(p: &mut Per) -> Option<String> {
+    // LatitudeLongitude: both components OPTIONAL.
+    let has_lat = p.bit()? == 1;
+    let has_lon = p.bit()? == 1;
+    let mut parts = Vec::new();
+    if has_lat {
+        let v = read_lat_or_lon(p, 90_000, 89)?;
+        let dir = if p.bit()? == 0 { "N" } else { "S" };
+        parts.push(format!("{v}{dir}"));
+    }
+    if has_lon {
+        let v = read_lat_or_lon(p, 180_000, 179)?;
+        let dir = if p.bit()? == 0 { "E" } else { "W" };
+        parts.push(format!("{v}{dir}"));
+    }
+    Some(parts.join(" "))
+}
+
+fn read_lat_or_lon(p: &mut Per, max_milli: i64, max_whole: i64) -> Option<String> {
+    Some(match p.uint(2)? {
+        0 => format!("{:.3}°", p.constrained(0, max_milli)? as f64 / 1000.0),
+        1 => {
+            let d = p.constrained(0, max_whole)?;
+            let m = p.constrained(0, 5999)? as f64 / 100.0;
+            format!("{d}°{m:.2}'")
+        }
+        2 => {
+            let d = p.constrained(0, max_whole)?;
+            let m = p.constrained(0, 59)?;
+            let s = p.constrained(0, 59)?;
+            format!("{d}°{m}'{s}\"")
+        }
+        _ => return None,
+    })
 }
 
 /// CM (context management) logon request — the dialogue that precedes
@@ -353,6 +538,10 @@ mod tests {
         m.push(0, 1);
         m.push(0, 3); // 1 element
         m.push(20, 8); // uM20 (238 → 8 bits)
+        // Level argument: singleLevel, flight level, FL360.
+        m.push(0, 1); // CHOICE: singleLevel
+        m.push(2, 2); // LevelType: levelFlightLevel
+        m.push(360 - 30, 10); // INTEGER (30..700) → 10 bits
         let inner_bits = m.0.len();
         let mut o = Bits::new();
         o.push(0, 1);
@@ -370,6 +559,7 @@ mod tests {
         assert_eq!(el["element"], "uM20Level");
         assert_eq!(el["phrase"], "CLIMB TO [level]");
         assert_eq!(el["argument_type"], "Level");
+        assert_eq!(el["text"], "CLIMB TO FL360");
     }
 
     #[test]
