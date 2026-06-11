@@ -164,7 +164,7 @@ impl PpmDemod {
         }
         let end = self.power.len() - frame_samples;
 
-        let mut found = Self::scan(
+        let raw_found = Self::scan(
             &self.power,
             self.half,
             end,
@@ -172,6 +172,16 @@ impl PpmDemod {
             &mut self.validator,
             true,
         );
+        let mut found: Vec<(usize, AdsbFrame)> = Vec::new();
+        for (pos, f) in raw_found {
+            let dup = found.iter().any(|(p, g)| {
+                g.bytes == f.bytes
+                    && (*p as i64 - pos as i64).unsigned_abs() < frame_samples as u64
+            });
+            if !dup {
+                found.push((pos, f));
+            }
+        }
         if self.two_phase {
             for grid in &self.power_frac {
                 let frames = Self::scan(
