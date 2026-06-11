@@ -4,6 +4,7 @@
 
 pub mod demod;
 pub mod frame;
+pub mod iip;
 pub mod ira;
 pub mod ms;
 pub mod sbd;
@@ -289,6 +290,11 @@ fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
         // Voice channel: run the VDA/VO6/VOD/VOZ/VOC classification
         // ladder and fold its result into the details.
         if let Some(serde_json::Value::Object(extra)) = voice::classify_voice(payload) {
+            details.as_object_mut().unwrap().extend(extra);
+        }
+    } else if ft == 1 {
+        // IP channel: IIP/IIQ/IIR frame classification.
+        if let Some(serde_json::Value::Object(extra)) = iip::parse_ip_payload(payload) {
             details.as_object_mut().unwrap().extend(extra);
         }
     }
