@@ -50,7 +50,10 @@ fn decodes_burst_at_channel_rate() {
     let iq_burst = burst_iq(&[aoa_frame(), rr_frame()], 50_000.0, 0.0, 0.5);
     let mut iq = vec![Complex::new(0.0, 0.0); 800];
     iq.extend(iq_burst);
-    iq.extend(vec![Complex::new(0.0, 0.0); 800]);
+    // Generous trailing noise: a phantom UW lock in the lead-in whose
+    // garbage header passes the thin 25-bit FEC needs enough stream to
+    // starve, fail RS, and rewind — live SDR streams never end.
+    iq.extend(vec![Complex::new(0.0, 0.0); 30_000]);
     let mut noise = Noise(0xabcd_ef01_2345_6789);
     for s in &mut iq {
         *s += Complex::new(noise.next() * 0.01, noise.next() * 0.01);
@@ -103,4 +106,31 @@ fn decodes_from_wideband_capture_with_cfo() {
     let acars = frames[0].acars.as_ref().unwrap();
     assert!(acars.crc_ok);
     assert_eq!(acars.core.text.len(), 79);
+}
+
+/// The pulse-shaped (RC α=0.6) modulator is the realistic loopback: RC
+/// is Nyquist, so the existing symbol-center demod must decode it
+/// cleanly at both channel rates and survive moderate noise.
+#[test]
+fn decodes_pulse_shaped_burst() {
+    use xng_mode_vdl2::modulate::burst_iq_shaped;
+    for rate in [50_000.0, 100_000.0] {
+        let iq_burst = burst_iq_shaped(&[aoa_frame(), rr_frame()], rate, 0.0, 0.5);
+        let pad = (rate / 50.0) as usize;
+        let mut iq = vec![Complex::new(0.0, 0.0); pad];
+        iq.extend(iq_burst);
+        iq.extend(vec![Complex::new(0.0, 0.0); 30_000]);
+        let mut noise = Noise(0x1357_9bdf_2468_ace0);
+        for s in &mut iq {
+            *s += Complex::new(noise.next() * 0.02, noise.next() * 0.02);
+        }
+
+        let mut dec = Vdl2ChannelDecoder::new(rate, 0.0).unwrap();
+        let mut frames = Vec::new();
+        for chunk in iq.chunks(4096) {
+            frames.extend(dec.process(chunk));
+        }
+        assert_eq!(frames.len(), 2, "rate {rate}");
+        assert!(frames[0].acars.is_some(), "rate {rate}: AOA frame decodes");
+    }
 }
