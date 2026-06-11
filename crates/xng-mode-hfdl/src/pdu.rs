@@ -10,6 +10,30 @@ fn fcs_ok(span: &[u8], trailer: &[u8]) -> bool {
     trailer.len() >= 2 && HDLC_FCS.checksum(span) == u16::from_le_bytes([trailer[0], trailer[1]])
 }
 
+/// ARINC HFDL ground-station names (public station list, as used by
+/// the HFDL community and the over-the-air system table assignments).
+pub fn gs_name(id: u8) -> Option<&'static str> {
+    Some(match id {
+        1 => "San Francisco, USA",
+        2 => "Molokai, Hawaii",
+        3 => "Reykjavik, Iceland",
+        4 => "Riverhead, New York",
+        5 => "Auckland, New Zealand",
+        6 => "Hat Yai, Thailand",
+        7 => "Shannon, Ireland",
+        8 => "Johannesburg, South Africa",
+        9 => "Barrow, Alaska",
+        10 => "Muan, South Korea",
+        11 => "Albrook, Panama",
+        13 => "Santa Cruz, Bolivia",
+        14 => "Krasnoyarsk, Russia",
+        15 => "Al Muharraq, Bahrain",
+        16 => "Agana, Guam",
+        17 => "Canarias, Spain",
+        _ => return None,
+    })
+}
+
 /// 20-bit two's-complement coordinate, degrees ×180/2^19.
 fn coordinate(v: u32) -> f64 {
     let r = ((v << 12) as i32) >> 12;
@@ -61,6 +85,7 @@ impl PduParser {
             kind: "squitter".into(),
             details: json!({
                 "gs_id": p[1] & 0x7F,
+                "gs_name": gs_name(p[1] & 0x7F),
                 "utc_sync": p[1] >> 7 == 1,
                 "frame_index": (p[2] as u16) | ((p[3] as u16 & 0x0F) << 8),
                 "frame_offset": p[3] >> 4,
@@ -87,7 +112,7 @@ impl PduParser {
                 return;
             }
             let sizes = (0..n).map(|i| p[6 + i] as usize + 1).collect();
-            (hdr, sizes, json!({ "dir": "downlink", "gs_id": p[1] & 0x7F, "aircraft_id": p[2] }))
+            (hdr, sizes, json!({ "dir": "downlink", "gs_id": p[1] & 0x7F, "gs_name": gs_name(p[1] & 0x7F), "aircraft_id": p[2] }))
         } else {
             let n_ac = ((p[0] >> 4) & 0x7) as usize + 1;
             let mut sizes = Vec::new();
@@ -109,7 +134,7 @@ impl PduParser {
                 idx += count;
                 acs.push(json!({ "aircraft_id": ac_id, "lpdus": count }));
             }
-            (idx, sizes, json!({ "dir": "uplink", "gs_id": p[1] & 0x7F, "aircraft": acs }))
+            (idx, sizes, json!({ "dir": "uplink", "gs_id": p[1] & 0x7F, "gs_name": gs_name(p[1] & 0x7F), "aircraft": acs }))
         };
         if p.len() < hdr_len + 2 || !fcs_ok(&p[..hdr_len], &p[hdr_len..]) {
             return;

@@ -444,6 +444,7 @@ pub(crate) fn decode_loop(
     let mut buf = vec![Complex::new(0.0f32, 0.0f32); READ_CHUNK];
     let mut stats: Vec<(u64, u64, u64)> = decoders.iter().map(|(f, _)| (*f, 0, 0)).collect();
     let mut consecutive_errors: u32 = 0;
+    let mut dedup = DedupFilter::new();
 
     while !stop.load(Ordering::Relaxed) {
         let n = match source.read(&mut buf) {
@@ -512,6 +513,9 @@ pub(crate) fn decode_loop(
             stats[i].1 += seen;
             stats[i].2 += ok;
             for mut msg in msgs {
+                if dedup.is_duplicate(&msg) {
+                    continue;
+                }
                 if let Some(r) = reasm.as_deref_mut() {
                     apply_reassembly(&mut msg, r);
                 }
@@ -527,6 +531,45 @@ pub(crate) fn decode_loop(
         }
     }
     Ok(stats)
+}
+
+/// Suppresses cross-channel duplicates: the same transmission decoded
+/// on two frequencies (ACARS uplinks especially) produces byte-identical
+/// raw payloads within a short window. Keyed on the raw frame bytes.
+pub(crate) struct DedupFilter {
+    seen: std::collections::HashMap<u64, std::time::Instant>,
+}
+
+const DEDUP_WINDOW: std::time::Duration = std::time::Duration::from_millis(2500);
+
+impl DedupFilter {
+    pub(crate) fn new() -> Self {
+        Self { seen: std::collections::HashMap::new() }
+    }
+
+    /// True when this message is a duplicate of one just published.
+    pub(crate) fn is_duplicate(&mut self, msg: &Message) -> bool {
+        let Some(raw) = &msg.raw else { return false };
+        if raw.is_empty() {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        if self.seen.len() > 1024 {
+            self.seen.retain(|_, t| now.duration_since(*t) < DEDUP_WINDOW);
+        }
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut h);
+        msg.mode.as_str().hash(&mut h);
+        let key = h.finish();
+        match self.seen.get(&key) {
+            Some(t) if now.duration_since(*t) < DEDUP_WINDOW => true,
+            _ => {
+                self.seen.insert(key, now);
+                false
+            }
+        }
+    }
 }
 
 /// Offer ACARS bodies to the multi-block reassembler; when a message
