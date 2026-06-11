@@ -7,6 +7,7 @@
 //!
 //! See PROVENANCE.md for clean-room sourcing (no GPL decoder code used).
 
+pub mod atn;
 pub mod avlc;
 pub mod demod;
 pub mod header;
@@ -29,6 +30,8 @@ pub const CHANNEL_PASSBAND_HZ: f64 = 8_500.0;
 pub struct Vdl2Frame {
     pub avlc: avlc::AvlcFrame,
     pub acars: Option<xng_acars::block::AcarsBlock>,
+    /// Decoded ATN transport (X.25 packet, CLNP/COTP) for I-frames.
+    pub atn: Option<serde_json::Value>,
     pub rs_corrected: usize,
 }
 
@@ -37,6 +40,9 @@ pub struct Vdl2ChannelDecoder {
     demod: demod::Vdl2Demod,
     rs: ReedSolomon,
     channel_buf: Vec<Complex<f32>>,
+    x25: atn::X25Reassembler,
+    samples_seen: u64,
+    input_rate: f64,
 }
 
 impl Vdl2ChannelDecoder {
@@ -51,10 +57,15 @@ impl Vdl2ChannelDecoder {
             demod: demod::Vdl2Demod::new(CHANNEL_RATE),
             rs: interleave::vdl2_rs(),
             channel_buf: Vec::new(),
+            x25: atn::X25Reassembler::new(),
+            samples_seen: 0,
+            input_rate,
         })
     }
 
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Vdl2Frame> {
+        self.samples_seen += input.len() as u64;
+        let now = self.samples_seen as f64 / self.input_rate;
         let channel: &[Complex<f32>] = match &mut self.ddc {
             Some(ddc) => {
                 self.channel_buf.clear();
@@ -73,7 +84,16 @@ impl Vdl2ChannelDecoder {
                     }
                     _ => None,
                 };
-                out.push(Vdl2Frame { avlc: frame, acars, rs_corrected: burst.rs_corrected });
+                // ATN transport rides in I-frame info fields: an ISO 8208
+                // packet (most links) or bare CLNP/ES-IS/IDRP.
+                let atn = if acars.is_none()
+                    && matches!(frame.control, avlc::Control::Info { .. })
+                {
+                    decode_atn(&frame.info, &mut self.x25, now)
+                } else {
+                    None
+                };
+                out.push(Vdl2Frame { avlc: frame, acars, atn, rs_corrected: burst.rs_corrected });
             }
         }
         out
@@ -84,6 +104,34 @@ impl Vdl2ChannelDecoder {
     }
 }
 
+/// Decode an I-frame information field as ATN transport.
+fn decode_atn(
+    info: &[u8],
+    x25: &mut atn::X25Reassembler,
+    now: f64,
+) -> Option<serde_json::Value> {
+    if let Some(pkt) = atn::parse_x25(info) {
+        let mut v = serde_json::to_value(&pkt).unwrap_or_default();
+        v["layer"] = serde_json::json!("x25");
+        if pkt.kind == "data" {
+            if let Some(full) = x25.push(&pkt, now) {
+                if let Some(net) = atn::parse_network(&full) {
+                    v["network"] = net;
+                }
+            } else {
+                v["reassembling"] = serde_json::json!(true);
+            }
+        } else if !pkt.payload.is_empty() {
+            // Call user data names the network protocol.
+            if let Some(net) = atn::parse_network(&pkt.payload) {
+                v["network"] = net;
+            }
+        }
+        return Some(v);
+    }
+    atn::parse_network(info)
+}
+
 /// Convert a decoded frame into the normalized message model.
 pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Provenance) -> Message {
     let (body, crc_ok, errors) = match &f.acars {
@@ -92,7 +140,7 @@ pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Pro
             b.crc_ok,
             Some(b.parity_errors),
         ),
-        None => (avlc_body(&f.avlc), true, None),
+        None => (avlc_body(&f.avlc, f.atn.as_ref()), true, None),
     };
     Message {
         mode: Mode::Vdl2,
@@ -113,7 +161,7 @@ pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Pro
 /// Structured body for non-ACARS AVLC frames: the link layer is always
 /// fully parsed (addresses, control), XID parameters are decoded, and
 /// ATN payloads are at least labeled by protocol.
-fn avlc_body(frame: &avlc::AvlcFrame) -> MessageBody {
+fn avlc_body(frame: &avlc::AvlcFrame, atn: Option<&serde_json::Value>) -> MessageBody {
     use avlc::{Control, Payload};
     let kind = match (&frame.control, &frame.payload) {
         (Control::Unnumbered { kind: "XID", .. }, _) => "xid".to_string(),
@@ -133,6 +181,9 @@ fn avlc_body(frame: &avlc::AvlcFrame) -> MessageBody {
             0x82 => "ES-IS",
             _ => "IDRP",
         });
+    }
+    if let Some(a) = atn {
+        details["atn"] = a.clone();
     }
     if matches!(frame.control, Control::Unnumbered { kind: "XID", .. }) {
         if let Some(params) = avlc::parse_xid(&frame.info) {

@@ -102,3 +102,17 @@ printable text where applicable; binary parameter layouts we have not
 verified against the spec are deliberately left as hex rather than
 guessed. ATN payloads are labeled by IPI per ISO TR 9577 (0x81 CLNP,
 0x82 ES-IS, 0x83 IDRP).
+
+## ATN transport (2026-06)
+
+X.25 packet layer (ISO/IEC 8208: GFI/LCN, data with M-bit, call/clear
+with causes, supervisory), CLNP full header (ISO/IEC 8473: NLPID 0x81,
+type, NSAP addresses), and COTP TPDU identification (ISO/IEC 8073)
+implemented clean-room from the public ISO framings as profiled by
+ICAO Doc 9776/9705 — dumpvdl2 (GPL) was not consulted for this module.
+X.25 M-bit sequences reassemble per logical channel before network-
+layer parsing. ATN's LREF/deflate-compressed CLNP variants are labeled
+but deliberately left as hex (layouts not yet verified against the
+spec). XID ground-station list parameters (0x41/0x45) decode as AVLC
+addresses via the standard EN 301 841-2 address parser; the autotune
+frequency parameter stays hex under the same hex-not-guessed policy.
