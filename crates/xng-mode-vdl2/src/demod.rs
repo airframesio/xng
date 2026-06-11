@@ -173,8 +173,12 @@ impl Vdl2Demod {
             pr[k] = pr[k - 1] + UW_DELTAS[k] as f32 * PI / 4.0;
         }
         let mut best: Option<(f32, f64, f32)> = None; // (cost, pos, theta)
-        let mut t = -3.0f64;
-        while t <= 3.0 {
+        // Search ±0.7 symbol (at least ±3 samples): the differential
+        // trigger localizes the UW no better than a fraction of a symbol,
+        // and its peak width in samples scales with the channel rate.
+        let half = (0.63 * self.sps).max(3.0);
+        let mut t = -half;
+        while t <= half {
             let cand = pos + t;
             t += 0.25;
             if cand < self.start_abs {
