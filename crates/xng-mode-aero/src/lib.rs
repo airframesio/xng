@@ -8,6 +8,7 @@
 //! [`xng_acars::block`] → [`xng_types::Message`].
 
 pub mod burst;
+pub mod cchannel;
 pub mod demod;
 pub mod oqpsk;
 pub mod frame;
@@ -250,6 +251,64 @@ impl AeroBurstDecoder {
 
     pub fn level_dbfs(&self) -> f32 {
         10.0 * self.level.max(1e-12).log10()
+    }
+}
+
+/// C-channel decoder: IQ (48 kHz, or DDC'd down from wideband) →
+/// 8 400 bps OQPSK demod → deframer → voice frames and sub-band SUs.
+/// C-channel circuits are call-assigned via P-channel setup, so the
+/// frequency comes from the operator, not a scan plan.
+pub struct CChannelDecoder {
+    ddc: Option<Ddc>,
+    demod: oqpsk::OqpskDemod,
+    deframer: cchannel::CChannelDeframer,
+    channel_buf: Vec<Complex<f32>>,
+    soft: Vec<(f32, u8)>,
+}
+
+impl CChannelDecoder {
+    pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let ddc = if (input_rate - oqpsk::CHANNEL_RATE_HR).abs() < 1e-6
+            && freq_offset_hz.abs() < 1e-6
+        {
+            None
+        } else {
+            Some(Ddc::new(
+                input_rate,
+                oqpsk::CHANNEL_RATE_HR,
+                freq_offset_hz,
+                8_400.0,
+            )?)
+        };
+        Ok(Self {
+            ddc,
+            demod: oqpsk::OqpskDemod::new_c_channel(oqpsk::CHANNEL_RATE_HR),
+            deframer: cchannel::CChannelDeframer::new(),
+            channel_buf: Vec::new(),
+            soft: Vec::new(),
+        })
+    }
+
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<cchannel::CChannelEvent> {
+        let channel: &[Complex<f32>] = match &mut self.ddc {
+            Some(ddc) => {
+                self.channel_buf.clear();
+                ddc.process(input, &mut self.channel_buf);
+                &self.channel_buf
+            }
+            None => input,
+        };
+        self.soft.clear();
+        self.demod.process(channel, &mut self.soft);
+        let mut out = Vec::new();
+        for &(s, _) in &self.soft {
+            out.extend(self.deframer.push(s));
+        }
+        out
+    }
+
+    pub fn level_dbfs(&self) -> f32 {
+        self.demod.level_dbfs()
     }
 }
 
