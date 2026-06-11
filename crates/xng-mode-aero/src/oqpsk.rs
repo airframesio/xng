@@ -141,6 +141,7 @@ pub fn rrc_taps(sps: f64, num_taps: usize, beta: f64) -> Vec<f32> {
 /// designed at 48 kHz; `HrChain` always feeds this demod at 48 kHz.
 pub struct OqpskDemod {
     fs: f64,
+    bit_rate: f64,
     rrc: Fir,
     filtered: Vec<Complex<f32>>,
     // carrier NCO (estimated offset, Hz, plus a phase trim in radians)
@@ -181,14 +182,42 @@ impl OqpskDemod {
     // traceability even though they truncate to f32.
     #[allow(clippy::excessive_precision)]
     pub fn new(channel_rate: f64) -> Self {
+        Self::new_with_rate(channel_rate, BIT_RATE as f64)
+    }
+
+    /// 8 400 bps variant (Aero C-channel): RRC β=0.6 and JAERO's
+    /// 8 400-specific timing-resonator coefficients; everything else is
+    /// the same demodulator.
+    pub fn new_c_channel(channel_rate: f64) -> Self {
+        Self::new_with_rate(channel_rate, 8_400.0)
+    }
+
+    fn new_with_rate(channel_rate: f64, bit_rate: f64) -> Self {
         debug_assert!(
             (channel_rate - CHANNEL_RATE_HR).abs() < 1e-6,
             "OQPSK IIR coefficients are designed for 48 kHz"
         );
-        let t = channel_rate / SYMBOL_RATE; // samples per symbol
+        let c8400 = (bit_rate - 8_400.0).abs() < 1e-6;
+        let symbol_rate = bit_rate / 2.0;
+        let rrc_beta = if c8400 { 0.6 } else { 1.0 };
+        // Timing resonators at 48 kHz on the bit rate: JAERO's 10.5 kHz
+        // set, or the ~10 Hz-bandwidth 8.4 kHz set.
+        let resonator = if c8400 {
+            Biquad::new(
+                [0.001_284_585_786_447_078_9, 0.0, -0.001_284_585_786_447_078_9],
+                [-0.906_814_619_992_798_89, 0.997_430_828_427_105_84],
+            )
+        } else {
+            Biquad::new(
+                [0.000_327_142_189_395_890_35, 0.0, 0.000_327_142_189_395_890_35],
+                [-0.390_052_999_482_108_03, 0.999_345_715_621_208_22],
+            )
+        };
+        let t = channel_rate / symbol_rate; // samples per symbol
         Self {
             fs: channel_rate,
-            rrc: Fir::new(rrc_taps(t, 55, 1.0)),
+            bit_rate,
+            rrc: Fir::new(rrc_taps(t, 55, rrc_beta)),
             filtered: Vec::new(),
             nco_freq_hz: 0.0,
             nco_phase: 0.0,
@@ -198,13 +227,9 @@ impl OqpskDemod {
             d_t41: FracDelay::new(t / 4.0),
             d_t42: FracDelay::new(t / 4.0),
             d_t8: FracDelay::new(t / 8.0),
-            // 10 500 Hz resonator at 48 kHz (JAERO st_iir_resonator).
-            resonator: Biquad::new(
-                [0.000_327_142_189_395_890_35, 0.0, 0.000_327_142_189_395_890_35],
-                [-0.390_052_999_482_108_03, 0.999_345_715_621_208_22],
-            ),
+            resonator,
             st_phase: 0.0,
-            st_freq_hz: BIT_RATE as f64,
+            st_freq_hz: bit_rate,
             sig_last: Complex::new(0.0, 0.0),
             pair_toggle: false,
             pt_d: Complex::new(0.0, 0.0),
@@ -263,7 +288,7 @@ impl OqpskDemod {
                     self.acq_blocks += 1;
                     if self.acq_blocks >= 2 {
                         let res = self.fs / ACQ_FFT as f64;
-                        let tone = (SYMBOL_RATE / res).round() as i64;
+                        let tone = (self.bit_rate / 2.0 / res).round() as i64;
                         let range = (3_000.0 / res) as i64;
                         let idx = |k: i64| k.rem_euclid(ACQ_FFT as i64) as usize;
                         let mut best = (f32::MIN, 0i64);
@@ -312,7 +337,7 @@ impl OqpskDemod {
             );
             let st_err = (st_rot * m1).arg();
             self.st_freq_hz = (self.st_freq_hz - st_err as f64 * 1e-8)
-                .clamp(BIT_RATE as f64 - 0.1, BIT_RATE as f64 + 0.1);
+                .clamp(self.bit_rate - 0.1, self.bit_rate + 0.1);
             let prev_phase = self.st_phase;
             self.st_phase += self.st_freq_hz / self.fs - st_err as f64 * 0.01 / 360.0;
             // Strobe when the oscillator passes STROBE_POINT (with wrap).
@@ -494,7 +519,21 @@ pub fn modulate_oqpsk(
     freq_offset_hz: f64,
     amplitude: f32,
 ) -> Vec<Complex<f32>> {
-    let half = sample_rate / SYMBOL_RATE / 2.0;
+    modulate_oqpsk_rate(bits, BIT_RATE as f64, 1.0, sample_rate, freq_offset_hz, amplitude)
+}
+
+/// OQPSK modulator at an arbitrary bit rate / RRC roll-off (the
+/// C-channel is 8 400 bps with β=0.6).
+pub fn modulate_oqpsk_rate(
+    bits: &[u8],
+    bit_rate: f64,
+    rrc_beta: f64,
+    sample_rate: f64,
+    freq_offset_hz: f64,
+    amplitude: f32,
+) -> Vec<Complex<f32>> {
+    let symbol_rate = bit_rate / 2.0;
+    let half = sample_rate / symbol_rate / 2.0;
     let total = ((bits.len() + 4) as f64 * half) as usize;
     let mut i_rail = vec![0.0f32; total];
     let mut q_rail = vec![0.0f32; total];
@@ -510,7 +549,7 @@ pub fn modulate_oqpsk(
             }
         }
     }
-    let taps = rrc_taps(sample_rate / SYMBOL_RATE, 129, 1.0);
+    let taps = rrc_taps(sample_rate / symbol_rate, 129, rrc_beta);
     let mut shape_i = Fir::new(taps.clone());
     let mut shape_q = Fir::new(taps);
     let ic: Vec<Complex<f32>> = i_rail.into_iter().map(|v| Complex::new(v, 0.0)).collect();

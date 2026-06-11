@@ -102,3 +102,27 @@ shared Viterbi/descrambler/SU path) is implemented and bit-level tested;
 the coherent OQPSK demodulator does not yet achieve carrier lock and its
 RF loopback tests are #[ignore]d pending a focused demod session
 (JAERO's tanh cross-product loop is the port reference).
+
+C-channel (8 400 bps OQPSK voice circuits) ported from
+`aerol.cpp::DecodeC` + `oqpskdemodulator.cpp` (fb==8400 paths):
+
+- Frame: 112-bit UW (two 52-bit rail patterns, JAERO `setPreamble`
+  arguments 216866263330005 / 3012071630031408, each detector trying
+  both patterns and complements for the OQPSK ambiguity) + 4096 coded
+  bits per ~500 ms superframe.
+- FEC: the P-channel K=7 rate-1/2 code punctured 3/4 (depuncture
+  inserts a neutral bit after every 3rd, last source bit dropped);
+  interleaving 16 × (64×4) blocks with the (27·i) mod 64 row permute;
+  decoded 2730 → first 2714 kept; LFSR15 descramble.
+- Payload: 25 sub-blocks of 1 + 96 + 12 bits — 96-bit AMBE voice
+  frames (12 bytes, surfaced for external decoding; the codec itself
+  is proprietary) and 12-bit slices accumulating into 12-byte sub-band
+  signal units (CRC-16/X.25), types 0x01 fill / 0x30 call progress
+  (AES, GES ids) / 0x60 telephony acknowledge.
+- Demod: the ported OQPSK demodulator with RRC β=0.6 and JAERO's
+  8 400-specific ~10 Hz timing-resonator coefficients.
+
+Note: JAERO additionally delays decoded bits by 2714−6 before the
+descrambler (`dl2`) for off-air scrambler alignment; our loopback is
+self-consistent without it, and the alignment question is flagged for
+when an off-air C-channel capture is available.
