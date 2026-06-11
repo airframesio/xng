@@ -338,3 +338,32 @@ derived filter, bit-level ground truth, off-air last.
 
 HFDL's no-DDC path has the same missing-selectivity structure and its
 own falsified-sensitivity backlog — worth the same experiment there.
+
+## Round 5 (2026-06-11): forensics reset — the pseudo-truth retraction
+
+Two corrections and a sharpened target list:
+
+1. **The `/tmp/vdl2_bits/burst_tl*.bits` files were never ground
+   truth.** They contain zero FCS-valid AVLC frames — they are our own
+   failed post-RS bits from an earlier round. Any conclusion drawn by
+   comparing against them (including this round's first "check-octet
+   convention" hypothesis) is invalid. Verification rule going
+   forward: a claimed truth file must pass `avlc::scan` before it is
+   used as a reference.
+2. **105 kS/s native channel support added** (exact 10 samples/symbol)
+   to falsify the fractional-interpolation hypothesis: 19 frames at
+   105 k, identical to 100 k. Linear-interpolation error is NOT the
+   gap. (Kept anyway: integer sps for free when the input divides.)
+
+Real oracle diff (dumpvdl2 built from source, JSON output, same
+capture): oracle 41 = 12 x25 + 10 acars + 9 RR + 8 xid + 2 other; we
+decode 19, including RRs from every conversation. Missing entirely:
+**all six GSIF broadcast XIDs** (2D4917/2D4918 → FFFFFF), 8 of 10
+ACARS, and roughly half of the 47806D→10981A x25 exchange. The
+stations are audible (their RRs decode); the mid-size frames fail.
+
+RS-failure positions are now dumpable (`VDL2_DUMP_BITS=<dir>`, files
+carry the burst sample offset); three GSIF burst IQ segments are
+extracted to /tmp/vdl2_lab/ for single-burst lab work. Next: bit-true
+single-burst study against dumpvdl2's decode of the same burst —
+obtained from dumpvdl2 itself, not from stale files.
