@@ -47,3 +47,14 @@ Ported from MIT-licensed libacars with attribution:
 Synthetic roundtrip vectors (compress → render → parse) stand in for
 off-air samples until label-MA/OHMA traffic is captured at the live
 station.
+
+## FANS-1/A composite arguments (2026-06)
+
+Additional element-argument readers: the two/three-component composites
+(PositionAltitude, TimeAltitude, PositionTimeAltitude, ...) compose the
+existing verified readers; new scalars take their PER constraints from
+libacars's asn1c tables (MIT, as before): VerticalRateEnglish (0..60,
+100 ft/min), VerticalRateMetric (0..200, 10 m/min), Degrees (1..360,
+magnetic/true), Direction (ENUMERATED 0..10), FreeText (IA5 SIZE
+1..256). Route clearances remain unsupported (deep optional-laden
+sequence; staged separately).
