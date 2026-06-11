@@ -444,6 +444,7 @@ fn dwell(
         bus.clone(),
         stop,
         Some((live.clone(), center, rate)),
+        None,
     )?;
     let _ = stop_thread.join();
     let levels = live.stats.lock().unwrap().clone();

@@ -61,6 +61,7 @@ impl From<&Message> for asf2::DecodedMessage {
                     msg_num: a.msg_num.clone(),
                     text: a.text.clone(),
                     more_to_come: a.more_to_come,
+                    reassembled: a.reassembled,
                 }))
             }
             MessageBody::Ais { nmea, msg_type, mmsi } => {

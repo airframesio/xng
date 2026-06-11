@@ -406,6 +406,7 @@ pub(crate) fn scan_group(
         bus,
         stop,
         Some((live.clone(), center, rate)),
+        None,
     )?;
     let _ = stop_thread.join();
 

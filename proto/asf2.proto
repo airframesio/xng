@@ -70,6 +70,7 @@ message AcarsBody {
   optional string mfi = 11;
   // Decoded application layer (ADS-C etc.) as JSON, when present.
   optional string app_json = 12;
+  bool reassembled = 13;
 }
 
 message AisBody {

@@ -26,3 +26,24 @@ independent reimplementation before porting.
 Differences from libacars: Rust-native types with serde serialization;
 CPDLC (AT1/CR1/CC1/DR1) payloads are currently carried as verified raw hex
 pending the FANS-1/A ASN.1 PER decoder; MIAM/OHMA not yet ported.
+
+## Reassembly, MIAM, OHMA (2026-06)
+
+Ported from MIT-licensed libacars with attribution:
+
+- `reasm.rs`: multi-block reassembly semantics from reassembly.c +
+  acars.c — key (tail, label, msg_num), downlink sequencing via the 4th
+  message-number character, uplink sequencing via block id with the
+  A..W wrap, the empty-uplink-ACK skip, per-bearer timeouts.
+- `miam.rs`: miam.c / miam-core.c — ACARS CF frame map (T/F/K/S/A/Y/X),
+  base85 armor ('!' offset, 'z' zero-word), bpad/hpad + '|' framing,
+  v1/v2 DATA header layouts, DEFLATE bodies inflated as raw streams
+  (windowBits −15 equivalence via miniz_oxide). CRC fields parsed but
+  not verified (matches libacars default behavior).
+- `ohma.rs`: ohma.c — OHMA/RYKO marker with downlink/uplink routing
+  prefixes, the duplicated-first-block quirk workaround, base64 → zlib
+  → JSON.
+
+Synthetic roundtrip vectors (compress → render → parse) stand in for
+off-air samples until label-MA/OHMA traffic is captured at the live
+station.

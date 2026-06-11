@@ -13,6 +13,9 @@ pub mod arinc622;
 pub mod cpdlc;
 pub mod block;
 pub mod media_adv;
+pub mod miam;
+pub mod ohma;
+pub mod reasm;
 pub mod sublabel;
 
 use serde::Serialize;
@@ -28,6 +31,14 @@ pub enum AcarsApp {
         #[serde(flatten)]
         message: adsc::AdscMessage,
     },
+    /// MIAM (ARINC 841) frame: single-transfer CORE PDUs (decompressed)
+    /// or file-transfer signalling.
+    Miam {
+        #[serde(flatten)]
+        frame: miam::MiamFrame,
+    },
+    /// OHMA aircraft-health JSON (Boeing), inflated and parsed.
+    Ohma { message: serde_json::Value },
     /// CPDLC (FANS-1/A) message in an ARINC 622 envelope: header and the
     /// first message element identified from the unaligned-PER body
     /// (element arguments are a planned follow-up).
@@ -68,7 +79,10 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
     }
 
     out.app = match label {
-        "A6" | "AA" | "B6" | "BA" | "H1" => arinc622::parse(body, downlink),
+        "A6" | "AA" | "B6" | "BA" => arinc622::parse(body, downlink),
+        "H1" => arinc622::parse(body, downlink)
+            .or_else(|| ohma::parse(body).map(|message| AcarsApp::Ohma { message })),
+        "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
         _ => None,
     };
@@ -88,6 +102,30 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
             m.current_link,
             if m.established { "established" } else { "lost" },
             m.time
+        )),
+        AcarsApp::Miam { frame } => Some(match frame {
+            miam::MiamFrame::SingleTransfer(p) => format!(
+                "MIAM v{} {}{}{}",
+                p.version,
+                p.pdu_type,
+                p.app_id.as_deref().map(|a| format!(" app={a}")).unwrap_or_default(),
+                if p.compressed { format!(" ({} bytes inflated)", p.data_len) } else { String::new() }
+            ),
+            miam::MiamFrame::FileTransferReq { file_id, file_size } => {
+                format!("MIAM file-transfer-req id={file_id} size={file_size}")
+            }
+            miam::MiamFrame::FileSegment { file_id, segment_id } => {
+                format!("MIAM file-segment id={file_id} seg={segment_id}")
+            }
+            f => format!("MIAM {}", serde_json::json!(f)["frame"].as_str().unwrap_or("frame")),
+        }),
+        AcarsApp::Ohma { message } => Some(format!(
+            "OHMA {}",
+            message
+                .pointer("/message/sysid")
+                .or_else(|| message.get("version"))
+                .map(|v| v.to_string().trim_matches('"').to_owned())
+                .unwrap_or_default()
         )),
     }
 }

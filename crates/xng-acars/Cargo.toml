@@ -8,7 +8,9 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+base64 = "0.22"
 crc.workspace = true
+miniz_oxide = "0.8"
 serde.workspace = true
 serde_json.workspace = true
 xng-types.workspace = true

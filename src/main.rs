@@ -417,12 +417,13 @@ pub(crate) fn probe_device_rates(sdr: &str) -> Vec<u32> {
     if args.force_soapy {
         return Vec::new();
     }
-    let serial = args.serial.as_deref().and_then(|s| sdr_args::parse_airspy_serial(s).ok());
+    let serial = || args.serial.as_deref().and_then(|s| sdr_args::parse_airspy_serial(s).ok());
+    let _ = &serial; // used only by the cfg'd arms below
     match args.driver.as_deref() {
         #[cfg(feature = "airspy")]
-        Some("airspy") => xng_sdr::airspy::device_rates(serial).unwrap_or_default(),
+        Some("airspy") => xng_sdr::airspy::device_rates(serial()).unwrap_or_default(),
         #[cfg(feature = "airspyhf")]
-        Some("airspyhf") => xng_sdr::airspyhf::device_rates(serial).unwrap_or_default(),
+        Some("airspyhf") => xng_sdr::airspyhf::device_rates(serial()).unwrap_or_default(),
         _ => Vec::new(),
     }
 }

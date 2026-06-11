@@ -108,6 +108,7 @@ pub fn to_message(
                 msg_num: f.msg_num.clone(),
                 text: f.text.clone(),
                 more_to_come: f.more_to_come,
+                reassembled: false,
                 app: appdec.app.map(|a| serde_json::to_value(&a).unwrap_or_default()),
             })
         },
