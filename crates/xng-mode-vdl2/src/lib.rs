@@ -8,6 +8,7 @@
 //! See PROVENANCE.md for clean-room sourcing (no GPL decoder code used).
 
 pub mod atn;
+pub mod atn_cpdlc;
 pub mod avlc;
 pub mod demod;
 pub mod header;
