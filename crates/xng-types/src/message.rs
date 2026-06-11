@@ -142,6 +142,11 @@ pub enum MessageBody {
     },
     /// A frame decoded at link layer but with no (or not-yet-implemented)
     /// application-layer interpretation.
+    /// Inmarsat Aero non-ACARS structures (C-channel assignments, ...).
+    Aero {
+        kind: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 
