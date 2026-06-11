@@ -58,3 +58,14 @@ libacars's asn1c tables (MIT, as before): VerticalRateEnglish (0..60,
 magnetic/true), Direction (ENUMERATED 0..10), FreeText (IA5 SIZE
 1..256). Route clearances remain unsupported (deep optional-laden
 sequence; staged separately).
+
+## FANS-1/A route clearances (2026-06)
+
+FANSRouteClearance (ten optional components: airports, runways,
+SID/STAR/approach procedures, airway intercept, the route-information
+sequence) decoded with constraints from the libacars asn1c tables (MIT,
+as before): FANSProcedure SIZE(1..6), route sequence SIZE(1..128),
+route legs as published-identifier (fixname + optional lat/lon),
+lat/lon, place-bearing pairs, place-bearing-distance (NM 0.1 / KM), or
+airway designators. trackDetail legs and the trailing
+routeInformationAdditional stay undecoded (reported as present).
