@@ -219,6 +219,78 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
             }
             _ => return None,
         },
+        // DGNSS broadcast binary message.
+        17 => {
+            // Raw field is in 1/10-minute units; reported /10 to match
+            // the pyais oracle convention.
+            let lon = i(bits, 40, 18)? as f64 / 10.0;
+            let lat = i(bits, 58, 17)? as f64 / 10.0;
+            {
+                put("lat", json!(lat));
+                put("lon", json!(lon));
+            }
+            if bits.len() > 80 {
+                put("data_hex", json!(data_hex(bits, 80)));
+            }
+        }
+        // Data link management: up to four slot-reservation blocks.
+        20 => {
+            let mut blocks = Vec::new();
+            for k in 0..4 {
+                let s0 = 40 + k * 30;
+                let (Some(offset), Some(number), Some(timeout), Some(increment)) = (
+                    u(bits, s0, 12),
+                    u(bits, s0 + 12, 4),
+                    u(bits, s0 + 16, 3),
+                    u(bits, s0 + 19, 11),
+                ) else {
+                    break;
+                };
+                if offset == 0 && number == 0 {
+                    continue;
+                }
+                blocks.push(json!({
+                    "offset": offset,
+                    "slots": number,
+                    "timeout_min": timeout,
+                    "increment": increment,
+                }));
+            }
+            if !blocks.is_empty() {
+                put("reservations", json!(blocks));
+            }
+        }
+        // Channel management (regional channel assignment).
+        22 => {
+            put("channel_a", json!(u(bits, 40, 12)));
+            put("channel_b", json!(u(bits, 52, 12)));
+            put("txrx", json!(u(bits, 64, 4)));
+            put("high_power", json!(u(bits, 68, 1)? == 1));
+            let addressed = u(bits, 139, 1)? == 1;
+            put("addressed", json!(addressed));
+            if !addressed {
+                // Region corners in 1/10-minute units.
+                put("ne_lon", json!(i(bits, 69, 18)? as f64 / 10.0));
+                put("ne_lat", json!(i(bits, 87, 17)? as f64 / 10.0));
+                put("sw_lon", json!(i(bits, 104, 18)? as f64 / 10.0));
+                put("sw_lat", json!(i(bits, 122, 17)? as f64 / 10.0));
+            }
+            put("band_a", json!(u(bits, 140, 1)? == 1));
+            put("band_b", json!(u(bits, 141, 1)? == 1));
+            put("zone_size", json!(u(bits, 142, 3)));
+        }
+        // Group assignment command.
+        23 => {
+            put("ne_lon", json!(i(bits, 40, 18)? as f64 / 10.0));
+            put("ne_lat", json!(i(bits, 58, 17)? as f64 / 10.0));
+            put("sw_lon", json!(i(bits, 75, 18)? as f64 / 10.0));
+            put("sw_lat", json!(i(bits, 93, 17)? as f64 / 10.0));
+            put("station_type", json!(u(bits, 110, 4)));
+            put("ship_type", json!(u(bits, 114, 8)));
+            put("txrx", json!(u(bits, 144, 2)));
+            put("interval", json!(u(bits, 146, 4)));
+            put("quiet_min", json!(u(bits, 150, 4)));
+        }
         // Long-range position report.
         27 => {
             let lon = i(bits, 44, 18)? as f64 / 600.0;
@@ -264,6 +336,64 @@ mod tests {
     }
 
     // Oracle: pyais 2.x decode of the same sentences (2026-06-10/11).
+
+    #[test]
+    fn dgnss_t17_matches_pyais() {
+        let (t, bits) = typed("A02R5Ph0E81:p7h5Ed1h=h", 4);
+        assert_eq!(t, 17);
+        let d = decode(t, &bits).unwrap();
+        assert_eq!(d["lon"], 33.8);
+        assert_eq!(d["lat"], 59.9);
+        assert_eq!(d["data_hex"], "7c0556c07037");
+    }
+
+    #[test]
+    fn link_mgmt_t20_matches_pyais() {
+        let (t, bits) = typed("D028rqP2tN?b<`I6D0000000000", 2);
+        assert_eq!(t, 20);
+        let d = decode(t, &bits).unwrap();
+        let r = &d["reservations"];
+        assert_eq!(r[0]["offset"], 47);
+        assert_eq!(r[0]["slots"], 1);
+        assert_eq!(r[0]["timeout_min"], 7);
+        assert_eq!(r[0]["increment"], 250);
+        assert_eq!(r[1]["offset"], 2250);
+        assert_eq!(r[1]["increment"], 1125);
+        assert!(r.get(2).is_none());
+    }
+
+    #[test]
+    fn channel_mgmt_t22_matches_pyais() {
+        let (t, bits) = typed("F030p8B2N2PMaJR0r;6f3rj20000", 0);
+        assert_eq!(t, 22);
+        let d = decode(t, &bits).unwrap();
+        assert_eq!(d["channel_a"], 2087);
+        assert_eq!(d["channel_b"], 2088);
+        assert_eq!(d["txrx"], 1);
+        assert_eq!(d["high_power"], true);
+        assert_eq!(d["ne_lon"], -7710.0);
+        assert_eq!(d["ne_lat"], 3300.0);
+        assert_eq!(d["sw_lon"], -8020.0);
+        assert_eq!(d["sw_lat"], 3210.0);
+        assert_eq!(d["addressed"], false);
+        assert_eq!(d["zone_size"], 4);
+    }
+
+    #[test]
+    fn group_assign_t23_matches_pyais() {
+        let (t, bits) = typed("G02:Kn01R`sn@291nj600000900", 2);
+        assert_eq!(t, 23);
+        let d = decode(t, &bits).unwrap();
+        assert_eq!(d["ne_lon"], 157.8);
+        assert_eq!(d["ne_lat"], 3064.2);
+        assert_eq!(d["sw_lon"], 109.6);
+        assert_eq!(d["sw_lat"], 3040.8);
+        assert_eq!(d["station_type"], 6);
+        assert_eq!(d["ship_type"], 0);
+        assert_eq!(d["txrx"], 0);
+        assert_eq!(d["interval"], 9);
+        assert_eq!(d["quiet_min"], 0);
+    }
 
     #[test]
     fn class_a_position_matches_pyais() {
