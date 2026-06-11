@@ -86,6 +86,9 @@ pub enum MessageBody {
         msg_type: Option<u8>,
         #[serde(skip_serializing_if = "Option::is_none")]
         mmsi: Option<u32>,
+        /// Decoded fields (position, kinematics, static/voyage data).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
     },
     /// Mode S / ADS-B frame summary (positions/BDS depth land later).
     ModeS {

@@ -64,11 +64,12 @@ impl From<&Message> for asf2::DecodedMessage {
                     reassembled: a.reassembled,
                 }))
             }
-            MessageBody::Ais { nmea, msg_type, mmsi } => {
+            MessageBody::Ais { nmea, msg_type, mmsi, details } => {
                 Some(asf2::decoded_message::Body::Ais(asf2::AisBody {
                     nmea: nmea.clone(),
                     msg_type: msg_type.map(u32::from),
                     mmsi: *mmsi,
+                    details_json: details.as_ref().map(|v| v.to_string()),
                 }))
             }
             MessageBody::ModeS {

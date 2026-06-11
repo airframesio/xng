@@ -3632,6 +3632,7 @@ version = "0.10.1"
 dependencies = [
  "chrono",
  "num-complex",
+ "serde_json",
  "xng-dsp",
  "xng-types",
 ]
