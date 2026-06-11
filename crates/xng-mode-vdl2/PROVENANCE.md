@@ -116,3 +116,16 @@ but deliberately left as hex (layouts not yet verified against the
 spec). XID ground-station list parameters (0x41/0x45) decode as AVLC
 addresses via the standard EN 301 841-2 address parser; the autotune
 frequency parameter stays hex under the same hex-not-guessed policy.
+
+## ATN-B1 CPDLC + CM (2026-06)
+
+Protected-mode CPDLC (ProtectedAircraftPDUs/ProtectedGroundPDUs,
+ATCUplink/DownlinkMessage header, the full 238/114 element tables with
+standard phraseology) and CM logon-request decode implemented from the
+ICAO Doc 9880/9705 ASN.1 modules, vendored as spec text in docs/asn1/
+(obtained via Wireshark's transcription of the ICAO standard — module
+text only; neither Wireshark's nor dumpvdl2's generated/dissector code
+was consulted). Unaligned PER (X.691) hand-walked as for FANS-1/A.
+v1 decodes element identity + phraseology; argument value rendering is
+the planned follow-up. Validated with synthetic UPER vectors built
+bit-by-bit from the module (WILCO downlink, CLIMB-TO uplink, CM logon).

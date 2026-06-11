@@ -239,7 +239,15 @@ fn parse_cotp(b: &[u8]) -> Option<Value> {
         out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
     }
     if name == "DT" && b.len() > li + 1 {
-        out["user_data_len"] = json!(b.len() - li - 1);
+        let user = &b[li + 1..];
+        out["user_data_len"] = json!(user.len());
+        // ATN-B1 applications ride here (via the ULCS null encoding):
+        // try protected-mode CPDLC, then CM.
+        if let Some(app) = crate::atn_cpdlc::parse_apdu(user)
+            .or_else(|| crate::atn_cpdlc::parse_cm_logon(user))
+        {
+            out["app"] = app;
+        }
     }
     Some(out)
 }
