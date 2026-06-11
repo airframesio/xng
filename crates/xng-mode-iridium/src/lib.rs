@@ -5,6 +5,7 @@
 pub mod demod;
 pub mod frame;
 pub mod ira;
+pub mod ms;
 pub mod sbd;
 pub mod wideband;
 pub mod modulate;
@@ -26,6 +27,7 @@ pub struct IridiumChannelDecoder {
     demod: demod::IridiumDemod,
     channel_buf: Vec<Complex<f32>>,
     sbd: sbd::SbdReassembler,
+    pager: ms::PagerReassembler,
     samples_seen: u64,
 }
 
@@ -41,6 +43,7 @@ impl IridiumChannelDecoder {
             demod: demod::IridiumDemod::new(CHANNEL_RATE),
             channel_buf: Vec::new(),
             sbd: sbd::SbdReassembler::new(),
+            pager: ms::PagerReassembler::new(),
             samples_seen: 0,
         })
     }
@@ -58,7 +61,7 @@ impl IridiumChannelDecoder {
         let time = self.samples_seen as f64 / CHANNEL_RATE;
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
-            handle_bits(&burst.bits, time, &mut self.sbd, &mut out);
+            handle_bits(&burst.bits, time, &mut self.sbd, &mut self.pager, &mut out);
         }
         out
     }
@@ -99,6 +102,27 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
             }
             Some(ira::parse_bc(bc_type, &payload, fixed, bits))
         }
+        frame::FrameKind::Ms => {
+            // After the 32-bit messaging header: 64-bit chunks, each a
+            // 2-way symbol interleave of two BCH blocks (toolkit MS path).
+            let mut blocks = Vec::new();
+            for chunk in data[32..].chunks_exact(64) {
+                let (o, e) = frame::de_interleave2(chunk);
+                blocks.push(o);
+                blocks.push(e);
+            }
+            frame::strip_fill(&mut blocks);
+            let (payload, _fixed) = frame::ecc_blocks(&blocks, frame::MESSAGING_BCH_POLY);
+            let blocks21: Vec<Vec<u8>> =
+                payload.chunks_exact(21).map(|c| c.to_vec()).collect();
+            let f = ms::parse(&blocks21)?;
+            Some(ira::IridiumFrame {
+                kind: "msg",
+                details: serde_json::to_value(&f).unwrap_or_default(),
+                acars: None,
+                raw_bits: bits.to_vec(),
+            })
+        }
         _ => None,
     }
 }
@@ -110,9 +134,30 @@ fn handle_bits(
     bits: &[u8],
     time: f64,
     sbd: &mut sbd::SbdReassembler,
+    pager: &mut ms::PagerReassembler,
     out: &mut Vec<ira::IridiumFrame>,
 ) {
     if let Some(f) = decode_bits(bits) {
+        // Multi-part pages: emit the assembled text when complete.
+        if f.kind == "msg" {
+            let body = serde_json::from_value::<ms::MsFrame>(f.details.clone())
+                .ok()
+                .and_then(|m| m.body);
+            if let Some(b) = body {
+                if let Some(full) = pager.push(&b, time) {
+                    out.push(ira::IridiumFrame {
+                        kind: "msg-complete",
+                        details: serde_json::json!({ "ric": b.ric, "text": full }),
+                        acars: None,
+                        raw_bits: Vec::new(),
+                    });
+                }
+            }
+        }
+        out.push(f);
+        return;
+    }
+    if let Some(f) = lcw_traffic_frame(bits) {
         out.push(f);
         return;
     }
@@ -152,6 +197,7 @@ fn handle_bits(
 pub struct IridiumWidebandDecoder {
     wb: wideband::IridiumWideband,
     sbd: sbd::SbdReassembler,
+    pager: ms::PagerReassembler,
     samples_seen: u64,
     input_rate: f64,
     level: f32,
@@ -163,6 +209,7 @@ impl IridiumWidebandDecoder {
         Ok(Self {
             wb: wideband::IridiumWideband::new(input_rate)?,
             sbd: sbd::SbdReassembler::new(),
+            pager: ms::PagerReassembler::new(),
             samples_seen: 0,
             input_rate,
             level: 0.0,
@@ -178,7 +225,7 @@ impl IridiumWidebandDecoder {
         let mut out = Vec::new();
         for burst in self.wb.process(input) {
             let mut frames = Vec::new();
-            handle_bits(&burst.bits, time, &mut self.sbd, &mut frames);
+            handle_bits(&burst.bits, time, &mut self.sbd, &mut self.pager, &mut frames);
             out.extend(frames.into_iter().map(|f| (burst.offset_hz, f)));
         }
         out
@@ -191,6 +238,18 @@ impl IridiumWidebandDecoder {
 
 /// Decode an LCW-bearing burst's DA frame, if it is one (ft == 2).
 pub fn decode_da_bits(bits: &[u8]) -> Option<(frame::DaFrame, Vec<u8>)> {
+    match decode_lcw_bits(bits)? {
+        (2, data) => {
+            let da = frame::decode_da(&data[46..])?;
+            Some((da, bits.to_vec()))
+        }
+        _ => None,
+    }
+}
+
+/// Classify an LCW-bearing duplex burst: returns the LCW frame type and
+/// the post-access-code data bits.
+fn decode_lcw_bits(bits: &[u8]) -> Option<(u8, &[u8])> {
     let data = if bits.len() > 24 && bits[..24] == frame::ACCESS_DL[..] {
         &bits[24..]
     } else if bits.len() > 24 && bits[..24] == frame::ACCESS_UL[..] {
@@ -202,11 +261,33 @@ pub fn decode_da_bits(bits: &[u8]) -> Option<(frame::DaFrame, Vec<u8>)> {
         return None;
     }
     let (ft, _, _, _) = frame::decode_lcw(data)?;
-    if ft != 2 {
-        return None;
-    }
-    let da = frame::decode_da(&data[46..])?;
-    Some((da, bits.to_vec()))
+    Some((ft, data))
+}
+
+/// Tag the non-DA duplex traffic classes by LCW frame type: voice (AMBE
+/// payload bytes extracted for external decoding — the codec itself is
+/// proprietary), IP data, and sync bursts (iridium-toolkit ft mapping).
+fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
+    let (ft, data) = decode_lcw_bits(bits)?;
+    let kind = match ft {
+        0 => "voice",
+        1 => "ip-data",
+        7 => "sync",
+        _ => return None,
+    };
+    let payload = &data[46..];
+    let payload_hex: String = payload
+        .chunks(8)
+        .map(|c| {
+            format!("{:02x}", c.iter().fold(0u8, |v, &b| (v << 1) | b))
+        })
+        .collect();
+    Some(ira::IridiumFrame {
+        kind,
+        details: serde_json::json!({ "payload_hex": payload_hex, "payload_bits": payload.len() }),
+        acars: None,
+        raw_bits: bits.to_vec(),
+    })
 }
 
 /// Convert a decoded frame into the normalized message model.

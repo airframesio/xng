@@ -9,6 +9,60 @@ fn push_field(bits: &mut Vec<u8>, v: u32, n: usize) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("ims") {
+        // Single-part ASCII page (matches the e2e test vector).
+        let ric: u32 = 1234567;
+        let text = "CALL OPS +14155550100";
+        let mut rest: Vec<u8> = Vec::new();
+        for k in 0..22 {
+            rest.push(((ric >> k) & 1) as u8);
+        }
+        push_field(&mut rest, 5, 5);
+        push_field(&mut rest, 7, 6);
+        push_field(&mut rest, 0, 4);
+        push_field(&mut rest, 0, 6);
+        push_field(&mut rest, 0, 4);
+        rest.push(0);
+        rest.push(0);
+        push_field(&mut rest, 0, 7);
+        for c in text.bytes() {
+            push_field(&mut rest, c as u32, 7);
+        }
+        push_field(&mut rest, 3, 7);
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        for chunk in rest.chunks(20) {
+            let mut b = vec![0u8];
+            b.extend_from_slice(chunk);
+            b.resize(21, 0);
+            blocks.push(b);
+        }
+        let total_halves = 1 + blocks.len();
+        let bch_blocks = (total_halves + 1) / 2;
+        let mut h = Vec::new();
+        h.push(0);
+        push_field(&mut h, 0, 4);
+        push_field(&mut h, 3, 4);
+        push_field(&mut h, 9, 6);
+        push_field(&mut h, bch_blocks as u32, 4);
+        push_field(&mut h, 1, 2);
+        let mut all = vec![h];
+        all.extend(blocks);
+        if all.len() % 2 == 1 {
+            all.push(vec![1u8; 21]);
+        }
+        let enc: Vec<Vec<u8>> =
+            all.iter().map(|d| frame::bch_encode(frame::MESSAGING_BCH_POLY, d)).collect();
+        let mut bits: Vec<u8> = frame::ACCESS_DL.to_vec();
+        bits.extend(frame::HEADER_MESSAGING.iter().copied());
+        for pair in enc.chunks_exact(2) {
+            bits.extend(frame::interleave2(&pair[0], &pair[1]));
+        }
+        let bitstr: String = bits.iter().map(|&b| char::from(b'0' + b)).collect();
+        let f = decode_bits(&bits).expect("decodes");
+        println!("{bitstr}");
+        println!("{}", f.details);
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("da") {
         let mut payload = [0u8; 20];
         for (i, b) in payload.iter_mut().enumerate() {

@@ -76,6 +76,16 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                 }
                 MessageBody::Iridium { kind, details } => {
                     let mut s = format!("IRIDIUM {kind}");
+                    if let Some(ric) = details.pointer("/body/ric").or_else(|| details.get("ric")) {
+                        s.push_str(&format!(" ric={ric}"));
+                    }
+                    if let Some(t) = details
+                        .pointer("/body/text")
+                        .or_else(|| details.get("text"))
+                        .and_then(|v| v.as_str())
+                    {
+                        s.push_str(&format!(" | {t}"));
+                    }
                     for key in ["sat", "beam"] {
                         if let Some(v) = details.get(key) {
                             s.push_str(&format!(" {key}={v}"));
