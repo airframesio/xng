@@ -241,12 +241,12 @@ pub fn classify_voice(payload_bits: &[u8]) -> Option<Value> {
         payload_r.push(f.reverse_bits());
     }
 
-    // 1. VDA: data frame with a valid CRC24.
+    // 1. VDA: data frame with a valid CRC24 — an IIP frame riding the
+    // voice channel; parse its ARQ structure.
     if iip_crc24(&payload_r) == 0 {
-        return Some(json!({
-            "voice_type": "VDA",
-            "data_hex": hex(&payload_r[..payload_r.len() - 3]),
-        }));
+        let mut v = crate::iip::parse_iip_frame(&payload_r);
+        v["voice_type"] = json!("VDA");
+        return Some(v);
     }
 
     // 2. VO6: 52 six-bit symbols form an RS(52,42) codeword.
