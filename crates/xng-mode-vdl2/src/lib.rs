@@ -61,7 +61,16 @@ impl Vdl2ChannelDecoder {
     pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
         // Prefer the high channel rate when the capture divides into it;
         // 50 kS/s remains the floor (and the vendored-fixture rate).
-        let channel_rate = if input_rate >= CHANNEL_RATE_HI
+        // Prefer 105 kS/s (an exact 10 samples/symbol) when the input
+        // divides into it: at 100 kS/s every symbol center falls at a
+        // fractional sample position and the linear interpolator's
+        // error acts as decision noise; integer sps removes it.
+        const CHANNEL_RATE_NATIVE: f64 = 105_000.0;
+        let channel_rate = if input_rate >= CHANNEL_RATE_NATIVE
+            && (input_rate / CHANNEL_RATE_NATIVE).fract().abs() < 1e-9
+        {
+            CHANNEL_RATE_NATIVE
+        } else if input_rate >= CHANNEL_RATE_HI
             && (input_rate / CHANNEL_RATE_HI).fract().abs() < 1e-9
         {
             CHANNEL_RATE_HI

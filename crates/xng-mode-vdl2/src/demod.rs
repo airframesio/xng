@@ -407,6 +407,18 @@ impl Vdl2Demod {
                                 if std::env::var("VDL2_DEBUG").is_ok() {
                                     eprintln!("RSFAIL tl_bits={tl_bits} syms={}", n / 3);
                                 }
+                                if let Ok(dir) = std::env::var("VDL2_DUMP_BITS") {
+                                    use std::sync::atomic::AtomicU32;
+                                    static N: AtomicU32 = AtomicU32::new(0);
+                                    let k = N.fetch_add(1, AOrd::Relaxed);
+                                    let _ = std::fs::write(
+                                        format!(
+                                            "{dir}/rx_tl{tl_bits}_{k}_at{}.bits",
+                                            c.uw_start as u64
+                                        ),
+                                        &c.bits[HEADER_BITS..n],
+                                    );
+                                }
                                 STAT_RS_FAIL.fetch_add(1, AOrd::Relaxed);
                                 self.last_rs_fail = c.uw_start;
                                 // A false UW lock (e.g. on a burst edge) can
