@@ -12,6 +12,7 @@ authors = ["Kevin Elliott", "xng contributors"]
 
 [workspace.dependencies]
 anyhow = "1"
+rumqttc = "0.24"
 chrono = { version = "0.4", features = ["serde"] }
 crc = "3"
 crossbeam-channel = "0.8"
@@ -71,6 +72,7 @@ airspyhf = ["xng-sdr/airspyhf"]
 
 [dependencies]
 anyhow.workspace = true
+rumqttc.workspace = true
 chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 num-complex.workspace = true

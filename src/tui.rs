@@ -48,6 +48,7 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
         let stop = stop.clone();
         let live = live.clone();
         let sdr = cfg.sdr.clone();
+        let label_filter = cfg.label_filter.clone();
         move || {
             let mut reasm = (
                 xng_acars::reasm::Reassembler::new(300.0),
@@ -62,6 +63,7 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
                 stop,
                 Some((live, capture_center, sample_rate)),
                 Some(&mut reasm),
+                label_filter,
             )
         }
     });

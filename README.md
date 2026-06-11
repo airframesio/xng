@@ -263,9 +263,18 @@ Every mode and every command shares the same output options:
 --metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels)
 --sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S)
 --beast 0.0.0.0:30005                          # Beast binary TCP (Mode S)
+--nmea-tcp 0.0.0.0:10110                       # NMEA AIVDM TCP (AIS)
+--mqtt mqtt://user:pass@broker:1883            # MQTT (JSON to <prefix>/<mode>)
+--mqtt-topic xng                               # MQTT topic prefix
 --asf2-grpc http://ingest:6001                 # asf-2.0 over gRPC
 --asf2-quic ingest:6011                        # asf-2.0 over QUIC (TLS verified)
 ```
+
+ACARS traffic can be filtered by label before it reaches any output:
+`--filter-labels H1,Q0` passes only those labels; `--exclude-labels SQ`
+drops the listed ones. Non-ACARS messages always pass. VDL2 console
+lines can name ground stations via `--gs-file stations.json` (a JSON
+object mapping hex AVLC addresses to names).
 
 **asf-2.0** ([docs/ASF2.md](docs/ASF2.md)) is xng's multiplexed feeding
 protocol: one protobuf schema carrying every channel/SDR/mode over a

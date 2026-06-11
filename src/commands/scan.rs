@@ -372,6 +372,7 @@ pub(crate) fn scan_group(
         station_ident: "XNG-SCAN".into(),
         sdr: None,
         receiver_pos: None,
+        label_filter: Default::default(),
         outputs: runtime::OutputConfig {
             console: crate::outputs::console::ConsoleFormat::Pretty,
             jsonl: None,
@@ -383,6 +384,8 @@ pub(crate) fn scan_group(
             sbs: None,
             beast: None,
             nmea_tcp: None,
+            mqtt: None,
+            mqtt_topic: "xng".into(),
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;
@@ -411,6 +414,7 @@ pub(crate) fn scan_group(
         stop,
         Some((live.clone(), center, rate)),
         None,
+        Default::default(),
     )?;
     let _ = stop_thread.join();
 
