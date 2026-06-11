@@ -286,3 +286,55 @@ mid-size bursts, and the next credible lever is a properly-derived
 receive filter (matched to the actual RC pulse, ISI-compensated or
 zero-forcing at symbol instants) — a half-day design task with the
 harness and funnel already in place.
+
+## Round 4 (2026-06): the receive filter, done properly
+
+Protocol followed as planned: pulse-shaped test modulator first, then a
+derived filter, bit-level ground truth, off-air last.
+
+1. **Pulse-shaped modulator** (`burst_iq_shaped`): linear D8PSK with the
+   Annex 10 full raised-cosine pulse (α=0.6, ±6T support). RC is
+   Nyquist, so the existing symbol-center demod decodes it unchanged —
+   loopback now covers the realistic waveform at both channel rates.
+
+2. **The derived filter is not a matched filter.** For an RC-shaped TX
+   pulse the zero-ISI receive filter family is F(ω) with H·F Nyquist;
+   the noise-optimal member that adds no ISI is **flat across the
+   signal band, zero outside**: a plain lowpass covering ±8.4 kHz.
+   Critically its -6 dB point must sit *beyond* the RC band edge
+   (we use Rs = 10.5 kHz, 101 taps) — an early experiment with the
+   cutoff at 8.5 kHz ate the outer RC rolloff, broke the Nyquist
+   property, and failed loopback exactly as theory predicts.
+
+3. **Where it goes**: the DDC's decimation filter already provides
+   channel selectivity (8.5 kHz passband), but the no-DDC path
+   (input rate == channel rate, zero offset — all fixture and off-air
+   harness runs) had NO filtering at all: the demod saw the full
+   input Nyquist band of noise. The selectivity FIR now fills that
+   path only.
+
+4. **Measured sensitivity** (shaped burst, 40 trials/point, 50 kS/s):
+   ~2.5-3 dB. At 13.5 dB SNR: 32/40 plain vs 40/40 filtered; at
+   11.4 dB: 12 vs 34; at 9.7 dB: 1 vs 19. Matches the expected
+   noise-bandwidth reduction (25 kHz → ~10.5 kHz equivalent).
+   `examples/sensitivity.rs` reproduces the table.
+
+5. **Off-air: 19 frames before, 19 after** (funnel slightly cleaner:
+   rs_fail 17→16, hdr_fail 204→199). The sigidwiki capture is
+   24-30 dB SNR — out-of-band noise was never its binding constraint.
+   **The receive-filter hypothesis for the 19→41 gap is falsified.**
+   The remaining gap stays where round 3 left it: in-band raw
+   symbol-decision quality on mid-size bursts (good residuals, wrong
+   bits), where the falsified-equalizer list already covers the cheap
+   in-band levers.
+
+6. **Harness hazard found**: a phantom UW lock in lead-in noise whose
+   garbage header passes the thin 25-bit FEC starves collection when
+   the test stream simply ends (no hdr_fail, no rs_fail, zero output —
+   a silent swallow). Live streams always provide the trailing samples
+   that let it fail RS and rewind. Loopback tests now pad 30k trailing
+   samples; remember this when a synthetic test inexplicably returns
+   zero bursts.
+
+HFDL's no-DDC path has the same missing-selectivity structure and its
+own falsified-sensitivity backlog — worth the same experiment there.

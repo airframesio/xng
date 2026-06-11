@@ -42,6 +42,13 @@ pub struct Vdl2Frame {
 
 pub struct Vdl2ChannelDecoder {
     ddc: Option<Ddc>,
+    /// Channel-selectivity lowpass for the no-DDC path. The RC(α=0.6)
+    /// TX pulse occupies ±(1+α)·Rs/2 = ±8.4 kHz; a flat lowpass there
+    /// keeps the signal spectrum (and its Nyquist zero-ISI property)
+    /// untouched while removing all out-of-band noise. When a DDC runs
+    /// its decimation filter already provides this.
+    selectivity: Option<xng_dsp::fir::Fir>,
+    select_buf: Vec<Complex<f32>>,
     demod: demod::Vdl2Demod,
     rs: ReedSolomon,
     channel_buf: Vec<Complex<f32>>,
@@ -66,8 +73,19 @@ impl Vdl2ChannelDecoder {
         } else {
             Some(Ddc::new(input_rate, channel_rate, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
         };
+        let selectivity = if ddc.is_none() {
+            // -6 dB point at the symbol rate so the filter is flat
+            // through the RC band edge (8.4 kHz) and the windowed-sinc
+            // transition lives entirely in the noise-only region.
+            let taps = xng_dsp::fir::lowpass_taps(demod::SYMBOL_RATE / channel_rate, 101);
+            Some(xng_dsp::fir::Fir::new(taps))
+        } else {
+            None
+        };
         Ok(Self {
             ddc,
+            selectivity,
+            select_buf: Vec::new(),
             demod: demod::Vdl2Demod::new(channel_rate),
             rs: interleave::vdl2_rs(),
             channel_buf: Vec::new(),
@@ -86,7 +104,14 @@ impl Vdl2ChannelDecoder {
                 ddc.process(input, &mut self.channel_buf);
                 &self.channel_buf
             }
-            None => input,
+            None => match &mut self.selectivity {
+                Some(fir) => {
+                    self.select_buf.clear();
+                    fir.process(input, &mut self.select_buf);
+                    &self.select_buf
+                }
+                None => input,
+            },
         };
         let mut out = Vec::new();
         for burst in self.demod.process(channel, &self.rs) {
