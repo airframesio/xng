@@ -29,6 +29,9 @@ pub struct X25Packet {
     pub cause: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<u8>,
+    /// Negotiated facilities on call packets.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub facilities: Vec<Value>,
     /// Payload (data packets: user data; call packets: CUD).
     #[serde(skip)]
     pub payload: Vec<u8>,
@@ -54,6 +57,7 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
         more: false,
         cause: None,
         diagnostic: None,
+        facilities: Vec::new(),
         payload: Vec::new(),
     };
     if t & 0x01 == 0 {
@@ -78,6 +82,10 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
                 if b.len() > fac_pos {
                     let fac_len = b[fac_pos] as usize;
                     let cud_pos = fac_pos + 1 + fac_len;
+                    if fac_len > 0 && fac_pos + 1 + fac_len <= b.len() {
+                        pkt.facilities =
+                            parse_facilities(&b[fac_pos + 1..fac_pos + 1 + fac_len]);
+                    }
                     if b.len() > cud_pos {
                         pkt.payload = b[cud_pos..].to_vec();
                     }
@@ -158,8 +166,8 @@ impl Default for X25Reassembler {
 pub fn parse_network(b: &[u8]) -> Option<Value> {
     match b.first()? {
         0x81 => parse_clnp(b),
-        0x82 => Some(json!({ "protocol": "ES-IS", "payload_len": b.len() })),
-        0x83 => Some(json!({ "protocol": "IDRP", "payload_len": b.len() })),
+        0x82 => Some(parse_esis(b)),
+        0x83 => Some(parse_idrp(b)),
         // ICAO 9705 LREF/deflate-compressed CLNP: leading octet is the
         // local-reference type. Layout not yet verified — label only.
         _ => Some(json!({
@@ -168,6 +176,109 @@ pub fn parse_network(b: &[u8]) -> Option<Value> {
             "payload_len": b.len(),
         })),
     }
+}
+
+/// ES-IS (ISO 9542) header: type and the advertised network entity
+/// titles / addresses (hex NSAPs).
+fn parse_esis(b: &[u8]) -> Value {
+    let mut out = json!({ "protocol": "ES-IS", "payload_len": b.len() });
+    if b.len() < 9 {
+        return out;
+    }
+    let hdr_len = b[1] as usize;
+    let type_code = b[4] & 0x1F;
+    out["type"] = json!(match type_code {
+        2 => "ESH",
+        4 => "ISH",
+        6 => "RD",
+        _ => "?",
+    });
+    out["holding_time_s"] = json!(u16::from_be_bytes([b[5], b[6]]));
+    // ESH: count + SA(s); ISH: single NET. Both length-prefixed.
+    let mut pos = 9usize;
+    let mut addrs = Vec::new();
+    if type_code == 2 && pos < b.len().min(hdr_len) {
+        let n = b[pos] as usize;
+        pos += 1;
+        for _ in 0..n {
+            let Some(&len) = b.get(pos) else { break };
+            let len = len as usize;
+            pos += 1;
+            if pos + len > b.len() || len > 20 {
+                break;
+            }
+            addrs.push(b[pos..pos + len].iter().map(|x| format!("{x:02x}")).collect::<String>());
+            pos += len;
+        }
+    } else if type_code == 4 {
+        if let Some(&len) = b.get(pos) {
+            let len = len as usize;
+            pos += 1;
+            if pos + len <= b.len() && len <= 20 {
+                addrs.push(b[pos..pos + len].iter().map(|x| format!("{x:02x}")).collect::<String>());
+            }
+        }
+    }
+    if !addrs.is_empty() {
+        out["addresses"] = json!(addrs);
+    }
+    out
+}
+
+/// IDRP (ISO 10747) BISPDU header: length, type, sequence numbers.
+fn parse_idrp(b: &[u8]) -> Value {
+    let mut out = json!({ "protocol": "IDRP", "payload_len": b.len() });
+    if b.len() < 4 {
+        return out;
+    }
+    let len = u16::from_be_bytes([b[1], b[2]]);
+    out["bispdu_len"] = json!(len);
+    out["type"] = json!(match b.get(3) {
+        Some(1) => "OPEN",
+        Some(2) => "UPDATE",
+        Some(3) => "ERROR",
+        Some(4) => "KEEPALIVE",
+        Some(5) => "CEASE",
+        _ => "?",
+    });
+    if b.len() >= 12 {
+        out["sequence"] = json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]));
+    }
+    out
+}
+
+/// X.25 facilities: TLVs with class-coded lengths (bits 7-8 of the
+/// code: 1/2/3 parameter bytes, or variable with a length byte).
+/// Codes are reported numerically — naming is deferred until the ITU
+/// table can be verified.
+fn parse_facilities(b: &[u8]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < b.len() {
+        let code = b[pos];
+        pos += 1;
+        let plen = match code >> 6 {
+            0 => 1,
+            1 => 2,
+            2 => 3,
+            _ => match b.get(pos) {
+                Some(&l) => {
+                    pos += 1;
+                    l as usize
+                }
+                None => break,
+            },
+        };
+        if pos + plen > b.len() {
+            break;
+        }
+        out.push(json!({
+            "code": format!("{code:#04x}"),
+            "params": b[pos..pos + plen].iter().map(|x| format!("{x:02x}")).collect::<String>(),
+        }));
+        pos += plen;
+    }
+    out
 }
 
 /// Full (uncompressed) CLNP header per ISO 8473.
@@ -245,6 +356,7 @@ fn parse_cotp(b: &[u8]) -> Option<Value> {
         // try protected-mode CPDLC, then CM.
         if let Some(app) = crate::atn_cpdlc::parse_apdu(user)
             .or_else(|| crate::atn_cpdlc::parse_cm_logon(user))
+            .or_else(|| crate::atn_cpdlc::parse_cm_ground(user))
         {
             out["app"] = app;
         }
@@ -271,6 +383,44 @@ mod tests {
         let mut r = X25Reassembler::new();
         assert_eq!(r.push(&d1, 0.0), None);
         assert_eq!(r.push(&d2, 1.0), Some(vec![0xAA, 0xBB, 0xCC]));
+    }
+
+    #[test]
+    fn esis_ish_parses_net() {
+        // NLPID 0x82, hdr_len, version, lifetime, type=ISH(4),
+        // holding time 600 s, checksum, then NET length + NET.
+        let mut b = vec![0x82, 0x0E, 0x01, 0x00, 0x04, 0x02, 0x58, 0x00, 0x00];
+        b.push(3); // NET length
+        b.extend([0x47, 0x00, 0x27]);
+        let v = parse_network(&b).unwrap();
+        assert_eq!(v["protocol"], "ES-IS");
+        assert_eq!(v["type"], "ISH");
+        assert_eq!(v["holding_time_s"], 600);
+        assert_eq!(v["addresses"][0], "470027");
+    }
+
+    #[test]
+    fn idrp_keepalive_parses() {
+        // NLPID 0x83, BISPDU len, type=KEEPALIVE(4), sequence.
+        let b = [0x83, 0x00, 0x0C, 0x04, 0x00, 0x00, 0x00, 0x2A, 0, 0, 0, 0];
+        let v = parse_network(&b).unwrap();
+        assert_eq!(v["protocol"], "IDRP");
+        assert_eq!(v["type"], "KEEPALIVE");
+        assert_eq!(v["sequence"], 42);
+        assert_eq!(v["bispdu_len"], 12);
+    }
+
+    #[test]
+    fn facilities_class_lengths() {
+        // class 0 (1 param byte): 0x01 0xAA; class 1 (2): 0x42 0x01 0x02;
+        // class 3 (length-prefixed): 0xC9 0x02 0xDE 0xAD.
+        let f = parse_facilities(&[0x01, 0xAA, 0x42, 0x01, 0x02, 0xC9, 0x02, 0xDE, 0xAD]);
+        assert_eq!(f.len(), 3);
+        assert_eq!(f[0]["code"], "0x01");
+        assert_eq!(f[0]["params"], "aa");
+        assert_eq!(f[1]["params"], "0102");
+        assert_eq!(f[2]["code"], "0xc9");
+        assert_eq!(f[2]["params"], "dead");
     }
 
     #[test]

@@ -381,6 +381,8 @@ pub(crate) fn scan_group(
             asf2_quic_trust: crate::outputs::asf2_quic::TrustMode::SystemRoots,
             metrics: None,
             sbs: None,
+            beast: None,
+            nmea_tcp: None,
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;

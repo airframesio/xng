@@ -35,7 +35,7 @@ pub fn format_beast(msg: &Message) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(2 + 7 + 1 + raw.len() * 2);
     out.push(0x1a);
     out.push(kind);
-    let mut push_esc = |b: u8, out: &mut Vec<u8>| {
+    let push_esc = |b: u8, out: &mut Vec<u8>| {
         out.push(b);
         if b == 0x1a {
             out.push(0x1a);

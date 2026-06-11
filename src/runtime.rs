@@ -36,6 +36,10 @@ pub struct OutputConfig {
     pub metrics: Option<String>,
     /// SBS-1 (BaseStation, dump1090 port-30003 style) TCP server address.
     pub sbs: Option<String>,
+    /// Beast binary TCP server address (Mode S, dump1090 port-30005 style).
+    pub beast: Option<String>,
+    /// NMEA (AIVDM) TCP server address.
+    pub nmea_tcp: Option<String>,
 }
 
 pub struct SessionConfig {
@@ -361,6 +365,14 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         if let Some(addr) = cfg.outputs.sbs.clone() {
             let rx = bus.subscribe();
             output_tasks.push(tokio::spawn(crate::outputs::sbs::run(rx, addr)));
+        }
+        if let Some(addr) = cfg.outputs.beast.clone() {
+            let rx = bus.subscribe();
+            output_tasks.push(tokio::spawn(crate::outputs::beast::run(rx, addr)));
+        }
+        if let Some(addr) = cfg.outputs.nmea_tcp.clone() {
+            let rx = bus.subscribe();
+            output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr)));
         }
         if let Some(url) = cfg.outputs.asf2_grpc.clone() {
             let rx = bus.subscribe();

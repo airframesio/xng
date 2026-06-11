@@ -574,6 +574,36 @@ fn read_lat_or_lon(p: &mut Per, max_milli: i64, max_whole: i64) -> Option<String
     })
 }
 
+/// CM ground-generated messages: identify the dialogue type (logon
+/// response, update, contact request, abort, forward).
+pub fn parse_cm_ground(bytes: &[u8]) -> Option<Value> {
+    let mut store = Vec::new();
+    let mut p = Per::new(bytes, &mut store);
+    // CMGroundMessage CHOICE (extensible, 6 root): ext bit + 3 bits.
+    if p.bit()? != 0 {
+        return None;
+    }
+    let kind = match p.uint(3)? {
+        0 => "logon-response",
+        1 => "update",
+        2 => "contact-request",
+        3 => "forward-request",
+        4 => "abort",
+        5 => "forward-response",
+        _ => return None,
+    };
+    let mut out = json!({ "application": "CM", "pdu": kind });
+    if matches!(kind, "logon-response" | "update") {
+        // Two OPTIONAL application lists; report presence only (the
+        // per-entry TSAP addresses are variable-size — staged).
+        let air = p.bit()? == 1;
+        let ground = p.bit()? == 1;
+        out["air_apps_present"] = json!(air);
+        out["ground_apps_present"] = json!(ground);
+    }
+    Some(out)
+}
+
 /// CM (context management) logon request — the dialogue that precedes
 /// CPDLC; identifies the flight.
 pub fn parse_cm_logon(bytes: &[u8]) -> Option<Value> {
@@ -600,6 +630,25 @@ pub fn parse_cm_logon(bytes: &[u8]) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cm_ground_logon_response() {
+        // CMGroundMessage CHOICE: ext=0, index=0 (logon-response),
+        // both OPTIONAL application lists absent.
+        let v = parse_cm_ground(&[0b0_000_0_0_00]).unwrap();
+        assert_eq!(v["application"], "CM");
+        assert_eq!(v["pdu"], "logon-response");
+        assert_eq!(v["air_apps_present"], false);
+        assert_eq!(v["ground_apps_present"], false);
+    }
+
+    #[test]
+    fn cm_ground_contact_request() {
+        // ext=0, index=2 (contact-request): no presence bits read.
+        let v = parse_cm_ground(&[0b0_010_0000]).unwrap();
+        assert_eq!(v["pdu"], "contact-request");
+        assert!(v.get("air_apps_present").is_none());
+    }
 
     /// Bit-builder for synthetic UPER vectors.
     struct Bits(Vec<u8>);
