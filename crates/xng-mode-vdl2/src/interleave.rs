@@ -57,15 +57,19 @@ pub fn layout(tl_bits: usize) -> Option<Layout> {
 }
 
 fn bits_to_octets(bits: &[u8]) -> Vec<u8> {
+    // LSB-first: HDLC wire order. The RS code operates on octets
+    // assembled this way (verified bit-true against dumpvdl2 on the
+    // off-air GSIF bursts — MSB packing makes the RS reject perfect
+    // codewords).
     bits.chunks(8)
-        .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | (v << (7 - i))))
+        .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | (v << i)))
         .collect()
 }
 
 fn octets_to_bits(octets: &[u8], nbits: usize) -> Vec<u8> {
     octets
         .iter()
-        .flat_map(|&o| (0..8).rev().map(move |i| (o >> i) & 1))
+        .flat_map(|&o| (0..8).map(move |i| (o >> i) & 1))
         .take(nbits)
         .collect()
 }

@@ -1,5 +1,6 @@
 {
   "_comment": "Minimum decode counts per fixture. Raise these when a demod improvement lands (they are the new floor); never lower without a documented tradeoff. Calibration history in docs/notes/BENCHMARKS.md.",
   "adsb_modes1": 310,
-  "ais_offair": 36
+  "ais_offair": 36,
+  "vdl2_offair": 42
 }

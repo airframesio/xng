@@ -367,3 +367,42 @@ carry the burst sample offset); three GSIF burst IQ segments are
 extracted to /tmp/vdl2_lab/ for single-burst lab work. Next: bit-true
 single-burst study against dumpvdl2's decode of the same burst —
 obtained from dumpvdl2 itself, not from stale files.
+
+## Round 6 (2026-06-11): CLOSED — the bug was never in the demodulator
+
+Bit-true ground truth (dumpvdl2 debug build, `--debug burst_detail`,
+post-deinterleave Data+FEC octet dumps) against our dumped RX bits for
+the failing GSIF burst at sample 39082:
+
+**zero differing octets.** All 78 (72 data + 6 FEC) identical. The
+demodulator has been bit-perfect on these bursts all along — which the
+round-2 observation already said, verbatim: "the constellation locks
+while the bits are wrong." The bits were right.
+
+The bug: `interleave.rs::bits_to_octets`/`octets_to_bits` packed
+MSB-first; the air interface computes RS(255,249) over octets
+assembled **LSB-first (HDLC wire order)**. Our RS stage was handed
+bit-reversed symbols and rejected perfect codewords. Every loopback
+passed because encode and decode shared the same wrong convention —
+the canonical self-consistent-loopback trap, and the reason oracle
+ground truth at the OCTET level (not frame counts) is the only
+evidence that could catch it. The single-line empirical proof:
+`rscheck <burst> 572 lsb` → VALID 0 corrections; `msb` → INVALID.
+
+Result with the one-line fix (LSB packing both directions):
+**19 → 44 frames** (dumpvdl2: 41) at 50 k, 100 k and 105 k. rs_fail
+14 → 6. The GSIF broadcasts, the missing ACARS, the X.25 tail — all
+of it was this. The remaining 6 rs_fails are bogus-TL false locks.
+
+Open question, recorded honestly: how did 19 frames pass RS under the
+wrong symbol convention at all? Candidates: rows validating under both
+conventions via erasure-recomputation slack on low-k rows, or a
+second cancelling reversal elsewhere in the old path. Worth a quiet
+afternoon some day; not load-bearing now.
+
+Post-mortem for the falsified-hypothesis list (rounds 1–5): every
+demod-side lever was chasing a phantom. The forensic step that broke
+the case was demanding *octet-level* ground truth from the oracle's
+own debug output rather than comparing frame counts or trusting
+derived files. Bench gate now includes the capture
+(`vdl2_offair >= 42`), so this class of regression is permanent-fenced.
