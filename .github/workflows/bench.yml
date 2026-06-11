@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
+        run: sudo apt install -y libsoapysdr-dev protobuf-compiler
       - name: Build
         run: cargo build --release
       - name: Fetch AIS fixture (release asset)
