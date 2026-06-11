@@ -81,10 +81,8 @@ mod tests {
         assert_eq!(o.broker_address(), ("broker.local".to_string(), 8883));
         let o = parse_url("mqtt://u:p@broker.local:1884", "id").unwrap();
         assert_eq!(o.broker_address(), ("broker.local".to_string(), 1884));
-        assert_eq!(
-            o.credentials(),
-            Some(("u".to_string(), "p".to_string()))
-        );
+        let login = o.credentials().expect("credentials set");
+        assert_eq!(format!("{login:?}"), format!("{:?}", rumqttc::Login::new("u", "p")));
         assert!(parse_url("tcp://x", "id").is_err());
     }
 }

@@ -12,7 +12,7 @@ authors = ["Kevin Elliott", "xng contributors"]
 
 [workspace.dependencies]
 anyhow = "1"
-rumqttc = "0.24"
+rumqttc = { version = "0.25", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 crc = "3"
 crossbeam-channel = "0.8"
