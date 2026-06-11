@@ -1,7 +1,7 @@
 # asf-2.0 — Airframes Standard Format, version 2
 
 **Status:** implemented by xng (client + reference ingest); schema
-`proto/asf2.proto` is canonical. Per-mode bodies as of v0.12.0: ACARS,
+`proto/asf2.proto` is canonical. Per-mode bodies as of v0.14.0: ACARS,
 AIS (incl. field-decode JSON), Mode S (incl. Comm-B), STD-C, HFDL,
 Iridium, VDL2 (AVLC link events / XID / ATN), Aero (C-channel
 assignments and other non-ACARS structures), plus `undecoded` with

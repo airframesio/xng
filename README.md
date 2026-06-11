@@ -1,21 +1,29 @@
 # xng
 
-[![Rust](https://github.com/airframesio/xng/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/airframesio/xng/actions/workflows/rust.yml)
+[![CI](https://github.com/airframesio/xng/actions/workflows/rust.yml/badge.svg?branch=master)](https://github.com/airframesio/xng/actions/workflows/rust.yml)
+[![Benchmarks](https://github.com/airframesio/xng/actions/workflows/bench.yml/badge.svg?branch=master)](https://github.com/airframesio/xng/actions/workflows/bench.yml)
+[![Docker](https://github.com/airframesio/xng/actions/workflows/docker.yml/badge.svg)](https://github.com/airframesio/xng/pkgs/container/xng)
 [![Release](https://img.shields.io/github/v/release/airframesio/xng)](https://github.com/airframesio/xng/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)](LICENSE-MIT)
 
 **One native SDR decoder for the whole aviation + maritime radio stack.**
 
 xng decodes **ACARS, VDL Mode 2, HFDL, Inmarsat Aero, Inmarsat STD-C/EGC,
 Iridium, AIS, and Mode S/ADS-B** in a single Rust binary — replacing
-acarsdec, vdlm2dec, dumpvdl2, dumphfdl, JAERO, Scytale-C, gr-iridium, and
-iridium-toolkit with consistent, tested decode cores that share one
-capture, one message model, one application layer, and one set of outputs
-(including first-class [airframes.io](https://airframes.io) feeding).
-All nine modes are implemented, validated, and merged — including the
-complete Iridium stack (ring alerts through ACARS-over-SBD with a
-wideband burst-hunting front end) — and shipped as tagged releases with
-binaries for Linux (x86_64/arm64, tarball + .deb), macOS Apple Silicon,
-and multi-arch Docker images.
+acarsdec, vdlm2dec, dumpvdl2, dumphfdl, JAERO, Scytale-C, gr-iridium,
+iridium-toolkit, AIS-catcher, and dump1090 with consistent, tested decode
+cores that share one capture, one message model, one application layer,
+and one set of outputs (including first-class
+[airframes.io](https://airframes.io) feeding).
+
+On off-air benchmark captures xng decodes **44 VDL2 frames where
+dumpvdl2 finds 41** and **161 unique Mode S frames to dump1090-fa's
+162** (plus 7 it misses) — every number enforced by a
+[CI regression gate](bench/) on each pull request
+([methodology + history](docs/notes/BENCHMARKS.md)).
+
+Releases ship binaries for Linux (x86_64/arm64, tarball + .deb), macOS
+Apple Silicon, and multi-arch Docker images.
 
 ```bash
 # Two ACARS channels from one RTL-SDR, fed to Airframes:
@@ -51,14 +59,14 @@ conventions — invisible to loopback testing — were caught only this way).
 | Mode | `--mode` | Band | What you get | Validation |
 |---|---|---|---|---|
 | VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + applications | Live off-air (RTL-SDR), CRC-verified, **fed to production Airframes end-to-end** |
-| VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | ACARS-over-AVLC, AVLC link events, XID handoff parameters (incl. ground-station lists), **ATN-B1: X.25/CLNP/COTP transport (+facilities, ES-IS, IDRP route updates with path attributes and NLRI), protected-mode CPDLC with the full element tables and phraseology, CM logon and ground PDUs**, ground-station naming via `--gs-file` | Off-air capture vs dumpvdl2 ground truth |
+| VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | ACARS-over-AVLC, AVLC link events, XID handoff parameters (incl. ground-station lists), **ATN-B1: X.25/CLNP/COTP transport (+facilities, ES-IS, IDRP route updates with path attributes and NLRI), protected-mode CPDLC with the full element tables and phraseology, CM logon and ground PDUs**, ground-station naming via `--gs-file` | **44 frames vs dumpvdl2's 41** on the off-air benchmark, CI-fenced |
 | HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons, positions, ACARS, **over-the-air system table**; channel-selectivity filtering (+4.5–5 dB measured sensitivity) | Off-air 21 931 kHz capture, field-exact vs dumphfdl |
 | Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC, **C-channel assignment SUs (voice-circuit frequencies from call setup)**; **C-channel voice circuits (8.4 kbps OQPSK): AMBE voice-frame extraction + call-progress/telephony signal units** | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air; C-channel RF loopback |
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
 | Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, **pager messages (IMS) with multi-part reassembly**, **voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction**, **IP-channel frames (IIP ARQ / IIQ / IIR)**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle |
-| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors + canonical published test vector |
-| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), per-aircraft tracking, **SBS + Beast outputs** | Published vectors (1090 Riddle) + field-exact vs pyModeS |
+| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors; off-air benchmark vs AIS-catcher (68 % and closing), CI-fenced |
+| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), per-aircraft tracking, **SBS + Beast outputs** | **161 unique vs dump1090-fa's 162 (+7 it misses)** on the canonical capture, CI-fenced; field-exact vs pyModeS |
 
 All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
@@ -90,9 +98,9 @@ The binaries need `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf`
 for native Airspy):
 
 ```bash
-sudo apt install ./xng_0.9.0_arm64.deb     # pulls runtime deps
+sudo apt install ./xng-0.14.0-arm64.deb    # pulls runtime deps
 # or
-tar xzf xng-v0.9.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng-*/xng /usr/local/bin/
+tar xzf xng-v0.14.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
 ```
 
 Multi-arch Docker images (amd64/arm64/armv7) are published per tag:
@@ -276,12 +284,6 @@ drops the listed ones. Non-ACARS messages always pass. VDL2 console
 lines can name ground stations via `--gs-file stations.json` (a JSON
 object mapping hex AVLC addresses to names).
 
-Decode performance is benchmarked against the strongest open decoders
-on off-air captures — **VDL2: 44 frames vs dumpvdl2's 41; ADS-B: 161
-unique vs dump1090-fa's 162 (plus 7 it misses); AIS: 68 % of
-AIS-catcher and closing** — with every result fenced by a CI
-regression gate ([bench/](bench/), [docs/notes/BENCHMARKS.md](docs/notes/BENCHMARKS.md)).
-
 **asf-2.0** ([docs/ASF2.md](docs/ASF2.md)) is xng's multiplexed feeding
 protocol: one protobuf schema carrying every channel/SDR/mode over a
 single gRPC or QUIC connection, with reconnect and backpressure handling.
@@ -338,10 +340,11 @@ ACARS from any carrier flows through one application layer
 Each core also ships `examples/` harnesses (`offair`, `dumpbits`, …) used
 for the validation campaigns — point them at your own captures.
 
-Architecture, research notes, and the roadmap live in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-[`docs/notes/`](docs/notes/). The pre-rewrite xng (a dumphfdl session
-wrapper) is preserved in [`legacy/`](legacy/).
+Architecture, research notes (including the finding-by-finding demod
+campaign notebooks), and benchmark methodology live in
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+[`docs/notes/`](docs/notes/), and [`bench/`](bench/). The pre-rewrite
+xng (a dumphfdl session wrapper) is preserved in git history.
 
 ## License
 
