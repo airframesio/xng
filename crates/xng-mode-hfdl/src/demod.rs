@@ -186,8 +186,12 @@ impl HfdlDemod {
     fn a1_fit(&self, pos: f64, theta0: f32) -> Option<(f64, f32)> {
         let a = fec::bits_of(fec::A_BITS);
         let mut best: Option<(f32, f64, f32)> = None;
-        let mut t = -4.0f64;
-        while t <= 4.0 {
+        // Symbol-denominated search (floored at the old ±4-sample width
+        // so the 12 kS/s path is unchanged): the trigger's peak width in
+        // samples scales with the channel rate (same lesson as VDL2).
+        let half = (0.6 * self.sps).max(4.0);
+        let mut t = -half;
+        while t <= half {
             let cand = pos + t;
             t += 0.25;
             if cand < self.start_abs {
