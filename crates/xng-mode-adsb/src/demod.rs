@@ -21,7 +21,7 @@ const PREAMBLE_PULSES: [usize; 4] = [0, 2, 7, 9];
 const PREAMBLE_QUIET: [usize; 6] = [1, 3, 5, 11, 13, 15];
 /// Candidate gate: mean pulse energy must exceed this multiple of the
 /// worst quiet slot.
-const PULSE_QUIET_RATIO: f32 = 2.0;
+const PULSE_QUIET_RATIO: f32 = 1.0;
 /// Long frame length in bits (DF >= 16).
 const LONG_BITS: usize = 112;
 const SHORT_BITS: usize = 56;
@@ -31,8 +31,19 @@ const NOISE_ALPHA: f32 = 1e-4;
 pub struct PpmDemod {
     /// Samples per half µs.
     half: usize,
+    /// Second timing phase active (2 MS/s input): a pulse landing
+    /// between samples splits its energy across two half-µs slots and
+    /// weak frames decide wrong. The original grid is scanned exactly
+    /// as before; a midpoint-interpolated half-shifted grid is scanned
+    /// independently and its *additional* frames merged in — never
+    /// replacing an on-grid decode (interpolation blurs pulse/quiet
+    /// contrast, measured −35 frames when used alone).
+    two_phase: bool,
+    last_sample: Complex<f32>,
     /// Power (|x|²) carry buffer across process() calls.
     power: Vec<f32>,
+    /// Half-shifted power buffer (midpoint complex interpolation).
+    power_mid: Vec<f32>,
     validator: FrameValidator,
     noise: f32,
 }
@@ -46,9 +57,13 @@ impl PpmDemod {
                  {input_rate} S/s gives {spu} (use e.g. 2000000)"
             ));
         }
+        let two_phase = (spu.round() as usize) == 2;
         Ok(Self {
             half: spu.round() as usize / 2,
+            two_phase,
+            last_sample: Complex::new(0.0, 0.0),
             power: Vec::new(),
+            power_mid: Vec::new(),
             validator: FrameValidator::new(),
             noise: 1e-6,
         })
@@ -56,37 +71,40 @@ impl PpmDemod {
 
     /// Energy in half-µs slot `slot` starting at sample `base`.
     #[inline]
-    fn slot(&self, base: usize, slot: usize) -> f32 {
-        let s = base + slot * self.half;
-        self.power[s..s + self.half].iter().sum()
+    fn slot(power: &[f32], half: usize, base: usize, slot: usize) -> f32 {
+        let s = base + slot * half;
+        power[s..s + half].iter().sum()
     }
 
-    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<AdsbFrame> {
-        self.power.extend(input.iter().map(|x| x.norm_sqr()));
-
-        let frame_samples = (PREAMBLE_US + LONG_BITS) * 2 * self.half;
+    /// Scan one power grid; emits (position, frame).
+    fn scan(
+        power: &[f32],
+        half: usize,
+        end: usize,
+        noise: &mut f32,
+        validator: &mut FrameValidator,
+        track_noise: bool,
+    ) -> Vec<(usize, AdsbFrame)> {
         let mut out = Vec::new();
-        if self.power.len() < frame_samples {
-            return out;
-        }
-
         let mut i = 0;
-        let end = self.power.len() - frame_samples;
         while i < end {
-            self.noise += NOISE_ALPHA * (self.power[i] - self.noise);
+            if track_noise {
+                *noise += NOISE_ALPHA * (power[i] - *noise);
+            }
 
-            let pulses: f32 = PREAMBLE_PULSES.iter().map(|&p| self.slot(i, p)).sum::<f32>() / 4.0;
-            if pulses < self.noise * self.half as f32 * 3.0 {
+            let pulses: f32 =
+                PREAMBLE_PULSES.iter().map(|&p| Self::slot(power, half, i, p)).sum::<f32>() / 4.0;
+            if pulses < *noise * half as f32 * 2.0 {
                 i += 1;
                 continue;
             }
             let quiet_max = PREAMBLE_QUIET
                 .iter()
-                .map(|&q| self.slot(i, q))
+                .map(|&q| Self::slot(power, half, i, q))
                 .fold(0.0f32, f32::max);
             let pulse_min = PREAMBLE_PULSES
                 .iter()
-                .map(|&p| self.slot(i, p))
+                .map(|&p| Self::slot(power, half, i, p))
                 .fold(f32::MAX, f32::min);
             if pulse_min < quiet_max * PULSE_QUIET_RATIO {
                 i += 1;
@@ -94,10 +112,10 @@ impl PpmDemod {
             }
 
             // Decode bits: data starts after the 8 µs preamble.
-            let data = i + PREAMBLE_US * 2 * self.half;
+            let data = i + PREAMBLE_US * 2 * half;
             let bit = |k: usize| -> u8 {
-                let first = self.slot(data, 2 * k);
-                let second = self.slot(data, 2 * k + 1);
+                let first = Self::slot(power, half, data, 2 * k);
+                let second = Self::slot(power, half, data, 2 * k + 1);
                 (first > second) as u8
             };
             let df = (0..5).fold(0u8, |v, k| (v << 1) | bit(k));
@@ -107,17 +125,76 @@ impl PpmDemod {
                 bytes[k / 8] = (bytes[k / 8] << 1) | bit(k);
             }
 
-            let level = 10.0 * (pulses / self.half as f32).max(1e-12).log10();
-            if let Some(frame) = self.validator.validate(&bytes, level) {
-                out.push(frame);
-                i += (PREAMBLE_US + nbits) * 2 * self.half;
+            let level = 10.0 * (pulses / half as f32).max(1e-12).log10();
+            if let Some(frame) = validator.validate(&bytes, level) {
+                out.push((i, frame));
+                i += (PREAMBLE_US + nbits) * 2 * half;
             } else {
                 i += 1;
             }
         }
+        out
+    }
+
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<AdsbFrame> {
+        self.power.extend(input.iter().map(|x| x.norm_sqr()));
+        if self.two_phase {
+            let mut prev = self.last_sample;
+            self.power_mid.reserve(input.len());
+            for &x in input {
+                self.power_mid.push(((prev + x) * 0.5).norm_sqr());
+                prev = x;
+            }
+            if let Some(&last) = input.last() {
+                self.last_sample = last;
+            }
+        }
+
+        let frame_samples = (PREAMBLE_US + LONG_BITS) * 2 * self.half;
+        let mut out = Vec::new();
+        if self.power.len() < frame_samples {
+            return out;
+        }
+        let end = self.power.len() - frame_samples;
+
+        let mut found = Self::scan(
+            &self.power,
+            self.half,
+            end,
+            &mut self.noise,
+            &mut self.validator,
+            true,
+        );
+        if self.two_phase {
+            let mid = Self::scan(
+                &self.power_mid,
+                self.half,
+                end.min(self.power_mid.len().saturating_sub(frame_samples)),
+                &mut self.noise,
+                &mut self.validator,
+                false,
+            );
+            // Merge: keep half-shifted decodes only when the on-grid scan
+            // didn't already produce the same bytes nearby (legitimate
+            // repeats of identical messages are many frame-lengths apart).
+            for (pos, f) in mid {
+                let dup = found.iter().any(|(p, g)| {
+                    g.bytes == f.bytes && (*p as i64 - pos as i64).unsigned_abs() < frame_samples as u64
+                });
+                if !dup {
+                    found.push((pos, f));
+                }
+            }
+        }
+        found.sort_by_key(|(p, _)| *p);
+        out.extend(found.into_iter().map(|(_, f)| f));
 
         // Keep the unscanned tail for the next call.
         self.power.drain(..end.min(self.power.len()));
+        if self.two_phase {
+            let n = end.min(self.power_mid.len());
+            self.power_mid.drain(..n);
+        }
         out
     }
 

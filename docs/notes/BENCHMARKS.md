@@ -23,8 +23,22 @@ phase-correlation demodulator out-pulls our magnitude PPM demod on
 weak/overlapped bursts. xng currently recovers ~72 % of FA's haul on
 this capture.
 
-Next lever (separate workstream): phase-aware PPM demod and/or
-2.4 MS/s-style fractional sampling. The funnel is in place — rerun:
+**Update (2026-06-11): two levers shipped, 116 → 145 unique (~90 %
+of FA).** Ablation-attributed: (1) candidate gate relaxation
+(PULSE_QUIET_RATIO 2.0 → 1.0, noise gate 3σ → 2σ — the CRC layer
+arbitrates, so strict pre-gates only cost frames): +15 unique;
+(2) a half-sample-shifted timing grid (midpoint complex
+interpolation) scanned independently and merged by bytes+position:
++14 unique. Bursts landing between samples split pulse energy across
+half-µs slots — the second phase grid is the 2 MS/s equivalent of
+dump1090-fa's sub-phase handling. Trap documented: REPLACING the
+on-grid stream with an interpolated one loses frames (−35; the
+midpoint samples blur pulse/quiet contrast) — the phases must be
+scanned independently and unioned. xng now also decodes 7 frames FA
+misses (all from the dominant aircraft, 3 CRC-clean DF17). Remaining
+FA-only clean DF17s: 20.
+
+The funnel is in place — rerun:
 
 ```
 xng decode modes1.cu8 -f cu8 -m adsb -r 2000000 -c 1090000000 --channels 1090
