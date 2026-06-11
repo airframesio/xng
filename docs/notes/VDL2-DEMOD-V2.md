@@ -130,3 +130,32 @@ The remaining gap to dumpvdl2 (41 on this capture) is not
 sample-rate-bound: next step is demod v3 proper — matched filter +
 decision-feedback equalization, the same arc that took HFDL from
 19 to 33.
+
+## Demod v3 attempt: UW-trained LMS equalizer (2026-06, reverted)
+
+Instrumented the failure funnel on the off-air capture at 100 kS/s:
+fit_pass=125, hdr_fail=26, **rs_fail=43**, burst_ok=25 → decision
+quality on accepted bursts is the bottleneck, not acquisition.
+
+Tried HFDL's recipe (7-tap T-spaced LMS trained on the 16-symbol UW,
+2nd-order DD carrier loop). Findings, all measured:
+
+1. **Coherent/absolute D8PSK detection loses outright** on this signal:
+   per-symbol |phase err| 0.07–0.39 rad against π/8 decision regions —
+   the capture has oscillator phase wander that differential detection
+   cancels and absolute tracking does not. (Decoded 1 frame vs 17.)
+2. Differential-on-equalized works in clean loopback (training residual
+   0.001–0.004 rad) but off-air decodes 10–12 vs 17 plain: 16 training
+   symbols leave the taps part-converged, and the residual tap noise
+   injects ISI that outweighs the equalization gain at 9.5 sps.
+   Decision-directed adaptation anchored on the previous output
+   (drift-free for DPSK) recovers some (10→12), not enough.
+3. Watch the lookahead-at-stream-end edge (k+3 window for the last
+   symbols) — it silently stalls collection in loopback tests.
+
+v3 direction that survives these findings: **two-pass decode** — first
+pass with the plain demod, then retrain the equalizer on the *entire*
+decoded burst (hundreds of known symbols instead of 16) and re-decode;
+apply only when pass 1 fails RS. That spends CPU exclusively on the 43
+RS failures and cannot regress the 25 already-good bursts. The funnel
+counters (demod::STAT_*) are kept for that work.

@@ -17,6 +17,13 @@ use crate::interleave;
 use crate::scramble::Scrambler;
 use num_complex::Complex;
 use std::f32::consts::PI;
+use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+
+/// Failure-funnel counters for off-air studies (see examples/offair.rs).
+pub static STAT_FIT_PASS: AtomicUsize = AtomicUsize::new(0);
+pub static STAT_HDR_FAIL: AtomicUsize = AtomicUsize::new(0);
+pub static STAT_RS_FAIL: AtomicUsize = AtomicUsize::new(0);
+pub static STAT_BURST_OK: AtomicUsize = AtomicUsize::new(0);
 use xng_dsp::rs::ReedSolomon;
 
 pub const SYMBOL_RATE: f64 = 10_500.0;
@@ -260,6 +267,7 @@ impl Vdl2Demod {
                     // wasted work, never a lost burst.
                     if let Some((p, th, cost)) = self.preamble_fit(pos) {
                         if cost < FIT_COST_MAX {
+                            STAT_FIT_PASS.fetch_add(1, AOrd::Relaxed);
                             return Some((p, th));
                         }
                     }
@@ -341,6 +349,7 @@ impl Vdl2Demod {
                         break; // need more samples
                     }
                     Some(Err(())) => {
+                        STAT_HDR_FAIL.fetch_add(1, AOrd::Relaxed);
                         // Bad header: resume hunting just past this UW.
                         self.state = State::Hunt;
                     }
@@ -351,10 +360,12 @@ impl Vdl2Demod {
                         match interleave::deinterleave(&c.bits[HEADER_BITS..n], tl_bits, rs)
                         {
                             Some((avlc_bits, fixed)) => {
+                                STAT_BURST_OK.fetch_add(1, AOrd::Relaxed);
                                 out.push(Burst { bits: avlc_bits, rs_corrected: fixed });
                                 self.cursor = c.next_pos; // skip past the burst
                             }
                             None => {
+                                STAT_RS_FAIL.fetch_add(1, AOrd::Relaxed);
                                 self.last_rs_fail = c.uw_start;
                                 // A false UW lock (e.g. on a burst edge) can
                                 // pass the header FEC with a bogus length and
