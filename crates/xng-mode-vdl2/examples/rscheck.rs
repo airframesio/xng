@@ -5,9 +5,14 @@ fn main() {
     let rx_path = std::env::args().nth(1).expect("rx file");
     let tl: usize = std::env::args().nth(2).expect("tl").parse().unwrap();
     let rx = std::fs::read(&rx_path).expect("rx");
-    let to_octets = |bits: &[u8]| -> Vec<u8> {
+    let msb = std::env::args().nth(3).map(|a| a == "msb").unwrap_or(false);
+    let to_octets = move |bits: &[u8]| -> Vec<u8> {
         bits.chunks(8)
-            .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | (v << (7 - i))))
+            .map(|c| {
+                c.iter().enumerate().fold(0u8, |b, (i, &v)| {
+                    b | (v << if msb { 7 - i } else { i })
+                })
+            })
             .collect()
     };
     let octets = to_octets(&rx);

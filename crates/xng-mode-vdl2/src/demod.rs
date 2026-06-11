@@ -418,6 +418,18 @@ impl Vdl2Demod {
                                         ),
                                         &c.bits[HEADER_BITS..n],
                                     );
+                                    let conf_txt: String = c
+                                        .conf
+                                        .iter()
+                                        .map(|v| format!("{v:.3}\n"))
+                                        .collect();
+                                    let _ = std::fs::write(
+                                        format!(
+                                            "{dir}/rx_tl{tl_bits}_{k}_at{}.conf",
+                                            c.uw_start as u64
+                                        ),
+                                        conf_txt,
+                                    );
                                 }
                                 STAT_RS_FAIL.fetch_add(1, AOrd::Relaxed);
                                 self.last_rs_fail = c.uw_start;

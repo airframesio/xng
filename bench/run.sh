@@ -43,4 +43,12 @@ else
   echo "skip: bench/data/ais_96k.cs16 not present (release asset)"
 fi
 
+# VDL2: the sigidwiki off-air capture (release asset), 105 kS/s s16.
+if [ -f bench/data/vdl2_105k_conj.s16 ]; then
+  vdl2=$(count bench/data/vdl2_105k_conj.s16 cs16 vdl2 105000 136975000 136.975)
+  check vdl2_offair "$vdl2"
+else
+  echo "skip: bench/data/vdl2_105k_conj.s16 not present (release asset)"
+fi
+
 exit $fail

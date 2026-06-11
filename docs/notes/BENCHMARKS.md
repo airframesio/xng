@@ -102,9 +102,12 @@ AIS-catcher -r CS16 ais_6m.cs16 -s 6000000 -n
 
 ## Standing results elsewhere
 
-- VDL2: 19/41 frames vs dumpvdl2 on the sigidwiki capture
-  (docs/notes/VDL2-DEMOD-V2.md — receive-filter hypothesis falsified,
-  remaining gap is in-band symbol quality)
+- VDL2: **44 frames vs dumpvdl2's 41** on the sigidwiki capture —
+  the long-standing 19/41 gap was a single bit-order bug in RS symbol
+  assembly (MSB vs HDLC's LSB-first), found via octet-level ground
+  truth from dumpvdl2's debug output; full story in
+  docs/notes/VDL2-DEMOD-V2.md round 6. Bench fixture + floor (42)
+  added.
 - HFDL: 33 events at every rate, vs 37-ish for dumphfdl on the
   21931 kHz capture; +4.5–5 dB synthetic sensitivity from the
   selectivity filter (PR #77)

@@ -19,6 +19,6 @@ jobs:
       - name: Fetch AIS fixture (release asset)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download bench-fixtures-v1 -p ais_96k.cs16 -D bench/data/
+        run: gh release download bench-fixtures-v1 -p ais_96k.cs16 -p vdl2_105k_conj.s16 -D bench/data/
       - name: Decode-count regression gate
         run: bash bench/run.sh
