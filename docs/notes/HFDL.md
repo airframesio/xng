@@ -141,3 +141,15 @@ Viterbi → bit-reverse bytes → SPDU/MPDU → LPDU FCS → HFNPDU → ACARS.
   --iq-file + DEBUG stage dumps give stage-by-stage goldens.
 - Synthetic TX→RX loopback is fully determined by the above.
 - Live: any HF antenna; 16 ground stations worldwide (systable.conf).
+
+## Channel-rate study (2026-06)
+
+Same experiment as VDL2 (the sigidwiki 21931 kHz capture via the offair
+harness): baseline 33 events at 12 kS/s (6.67 sps). Raising the channel
+rate to 24 kS/s — with the A1-fit grid symbol-denominated first (it was
+±4 samples; same latent scaling bug as VDL2's) — DROPPED decodes to 26.
+Conclusion: HFDL's marginal frames are fading/SNR-bound, not
+timing-resolution-bound; the LMS equalizer + DD carrier loop already
+own that domain at 6.67 sps. CHANNEL_RATE stays 12 kS/s; the grid fix
+is kept as hardening (floored at the old width — the 12 kS/s path is
+verified unchanged at 33).
