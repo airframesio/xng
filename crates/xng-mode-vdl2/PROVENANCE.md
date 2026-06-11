@@ -129,3 +129,13 @@ was consulted). Unaligned PER (X.691) hand-walked as for FANS-1/A.
 v1 decodes element identity + phraseology; argument value rendering is
 the planned follow-up. Validated with synthetic UPER vectors built
 bit-by-bit from the module (WILCO downlink, CLIMB-TO uplink, CM logon).
+
+## ATN-B1 CPDLC argument values (2026-06)
+
+Argument readers for the common element types (Level with feet/meters/
+FL/metric-FL variants, Time, Position incl. fix/navaid/airport/lat-lon,
+Speed in all seven units, Degrees, Direction, and their two-component
+compounds) implemented from the same vendored Doc 9880 module; decoded
+values render into the module's phraseology templates ("CLIMB TO
+FL360"). Elements whose argument type is not yet supported stop the
+walk explicitly (sizes unknown), matching the staged FANS approach.
