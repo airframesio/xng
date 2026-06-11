@@ -21,6 +21,14 @@ pub const SUBCARRIER_OFFSET_HZ: f64 = 1_440.0;
 
 pub struct HfdlChannelDecoder {
     ddc: Option<Ddc>,
+    /// Channel-selectivity lowpass for the no-DDC path: the same
+    /// ±1.5 kHz passband the DDC's decimation filter applies (off-air
+    /// validated through that path). Without it a 12 kS/s direct input
+    /// feeds the demod the full ±6 kHz of noise. The LMS equalizer
+    /// downstream absorbs the filter's static in-band ISI, as it does
+    /// on the DDC path.
+    selectivity: Option<xng_dsp::Fir>,
+    select_buf: Vec<Complex<f32>>,
     demod: demod::HfdlDemod,
     parser: pdu::PduParser,
     channel_buf: Vec<Complex<f32>>,
@@ -37,8 +45,17 @@ impl HfdlChannelDecoder {
         } else {
             Some(Ddc::new(input_rate, CHANNEL_RATE, sub, CHANNEL_PASSBAND_HZ)?)
         };
+        let selectivity = if ddc.is_none() {
+            let taps =
+                xng_dsp::lowpass_taps(CHANNEL_PASSBAND_HZ / CHANNEL_RATE, 101);
+            Some(xng_dsp::Fir::new(taps))
+        } else {
+            None
+        };
         Ok(Self {
             ddc,
+            selectivity,
+            select_buf: Vec::new(),
             demod: demod::HfdlDemod::new(CHANNEL_RATE),
             parser: pdu::PduParser::new(),
             channel_buf: Vec::new(),
@@ -52,7 +69,14 @@ impl HfdlChannelDecoder {
                 ddc.process(input, &mut self.channel_buf);
                 &self.channel_buf
             }
-            None => input,
+            None => match &mut self.selectivity {
+                Some(fir) => {
+                    self.select_buf.clear();
+                    fir.process(input, &mut self.select_buf);
+                    &self.select_buf
+                }
+                None => input,
+            },
         };
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
