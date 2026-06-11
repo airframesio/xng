@@ -90,3 +90,25 @@ fn decodes_both_channels_from_wideband_capture_with_cfo() {
     assert!(found_a[0].1[0].contains(",A,"));
     assert!(found_b[0].1[0].contains(",B,"));
 }
+
+/// The GMSK-shaped (BT=0.4) modulator is the realistic waveform: the
+/// existing discriminator demod must decode it cleanly.
+#[test]
+fn decodes_gmsk_shaped_burst() {
+    use xng_mode_ais::modulate::burst_iq_gmsk;
+    let msg_bits = payload_to_bits(KNOWN_PAYLOAD);
+    let mut iq = vec![Complex::new(0.0, 0.0); 300];
+    iq.extend(burst_iq_gmsk(&msg_bits, 48_000.0, 0.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 300]);
+    let mut noise = Noise(0x5151_aaaa_3333_7777);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.02, noise.next() * 0.02);
+    }
+    let mut dec = AisChannelDecoder::new(48_000.0, 0.0, 162_025_000).unwrap();
+    let mut found = Vec::new();
+    for chunk in iq.chunks(512) {
+        found.extend(dec.process(chunk));
+    }
+    assert_eq!(found.len(), 1, "GMSK burst decodes");
+    assert_eq!(found[0].0.mmsi, 477_553_000);
+}
