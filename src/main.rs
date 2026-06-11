@@ -106,6 +106,17 @@ struct OutputOpts {
     /// Mode S/ADS-B messages only)
     #[arg(long)]
     sbs: Option<String>,
+    /// Serve Beast binary frames (Mode S) over TCP, dump1090-style
+    /// (e.g. 0.0.0.0:30005)
+    #[arg(long)]
+    beast: Option<String>,
+    /// Serve raw NMEA AIVDM over TCP (e.g. 0.0.0.0:10110)
+    #[arg(long)]
+    nmea_tcp: Option<String>,
+    /// JSON file mapping hex VDL2 ground-station addresses to names
+    /// (shown in console output)
+    #[arg(long)]
+    gs_file: Option<PathBuf>,
 }
 
 impl OutputOpts {
@@ -129,6 +140,9 @@ impl OutputOpts {
             );
             udp.push(AIRFRAMES_ACARS_UDP.to_owned());
         }
+        if let Some(p) = &self.gs_file {
+            outputs::console::load_gs_names(p)?;
+        }
         let ident = self.station_id.clone().unwrap_or_else(|| "XNG-DEV".to_owned());
         Ok((
             runtime::OutputConfig {
@@ -140,6 +154,8 @@ impl OutputOpts {
                 asf2_quic_trust: quic_trust,
                 metrics: self.metrics.clone(),
                 sbs: self.sbs.clone(),
+                beast: self.beast.clone(),
+                nmea_tcp: self.nmea_tcp.clone(),
             },
             ident,
         ))
@@ -586,6 +602,8 @@ fn main() -> anyhow::Result<()> {
                         asf2_quic_trust: outputs::asf2_quic::TrustMode::SystemRoots,
                         metrics: None,
                         sbs: None,
+                        beast: None,
+                        nmea_tcp: None,
                     },
                 },
             )

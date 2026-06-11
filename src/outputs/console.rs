@@ -44,6 +44,23 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Optional ground-station name table (hex AVLC address → name),
+/// loaded once from --gs-file.
+static GS_NAMES: std::sync::OnceLock<std::collections::HashMap<String, String>> =
+    std::sync::OnceLock::new();
+
+/// Load a JSON object file mapping hex addresses to names.
+pub fn load_gs_names(path: &std::path::Path) -> anyhow::Result<()> {
+    let map: std::collections::HashMap<String, String> =
+        serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let _ = GS_NAMES.set(map);
+    Ok(())
+}
+
+fn gs_name(addr: &str) -> Option<&'static str> {
+    GS_NAMES.get()?.get(addr).map(String::as_str)
+}
+
 pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
     match fmt {
         ConsoleFormat::Json => serde_json::to_string(msg).unwrap_or_else(|e| format!("<serialize error: {e}>")),
@@ -177,8 +194,16 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                             .unwrap_or("?")
                             .to_owned()
                     };
-                    let mut s =
-                        format!("VDL2 {} {}→{}", kind.to_uppercase(), addr("src"), addr("dst"));
+                    let deco = |a: String| match gs_name(&a) {
+                        Some(n) => format!("{a}[{n}]"),
+                        None => a,
+                    };
+                    let mut s = format!(
+                        "VDL2 {} {}→{}",
+                        kind.to_uppercase(),
+                        deco(addr("src")),
+                        deco(addr("dst"))
+                    );
                     if let Some(nr) = details.pointer("/control/nr").and_then(|v| v.as_u64()) {
                         s.push_str(&format!(" nr={nr}"));
                     }
