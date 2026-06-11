@@ -7,6 +7,7 @@ pub mod frame;
 pub mod ira;
 pub mod ms;
 pub mod sbd;
+pub mod voice;
 pub mod wideband;
 pub mod modulate;
 
@@ -282,9 +283,18 @@ fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
             format!("{:02x}", c.iter().fold(0u8, |v, &b| (v << 1) | b))
         })
         .collect();
+    let mut details =
+        serde_json::json!({ "payload_hex": payload_hex, "payload_bits": payload.len() });
+    if ft == 0 {
+        // Voice channel: run the VDA/VO6/VOD/VOZ/VOC classification
+        // ladder and fold its result into the details.
+        if let Some(serde_json::Value::Object(extra)) = voice::classify_voice(payload) {
+            details.as_object_mut().unwrap().extend(extra);
+        }
+    }
     Some(ira::IridiumFrame {
         kind,
-        details: serde_json::json!({ "payload_hex": payload_hex, "payload_bits": payload.len() }),
+        details,
         acars: None,
         raw_bits: bits.to_vec(),
     })
