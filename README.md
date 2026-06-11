@@ -276,6 +276,12 @@ drops the listed ones. Non-ACARS messages always pass. VDL2 console
 lines can name ground stations via `--gs-file stations.json` (a JSON
 object mapping hex AVLC addresses to names).
 
+Decode performance is benchmarked against the strongest open decoders
+on off-air captures — **VDL2: 44 frames vs dumpvdl2's 41; ADS-B: 161
+unique vs dump1090-fa's 162 (plus 7 it misses); AIS: 68 % of
+AIS-catcher and closing** — with every result fenced by a CI
+regression gate ([bench/](bench/), [docs/notes/BENCHMARKS.md](docs/notes/BENCHMARKS.md)).
+
 **asf-2.0** ([docs/ASF2.md](docs/ASF2.md)) is xng's multiplexed feeding
 protocol: one protobuf schema carrying every channel/SDR/mode over a
 single gRPC or QUIC connection, with reconnect and backpressure handling.
