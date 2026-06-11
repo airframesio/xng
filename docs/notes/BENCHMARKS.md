@@ -77,9 +77,11 @@ Viterbi with decision-directed phase tracking) raised the synthetic
 sensitivity by **+11–12 dB** (discriminator dies at ~12 dB SNR;
 coherent path runs 40/40 at 6.2 dB and 30/40 at 0.9 dB) and the
 off-air capture from 6 to **24 unique payloads** (45 % of
-AIS-catcher, still a clean subset). The remaining gap is timing
-refinement (the anchor is integer-sample), GMSK-pulse-exact branch
-metrics, and multi-hypothesis decoding of colliding bursts.
+AIS-catcher, still a clean subset). **Fractional-timing refinement** (sub-sample template offsets,
+window resampled at the winner) followed: 24 → 26 unique payloads
+(49 % of AIS-catcher), bench fixture 36 → 39 frames. The remaining
+gap is GMSK-pulse-exact branch metrics and multi-hypothesis decoding
+of colliding bursts.
 
 Hard-won implementation notes: the template-correlation anchor MUST
 reject peaks near the search-window edge (the rising shoulder of a
