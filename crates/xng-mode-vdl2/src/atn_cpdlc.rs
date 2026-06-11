@@ -215,6 +215,7 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
     let idx_bits = 64 - (table.len() as u64 - 1).leading_zeros() as usize;
 
     let mut elements = Vec::new();
+    let mut bailed = false;
     for k in 0..count {
         // Element CHOICE (not extensible in the module).
         let idx = p.uint(idx_bits)? as usize;
@@ -243,13 +244,149 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
         elements.push(el);
     }
 
-    Some(json!({
+    let mut out = json!({
         "msg_id": msg_id,
         "msg_ref": msg_ref,
         "timestamp": format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z"),
         "logical_ack": ack,
         "elements": elements,
-    }))
+    });
+    // constrainedData (route clearances) sits after the element list —
+    // reachable only when every element argument decoded.
+    if _has_constrained && !bailed {
+        // SEQUENCE { routeClearanceData SIZE(1..2) OPTIONAL, ... }:
+        // extension bit + presence bit.
+        if p.bit() == Some(0) && p.bit() == Some(1) {
+            if let Some(n) = p.constrained(1, 2) {
+                let mut rcs = Vec::new();
+                for _ in 0..n {
+                    match read_route_clearance(&mut p) {
+                        Some(rc) => rcs.push(rc),
+                        None => break,
+                    }
+                }
+                if !rcs.is_empty() {
+                    out["route_clearances"] = json!(rcs);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+
+/// PublishedIdentifier: fixName | navaid (both name + optional latlon).
+fn read_published(p: &mut Per) -> Option<String> {
+    let navaid = p.bit()? == 1;
+    let has_ll = p.bit()? == 1;
+    let name = if navaid { p.ia5(1, 4)? } else { p.ia5(1, 5)? };
+    if has_ll {
+        let ll = read_latlon(p)?;
+        Some(format!("{name} ({ll})"))
+    } else {
+        Some(name)
+    }
+}
+
+fn read_distance(p: &mut Per) -> Option<String> {
+    Some(if p.bit()? == 0 {
+        format!("{:.1} NM", p.constrained(0, 9999)? as f64 / 10.0)
+    } else {
+        format!("{:.2} KM", p.constrained(0, 8000)? as f64 / 4.0)
+    })
+}
+
+/// ProcedureName: type + IA5(1..20) + optional transition IA5(1..5).
+fn read_procedure(p: &mut Per) -> Option<String> {
+    let has_transition = p.bit()? == 1;
+    let ptype = match p.uint(2)? {
+        0 => "ARRIVAL",
+        1 => "APPROACH",
+        2 => "DEPARTURE",
+        _ => return None,
+    };
+    let name = p.ia5(1, 20)?;
+    let mut s = format!("{name} ({ptype})");
+    if has_transition {
+        s.push_str(&format!(" TRANSITION {}", p.ia5(1, 5)?));
+    }
+    Some(s)
+}
+
+/// Runway: direction (1..36) + L/R/C suffix.
+fn read_runway(p: &mut Per) -> Option<String> {
+    let dir = p.constrained(1, 36)?;
+    let cfg = match p.uint(2)? {
+        0 => "L",
+        1 => "R",
+        2 => "C",
+        _ => "",
+    };
+    Some(format!("RWY {dir:02}{cfg}"))
+}
+
+/// One RouteInformation leg.
+fn read_route_information(p: &mut Per) -> Option<String> {
+    match p.uint(3)? {
+        0 => read_published(p),
+        1 => read_latlon(p),
+        2 => {
+            // PlaceBearingPlaceBearing: SEQUENCE SIZE(2) OF PlaceBearing.
+            let a = format!("{} BRG {}", read_published(p)?, read_degrees(p)?);
+            let b = format!("{} BRG {}", read_published(p)?, read_degrees(p)?);
+            Some(format!("{a} / {b}"))
+        }
+        3 => Some(format!(
+            "{} BRG {} DIST {}",
+            read_published(p)?,
+            read_degrees(p)?,
+            read_distance(p)?
+        )),
+        4 => p.ia5(2, 7), // ATS route designator
+        _ => None,
+    }
+}
+
+/// RouteClearance: 9 optional components; the route itself is the list
+/// of RouteInformation legs. The routeInformationAdditional tail (hold
+/// patterns, RTA, intercepts) is reported present-but-undecoded — it is
+/// last in the structure, so everything before it is safe to decode.
+fn read_route_clearance(p: &mut Per) -> Option<Value> {
+    let present: Vec<bool> = (0..9).map(|_| p.bit() == Some(1)).collect();
+    let mut out = serde_json::Map::new();
+    if present[0] {
+        out.insert("departure_airport".into(), json!(p.ia5(4, 4)?));
+    }
+    if present[1] {
+        out.insert("destination_airport".into(), json!(p.ia5(4, 4)?));
+    }
+    if present[2] {
+        out.insert("departure_runway".into(), json!(read_runway(p)?));
+    }
+    if present[3] {
+        out.insert("departure_procedure".into(), json!(read_procedure(p)?));
+    }
+    if present[4] {
+        out.insert("arrival_runway".into(), json!(read_runway(p)?));
+    }
+    if present[5] {
+        out.insert("approach_procedure".into(), json!(read_procedure(p)?));
+    }
+    if present[6] {
+        out.insert("arrival_procedure".into(), json!(read_procedure(p)?));
+    }
+    if present[7] {
+        let n = p.constrained(1, 128)? as usize;
+        let mut legs = Vec::with_capacity(n);
+        for _ in 0..n {
+            legs.push(read_route_information(p)?);
+        }
+        out.insert("route".into(), json!(legs));
+    }
+    if present[8] {
+        out.insert("additional".into(), json!("present (undecoded)"));
+    }
+    Some(Value::Object(out))
 }
 
 
