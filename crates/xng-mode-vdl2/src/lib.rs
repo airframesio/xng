@@ -24,6 +24,10 @@ use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQua
 
 /// Internal channel rate (≈4.76 samples/symbol).
 pub const CHANNEL_RATE: f64 = 50_000.0;
+/// Preferred channel rate (~9.5 samples/symbol): measurably better
+/// off-air decode than the 50 kS/s floor; used whenever the capture
+/// rate divides into it.
+pub const CHANNEL_RATE_HI: f64 = 100_000.0;
 /// One-sided passband: D8PSK 10.5 kBd, RC α=0.6 → ±8.4 kHz.
 pub const CHANNEL_PASSBAND_HZ: f64 = 8_500.0;
 
@@ -48,14 +52,23 @@ pub struct Vdl2ChannelDecoder {
 
 impl Vdl2ChannelDecoder {
     pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
-        let ddc = if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+        // Prefer the high channel rate when the capture divides into it;
+        // 50 kS/s remains the floor (and the vendored-fixture rate).
+        let channel_rate = if input_rate >= CHANNEL_RATE_HI
+            && (input_rate / CHANNEL_RATE_HI).fract().abs() < 1e-9
+        {
+            CHANNEL_RATE_HI
+        } else {
+            CHANNEL_RATE
+        };
+        let ddc = if (input_rate - channel_rate).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
             None
         } else {
-            Some(Ddc::new(input_rate, CHANNEL_RATE, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
+            Some(Ddc::new(input_rate, channel_rate, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
         };
         Ok(Self {
             ddc,
-            demod: demod::Vdl2Demod::new(CHANNEL_RATE),
+            demod: demod::Vdl2Demod::new(channel_rate),
             rs: interleave::vdl2_rs(),
             channel_buf: Vec::new(),
             x25: atn::X25Reassembler::new(),

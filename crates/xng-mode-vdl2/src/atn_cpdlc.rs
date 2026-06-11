@@ -234,6 +234,7 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
                         el["note"] =
                             json!("remaining elements undecoded (argument type unsupported)");
                     }
+                    bailed = true;
                     elements.push(el);
                     break;
                 }

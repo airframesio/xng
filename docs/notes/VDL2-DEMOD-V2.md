@@ -107,3 +107,26 @@ trigger threshold drops 0.88 → 0.6 with the fit-cost gate (< 0.25 rad²)
 arbitrating, and weak bursts get attempted safely: **16 frames** on the
 capture (13 before; plateau holds down to thr 0.4). The remaining gap
 to dumpvdl2 is genuine SNR reach at 4.76 samples/symbol.
+
+## Channel-rate study (2026-06)
+
+The 4.76 samples/symbol hypothesis tested directly: the sigidwiki
+capture (48 kS/s native) resampled to 100 kS/s with a matched ±13 kHz
+channel filter and fed to the demod at 9.52 sps. Two findings:
+
+1. The preamble-fit search grid was sample-denominated (±3 samples =
+   only ±0.32 symbols at the higher rate, while the differential
+   trigger's peak width in samples scales with rate). Naively raising
+   the rate DROPPED decodes 16 → 9. Symbol-denominating the grid
+   (±0.63 symbols, floor ±3 samples — exactly the old width at
+   4.76 sps) restored and then beat the baseline.
+
+2. With the grid fixed: 50 kS/s → 16 frames (unchanged), 100 kS/s →
+   17 frames. The decoder now auto-selects 100 kS/s whenever the
+   capture rate divides into it (every real SDR rate: 2.4M/3M/6M);
+   50 kS/s remains the floor and the vendored-fixture path.
+
+The remaining gap to dumpvdl2 (41 on this capture) is not
+sample-rate-bound: next step is demod v3 proper — matched filter +
+decision-feedback equalization, the same arc that took HFDL from
+19 to 33.
