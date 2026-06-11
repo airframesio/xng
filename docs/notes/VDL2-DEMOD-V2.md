@@ -256,3 +256,33 @@ on RS failure, ladder over the header codewords within FEC distance
 of the received header bits and retry the deinterleave per candidate
 length (data is already collected for the longest). FCS-arbitrated as
 always.
+
+## Forensics round 3 (2026-06): FEC thinness + the matched-filter trap
+
+Two more hard-won facts:
+
+1. **The FEC is thinnest exactly where the failures live**: rows of
+   3-30 data octets carry 2 check octets (corrects ONE error), 31-67
+   carry 4 (corrects two). The missing mid-size I-frames and GSIF
+   broadcasts land in these bands, where 2-3 scattered symbol errors —
+   entirely consistent with the observed 0.10-0.12 rad mean residuals —
+   are fatal. dumpvdl2 wins these bursts by making fewer raw symbol
+   errors, not by better FEC. (Header-candidate ladder and PLL
+   lattice-clamp hypotheses: both falsified by measurement first.)
+
+2. **A naive RRC matched filter is a trap**: inserting RRC(0.6) before
+   the slicer passes every synthetic loopback test and collapses
+   off-air decode 19 → 1, with the alarming signature of RS-passing
+   bursts full of AVLC-invalid bytes. Do NOT retry this without first
+   deriving the TX pulse/ISI interaction properly (the Annex 10 pulse
+   is full raised-cosine: an RRC receive filter creates RC^1.5 ISI at
+   the sampling instants) and validating decisions against a bit-level
+   ground-truth burst. The synthetic loopback is blind to this failure
+   class because the test modulator does not shape pulses.
+
+Net position after rounds 1-3: 19/41 frames; every cheap hypothesis is
+measured and dead; the remaining gap is raw symbol-decision quality on
+mid-size bursts, and the next credible lever is a properly-derived
+receive filter (matched to the actual RC pulse, ISI-compensated or
+zero-forcing at symbol instants) — a half-day design task with the
+harness and funnel already in place.
