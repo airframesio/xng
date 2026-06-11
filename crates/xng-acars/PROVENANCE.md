@@ -69,3 +69,12 @@ route legs as published-identifier (fixname + optional lat/lon),
 lat/lon, place-bearing pairs, place-bearing-distance (NM 0.1 / KM), or
 airway designators. trackDetail legs and the trailing
 routeInformationAdditional stay undecoded (reported as present).
+
+## MIAM file-transfer reassembly (2026-06)
+
+File transfers spanning multiple label-MA messages reassemble per the
+libacars semantics (MIT, as before): the FileTransferRequest registers
+file id and size, segments numbered from 1 carry CORE-PDU text
+fragments, completion at the declared size parses the combined text as
+a CORE PDU (attached to the closing segment's message as
+miam_file_complete). Abort frames cancel; 10-minute timeout.

@@ -16,7 +16,12 @@ pub enum MiamFrame {
     SingleTransfer(CorePdu),
     FileTransferReq { file_id: u16, file_size: u32 },
     FileTransferAccept { file_id: u16, segment_size: u8 },
-    FileSegment { file_id: u16, segment_id: u16 },
+    FileSegment {
+        file_id: u16,
+        segment_id: u16,
+        /// CORE-PDU text fragment carried by this segment.
+        payload: String,
+    },
     FileTransferAbort { file_id: u16, reason: u8 },
     XoffInd { file_id: Option<u16> },
     XonInd { file_id: Option<u16> },
@@ -67,6 +72,7 @@ pub fn parse(text: &str) -> Option<MiamFrame> {
         'S' => Some(MiamFrame::FileSegment {
             file_id: num(rest, 3)? as u16,
             segment_id: num(&rest[3..], 3)? as u16,
+            payload: rest.get(6..)?.to_string(),
         }),
         'A' => Some(MiamFrame::FileTransferAbort {
             file_id: num(rest, 3)? as u16,
@@ -75,6 +81,81 @@ pub fn parse(text: &str) -> Option<MiamFrame> {
         'Y' => Some(MiamFrame::XoffInd { file_id: num(rest, 3).map(|v| v as u16) }),
         'X' => Some(MiamFrame::XonInd { file_id: num(rest, 3).map(|v| v as u16) }),
         _ => None,
+    }
+}
+
+/// Reassembles multi-message MIAM file transfers (libacars semantics:
+/// the FileTransferReq registers file id + size; segments numbered
+/// from 1 carry CORE-PDU text fragments; the combined text parses as a
+/// CORE PDU once the declared size is reached).
+pub struct FileReassembler {
+    pending: std::collections::HashMap<(String, u16), FileEntry>,
+}
+
+struct FileEntry {
+    expected: usize,
+    parts: std::collections::BTreeMap<u16, String>,
+    time: f64,
+}
+
+const FILE_TIMEOUT_SECS: f64 = 600.0;
+
+impl FileReassembler {
+    pub fn new() -> Self {
+        Self { pending: std::collections::HashMap::new() }
+    }
+
+    /// Offer a label-MA message text; returns the completed CORE PDU
+    /// when a file transfer finishes.
+    pub fn push(&mut self, tail: &str, text: &str, now: f64) -> Option<CorePdu> {
+        self.pending.retain(|_, e| now - e.time < FILE_TIMEOUT_SECS);
+        match parse(text)? {
+            MiamFrame::FileTransferReq { file_id, file_size } => {
+                self.pending.insert(
+                    (tail.to_owned(), file_id),
+                    FileEntry {
+                        expected: file_size as usize,
+                        parts: Default::default(),
+                        time: now,
+                    },
+                );
+                None
+            }
+            MiamFrame::FileTransferAbort { file_id, .. } => {
+                self.pending.remove(&(tail.to_owned(), file_id));
+                None
+            }
+            MiamFrame::FileSegment { file_id, segment_id, payload } => {
+                let e = self.pending.get_mut(&(tail.to_owned(), file_id))?;
+                e.parts.insert(segment_id, payload);
+                e.time = now;
+                let total: usize = e.parts.values().map(|p| p.len()).sum();
+                if total < e.expected {
+                    return None;
+                }
+                // Contiguous from segment 1.
+                let contiguous = e
+                    .parts
+                    .keys()
+                    .copied()
+                    .zip(1u16..)
+                    .all(|(have, want)| have == want);
+                if !contiguous {
+                    return None;
+                }
+                let combined: String =
+                    e.parts.values().map(String::as_str).collect();
+                self.pending.remove(&(tail.to_owned(), file_id));
+                core_pdu(&combined)
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Default for FileReassembler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -247,8 +328,12 @@ mod tests {
             Some(MiamFrame::FileTransferReq { file_id: 12, file_size: 345 })
         );
         assert_eq!(
-            parse("S012003"),
-            Some(MiamFrame::FileSegment { file_id: 12, segment_id: 3 })
+            parse("S012003abc"),
+            Some(MiamFrame::FileSegment {
+                file_id: 12,
+                segment_id: 3,
+                payload: "abc".into()
+            })
         );
         assert_eq!(parse("not miam"), None);
     }
@@ -290,5 +375,50 @@ mod tests {
         assert_eq!(pdu.msg_num, Some(42));
         assert!(pdu.compressed);
         assert_eq!(pdu.text.as_deref(), Some(std::str::from_utf8(inner).unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn file_transfer_reassembles_to_core_pdu() {
+        // Build a small v1 DATA core PDU text (uncompressed body).
+        fn b85(data: &[u8]) -> String {
+            let mut s = String::new();
+            for chunk in data.chunks(4) {
+                let mut w = [0u8; 4];
+                w[..chunk.len()].copy_from_slice(chunk);
+                let mut v = u32::from_be_bytes(w) as u64;
+                let mut digits = [0u8; 5];
+                for d in digits.iter_mut().rev() {
+                    *d = (v % 85) as u8 + 0x21;
+                    v /= 85;
+                }
+                s.extend(digits.iter().map(|&d| d as char));
+            }
+            s
+        }
+        let mut hdr = vec![0x01u8];
+        hdr.extend_from_slice(&[0, 0, 32]);
+        hdr.extend_from_slice(b".N00001");
+        hdr.push(2 << 1);
+        hdr.push(0x00); // no compression
+        hdr.push(0x00); // ISO5, app type 0
+        hdr.extend_from_slice(b"T2");
+        hdr.extend_from_slice(&[0, 0, 0, 0]);
+        let hpad = (4 - hdr.len() % 4) % 4;
+        hdr.extend(std::iter::repeat(0).take(hpad));
+        let core = format!("-{hpad}{}|HELLO FILE WORLD", b85(&hdr));
+
+        let (a, b) = core.split_at(core.len() / 2);
+        let mut fr = FileReassembler::new();
+        let req = format!("F007{:06}", core.len());
+        assert!(fr.push("N12345", &req, 0.0).is_none());
+        assert!(fr.push("N12345", &format!("S007001{a}"), 1.0).is_none());
+        let pdu = fr.push("N12345", &format!("S007002{b}"), 2.0).expect("complete");
+        assert_eq!(pdu.version, 1);
+        assert_eq!(pdu.text.as_deref(), Some("HELLO FILE WORLD"));
     }
 }

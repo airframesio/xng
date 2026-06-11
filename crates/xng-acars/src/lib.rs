@@ -114,7 +114,7 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
             miam::MiamFrame::FileTransferReq { file_id, file_size } => {
                 format!("MIAM file-transfer-req id={file_id} size={file_size}")
             }
-            miam::MiamFrame::FileSegment { file_id, segment_id } => {
+            miam::MiamFrame::FileSegment { file_id, segment_id, .. } => {
                 format!("MIAM file-segment id={file_id} seg={segment_id}")
             }
             f => format!("MIAM {}", serde_json::json!(f)["frame"].as_str().unwrap_or("frame")),
