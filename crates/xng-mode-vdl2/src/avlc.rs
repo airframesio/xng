@@ -182,12 +182,29 @@ pub fn parse_xid(info: &[u8]) -> Option<Vec<XidParam>> {
             pos += plen;
             let printable = value.len() >= 2
                 && value.iter().all(|&b| (0x20..0x7F).contains(&b));
+            // Ground-station list parameters carry 4-octet AVLC
+            // addresses — decodable with the standard address parser.
+            let text = if group == 0xF0
+                && matches!(id, 0x41 | 0x45)
+                && !value.is_empty()
+                && value.len() % 4 == 0
+            {
+                Some(
+                    value
+                        .chunks_exact(4)
+                        .map(|c| parse_address(c).addr)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                )
+            } else {
+                printable.then(|| String::from_utf8_lossy(value).into_owned())
+            };
             params.push(XidParam {
                 group,
                 id,
                 name: if group == 0xF0 { vdl_param_name(id) } else { None },
                 value_hex: value.iter().map(|b| format!("{b:02x}")).collect(),
-                text: printable.then(|| String::from_utf8_lossy(value).into_owned()),
+                text,
             });
         }
         pos = end;
@@ -428,5 +445,22 @@ mod body_tests {
         // Param claims more bytes than the group holds.
         let info = [0x82, 0xF0, 0x00, 0x04, 0x42, 0x40];
         assert!(parse_xid(&info).is_none());
+    }
+}
+
+#[cfg(test)]
+mod xid_gs_tests {
+    use super::*;
+
+    #[test]
+    fn ground_station_list_param_decodes_addresses() {
+        let gs1 = encode_address(AddressType::GroundIcao, 0x2C0A55, false, false);
+        let gs2 = encode_address(AddressType::GroundIcao, 0x2D4917, false, true);
+        let mut info = vec![0x82, 0xF0, 0x00, (2 + 8) as u8, 0x41, 8];
+        info.extend_from_slice(&gs1);
+        info.extend_from_slice(&gs2);
+        let params = parse_xid(&info).unwrap();
+        assert_eq!(params[0].name, Some("acceptable-alternate-ground-stations"));
+        assert_eq!(params[0].text.as_deref(), Some("2C0A55,2D4917"));
     }
 }
