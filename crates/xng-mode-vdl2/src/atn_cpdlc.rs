@@ -443,6 +443,15 @@ fn read_argument(p: &mut Per, ty: &str) -> Option<Vec<String>> {
         "TimeLevel" => vec![read_time(p)?, read_level(p)?],
         "TimePosition" => vec![read_time(p)?, read_position(p)?],
         "DirectionDegrees" => vec![read_direction(p)?, read_degrees(p)?],
+        // The clearance itself rides in constrainedData; elements carry
+        // an index into it.
+        "RouteClearanceIndex" => {
+            vec![format!("(route clearance #{})", p.constrained(1, 2)?)]
+        }
+        "PositionRouteClearanceIndex" => vec![
+            read_position(p)?,
+            format!("(route clearance #{})", p.constrained(1, 2)?),
+        ],
         _ => return None,
     })
 }
@@ -713,5 +722,91 @@ mod tests {
         let v = parse_cm_logon(&b.bytes()).expect("cm");
         assert_eq!(v["pdu"], "logon-request");
         assert_eq!(v["flight_id"], "UAL123");
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn cleared_route_decodes() {
+        // Inner ATCUplinkMessage: uM80 CLEARED [routeClearance] with the
+        // clearance in constrainedData: dest KSFO, route J501 → OAK.
+        struct B(Vec<u8>);
+        impl B {
+            fn push(&mut self, v: u64, n: usize) {
+                for k in (0..n).rev() {
+                    self.0.push(((v >> k) & 1) as u8);
+                }
+            }
+            fn ia5(&mut self, s: &str) {
+                for c in s.bytes() {
+                    self.push(c as u64, 7);
+                }
+            }
+        }
+        let mut m = B(Vec::new());
+        m.push(0, 1); // no msgRef
+        m.push(0, 1); // default logicalAck
+        m.push(3, 6); // msg id
+        m.push(30, 7); // year 2026
+        m.push(5, 4); // June (1..12)
+        m.push(10, 5); // day 11 (1..31)
+        m.push(2, 5);
+        m.push(0, 6);
+        m.push(0, 6);
+        m.push(1, 1); // constrainedData PRESENT
+        m.push(0, 3); // one element
+        m.push(80, 8); // uM80RouteClearance (index arg)
+        m.push(0, 1); // RouteClearanceIndex = 1
+        // constrainedData: ext 0, routeClearanceData present, count 1.
+        m.push(0, 1);
+        m.push(1, 1);
+        m.push(0, 1);
+        // RouteClearance presence: destination airport + route list.
+        m.push(0b010000010, 9);
+        m.ia5("KSFO"); // Airport: fixed SIZE(4), no length bits
+        m.push(1, 7); // route count 2 (1..128)
+        m.push(4, 3); // leg 1: ATS route designator
+        m.push(2, 3); // IA5(2..7) length 4
+        m.ia5("J501");
+        m.push(0, 3); // leg 2: publishedIdentifier
+        m.push(0, 1); // fixName
+        m.push(0, 1); // no latlon
+        m.push(2, 3); // Fix IA5(1..5) length 3
+        m.ia5("OAK");
+        let inner_bits = m.0.len();
+
+        let mut o = B(Vec::new());
+        o.push(0, 1);
+        o.push(3, 3); // ground: send
+        o.push(0, 1);
+        o.push(0, 1);
+        o.push(1, 1);
+        // Length determinant: long form (the message exceeds 127 bits).
+        if inner_bits < 128 {
+            o.push(0, 1);
+            o.push(inner_bits as u64, 7);
+        } else {
+            o.push(0b10, 2);
+            o.push(inner_bits as u64, 14);
+        }
+        o.0.extend(&m.0);
+        o.push(0, 1);
+        o.push(0, 7);
+        let bytes: Vec<u8> = o
+            .0
+            .chunks(8)
+            .map(|c| c.iter().enumerate().fold(0u8, |v, (i, &b)| v | (b << (7 - i))))
+            .collect();
+
+        let v = parse_pdus(&bytes, false).expect("apdu");
+        let msg = &v["message"];
+        assert_eq!(msg["elements"][0]["element"], "uM80RouteClearance");
+        let rc = &msg["route_clearances"][0];
+        assert_eq!(rc["destination_airport"], "KSFO");
+        assert_eq!(rc["route"][0], "J501");
+        assert_eq!(rc["route"][1], "OAK");
     }
 }

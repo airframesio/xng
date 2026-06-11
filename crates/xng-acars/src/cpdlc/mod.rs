@@ -131,32 +131,136 @@ fn read_position(b: &mut Bits) -> Option<String> {
         0 => read_ia5(b, 3, 1), // fixName SIZE(1..5)
         1 => read_ia5(b, 2, 1), // navaid SIZE(1..4)
         2 => read_ia5(b, 0, 4), // airport SIZE(4)
-        3 => {
-            let lat_has_min = b.read(1)? == 1;
-            let lat_deg = b.read(7)?;
-            let lat_min = if lat_has_min { Some(b.read(10)?) } else { None };
-            let ns = if b.read(1)? == 1 { 'S' } else { 'N' };
-            let lon_has_min = b.read(1)? == 1;
-            let lon_deg = b.read(8)?;
-            let lon_min = if lon_has_min { Some(b.read(10)?) } else { None };
-            let ew = if b.read(1)? == 1 { 'W' } else { 'E' };
-            if lat_deg > 90 || lon_deg > 180 {
-                return None;
-            }
-            let fmt = |deg: u32, min: Option<u32>, dir: char| match min {
-                Some(m) => format!("{deg}°{:.1}'{dir}", m as f32 / 10.0),
-                None => format!("{deg}°{dir}"),
-            };
-            Some(format!(
-                "{} {}",
-                fmt(lat_deg, lat_min, ns),
-                fmt(lon_deg, lon_min, ew)
-            ))
-        }
+        3 => read_latlon(b),
         // placeBearingDistance: not decoded.
         _ => None,
     }
 }
+
+fn read_latlon(b: &mut Bits) -> Option<String> {
+    let lat_has_min = b.read(1)? == 1;
+    let lat_deg = b.read(7)?;
+    let lat_min = if lat_has_min { Some(b.read(10)?) } else { None };
+    let ns = if b.read(1)? == 1 { 'S' } else { 'N' };
+    let lon_has_min = b.read(1)? == 1;
+    let lon_deg = b.read(8)?;
+    let lon_min = if lon_has_min { Some(b.read(10)?) } else { None };
+    let ew = if b.read(1)? == 1 { 'W' } else { 'E' };
+    if lat_deg > 90 || lon_deg > 180 {
+        return None;
+    }
+    let fmt = |deg: u32, min: Option<u32>, dir: char| match min {
+        Some(m) => format!("{deg}°{:.1}'{dir}", m as f32 / 10.0),
+        None => format!("{deg}°{dir}"),
+    };
+    Some(format!("{} {}", fmt(lat_deg, lat_min, ns), fmt(lon_deg, lon_min, ew)))
+}
+
+/// FANSPublishedIdentifier: fixName + OPTIONAL latitudeLongitude.
+fn read_published(b: &mut Bits) -> Option<String> {
+    let has_ll = b.read(1)? == 1;
+    let name = read_ia5(b, 3, 1)?; // Fixname SIZE(1..5)
+    if has_ll {
+        Some(format!("{name} ({})", read_latlon(b)?))
+    } else {
+        Some(name)
+    }
+}
+
+/// FANSRouteClearance: ten optional components (constraints from the
+/// libacars asn1c tables). The trailing routeInformationAdditional is
+/// reported present-but-undecoded; it is last, so the route itself is
+/// always reachable.
+fn read_route_clearance(b: &mut Bits) -> Option<String> {
+    let present: Vec<bool> = (0..10).map(|_| b.read(1) == Some(1)).collect();
+    let mut parts: Vec<String> = Vec::new();
+    let read_runway = |b: &mut Bits| -> Option<String> {
+        let dir = b.read(6)? + 1; // (1..36)
+        let cfg = match b.read(2)? {
+            0 => "L",
+            1 => "R",
+            2 => "C",
+            _ => "",
+        };
+        Some(format!("RWY {dir:02}{cfg}"))
+    };
+    let read_procedure = |b: &mut Bits| -> Option<String> {
+        let has_transition = b.read(1)? == 1;
+        let ptype = match b.read(2)? {
+            0 => "ARRIVAL",
+            1 => "APPROACH",
+            _ => "DEPARTURE",
+        };
+        let name = read_ia5(b, 3, 1)?; // FANSProcedure SIZE(1..6)
+        let mut s = format!("{name} ({ptype})");
+        if has_transition {
+            s.push_str(&format!(" TRANS {}", read_ia5(b, 3, 1)?)); // SIZE(1..5)
+        }
+        Some(s)
+    };
+    if present[0] {
+        parts.push(format!("DEP {}", read_ia5(b, 0, 4)?));
+    }
+    if present[1] {
+        parts.push(format!("DEST {}", read_ia5(b, 0, 4)?));
+    }
+    if present[2] {
+        parts.push(format!("DEP {}", read_runway(b)?));
+    }
+    if present[3] {
+        parts.push(format!("SID {}", read_procedure(b)?));
+    }
+    if present[4] {
+        parts.push(format!("ARR {}", read_runway(b)?));
+    }
+    if present[5] {
+        parts.push(format!("APPROACH {}", read_procedure(b)?));
+    }
+    if present[6] {
+        parts.push(format!("STAR {}", read_procedure(b)?));
+    }
+    if present[7] {
+        parts.push(format!("INTERCEPT {}", read_ia5(b, 3, 1)?)); // SIZE(1..5)
+    }
+    if present[8] {
+        // FANSRouteInformationSequence SIZE(1..128).
+        let n = b.read(7)? as usize + 1;
+        let mut legs = Vec::with_capacity(n);
+        for _ in 0..n {
+            let leg = match b.read(3)? {
+                0 => read_published(b)?,
+                1 => read_latlon(b)?,
+                2 => format!(
+                    "{} BRG {} / {} BRG {}",
+                    read_published(b)?,
+                    read_degrees(b)?,
+                    read_published(b)?,
+                    read_degrees(b)?
+                ),
+                3 => {
+                    let pb = read_published(b)?;
+                    let deg = read_degrees(b)?;
+                    let dist = if b.read(1)? == 0 {
+                        format!("{:.1} NM", b.read(14)? as f64 / 10.0)
+                    } else {
+                        format!("{} KM", b.read(10)? + 1)
+                    };
+                    format!("{pb} BRG {deg} DIST {dist}")
+                }
+                4 => read_ia5(b, 3, 1)?, // airway SIZE(1..5)
+                _ => return None, // trackDetail: not decoded
+            };
+            legs.push(leg);
+        }
+        parts.push(format!("ROUTE {}", legs.join(" ")));
+    }
+    if present[9] {
+        parts.push("[+additional data undecoded]".into());
+    }
+    Some(parts.join(", "))
+}
+
+
 
 /// FANSTime: hours (0..23, 5 bits) + minutes (0..59, 6 bits).
 fn read_time(b: &mut Bits) -> Option<String> {
@@ -235,6 +339,10 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
         "Degrees" => Some(vec![read_degrees(b)?]),
         "DirectionDegrees" => Some(vec![read_direction(b)?, read_degrees(b)?]),
         "FreeText" => Some(vec![read_freetext(b)?]),
+        "RouteClearance" => Some(vec![read_route_clearance(b)?]),
+        "PositionRouteClearance" => {
+            Some(vec![read_position(b)?, read_route_clearance(b)?])
+        }
         _ => None,
     }
 }
@@ -567,5 +675,56 @@ mod composite_tests {
         let m = decode(&b.0, true).expect("decode");
         assert_eq!(m.element, "dM67FreeText");
         assert_eq!(m.text, "DUE WX");
+    }
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    struct Builder(Vec<u8>, usize);
+    impl Builder {
+        fn new() -> Self {
+            Builder(vec![0u8; 96], 0)
+        }
+        fn push(&mut self, v: u32, n: usize) {
+            for k in (0..n).rev() {
+                let bit = ((v >> k) & 1) as u8;
+                self.0[self.1 / 8] |= bit << (7 - self.1 % 8);
+                self.1 += 1;
+            }
+        }
+        fn ia5(&mut self, s: &str) {
+            for c in s.bytes() {
+                self.push(c as u32, 7);
+            }
+        }
+    }
+
+    /// dM40RouteClearance "ASSIGNED ROUTE [routeclearance]" with a
+    /// destination airport and a two-leg route.
+    #[test]
+    fn assigned_route_decodes() {
+        let mut b = Builder::new();
+        b.push(0, 1); // single element
+        b.push(0, 1); // no msg ref
+        b.push(0, 1); // no timestamp
+        b.push(22, 6); // msg id
+        b.push(40, 8); // dM40RouteClearance
+        // presence map: destination airport (bit 1) + route list (bit 8)
+        b.push(0b0100000010, 10);
+        b.ia5("KSFO"); // airport SIZE(4): no length bits
+        b.push(1, 7); // 2 legs (SIZE 1..128)
+        b.push(4, 3); // airway identifier
+        b.push(3, 3); // SIZE(1..5) length 4
+        b.ia5("J501");
+        b.push(0, 3); // published identifier
+        b.push(0, 1); // no latlon
+        b.push(2, 3); // fixname length 3
+        b.ia5("OAK");
+        let m = decode(&b.0, true).expect("decode");
+        assert_eq!(m.element, "dM40RouteClearance");
+        assert!(m.text.contains("DEST KSFO"), "{}", m.text);
+        assert!(m.text.contains("ROUTE J501 OAK"), "{}", m.text);
     }
 }
