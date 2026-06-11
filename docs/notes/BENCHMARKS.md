@@ -95,9 +95,19 @@ unanchored. Process lesson re-learned at cost: `cargo build -p <crate>`
 does NOT rebuild the workspace binary — three off-air "regressions"
 were a stale `target/release/xng`.
 
-Remaining 17 AC-only payloads: colliding bursts and the weakest tail —
-multi-hypothesis collision decode is the shared next lever with ADS-B's
-last 8.
+**Collision decode (same day)**: AIS successive interference
+cancellation shipped — a confirmed FCS-valid burst is reconstructed
+exactly (the bits are known; the synthesis is the modulator's),
+least-squares scaled with its own CFO estimate, subtracted, and the
+residual re-hunted for a colliding burst. **No gain on this fixture**
+(the missing 17 never anchor at any threshold — they are the genuinely
+weakest tail, not collisions), but the machinery is in place for dense
+traffic. ADS-B in-frame collision scanning was tried and **falsified**
+on modes1 (−7 unique: mid-frame false DF11 candidates pollute the ICAO
+cache; the cache clock was moved from attempts to sightings as a
+lasting fix). The remaining gaps — AIS 17, ADS-B 8 — are deep-weak
+sensitivity and need either better front-end SNR or per-burst
+iterative refinement, not collision handling.
 
 Hard-won implementation notes: the template-correlation anchor MUST
 reject peaks near the search-window edge (the rising shoulder of a

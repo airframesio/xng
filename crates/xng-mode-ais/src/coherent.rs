@@ -156,6 +156,24 @@ fn gmsk_waveform(levels: &[f32]) -> Vec<Complex<f32>> {
     out
 }
 
+/// First FCS-valid candidate: returns (bits consumed incl. closing
+/// flag, the raw stuffed payload bits actually transmitted).
+fn first_valid(candidates: &[Vec<u8>]) -> Option<(usize, Vec<u8>)> {
+    for bits in candidates {
+        let mut df = crate::frame::HdlcDeframer::new();
+        for &b in &[0u8, 1, 1, 1, 1, 1, 1, 0] {
+            df.push_bit(b);
+        }
+        for (k, &b) in bits.iter().enumerate() {
+            if df.push_bit(b).is_some() {
+                // k is the index of the closing flag's final 0.
+                return Some((k + 1, bits[..k + 1].to_vec()));
+            }
+        }
+    }
+    None
+}
+
 pub struct CoherentDemod {
     buf: VecDeque<Complex<f32>>,
     /// Absolute index of buf[0] in the stream.
@@ -213,6 +231,41 @@ impl CoherentDemod {
                 if std::env::var("AIS_DEBUG").is_ok() {
                     eprintln!("try_decode at {}: {} candidate(s)", start, decoded.len());
                 }
+                // Successive interference cancellation: if a candidate
+                // is FCS-valid, reconstruct its exact burst (bits are
+                // known, the synthesis is the modulator's) and subtract;
+                // a colliding weaker burst then gets its own pass.
+                if let Some((_bits_used, frame_bits)) = first_valid(&decoded) {
+                    if let Some(residual) = self.subtract_burst(&window, &frame_bits) {
+                        // The colliding burst's template can sit anywhere
+                        // in the residual: scan for the best anchor.
+                        let tmpl_len = self.template.len();
+                        let mut best = (0.0f32, 0usize);
+                        let mut off = 0usize;
+                        while off + tmpl_len + SPB < residual.len() {
+                            let m = Self::template_metric(
+                                &self.template,
+                                &residual[off..off + tmpl_len],
+                            );
+                            if m > best.0 {
+                                best = (m, off);
+                            }
+                            off += 1;
+                        }
+                        if best.0 > CORR_THRESHOLD {
+                            let rescued = self.try_decode(&residual[best.1..]);
+                            if std::env::var("AIS_DEBUG").is_ok() {
+                                eprintln!(
+                                    "  SIC anchor m={:.3} at {}: {} candidate(s)",
+                                    best.0,
+                                    best.1,
+                                    rescued.len()
+                                );
+                            }
+                            out.extend(rescued);
+                        }
+                    }
+                }
                 out.extend(decoded);
                 self.pending = None;
                 self.cursor = start + tmpl_len as u64; // resume past the template
@@ -254,8 +307,86 @@ impl CoherentDemod {
         out
     }
 
+    /// Reconstruct a confirmed burst (template + raw payload bits) and
+    /// subtract it from the window; returns the residual for a second
+    /// decode pass, or None when the fit is implausible.
+    fn subtract_burst(
+        &self,
+        window: &[Complex<f32>],
+        payload_bits: &[u8],
+    ) -> Option<Vec<Complex<f32>>> {
+        // Synthesize the full transmitted waveform: template bits then
+        // the raw payload bits, NRZI → levels → GMSK.
+        let mut bits = Vec::with_capacity(TMPL_BITS + payload_bits.len());
+        for k in 0..16 {
+            bits.push((k % 2) as u8);
+        }
+        bits.extend([0, 1, 1, 1, 1, 1, 1, 0]);
+        bits.extend_from_slice(payload_bits);
+        let wave = gmsk_waveform(&nrzi_levels(&bits));
+        let n = wave.len().min(window.len());
+
+        // CFO estimate over the whole known waveform (phase slope of
+        // halves), then complex least-squares amplitude.
+        let mut c1 = Complex::new(0.0f32, 0.0);
+        let mut c2 = Complex::new(0.0f32, 0.0);
+        for k in 0..n {
+            let v = window[k] * wave[k].conj();
+            if k < n / 2 {
+                c1 += v;
+            } else {
+                c2 += v;
+            }
+        }
+        let dphi = (c2 * c1.conj()).arg();
+        let cfo_step = Complex::from_polar(1.0, dphi / (n as f32 / 2.0));
+        let mut rot = Complex::new(1.0f32, 0.0);
+        let mut num = Complex::new(0.0f32, 0.0);
+        let mut den = 0.0f32;
+        for k in 0..n {
+            let w = wave[k] * rot;
+            num += window[k] * w.conj();
+            den += w.norm_sqr();
+            rot *= cfo_step;
+        }
+        let scale = num / den.max(1e-12);
+        // Sanity: the fit must explain a meaningful share of the
+        // window energy, else subtraction just injects the template.
+        let fit_energy = scale.norm_sqr() * den;
+        let win_energy: f32 = window[..n].iter().map(|c| c.norm_sqr()).sum();
+        if fit_energy < 0.25 * win_energy {
+            return None;
+        }
+        let mut residual = window.to_vec();
+        let mut rot = Complex::new(1.0f32, 0.0);
+        for k in 0..n {
+            residual[k] -= scale * wave[k] * rot;
+            rot *= cfo_step;
+        }
+        Some(residual)
+    }
+
     /// Correlate the template over a short window after `rel`; returns
     /// the offset of an accepted anchor.
+    /// Differential-coherent template metric at one position (CFO-
+    /// immune: the four partial sums' magnitudes are rotation-
+    /// invariant).
+    fn template_metric(template: &[Complex<f32>], w: &[Complex<f32>]) -> f32 {
+        let tmpl_len = template.len();
+        let mut acc = [Complex::new(0.0f32, 0.0); 4];
+        let mut energy = 0.0f32;
+        for (k, &t) in template.iter().enumerate() {
+            let r = w[k];
+            acc[k * 4 / tmpl_len] += r * t.conj();
+            energy += r.norm_sqr();
+        }
+        if energy < 1e-12 {
+            return 0.0;
+        }
+        (acc[0].norm() + acc[1].norm() + acc[2].norm() + acc[3].norm())
+            / (energy * tmpl_len as f32).sqrt()
+    }
+
     fn hunt_template(&self, rel: usize) -> Option<usize> {
         let tmpl_len = self.template.len();
         let span = SPB * 64; // search ~64 bits ahead of the gate
@@ -265,24 +396,9 @@ impl CoherentDemod {
             if s0 + tmpl_len >= self.buf.len() {
                 break;
             }
-            // Differential-coherent metric is CFO-immune enough for the
-            // anchor: corr of (r·conj(template)) self-consistency via
-            // per-quarter-template phase agreement.
-            let mut acc = [Complex::new(0.0f32, 0.0); 4];
-            let mut energy = 0.0f32;
-            for (k, &t) in self.template.iter().enumerate() {
-                let r = self.buf[s0 + k];
-                acc[k * 4 / tmpl_len] += r * t.conj();
-                energy += r.norm_sqr();
-            }
-            if energy < 1e-12 {
-                continue;
-            }
-            // CFO rotates the four partial sums by a constant step;
-            // the magnitude of the differential combination is
-            // rotation-invariant.
-            let m = (acc[0].norm() + acc[1].norm() + acc[2].norm() + acc[3].norm())
-                / (energy * tmpl_len as f32).sqrt();
+            let w: Vec<Complex<f32>> =
+                self.buf.iter().skip(s0).take(tmpl_len).copied().collect();
+            let m = Self::template_metric(&self.template, &w);
             if m > best.0 {
                 best = (m, off);
             }

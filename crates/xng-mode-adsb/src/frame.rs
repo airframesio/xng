@@ -88,7 +88,6 @@ impl FrameValidator {
     /// Validate a demodulated candidate; returns a frame when parity
     /// checks out.
     pub fn validate(&mut self, bytes: &[u8], level_dbfs: f32) -> Option<AdsbFrame> {
-        self.counter += 1;
         let df = bytes[0] >> 3;
         // Syndrome = expected parity over the data bits XOR the received
         // parity field: 0 for clean parity, the overlaid address otherwise.
@@ -179,6 +178,11 @@ impl FrameValidator {
     }
 
     fn learn(&mut self, icao: u32) {
+        // The staleness clock ticks on sightings, not candidate
+        // attempts: near-floor gates plus in-frame collision scanning
+        // make attempt counts explode, and an attempt-based clock
+        // thrashes the cache (measured: −7 unique frames).
+        self.counter += 1;
         if self.icao_cache.len() >= ICAO_CACHE_MAX {
             // Drop the stalest half (rare; cheap enough).
             let cutoff = self.counter.saturating_sub((ICAO_CACHE_MAX / 2) as u64);
