@@ -58,7 +58,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
 | Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, **pager messages (IMS) with multi-part reassembly**, voice/IP-data tagging with AMBE payload extraction, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle |
 | AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM | Canonical published test vector |
-| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (global+local, airborne+surface), velocity/heading/vertical rate, squawk, altitude replies (Q-bit + Gillham), per-aircraft tracking, **SBS/BaseStation output** | Published reference vectors (1090 Riddle worked examples); zero false positives on noise |
+| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), per-aircraft tracking, **SBS + Beast outputs** | Published vectors (1090 Riddle) + field-exact vs pyModeS |
 
 All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
@@ -262,6 +262,7 @@ Every mode and every command shares the same output options:
 --jsonl messages.jsonl                         # JSONL file
 --metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels)
 --sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S)
+--beast 0.0.0.0:30005                          # Beast binary TCP (Mode S)
 --asf2-grpc http://ingest:6001                 # asf-2.0 over gRPC
 --asf2-quic ingest:6011                        # asf-2.0 over QUIC (TLS verified)
 ```

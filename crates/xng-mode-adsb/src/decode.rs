@@ -3,6 +3,8 @@
 //! as laid out in open references (notably "The 1090 Megahertz Riddle",
 //! Junzi Sun), validated against that book's worked examples.
 
+use crate::frame::IDENT_CHARSET;
+
 /// Number of latitude zones (NZ) for airborne CPR.
 const NZ: f64 = 15.0;
 
@@ -325,5 +327,196 @@ mod tests {
         let id: u32 = (1 << 12) /*C1*/ | (1 << 8) /*C4*/ | (1 << 5) /*B1*/
             | (1 << 3) /*B2*/ | (1 << 2) /*D2*/ | (1 << 0) /*D4*/;
         assert_eq!(squawk13(id), "0356");
+    }
+}
+
+// ── Comm-B (BDS register) inference ─────────────────────────────────
+// Layouts per the published Annex 10 / 1090-Riddle Comm-B chapter;
+// validity gates in the pyModeS style (MIT); validated field-exact
+// against pyModeS v3 on the vectors in the tests below.
+
+fn mb_bit(mb: &[u8], i: usize) -> u32 {
+    ((mb[(i - 1) / 8] >> (7 - (i - 1) % 8)) & 1) as u32
+}
+
+fn mb_field(mb: &[u8], start: usize, len: usize) -> u32 {
+    (start..start + len).fold(0, |v, i| (v << 1) | mb_bit(mb, i))
+}
+
+fn mb_signed(mb: &[u8], sign_bit: usize, start: usize, len: usize) -> i32 {
+    let v = mb_field(mb, start, len) as i32;
+    if mb_bit(mb, sign_bit) == 1 { v - (1 << len) } else { v }
+}
+
+/// BDS 2,0 — aircraft identification.
+pub fn bds20(mb: &[u8]) -> Option<serde_json::Value> {
+    if mb_field(mb, 1, 8) != 0x20 {
+        return None;
+    }
+    let mut cs = String::new();
+    for k in 0..8 {
+        let c = IDENT_CHARSET[mb_field(mb, 9 + 6 * k, 6) as usize];
+        if c == b'#' {
+            return None;
+        }
+        cs.push(c as char);
+    }
+    let cs = cs.trim_end().to_string();
+    if cs.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({ "bds": "2,0", "callsign": cs }))
+}
+
+/// BDS 4,0 — selected vertical intention.
+pub fn bds40(mb: &[u8]) -> Option<serde_json::Value> {
+    // Reserved bits 40..=47 and 52..=53 must be zero.
+    if mb_field(mb, 40, 8) != 0 || mb_field(mb, 52, 2) != 0 {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    if mb_bit(mb, 1) == 1 {
+        out.insert("selected_altitude_mcp".into(), (mb_field(mb, 2, 12) * 16).into());
+    }
+    if mb_bit(mb, 14) == 1 {
+        out.insert("selected_altitude_fms".into(), (mb_field(mb, 15, 12) * 16).into());
+    }
+    if mb_bit(mb, 27) == 1 {
+        let v = mb_field(mb, 28, 12) as f64 * 0.1 + 800.0;
+        if !(800.0..=1210.0).contains(&v) {
+            return None;
+        }
+        out.insert("baro_pressure_setting".into(), serde_json::json!(v));
+    }
+    if out.is_empty() {
+        return None;
+    }
+    out.insert("bds".into(), "4,0".into());
+    Some(serde_json::Value::Object(out))
+}
+
+/// BDS 5,0 — track and turn report.
+pub fn bds50(mb: &[u8]) -> Option<serde_json::Value> {
+    let roll = mb_signed(mb, 2, 3, 9) as f64 * 45.0 / 256.0;
+    let track = {
+        let v = mb_signed(mb, 13, 14, 10) as f64 * 90.0 / 512.0;
+        if v < 0.0 { v + 360.0 } else { v }
+    };
+    let gs = mb_field(mb, 25, 10) * 2;
+    let tas = mb_field(mb, 47, 10) * 2;
+    // Gates: all five status bits set, plausible kinematics.
+    for s in [1usize, 12, 24, 35, 46] {
+        if mb_bit(mb, s) == 0 {
+            return None;
+        }
+    }
+    if roll.abs() > 50.0 || gs > 600 || tas > 575 || gs == 0 || tas == 0 {
+        return None;
+    }
+    if (gs as f64 - tas as f64).abs() > 200.0 {
+        return None;
+    }
+    let track_rate = mb_signed(mb, 36, 37, 9) as f64 * 8.0 / 256.0;
+    Some(serde_json::json!({
+        "bds": "5,0",
+        "roll": roll,
+        "true_track": track,
+        "groundspeed": gs,
+        "track_rate": track_rate,
+        "true_airspeed": tas,
+    }))
+}
+
+/// BDS 6,0 — heading and speed report.
+pub fn bds60(mb: &[u8]) -> Option<serde_json::Value> {
+    for s in [1usize, 13, 24, 35, 46] {
+        if mb_bit(mb, s) == 0 {
+            return None;
+        }
+    }
+    let heading = {
+        let v = mb_signed(mb, 2, 3, 10) as f64 * 90.0 / 512.0;
+        if v < 0.0 { v + 360.0 } else { v }
+    };
+    let ias = mb_field(mb, 14, 10);
+    let mach = mb_field(mb, 25, 10) as f64 * 2.048 / 512.0;
+    let vr_baro = mb_signed(mb, 36, 37, 9) * 32;
+    let vr_ins = mb_signed(mb, 47, 48, 9) * 32;
+    if ias == 0 || ias > 500 || mach <= 0.0 || mach > 1.0 {
+        return None;
+    }
+    if vr_baro.abs() > 6000 || vr_ins.abs() > 6000 {
+        return None;
+    }
+    Some(serde_json::json!({
+        "bds": "6,0",
+        "magnetic_heading": heading,
+        "indicated_airspeed": ias,
+        "mach": (mach * 1000.0).round() / 1000.0,
+        "baro_vertical_rate": vr_baro,
+        "inertial_vertical_rate": vr_ins,
+    }))
+}
+
+/// Infer the BDS register of a DF20/21 MB field: accept only when
+/// exactly one decoder validates (the pyModeS approach).
+pub fn bds_infer(mb: &[u8]) -> Option<serde_json::Value> {
+    let cands: Vec<serde_json::Value> =
+        [bds20(mb), bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
+    match cands.len() {
+        1 => Some(cands.into_iter().next().unwrap()),
+        _ => None, // none or ambiguous
+    }
+}
+
+#[cfg(test)]
+mod bds_tests {
+    use super::*;
+
+    fn mb_of(frame_hex: &str) -> Vec<u8> {
+        (8..22)
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&frame_hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // Oracle: pyModeS v3 decode() on these frames (2026-06-11).
+
+    #[test]
+    fn bds20_callsign_matches_pymodes() {
+        let v = bds_infer(&mb_of("A000083E202CC371C31DE0AA1CCF")).unwrap();
+        assert_eq!(v["bds"], "2,0");
+        assert_eq!(v["callsign"], "KLM1017");
+    }
+
+    #[test]
+    fn bds40_selected_altitude_matches_pymodes() {
+        let v = bds_infer(&mb_of("A000029C85E42F313000007047D3")).unwrap();
+        assert_eq!(v["bds"], "4,0");
+        assert_eq!(v["selected_altitude_mcp"], 3008);
+        assert_eq!(v["selected_altitude_fms"], 3008);
+        assert_eq!(v["baro_pressure_setting"], 1020.0);
+    }
+
+    #[test]
+    fn bds50_track_turn_matches_pymodes() {
+        let v = bds_infer(&mb_of("A000139381951536E024D4CCF6B5")).unwrap();
+        assert_eq!(v["bds"], "5,0");
+        assert_eq!(v["roll"], 2.109375);
+        assert_eq!(v["true_track"], 114.2578125);
+        assert_eq!(v["groundspeed"], 438);
+        assert_eq!(v["track_rate"], 0.125);
+        assert_eq!(v["true_airspeed"], 424);
+    }
+
+    #[test]
+    fn bds60_heading_speed_matches_pymodes() {
+        let v = bds_infer(&mb_of("A00004128F39F91A7E27C46ADC21")).unwrap();
+        assert_eq!(v["bds"], "6,0");
+        assert_eq!(v["magnetic_heading"], 42.71484375);
+        assert_eq!(v["indicated_airspeed"], 252);
+        assert_eq!(v["mach"], 0.42);
+        assert_eq!(v["baro_vertical_rate"], -1920);
+        assert_eq!(v["inertial_vertical_rate"], -1920);
     }
 }

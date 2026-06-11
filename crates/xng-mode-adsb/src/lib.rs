@@ -39,6 +39,9 @@ pub struct AdsbDecoder {
     input_rate: f64,
     samples_seen: u64,
     track: HashMap<u32, AcState>,
+    /// Receiver location: reference for surface-position CPR (and a
+    /// fallback reference for the first airborne fix of an aircraft).
+    receiver: Option<(f64, f64)>,
 }
 
 impl AdsbDecoder {
@@ -50,7 +53,13 @@ impl AdsbDecoder {
             input_rate,
             samples_seen: 0,
             track: HashMap::new(),
+            receiver: None,
         })
+    }
+
+    /// Set the receiver location (enables surface-position decode).
+    pub fn set_receiver_position(&mut self, lat: f64, lon: f64) {
+        self.receiver = Some((lat, lon));
     }
 
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<frame::AdsbFrame> {
@@ -91,7 +100,9 @@ impl AdsbDecoder {
                 }
                 _ => None,
             },
-            _ => None,
+            // Surface with no fresh aircraft fix: the receiver location
+            // is the reference (surface targets are nearby by nature).
+            _ => self.receiver.map(|(rlat, rlon)| decode::cpr_local(cpr, rlat, rlon)),
         };
         let pos = pos.filter(|(lat, lon)| (-90.0..=90.0).contains(lat) && (-180.0..=180.0).contains(lon));
         if let Some((lat, lon)) = pos {
@@ -130,6 +141,7 @@ pub fn to_message(
             speed_type: f.velocity.map(|v| if v.airspeed { "AS".into() } else { "GS".into() }),
             track_deg: f.velocity.map(|v| v.track_deg),
             vertical_rate_fpm: f.velocity.and_then(|v| v.vertical_rate_fpm),
+            comm_b: f.comm_b.clone(),
         },
         raw: Some(f.bytes.clone()),
         source,

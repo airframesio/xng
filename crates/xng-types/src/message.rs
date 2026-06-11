@@ -110,6 +110,9 @@ pub enum MessageBody {
         track_deg: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         vertical_rate_fpm: Option<i32>,
+        /// Comm-B register content (BDS-inferred from DF20/21).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        comm_b: Option<serde_json::Value>,
     },
     /// Iridium frame (ring alert, broadcast, ...).
     Iridium {

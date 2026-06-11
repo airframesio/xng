@@ -13,7 +13,7 @@ use xng_dsp::checksum::mode_s_crc;
 
 /// Identification charset (TC 1–4): index 1–26 = A–Z, 32 = space,
 /// 48–57 = digits.
-const IDENT_CHARSET: &[u8; 64] =
+pub(crate) const IDENT_CHARSET: &[u8; 64] =
     b"#ABCDEFGHIJKLMNOPQRSTUVWXYZ##### ###############0123456789######";
 
 const ICAO_CACHE_MAX: usize = 8192;
@@ -38,6 +38,8 @@ pub struct AdsbFrame {
     pub velocity: Option<Velocity>,
     /// Resolved position (filled by the per-aircraft tracker).
     pub position: Option<(f64, f64)>,
+    /// Comm-B register content (DF20/21 MB field, BDS-inferred).
+    pub comm_b: Option<serde_json::Value>,
     /// Signal level at decode time.
     pub level_dbfs: f32,
 }
@@ -105,6 +107,7 @@ impl FrameValidator {
             cpr: None,
             velocity: None,
             position: None,
+            comm_b: None,
             level_dbfs,
         };
         match df {
@@ -113,11 +116,17 @@ impl FrameValidator {
             0 | 4 | 16 | 20 => {
                 let ac = ((bytes[2] as u32 & 0x1F) << 8) | bytes[3] as u32;
                 f.altitude_ft = decode::altitude13(ac);
+                if df == 20 && bytes.len() == 14 {
+                    f.comm_b = decode::bds_infer(&bytes[4..11]);
+                }
             }
             // Surveillance identity reply: 13-bit ID field → squawk.
             5 | 21 => {
                 let id = ((bytes[2] as u32 & 0x1F) << 8) | bytes[3] as u32;
                 f.squawk = Some(decode::squawk13(id));
+                if df == 21 && bytes.len() == 14 {
+                    f.comm_b = decode::bds_infer(&bytes[4..11]);
+                }
             }
             _ => {}
         }

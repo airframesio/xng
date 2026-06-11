@@ -49,6 +49,22 @@ struct TuneOpts {
     /// fit the capture width and CPU budget); decode/listen require it.
     #[arg(long, value_delimiter = ',')]
     channels: Vec<String>,
+    /// Receiver location as lat,lon (e.g. 38.69,-121.59) — enables
+    /// ADS-B surface-position decoding
+    #[arg(long)]
+    receiver_pos: Option<String>,
+}
+
+fn parse_receiver_pos(s: &Option<String>) -> anyhow::Result<Option<(f64, f64)>> {
+    match s {
+        None => Ok(None),
+        Some(v) => {
+            let (a, b) = v
+                .split_once(',')
+                .ok_or_else(|| anyhow::anyhow!("--receiver-pos wants lat,lon"))?;
+            Ok(Some((a.trim().parse()?, b.trim().parse()?)))
+        }
+    }
 }
 
 #[derive(Args)]
@@ -471,6 +487,7 @@ fn main() -> anyhow::Result<()> {
                         serial: None,
                     }),
                     outputs,
+                    receiver_pos: parse_receiver_pos(&tune.receiver_pos)?,
                 },
             )
         }
@@ -559,6 +576,7 @@ fn main() -> anyhow::Result<()> {
                     channels_hz,
                     station_ident: "XNG-TUI".into(),
                     sdr: None,
+                    receiver_pos: parse_receiver_pos(&tune.receiver_pos)?,
                     outputs: runtime::OutputConfig {
                         console: ConsoleFormat::Pretty,
                         jsonl: None,
@@ -665,6 +683,7 @@ fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) ->
                 serial,
             }),
             outputs,
+            receiver_pos: parse_receiver_pos(&tune.receiver_pos)?,
         },
     )
 }

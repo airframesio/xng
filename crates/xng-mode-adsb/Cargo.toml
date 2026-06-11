@@ -8,6 +8,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 chrono.workspace = true
 num-complex.workspace = true
 xng-dsp.workspace = true
