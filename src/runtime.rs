@@ -398,7 +398,10 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                     _ => 660.0,
                 };
                 move || {
-                    let mut reasm = xng_acars::reasm::Reassembler::new(reasm_timeout);
+                    let mut reasm = (
+                        xng_acars::reasm::Reassembler::new(reasm_timeout),
+                        xng_acars::miam::FileReassembler::new(),
+                    );
                     decode_loop(
                         &mut *source,
                         decoders,
@@ -441,7 +444,7 @@ pub(crate) fn decode_loop(
     bus: MessageBus,
     stop: Arc<AtomicBool>,
     live: Option<(Arc<LiveState>, u64, f64)>,
-    mut reasm: Option<&mut xng_acars::reasm::Reassembler>,
+    mut reasm: Option<&mut (xng_acars::reasm::Reassembler, xng_acars::miam::FileReassembler)>,
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
     use std::sync::atomic::Ordering as AtomOrd;
     let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
@@ -521,8 +524,8 @@ pub(crate) fn decode_loop(
                 if dedup.is_duplicate(&msg) {
                     continue;
                 }
-                if let Some(r) = reasm.as_deref_mut() {
-                    apply_reassembly(&mut msg, r);
+                if let Some((r, files)) = reasm.as_deref_mut() {
+                    apply_reassembly(&mut msg, r, files);
                 }
                 bus.publish(msg);
             }
@@ -581,13 +584,28 @@ impl DedupFilter {
 /// completes, replace the text with the full assembly and re-run the
 /// application layer over it (long CPDLC/OHMA/MIAM payloads only decode
 /// from complete text).
-fn apply_reassembly(msg: &mut Message, r: &mut xng_acars::reasm::Reassembler) {
+fn apply_reassembly(
+    msg: &mut Message,
+    r: &mut xng_acars::reasm::Reassembler,
+    files: &mut xng_acars::miam::FileReassembler,
+) {
     use xng_acars::reasm::Reasm;
     let MessageBody::Acars(core) = &mut msg.body else { return };
     if !msg.decode.crc_ok {
         return;
     }
     let now = msg.timestamp.timestamp_millis() as f64 / 1e3;
+    // MIAM file transfers span many label-MA messages; on completion
+    // the combined CORE PDU is attached to the closing segment.
+    if core.label == "MA" {
+        if let Some(tail) = core.tail.clone() {
+            if let Some(pdu) = files.push(&tail, &core.text, now) {
+                let mut app = core.app.take().unwrap_or_else(|| serde_json::json!({}));
+                app["miam_file_complete"] = serde_json::to_value(&pdu).unwrap_or_default();
+                core.app = Some(app);
+            }
+        }
+    }
     if let Reasm::Complete(full) = r.push(core, now) {
         let downlink = core.block_id.is_some_and(|b| b.is_ascii_digit());
         let dec = xng_acars::decode(&core.label, &full, downlink);
