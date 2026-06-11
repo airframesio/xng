@@ -53,6 +53,13 @@ struct TuneOpts {
     /// ADS-B surface-position decoding
     #[arg(long)]
     receiver_pos: Option<String>,
+    /// Only pass ACARS messages with these labels (comma separated,
+    /// e.g. H1,Q0). Non-ACARS messages always pass.
+    #[arg(long, value_delimiter = ',')]
+    filter_labels: Vec<String>,
+    /// Drop ACARS messages with these labels (comma separated)
+    #[arg(long, value_delimiter = ',')]
+    exclude_labels: Vec<String>,
 }
 
 fn parse_receiver_pos(s: &Option<String>) -> anyhow::Result<Option<(f64, f64)>> {
@@ -117,6 +124,13 @@ struct OutputOpts {
     /// (shown in console output)
     #[arg(long)]
     gs_file: Option<PathBuf>,
+    /// Publish messages as JSON to an MQTT broker
+    /// (mqtt://[user:pass@]host[:port])
+    #[arg(long)]
+    mqtt: Option<String>,
+    /// MQTT topic prefix; messages publish to <prefix>/<mode>
+    #[arg(long, default_value = "xng")]
+    mqtt_topic: String,
 }
 
 impl OutputOpts {
@@ -156,6 +170,8 @@ impl OutputOpts {
                 sbs: self.sbs.clone(),
                 beast: self.beast.clone(),
                 nmea_tcp: self.nmea_tcp.clone(),
+                mqtt: self.mqtt.clone(),
+                mqtt_topic: self.mqtt_topic.clone(),
             },
             ident,
         ))
@@ -504,6 +520,10 @@ fn main() -> anyhow::Result<()> {
                     }),
                     outputs,
                     receiver_pos: parse_receiver_pos(&tune.receiver_pos)?,
+                    label_filter: runtime::LabelFilter {
+                        include: tune.filter_labels.clone(),
+                        exclude: tune.exclude_labels.clone(),
+                    },
                 },
             )
         }
@@ -593,6 +613,10 @@ fn main() -> anyhow::Result<()> {
                     station_ident: "XNG-TUI".into(),
                     sdr: None,
                     receiver_pos: parse_receiver_pos(&tune.receiver_pos)?,
+                    label_filter: runtime::LabelFilter {
+                        include: tune.filter_labels.clone(),
+                        exclude: tune.exclude_labels.clone(),
+                    },
                     outputs: runtime::OutputConfig {
                         console: ConsoleFormat::Pretty,
                         jsonl: None,
@@ -604,6 +628,8 @@ fn main() -> anyhow::Result<()> {
                         sbs: None,
                         beast: None,
                         nmea_tcp: None,
+                        mqtt: None,
+                        mqtt_topic: "xng".into(),
                     },
                 },
             )
@@ -702,6 +728,10 @@ fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) ->
             }),
             outputs,
             receiver_pos: parse_receiver_pos(&tune.receiver_pos)?,
+                    label_filter: runtime::LabelFilter {
+                        include: tune.filter_labels.clone(),
+                        exclude: tune.exclude_labels.clone(),
+                    },
         },
     )
 }

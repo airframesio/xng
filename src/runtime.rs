@@ -40,6 +40,10 @@ pub struct OutputConfig {
     pub beast: Option<String>,
     /// NMEA (AIVDM) TCP server address.
     pub nmea_tcp: Option<String>,
+    /// MQTT broker URL (mqtt://[user:pass@]host[:port]).
+    pub mqtt: Option<String>,
+    /// MQTT topic prefix (messages publish to `<prefix>/<mode>`).
+    pub mqtt_topic: String,
 }
 
 pub struct SessionConfig {
@@ -51,6 +55,31 @@ pub struct SessionConfig {
     pub outputs: OutputConfig,
     /// Receiver location (lat, lon) — enables ADS-B surface decode.
     pub receiver_pos: Option<(f64, f64)>,
+    /// ACARS label filter applied before messages reach the bus.
+    pub label_filter: LabelFilter,
+}
+
+/// Keep/drop filter on the ACARS label. Non-ACARS messages always
+/// pass. An empty filter passes everything.
+#[derive(Clone, Default)]
+pub struct LabelFilter {
+    /// When non-empty, only these labels pass.
+    pub include: Vec<String>,
+    /// Labels dropped even if included.
+    pub exclude: Vec<String>,
+}
+
+impl LabelFilter {
+    pub fn allows(&self, msg: &Message) -> bool {
+        let label = match &msg.body {
+            xng_types::MessageBody::Acars(a) => &a.label,
+            _ => return true,
+        };
+        if !self.include.is_empty() && !self.include.iter().any(|l| l == label) {
+            return false;
+        }
+        !self.exclude.iter().any(|l| l == label)
+    }
 }
 
 const READ_CHUNK: usize = 65_536;
@@ -374,6 +403,17 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
             let rx = bus.subscribe();
             output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr)));
         }
+        if let Some(url) = cfg.outputs.mqtt.clone() {
+            let rx = bus.subscribe();
+            let topic = cfg.outputs.mqtt_topic.clone();
+            let station = cfg.station_ident.clone();
+            output_tasks.push(tokio::spawn(async move {
+                if let Err(e) = crate::outputs::mqtt::run(rx, url, topic, station).await {
+                    tracing::error!("mqtt output: {e}");
+                }
+                Ok(())
+            }));
+        }
         if let Some(url) = cfg.outputs.asf2_grpc.clone() {
             let rx = bus.subscribe();
             let (id, ident) = (station.id.to_string(), station.ident.clone());
@@ -423,6 +463,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                         stop,
                         Some((live, capture_center, sample_rate)),
                         Some(&mut reasm),
+                        cfg.label_filter,
                     )
                 }
             }
@@ -457,6 +498,7 @@ pub(crate) fn decode_loop(
     stop: Arc<AtomicBool>,
     live: Option<(Arc<LiveState>, u64, f64)>,
     mut reasm: Option<&mut (xng_acars::reasm::Reassembler, xng_acars::miam::FileReassembler)>,
+    label_filter: LabelFilter,
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
     use std::sync::atomic::Ordering as AtomOrd;
     let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
@@ -538,6 +580,9 @@ pub(crate) fn decode_loop(
                 }
                 if let Some((r, files)) = reasm.as_deref_mut() {
                     apply_reassembly(&mut msg, r, files);
+                }
+                if !label_filter.allows(&msg) {
+                    continue;
                 }
                 bus.publish(msg);
             }
@@ -661,4 +706,48 @@ pub(crate) fn build_decoders(
         decoders.push((freq, dec));
     }
     Ok(decoders)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acars_msg(label: &str) -> Message {
+        Message {
+            mode: Mode::AcarsPoa,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 131_550_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: xng_types::MessageBody::Acars(xng_types::AcarsCore {
+                label: label.into(),
+                ..Default::default()
+            }),
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("XX-TEST"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn label_filter_include_exclude() {
+        let empty = LabelFilter::default();
+        assert!(empty.allows(&acars_msg("H1")));
+
+        let only_h1 = LabelFilter { include: vec!["H1".into()], exclude: vec![] };
+        assert!(only_h1.allows(&acars_msg("H1")));
+        assert!(!only_h1.allows(&acars_msg("Q0")));
+
+        let no_q0 = LabelFilter { include: vec![], exclude: vec!["Q0".into()] };
+        assert!(no_q0.allows(&acars_msg("H1")));
+        assert!(!no_q0.allows(&acars_msg("Q0")));
+
+        // exclude wins over include
+        let both = LabelFilter { include: vec!["Q0".into()], exclude: vec!["Q0".into()] };
+        assert!(!both.allows(&acars_msg("Q0")));
+    }
 }

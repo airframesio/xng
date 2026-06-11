@@ -413,6 +413,7 @@ fn dwell(
         station_ident: "XNG-SURVEY".into(),
         sdr: None,
         receiver_pos: None,
+        label_filter: Default::default(),
         outputs: runtime::OutputConfig {
             console: ConsoleFormat::Pretty,
             jsonl: None,
@@ -424,6 +425,8 @@ fn dwell(
             sbs: None,
             beast: None,
             nmea_tcp: None,
+            mqtt: None,
+            mqtt_topic: "xng".into(),
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;
@@ -449,6 +452,7 @@ fn dwell(
         stop,
         Some((live.clone(), center, rate)),
         None,
+        Default::default(),
     )?;
     let _ = stop_thread.join();
     let levels = live.stats.lock().unwrap().clone();
