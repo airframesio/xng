@@ -52,7 +52,7 @@ const CORR_THRESHOLD: f32 = 0.6;
 /// fit for a candidate to count as a UW (true preambles on the off-air
 /// capture fit below ~0.11; random data above ~0.5).
 const FIT_COST_MAX: f32 = 0.25;
-const ENERGY_FACTOR: f32 = 6.0;
+const ENERGY_FACTOR: f32 = 12.0;
 const NOISE_ALPHA: f32 = 1e-4;
 const PHASE_GAIN: f32 = 0.1;
 
@@ -256,10 +256,17 @@ impl Vdl2Demod {
             self.cursor += 1.0;
             let rel = (pos - self.start_abs) as usize;
             let p = self.buf[rel].norm_sqr();
-            self.noise += NOISE_ALPHA * (p - self.noise);
+            // Gated noise estimator: never learn the floor from burst
+            // power (a strong burst otherwise inflates the floor for
+            // ~0.1 s and shadows rapid back-to-back transmissions —
+            // measured: 17 → 20+ frames on the off-air capture).
             if p < self.noise * ENERGY_FACTOR {
+                self.noise += NOISE_ALPHA * (p - self.noise);
                 continue;
             }
+            // Tiny up-creep so the floor can re-converge if it ever
+            // starts far too low.
+            self.noise *= 1.0 + NOISE_ALPHA * 0.1;
             if let Some((metric, _)) = self.uw_correlate(pos) {
                 if metric > CORR_THRESHOLD {
                     // Coherent refinement: joint timing/CFO fit over the
@@ -287,7 +294,12 @@ impl Vdl2Demod {
         loop {
             if c.needed.is_none() && c.bits.len() >= HEADER_BITS {
                 let hdr: [u8; HEADER_BITS] = c.bits[..HEADER_BITS].try_into().unwrap();
+                // Real VDL2 bursts top out near a couple of thousand
+                // bits; a huge length is a false lock whose bogus header
+                // passed FEC — collecting seconds of "burst" for it
+                // starves hunting and pollutes the failure statistics.
                 match header::decode(&hdr)
+                    .filter(|&tl| tl <= 16_000)
                     .and_then(|tl| interleave::layout(tl as usize))
                 {
                     Some(lay) => c.needed = Some(HEADER_BITS + lay.total_tx_bits),
@@ -371,6 +383,9 @@ impl Vdl2Demod {
                             rs,
                         ) {
                             Some((avlc_bits, fixed, soft)) => {
+                                if std::env::var("VDL2_DEBUG").is_ok() {
+                                    eprintln!("RSOK   tl_bits={tl_bits} syms={} soft={soft}", n / 3);
+                                }
                                 STAT_BURST_OK.fetch_add(1, AOrd::Relaxed);
                                 if soft {
                                     STAT_SOFT_OK.fetch_add(1, AOrd::Relaxed);
@@ -389,6 +404,9 @@ impl Vdl2Demod {
                                 }
                             }
                             None => {
+                                if std::env::var("VDL2_DEBUG").is_ok() {
+                                    eprintln!("RSFAIL tl_bits={tl_bits} syms={}", n / 3);
+                                }
                                 STAT_RS_FAIL.fetch_add(1, AOrd::Relaxed);
                                 self.last_rs_fail = c.uw_start;
                                 // A false UW lock (e.g. on a burst edge) can

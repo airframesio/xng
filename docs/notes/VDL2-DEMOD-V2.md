@@ -204,3 +204,27 @@ the 17-vs-41 gap to dumpvdl2 lives in raw demodulation quality
 machinery ships because it is free on the happy path, regression-proof
 by construction, observable live (soft_ok counter), and exactly
 targets the 4-bad-octet bursts that real reception produces.
+
+## The gate, not the slicer (2026-06): 16-17 → 19 frames
+
+The dumpvdl2 oracle audit flipped the weak-burst theory: 40 of its 41
+frames sit at 24-30 dB SNR — the missing frames were STRONG. Two real
+culprits found by instrumenting per-burst lengths and SNRs:
+
+1. **False-lock monsters**: bogus headers passing the 25-bit FEC with
+   absurd lengths (up to 112k bits = 3.4 s of "collection"). Now capped
+   at 16k bits in the demod acceptance.
+2. **Noise-floor inflation**: the energy gate's EMA learned from burst
+   power during post-rewind rescans, inflating the floor for ~0.1 s and
+   shadowing rapid back-to-back transmissions (XID/ack exchanges — the
+   exact pattern in the capture). The estimator is now gated: it only
+   learns from samples below the gate, with a tiny up-creep for
+   re-convergence. Result: 19 frames at every capture rate (50 kS/s:
+   16 → 19, 100 kS/s: 17 → 19), and the frame count is flat across
+   ENERGY_FACTOR 8-20 and trigger threshold 0.4-0.6 where the old
+   estimator wobbled 17-20.
+
+Remaining gap (19 vs 41): the oracle decodes multiple frames from
+burst sequences we still partially miss; next instrumentation step is
+time-aligning our decoded burst list against dumpvdl2's per-burst
+timestamps to see exactly which transmissions remain.
