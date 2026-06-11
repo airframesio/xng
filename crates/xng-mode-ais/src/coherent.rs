@@ -38,6 +38,81 @@ fn sample_frac(w: &[Complex<f32>], pos: f32) -> Complex<f32> {
     w[i] * (1.0 - f) + w[i + 1] * f
 }
 
+/// GMSK (BT = 0.4) integrated phase pulse q̃(t): 0 → 1 over ±2 bit
+/// periods (same Gaussian math as the test modulator).
+fn gmsk_qtilde(t: f32) -> f32 {
+    // Integral of the Gaussian frequency pulse; erf approximation
+    // (Abramowitz–Stegun 7.1.26).
+    let erf = |x: f32| -> f32 {
+        let s = if x < 0.0 { -1.0 } else { 1.0 };
+        let x = x.abs();
+        let t = 1.0 / (1.0 + 0.327_591_1 * x);
+        let y = 1.0
+            - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t
+                - 0.284_496_736)
+                * t
+                + 0.254_829_592)
+                * t
+                * (-x * x).exp();
+        s * y
+    };
+    const BT: f32 = 0.4;
+    let a = (2.0 * PI / (2.0f32.ln()).sqrt()) * BT;
+    // q̃(t) = ∫_{-∞}^{t} g; with g = (erf-difference)/2 form, integrate
+    // numerically once over a fine grid (cached).
+    // Cheap closed-enough form: integrate g(u) du with small steps.
+    let mut acc = 0.0f32;
+    let mut u = -3.0f32;
+    while u < t.min(3.0) {
+        let g = 0.5 * (erf(a * (u + 0.5) / std::f32::consts::SQRT_2)
+            - erf(a * (u - 0.5) / std::f32::consts::SQRT_2));
+        acc += g * 0.01;
+        u += 0.01;
+    }
+    if t >= 3.0 { 1.0 } else { acc.clamp(0.0, 1.0) }
+}
+
+/// Per-(prev,cur,next) middle-bit waveforms: 5 samples of relative
+/// phase (radians) above the completed-pulse reference, plus the
+/// quadrant advance contributed when `prev` completes.
+fn gmsk_bit_waveforms() -> [[f32; SPB]; 8] {
+    let mut out = [[0.0f32; SPB]; 8];
+    for (idx, w) in out.iter_mut().enumerate() {
+        let lp = if idx & 4 != 0 { 1.0f32 } else { -1.0 };
+        let lc = if idx & 2 != 0 { 1.0f32 } else { -1.0 };
+        let ln = if idx & 1 != 0 { 1.0f32 } else { -1.0 };
+        for (j, v) in w.iter_mut().enumerate() {
+            let t = (j as f32 + 0.5) / SPB as f32; // within [0,1) of cur bit
+            // φ_rel(t) = (π/2)[ lp·q̃(t+1) + lc·q̃(t) + ln·q̃(t−1) ]
+            // minus lp's completed value at the window start reference
+            // (the state's quadrant holds Σ levels through prev−1, and
+            // prev's pulse is still partially in flight).
+            *v = (PI / 2.0)
+                * (lp * gmsk_qtilde(t + 1.0) + lc * gmsk_qtilde(t) + ln * gmsk_qtilde(t - 1.0));
+        }
+    }
+    out
+}
+
+/// MSK (rectangular frequency) waveform table in the same
+/// (prev,cur,next) format: the phase ramp depends on `cur` only.
+/// Real transmitters vary in pulse shaping; the decoder runs both
+/// hypotheses per burst and the HDLC FCS arbitrates.
+fn msk_bit_waveforms() -> [[f32; SPB]; 8] {
+    let mut out = [[0.0f32; SPB]; 8];
+    for (idx, w) in out.iter_mut().enumerate() {
+        let lc = if idx & 2 != 0 { 1.0f32 } else { -1.0 };
+        let lp = if idx & 4 != 0 { 1.0f32 } else { -1.0 };
+        for (j, v) in w.iter_mut().enumerate() {
+            // Completed-pulse reference matches the GMSK convention:
+            // prev contributes its full remaining half above the
+            // reference (q̃ → step at 0.5 for MSK), i.e. lp·π/4 + ramp.
+            *v = lp * PI / 4.0 + lc * PI / 2.0 * (j as f32 + 0.5) / SPB as f32;
+        }
+    }
+    out
+}
+
 /// NRZI level sequence (±1) for a bit pattern, starting from +1.
 fn nrzi_levels(bits: &[u8]) -> Vec<f32> {
     let mut level = 1.0f32;
@@ -51,15 +126,32 @@ fn nrzi_levels(bits: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-/// MSK baseband for a level sequence: phase ramps ±π/2 per bit.
-fn msk_waveform(levels: &[f32]) -> Vec<Complex<f32>> {
-    let mut phase = 0.0f32;
-    let mut out = Vec::with_capacity(levels.len() * SPB);
-    for &l in levels {
-        for _ in 0..SPB {
-            phase += l * PI / 2.0 / SPB as f32;
+/// GMSK baseband for a level sequence (BT = 0.4 pulse), preceded and
+/// followed by an implicit continuation of the edge levels.
+fn gmsk_waveform(levels: &[f32]) -> Vec<Complex<f32>> {
+    let n = levels.len();
+    let mut out = Vec::with_capacity(n * SPB);
+    let lvl = |i: i64| -> f32 {
+        if i < 0 {
+            levels[0]
+        } else if i as usize >= n {
+            levels[n - 1]
+        } else {
+            levels[i as usize]
+        }
+    };
+    let mut completed = 0.0f32; // Σ levels of fully past pulses
+    for k in 0..n as i64 {
+        for j in 0..SPB {
+            let t = (j as f32 + 0.5) / SPB as f32;
+            let phase = (PI / 2.0)
+                * (completed
+                    + lvl(k - 1) * gmsk_qtilde(t + 1.0)
+                    + lvl(k) * gmsk_qtilde(t)
+                    + lvl(k + 1) * gmsk_qtilde(t - 1.0));
             out.push(Complex::from_polar(1.0, phase));
         }
+        completed += lvl(k - 1);
     }
     out
 }
@@ -85,7 +177,7 @@ impl CoherentDemod {
         }
         tmpl_bits.extend([0, 1, 1, 1, 1, 1, 1, 0]);
         debug_assert_eq!(tmpl_bits.len(), TMPL_BITS);
-        let template = msk_waveform(&nrzi_levels(&tmpl_bits));
+        let template = gmsk_waveform(&nrzi_levels(&tmpl_bits));
         Self {
             buf: VecDeque::new(),
             base: 0,
@@ -119,11 +211,9 @@ impl CoherentDemod {
                     self.buf.iter().skip(s0).take(burst_len).copied().collect();
                 let decoded = self.try_decode(&window);
                 if std::env::var("AIS_DEBUG").is_ok() {
-                    eprintln!("try_decode at {}: {}", start, decoded.is_some());
+                    eprintln!("try_decode at {}: {} candidate(s)", start, decoded.len());
                 }
-                if let Some(bits) = decoded {
-                    out.push(bits);
-                }
+                out.extend(decoded);
                 self.pending = None;
                 self.cursor = start + tmpl_len as u64; // resume past the template
                 continue;
@@ -208,8 +298,23 @@ impl CoherentDemod {
         (best.0 > CORR_THRESHOLD && best.1 + SPB * 8 < span).then_some(best.1)
     }
 
-    /// Anchor accepted: estimate CFO + phase, Viterbi the payload.
-    fn try_decode(&self, window: &[Complex<f32>]) -> Option<Vec<u8>> {
+    /// Anchor accepted: estimate CFO + phase, Viterbi the payload with
+    /// both pulse-shape hypotheses (GMSK BT=0.4 and MSK).
+    fn try_decode(&self, window: &[Complex<f32>]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for table in [gmsk_bit_waveforms(), msk_bit_waveforms()] {
+            if let Some(bits) = self.try_decode_with(window, &table) {
+                out.push(bits);
+            }
+        }
+        out
+    }
+
+    fn try_decode_with(
+        &self,
+        window: &[Complex<f32>],
+        wf: &[[f32; SPB]; 8],
+    ) -> Option<Vec<u8>> {
         let tmpl_len = self.template.len();
         // CFO estimate: maximize coherent template correlation on a grid.
         let mut best: Option<(f32, f32, Complex<f32>)> = None; // (|corr|, cfo, corr)
@@ -285,97 +390,92 @@ impl CoherentDemod {
         let step = Complex::from_polar(1.0, -2.0 * PI * cfo / self.fs);
         let mut rot = Complex::from_polar(1.0, -phase0)
             * Complex::from_polar(1.0, -2.0 * PI * cfo / self.fs * tmpl_len as f32);
-        // The template waveform ends at a known phase; remove it so the
-        // trellis starts at quadrant 0.
-        let tmpl_end_phase = self.template.last().unwrap().arg();
-        rot *= Complex::from_polar(1.0, -tmpl_end_phase);
 
-        let payload = &window[tmpl_len..];
+
+        // Start one bit early, on the template's KNOWN last bit: it
+        // anchors the state (quadrant + both in-flight levels) and the
+        // window boundary; its emission is dropped below.
+        let payload = &window[tmpl_len - SPB..];
         let nbits = payload.len() / SPB;
 
-        // 4-state Viterbi over the phase quadrant; transitions are
-        // level ±1 advancing the quadrant by ±1 (π/2). NRZI: the data
-        // bit is 1 when the level repeats, 0 when it toggles — that
-        // needs the previous level, so the state is (quadrant, level):
-        // 8 states.
-        const NS: usize = 8; // quadrant(4) × prev level(2)
+        // GMSK-exact MLSE: state = (quadrant of completed pulses,
+        // l_prev, l_cur) — 16 states; branch chooses l_next. The branch
+        // waveform for the current bit window is the true BT=0.4 pulse
+        // shape for (l_prev, l_cur, l_next); the quadrant advances by
+        // l_prev as its pulse completes. NRZI emits inside transitions.
+        const NS: usize = 16;
         let mut metric = [f32::NEG_INFINITY; NS];
-        // Start: quadrant 0; the template's last level is known: the
-        // flag ends …1110 → last bit 0 toggles; template levels end at
-        // a deterministic level. nrzi_levels start +1 over the 24 tmpl
-        // bits: recompute to know the final level.
+        // Template levels end deterministically; both sign hypotheses
+        // (the carrier-phase estimate absorbs a π flip).
         let mut tmpl_bits = Vec::new();
         for k in 0..16 {
             tmpl_bits.push((k % 2) as u8);
         }
         tmpl_bits.extend([0, 1, 1, 1, 1, 1, 1, 0]);
-        let last_level = *nrzi_levels(&tmpl_bits).last().unwrap();
-        let l0 = if last_level > 0.0 { 1usize } else { 0 };
-        metric[l0] = 0.0; // quadrant 0, known level
-        // Also allow the opposite-sign anchor (template sign ambiguity
-        // is absorbed by phase0, so quadrant 2 with flipped level):
-        metric[2 * 2 + (1 - l0)] = 0.0;
+        let lv = nrzi_levels(&tmpl_bits);
+        let n_t = lv.len();
+        // State for the template's last-bit window (fully known):
+        // quadrant = completed pulses through template[n−3] (matching
+        // gmsk_waveform's accumulation, which starts with the
+        // continuation pseudo-pulse lvl(−1) = levels[0]).
+        let completed: f32 = lv[0] + lv[..n_t - 2].iter().sum::<f32>();
+        let q0 = (completed as i32).rem_euclid(4) as usize;
+        let lp0 = (lv[n_t - 2] > 0.0) as usize;
+        let lc0 = (lv[n_t - 1] > 0.0) as usize;
+        metric[(q0 << 2) | (lp0 << 1) | lc0] = 0.0;
+        // π-flip image (carrier-phase sign ambiguity).
+        metric[(((q0 + 2) % 4) << 2) | ((1 - lp0) << 1) | (1 - lc0)] = 0.0;
 
         let mut paths: Vec<Vec<u8>> = vec![Vec::with_capacity(nbits); NS];
         let mut rot_k = rot;
-        // Decision-directed phase tracking: the residual angle of each
-        // bit's winning correlation drives a slow trim that absorbs the
-        // remaining CFO error and the GMSK-vs-MSK pulse mismatch.
         let mut trim = Complex::new(1.0f32, 0.0);
         const PHASE_GAIN: f32 = 0.25;
         for bit in 0..nbits {
-            // Precompute the two expected bit waveforms (level ±1) from
-            // quadrant 0; other quadrants are i^q rotations.
-            let s = &payload[bit * SPB..(bit + 1) * SPB];
-            // Correlate against +level ramp and −level ramp.
-            let mut c_up = Complex::new(0.0f32, 0.0);
-            let mut c_dn = Complex::new(0.0f32, 0.0);
+            let sm = &payload[bit * SPB..(bit + 1) * SPB];
+            // Pre-rotate the received samples once.
             let mut r = rot_k;
-            for (k, &x) in s.iter().enumerate() {
-                let ph = (k as f32 + 0.5) * PI / 2.0 / SPB as f32;
-                let xr = x * r * trim;
-                c_up += xr * Complex::from_polar(1.0, ph).conj();
-                c_dn += xr * Complex::from_polar(1.0, -ph).conj();
+            let mut rx = [Complex::new(0.0f32, 0.0); SPB];
+            for (j, &x) in sm.iter().enumerate() {
+                rx[j] = x * r * trim;
                 r *= step;
             }
             rot_k = r;
 
-            let mut nm = [f32::NEG_INFINITY; NS];
-            let mut np: Vec<Vec<u8>> = vec![Vec::new(); NS];
-            for q in 0..4 {
-                // Quadrant rotation: expected waveform × i^q ⇒ correlate
-                // received × conj(i^q).
-                let qrot = Complex::from_polar(1.0, -(q as f32) * PI / 2.0);
-                let up = (c_up * qrot).re;
-                let dn = (c_dn * qrot).re;
-                for lev in 0..2 {
-                    let st = q * 2 + lev;
-                    if metric[st] == f32::NEG_INFINITY {
-                        continue;
-                    }
-                    for (new_lev, gain, dq) in [(1usize, up, 1i32), (0usize, dn, -1)] {
-                        let nq = ((q as i32 + dq).rem_euclid(4)) as usize;
-                        let nst = nq * 2 + new_lev;
-                        let m = metric[st] + gain;
-                        if m > nm[nst] {
-                            nm[nst] = m;
-                            let mut p = paths[st].clone();
-                            // NRZI: 1 = level unchanged, 0 = toggled.
-                            p.push((new_lev == lev) as u8);
-                            np[nst] = p;
-                        }
-                    }
+            // Correlations against the 8 context waveforms (quadrant 0).
+            let mut cw = [Complex::new(0.0f32, 0.0); 8];
+            for (w_idx, c) in cw.iter_mut().enumerate() {
+                for j in 0..SPB {
+                    *c += rx[j] * Complex::from_polar(1.0, wf[w_idx][j]).conj();
                 }
             }
-            // Phase trim from the globally best branch this bit: its
-            // correlation should be real-positive; rotate against the
-            // residual.
+
+            let mut nm = [f32::NEG_INFINITY; NS];
+            let mut np: Vec<Vec<u8>> = vec![Vec::new(); NS];
             let mut best_resid: Option<(f32, Complex<f32>)> = None;
-            for q in 0..4 {
+            for st in 0..NS {
+                if metric[st] == f32::NEG_INFINITY {
+                    continue;
+                }
+                let q = st >> 2;
+                let lp = (st >> 1) & 1;
+                let lc = st & 1;
                 let qrot = Complex::from_polar(1.0, -(q as f32) * PI / 2.0);
-                for c in [c_up * qrot, c_dn * qrot] {
-                    if best_resid.is_none() || c.re > best_resid.unwrap().0 {
-                        best_resid = Some((c.re, c));
+                for ln in 0..2usize {
+                    let w_idx = (lp << 2) | (lc << 1) | ln;
+                    let c = cw[w_idx] * qrot;
+                    let m = metric[st] + c.re;
+                    // Next state: quadrant advances by l_prev (±1).
+                    let nq = if lp == 1 { (q + 1) % 4 } else { (q + 3) % 4 };
+                    let nst = (nq << 2) | (lc << 1) | ln;
+                    if m > nm[nst] {
+                        nm[nst] = m;
+                        let mut pth = paths[st].clone();
+                        // NRZI for bit k: 1 = level repeated (l_k == l_{k−1}).
+                        pth.push((lc == lp) as u8);
+                        np[nst] = pth;
+                        if best_resid.is_none() || c.re > best_resid.unwrap().0 {
+                            best_resid = Some((c.re, c));
+                        }
                     }
                 }
             }
@@ -392,8 +492,10 @@ impl CoherentDemod {
         if metric[bestst] == f32::NEG_INFINITY {
             return None;
         }
-        Some(paths[bestst].clone())
+        // First emission is the known template bit — drop it.
+        Some(paths[bestst][1..].to_vec())
     }
+
 }
 
 #[cfg(test)]
@@ -410,7 +512,7 @@ mod tests {
         }
         bits.extend([0, 1, 1, 1, 1, 1, 1, 0]);
         let levels = nrzi_levels(&bits);
-        let tmpl = msk_waveform(&levels);
+        let tmpl = gmsk_waveform(&levels);
         assert_eq!(tmpl.len(), TMPL_BITS * SPB);
         let last = tmpl.last().unwrap();
         assert!((last.norm() - 1.0).abs() < 1e-5);

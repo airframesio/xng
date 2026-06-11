@@ -79,9 +79,25 @@ coherent path runs 40/40 at 6.2 dB and 30/40 at 0.9 dB) and the
 off-air capture from 6 to **24 unique payloads** (45 % of
 AIS-catcher, still a clean subset). **Fractional-timing refinement** (sub-sample template offsets,
 window resampled at the winner) followed: 24 → 26 unique payloads
-(49 % of AIS-catcher), bench fixture 36 → 39 frames. The remaining
-gap is GMSK-pulse-exact branch metrics and multi-hypothesis decoding
-of colliding bursts.
+(49 % of AIS-catcher), bench fixture 36 → 39 frames.
+
+**GMSK-exact MLSE (same day): 26 → 36 unique (68 %), fixture
+39 → 51 frames.** The trellis is now 16-state
+(phase-quadrant × two in-flight levels) with branch waveforms
+synthesized from the true BT=0.4 Gaussian phase pulse; the anchor
+template uses the same synthesis; both GMSK and MSK pulse hypotheses
+run per anchored burst with the FCS arbitrating (real transmitters
+vary). Synthetic: 40/40 at 3.7 dB SNR (vs 39/40 for the MSK trellis).
+Boundary lesson: the trellis must start on the *known* last template
+bit (anchoring quadrant and both in-flight levels) and drop its
+emission — seeding at payload bit 0 leaves the first decision
+unanchored. Process lesson re-learned at cost: `cargo build -p <crate>`
+does NOT rebuild the workspace binary — three off-air "regressions"
+were a stale `target/release/xng`.
+
+Remaining 17 AC-only payloads: colliding bursts and the weakest tail —
+multi-hypothesis collision decode is the shared next lever with ADS-B's
+last 8.
 
 Hard-won implementation notes: the template-correlation anchor MUST
 reject peaks near the search-window edge (the rising shoulder of a
