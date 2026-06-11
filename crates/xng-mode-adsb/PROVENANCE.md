@@ -15,3 +15,16 @@ only; no code from any decoder was read or ported):
   example frames used as test vectors (8D4840D6... → KLM1023 ident;
   8D40621D... → 38000 ft).
 - Textbook DSP (magnitude-domain pulse detection).
+
+## Position/velocity depth (2026-06)
+
+CPR decode (global airborne, local airborne/surface, NL function), TC 19
+velocity, 13-bit AC altitude (Q-bit + Gillham reorder) and ID-field
+squawk follow the ICAO Annex 10 Vol IV procedures as published openly in
+"The 1090 Megahertz Riddle" (Junzi Sun, CC BY-SA) — implemented from the
+described algorithms, validated against the book's worked examples
+(vendored as unit-test vectors: the 40621D CPR pair, ground-speed and
+airspeed velocity frames). The per-aircraft tracker (even/odd pairing
+within 10 s, local decode against a fix fresher than 180 s) mirrors the
+standard surveillance practice; SBS-1 output line format follows the de
+facto BaseStation convention as served by dump1090-family tools.

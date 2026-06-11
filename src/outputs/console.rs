@@ -64,13 +64,40 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     mmsi.map_or("?".into(), |m| m.to_string()),
                     nmea.first().map(String::as_str).unwrap_or("")
                 ),
-                MessageBody::ModeS { df, icao, callsign, altitude_ft } => {
+                MessageBody::ModeS {
+                    df,
+                    icao,
+                    callsign,
+                    altitude_ft,
+                    squawk,
+                    lat,
+                    lon,
+                    speed_kt,
+                    speed_type,
+                    track_deg,
+                    vertical_rate_fpm,
+                } => {
                     let mut s = format!("MODE-S df={} icao={}", df, icao.as_deref().unwrap_or("-"));
                     if let Some(c) = callsign {
                         s.push_str(&format!(" ident={c}"));
                     }
+                    if let Some(sq) = squawk {
+                        s.push_str(&format!(" squawk={sq}"));
+                    }
                     if let Some(a) = altitude_ft {
                         s.push_str(&format!(" alt={a}ft"));
+                    }
+                    if let (Some(la), Some(lo)) = (lat, lon) {
+                        s.push_str(&format!(" pos={la:.5},{lo:.5}"));
+                    }
+                    if let Some(v) = speed_kt {
+                        s.push_str(&format!(" {}={v:.0}kt", speed_type.as_deref().unwrap_or("GS").to_lowercase()));
+                    }
+                    if let Some(t) = track_deg {
+                        s.push_str(&format!(" trk={t:.0}"));
+                    }
+                    if let Some(vr) = vertical_rate_fpm {
+                        s.push_str(&format!(" vr={vr:+}fpm"));
                     }
                     s
                 }

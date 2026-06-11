@@ -86,6 +86,10 @@ struct OutputOpts {
     /// Serve Prometheus metrics on this address (e.g. 0.0.0.0:9090)
     #[arg(long)]
     metrics: Option<String>,
+    /// Serve SBS-1/BaseStation output on this address (e.g. 0.0.0.0:30003;
+    /// Mode S/ADS-B messages only)
+    #[arg(long)]
+    sbs: Option<String>,
 }
 
 impl OutputOpts {
@@ -119,6 +123,7 @@ impl OutputOpts {
                 asf2_quic: self.asf2_quic.clone(),
                 asf2_quic_trust: quic_trust,
                 metrics: self.metrics.clone(),
+                sbs: self.sbs.clone(),
             },
             ident,
         ))
@@ -417,12 +422,13 @@ pub(crate) fn probe_device_rates(sdr: &str) -> Vec<u32> {
     if args.force_soapy {
         return Vec::new();
     }
-    let serial = args.serial.as_deref().and_then(|s| sdr_args::parse_airspy_serial(s).ok());
+    let serial = || args.serial.as_deref().and_then(|s| sdr_args::parse_airspy_serial(s).ok());
+    let _ = &serial; // used only by the cfg'd arms below
     match args.driver.as_deref() {
         #[cfg(feature = "airspy")]
-        Some("airspy") => xng_sdr::airspy::device_rates(serial).unwrap_or_default(),
+        Some("airspy") => xng_sdr::airspy::device_rates(serial()).unwrap_or_default(),
         #[cfg(feature = "airspyhf")]
-        Some("airspyhf") => xng_sdr::airspyhf::device_rates(serial).unwrap_or_default(),
+        Some("airspyhf") => xng_sdr::airspyhf::device_rates(serial()).unwrap_or_default(),
         _ => Vec::new(),
     }
 }
@@ -561,6 +567,7 @@ fn main() -> anyhow::Result<()> {
                         asf2_quic: None,
                         asf2_quic_trust: outputs::asf2_quic::TrustMode::SystemRoots,
                         metrics: None,
+                        sbs: None,
                     },
                 },
             )

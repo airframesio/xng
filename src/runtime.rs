@@ -34,6 +34,8 @@ pub struct OutputConfig {
     pub asf2_quic_trust: crate::outputs::asf2_quic::TrustMode,
     /// Prometheus metrics listen address (host:port).
     pub metrics: Option<String>,
+    /// SBS-1 (BaseStation, dump1090 port-30003 style) TCP server address.
+    pub sbs: Option<String>,
 }
 
 pub struct SessionConfig {
@@ -350,6 +352,10 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         for target in cfg.outputs.udp.clone() {
             let rx = bus.subscribe();
             output_tasks.push(tokio::spawn(acarsdec_json::run(rx, target)));
+        }
+        if let Some(addr) = cfg.outputs.sbs.clone() {
+            let rx = bus.subscribe();
+            output_tasks.push(tokio::spawn(crate::outputs::sbs::run(rx, addr)));
         }
         if let Some(url) = cfg.outputs.asf2_grpc.clone() {
             let rx = bus.subscribe();

@@ -24,6 +24,7 @@ attribution. GPL projects are listed as fact references only.
 | ISO/IEC 13239 | HDLC framing conventions (flags, stuffing, FCS) referenced by AVLC and AIS | via EN 301 841-2 citations |
 | ISO/IEC TR 9577 | AVLC payload protocol identification (0xFF ACARS escape, 0x81 CLNP, 0x82 ES-IS, 0x83 IDRP) | via Wiley excerpt + GE patent below |
 | ARINC 622 / 745 (via libacars) | ATS envelope, ADS-C field layouts | via libacars source (MIT) |
+| "The 1090 Megahertz Riddle" (Junzi Sun, TU Delft, CC BY-SA) | Mode S/ADS-B decode procedures as published: CPR global/local algorithms + NL function, TC 19 velocity layouts, AC/ID field bit orders (Gillham/squawk), with the book's worked examples vendored as test vectors | https://mode-s.org/decode/ |
 | reveng CRC catalogue | CRC-16/KERMIT identification for ACARS BCS | https://reveng.sourceforge.io/crc-catalogue/16.htm |
 
 ## Source code used as reference or ported

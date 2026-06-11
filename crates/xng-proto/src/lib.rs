@@ -70,12 +70,31 @@ impl From<&Message> for asf2::DecodedMessage {
                     mmsi: *mmsi,
                 }))
             }
-            MessageBody::ModeS { df, icao, callsign, altitude_ft } => {
+            MessageBody::ModeS {
+                df,
+                icao,
+                callsign,
+                altitude_ft,
+                squawk,
+                lat,
+                lon,
+                speed_kt,
+                speed_type,
+                track_deg,
+                vertical_rate_fpm,
+            } => {
                 Some(asf2::decoded_message::Body::ModeS(asf2::ModeSBody {
                     df: u32::from(*df),
                     icao: icao.clone(),
                     callsign: callsign.clone(),
                     altitude_ft: *altitude_ft,
+                    squawk: squawk.clone(),
+                    lat: *lat,
+                    lon: *lon,
+                    speed_kt: *speed_kt,
+                    speed_type: speed_type.clone(),
+                    track_deg: *track_deg,
+                    vertical_rate_fpm: *vertical_rate_fpm,
                 }))
             }
             MessageBody::Iridium { kind, details } => {
