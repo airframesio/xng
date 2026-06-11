@@ -85,6 +85,13 @@ message HfdlBody {
   string details_json = 2;
 }
 
+message AeroBody {
+  // Structure kind, e.g. "c-channel-assignment".
+  string kind = 1;
+  // Decoded fields as JSON.
+  string details_json = 2;
+}
+
 message Vdl2Body {
   string kind = 1;          // xid | avlc-rr | avlc-i | avlc-ua | ...
   string details_json = 2;  // addresses, control, decoded parameters
@@ -136,6 +143,7 @@ message DecodedMessage {
     HfdlBody hfdl = 15;
     IridiumBody iridium = 16;
     Vdl2Body vdl2 = 17;
+    AeroBody aero = 18;
   }
 }
 

@@ -185,6 +185,25 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::Aero { kind, details } => {
+                    let mut s = format!("AERO {kind}");
+                    if let Some(svc) = details.get("service").and_then(|v| v.as_str()) {
+                        s.push_str(&format!(" {svc}"));
+                    }
+                    if let (Some(aes), Some(ges)) = (
+                        details.get("aes_id").and_then(|v| v.as_str()),
+                        details.get("ges_id").and_then(|v| v.as_u64()),
+                    ) {
+                        s.push_str(&format!(" AES:{aes} GES:{ges}"));
+                    }
+                    if let (Some(rx), Some(tx)) = (
+                        details.get("receive_mhz").and_then(|v| v.as_f64()),
+                        details.get("transmit_mhz").and_then(|v| v.as_f64()),
+                    ) {
+                        s.push_str(&format!(" rx:{rx:.4} tx:{tx:.4} MHz"));
+                    }
+                    s
+                }
                 MessageBody::Vdl2 { kind, details } => {
                     let addr = |k: &str| {
                         details

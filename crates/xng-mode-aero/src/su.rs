@@ -322,6 +322,35 @@ pub fn build_r_sus(aes_id: u32, ges_id: u8, qno: u8, refno: u8, data: &[u8]) -> 
 }
 
 /// Fill-in SU (type 0x01) used to pad frames.
+/// Parse a C-channel assignment SU (P-channel types 0x31–0x34): the
+/// ground station tells an aircraft which voice-circuit frequency pair
+/// to use. Channel numbers step 2.5 kHz from 1510.0 (receive) and
+/// 1611.5 MHz (transmit); bit 7 of each high byte flags a spot beam.
+/// (JAERO `CreateCAssignmentItem`.)
+pub fn parse_c_assignment(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < 10 || !(0x31..=0x34).contains(&su[0]) {
+        return None;
+    }
+    let service = match su[0] {
+        0x31 => "distress",
+        0x32 => "flight-safety",
+        0x33 => "other-safety",
+        _ => "non-safety",
+    };
+    let rx_chan = (((su[6] & 0x7F) as u32) << 8) | su[7] as u32;
+    let tx_chan = (((su[8] & 0x7F) as u32) << 8) | su[9] as u32;
+    Some(serde_json::json!({
+        "su_type": "c-channel-assignment",
+        "service": service,
+        "aes_id": format!("{:06X}", u32::from_be_bytes([0, su[1], su[2], su[3]])),
+        "ges_id": su[4],
+        "receive_mhz": rx_chan as f64 * 0.0025 + 1510.0,
+        "transmit_mhz": tx_chan as f64 * 0.0025 + 1611.5,
+        "receive_spotbeam": su[6] & 0x80 != 0,
+        "transmit_spotbeam": su[8] & 0x80 != 0,
+    }))
+}
+
 pub fn fill_su() -> Vec<u8> {
     su_with_crc(vec![0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 }
@@ -329,6 +358,31 @@ pub fn fill_su() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn c_assignment_parses_frequencies() {
+        // type 0x32 flight-safety, AES ABCDEF, GES 0x44,
+        // rx channel 4000 (spot beam), tx channel 2000.
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x32;
+        su10[1..4].copy_from_slice(&[0xAB, 0xCD, 0xEF]);
+        su10[4] = 0x44;
+        su10[6] = 0x80 | ((4000u16 >> 8) as u8);
+        su10[7] = (4000u16 & 0xFF) as u8;
+        su10[8] = (2000u16 >> 8) as u8;
+        su10[9] = (2000u16 & 0xFF) as u8;
+        let su = su_with_crc(su10);
+        let a = parse_c_assignment(&su).unwrap();
+        assert_eq!(a["service"], "flight-safety");
+        assert_eq!(a["aes_id"], "ABCDEF");
+        assert_eq!(a["ges_id"], 0x44);
+        assert_eq!(a["receive_mhz"], 1520.0);
+        assert_eq!(a["transmit_mhz"], 1616.5);
+        assert_eq!(a["receive_spotbeam"], true);
+        assert_eq!(a["transmit_spotbeam"], false);
+        // non-assignment types pass through
+        assert!(parse_c_assignment(&[0x71; 12]).is_none());
+    }
 
     #[test]
     fn isu_chain_reassembles() {

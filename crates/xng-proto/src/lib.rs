@@ -113,6 +113,12 @@ impl From<&Message> for asf2::DecodedMessage {
                     details_json: details.to_string(),
                 }))
             }
+            MessageBody::Aero { kind, details } => {
+                Some(asf2::decoded_message::Body::Aero(asf2::AeroBody {
+                    kind: kind.clone(),
+                    details_json: details.to_string(),
+                }))
+            }
             MessageBody::Hfdl { kind, details } => {
                 Some(asf2::decoded_message::Body::Hfdl(asf2::HfdlBody {
                     kind: kind.clone(),
