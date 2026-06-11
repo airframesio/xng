@@ -172,6 +172,41 @@ fn read_time(b: &mut Bits) -> Option<String> {
 /// `dMnn`/`uMnn`) is one of the simple shapes we handle. Returns None
 /// for argument structures not decoded yet — the caller keeps the
 /// bracketed template untouched.
+/// FANSVerticalRate: CHOICE english (0..60, 100 ft/min) / metric
+/// (0..200, 10 m/min) — constraints per libacars asn1c tables.
+fn read_vertical_rate(b: &mut Bits) -> Option<String> {
+    Some(if b.read(1)? == 0 {
+        format!("{} FT/MIN", b.read(6)? * 100)
+    } else {
+        format!("{} M/MIN", b.read(8)? * 10)
+    })
+}
+
+/// FANSDegrees: CHOICE magnetic/true, each INTEGER (1..360).
+fn read_degrees(b: &mut Bits) -> Option<String> {
+    let mag = b.read(1)? == 0;
+    Some(format!("{}°{}", b.read(9)? + 1, if mag { "M" } else { "T" }))
+}
+
+/// FANSDirection: ENUMERATED (0..10).
+fn read_direction(b: &mut Bits) -> Option<String> {
+    const DIRS: [&str; 11] = [
+        "LEFT", "RIGHT", "EITHER SIDE", "NORTH", "SOUTH", "EAST", "WEST",
+        "NORTH-EAST", "NORTH-WEST", "SOUTH-EAST", "SOUTH-WEST",
+    ];
+    DIRS.get(b.read(4)? as usize).map(|s| s.to_string())
+}
+
+/// FANSFreeText: IA5String SIZE (1..256).
+fn read_freetext(b: &mut Bits) -> Option<String> {
+    let n = b.read(8)? as usize + 1;
+    let mut s = String::with_capacity(n);
+    for _ in 0..n {
+        s.push(b.read(7)? as u8 as char);
+    }
+    Some(s)
+}
+
 fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
     let ty = tag.trim_start_matches(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == 'M');
     match ty {
@@ -184,6 +219,22 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
         "SpeedSpeed" => Some(vec![read_speed(b)?, read_speed(b)?]),
         "Position" => Some(vec![read_position(b)?]),
         "PositionPosition" => Some(vec![read_position(b)?, read_position(b)?]),
+        "PositionAltitude" => Some(vec![read_position(b)?, read_altitude(b)?]),
+        "AltitudePosition" => Some(vec![read_altitude(b)?, read_position(b)?]),
+        "TimeAltitude" => Some(vec![read_time(b)?, read_altitude(b)?]),
+        "AltitudeTime" => Some(vec![read_altitude(b)?, read_time(b)?]),
+        "PositionTime" => Some(vec![read_position(b)?, read_time(b)?]),
+        "TimePosition" => Some(vec![read_time(b)?, read_position(b)?]),
+        "PositionSpeed" => Some(vec![read_position(b)?, read_speed(b)?]),
+        "TimeSpeed" => Some(vec![read_time(b)?, read_speed(b)?]),
+        "AltitudeSpeed" => Some(vec![read_altitude(b)?, read_speed(b)?]),
+        "PositionTimeAltitude" => {
+            Some(vec![read_position(b)?, read_time(b)?, read_altitude(b)?])
+        }
+        "VerticalRate" => Some(vec![read_vertical_rate(b)?]),
+        "Degrees" => Some(vec![read_degrees(b)?]),
+        "DirectionDegrees" => Some(vec![read_direction(b)?, read_degrees(b)?]),
+        "FreeText" => Some(vec![read_freetext(b)?]),
         _ => None,
     }
 }
@@ -452,5 +503,69 @@ mod tests {
         // Element index beyond the downlink table.
         assert!(decode(&build(1, None, None, 200, false), true).is_none());
         assert!(decode(&[], true).is_none());
+    }
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::*;
+
+    struct Builder(Vec<u8>, usize);
+    impl Builder {
+        fn new() -> Self {
+            Builder(vec![0u8; 64], 0)
+        }
+        fn push(&mut self, v: u32, n: usize) {
+            for k in (0..n).rev() {
+                let bit = ((v >> k) & 1) as u8;
+                self.0[self.1 / 8] |= bit << (7 - self.1 % 8);
+                self.1 += 1;
+            }
+        }
+    }
+
+    /// dM11PositionAltitude: "AT [position] REQUEST CLIMB TO [altitude]".
+    #[test]
+    fn position_altitude_composite_renders() {
+        let mut b = Builder::new();
+        b.push(0, 1); // no more elements
+        b.push(0, 1); // no msg ref
+        b.push(0, 1); // no timestamp
+        b.push(7, 6); // msg id
+        b.push(11, 8); // dM11
+        // FANSPosition CHOICE: fixname (index 0 of 5 → 3 bits), IA5 1..5.
+        b.push(0, 3);
+        b.push(3, 3); // length 4 (offset from 1)
+        for c in b"OAKEY" [..4].iter() {
+            b.push(*c as u32, 7);
+        }
+        // FANSAltitude CHOICE index for flight level (per existing
+        // read_altitude): use the same encoding the roundtrip tests use —
+        // altitudeFlightLevel is choice 4 of 8 (3 bits) value (30..600).
+        b.push(4, 3);
+        b.push(360 - 30, 10);
+        let m = decode(&b.0, true).expect("decode");
+        assert_eq!(m.element, "dM11PositionAltitude");
+        assert!(m.text.contains("AT OAKE"), "{}", m.text);
+        assert!(m.text.contains("CLIMB TO"), "{}", m.text);
+    }
+
+    /// FreeText downlink renders verbatim.
+    #[test]
+    fn freetext_renders() {
+        let mut b = Builder::new();
+        b.push(0, 1);
+        b.push(0, 1);
+        b.push(0, 1);
+        b.push(9, 6);
+        b.push(67, 8); // dM67FreeText
+        let msg = b"DUE WX";
+        b.push((msg.len() - 1) as u32, 8);
+        for c in msg {
+            b.push(*c as u32, 7);
+        }
+        let m = decode(&b.0, true).expect("decode");
+        assert_eq!(m.element, "dM67FreeText");
+        assert_eq!(m.text, "DUE WX");
     }
 }
