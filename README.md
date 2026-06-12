@@ -205,8 +205,9 @@ xng listen --sdr driver=rtlsdr --mode iridium -r 2000000 -c 1626.250M \
 xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
     --channels 161.975,162.025
 
-# Mode S / ADS-B (consumes the whole capture)
-xng listen --sdr driver=rtlsdr --mode adsb -r 2000000 -c 1090.000M --channels 1090
+# Mode S / ADS-B (consumes the whole capture; 2.4 MS/s — the
+# RTL-SDR's best rate — decodes natively via the fractional path)
+xng listen --sdr driver=rtlsdr --mode adsb -r 2400000 -c 1090.000M --channels 1090
 ```
 
 ### Site survey / soak test
