@@ -1,7 +1,8 @@
 {
-  "_comment": "Minimum decode counts per fixture. Raise these when a demod improvement lands (they are the new floor); never lower without a documented tradeoff. Calibration history in docs/notes/BENCHMARKS.md.",
+  "_comment": "Minimum decode counts per fixture. Raise these when a demod improvement lands (they are the new floor); never lower without a documented tradeoff. Calibration history in docs/notes/BENCHMARKS.md. Keys ending in _max are CEILINGS (false-positive gates): fail when the count EXCEEDS the value.",
   "adsb_modes1": 310,
   "ais_offair": 48,
   "vdl2_offair": 42,
-  "hfdl_offair": 31
+  "hfdl_offair": 31,
+  "adsb_quiet_max": 4
 }

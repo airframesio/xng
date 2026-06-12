@@ -30,9 +30,31 @@ check() { # name actual
   fi
 }
 
+check_max() { # name actual — ceiling gate for false-positive fixtures
+  local max
+  max=$(python3 -c "import json;print(json.load(open('$BASE'))['$1'])")
+  if [ "$2" -gt "$max" ]; then
+    echo "REGRESSION: $1 decoded $2 frames (ceiling <= $max — false positives)"
+    fail=1
+  else
+    echo "ok: $1 = $2 frames (ceiling <= $max)"
+  fi
+}
+
 # ADS-B: the canonical dump1090 test capture (vendored).
 adsb=$(count bench/data/modes1.cu8 cu8 adsb 2000000 1090000000 1090)
 check adsb_modes1 "$adsb"
+
+# ADS-B false-positive gate: 20 s of quiet live 1090 RF (release
+# asset). Near-floor candidate gates + CRC trials produce ~70 phantom
+# frames/min on noise unless the two-sighting ICAO confirmation holds
+# them back; this asserts the phantom rate stays ~zero.
+if [ -f bench/data/adsb_quiet_24m.cu8 ]; then
+  quiet=$(count bench/data/adsb_quiet_24m.cu8 cu8 adsb 2400000 1090000000 1090)
+  check_max adsb_quiet_max "$quiet"
+else
+  echo "skip: bench/data/adsb_quiet_24m.cu8 not present (release asset)"
+fi
 
 # AIS: 5-minute off-air capture (release asset; fetched by CI or
 # manually: gh release download bench-fixtures-v1 -p ais_96k.cs16 -D bench/data/).
