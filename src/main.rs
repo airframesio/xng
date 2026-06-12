@@ -60,6 +60,11 @@ struct TuneOpts {
     /// Drop ACARS messages with these labels (comma separated)
     #[arg(long, value_delimiter = ',')]
     exclude_labels: Vec<String>,
+    /// Demod effort: 'max' scans every timing grid (default for file
+    /// decode), 'live' trims to a real-time budget (default for SDR
+    /// commands; matters on Pi-class hardware)
+    #[arg(long)]
+    demod_effort: Option<runtime::DemodEffort>,
 }
 
 fn parse_receiver_pos(s: &Option<String>) -> anyhow::Result<Option<(f64, f64)>> {
@@ -524,6 +529,7 @@ fn main() -> anyhow::Result<()> {
                         include: tune.filter_labels.clone(),
                         exclude: tune.exclude_labels.clone(),
                     },
+                    demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Max),
                 },
             )
         }
@@ -617,6 +623,7 @@ fn main() -> anyhow::Result<()> {
                         include: tune.filter_labels.clone(),
                         exclude: tune.exclude_labels.clone(),
                     },
+                    demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
                     outputs: runtime::OutputConfig {
                         console: ConsoleFormat::Pretty,
                         jsonl: None,
@@ -732,6 +739,7 @@ fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) ->
                         include: tune.filter_labels.clone(),
                         exclude: tune.exclude_labels.clone(),
                     },
+                    demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
         },
     )
 }

@@ -373,6 +373,7 @@ pub(crate) fn scan_group(
         sdr: None,
         receiver_pos: None,
         label_filter: Default::default(),
+        demod_effort: runtime::DemodEffort::Live,
         outputs: runtime::OutputConfig {
             console: crate::outputs::console::ConsoleFormat::Pretty,
             jsonl: None,

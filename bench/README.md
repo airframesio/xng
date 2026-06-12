@@ -15,6 +15,11 @@ gh release download bench-fixtures-v1 -p ais_96k.cs16 -D bench/data/
 bench/run.sh
 ```
 
+`cpu.sh` measures decode speed (×-realtime) per mode on the same
+fixtures. Aero, STD-C, and Iridium are fenced separately: their
+vendored `tests/data` fixtures assert exact decode results in
+`cargo test` on every CI run.
+
 Oracle calibration (what the strongest open decoders get on the same
 fixtures, methodology, and the history of xng's numbers) lives in
 [docs/notes/BENCHMARKS.md](../docs/notes/BENCHMARKS.md). Baselines are
