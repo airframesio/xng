@@ -134,9 +134,16 @@ AIS-catcher -r CS16 ais_6m.cs16 -s 6000000 -n
   truth from dumpvdl2's debug output; full story in
   docs/notes/VDL2-DEMOD-V2.md round 6. Bench fixture + floor (42)
   added.
-- HFDL: 33 events at every rate, vs 37-ish for dumphfdl on the
-  21931 kHz capture; +4.5–5 dB synthetic sensitivity from the
-  selectivity filter (PR #77)
+- HFDL (forensic round 2026-06-12, VDL2 methodology): **33 events vs
+  dumphfdl's 37** on the 21931 kHz capture — frame-exact diff shows
+  the 13 data LPDUs match the oracle one-for-one; the missing 4 are
+  the weakest bursts (4.0–5.0 dB SNR at 300 bps), a genuine
+  sensitivity tail, NOT a convention bug. Parser-policy fixes from the
+  round: no CRC-valid LPDU is ever silently dropped (unparsable
+  HFNPDUs emit an envelope event) and 0x4F is correctly labeled
+  logon-resume. Fixture + floor (31) added to the bench gate.
+  Earlier: +4.5–5 dB synthetic sensitivity from the selectivity
+  filter (PR #77).
 - Iridium/STD-C/Aero: oracle-validated field-exact; no count-style
   sensitivity comparison run yet
 

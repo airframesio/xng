@@ -3,3 +3,4 @@ legacy/target
 .DS_Store
 bench/data/ais_96k.cs16
 bench/data/vdl2_105k_conj.s16
+bench/data/hfdl_48k.cs16

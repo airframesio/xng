@@ -43,6 +43,14 @@ else
   echo "skip: bench/data/ais_96k.cs16 not present (release asset)"
 fi
 
+# HFDL: the 21931 kHz off-air capture (release asset), 48 kS/s s16.
+if [ -f bench/data/hfdl_48k.cs16 ]; then
+  hfdl=$(count bench/data/hfdl_48k.cs16 cs16 hfdl 48000 21931000 21931k)
+  check hfdl_offair "$hfdl"
+else
+  echo "skip: bench/data/hfdl_48k.cs16 not present (release asset)"
+fi
+
 # VDL2: the sigidwiki off-air capture (release asset), 105 kS/s s16.
 if [ -f bench/data/vdl2_105k_conj.s16 ]; then
   vdl2=$(count bench/data/vdl2_105k_conj.s16 cs16 vdl2 105000 136975000 136.975)

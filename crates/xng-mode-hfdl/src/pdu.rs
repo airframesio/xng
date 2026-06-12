@@ -161,8 +161,14 @@ impl PduParser {
         };
         match body[0] {
             0x0D | 0x1D => self.parse_hfnpdu(&body[1..], who, bps, out),
-            0x8F | 0xBF | 0x4F if body.len() >= 4 => out.push(HfdlEvent {
+            0x8F | 0xBF if body.len() >= 4 => out.push(HfdlEvent {
                 kind: "logon-request".into(),
+                details: json!({ "icao": icao(&body[1..4]), "who": who }),
+                acars: None,
+                raw: l.to_vec(),
+            }),
+            0x4F if body.len() >= 4 => out.push(HfdlEvent {
+                kind: "logon-resume".into(),
                 details: json!({ "icao": icao(&body[1..4]), "who": who }),
                 acars: None,
                 raw: l.to_vec(),
@@ -189,7 +195,23 @@ impl PduParser {
     }
 
     fn parse_hfnpdu(&mut self, h: &[u8], who: &serde_json::Value, bps: u32, out: &mut Vec<HfdlEvent>) {
+        // Never drop a CRC-valid data LPDU on the floor: when the HFNPDU
+        // contents don't parse, emit the envelope with the payload hex
+        // (dumphfdl-equivalent behaviour; silent drops cost 4+ frames on
+        // the bench capture).
+        let envelope = |out: &mut Vec<HfdlEvent>| {
+            out.push(HfdlEvent {
+                kind: "unnumbered-data".into(),
+                details: json!({
+                    "who": who,
+                    "data_hex": h.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                }),
+                acars: None,
+                raw: h.to_vec(),
+            });
+        };
         if h.len() < 2 || h[0] != 0xFF {
+            envelope(out);
             return;
         }
         match h[1] {
@@ -202,6 +224,8 @@ impl PduParser {
                         acars: Some(b),
                         raw: h.to_vec(),
                     });
+                } else {
+                    envelope(out);
                 }
             }
             0xD1 | 0xD5 if h.len() >= 15 => {
