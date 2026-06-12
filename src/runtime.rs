@@ -20,6 +20,7 @@ use xng_mode_vdl2::Vdl2ChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
 
+#[derive(Clone)]
 pub struct OutputConfig {
     /// Console format (always on).
     pub console: ConsoleFormat,
@@ -357,6 +358,66 @@ impl ModeChannel {
     }
 }
 
+/// Spawn the configured output sinks on the current tokio runtime.
+fn spawn_outputs(
+    bus: &MessageBus,
+    outputs: &OutputConfig,
+    station: &StationIdentity,
+) -> Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> {
+    let mut output_tasks = Vec::new();
+    output_tasks.push(tokio::spawn({
+        let rx = bus.subscribe();
+        let fmt = outputs.console;
+        async move {
+            console::run(rx, fmt).await;
+            Ok::<(), std::io::Error>(())
+        }
+    }));
+    if let Some(path) = outputs.jsonl.clone() {
+        let rx = bus.subscribe();
+        output_tasks.push(tokio::spawn(async move { jsonl::run(rx, &path).await }));
+    }
+    for target in outputs.udp.clone() {
+        let rx = bus.subscribe();
+        output_tasks.push(tokio::spawn(acarsdec_json::run(rx, target)));
+    }
+    if let Some(addr) = outputs.sbs.clone() {
+        let rx = bus.subscribe();
+        output_tasks.push(tokio::spawn(crate::outputs::sbs::run(rx, addr)));
+    }
+    if let Some(addr) = outputs.beast.clone() {
+        let rx = bus.subscribe();
+        output_tasks.push(tokio::spawn(crate::outputs::beast::run(rx, addr)));
+    }
+    if let Some(addr) = outputs.nmea_tcp.clone() {
+        let rx = bus.subscribe();
+        output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr)));
+    }
+    if let Some(url) = outputs.mqtt.clone() {
+        let rx = bus.subscribe();
+        let topic = outputs.mqtt_topic.clone();
+        let ident = station.ident.clone();
+        output_tasks.push(tokio::spawn(async move {
+            if let Err(e) = crate::outputs::mqtt::run(rx, url, topic, ident).await {
+                tracing::error!("mqtt output: {e}");
+            }
+            Ok(())
+        }));
+    }
+    if let Some(url) = outputs.asf2_grpc.clone() {
+        let rx = bus.subscribe();
+        let (id, ident) = (station.id.to_string(), station.ident.clone());
+        output_tasks.push(tokio::spawn(crate::outputs::asf2_grpc::run(rx, url, id, ident)));
+    }
+    if let Some(target) = outputs.asf2_quic.clone() {
+        let rx = bus.subscribe();
+        let trust = outputs.asf2_quic_trust.clone();
+        let (id, ident) = (station.id.to_string(), station.ident.clone());
+        output_tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(rx, target, trust, id, ident)));
+    }
+    output_tasks
+}
+
 /// Run a decode session until the source ends or `stop` is set.
 pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<()> {
     let sample_rate = source.sample_rate();
@@ -405,57 +466,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 }
             });
         }
-        let mut output_tasks = Vec::new();
-        output_tasks.push(tokio::spawn({
-            let rx = bus.subscribe();
-            let fmt = cfg.outputs.console;
-            async move {
-                console::run(rx, fmt).await;
-                Ok::<(), std::io::Error>(())
-            }
-        }));
-        if let Some(path) = cfg.outputs.jsonl.clone() {
-            let rx = bus.subscribe();
-            output_tasks.push(tokio::spawn(async move { jsonl::run(rx, &path).await }));
-        }
-        for target in cfg.outputs.udp.clone() {
-            let rx = bus.subscribe();
-            output_tasks.push(tokio::spawn(acarsdec_json::run(rx, target)));
-        }
-        if let Some(addr) = cfg.outputs.sbs.clone() {
-            let rx = bus.subscribe();
-            output_tasks.push(tokio::spawn(crate::outputs::sbs::run(rx, addr)));
-        }
-        if let Some(addr) = cfg.outputs.beast.clone() {
-            let rx = bus.subscribe();
-            output_tasks.push(tokio::spawn(crate::outputs::beast::run(rx, addr)));
-        }
-        if let Some(addr) = cfg.outputs.nmea_tcp.clone() {
-            let rx = bus.subscribe();
-            output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr)));
-        }
-        if let Some(url) = cfg.outputs.mqtt.clone() {
-            let rx = bus.subscribe();
-            let topic = cfg.outputs.mqtt_topic.clone();
-            let station = cfg.station_ident.clone();
-            output_tasks.push(tokio::spawn(async move {
-                if let Err(e) = crate::outputs::mqtt::run(rx, url, topic, station).await {
-                    tracing::error!("mqtt output: {e}");
-                }
-                Ok(())
-            }));
-        }
-        if let Some(url) = cfg.outputs.asf2_grpc.clone() {
-            let rx = bus.subscribe();
-            let (id, ident) = (station.id.to_string(), station.ident.clone());
-            output_tasks.push(tokio::spawn(crate::outputs::asf2_grpc::run(rx, url, id, ident)));
-        }
-        if let Some(target) = cfg.outputs.asf2_quic.clone() {
-            let rx = bus.subscribe();
-            let trust = cfg.outputs.asf2_quic_trust.clone();
-            let (id, ident) = (station.id.to_string(), station.ident.clone());
-            output_tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(rx, target, trust, id, ident)));
-        }
+        let output_tasks = spawn_outputs(&bus, &cfg.outputs, &station);
 
         // Ctrl-C → graceful stop.
         tokio::spawn({
@@ -627,6 +638,136 @@ pub(crate) fn decode_loop(
         }
     }
     Ok(stats)
+}
+
+/// Run several decode sessions (different modes/SDRs) in one process,
+/// sharing one message bus and one set of outputs — the whole station
+/// as a single unit.
+pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow::Result<()> {
+    anyhow::ensure!(!sessions.is_empty(), "station config has no sessions");
+
+    struct Prepared {
+        source: Box<dyn IqSource>,
+        decoders: Vec<(u64, ModeChannel)>,
+        cfg: SessionConfig,
+        capture_center: u64,
+    }
+    let mut prepared = Vec::new();
+    for (source, cfg) in sessions {
+        let sample_rate = source.sample_rate();
+        let capture_center =
+            if cfg.center_hz > 0 { cfg.center_hz } else { source.center_freq_hz() };
+        let mut decoders = Vec::new();
+        for &freq in &cfg.channels_hz {
+            let offset = freq as f64 - capture_center as f64;
+            if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+                anyhow::bail!(
+                    "[{}] channel {:.3} MHz is outside the capture (center {:.3} MHz, rate {} S/s)",
+                    cfg.mode,
+                    freq as f64 / 1e6,
+                    capture_center as f64 / 1e6,
+                    sample_rate
+                );
+            }
+            let mut dec =
+                ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
+                    .map_err(|e| anyhow::anyhow!("[{}] {:.3} MHz: {e}", cfg.mode, freq as f64 / 1e6))?;
+            if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
+                d.set_receiver_position(lat, lon);
+            }
+            decoders.push((freq, dec));
+        }
+        tracing::info!(
+            "station session: {} with {} channel(s) at {:.0} S/s centered {:.3} MHz",
+            cfg.mode,
+            decoders.len(),
+            sample_rate,
+            capture_center as f64 / 1e6
+        );
+        prepared.push(Prepared { source, decoders, cfg, capture_center });
+    }
+
+    let station = StationIdentity::new(prepared[0].cfg.station_ident.clone());
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let bus = MessageBus::new();
+        if let Some(addr) = prepared[0].cfg.outputs.metrics.clone() {
+            let live = LiveState::new();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crate::outputs::metrics::serve(addr, live, "station".to_string()).await
+                {
+                    tracing::warn!("metrics endpoint failed: {e}");
+                }
+            });
+        }
+        let output_tasks = spawn_outputs(&bus, &prepared[0].cfg.outputs, &station);
+
+        tokio::spawn({
+            let stop = stop.clone();
+            async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    tracing::info!("interrupt received, stopping station");
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let mut decode_tasks = Vec::new();
+        for mut prep in prepared {
+            let bus = bus.clone();
+            let stop = stop.clone();
+            let station = station.clone();
+            decode_tasks.push(tokio::task::spawn_blocking(move || {
+                let reasm_timeout = match prep.cfg.mode {
+                    Mode::AcarsPoa | Mode::Vdl2 => 120.0,
+                    _ => 660.0,
+                };
+                let mut reasm = (
+                    xng_acars::reasm::Reassembler::new(reasm_timeout),
+                    xng_acars::miam::FileReassembler::new(),
+                );
+                let _ = prep.capture_center;
+                decode_loop(
+                    &mut *prep.source,
+                    std::mem::take(&mut prep.decoders),
+                    station,
+                    prep.cfg.sdr.clone(),
+                    bus,
+                    stop,
+                    None,
+                    Some(&mut reasm),
+                    prep.cfg.label_filter.clone(),
+                )
+            }));
+        }
+        for t in decode_tasks {
+            match t.await? {
+                Ok(stats) => {
+                    for (freq, seen, ok) in stats {
+                        tracing::info!(
+                            "channel {:.3} MHz: {} frame(s), {} with valid CRC",
+                            freq as f64 / 1e6,
+                            seen,
+                            ok
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("session ended with error: {e}"),
+            }
+        }
+
+        drop(bus);
+        for t in output_tasks {
+            if let Err(e) = t.await? {
+                tracing::warn!("output error: {e}");
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+    Ok(())
 }
 
 /// Suppresses cross-channel duplicates: the same transmission decoded

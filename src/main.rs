@@ -219,6 +219,12 @@ enum Command {
         #[command(flatten)]
         output: OutputOpts,
     },
+    /// Run a whole station from a config file: several decode
+    /// sessions (modes + SDRs) in one process with shared outputs
+    Station {
+        /// Path to the station TOML config
+        config: PathBuf,
+    },
     /// Inspect a recorded IQ file: duration, power, spectral peaks
     IqInfo {
         /// Path to the IQ file
@@ -536,6 +542,7 @@ fn main() -> anyhow::Result<()> {
         Command::Listen { sdr, gain, tune, output } => {
             listen(&sdr, gain, &tune, &output)
         }
+        Command::Station { config } => run_station_cmd(&config),
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
         }
@@ -652,6 +659,110 @@ fn main() -> anyhow::Result<()> {
 /// served it. `driver=airspy` / `driver=airspyhf` use the native backends
 /// when compiled in (falling through to SoapySDR otherwise, where a
 /// SoapyAirspy module may exist); `backend=soapy` forces the fallthrough.
+fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
+    let st = commands::station::load(config)?;
+
+    // Shared outputs (the first session's SessionConfig carries them).
+    let mut udp = st.outputs.udp.clone();
+    if st.outputs.feed_airframes {
+        udp.push(AIRFRAMES_ACARS_UDP.to_owned());
+    }
+    let outputs = runtime::OutputConfig {
+        console: if st.outputs.json { ConsoleFormat::Json } else { ConsoleFormat::Pretty },
+        jsonl: st.outputs.jsonl.clone(),
+        udp,
+        asf2_grpc: st.outputs.asf2_grpc.clone(),
+        asf2_quic: st.outputs.asf2_quic.clone(),
+        asf2_quic_trust: outputs::asf2_quic::TrustMode::SystemRoots,
+        metrics: st.outputs.metrics.clone(),
+        sbs: st.outputs.sbs.clone(),
+        beast: st.outputs.beast.clone(),
+        nmea_tcp: st.outputs.nmea_tcp.clone(),
+        mqtt: st.outputs.mqtt.clone(),
+        mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
+    };
+
+    let mut sessions = Vec::new();
+    for (i, sess) in st.sessions.iter().enumerate() {
+        let label = format!("session {} ({})", i + 1, sess.mode);
+        // Tuning: explicit values, or the mode plan via the same
+        // derivation the TUI uses.
+        let tune = TuneOpts {
+            mode: sess.mode.clone(),
+            sample_rate: sess.sample_rate,
+            center_freq: sess.center.clone(),
+            channels: sess.channels.clone(),
+            receiver_pos: sess.receiver_pos.clone(),
+            filter_labels: Vec::new(),
+            exclude_labels: Vec::new(),
+            demod_effort: sess
+                .demod_effort
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|e: String| anyhow::anyhow!("{label}: {e}"))?,
+        };
+        let (mode, rate, center_hz, channels) = if tune.sample_rate.is_some()
+            && tune.center_freq.is_some()
+            && !tune.channels.is_empty()
+        {
+            parse_tune(&tune)?
+        } else if let Some(sdr) = &sess.sdr {
+            resolve_tune_auto(&tune, sdr)?
+        } else {
+            anyhow::bail!("{label}: file sessions need sample-rate, center, and channels");
+        };
+
+        let (source, sdr_info): (Box<dyn xng_sdr::IqSource>, Option<xng_types::SdrInfo>) =
+            match (&sess.sdr, &sess.file) {
+                (Some(sdr), None) => {
+                    let (src, backend) = open_sdr(sdr, rate, center_hz, sess.gain)?;
+                    let info = xng_types::SdrInfo {
+                        id: sdr.clone(),
+                        driver: backend.to_string(),
+                        serial: None,
+                    };
+                    (src, Some(info))
+                }
+                (None, Some(path)) => {
+                    let fmt = match &sess.format {
+                        Some(f) => f
+                            .parse::<IqFormat>()
+                            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?,
+                        None => IqFormat::from_extension(path)
+                            .ok_or_else(|| anyhow::anyhow!("{label}: pass `format`"))?,
+                    };
+                    let src = FileIqSource::open(path, fmt, rate, center_hz)?;
+                    (
+                        Box::new(src),
+                        Some(xng_types::SdrInfo {
+                            id: "file".into(),
+                            driver: "file".into(),
+                            serial: None,
+                        }),
+                    )
+                }
+                _ => unreachable!("validated in station::load"),
+            };
+
+        sessions.push((
+            source,
+            runtime::SessionConfig {
+                mode,
+                center_hz,
+                channels_hz: channels,
+                station_ident: st.station_id.clone(),
+                sdr: sdr_info,
+                outputs: outputs.clone(),
+                receiver_pos: parse_receiver_pos(&sess.receiver_pos)?,
+                label_filter: Default::default(),
+                demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
+            },
+        ));
+    }
+    runtime::run_station(sessions)
+}
+
 fn open_sdr(
     sdr: &str,
     sample_rate: f64,

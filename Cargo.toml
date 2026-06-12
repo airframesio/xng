@@ -73,6 +73,7 @@ airspyhf = ["xng-sdr/airspyhf"]
 [dependencies]
 anyhow.workspace = true
 rumqttc.workspace = true
+toml = "0.8"
 chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 num-complex.workspace = true

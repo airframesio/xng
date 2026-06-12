@@ -1,0 +1,23 @@
+# systemd unit for an xng station.
+#   sudo cp xng-station.service /etc/systemd/system/
+#   sudo systemctl enable --now xng-station
+[Unit]
+Description=xng multi-mode SDR station
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/xng station /etc/xng/station.toml
+Restart=on-failure
+RestartSec=10
+# SDR USB access typically wants the plugdev group:
+User=xng
+Group=plugdev
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/log/xng
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
