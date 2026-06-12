@@ -25,12 +25,25 @@ const CPR_PAIR_SECS: f64 = 10.0;
 /// Reference-position freshness for locally unambiguous decode.
 const CPR_LOCAL_SECS: f64 = 180.0;
 const TRACK_MAX: usize = 4096;
+/// Plausibility gate: reject a fix implying faster motion than this
+/// from the aircraft's last accepted fix (~1360 kt — comfortably above
+/// anything subsonic, far below the ~111 km jumps a corrupted CPR
+/// field produces). A corrupted-but-CRC-clean frame (e.g. an unlucky
+/// single-bit "repair" of a two-bit error) otherwise lands anywhere in
+/// the CPR zone and then drags the track as the new reference.
+const MAX_SPEED_MPS: f64 = 700.0;
+/// Slack for CPR quantization and same-chunk timestamps.
+const SPEED_GATE_SLACK_M: f64 = 500.0;
+/// Consecutive gate failures that mean the *reference* is wrong (a bad
+/// fix got anchored): drop it and re-acquire from an even/odd pair.
+const REJECTS_TO_REANCHOR: u8 = 3;
 
 #[derive(Default, Clone)]
 struct AcState {
     even: Option<(Cpr, f64)>,
     odd: Option<(Cpr, f64)>,
     last_pos: Option<(f64, f64, f64)>,
+    rejects: u8,
 }
 
 /// Decodes Mode S from a capture centered on 1090 MHz.
@@ -118,6 +131,27 @@ impl AdsbDecoder {
             _ => self.receiver.map(|(rlat, rlon)| decode::cpr_local(cpr, rlat, rlon)),
         };
         let pos = pos.filter(|(lat, lon)| (-90.0..=90.0).contains(lat) && (-180.0..=180.0).contains(lon));
+        // Speed gate against the last accepted fix. Repeated failures
+        // mean the anchor itself is the bad fix — drop it so the next
+        // even/odd pair re-acquires globally.
+        let pos = match (pos, st.last_pos) {
+            (Some((lat, lon)), Some((plat, plon, pt))) => {
+                let dt = (now - pt).max(0.1);
+                let dist = flat_distance_m(lat, lon, plat, plon);
+                if dist <= MAX_SPEED_MPS * dt + SPEED_GATE_SLACK_M {
+                    st.rejects = 0;
+                    Some((lat, lon))
+                } else {
+                    st.rejects += 1;
+                    if st.rejects >= REJECTS_TO_REANCHOR {
+                        st.last_pos = None;
+                        st.rejects = 0;
+                    }
+                    None
+                }
+            }
+            (p, _) => p,
+        };
         if let Some((lat, lon)) = pos {
             st.last_pos = Some((lat, lon, now));
         }
@@ -128,6 +162,13 @@ impl AdsbDecoder {
     pub fn level_dbfs(&self) -> f32 {
         self.demod.noise_dbfs()
     }
+}
+
+/// Flat-earth distance in metres — fine at speed-gate scales.
+fn flat_distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+    let dlat = (lat1 - lat2) * 111_320.0;
+    let dlon = (lon1 - lon2) * 111_320.0 * lat1.to_radians().cos();
+    (dlat * dlat + dlon * dlon).sqrt()
 }
 
 /// Convert a decoded frame into the normalized message model.
@@ -193,5 +234,54 @@ mod tracker_tests {
         assert_eq!(dec.resolve_position(0x40621D, EVEN, 0.0), None);
         // 60 s later: outside the 10 s pairing window, no reference.
         assert_eq!(dec.resolve_position(0x40621D, ODD, 60.0), None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpr_of(frame_hex: &str) -> Cpr {
+        let bytes: Vec<u8> = (0..frame_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&frame_hex[i..i + 2], 16).unwrap())
+            .collect();
+        let me = &bytes[4..11];
+        let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+        let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+        Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false }
+    }
+
+    // Worked examples from "The 1090 Megahertz Riddle".
+    const EVEN: &str = "8D40621D58C382D690C8AC2863A7";
+    const ODD: &str = "8D40621D58C386435CC412692AD6";
+
+    #[test]
+    fn speed_gate_rejects_corrupted_fix_and_reanchors() {
+        let mut d = AdsbDecoder::new(2_000_000.0).unwrap();
+        let icao = 0x40621D;
+        let (even, odd) = (cpr_of(EVEN), cpr_of(ODD));
+
+        // Establish a track from a fresh even/odd pair.
+        assert!(d.resolve_position(icao, even, 0.0).is_none());
+        let fix = d.resolve_position(icao, odd, 1.0).expect("global fix");
+        assert!((fix.0 - 52.26578).abs() < 0.01, "lat {}", fix.0);
+
+        // A corrupted-but-CRC-clean report: high CPR lat bit flipped.
+        // Local decode would land tens of km away — the gate drops it
+        // and the last good fix stays the reference.
+        let bad = Cpr { lat: even.lat ^ 0x10000, ..even };
+        assert!(d.resolve_position(icao, bad, 2.0).is_none());
+        let good = d.resolve_position(icao, even, 3.0).expect("good fix still accepted");
+        assert!((good.0 - 52.2572).abs() < 0.01, "lat {}", good.0);
+
+        // Three consecutive implausible fixes mean the *anchor* is bad:
+        // the track drops it and re-acquires from a fresh pair.
+        for t in 0..3 {
+            assert!(d.resolve_position(icao, bad, 4.0 + t as f64).is_none());
+        }
+        assert!(d.track[&icao].last_pos.is_none(), "anchor dropped");
+        assert!(d.resolve_position(icao, even, 20.0).is_none());
+        assert!(d.resolve_position(icao, odd, 20.5).is_some(), "re-anchored");
     }
 }
