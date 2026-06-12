@@ -77,7 +77,7 @@ async function tick() {
       const popup = `<b>${label}</b><br>icao ${escapeHtml(a.icao)}` +
         (a.alt != null ? `<br>${a.alt} ft` : '') +
         (a.spd != null ? `<br>${a.spd} kt` : '') +
-        (a.squawk ? `<br>squawk ${a.squawk}` : '') + `<br>${a.msgs} msgs`;
+        (a.squawk ? `<br>squawk ${escapeHtml(String(a.squawk))}` : '') + `<br>${a.msgs} msgs`;
       const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk), label, popup);
       if (p) pts.push(p);
     }
