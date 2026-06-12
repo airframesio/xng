@@ -140,8 +140,17 @@ AIS-catcher -r CS16 ais_6m.cs16 -s 6000000 -n
    sub-sample phase passes merged by bytes+position.
 2. Result: **157 unique at 2.4 MS/s** on readsb's own input file
    (94 % of readsb; was 0 — the rate didn't work at all). The 2 MS/s
-   path is untouched (gate: 323). Remaining readsb edge: its
-   phase-classified bit templates.
+   path is untouched (gate: 323).
+
+**Round 2 (same day): 157 → 164 (98 % of readsb).** The winning lever
+was simply a denser sub-sample pass grid (4 → 8 → 16 passes measured
+157 → 163 → 164; asymptote at 16), now effort-gated (live = 2 passes
+= 148 unique within a Pi budget; max = 16). Falsified along the way,
+with numbers: trimmed-slot bit integrals (152 — edge energy hurts
+more than extra energy helps) and per-candidate preamble-contrast
+phase refinement (154 — overfits preamble noise). xng also decodes
+**5 frames readsb misses**; the remaining 4-frame readsb edge is its
+phase-classified bit templates.
 
 ## Decode CPU (×-realtime, Apple M-series; `bench/cpu.sh`)
 
