@@ -28,6 +28,23 @@ struct Dash {
     totals: HashMap<String, u64>,
 }
 
+/// Append to the entity's position trail (decimated: only when moved
+/// meaningfully; capped length).
+fn push_trail(o: &mut serde_json::Map<String, Value>, lat: f64, lon: f64) {
+    let trail = o.entry("trail").or_insert_with(|| json!([]));
+    let arr = trail.as_array_mut().unwrap();
+    if let Some(last) = arr.last().and_then(Value::as_array) {
+        let (pl, po) = (last[0].as_f64().unwrap_or(0.0), last[1].as_f64().unwrap_or(0.0));
+        if (pl - lat).abs() < 1e-4 && (po - lon).abs() < 1e-4 {
+            return;
+        }
+    }
+    arr.push(json!([lat, lon]));
+    if arr.len() > 60 {
+        arr.remove(0);
+    }
+}
+
 fn now_s() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -52,8 +69,26 @@ fn update(d: &mut Dash, m: &Message) {
             let o = e.as_object_mut().unwrap();
             o.insert("icao".into(), json!(icao));
             o.insert("seen".into(), json!(now_s()));
+            if !o.contains_key("country") {
+                if let Ok(hex) = u32::from_str_radix(icao, 16) {
+                    if let Some(c) = crate::outputs::dbinfo::icao_country(hex) {
+                        o.insert("country".into(), json!(c));
+                    }
+                    if let Some((reg, typ)) = crate::outputs::dbinfo::AircraftDb::lookup(hex) {
+                        if !reg.is_empty() {
+                            o.insert("reg".into(), json!(reg));
+                        }
+                        if !typ.is_empty() {
+                            o.insert("actype".into(), json!(typ));
+                        }
+                    }
+                }
+            }
             let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
             o.insert("msgs".into(), json!(msgs + 1));
+            if let (Some(la), Some(lo_)) = (lat, lon) {
+                push_trail(o, *la, *lo_);
+            }
             for (k, v) in [
                 ("callsign", callsign.as_ref().map(|c| json!(c.trim()))),
                 ("alt", altitude_ft.map(|v| json!(v))),
@@ -73,6 +108,17 @@ fn update(d: &mut Dash, m: &Message) {
             let o = e.as_object_mut().unwrap();
             o.insert("mmsi".into(), json!(mmsi));
             o.insert("seen".into(), json!(now_s()));
+            if !o.contains_key("country") {
+                if let Some(c) = crate::outputs::dbinfo::mid_country(*mmsi) {
+                    o.insert("country".into(), json!(c));
+                }
+            }
+            if let (Some(la), Some(lo_)) = (
+                det.get("lat").and_then(Value::as_f64),
+                det.get("lon").and_then(Value::as_f64),
+            ) {
+                push_trail(o, la, lo_);
+            }
             if let Some(t) = msg_type {
                 o.insert("type".into(), json!(t));
             }

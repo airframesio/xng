@@ -129,6 +129,10 @@ struct OutputOpts {
     /// (shown in console output)
     #[arg(long)]
     gs_file: Option<PathBuf>,
+    /// Aircraft database CSV (tar1090/Mictronics format: icao;reg;type)
+    /// enriching the web dashboard with registrations and types
+    #[arg(long)]
+    aircraft_db: Option<PathBuf>,
     /// Serve the live web dashboard (map of decoded aircraft/vessels
     /// + message stream) on this address (e.g. 0.0.0.0:8080)
     #[arg(long)]
@@ -165,6 +169,10 @@ impl OutputOpts {
         }
         if let Some(p) = &self.gs_file {
             outputs::console::load_gs_names(p)?;
+        }
+        if let Some(p) = &self.aircraft_db {
+            let n = outputs::dbinfo::AircraftDb::load(p)?;
+            tracing::info!("aircraft db: {n} entries");
         }
         let ident = self.station_id.clone().unwrap_or_else(|| "XNG-DEV".to_owned());
         Ok((
@@ -689,6 +697,10 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
     };
 
+    if let Some(p) = &st.outputs.aircraft_db {
+        let n = outputs::dbinfo::AircraftDb::load(p)?;
+        tracing::info!("aircraft db: {n} entries");
+    }
     let mut sessions = Vec::new();
     for (i, sess) in st.sessions.iter().enumerate() {
         let label = format!("session {} ({})", i + 1, sess.mode);
