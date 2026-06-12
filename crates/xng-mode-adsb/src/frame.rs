@@ -75,19 +75,32 @@ pub struct AdsbFrame {
 
 /// Validates candidate frames and learns ICAO addresses from squitters.
 pub struct FrameValidator {
-    /// ICAO → frame counter at last sighting.
+    /// ICAO → frame counter at last sighting (confirmed aircraft only).
     icao_cache: HashMap<u32, u64>,
     counter: u64,
+    /// First sighting of a not-yet-confirmed ICAO: the held frame and
+    /// the sighting-counter at arrival. A second clean frame with the
+    /// same address confirms (random CRC-passing noise never repeats
+    /// an address); both frames are then released. Live captures
+    /// measured ~30 phantom single-sighting DF17s/minute without this.
+    pending: HashMap<u32, (Vec<u8>, f32, usize, u64)>,
+    /// Frames released by a confirmation, drained by the caller.
+    pub released: Vec<(usize, AdsbFrame)>,
 }
 
 impl FrameValidator {
     pub fn new() -> Self {
-        Self { icao_cache: HashMap::new(), counter: 0 }
+        Self {
+            icao_cache: HashMap::new(),
+            counter: 0,
+            pending: HashMap::new(),
+            released: Vec::new(),
+        }
     }
 
     /// Validate a demodulated candidate; returns a frame when parity
     /// checks out.
-    pub fn validate(&mut self, bytes: &[u8], level_dbfs: f32) -> Option<AdsbFrame> {
+    pub fn validate(&mut self, bytes: &[u8], level_dbfs: f32, pos: usize) -> Option<AdsbFrame> {
         let df = bytes[0] >> 3;
         // Syndrome = expected parity over the data bits XOR the received
         // parity field: 0 for clean parity, the overlaid address otherwise.
@@ -118,16 +131,22 @@ impl FrameValidator {
                     }
                 }
                 let icao = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]);
-                self.learn(icao);
+                if !self.confirm(icao, &bytes, level_dbfs, pos) {
+                    return None;
+                }
                 icao
             }
-            // All-call reply: PI overlaid with the interrogator code only.
+            // All-call reply: PI overlaid with the interrogator code
+            // only. DF11 carries no payload worth emitting on first
+            // sight; it counts as a confirmation sighting.
             11 => {
                 if syndrome & 0xFF_FF80 != 0 {
                     return None;
                 }
                 let icao = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]);
-                self.learn(icao);
+                if !self.confirm(icao, &bytes, level_dbfs, pos) {
+                    return None;
+                }
                 icao
             }
             // Address-overlaid parity: accept only known aircraft.
@@ -173,6 +192,64 @@ impl FrameValidator {
                 }
             }
             _ => {}
+        }
+        Some(f)
+    }
+
+    /// Two-sighting confirmation for addresses asserted by a clean
+    /// CRC: known ICAOs pass straight through; an unknown ICAO's first
+    /// frame is held; its second sighting confirms, releases the held
+    /// frame via `released`, and admits the address to the cache.
+    fn confirm(&mut self, icao: u32, bytes: &[u8], level_dbfs: f32, pos: usize) -> bool {
+        if self.icao_cache.contains_key(&icao) {
+            self.learn(icao);
+            return true;
+        }
+        if let Some((held, held_level, held_pos, _)) = self.pending.remove(&icao) {
+            self.learn(icao);
+            // Decode and release the held first frame.
+            if let Some(f) = self.decode_known(&held, held_level) {
+                self.released.push((held_pos, f));
+            }
+            return true;
+        }
+        // First sighting: hold. Cap the pending table (phantom
+        // addresses are random and never repeat; FIFO-ish eviction by
+        // age keeps it small).
+        if self.pending.len() >= 64 {
+            let oldest = self
+                .pending
+                .iter()
+                .min_by_key(|(_, (_, _, _, at))| *at)
+                .map(|(k, _)| *k);
+            if let Some(k) = oldest {
+                self.pending.remove(&k);
+            }
+        }
+        self.pending.insert(icao, (bytes.to_vec(), level_dbfs, pos, self.counter));
+        false
+    }
+
+    /// Decode a frame whose address is already trusted (used when a
+    /// held first frame is released by its confirmation).
+    fn decode_known(&mut self, bytes: &[u8], level_dbfs: f32) -> Option<AdsbFrame> {
+        let df = bytes[0] >> 3;
+        let icao = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]);
+        let mut f = AdsbFrame {
+            df,
+            icao,
+            bytes: bytes.to_vec(),
+            callsign: None,
+            altitude_ft: None,
+            squawk: None,
+            cpr: None,
+            velocity: None,
+            position: None,
+            comm_b: None,
+            level_dbfs,
+        };
+        if df == 17 || df == 18 {
+            decode_extended_squitter(&bytes[4..11], &mut f);
         }
         Some(f)
     }
@@ -251,35 +328,62 @@ mod tests {
         0x8D, 0x40, 0x62, 0x1D, 0x58, 0xC3, 0x82, 0xD6, 0x90, 0xC8, 0xAC, 0x28, 0x63, 0xA7,
     ];
 
+    /// Confirm an ICAO so subsequent single frames validate directly.
+    fn confirmed(v: &mut FrameValidator, frame: &[u8]) -> AdsbFrame {
+        assert!(v.validate(frame, -20.0, 0).is_none(), "first sighting held");
+        v.validate(frame, -20.0, 1000).expect("second sighting confirms")
+    }
+
     #[test]
     fn decodes_published_ident_frame() {
-        let f = FrameValidator::new().validate(&ID_FRAME, -20.0).unwrap();
+        let mut v = FrameValidator::new();
+        let f = confirmed(&mut v, &ID_FRAME);
         assert_eq!(f.df, 17);
         assert_eq!(f.icao, 0x4840D6);
         assert_eq!(f.callsign.as_deref(), Some("KLM1023"));
         assert_eq!(f.altitude_ft, None);
+        // The held first frame was released alongside, fully decoded.
+        assert_eq!(v.released.len(), 1);
+        assert_eq!(v.released[0].0, 0);
+        assert_eq!(v.released[0].1.callsign.as_deref(), Some("KLM1023"));
     }
 
     #[test]
     fn decodes_published_altitude_frame() {
-        let f = FrameValidator::new().validate(&POS_FRAME, -20.0).unwrap();
+        let mut v = FrameValidator::new();
+        let f = confirmed(&mut v, &POS_FRAME);
         assert_eq!(f.icao, 0x40621D);
         assert_eq!(f.altitude_ft, Some(38_000));
+        assert_eq!(v.released[0].1.altitude_ft, Some(38_000));
     }
 
     #[test]
     fn repairs_single_bit_rejects_double() {
         // One flipped bit: the syndrome identifies it and the frame
         // repairs to the original.
+        let mut v = FrameValidator::new();
+        confirmed(&mut v, &ID_FRAME);
         let mut one = ID_FRAME;
         one[6] ^= 0x01;
-        let f = FrameValidator::new().validate(&one, -20.0).expect("repaired");
+        let f = v.validate(&one, -20.0, 0).expect("repaired");
         assert_eq!(f.bytes, &ID_FRAME);
         // Two flipped bits: not repairable, rejected.
         let mut two = ID_FRAME;
         two[6] ^= 0x01;
         two[9] ^= 0x10;
-        assert!(FrameValidator::new().validate(&two, -20.0).is_none());
+        assert!(v.validate(&two, -20.0, 0).is_none());
+    }
+
+    #[test]
+    fn unconfirmed_singletons_never_emit() {
+        // A CRC-clean DF17 whose address is never seen again — the
+        // phantom signature on quiet live captures — stays held.
+        let mut v = FrameValidator::new();
+        assert!(v.validate(&ID_FRAME, -20.0, 0).is_none());
+        assert!(v.released.is_empty());
+        // A different aircraft doesn't confirm it.
+        assert!(v.validate(&POS_FRAME, -20.0, 500).is_none());
+        assert!(v.released.is_empty());
     }
 
     #[test]
@@ -293,10 +397,10 @@ mod tests {
         frame.extend([crc[1] ^ addr[1], crc[2] ^ addr[2], crc[3] ^ addr[3]]);
 
         // Unknown aircraft → rejected.
-        assert!(v.validate(&frame, -20.0).is_none());
-        // Learn the ICAO from a squitter, then the DF4 is accepted.
-        v.validate(&ID_FRAME, -20.0).unwrap();
-        let f = v.validate(&frame, -20.0).unwrap();
+        assert!(v.validate(&frame, -20.0, 0).is_none());
+        // Confirm the ICAO from squitters, then the DF4 is accepted.
+        confirmed(&mut v, &ID_FRAME);
+        let f = v.validate(&frame, -20.0, 0).unwrap();
         assert_eq!(f.df, 4);
         assert_eq!(f.icao, 0x4840D6);
     }

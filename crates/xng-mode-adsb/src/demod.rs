@@ -193,7 +193,8 @@ impl PpmDemod {
             }
 
             let level = 10.0 * (pulses / half_f as f32).max(1e-12).log10();
-            if let Some(frame) = validator.validate(&bytes, level) {
+            if let Some(frame) = validator.validate(&bytes, level, i) {
+                out.append(&mut validator.released);
                 out.push((i, frame));
                 i += (((PREAMBLE_US + nbits) * 2) as f64 * half_f) as usize;
             } else {
@@ -253,7 +254,8 @@ impl PpmDemod {
             }
 
             let level = 10.0 * (pulses / half as f32).max(1e-12).log10();
-            if let Some(frame) = validator.validate(&bytes, level) {
+            if let Some(frame) = validator.validate(&bytes, level, i) {
+                out.append(&mut validator.released);
                 out.push((i, frame));
                 i += (PREAMBLE_US + nbits) * 2 * half;
             } else {
