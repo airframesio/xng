@@ -41,6 +41,23 @@ fn sample_frac(w: &[Complex<f32>], pos: f32) -> Complex<f32> {
 /// GMSK (BT = 0.4) integrated phase pulse q̃(t): 0 → 1 over ±2 bit
 /// periods (same Gaussian math as the test modulator).
 fn gmsk_qtilde(t: f32) -> f32 {
+    // Cached lookup: the erf integration below is only run once to fill
+    // a fine table (the function is called per waveform sample).
+    static TABLE: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let table = TABLE.get_or_init(|| {
+        (0..=1200).map(|i| gmsk_qtilde_exact(-3.0 + i as f32 * 0.005)).collect()
+    });
+    if t <= -3.0 {
+        return 0.0;
+    }
+    if t >= 3.0 {
+        return 1.0;
+    }
+    let idx = ((t + 3.0) / 0.005) as usize;
+    table[idx.min(1200)]
+}
+
+fn gmsk_qtilde_exact(t: f32) -> f32 {
     // Integral of the Gaussian frequency pulse; erf approximation
     // (Abramowitz–Stegun 7.1.26).
     let erf = |x: f32| -> f32 {
@@ -184,6 +201,7 @@ pub struct CoherentDemod {
     /// Burst window currently being gathered: (start_abs, samples needed).
     pending: Option<u64>,
     fs: f32,
+    last_hunt_best: f32,
 }
 
 impl CoherentDemod {
@@ -204,6 +222,7 @@ impl CoherentDemod {
             template,
             pending: None,
             fs: fs as f32,
+            last_hunt_best: 0.0,
         }
     }
 
@@ -212,6 +231,7 @@ impl CoherentDemod {
     /// so callers can dedup against the streaming path.
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Vec<u8>> {
         self.buf.extend(input.iter().copied());
+        self.buf.make_contiguous();
         let mut out = Vec::new();
 
         let tmpl_len = self.template.len();
@@ -288,13 +308,18 @@ impl CoherentDemod {
                 continue;
             }
             // Candidate: search the template in the next ~2 slots.
-            if let Some(offset) = self.hunt_template(rel) {
+            let hunted = self.hunt_template(rel);
+            if let Some(offset) = hunted {
                 if std::env::var("AIS_DEBUG").is_ok() {
                     eprintln!("anchor at {}", self.base + (rel + offset) as u64);
                 }
                 self.pending = Some(self.base + (rel + offset) as u64);
+            } else if self.last_hunt_best < 0.3 {
+                // Nothing remotely template-like in the whole span:
+                // skip most of it (huge CPU win on always-gated noise).
+                self.cursor += (SPB * 48) as u64;
             } else {
-                self.cursor += (SPB * 8) as u64; // skip ahead a byte
+                self.cursor += (SPB * 8) as u64; // recenter the shoulder
             }
         }
 
@@ -387,22 +412,39 @@ impl CoherentDemod {
             / (energy * tmpl_len as f32).sqrt()
     }
 
-    fn hunt_template(&self, rel: usize) -> Option<usize> {
+    /// Returns Some(offset) on an anchor; on a miss, the caller may use
+    /// `last_hunt_best` to skip far ahead when nothing template-like
+    /// was in the span at all.
+    fn hunt_template(&mut self, rel: usize) -> Option<usize> {
         let tmpl_len = self.template.len();
         let span = SPB * 64; // search ~64 bits ahead of the gate
         let mut best = (0.0f32, 0usize);
-        for off in 0..span {
+        let buf = self.buf.as_slices().0; // contiguous after make_contiguous
+        // Stride-2 coarse pass, then ±1 refinement around the winner:
+        // the metric's peak is several samples wide and the fractional
+        // refine absorbs ±1 anyway. Halves the hunt cost.
+        let mut off = 0;
+        while off < span {
             let s0 = rel + off;
-            if s0 + tmpl_len >= self.buf.len() {
+            if s0 + tmpl_len >= buf.len() {
                 break;
             }
-            let w: Vec<Complex<f32>> =
-                self.buf.iter().skip(s0).take(tmpl_len).copied().collect();
-            let m = Self::template_metric(&self.template, &w);
+            let m = Self::template_metric(&self.template, &buf[s0..s0 + tmpl_len]);
             if m > best.0 {
                 best = (m, off);
             }
+            off += 2;
         }
+        for off in [best.1.saturating_sub(1), best.1 + 1] {
+            let s0 = rel + off;
+            if s0 + tmpl_len < buf.len() {
+                let m = Self::template_metric(&self.template, &buf[s0..s0 + tmpl_len]);
+                if m > best.0 {
+                    best = (m, off);
+                }
+            }
+        }
+        self.last_hunt_best = best.0;
         if std::env::var("AIS_DEBUG").is_ok() && best.0 > 0.3 {
             eprintln!("  hunt rel {rel}: best m={:.3} off={}", best.0, best.1);
         }
@@ -417,8 +459,10 @@ impl CoherentDemod {
     /// Anchor accepted: estimate CFO + phase, Viterbi the payload with
     /// both pulse-shape hypotheses (GMSK BT=0.4 and MSK).
     fn try_decode(&self, window: &[Complex<f32>]) -> Vec<Vec<u8>> {
+        static TABLES: std::sync::OnceLock<[[[f32; SPB]; 8]; 2]> = std::sync::OnceLock::new();
+        let tables = TABLES.get_or_init(|| [gmsk_bit_waveforms(), msk_bit_waveforms()]);
         let mut out = Vec::new();
-        for table in [gmsk_bit_waveforms(), msk_bit_waveforms()] {
+        for table in tables {
             if let Some(bits) = self.try_decode_with(window, &table) {
                 out.push(bits);
             }
@@ -542,7 +586,9 @@ impl CoherentDemod {
         // π-flip image (carrier-phase sign ambiguity).
         metric[(((q0 + 2) % 4) << 2) | ((1 - lp0) << 1) | (1 - lc0)] = 0.0;
 
-        let mut paths: Vec<Vec<u8>> = vec![Vec::with_capacity(nbits); NS];
+        // Traceback matrix instead of per-branch path clones (the
+        // clones were O(n²) and dominated the live CPU budget).
+        let mut back: Vec<[u8; NS]> = Vec::with_capacity(nbits);
         let mut rot_k = rot;
         let mut trim = Complex::new(1.0f32, 0.0);
         const PHASE_GAIN: f32 = 0.25;
@@ -566,7 +612,7 @@ impl CoherentDemod {
             }
 
             let mut nm = [f32::NEG_INFINITY; NS];
-            let mut np: Vec<Vec<u8>> = vec![Vec::new(); NS];
+            let mut prev_state = [0u8; NS];
             let mut best_resid: Option<(f32, Complex<f32>)> = None;
             for st in 0..NS {
                 if metric[st] == f32::NEG_INFINITY {
@@ -585,10 +631,7 @@ impl CoherentDemod {
                     let nst = (nq << 2) | (lc << 1) | ln;
                     if m > nm[nst] {
                         nm[nst] = m;
-                        let mut pth = paths[st].clone();
-                        // NRZI for bit k: 1 = level repeated (l_k == l_{k−1}).
-                        pth.push((lc == lp) as u8);
-                        np[nst] = pth;
+                        prev_state[nst] = st as u8;
                         if best_resid.is_none() || c.re > best_resid.unwrap().0 {
                             best_resid = Some((c.re, c));
                         }
@@ -601,15 +644,33 @@ impl CoherentDemod {
                 }
             }
             metric = nm;
-            paths = np;
+            back.push(prev_state);
         }
 
         let bestst = (0..NS).max_by(|&a, &b| metric[a].partial_cmp(&metric[b]).unwrap())?;
         if metric[bestst] == f32::NEG_INFINITY {
             return None;
         }
+        // Traceback: NRZI bit k = (l_k == l_{k−1}) read from the state
+        // pair along the surviving path.
+        let mut bits_rev = Vec::with_capacity(nbits);
+        let mut st = bestst;
+        for k in (0..nbits).rev() {
+            let lp = (st >> 1) & 1;
+            let lc = st & 1;
+            let _ = lc;
+            // The emitted bit at step k compared l_cur (then) with
+            // l_prev (then): from the SOURCE state of this transition.
+            let src = back[k][st] as usize;
+            let s_lp = (src >> 1) & 1;
+            let s_lc = src & 1;
+            bits_rev.push((s_lc == s_lp) as u8);
+            let _ = lp;
+            st = src;
+        }
+        bits_rev.reverse();
         // First emission is the known template bit — drop it.
-        Some(paths[bestst][1..].to_vec())
+        Some(bits_rev[1..].to_vec())
     }
 
 }

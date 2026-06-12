@@ -57,6 +57,27 @@ pub struct SessionConfig {
     pub receiver_pos: Option<(f64, f64)>,
     /// ACARS label filter applied before messages reach the bus.
     pub label_filter: LabelFilter,
+    /// Demod effort: Max scans every timing grid (file analysis);
+    /// Live trims to a real-time budget for embedded hardware.
+    pub demod_effort: DemodEffort,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DemodEffort {
+    Live,
+    #[default]
+    Max,
+}
+
+impl std::str::FromStr for DemodEffort {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "live" => Ok(Self::Live),
+            "max" => Ok(Self::Max),
+            other => Err(format!("unknown effort {other:?} (live|max)")),
+        }
+    }
 }
 
 /// Keep/drop filter on the ACARS label. Non-ACARS messages always
@@ -125,7 +146,13 @@ pub(crate) enum ModeChannel {
 }
 
 impl ModeChannel {
-    fn new(mode: Mode, sample_rate: f64, offset: f64, freq: u64) -> Result<Self, String> {
+    fn new(
+        mode: Mode,
+        sample_rate: f64,
+        offset: f64,
+        freq: u64,
+        effort: DemodEffort,
+    ) -> Result<Self, String> {
         match mode {
             Mode::AcarsPoa => Ok(Self::Acars(AcarsChannelDecoder::new(sample_rate, offset)?)),
             Mode::Ais => Ok(Self::Ais(AisChannelDecoder::new(sample_rate, offset, freq)?)),
@@ -148,7 +175,11 @@ impl ModeChannel {
                 if offset.abs() > 1e-6 {
                     return Err("Mode S uses the whole capture: tune -c to 1090.000M and pass --channels 1090".into());
                 }
-                Ok(Self::Adsb(AdsbDecoder::new(sample_rate)?))
+                Ok(Self::Adsb(if effort == DemodEffort::Live {
+                    AdsbDecoder::new_live(sample_rate)?
+                } else {
+                    AdsbDecoder::new(sample_rate)?
+                }))
             }
             other => Err(format!("mode {other} has no native core yet")),
         }
@@ -343,7 +374,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 sample_rate
             );
         }
-        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
         if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
             d.set_receiver_position(lat, lon);
@@ -698,7 +729,7 @@ pub(crate) fn build_decoders(
                 freq as f64 / 1e6
             );
         }
-        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
         if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
             d.set_receiver_position(lat, lon);

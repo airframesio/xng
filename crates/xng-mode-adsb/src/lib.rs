@@ -57,6 +57,19 @@ impl AdsbDecoder {
         })
     }
 
+    /// Live/embedded variant: a single half-sample extra grid instead
+    /// of the full ⅛-sample set (~3× cheaper scan, small recall cost —
+    /// see docs/notes/BENCHMARKS.md).
+    pub fn new_live(input_rate: f64) -> Result<Self, String> {
+        Ok(Self {
+            demod: demod::PpmDemod::with_phases(input_rate, &[0.5])?,
+            input_rate,
+            samples_seen: 0,
+            track: HashMap::new(),
+            receiver: None,
+        })
+    }
+
     /// Set the receiver location (enables surface-position decode).
     pub fn set_receiver_position(&mut self, lat: f64, lon: f64) {
         self.receiver = Some((lat, lon));

@@ -126,6 +126,25 @@ xng decode ais_6m.cs16 -f cs16 -m ais -r 6000000 -c 162000000 --channels 161.975
 AIS-catcher -r CS16 ais_6m.cs16 -s 6000000 -n
 ```
 
+## Decode CPU (×-realtime, Apple M-series; `bench/cpu.sh`)
+
+| mode | effort | speed | decode recall |
+|---|---|---|---|
+| adsb | `max` (default for files) | 5.3× | 161 unique (reference) |
+| adsb | `live` (default for SDR) | **16.6×** | 156 unique (97 %) |
+| ais | full | **8.6×** | 52 frames |
+| vdl2 | full | 85× | 44 frames |
+| hfdl | full | 283× | 33 frames |
+
+Pi-class hardware runs ~5–8× slower than the bench machine: `live`
+effort keeps ADS-B comfortably real-time there; AIS lands ~1.4×.
+History: the first measurement caught AIS at 3.0× and ADS-B at an
+unusable 2.2× — fixed by caching the GMSK waveform tables, replacing
+the trellis' O(n²) path clones with a traceback matrix, stride-2
+template hunting with low-metric span skipping (which also *gained* a
+frame: 51 → 52), and the `--demod-effort` knob (per-command defaults:
+file decode = max, SDR commands = live).
+
 ## Standing results elsewhere
 
 - VDL2: **44 frames vs dumpvdl2's 41** on the sigidwiki capture —

@@ -42,14 +42,24 @@ pub struct PpmDemod {
     last_sample: Complex<f32>,
     /// Power (|x|²) carry buffer across process() calls.
     power: Vec<f32>,
-    /// Fractionally shifted power buffers (⅛-sample offset grid).
-    power_frac: [Vec<f32>; 7],
+    /// Fractional offsets scanned besides the on-grid stream.
+    fracs: Vec<f32>,
+    /// Fractionally shifted power buffers (one per offset).
+    power_frac: Vec<Vec<f32>>,
     validator: FrameValidator,
     noise: f32,
 }
 
 impl PpmDemod {
     pub fn new(input_rate: f64) -> Result<Self, String> {
+        Self::with_phases(input_rate, &[0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875])
+    }
+
+    /// `fracs` selects the interpolated timing grids scanned besides
+    /// the on-grid one (2 MS/s input only). The full ⅛-sample set buys
+    /// ~+16 unique frames on the modes1 benchmark at ~8× the scan
+    /// cost; `&[0.5]` is the live/embedded compromise.
+    pub fn with_phases(input_rate: f64, fracs: &[f32]) -> Result<Self, String> {
         let spu = input_rate / 1e6;
         if (spu - spu.round()).abs() > 1e-9 || (spu.round() as usize) % 2 != 0 || spu < 2.0 {
             return Err(format!(
@@ -57,13 +67,14 @@ impl PpmDemod {
                  {input_rate} S/s gives {spu} (use e.g. 2000000)"
             ));
         }
-        let two_phase = (spu.round() as usize) == 2;
+        let two_phase = (spu.round() as usize) == 2 && !fracs.is_empty();
         Ok(Self {
             half: spu.round() as usize / 2,
             two_phase,
+            fracs: fracs.to_vec(),
             last_sample: Complex::new(0.0, 0.0),
             power: Vec::new(),
-            power_frac: std::array::from_fn(|_| Vec::new()),
+            power_frac: fracs.iter().map(|_| Vec::new()).collect(),
             validator: FrameValidator::new(),
             noise: 1e-6,
         })
@@ -144,9 +155,7 @@ impl PpmDemod {
                 v.reserve(input.len());
             }
             for &x in input {
-                for (j, frac) in
-                    [0.125f32, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875].iter().enumerate()
-                {
+                for (j, frac) in self.fracs.iter().enumerate() {
                     let interp = prev * (1.0 - frac) + x * *frac;
                     self.power_frac[j].push(interp.norm_sqr());
                 }
