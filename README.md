@@ -332,6 +332,13 @@ software. The header shows the station id and uptime. The page is
 embedded in the binary (CDN assets are SRI-pinned; RF-sourced strings
 are HTML-escaped).
 
+Aircraft on the map are drawn with type-specific silhouettes from
+[PlaneWatch pw-silhouettes](https://github.com/plane-watch/pw-silhouettes)
+(CC BY-NC-SA 4.0, **used with permission** — thank you, Plane Watch!),
+resolved by the ICAO type designator from the aircraft database and
+colored by altitude. Aircraft without a known type fall back to a
+plain arrow.
+
 ### Feeding and outputs
 
 Every mode and every command shares the same output options:

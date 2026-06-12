@@ -25,7 +25,22 @@
   #entities th { color: #565f89; position: sticky; top: 0; background: #0b0e14; cursor: default; }
   #entities tr.row { cursor: pointer; }
   #entities tr.row:hover { background: #16161e; }
+  #entities tr.row.sel { background: #1f2435; }
+  #entities tr.row.sel td:first-child { border-left: 2px solid #7aa2f7; padding-left: 6px; }
   #entities td.age { color: #565f89; }
+  .silh, .silh svg { width: 100%; height: 100%; display: block; }
+  .silh svg * { fill: currentColor !important; stroke: none !important; }
+  .silh svg image { display: none !important; }
+  .leaflet-popup-content-wrapper { background: #16161e; color: #c8ccd4; border: 1px solid #2a2f41; border-radius: 6px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; box-shadow: 0 3px 14px rgba(0,0,0,0.5); }
+  .leaflet-popup-content { margin: 10px 12px; }
+  .leaflet-popup-tip { background: #16161e; border: 1px solid #2a2f41; }
+  .leaflet-popup-close-button { color: #565f89 !important; }
+  .pp { display: flex; gap: 12px; align-items: flex-start; min-width: 210px; }
+  .pp .pic { width: 64px; height: 64px; flex: none; margin-top: 2px; }
+  .pp h3 { margin: 0 0 3px; font-size: 14px; color: #7aa2f7; }
+  .pp table { border-collapse: collapse; }
+  .pp td { padding: 0 8px 0 0; vertical-align: baseline; }
+  .pp td.k { color: #565f89; }
   #msgbar { display: flex; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #1c2230; align-items: center; }
   #msgbar input { flex: 1; background: #11141c; border: 1px solid #2a2f41; border-radius: 4px; color: #c8ccd4; padding: 3px 8px; font: inherit; outline: none; }
   #msgbar button { background: #16161e; border: 1px solid #2a2f41; border-radius: 4px; color: #c8ccd4; padding: 3px 10px; font: inherit; cursor: pointer; }
@@ -56,8 +71,38 @@
 <script>
 const map = L.map('map', { zoomControl: true }).setView([40, -95], 4);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-  attribution: '&copy; OpenStreetMap, &copy; CARTO', maxZoom: 18,
+  attribution: '&copy; OpenStreetMap, &copy; CARTO · silhouettes &copy; <a href="https://github.com/plane-watch/pw-silhouettes">Plane Watch</a>', maxZoom: 18,
 }).addTo(map);
+
+// Aircraft silhouettes: PlaneWatch pw-silhouettes (CC BY-NC-SA 4.0,
+// used with permission). Resolved by ICAO type designator via the
+// repo's airframes/<TYPE>.json metadata (follows aliasOf), fetched
+// once per type and inlined so the fill tracks the altitude color.
+const SIL_BASE = 'https://cdn.jsdelivr.net/gh/plane-watch/pw-silhouettes@main';
+const silCache = new Map(); // TYPE -> {svg, noRotate} | 'pending' | null
+function silhouette(type) {
+  if (!type) return null;
+  const t = String(type).toUpperCase().replace(/[^A-Z0-9-]/g, '');
+  const v = silCache.get(t);
+  if (v !== undefined) return v && v.svg ? v : null;
+  silCache.set(t, 'pending');
+  (async () => {
+    try {
+      let j = await (await fetch(`${SIL_BASE}/airframes/${t}.json`)).json();
+      if (j.aliasOf) j = await (await fetch(`${SIL_BASE}/airframes/${j.aliasOf}.json`)).json();
+      const src = (((j.art || {}).frames || [])[0] || {}).src;
+      let svg = await (await fetch(`${SIL_BASE}/${src}`)).text();
+      svg = svg.slice(svg.indexOf('<svg'));
+      if (!svg.startsWith('<svg')) throw new Error('no svg');
+      silCache.set(t, { svg, noRotate: !!(j.render || {}).noRotate });
+    } catch (e) { silCache.set(t, null); }
+  })();
+  return null;
+}
+function silDiv(sil, color, rot) {
+  const r = sil.noRotate ? 0 : rot || 0;
+  return `<div class="silh" style="color:${color};transform:rotate(${r}deg)">${sil.svg}</div>`;
+}
 
 const MODE_COLORS = {
   acars: '#e0af68', vdl2: '#7aa2f7', hfdl: '#bb9af7', adsb: '#7dcfff',
@@ -72,9 +117,12 @@ function altColor(alt) {
   const h = 20 + Math.min(Math.max(alt, 0), 42000) / 42000 * 220;
   return `hsl(${h.toFixed(0)},75%,62%)`;
 }
-const planeIcon = (trk, alt) => L.divIcon({ className: '', html:
-  `<div style="transform:rotate(${trk||0}deg);font-size:18px;color:${altColor(alt)}">&#9650;</div>`,
-  iconSize: [18, 18], iconAnchor: [9, 9] });
+const planeIcon = (trk, alt, sil) => sil
+  ? L.divIcon({ className: '', html: silDiv(sil, altColor(alt), trk),
+      iconSize: [28, 28], iconAnchor: [14, 14] })
+  : L.divIcon({ className: '', html:
+      `<div style="transform:rotate(${trk||0}deg);font-size:18px;color:${altColor(alt)}">&#9650;</div>`,
+      iconSize: [18, 18], iconAnchor: [9, 9] });
 const shipIcon = cog => L.divIcon({ className: '', html:
   `<div style="transform:rotate(${cog||0}deg);font-size:14px;color:#9ece6a">&#11041;</div>`,
   iconSize: [14, 14], iconAnchor: [7, 7] });
@@ -82,14 +130,21 @@ const shipIcon = cog => L.divIcon({ className: '', html:
 const markers = new Map(); // key -> {marker, trail}
 let fitted = false;
 let paused = false;
+let selected = null; // entity key ('a'+icao / 'v'+mmsi)
 const hiddenModes = new Set();
 const expanded = new Set();
 const rateHist = []; // [t_ms, totals] samples for per-mode rates
 
-function focusEntity(lat, lon) {
+function selectEntity(key, lat, lon) {
+  selected = key;
   if (lat != null && lon != null) map.setView([lat, lon], Math.max(map.getZoom(), 9));
+  const e = markers.get(key);
+  if (e) e.marker.openPopup();
+  render();
+  const row = document.querySelector(`#entities tr[data-k="${key}"]`);
+  if (row) row.scrollIntoView({ block: 'nearest' });
 }
-window.focusEntity = focusEntity;
+window.selectEntity = selectEntity;
 window.toggleMode = m => { hiddenModes.has(m) ? hiddenModes.delete(m) : hiddenModes.add(m); render(); };
 window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
 document.getElementById('pause').onclick = function () {
@@ -107,6 +162,15 @@ function upsert(key, lat, lon, icon, label, popup, trail, color) {
     e = { marker: L.marker([lat, lon], { icon }).addTo(map) };
     e.marker.bindTooltip(label, { permanent: true, direction: 'right', offset: [10, 0], className: 'lbl' });
     e.marker.bindPopup(popup);
+    // Clicking the marker selects the entity (highlights its row).
+    e.marker.on('popupopen', () => {
+      if (selected !== key) {
+        selected = key;
+        render();
+        const row = document.querySelector(`#entities tr[data-k="${key}"]`);
+        if (row) row.scrollIntoView({ block: 'nearest' });
+      }
+    });
     markers.set(key, e);
   } else {
     e.marker.setLatLng([lat, lon]);
@@ -125,6 +189,16 @@ function upsert(key, lat, lon, icon, label, popup, trail, color) {
 function fmtAge(s) {
   if (s == null) return '';
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m`;
+}
+// Structured popup card: optional silhouette + key/value rows (values
+// are pre-escaped by the caller; empty rows are dropped).
+function entityPopup(pic, title, kv) {
+  const rows = kv
+    .filter(([, v]) => v != null && v !== false && v !== '')
+    .map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`)
+    .join('');
+  return `<div class="pp">${pic ? `<div class="pic">${pic}</div>` : ''}` +
+    `<div><h3>${title}</h3><table>${rows}</table></div></div>`;
 }
 function fmtUptime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
@@ -164,20 +238,35 @@ function render() {
   for (const a of s.aircraft) {
     // Callsigns arrive over RF: escape before any HTML context.
     const label = escapeHtml(a.callsign || a.icao);
-    const popup = `<b>${label}</b><br>icao ${escapeHtml(a.icao)}` +
-      (a.reg ? `<br>${escapeHtml(a.reg)}${a.actype ? ' · ' + escapeHtml(a.actype) : ''}` : '') +
-      (a.country ? `<br>${escapeHtml(a.country)}` : '') +
-      (a.alt != null ? `<br>${a.alt} ft` : '') +
-      (a.spd != null ? `<br>${a.spd} kt` : '') +
-      (a.squawk ? `<br>squawk ${escapeHtml(String(a.squawk))}` : '') + `<br>${a.msgs} msgs`;
-    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt), label, popup, a.trail, altColor(a.alt));
+    const sil = silhouette(a.actype);
+    const popup = entityPopup(
+      sil ? silDiv(sil, altColor(a.alt), a.trk) : '',
+      label,
+      [
+        ['icao', escapeHtml(a.icao)],
+        ['reg', a.reg && escapeHtml(a.reg)],
+        ['type', a.actype && escapeHtml(a.actype)],
+        ['country', a.country && escapeHtml(a.country)],
+        ['altitude', a.alt != null ? `${a.alt} ft` : null],
+        ['speed', a.spd != null ? `${a.spd} kt` : null],
+        ['track', a.trk != null ? `${a.trk}&deg;` : null],
+        ['squawk', a.squawk && escapeHtml(String(a.squawk))],
+        ['msgs', a.msgs],
+        ['seen', `${fmtAge(s.now - a.seen)} ago`],
+      ]);
+    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt, sil), label, popup, a.trail, altColor(a.alt));
     if (p) pts.push(p);
   }
   for (const v of s.vessels) {
     const label = escapeHtml((v.name || String(v.mmsi)).trim());
-    const popup = `<b>${label}</b><br>mmsi ${v.mmsi}` +
-      (v.country ? `<br>${escapeHtml(v.country)}` : '') +
-      (v.sog != null ? `<br>${v.sog} kt` : '');
+    const popup = entityPopup('', label, [
+      ['mmsi', v.mmsi],
+      ['country', v.country && escapeHtml(v.country)],
+      ['speed', v.sog != null ? `${v.sog} kt` : null],
+      ['course', v.cog != null ? `${v.cog}&deg;` : null],
+      ['type', v.type != null ? `msg ${v.type}` : null],
+      ['seen', `${fmtAge(s.now - v.seen)} ago`],
+    ]);
     const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog), label, popup, v.trail, '#9ece6a');
     if (p) pts.push(p);
   }
@@ -207,14 +296,18 @@ function render() {
 
   const rows = [];
   for (const a of [...s.aircraft].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
-    rows.push(`<tr class="row" onclick="focusEntity(${a.lat ?? 'null'},${a.lon ?? 'null'})">` +
+    const k = 'a' + a.icao;
+    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
+      `onclick="selectEntity('${k}',${a.lat ?? 'null'},${a.lon ?? 'null'})">` +
       `<td style="color:${altColor(a.alt)}">✈ ${escapeHtml(a.callsign || a.icao)}</td>` +
       `<td>${escapeHtml(a.reg || '')}</td><td>${escapeHtml(a.actype || '')}</td>` +
       `<td>${a.alt ?? ''}</td><td>${a.spd ?? ''}</td><td>${a.msgs ?? ''}</td>` +
       `<td class="age">${fmtAge(s.now - a.seen)}</td></tr>`);
   }
   for (const v of [...s.vessels].sort((x, y) => (y.mmsi||0) - (x.mmsi||0))) {
-    rows.push(`<tr class="row" onclick="focusEntity(${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
+    const k = 'v' + v.mmsi;
+    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
+      `onclick="selectEntity('${k}',${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
       `<td>⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
       `<td colspan="2">${escapeHtml(v.country || '')}</td>` +
       `<td></td><td>${v.sog ?? ''}</td><td></td>` +

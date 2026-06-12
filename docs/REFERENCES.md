@@ -45,6 +45,7 @@ attribution. GPL projects are listed as fact references only.
 | sigidwiki HFDL sample (skip.land) | CC BY-SA | Off-air 21931 kHz IQ capture used for HFDL validation; 8 s vendored as CI fixture with attribution | https://www.sigidwiki.com/wiki/High_Frequency_Data_Link_(HFDL) |
 | sigidwiki VDL-M2 sample | CC BY-SA | Off-air VDL2 IQ capture (Amsterdam area, inverted I/Q convention) used for VDL2 validation with dumpvdl2 2.6.0 as ground truth; 6 s vendored as CI fixture with attribution | https://www.sigidwiki.com/wiki/VHF_Data_Link_-_Mode_2_(VDL-M2) |
 | sigidwiki Inmarsat-C TDM sample | CC BY-SA | Off-air STD-C TDM/EGC IQ capture (AOR-E) used for STD-C validation; 14 s vendored as CI fixture with attribution | https://www.sigidwiki.com/wiki/Inmarsat-C_TDM |
+| PlaneWatch pw-silhouettes | CC BY-NC-SA 4.0, **used with permission** | Aircraft silhouette artwork rendered on the web-dashboard map (fetched at page load from the upstream repo via CDN — not vendored); resolved by ICAO type designator through the repo's `airframes/*.json` metadata | https://github.com/plane-watch/pw-silhouettes |
 | acarsdec (TLeconte / f00b4r0) | LGPL/GPL-2 | Facts only (display conventions) | https://github.com/TLeconte/acarsdec |
 | AIS-catcher (jvde-github) | GPL-3 | Facts only (landscape research) | https://github.com/jvde-github/AIS-catcher |
 | gr-iridium (muccc) | GPL-3 | Facts only: PHY parameters (25 ksym/s DQPSK, channel/burst structure, PLL α, UW symbol patterns) | https://github.com/muccc/gr-iridium |
