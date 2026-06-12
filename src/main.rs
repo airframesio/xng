@@ -129,6 +129,10 @@ struct OutputOpts {
     /// (shown in console output)
     #[arg(long)]
     gs_file: Option<PathBuf>,
+    /// Serve the live web dashboard (map of decoded aircraft/vessels
+    /// + message stream) on this address (e.g. 0.0.0.0:8080)
+    #[arg(long)]
+    http: Option<String>,
     /// Publish messages as JSON to an MQTT broker
     /// (mqtt://[user:pass@]host[:port])
     #[arg(long)]
@@ -175,6 +179,7 @@ impl OutputOpts {
                 sbs: self.sbs.clone(),
                 beast: self.beast.clone(),
                 nmea_tcp: self.nmea_tcp.clone(),
+                http: self.http.clone(),
                 mqtt: self.mqtt.clone(),
                 mqtt_topic: self.mqtt_topic.clone(),
             },
@@ -642,6 +647,7 @@ fn main() -> anyhow::Result<()> {
                         sbs: None,
                         beast: None,
                         nmea_tcp: None,
+                        http: None,
                         mqtt: None,
                         mqtt_topic: "xng".into(),
                     },
@@ -678,6 +684,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         sbs: st.outputs.sbs.clone(),
         beast: st.outputs.beast.clone(),
         nmea_tcp: st.outputs.nmea_tcp.clone(),
+        http: st.outputs.http.clone(),
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
     };

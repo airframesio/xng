@@ -385,6 +385,7 @@ pub(crate) fn scan_group(
             sbs: None,
             beast: None,
             nmea_tcp: None,
+            http: None,
             mqtt: None,
             mqtt_topic: "xng".into(),
         },

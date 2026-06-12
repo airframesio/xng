@@ -47,6 +47,7 @@ pub struct OutputsToml {
     pub sbs: Option<String>,
     pub beast: Option<String>,
     pub nmea_tcp: Option<String>,
+    pub http: Option<String>,
     pub mqtt: Option<String>,
     pub mqtt_topic: Option<String>,
     pub asf2_grpc: Option<String>,

@@ -293,6 +293,16 @@ A full example config and a hardened systemd unit live in
 [`contrib/`](contrib/). Sessions can also replay IQ files (`file =`
 instead of `sdr =`) — useful for regression runs over recorded nights.
 
+### Web dashboard
+
+`--http 0.0.0.0:8080` (any command, or `http =` in the station config)
+serves a built-in live dashboard: a dark map of decoded **aircraft**
+(Mode S positions, callsigns, altitude/speed) and **vessels** (AIS),
+a streaming message panel, and per-mode counters — the tar1090 /
+AIS-catcher-viewer experience, for every mode at once, with zero extra
+software. The page is embedded in the binary (CDN assets are
+SRI-pinned; RF-sourced strings are HTML-escaped).
+
 ### Feeding and outputs
 
 Every mode and every command shares the same output options:
