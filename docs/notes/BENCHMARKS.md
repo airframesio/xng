@@ -163,6 +163,17 @@ no clock policy fixes; a cache large enough to be pollution-proof
 would weaken the overlay-DF trust model). The ADS-B demod stands at
 its measured best: 161 @2 MS/s, 164 @2.4 MS/s.
 
+**Round 5 (2026-06-12)**: disagreement-flagged suspect bits
+(center-tap vs slot-integral statistics) feeding syndrome-targeted
+1/2-bit repair — implemented, measured, **decoded set bit-identical
+to baseline** (the suspect-pair mechanism never converted a frame on
+this capture). Reverted per the discipline: unmeasurable benefit
+doesn't ship. Conclusion of the ADS-B campaign on current evidence:
+the demod is at its measured ceiling on these captures; the levers
+that could move it further are (a) new bench captures with genuinely
+weak/dense traffic (the current ones saturate), and (b) readsb-style
+per-phase bit templates, parked at an estimated ≤4-frame payoff.
+
 ## Decode CPU (×-realtime, Apple M-series; `bench/cpu.sh`)
 
 | mode | effort | speed | decode recall |
