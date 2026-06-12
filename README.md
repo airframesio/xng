@@ -259,6 +259,40 @@ xng tui --sdr driver=rtlsdr -r 2400000 -c 131.500M --channels 131.550,131.125
 xng tui --file capture.cf32 -r 2400000 -c 131.500M --channels 131.550
 ```
 
+### Whole-station mode
+
+One process can run the entire receive site — several modes on several
+SDRs, sharing one feed, one output set, and one metrics endpoint
+(something no single-mode decoder can do):
+
+```bash
+xng station station.toml
+```
+
+```toml
+station-id = "XX-KSEA-1"
+
+[outputs]
+feed-airframes = true
+metrics = "0.0.0.0:9090"
+
+[[session]]
+sdr = "driver=rtlsdr,serial=00000001"
+gain = 48
+mode = "acars"
+sample-rate = 2400000
+center = "131.000M"
+channels = ["130.025", "131.550", "131.725"]
+
+[[session]]
+sdr = "driver=airspy"   # rate/center/channels derive from the plan
+mode = "vdl2"
+```
+
+A full example config and a hardened systemd unit live in
+[`contrib/`](contrib/). Sessions can also replay IQ files (`file =`
+instead of `sdr =`) — useful for regression runs over recorded nights.
+
 ### Feeding and outputs
 
 Every mode and every command shares the same output options:

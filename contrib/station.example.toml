@@ -1,0 +1,32 @@
+# xng station configuration — the whole receive site in one process.
+#   xng station station.toml
+station-id = "XX-KSEA-1"
+
+[outputs]
+feed-airframes = true
+jsonl = "/var/log/xng/messages.jsonl"
+metrics = "0.0.0.0:9090"
+# mqtt = "mqtt://user:pass@broker:1883"
+# sbs = "0.0.0.0:30003"        # Mode S BaseStation TCP
+# beast = "0.0.0.0:30005"      # Mode S Beast TCP (mlat-client compatible)
+# nmea-tcp = "0.0.0.0:10110"   # AIS NMEA TCP
+
+[[session]]
+sdr = "driver=rtlsdr,serial=00000001"
+gain = 48
+mode = "acars"
+sample-rate = 2400000
+center = "131.000M"
+channels = ["130.025", "131.125", "131.550", "131.725"]
+
+[[session]]
+sdr = "driver=airspy"          # rate/center/channels derive from the
+mode = "vdl2"                  # mode's built-in plan when omitted
+
+[[session]]
+sdr = "driver=rtlsdr,serial=00000002"
+mode = "adsb"
+sample-rate = 2000000
+center = "1090M"
+channels = ["1090"]
+receiver-pos = "47.62,-122.35" # enables surface-position decode
