@@ -214,3 +214,33 @@ file decode = max, SDR commands = live).
 - Iridium/STD-C/Aero: oracle-validated field-exact; no count-style
   sensitivity comparison run yet
 
+## Live-capture authenticity: phantom frames and ICAO confirmation
+
+A 60 s off-air 1090 MHz capture (RTL-SDR, 2.4 MS/s, gain 48, quiet
+minute) exposed a real defect the dense benchmark captures had hidden:
+xng reported 70 "unique frames" where dump1090-fa and readsb both
+reported ~0. The frames had the unmistakable phantom signature — 31
+CRC-clean DF17s carrying 31 *distinct* ICAO addresses, each seen
+exactly once, scattered across implausible allocation blocks.
+
+The math says this must happen: near-floor candidate gates × 16
+sub-sample phase passes over 60 s ≈ 2.3 × 10⁹ CRC trials, and a random
+112-bit candidate passes the 24-bit parity with probability 2⁻²⁴ —
+~140 expected false DF17s per minute of pure noise. The 0.18 s modes1
+fixture expects ~0.4, which is why the benchmarks never showed it.
+Worse, false DF11s (only 17 parity bits effectively checked) were
+*learning* junk ICAOs into the cache, which then validated junk
+address-overlaid DF0/4/5 frames.
+
+Fix: two-sighting ICAO confirmation (the same policy readsb uses for
+unreliable sources). A CRC-clean DF17/18/11 whose address has never
+been seen is held, not emitted; a second clean frame with the same
+address confirms the aircraft, releases the held frame at its original
+position, and admits the ICAO to the cache. Random phantoms never
+repeat an address (P ≈ 2⁻²⁴ per pair), so they die in the pending
+table (capped at 64, age-evicted). Address-overlaid frames already
+required a cached ICAO, so they now inherit confirmed-only trust.
+
+Measured cost: zero. modes1 is a single heavily-repeated aircraft —
+the gate still reads 323 at 2 MS/s. Measured benefit: the quiet live
+capture drops from 70 phantoms to exactly 0, matching both oracles.
