@@ -164,6 +164,13 @@ impl PpmDemod {
             // sample's energy across both halves and flips bits at
             // adverse sampling phases (measured at 2.4 MS/s); the
             // center is always inside its pulse.
+            // Bit decisions at interpolated half-bit centers of the
+            // pass phase. Falsified alternatives (measured on the
+            // readsb benchmark file): trimmed-slot integrals 152,
+            // preamble-contrast phase refinement 154, vs centers 157.
+            // (Per-candidate phase refinement by preamble contrast was
+            // also tried: 154 — overfits preamble noise. Plain pass-
+            // grid centers win.)
             let center = |slot: usize| -> f32 {
                 let pos = i as f64 + frac + (slot as f64 + 0.5) * half_f;
                 let s0 = pos.floor() as usize;
@@ -297,7 +304,13 @@ impl PpmDemod {
             // fractionally): candidates at each offset, merged by
             // bytes + position.
             let mut found: Vec<(usize, AdsbFrame)> = Vec::new();
-            for (pass, frac) in [0.0f64, 0.25, 0.5, 0.75].into_iter().enumerate() {
+            // Effort follows the integer path's grid choice: live (one
+            // extra phase configured) runs 2 passes; max runs 16
+            // (measured asymptote: 157 → 163 → 164 unique at 4/8/16).
+            let npass: usize = if self.fracs.len() <= 1 { 2 } else { 16 };
+            for (pass, frac) in
+                (0..npass).map(|k| k as f64 / npass as f64).enumerate()
+            {
                 let pass_found = Self::scan_f(
                     &self.power,
                     &prefix,
