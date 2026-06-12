@@ -78,8 +78,31 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
 // used with permission). Resolved by ICAO type designator via the
 // repo's airframes/<TYPE>.json metadata (follows aliasOf), fetched
 // once per type and inlined so the fill tracks the altitude color.
-const SIL_BASE = 'https://cdn.jsdelivr.net/gh/plane-watch/pw-silhouettes@main';
+// Pinned to a commit (not @main) so upstream changes can't silently
+// alter what executes here, and sanitized before injection.
+const SIL_BASE = 'https://cdn.jsdelivr.net/gh/plane-watch/pw-silhouettes@2daabf1a862710e9360ecb05c95111822f346dc5';
 const silCache = new Map(); // TYPE -> {svg, noRotate} | 'pending' | null
+
+// Reduce a fetched SVG to inert geometry: parse, reject non-SVG,
+// strip scriptable/embedding elements and event-handler or
+// javascript:/data: URL attributes, then reserialize.
+function sanitizeSvg(text) {
+  const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+  const root = doc.documentElement;
+  if (!root || root.nodeName.toLowerCase() !== 'svg') return null;
+  root.querySelectorAll('script,foreignObject,image,use,animate,set,animateTransform,animateMotion')
+    .forEach(el => el.remove());
+  for (const el of [root, ...root.querySelectorAll('*')]) {
+    for (const at of [...el.attributes]) {
+      const n = at.name.toLowerCase();
+      if (n.startsWith('on') || ((n === 'href' || n === 'xlink:href') && /^\s*(javascript|data):/i.test(at.value))) {
+        el.removeAttribute(at.name);
+      }
+    }
+  }
+  return new XMLSerializer().serializeToString(root);
+}
+
 function silhouette(type) {
   if (!type) return null;
   const t = String(type).toUpperCase().replace(/[^A-Z0-9-]/g, '');
@@ -90,10 +113,10 @@ function silhouette(type) {
     try {
       let j = await (await fetch(`${SIL_BASE}/airframes/${t}.json`)).json();
       if (j.aliasOf) j = await (await fetch(`${SIL_BASE}/airframes/${j.aliasOf}.json`)).json();
-      const src = (((j.art || {}).frames || [])[0] || {}).src;
-      let svg = await (await fetch(`${SIL_BASE}/${src}`)).text();
-      svg = svg.slice(svg.indexOf('<svg'));
-      if (!svg.startsWith('<svg')) throw new Error('no svg');
+      const src = String((((j.art || {}).frames || [])[0] || {}).src || '');
+      if (!/^silhouettes\/[A-Za-z0-9_-]+\.svg$/.test(src)) throw new Error('bad src');
+      const svg = sanitizeSvg(await (await fetch(`${SIL_BASE}/${src}`)).text());
+      if (!svg) throw new Error('no svg');
       silCache.set(t, { svg, noRotate: !!(j.render || {}).noRotate });
     } catch (e) { silCache.set(t, null); }
   })();
