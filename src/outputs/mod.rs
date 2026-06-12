@@ -7,6 +7,7 @@ pub mod beast;
 pub mod asf2_grpc;
 pub mod asf2_quic;
 pub mod console;
+pub mod http;
 pub mod jsonl;
 pub mod metrics;
 pub mod mqtt;

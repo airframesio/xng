@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xng station</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; display: flex; height: 100vh; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0e14; color: #c8ccd4; }
+  #map { flex: 1; }
+  #side { width: 420px; display: flex; flex-direction: column; border-left: 1px solid #1c2230; }
+  #head { padding: 10px 12px; border-bottom: 1px solid #1c2230; display: flex; justify-content: space-between; align-items: baseline; }
+  #head b { color: #7aa2f7; font-size: 15px; }
+  #totals { padding: 8px 12px; border-bottom: 1px solid #1c2230; display: flex; flex-wrap: wrap; gap: 6px 14px; }
+  #totals span b { color: #9ece6a; }
+  #msgs { flex: 1; overflow-y: auto; padding: 6px 0; }
+  .msg { padding: 3px 12px; border-bottom: 1px solid #11141c; white-space: pre-wrap; word-break: break-word; }
+  .msg .meta { color: #565f89; }
+  .leaflet-container { background: #0b0e14; }
+  .lbl { background: #16161e; border: 1px solid #2a2f41; border-radius: 3px; color: #c8ccd4; padding: 1px 4px; font: 11px ui-monospace, monospace; white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="side">
+  <div id="head"><b>xng station</b><span id="counts"></span></div>
+  <div id="totals"></div>
+  <div id="msgs"></div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
+<script>
+const map = L.map('map', { zoomControl: true }).setView([40, -95], 4);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  attribution: '&copy; OpenStreetMap, &copy; CARTO', maxZoom: 18,
+}).addTo(map);
+
+const planeIcon = trk => L.divIcon({ className: '', html:
+  `<div style="transform:rotate(${trk||0}deg);font-size:18px;color:#7aa2f7">&#9650;</div>`,
+  iconSize: [18, 18], iconAnchor: [9, 9] });
+const shipIcon = cog => L.divIcon({ className: '', html:
+  `<div style="transform:rotate(${cog||0}deg);font-size:14px;color:#9ece6a">&#11041;</div>`,
+  iconSize: [14, 14], iconAnchor: [7, 7] });
+
+const markers = new Map(); // key -> {marker, label}
+let fitted = false;
+
+function upsert(key, lat, lon, icon, label, popup) {
+  if (lat == null || lon == null) return null;
+  let e = markers.get(key);
+  if (!e) {
+    e = { marker: L.marker([lat, lon], { icon }).addTo(map) };
+    e.marker.bindTooltip(label, { permanent: true, direction: 'right', offset: [10, 0], className: 'lbl' });
+    e.marker.bindPopup(popup);
+    markers.set(key, e);
+  } else {
+    e.marker.setLatLng([lat, lon]);
+    e.marker.setIcon(icon);
+    e.marker.setTooltipContent(label);
+    e.marker.setPopupContent(popup);
+  }
+  e.alive = true;
+  return [lat, lon];
+}
+
+async function tick() {
+  try {
+    const r = await fetch('/api/state');
+    const s = await r.json();
+    markers.forEach(e => e.alive = false);
+    const pts = [];
+
+    for (const a of s.aircraft) {
+      // Callsigns arrive over RF: escape before any HTML context.
+      const label = escapeHtml(a.callsign || a.icao);
+      const popup = `<b>${label}</b><br>icao ${escapeHtml(a.icao)}` +
+        (a.alt != null ? `<br>${a.alt} ft` : '') +
+        (a.spd != null ? `<br>${a.spd} kt` : '') +
+        (a.squawk ? `<br>squawk ${a.squawk}` : '') + `<br>${a.msgs} msgs`;
+      const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk), label, popup);
+      if (p) pts.push(p);
+    }
+    for (const v of s.vessels) {
+      const label = escapeHtml((v.name || String(v.mmsi)).trim());
+      const popup = `<b>${label}</b><br>mmsi ${v.mmsi}` +
+        (v.sog != null ? `<br>${v.sog} kt` : '');
+      const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog), label, popup);
+      if (p) pts.push(p);
+    }
+    markers.forEach((e, k) => { if (!e.alive) { map.removeLayer(e.marker); markers.delete(k); } });
+    if (!fitted && pts.length) { map.fitBounds(pts, { maxZoom: 9, padding: [40, 40] }); fitted = true; }
+
+    document.getElementById('counts').textContent =
+      `${s.aircraft.length} aircraft · ${s.vessels.length} vessels`;
+    document.getElementById('totals').innerHTML = Object.entries(s.totals)
+      .sort()
+      .map(([m, n]) => `<span>${m} <b>${n}</b></span>`)
+      .join('');
+    document.getElementById('msgs').innerHTML = s.messages
+      .map(m => `<div class="msg"><span class="meta">${m.t.slice(11, 19)} ${(m.freq / 1e6).toFixed(3)}</span> ${escapeHtml(m.text)}</div>`)
+      .join('');
+  } catch (e) { /* server restarting; retry */ }
+}
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

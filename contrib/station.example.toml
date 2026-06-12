@@ -6,6 +6,7 @@ station-id = "XX-KSEA-1"
 feed-airframes = true
 jsonl = "/var/log/xng/messages.jsonl"
 metrics = "0.0.0.0:9090"
+http = "0.0.0.0:8080"          # live web dashboard (map + messages)
 # mqtt = "mqtt://user:pass@broker:1883"
 # sbs = "0.0.0.0:30003"        # Mode S BaseStation TCP
 # beast = "0.0.0.0:30005"      # Mode S Beast TCP (mlat-client compatible)

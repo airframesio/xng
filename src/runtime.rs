@@ -41,6 +41,8 @@ pub struct OutputConfig {
     pub beast: Option<String>,
     /// NMEA (AIVDM) TCP server address.
     pub nmea_tcp: Option<String>,
+    /// Web dashboard listen address (live map + message stream).
+    pub http: Option<String>,
     /// MQTT broker URL (mqtt://[user:pass@]host[:port]).
     pub mqtt: Option<String>,
     /// MQTT topic prefix (messages publish to `<prefix>/<mode>`).
@@ -392,6 +394,10 @@ fn spawn_outputs(
     if let Some(addr) = outputs.nmea_tcp.clone() {
         let rx = bus.subscribe();
         output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr)));
+    }
+    if let Some(addr) = outputs.http.clone() {
+        let rx = bus.subscribe();
+        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr)));
     }
     if let Some(url) = outputs.mqtt.clone() {
         let rx = bus.subscribe();
