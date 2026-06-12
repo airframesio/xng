@@ -61,6 +61,32 @@ fn works_at_higher_sample_rates() {
 
 #[test]
 fn rejects_unsupported_rates() {
-    assert!(AdsbDecoder::new(2_400_000.0).is_err());
+    // 2.4 MS/s (non-integer samples/µs) runs the fractional path now.
+    assert!(AdsbDecoder::new(2_400_000.0).is_ok());
     assert!(AdsbDecoder::new(1_000_000.0).is_err());
+}
+
+/// Native 2.4 MS/s (12 samples per 5 µs): synthesize at 12 MS/s
+/// (integer modulator grid) and decimate by 5 — exact, no resampler.
+#[test]
+fn decodes_at_2400ksps_fractional_path() {
+    let mut hi = vec![Complex::new(0.0f32, 0.0f32); 6000];
+    hi.extend(frame_iq(&ID_FRAME, 12, 0.6));
+    hi.extend(vec![Complex::new(0.0, 0.0); 12000]);
+    hi.extend(frame_iq(&POS_FRAME, 12, 0.4));
+    hi.extend(vec![Complex::new(0.0, 0.0); 6000]);
+    let mut iq: Vec<Complex<f32>> = hi.into_iter().step_by(5).collect();
+    let mut noise = Noise(0x0123_4567_89ab_cdef);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.02, noise.next() * 0.02);
+    }
+
+    let mut dec = AdsbDecoder::new(2_400_000.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(777) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 2, "expected both frames: {frames:?}");
+    assert_eq!(frames[0].callsign.as_deref(), Some("KLM1023"));
+    assert_eq!(frames[1].altitude_ft, Some(38_000));
 }

@@ -126,6 +126,23 @@ xng decode ais_6m.cs16 -f cs16 -m ais -r 6000000 -c 162000000 --channels 161.975
 AIS-catcher -r CS16 ais_6m.cs16 -s 6000000 -n
 ```
 
+**readsb round (2026-06-12)**: readsb (wiedehopf, built from source,
+`--no-fix`) is the strongest ADS-B oracle: **167 unique** on the
+2.4 MS/s resample of modes1, vs dump1090-fa's 162 and our 161 (at
+2 MS/s). Two improvements followed:
+
+1. **Native 2.4 MS/s support** — the RTL-SDR's best rate, previously
+   rejected (integer-samples/µs requirement). The fractional path
+   integrates half-µs slots from prefix sums with fractional edges and
+   decides bits at interpolated half-bit **centers** (the slot
+   integral splits a boundary-straddling sample's energy across both
+   halves and flips bits at adverse phases — measured), with four
+   sub-sample phase passes merged by bytes+position.
+2. Result: **157 unique at 2.4 MS/s** on readsb's own input file
+   (94 % of readsb; was 0 — the rate didn't work at all). The 2 MS/s
+   path is untouched (gate: 323). Remaining readsb edge: its
+   phase-classified bit templates.
+
 ## Decode CPU (×-realtime, Apple M-series; `bench/cpu.sh`)
 
 | mode | effort | speed | decode recall |
