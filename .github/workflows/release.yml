@@ -62,6 +62,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -114,6 +116,22 @@ jobs:
               --feed-airframes --station-id XX-YOUR-STATION
           ```
           EOF
+      - name: Changelog since previous tag
+        run: |
+          PREV=$(git describe --tags --abbrev=0 "$GITHUB_REF_NAME^" 2>/dev/null || true)
+          {
+            echo "## What's changed"
+            echo
+            git log --pretty='- %s' ${PREV:+$PREV..}"$GITHUB_REF_NAME" \
+              | grep -E '\(#[0-9]+\)$' || echo "- (no merged PRs found)"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "Full diff: [\`$PREV...$GITHUB_REF_NAME\`](https://github.com/airframesio/xng/compare/$PREV...$GITHUB_REF_NAME)"
+              echo
+            fi
+            cat notes.md
+          } > notes_full.md
+          mv notes_full.md notes.md
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}

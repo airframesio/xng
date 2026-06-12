@@ -152,6 +152,17 @@ phase refinement (154 — overfits preamble noise). xng also decodes
 **5 frames readsb misses**; the remaining 4-frame readsb edge is its
 phase-classified bit templates.
 
+**Round 4 falsifications (2026-06-12)**, recorded with numbers:
+two-bit syndrome-pair repair for DF17 (known-ICAO-gated) gained zero
+frames on either benchmark while halving max-effort throughput
+(5.3× → 2.7×) — reverted; in-frame collision rescanning still loses
+7 frames even with the sighting-based cache clock (the earlier
+attribution was wrong — the harm is false mid-frame DF11/17-shaped
+candidates filling the ICAO cache and evicting real aircraft, which
+no clock policy fixes; a cache large enough to be pollution-proof
+would weaken the overlay-DF trust model). The ADS-B demod stands at
+its measured best: 161 @2 MS/s, 164 @2.4 MS/s.
+
 ## Decode CPU (×-realtime, Apple M-series; `bench/cpu.sh`)
 
 | mode | effort | speed | decode recall |

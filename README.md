@@ -16,11 +16,11 @@ cores that share one capture, one message model, one application layer,
 and one set of outputs (including first-class
 [airframes.io](https://airframes.io) feeding).
 
-On off-air benchmark captures xng decodes **44 VDL2 frames where
-dumpvdl2 finds 41** and **161 unique Mode S frames to dump1090-fa's
-162** (plus 7 it misses) — every number enforced by a
-[CI regression gate](bench/) on each pull request
-([methodology + history](docs/notes/BENCHMARKS.md)).
+On off-air benchmark captures xng **beats dumpvdl2 on VDL2** and
+decodes **98–99 % of the strongest Mode S oracles** (readsb,
+dump1090-fa) while finding frames they miss — see the
+[benchmarks](#benchmarks) below; every number is enforced by a
+[CI regression gate](bench/) on each pull request.
 
 Releases ship binaries for Linux (x86_64/arm64, tarball + .deb), macOS
 Apple Silicon, and multi-arch Docker images.
@@ -66,7 +66,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
 | Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, **pager messages (IMS) with multi-part reassembly**, **voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction**, **IP-channel frames (IIP ARQ / IIQ / IIR)**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle |
 | AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors; off-air benchmark vs AIS-catcher (68 % and closing), CI-fenced |
-| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), per-aircraft tracking, **SBS + Beast outputs** | **161 unique vs dump1090-fa's 162 (+7 it misses)** on the canonical capture, CI-fenced; field-exact vs pyModeS |
+| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), single-bit CRC repair, per-aircraft tracking, **SBS + Beast outputs**; any rate ≥ 2 MS/s including **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
 
 All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
@@ -88,6 +88,28 @@ native Airspy backends map dB sensibly onto the actual hardware controls
 gain). With a native backend compiled in, its driver name routes to it
 automatically; add `backend=soapy` to force SoapySDR instead. IQ-file
 input (`xng decode`) needs no hardware or SDR libraries at all.
+
+## Benchmarks
+
+Decode counts on shared off-air captures, against the strongest open
+decoder for each mode ([methodology, history, and every falsified
+hypothesis](docs/notes/BENCHMARKS.md); fenced in CI by
+[`bench/run.sh`](bench/)):
+
+| Mode | Reference decoder | Reference | xng | | xng-exclusive frames |
+|---|---|---:|---:|---|---:|
+| VDL Mode 2 | dumpvdl2 | 41 | **44** | **107 %** | — |
+| Mode S @2.4 MS/s | readsb (`--no-fix`) | 167 | **164** | 98 % | 5 |
+| Mode S @2 MS/s | dump1090-fa (`--no-fix`) | 162 | **161** | 99 % | 7 |
+| HFDL | dumphfdl | 37 | 33 | 89 % | — |
+| AIS | AIS-catcher | 53 | 36 | 68 % | — |
+
+The HFDL and AIS gaps are characterized down to the burst: the missing
+frames are the weakest signals (4–5 dB SNR) at the margin of one
+inland antenna — not protocol or decode defects. Decode speed
+(Apple M-series; `bench/cpu.sh`): VDL2 85×, HFDL 283×, AIS 8.6×
+realtime; Mode S 16.6× at live effort / 5.3× at max — every mode
+runs real-time on Pi-class hardware via `--demod-effort`.
 
 ## Installing
 
