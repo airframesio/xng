@@ -397,7 +397,8 @@ fn spawn_outputs(
     }
     if let Some(addr) = outputs.http.clone() {
         let rx = bus.subscribe();
-        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr)));
+        let ident = station.ident.clone();
+        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr, ident)));
     }
     if let Some(url) = outputs.mqtt.clone() {
         let rx = bus.subscribe();

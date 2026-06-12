@@ -321,13 +321,16 @@ instead of `sdr =`) — useful for regression runs over recorded nights.
 `--http 0.0.0.0:8080` (any command, or `http =` in the station config)
 serves a built-in live dashboard: a dark map of decoded **aircraft**
 (Mode S positions, callsigns, altitude/speed) and **vessels** (AIS)
-with **position trails**, a click-to-focus **entity table**, countries
-from the ICAO/MID allocation tables, registrations/types from an
-optional `--aircraft-db` CSV (tar1090/Mictronics format), a streaming
-message panel, and per-mode counters — the tar1090 /
+with **position trails** and altitude-colored icons, a click-to-focus
+**entity table**, countries from the ICAO/MID allocation tables,
+registrations/types from an optional `--aircraft-db` CSV
+(tar1090/Mictronics format), and a streaming message panel with
+per-mode **filter chips and live rates**, pause and text search, and
+click-to-expand full decoded JSON for any message — the tar1090 /
 AIS-catcher-viewer experience, for every mode at once, with zero extra
-software. The page is embedded in the binary (CDN assets are
-SRI-pinned; RF-sourced strings are HTML-escaped).
+software. The header shows the station id and uptime. The page is
+embedded in the binary (CDN assets are SRI-pinned; RF-sourced strings
+are HTML-escaped).
 
 ### Feeding and outputs
 

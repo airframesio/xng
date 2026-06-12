@@ -26,6 +26,11 @@ struct Dash {
     vessels: HashMap<u32, Value>,
     recent: VecDeque<Value>,
     totals: HashMap<String, u64>,
+    /// Monotonic message id — lets the page keep expansion state
+    /// across poll re-renders.
+    next_id: u64,
+    station: String,
+    started: u64,
 }
 
 /// Append to the entity's position trail (decimated: only when moved
@@ -133,13 +138,17 @@ fn update(d: &mut Dash, m: &Message) {
         _ => {}
     }
 
-    // Message stream entry: a one-line summary plus the body.
+    // Message stream entry: a one-line summary, plus the full decoded
+    // message for the click-to-expand detail view.
     let line = crate::outputs::console::format_message(m, crate::outputs::console::ConsoleFormat::Pretty);
+    d.next_id += 1;
     d.recent.push_back(json!({
+        "id": d.next_id,
         "t": m.timestamp.to_rfc3339(),
         "mode": mode,
         "freq": m.frequency_hz,
         "text": line,
+        "detail": serde_json::to_value(m).unwrap_or(Value::Null),
     }));
     while d.recent.len() > RECENT_CAP {
         d.recent.pop_front();
@@ -151,9 +160,11 @@ fn snapshot(d: &mut Dash) -> String {
     d.aircraft.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.vessels.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     json!({
+        "station": d.station,
+        "started": d.started,
         "aircraft": d.aircraft.values().collect::<Vec<_>>(),
         "vessels": d.vessels.values().collect::<Vec<_>>(),
-        "messages": d.recent.iter().rev().take(60).collect::<Vec<_>>(),
+        "messages": d.recent.iter().rev().take(100).collect::<Vec<_>>(),
         "totals": d.totals,
         "now": now_s(),
     })
@@ -163,8 +174,13 @@ fn snapshot(d: &mut Dash) -> String {
 pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     addr: String,
+    station: String,
 ) -> std::io::Result<()> {
-    let state = Arc::new(Mutex::new(Dash::default()));
+    let state = Arc::new(Mutex::new(Dash {
+        station,
+        started: now_s(),
+        ..Dash::default()
+    }));
 
     // HTTP listener.
     let listener = tokio::net::TcpListener::bind(&addr).await?;

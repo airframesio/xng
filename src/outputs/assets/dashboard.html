@@ -10,20 +10,32 @@
   * { box-sizing: border-box; }
   body { margin: 0; display: flex; height: 100vh; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0e14; color: #c8ccd4; }
   #map { flex: 1; }
-  #side { width: 420px; display: flex; flex-direction: column; border-left: 1px solid #1c2230; }
-  #head { padding: 10px 12px; border-bottom: 1px solid #1c2230; display: flex; justify-content: space-between; align-items: baseline; }
-  #head b { color: #7aa2f7; font-size: 15px; }
-  #totals { padding: 8px 12px; border-bottom: 1px solid #1c2230; display: flex; flex-wrap: wrap; gap: 6px 14px; }
-  #totals span b { color: #9ece6a; }
-  #entities { max-height: 40%; overflow-y: auto; border-bottom: 1px solid #1c2230; }
+  #side { width: 480px; display: flex; flex-direction: column; border-left: 1px solid #1c2230; }
+  #head { padding: 9px 12px; border-bottom: 1px solid #1c2230; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  #head b { color: #7aa2f7; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #head .sub { color: #565f89; font-size: 12px; white-space: nowrap; }
+  #chips { padding: 7px 10px; border-bottom: 1px solid #1c2230; display: flex; flex-wrap: wrap; gap: 5px; }
+  .chip { border: 1px solid #2a2f41; border-radius: 10px; padding: 2px 9px; cursor: pointer; user-select: none; display: flex; gap: 6px; align-items: baseline; }
+  .chip b { font-weight: 600; }
+  .chip .rate { color: #565f89; font-size: 11px; }
+  .chip.off { opacity: 0.35; }
+  #entities { max-height: 38%; overflow-y: auto; border-bottom: 1px solid #1c2230; }
   #entities table { width: 100%; border-collapse: collapse; }
   #entities th, #entities td { text-align: left; padding: 2px 8px; white-space: nowrap; }
   #entities th { color: #565f89; position: sticky; top: 0; background: #0b0e14; cursor: default; }
   #entities tr.row { cursor: pointer; }
   #entities tr.row:hover { background: #16161e; }
-  #msgs { flex: 1; overflow-y: auto; padding: 6px 0; }
-  .msg { padding: 3px 12px; border-bottom: 1px solid #11141c; white-space: pre-wrap; word-break: break-word; }
+  #entities td.age { color: #565f89; }
+  #msgbar { display: flex; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #1c2230; align-items: center; }
+  #msgbar input { flex: 1; background: #11141c; border: 1px solid #2a2f41; border-radius: 4px; color: #c8ccd4; padding: 3px 8px; font: inherit; outline: none; }
+  #msgbar button { background: #16161e; border: 1px solid #2a2f41; border-radius: 4px; color: #c8ccd4; padding: 3px 10px; font: inherit; cursor: pointer; }
+  #msgbar button.on { color: #e0af68; border-color: #e0af68; }
+  #msgs { flex: 1; overflow-y: auto; padding: 4px 0; }
+  .msg { padding: 3px 12px; border-bottom: 1px solid #11141c; white-space: pre-wrap; word-break: break-word; cursor: pointer; }
+  .msg:hover { background: #11141c; }
   .msg .meta { color: #565f89; }
+  .msg .tag { border-radius: 3px; padding: 0 5px; font-size: 11px; color: #0b0e14; font-weight: 600; }
+  .msg pre { margin: 6px 0 2px; padding: 6px 8px; background: #11141c; border: 1px solid #1c2230; border-radius: 4px; overflow-x: auto; font-size: 11px; color: #9aa5ce; cursor: text; }
   .leaflet-container { background: #0b0e14; }
   .lbl { background: #16161e; border: 1px solid #2a2f41; border-radius: 3px; color: #c8ccd4; padding: 1px 4px; font: 11px ui-monospace, monospace; white-space: nowrap; }
 </style>
@@ -31,9 +43,13 @@
 <body>
 <div id="map"></div>
 <div id="side">
-  <div id="head"><b>xng station</b><span id="counts"></span></div>
-  <div id="totals"></div>
+  <div id="head"><b id="station">xng station</b><span class="sub" id="status"></span></div>
+  <div id="chips"></div>
   <div id="entities"></div>
+  <div id="msgbar">
+    <button id="pause" title="Freeze the message stream">pause</button>
+    <input id="search" type="text" placeholder="filter messages…" spellcheck="false">
+  </div>
   <div id="msgs"></div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
@@ -43,8 +59,21 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; OpenStreetMap, &copy; CARTO', maxZoom: 18,
 }).addTo(map);
 
-const planeIcon = trk => L.divIcon({ className: '', html:
-  `<div style="transform:rotate(${trk||0}deg);font-size:18px;color:#7aa2f7">&#9650;</div>`,
+const MODE_COLORS = {
+  acars: '#e0af68', vdl2: '#7aa2f7', hfdl: '#bb9af7', adsb: '#7dcfff',
+  modes: '#7dcfff', ais: '#9ece6a', aero: '#f7768e', stdc: '#ff9e64',
+  iridium: '#73daca',
+};
+const modeColor = m => MODE_COLORS[m] || '#9aa5ce';
+
+// Aircraft color by altitude: warm low, cool high (tar1090-style cue).
+function altColor(alt) {
+  if (alt == null) return '#7aa2f7';
+  const h = 20 + Math.min(Math.max(alt, 0), 42000) / 42000 * 220;
+  return `hsl(${h.toFixed(0)},75%,62%)`;
+}
+const planeIcon = (trk, alt) => L.divIcon({ className: '', html:
+  `<div style="transform:rotate(${trk||0}deg);font-size:18px;color:${altColor(alt)}">&#9650;</div>`,
   iconSize: [18, 18], iconAnchor: [9, 9] });
 const shipIcon = cog => L.divIcon({ className: '', html:
   `<div style="transform:rotate(${cog||0}deg);font-size:14px;color:#9ece6a">&#11041;</div>`,
@@ -52,11 +81,24 @@ const shipIcon = cog => L.divIcon({ className: '', html:
 
 const markers = new Map(); // key -> {marker, trail}
 let fitted = false;
+let paused = false;
+const hiddenModes = new Set();
+const expanded = new Set();
+const rateHist = []; // [t_ms, totals] samples for per-mode rates
 
 function focusEntity(lat, lon) {
   if (lat != null && lon != null) map.setView([lat, lon], Math.max(map.getZoom(), 9));
 }
 window.focusEntity = focusEntity;
+window.toggleMode = m => { hiddenModes.has(m) ? hiddenModes.delete(m) : hiddenModes.add(m); render(); };
+window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
+document.getElementById('pause').onclick = function () {
+  paused = !paused;
+  this.classList.toggle('on', paused);
+  this.textContent = paused ? 'resume' : 'pause';
+  render();
+};
+document.getElementById('search').oninput = () => render();
 
 function upsert(key, lat, lon, icon, label, popup, trail, color) {
   if (lat == null || lon == null) return null;
@@ -80,72 +122,128 @@ function upsert(key, lat, lon, icon, label, popup, trail, color) {
   return [lat, lon];
 }
 
+function fmtAge(s) {
+  if (s == null) return '';
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m`;
+}
+function fmtUptime(s) {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+
+// msgs/min per mode over the last 60 s of samples.
+function rates() {
+  const now = Date.now();
+  while (rateHist.length && now - rateHist[0][0] > 65000) rateHist.shift();
+  if (rateHist.length < 2) return {};
+  const [t0, a] = rateHist[0], [t1, b] = rateHist[rateHist.length - 1];
+  const dt = (t1 - t0) / 60000;
+  if (dt <= 0) return {};
+  const r = {};
+  for (const m of Object.keys(b)) r[m] = ((b[m] || 0) - (a[m] || 0)) / dt;
+  return r;
+}
+
+let state = null;
+
 async function tick() {
   try {
     const r = await fetch('/api/state');
-    const s = await r.json();
-    markers.forEach(e => e.alive = false);
-    const pts = [];
-
-    for (const a of s.aircraft) {
-      // Callsigns arrive over RF: escape before any HTML context.
-      const label = escapeHtml(a.callsign || a.icao);
-      const popup = `<b>${label}</b><br>icao ${escapeHtml(a.icao)}` +
-        (a.reg ? `<br>${escapeHtml(a.reg)}${a.actype ? ' · ' + escapeHtml(a.actype) : ''}` : '') +
-        (a.country ? `<br>${escapeHtml(a.country)}` : '') +
-        (a.alt != null ? `<br>${a.alt} ft` : '') +
-        (a.spd != null ? `<br>${a.spd} kt` : '') +
-        (a.squawk ? `<br>squawk ${escapeHtml(String(a.squawk))}` : '') + `<br>${a.msgs} msgs`;
-      const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk), label, popup, a.trail, '#7aa2f7');
-      if (p) pts.push(p);
-    }
-    for (const v of s.vessels) {
-      const label = escapeHtml((v.name || String(v.mmsi)).trim());
-      const popup = `<b>${label}</b><br>mmsi ${v.mmsi}` +
-        (v.country ? `<br>${escapeHtml(v.country)}` : '') +
-        (v.sog != null ? `<br>${v.sog} kt` : '');
-      const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog), label, popup, v.trail, '#9ece6a');
-      if (p) pts.push(p);
-    }
-    markers.forEach((e, k) => {
-      if (!e.alive) {
-        map.removeLayer(e.marker);
-        if (e.trail) map.removeLayer(e.trail);
-        markers.delete(k);
-      }
-    });
-    if (!fitted && pts.length) { map.fitBounds(pts, { maxZoom: 9, padding: [40, 40] }); fitted = true; }
-
-    document.getElementById('counts').textContent =
-      `${s.aircraft.length} aircraft · ${s.vessels.length} vessels`;
-    document.getElementById('totals').innerHTML = Object.entries(s.totals)
-      .sort()
-      .map(([m, n]) => `<span>${m} <b>${n}</b></span>`)
-      .join('');
-    const rows = [];
-    for (const a of [...s.aircraft].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
-      rows.push(`<tr class="row" onclick="focusEntity(${a.lat ?? 'null'},${a.lon ?? 'null'})">` +
-        `<td>✈ ${escapeHtml(a.callsign || a.icao)}</td>` +
-        `<td>${escapeHtml(a.reg || '')}</td><td>${escapeHtml(a.actype || '')}</td>` +
-        `<td>${a.alt ?? ''}</td><td>${a.spd ?? ''}</td><td>${a.msgs ?? ''}</td></tr>`);
-    }
-    for (const v of [...s.vessels].sort((x, y) => (y.mmsi||0) - (x.mmsi||0))) {
-      rows.push(`<tr class="row" onclick="focusEntity(${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
-        `<td>⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
-        `<td colspan="2">${escapeHtml(v.country || '')}</td>` +
-        `<td></td><td>${v.sog ?? ''}</td><td></td></tr>`);
-    }
-    document.getElementById('entities').innerHTML = rows.length
-      ? `<table><tr><th>id</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th></tr>${rows.join('')}</table>`
-      : '';
-
-    document.getElementById('msgs').innerHTML = s.messages
-      .map(m => `<div class="msg"><span class="meta">${m.t.slice(11, 19)} ${(m.freq / 1e6).toFixed(3)}</span> ${escapeHtml(m.text)}</div>`)
-      .join('');
+    state = await r.json();
+    rateHist.push([Date.now(), { ...state.totals }]);
+    render();
   } catch (e) { /* server restarting; retry */ }
 }
+
+function render() {
+  const s = state;
+  if (!s) return;
+  markers.forEach(e => e.alive = false);
+  const pts = [];
+
+  for (const a of s.aircraft) {
+    // Callsigns arrive over RF: escape before any HTML context.
+    const label = escapeHtml(a.callsign || a.icao);
+    const popup = `<b>${label}</b><br>icao ${escapeHtml(a.icao)}` +
+      (a.reg ? `<br>${escapeHtml(a.reg)}${a.actype ? ' · ' + escapeHtml(a.actype) : ''}` : '') +
+      (a.country ? `<br>${escapeHtml(a.country)}` : '') +
+      (a.alt != null ? `<br>${a.alt} ft` : '') +
+      (a.spd != null ? `<br>${a.spd} kt` : '') +
+      (a.squawk ? `<br>squawk ${escapeHtml(String(a.squawk))}` : '') + `<br>${a.msgs} msgs`;
+    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt), label, popup, a.trail, altColor(a.alt));
+    if (p) pts.push(p);
+  }
+  for (const v of s.vessels) {
+    const label = escapeHtml((v.name || String(v.mmsi)).trim());
+    const popup = `<b>${label}</b><br>mmsi ${v.mmsi}` +
+      (v.country ? `<br>${escapeHtml(v.country)}` : '') +
+      (v.sog != null ? `<br>${v.sog} kt` : '');
+    const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog), label, popup, v.trail, '#9ece6a');
+    if (p) pts.push(p);
+  }
+  markers.forEach((e, k) => {
+    if (!e.alive) {
+      map.removeLayer(e.marker);
+      if (e.trail) map.removeLayer(e.trail);
+      markers.delete(k);
+    }
+  });
+  if (!fitted && pts.length) { map.fitBounds(pts, { maxZoom: 9, padding: [40, 40] }); fitted = true; }
+
+  if (s.station) document.getElementById('station').textContent = s.station;
+  document.getElementById('status').textContent =
+    `up ${fmtUptime(s.now - s.started)} · ${s.aircraft.length} aircraft · ${s.vessels.length} vessels`;
+
+  const rate = rates();
+  document.getElementById('chips').innerHTML = Object.entries(s.totals)
+    .sort()
+    .map(([m, n]) => {
+      const c = modeColor(m);
+      const rt = rate[m] != null && rate[m] >= 0.05 ? `<span class="rate">${rate[m].toFixed(rate[m] < 10 ? 1 : 0)}/min</span>` : '';
+      return `<span class="chip${hiddenModes.has(m) ? ' off' : ''}" onclick="toggleMode('${escapeHtml(m)}')" ` +
+        `style="border-color:${c}"><span style="color:${c}">${escapeHtml(m)}</span> <b>${n}</b>${rt}</span>`;
+    })
+    .join('');
+
+  const rows = [];
+  for (const a of [...s.aircraft].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
+    rows.push(`<tr class="row" onclick="focusEntity(${a.lat ?? 'null'},${a.lon ?? 'null'})">` +
+      `<td style="color:${altColor(a.alt)}">✈ ${escapeHtml(a.callsign || a.icao)}</td>` +
+      `<td>${escapeHtml(a.reg || '')}</td><td>${escapeHtml(a.actype || '')}</td>` +
+      `<td>${a.alt ?? ''}</td><td>${a.spd ?? ''}</td><td>${a.msgs ?? ''}</td>` +
+      `<td class="age">${fmtAge(s.now - a.seen)}</td></tr>`);
+  }
+  for (const v of [...s.vessels].sort((x, y) => (y.mmsi||0) - (x.mmsi||0))) {
+    rows.push(`<tr class="row" onclick="focusEntity(${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
+      `<td>⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
+      `<td colspan="2">${escapeHtml(v.country || '')}</td>` +
+      `<td></td><td>${v.sog ?? ''}</td><td></td>` +
+      `<td class="age">${fmtAge(s.now - v.seen)}</td></tr>`);
+  }
+  document.getElementById('entities').innerHTML = rows.length
+    ? `<table><tr><th>id</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th><th>seen</th></tr>${rows.join('')}</table>`
+    : '';
+
+  if (!paused) {
+    const q = document.getElementById('search').value.toLowerCase();
+    document.getElementById('msgs').innerHTML = s.messages
+      .filter(m => !hiddenModes.has(m.mode))
+      .filter(m => !q || m.text.toLowerCase().includes(q) || m.mode.includes(q))
+      .map(m => {
+        const c = modeColor(m.mode);
+        const det = expanded.has(m.id)
+          ? `<pre onclick="event.stopPropagation()">${escapeHtml(JSON.stringify(m.detail, null, 1))}</pre>`
+          : '';
+        return `<div class="msg" onclick="toggleMsg(${m.id})">` +
+          `<span class="meta">${m.t.slice(11, 19)}</span> ` +
+          `<span class="tag" style="background:${c}">${escapeHtml(m.mode)}</span> ` +
+          `<span class="meta">${(m.freq / 1e6).toFixed(3)}</span> ${escapeHtml(m.text)}${det}</div>`;
+      })
+      .join('');
+  }
+}
 function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 tick();
 setInterval(tick, 2000);
