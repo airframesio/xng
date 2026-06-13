@@ -485,6 +485,38 @@ impl HfdlDemod {
                         break;
                     }
                     let fin = self.finish(a1_pos, theta, s);
+                    // Rescue (the AIS deep-weak lesson transplanted):
+                    // at 4–5 dB the timing and carrier estimates are
+                    // noisy enough that the equalizer trains on a
+                    // skewed grid and every PDU CRC fails. Re-run the
+                    // demod at small timing/carrier offsets and let
+                    // the PDU header CRC arbitrate — pure decode-side,
+                    // ~20 extra finishes only on bursts that failed.
+                    let clean = |b: &Burst| {
+                        !crate::pdu::PduParser::new().parse(&b.payload, b.bps).is_empty()
+                    };
+                    let fin = match fin {
+                        Some(b) if clean(&b) => Some(b),
+                        nominal => {
+                            let mut chosen = nominal;
+                            'rescue: for dt in [-1.0f64, -0.5, 0.5, 1.0] {
+                                for dth in [0.0f32, -0.007, 0.007, -0.017, 0.017] {
+                                    if let Some(b) =
+                                        self.finish(a1_pos + dt, theta + dth, s)
+                                    {
+                                        if clean(&b) {
+                                            chosen = Some(b);
+                                            break 'rescue;
+                                        }
+                                        if chosen.is_none() {
+                                            chosen = Some(b);
+                                        }
+                                    }
+                                }
+                            }
+                            chosen
+                        }
+                    };
                     #[cfg(feature = "demod-debug")]
                     eprintln!("DBG finish: ok={} ", fin.is_some());
                     if let Some(b) = fin {

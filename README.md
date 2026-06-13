@@ -17,8 +17,9 @@ and one set of outputs (including first-class
 [airframes.io](https://airframes.io) feeding).
 
 On off-air benchmark captures xng **beats dumpvdl2 on VDL2** and
-decodes **98–99 % of the strongest Mode S oracles** (readsb,
-dump1090-fa) while finding frames they miss — see the
+decodes **97–99 % of the strongest oracles for Mode S, HFDL, and
+AIS** (readsb, dump1090-fa, dumphfdl, AIS-catcher) while finding
+Mode S frames they miss — see the
 [benchmarks](#benchmarks) below; every number is enforced by a
 [CI regression gate](bench/) on each pull request.
 
@@ -60,7 +61,7 @@ conventions — invisible to loopback testing — were caught only this way).
 |---|---|---|---|---|
 | VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + applications | Live off-air (RTL-SDR), CRC-verified, **fed to production Airframes end-to-end** |
 | VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | ACARS-over-AVLC, AVLC link events, XID handoff parameters (incl. ground-station lists), **ATN-B1: X.25/CLNP/COTP transport (+facilities, ES-IS, IDRP route updates with path attributes and NLRI), protected-mode CPDLC with the full element tables and phraseology, CM logon and ground PDUs**, ground-station naming via `--gs-file` | **44 frames vs dumpvdl2's 41** on the off-air benchmark, CI-fenced |
-| HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons, positions, ACARS, **over-the-air system table**; channel-selectivity filtering (+4.5–5 dB measured sensitivity) | Off-air 21 931 kHz capture, field-exact vs dumphfdl |
+| HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons, positions, ACARS, **over-the-air system table**; channel-selectivity filtering (+4.5–5 dB measured sensitivity) | Off-air 21 931 kHz capture, field-exact vs dumphfdl, **97 % of its haul**, CI-fenced |
 | Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC, **C-channel assignment SUs (voice-circuit frequencies from call setup)**; **C-channel voice circuits (8.4 kbps OQPSK): AMBE voice-frame extraction + call-progress/telephony signal units** | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air; C-channel RF loopback |
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
@@ -101,8 +102,8 @@ hypothesis](docs/notes/BENCHMARKS.md); fenced in CI by
 | VDL Mode 2 | dumpvdl2 | 41 | **44** | **107 %** | — |
 | Mode S @2.4 MS/s | readsb (`--no-fix`) | 167 | **164** | 98 % | 5 |
 | Mode S @2 MS/s | dump1090-fa (`--no-fix`) | 162 | **161** | 99 % | 7 |
-| HFDL | dumphfdl | 37 | 33 | 89 % | — |
-| AIS | AIS-catcher | 53 | 48 | 91 % | 0 |
+| HFDL | dumphfdl | 37 | **36** | 97 % | — |
+| AIS | AIS-catcher | 53 | **48** | 91 % | 0 |
 
 The HFDL and AIS gaps are characterized down to the burst: the missing
 frames are the weakest signals at the margin of one inland antenna —
