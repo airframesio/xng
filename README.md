@@ -318,6 +318,23 @@ A full example config and a hardened systemd unit live in
 [`contrib/`](contrib/). Sessions can also replay IQ files (`file =`
 instead of `sdr =`) — useful for regression runs over recorded nights.
 
+`xng status` prints a live per-session table for a running station
+(querying its dashboard endpoint, default `127.0.0.1:8080`, or
+`--http host:port`):
+
+```text
+  KE-KSEA-1   up 3h12m   41 aircraft · 7 vessels
+  ┌────────┬────────┬─────────┬─────────────────────┬───────────────────────────────────┐
+  │ SDR    │ Serial │ Mode    │ Tuning              │ Status                            │
+  ├────────┼────────┼─────────┼─────────────────────┼───────────────────────────────────┤
+  │ rtlsdr │ 001    │ ACARS   │ 11 ch @ 130.940 MHz │ decoding · 4218 msgs · last now   │
+  │ rtlsdr │ 002    │ VDL2    │ 4 ch @ 136.850 MHz  │ decoding · 86 msgs · last 12s ago │
+  │ rtlsdr │ 003    │ AIS     │ 2 ch @ 162.000 MHz  │ decoding · 9304 msgs · last now   │
+  │ rtlsdr │ 004    │ ADSB    │ 1 ch @ 1090.000 MHz │ decoding · 51k msgs · last now    │
+  │ airspy │ —      │ IRIDIUM │ 1 ch @ 1624.000 MHz │ decoding · 240 msgs · last 4s ago │
+  └────────┴────────┴─────────┴─────────────────────┴───────────────────────────────────┘
+```
+
 ### Web dashboard
 
 `--http 0.0.0.0:8080` (any command, or `http =` in the station config)

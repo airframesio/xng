@@ -238,6 +238,13 @@ enum Command {
         /// Path to the station TOML config
         config: PathBuf,
     },
+    /// Show a running station's sessions and live decode status (queries
+    /// its web dashboard endpoint)
+    Status {
+        /// Dashboard address of the running station (host:port)
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        http: String,
+    },
     /// Inspect a recorded IQ file: duration, power, spectral peaks
     IqInfo {
         /// Path to the IQ file
@@ -556,6 +563,7 @@ fn main() -> anyhow::Result<()> {
             listen(&sdr, gain, &tune, &output)
         }
         Command::Station { config } => run_station_cmd(&config),
+        Command::Status { http } => run_status_cmd(&http),
         Command::IqInfo { file, sample_rate, format, center_freq, fft_size } => {
             commands::iq_info::run(&file, sample_rate, format.as_deref(), center_freq, fft_size)
         }
@@ -780,6 +788,130 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         ));
     }
     runtime::run_station(sessions)
+}
+
+/// `xng status`: query a running station's dashboard JSON and print a
+/// per-session table with live decode status.
+fn run_status_cmd(http: &str) -> anyhow::Result<()> {
+    let body = http_get(http, "/api/state").map_err(|e| {
+        anyhow::anyhow!(
+            "could not reach a station at http://{http}/ ({e}). Is one running with `http = \"{http}\"` in its config (or --http {http})?"
+        )
+    })?;
+    let s: serde_json::Value = serde_json::from_str(&body)?;
+
+    let now = s["now"].as_u64().unwrap_or(0);
+    let started = s["started"].as_u64().unwrap_or(now);
+    let station = s["station"].as_str().unwrap_or("xng station");
+    let totals = &s["totals"];
+    let last_seen = &s["last_seen"];
+
+    let up = now.saturating_sub(started);
+    let (h, m, sec) = (up / 3600, (up % 3600) / 60, up % 60);
+    let uptime = if h > 0 { format!("{h}h{m:02}m") } else if m > 0 { format!("{m}m{sec:02}s") } else { format!("{sec}s") };
+    println!("\n  {station}   up {uptime}   {} aircraft · {} vessels",
+        s["aircraft"].as_array().map_or(0, |a| a.len()),
+        s["vessels"].as_array().map_or(0, |a| a.len()));
+
+    // Build rows from the session list.
+    let empty = vec![];
+    let sessions = s["sessions"].as_array().unwrap_or(&empty);
+    let mut rows: Vec<[String; 5]> = Vec::new();
+    for sess in sessions {
+        let sdr = sess["sdr"].as_str().unwrap_or("?");
+        let serial = sess["serial"].as_str().unwrap_or("—");
+        let mode = sess["mode"].as_str().unwrap_or("?");
+        let chans = sess["channels"].as_array().map_or(0, |c| c.len());
+        let center = sess["center_mhz"].as_f64().unwrap_or(0.0);
+        let driver = sdr.split(',').next().unwrap_or(sdr)
+            .strip_prefix("driver=").unwrap_or(sdr);
+        let count = totals[mode].as_u64().unwrap_or(0);
+        let seen = last_seen[mode].as_u64();
+        let status = match (count, seen) {
+            (0, _) => "awaiting traffic".to_string(),
+            (n, Some(t)) => {
+                let ago = now.saturating_sub(t);
+                let when = if ago < 5 { "now".to_string() }
+                    else if ago < 90 { format!("{ago}s ago") }
+                    else { format!("{}m ago", ago / 60) };
+                let live = if ago < 60 { "decoding" } else { "idle" };
+                format!("{live} · {n} msgs · last {when}")
+            }
+            (n, None) => format!("{n} msgs"),
+        };
+        rows.push([
+            driver.to_string(),
+            serial.to_string(),
+            mode.to_uppercase(),
+            format!("{chans} ch @ {center:.3} MHz"),
+            status,
+        ]);
+    }
+    if rows.is_empty() {
+        println!("\n  (station reports no sessions)\n");
+        return Ok(());
+    }
+    print_table(&["SDR", "Serial", "Mode", "Tuning", "Status"], &rows);
+    println!();
+    Ok(())
+}
+
+/// Minimal blocking HTTP/1.0 GET for the local dashboard (small JSON;
+/// avoids pulling in an HTTP client crate).
+fn http_get(addr: &str, path: &str) -> std::io::Result<String> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(addr)?;
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+    write!(stream, "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")?;
+    stream.flush()?;
+    // Accumulate until EOF. A minimal server may RST rather than send a
+    // clean FIN; tolerate a reset once we already have the response.
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset && !raw.is_empty() => break,
+            Err(e) => return Err(e),
+        }
+    }
+    let raw = String::from_utf8_lossy(&raw);
+    let body = raw
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "no HTTP body"))?;
+    Ok(body.to_string())
+}
+
+/// Render a box-drawing table sized to its content.
+fn print_table(headers: &[&str], rows: &[[String; 5]]) {
+    let mut w: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for r in rows {
+        for (i, cell) in r.iter().enumerate() {
+            w[i] = w[i].max(cell.chars().count());
+        }
+    }
+    let line = |l: &str, mid: &str, r: &str| {
+        let segs: Vec<String> = w.iter().map(|&n| "─".repeat(n + 2)).collect();
+        format!("{l}{}{r}", segs.join(mid))
+    };
+    let fmt_row = |cells: &[String]| {
+        let parts: Vec<String> = cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!(" {c:<width$} ", width = w[i]))
+            .collect();
+        format!("│{}│", parts.join("│"))
+    };
+    println!("  {}", line("┌", "┬", "┐"));
+    let hdr: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    println!("  {}", fmt_row(&hdr));
+    println!("  {}", line("├", "┼", "┤"));
+    for r in rows {
+        println!("  {}", fmt_row(r));
+    }
+    println!("  {}", line("└", "┴", "┘"));
 }
 
 fn open_sdr(
