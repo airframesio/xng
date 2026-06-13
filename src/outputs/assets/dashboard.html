@@ -146,9 +146,33 @@ const planeIcon = (trk, alt, sil) => sil
   : L.divIcon({ className: '', html:
       `<div style="transform:rotate(${trk||0}deg);font-size:18px;color:${altColor(alt)}">&#9650;</div>`,
       iconSize: [18, 18], iconAnchor: [9, 9] });
-const shipIcon = cog => L.divIcon({ className: '', html:
-  `<div style="transform:rotate(${cog||0}deg);font-size:14px;color:#9ece6a">&#11041;</div>`,
-  iconSize: [14, 14], iconAnchor: [7, 7] });
+// Vessel category from the AIS ship-type code (ITU-R M.1371): a
+// label and a tint. Kept coarse — at marker size colour reads where
+// hull-shape detail can't. No suitable open vessel-silhouette set
+// exists (unlike PlaneWatch for aircraft), so this is our own art.
+function shipMeta(t) {
+  if (t == null) return { label: null, color: '#9ece6a' };
+  if (t >= 70 && t <= 79) return { label: 'Cargo', color: '#9ece6a' };
+  if (t >= 80 && t <= 89) return { label: 'Tanker', color: '#f7768e' };
+  if (t >= 60 && t <= 69) return { label: 'Passenger', color: '#7aa2f7' };
+  if (t >= 40 && t <= 49) return { label: 'High-speed', color: '#bb9af7' };
+  if (t === 30) return { label: 'Fishing', color: '#73daca' };
+  if (t === 31 || t === 32 || t === 52) return { label: 'Tug/tow', color: '#e0af68' };
+  if (t === 36) return { label: 'Sailing', color: '#7dcfff' };
+  if (t === 37) return { label: 'Pleasure', color: '#7dcfff' };
+  if (t === 50) return { label: 'Pilot', color: '#ff9e64' };
+  if (t === 51 || t === 55) return { label: 'SAR/patrol', color: '#ff9e64' };
+  return { label: 'Other', color: '#9ece6a' };
+}
+// Top-view hull: pointed bow (north), squared stern, rotated by COG.
+const shipIcon = (cog, type) => {
+  const color = shipMeta(type).color;
+  return L.divIcon({ className: '', html:
+    `<svg width="16" height="16" viewBox="0 0 24 24" style="transform:rotate(${cog||0}deg)">` +
+    `<path d="M12 1 L18 9 L18 20 Q18 23 15 23 L9 23 Q6 23 6 20 L6 9 Z" ` +
+    `fill="${color}" stroke="#0b0e14" stroke-width="1.5"/></svg>`,
+    iconSize: [16, 16], iconAnchor: [8, 8] });
+};
 
 const markers = new Map(); // key -> {marker, trail}
 let fitted = false;
@@ -282,15 +306,17 @@ function render() {
   }
   for (const v of s.vessels) {
     const label = escapeHtml((v.name || String(v.mmsi)).trim());
+    const sm = shipMeta(v.shiptype);
     const popup = entityPopup('', label, [
       ['mmsi', v.mmsi],
       ['country', v.country && escapeHtml(v.country)],
+      ['class', sm.label ? `${sm.label} (${v.shiptype})` : null],
       ['speed', v.sog != null ? `${v.sog} kt` : null],
       ['course', v.cog != null ? `${v.cog}&deg;` : null],
       ['type', v.type != null ? `msg ${v.type}` : null],
       ['seen', `${fmtAge(s.now - v.seen)} ago`],
     ]);
-    const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog), label, popup, v.trail, '#9ece6a');
+    const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog, v.shiptype), label, popup, v.trail, sm.color);
     if (p) pts.push(p);
   }
   markers.forEach((e, k) => {
@@ -331,8 +357,8 @@ function render() {
     const k = 'v' + v.mmsi;
     rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
       `onclick="selectEntity('${k}',${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
-      `<td>⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
-      `<td colspan="2">${escapeHtml(v.country || '')}</td>` +
+      `<td style="color:${shipMeta(v.shiptype).color}">⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
+      `<td>${escapeHtml(v.country || '')}</td><td>${escapeHtml(shipMeta(v.shiptype).label || '')}</td>` +
       `<td></td><td>${v.sog ?? ''}</td><td></td>` +
       `<td class="age">${fmtAge(s.now - v.seen)}</td></tr>`);
   }
