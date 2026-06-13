@@ -29,6 +29,29 @@ fn da_roundtrip() {
 }
 
 #[test]
+fn da_decodes_with_lcw_bit_errors() {
+    // Real off-air LCWs carry a few bit errors. The LCW BCH corrects them,
+    // so decode_lcw_bits must accept the burst rather than gate on the
+    // strict zero-syndrome classify() (which drops it as Unknown). Without
+    // the tolerant gate this burst does not decode at all.
+    let mut payload = [0u8; 20];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = (i as u8) * 5 + 1;
+    }
+    let mut bits = da_burst_bits(false, 1, 12, &payload);
+    // Flip two bits inside the 46-bit LCW (data positions 0..46, i.e. bit
+    // indices 24..70) — within the BCH's correction reach.
+    bits[24 + 2] ^= 1;
+    bits[24 + 40] ^= 1;
+    let (da, _) =
+        xng_mode_iridium::decode_da_bits(&bits).expect("DA with LCW bit errors still decodes");
+    assert_eq!(da.ctr, 1);
+    assert_eq!(da.len, 12);
+    assert_eq!(da.data, payload);
+    assert!(da.crc_ok, "payload CRC is unaffected by the LCW errors");
+}
+
+#[test]
 fn sbd_acars_end_to_end() {
     // A short ACARS block (standard SOH..DEL, built by xng-acars).
     let block = xng_acars::block::build(

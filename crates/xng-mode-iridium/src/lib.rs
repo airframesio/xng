@@ -155,6 +155,7 @@ fn handle_bits(
     pager: &mut ms::PagerReassembler,
     out: &mut Vec<ira::IridiumFrame>,
 ) {
+    let n0 = out.len();
     if let Some(f) = decode_bits(bits) {
         // Multi-part pages: emit the assembled text when complete.
         if f.kind == "msg" {
@@ -205,6 +206,16 @@ fn handle_bits(
                 raw_bits: Vec::new(),
             });
         }
+    }
+    // Diagnose access-matched bursts that produced nothing (XNG_IRIDIUM_DEBUG).
+    if out.len() == n0 && std::env::var("XNG_IRIDIUM_DEBUG").is_ok() {
+        let data = if bits.len() > 24 { &bits[24..] } else { bits };
+        let head: String = data.iter().take(48).map(|&b| if b == 1 { '1' } else { '0' }).collect();
+        eprintln!(
+            "  DROP {} bits, classify={:?}, data[0..48]={head}",
+            bits.len(),
+            frame::classify(data)
+        );
     }
 }
 
@@ -275,10 +286,23 @@ fn decode_lcw_bits(bits: &[u8]) -> Option<(u8, &[u8])> {
     } else {
         return None;
     };
-    if frame::classify(data) != frame::FrameKind::Lw {
+    // Do NOT gate on the strict zero-syndrome `classify() == Lw`: real
+    // off-air LCWs routinely carry a few bit errors, which that check
+    // rejects outright (the burst then drops as Unknown). `decode_lcw`
+    // already BCH-corrects all three LCW components — accept it when the
+    // correction is light. Heavy correction means it isn't really an LCW
+    // frame. The 24-bit access code has already confirmed a genuine burst,
+    // and the frame type is validated by the callers (voice/ip/sync/DA),
+    // with a CRC on the DA path.
+    let (ft, _, _, errs) = frame::decode_lcw(data)?;
+    // DA (ft=2) carries ACARS/SBD and is CRC-protected downstream, so a bad
+    // LCW correction is caught there — give it the BCH's full reach. The
+    // CRC-less classes (voice/IP/sync) get a tight bound so a noisy LCW
+    // can't fabricate them.
+    let max_errs = if ft == 2 { 6 } else { 2 };
+    if errs > max_errs {
         return None;
     }
-    let (ft, _, _, _) = frame::decode_lcw(data)?;
     Some((ft, data))
 }
 
