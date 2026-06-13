@@ -685,7 +685,7 @@ impl CoherentDemod {
 
         // De-rotate the payload region by CFO and the carrier phase.
         let step = Complex::from_polar(1.0, -2.0 * PI * cfo / self.fs);
-        let mut rot = Complex::from_polar(1.0, -phase0)
+        let rot = Complex::from_polar(1.0, -phase0)
             * Complex::from_polar(1.0, -2.0 * PI * cfo / self.fs * tmpl_len as f32);
 
 

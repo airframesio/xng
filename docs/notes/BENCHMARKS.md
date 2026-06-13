@@ -244,7 +244,15 @@ file decode = max, SDR commands = live).
   dumphfdl's 37** on the 21931 kHz capture — frame-exact diff shows
   the 13 data LPDUs match the oracle one-for-one; the missing 4 are
   the weakest bursts (4.0–5.0 dB SNR at 300 bps), a genuine
-  sensitivity tail, NOT a convention bug. Parser-policy fixes from the
+  sensitivity tail, NOT a convention bug. **Same-day follow-up: 33 →
+  36 (97 %)** by transplanting the AIS deep-weak lesson — when every
+  PDU CRC in a detected burst fails, re-run the demod at small
+  timing (±0.5/±1 sample) and carrier (±2/±5 Hz) offsets and let the
+  PDU header CRC arbitrate (~20 extra finishes, only on failed
+  bursts; the fixture decodes in 0.5 s). Falsified in the same
+  session: wider ±2/±3-sample shifts (no further gain) and lowering
+  the A1 detection threshold 0.4 → 0.32 (catastrophic — false A1
+  anchors consume real bursts: 19 events). Baseline 31 → 34. Parser-policy fixes from the
   round: no CRC-valid LPDU is ever silently dropped (unparsable
   HFNPDUs emit an envelope event) and 0x4F is correctly labeled
   logon-resume. Fixture + floor (31) added to the bench gate.
