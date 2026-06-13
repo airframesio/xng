@@ -125,6 +125,22 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
                 raw_bits: bits.to_vec(),
             })
         }
+        frame::FrameKind::Itl => {
+            // Time-Location (satellite ranging broadcast). The 96-bit
+            // `11`+0… header is recognized; the descrambled payload's
+            // satellite/plane PRS decode needs the toolkit's lookup tables
+            // and is deferred, but the frame is reported with its true
+            // type rather than mis-decoded as an all-zero ring alert.
+            Some(ira::IridiumFrame {
+                kind: "itl",
+                details: serde_json::json!({
+                    "type": "time-location",
+                    "payload_bits": data.len().saturating_sub(96),
+                }),
+                acars: None,
+                raw_bits: bits.to_vec(),
+            })
+        }
         _ => None,
     }
 }
