@@ -339,7 +339,10 @@ Aircraft on the map are drawn with type-specific silhouettes from
 (CC BY-NC-SA 4.0, **used with permission** — thank you, Plane Watch!),
 resolved by the ICAO type designator from the aircraft database and
 colored by altitude. Aircraft without a known type fall back to a
-plain arrow.
+plain arrow. Vessels use a top-view hull marker (our own MIT artwork)
+rotated by course and tinted by AIS ship-type category — cargo,
+tanker, passenger, fishing, tug, sailing, high-speed, pilot/patrol —
+with the class shown in the entity table and popup.
 
 ### Feeding and outputs
 

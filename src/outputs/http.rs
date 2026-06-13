@@ -127,6 +127,14 @@ fn update(d: &mut Dash, m: &Message) {
             if let Some(t) = msg_type {
                 o.insert("type".into(), json!(t));
             }
+            // Ship type (ITU-R M.1371 code, types 5/19/21/24) — sticky:
+            // it arrives on static reports, the map marker is keyed to
+            // it, and position reports must not clear it.
+            if let Some(st) = det.get("ship_type").and_then(Value::as_u64) {
+                if st != 0 {
+                    o.insert("shiptype".into(), json!(st));
+                }
+            }
             for (k, src) in
                 [("lat", "lat"), ("lon", "lon"), ("sog", "sog_kt"), ("cog", "cog_deg"), ("name", "name")]
             {
