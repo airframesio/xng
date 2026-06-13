@@ -6,20 +6,34 @@
 <title>xng station</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --sw: 480px; --eh: 45%; }
   * { box-sizing: border-box; }
   body { margin: 0; display: flex; height: 100vh; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0e14; color: #c8ccd4; }
-  #map { flex: 1; }
-  #side { width: 480px; display: flex; flex-direction: column; border-left: 1px solid #1c2230; }
-  #head { padding: 9px 12px; border-bottom: 1px solid #1c2230; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  #map { flex: 1; min-width: 0; }
+  /* Drag handle between the map and the side panel. */
+  #hres { flex: none; width: 6px; cursor: col-resize; background: #1c2230; }
+  #hres:hover, #vres:hover { background: #2a2f41; }
+  #side { flex: 0 0 var(--sw); display: flex; flex-direction: column; min-width: 280px; }
+  #head { padding: 9px 12px; border-bottom: 1px solid #1c2230; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex: none; }
   #head b { color: #7aa2f7; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #head .sub { color: #565f89; font-size: 12px; white-space: nowrap; }
-  #chips { padding: 7px 10px; border-bottom: 1px solid #1c2230; display: flex; flex-wrap: wrap; gap: 5px; }
+  /* Mode filter chips — sit with the message log they filter. */
+  #chips { padding: 7px 10px; border-bottom: 1px solid #1c2230; display: flex; flex-wrap: wrap; gap: 5px; flex: none; }
   .chip { border: 1px solid #2a2f41; border-radius: 10px; padding: 2px 9px; cursor: pointer; user-select: none; display: flex; gap: 6px; align-items: baseline; }
   .chip b { font-weight: 600; }
   .chip .rate { color: #565f89; font-size: 11px; }
   .chip.off { opacity: 0.35; }
-  #entities { max-height: 38%; overflow-y: auto; border-bottom: 1px solid #1c2230; }
+  /* Entities table: top pane, resizable height. Grows to fill when the
+     log pane is minimized. */
+  #entities { flex: 0 0 var(--eh); overflow-y: auto; }
+  body.logmin #entities { flex: 1 1 auto; }
+  /* Drag handle between the entities table and the log pane. */
+  #vres { flex: none; height: 6px; cursor: row-resize; background: #1c2230; }
+  body.logmin #vres { display: none; }
+  /* Log pane: chips + controls + message stream, bottom of the side. */
+  #logpane { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; border-top: 1px solid #1c2230; }
+  body.logmin #logpane { flex: none; }
+  body.logmin #msgs { display: none; }
   #entities table { width: 100%; border-collapse: collapse; }
   #entities th, #entities td { text-align: left; padding: 2px 8px; white-space: nowrap; }
   #entities th { color: #565f89; position: sticky; top: 0; background: #0b0e14; cursor: default; }
@@ -57,15 +71,20 @@
 </head>
 <body>
 <div id="map"></div>
+<div id="hres" title="Drag to resize"></div>
 <div id="side">
   <div id="head"><b id="station">xng station</b><span class="sub" id="status"></span></div>
-  <div id="chips"></div>
   <div id="entities"></div>
-  <div id="msgbar">
-    <button id="pause" title="Freeze the message stream">pause</button>
-    <input id="search" type="text" placeholder="filter messages…" spellcheck="false">
+  <div id="vres" title="Drag to resize"></div>
+  <div id="logpane">
+    <div id="chips"></div>
+    <div id="msgbar">
+      <button id="collapse" title="Minimize / restore the message log">▾</button>
+      <button id="pause" title="Freeze the message stream">pause</button>
+      <input id="search" type="text" placeholder="filter messages…" spellcheck="false">
+    </div>
+    <div id="msgs"></div>
   </div>
-  <div id="msgs"></div>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
 <script>
@@ -201,6 +220,58 @@ document.getElementById('pause').onclick = function () {
   render();
 };
 document.getElementById('search').oninput = () => render();
+
+// Minimize / restore the message-log pane (the entities table takes
+// the freed space). Leaflet must recompute the map size after any
+// layout change.
+const collapseBtn = document.getElementById('collapse');
+function setLogMin(min) {
+  document.body.classList.toggle('logmin', min);
+  collapseBtn.textContent = min ? '▸' : '▾';
+  collapseBtn.classList.toggle('on', min);
+  localStorage.setItem('xng.logmin', min ? '1' : '0');
+  setTimeout(() => map.invalidateSize(), 50);
+}
+collapseBtn.onclick = () => setLogMin(!document.body.classList.contains('logmin'));
+
+// Draggable pane sizes, persisted. The horizontal handle resizes the
+// side panel width; the vertical handle resizes the entities/log split.
+function restore(key, varName) {
+  const v = localStorage.getItem(key);
+  if (v) document.documentElement.style.setProperty(varName, v);
+}
+restore('xng.sw', '--sw');
+restore('xng.eh', '--eh');
+if (localStorage.getItem('xng.logmin') === '1') setLogMin(true);
+
+function drag(handle, onMove) {
+  handle.addEventListener('mousedown', e => {
+    e.preventDefault();
+    document.body.style.userSelect = 'none';
+    const move = ev => onMove(ev);
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+      document.body.style.userSelect = '';
+      map.invalidateSize();
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
+drag(document.getElementById('hres'), ev => {
+  const w = Math.min(Math.max(window.innerWidth - ev.clientX, 280), window.innerWidth - 200);
+  document.documentElement.style.setProperty('--sw', w + 'px');
+  localStorage.setItem('xng.sw', w + 'px');
+});
+drag(document.getElementById('vres'), ev => {
+  const side = document.getElementById('side').getBoundingClientRect();
+  const top = document.getElementById('entities').getBoundingClientRect().top;
+  const h = Math.min(Math.max(ev.clientY - top, 60), side.bottom - top - 80);
+  const pct = (h / side.height * 100).toFixed(1) + '%';
+  document.documentElement.style.setProperty('--eh', pct);
+  localStorage.setItem('xng.eh', pct);
+});
 
 function upsert(key, lat, lon, icon, label, popup, trail, color) {
   if (lat == null || lon == null) return null;
