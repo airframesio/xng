@@ -156,9 +156,28 @@ captures). Measured on the 96 kS/s fixture: live 71 frames at 8.4×
 realtime (unchanged CPU), max 72 at 5.2×. Baseline raised 48 → 65.
 
 The remaining 5 payloads anchor but never produce an FCS-valid frame
-under any tested hypothesis — the deepest fades on this capture. Next
-documented lever: soft-bit list repair (flip the lowest-confidence
-trellis bits, FCS-verify, MMSI-confirm), worth an estimated 1–2 dB.
+under any tested hypothesis — the deepest fades on this capture.
+
+**Soft-bit list repair: falsified on this capture (2026-06-13).** The
+trellis was given a proper max-log soft output (a backward β pass;
+per-bit reliability = the α+β margin between the two emitted-bit
+hypotheses, which is well-defined here because the NRZI output bit is
+a function of the source state alone, lp == lc) and a Chase-style
+search flipped the K least-reliable bits, FCS-checking each. At K=10,
+1–2-bit flips: **no change** (48, zero false) — the 5 genuine misses
+are >2 bits from any valid frame. Pushing to K=16, 1–3-bit flips over
+the full CFO×gain grid recovered **none** of the 5 and instead
+manufactured one false decode: a type-13 frame from MMSI 242215158
+(Portugal) in a Sacramento capture, a 3-bit flip that chanced onto a
+valid FCS-16. It even subverted the two-sighting MMSI guard — the
+repair emits several FCS-valid *variants of one burst*, and two
+distinct variants sharing the forged MMSI "confirm" each other. The
+deepest fades are simply too far from the codeword for blind bit
+search, and FCS-16 is too weak to gate a search that large without a
+stronger external prior. Reverted. Recovering these needs a denser /
+stronger capture, not more search — the lesson the AIS and ADS-B
+campaigns keep returning: at the noise floor, sensitivity is a
+capture problem, not a code problem.
 
 ```
 xng decode ais_6m.cs16 -f cs16 -m ais -r 6000000 -c 162000000 --channels 161.975,162.025
