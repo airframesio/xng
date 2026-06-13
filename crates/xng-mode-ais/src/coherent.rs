@@ -24,7 +24,12 @@ const CFO_RANGE_HZ: f32 = 1_200.0;
 /// Burst gate: power must exceed the tracked floor by this factor.
 const GATE_FACTOR: f32 = 2.0;
 /// Correlation acceptance (normalized 0..1).
-const CORR_THRESHOLD: f32 = 0.72;
+/// Anchor acceptance at live effort: cheap, proven safe.
+const CORR_THRESHOLD_LIVE: f32 = 0.72;
+/// Max effort digs to the deep-weak detection floor (off-air miss
+/// bursts peak at 0.56–0.60); the rescue acceptance policy absorbs
+/// the extra false anchors, CPU pays ~3×.
+const CORR_THRESHOLD_MAX: f32 = 0.55;
 const NOISE_ALPHA: f32 = 5e-4;
 
 /// Linearly interpolated sample at fractional position `pos`.
@@ -173,6 +178,16 @@ fn gmsk_waveform(levels: &[f32]) -> Vec<Complex<f32>> {
     out
 }
 
+/// Deframe one candidate (with a leading flag) to its FCS-valid AIS
+/// frame, if any.
+fn valid_frame(bits: &[u8]) -> Option<crate::frame::AisFrame> {
+    let mut df = crate::frame::HdlcDeframer::new();
+    for &b in &[0u8, 1, 1, 1, 1, 1, 1, 0] {
+        df.push_bit(b);
+    }
+    bits.iter().find_map(|&b| df.push_bit(b))
+}
+
 /// First FCS-valid candidate: returns (bits consumed incl. closing
 /// flag, the raw stuffed payload bits actually transmitted).
 fn first_valid(candidates: &[Vec<u8>]) -> Option<(usize, Vec<u8>)> {
@@ -202,6 +217,12 @@ pub struct CoherentDemod {
     pending: Option<u64>,
     fs: f32,
     last_hunt_best: f32,
+    corr_threshold: f32,
+    /// MMSIs seen in any accepted frame (rescue confirmation).
+    known_mmsis: std::collections::HashSet<u32>,
+    /// Rescue-decoded frames from a not-yet-confirmed MMSI, held until
+    /// a second frame from the same source confirms it.
+    pending_rescue: std::collections::HashMap<u32, Vec<Vec<u8>>>,
 }
 
 impl CoherentDemod {
@@ -223,7 +244,60 @@ impl CoherentDemod {
             pending: None,
             fs: fs as f32,
             last_hunt_best: 0.0,
+            corr_threshold: CORR_THRESHOLD_LIVE,
+            known_mmsis: std::collections::HashSet::new(),
+            pending_rescue: std::collections::HashMap::new(),
         }
+    }
+
+    /// Acceptance policy. Nominal decodes pass through (single
+    /// hypothesis, negligible false-FCS odds). Rescue decodes come
+    /// from a ~90-way hypothesis fan-out where random FCS-16 passes
+    /// become a real rate, so they additionally need a sane message
+    /// type and a confirmed source: an MMSI already seen, or a second
+    /// held frame from the same MMSI (random passes never repeat a
+    /// source — the same policy as the ADS-B ICAO confirmation).
+    fn accept(&mut self, candidates: Vec<Vec<u8>>, rescued: bool) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for cand in candidates {
+            let Some(f) = valid_frame(&cand) else {
+                if !rescued {
+                    out.push(cand); // invalid candidates were always passed through
+                }
+                continue;
+            };
+            if !rescued {
+                self.known_mmsis.insert(f.mmsi);
+                out.push(cand);
+                continue;
+            }
+            if !(1..=27).contains(&f.msg_type) {
+                continue;
+            }
+            if self.known_mmsis.contains(&f.mmsi) {
+                out.push(cand);
+                continue;
+            }
+            let held = self.pending_rescue.entry(f.mmsi).or_default();
+            if held.iter().any(|h| h == &cand) {
+                continue; // same bits from another hypothesis: not a confirmation
+            }
+            held.push(cand);
+            if held.len() >= 2 {
+                out.append(held);
+                self.known_mmsis.insert(f.mmsi);
+            } else if self.pending_rescue.len() > 64 {
+                let k = *self.pending_rescue.keys().next().unwrap();
+                self.pending_rescue.remove(&k);
+            }
+        }
+        out
+    }
+
+    /// Max effort lowers the anchor threshold to the deep-weak floor.
+    pub fn set_max_effort(&mut self, max: bool) {
+        self.corr_threshold =
+            if max { CORR_THRESHOLD_MAX } else { CORR_THRESHOLD_LIVE };
     }
 
     /// Feed samples; returns decoded post-flag bit vectors (NRZI already
@@ -247,7 +321,36 @@ impl CoherentDemod {
                 let s0 = (start - self.base) as usize;
                 let window: Vec<Complex<f32>> =
                     self.buf.iter().skip(s0).take(burst_len).copied().collect();
-                let decoded = self.try_decode(&window);
+                let mut decoded = self.try_decode_nominal(&window);
+                let mut rescued = false;
+                if first_valid(&decoded).is_none() {
+                    // Rescue: the full CFO × phase-gain hypothesis grid,
+                    // then shifted windows — the stride-2 hunt can
+                    // anchor a few samples off and the fractional
+                    // refine only spans ±0.5 (weak bursts are acutely
+                    // timing-sensitive). The FCS arbitrates; rescued
+                    // frames face the stricter acceptance below.
+                    decoded = self.try_decode(&window);
+                    if first_valid(&decoded).is_none() && s0 >= 2 {
+                        // Live caps the shift search (the retries, not
+                        // the hypothesis grid, dominate rescue CPU).
+                        let toffs: &[i64] = if self.corr_threshold <= CORR_THRESHOLD_MAX {
+                            &[-1, 1, -2, 2, -3, 3, -4, 4]
+                        } else {
+                            &[-1, 1, -2, 2]
+                        };
+                        for &toff in toffs {
+                            let sh = (s0 as i64 + toff) as usize;
+                            let w: Vec<Complex<f32>> =
+                                self.buf.iter().skip(sh).take(burst_len).copied().collect();
+                            decoded = self.try_decode(&w);
+                            if first_valid(&decoded).is_some() {
+                                break;
+                            }
+                        }
+                    }
+                    rescued = true;
+                }
                 if std::env::var("AIS_DEBUG").is_ok() {
                     eprintln!("try_decode at {}: {} candidate(s)", start, decoded.len());
                 }
@@ -272,7 +375,7 @@ impl CoherentDemod {
                             }
                             off += 1;
                         }
-                        if best.0 > CORR_THRESHOLD {
+                        if best.0 > self.corr_threshold {
                             let rescued = self.try_decode(&residual[best.1..]);
                             if std::env::var("AIS_DEBUG").is_ok() {
                                 eprintln!(
@@ -282,11 +385,12 @@ impl CoherentDemod {
                                     rescued.len()
                                 );
                             }
-                            out.extend(rescued);
+                            let sic = self.accept(rescued, true);
+                            out.extend(sic);
                         }
                     }
                 }
-                out.extend(decoded);
+                out.extend(self.accept(decoded, rescued));
                 self.pending = None;
                 self.cursor = start + tmpl_len as u64; // resume past the template
                 continue;
@@ -446,14 +550,14 @@ impl CoherentDemod {
         }
         self.last_hunt_best = best.0;
         if std::env::var("AIS_DEBUG").is_ok() && best.0 > 0.3 {
-            eprintln!("  hunt rel {rel}: best m={:.3} off={}", best.0, best.1);
+            eprintln!("  hunt abs {}: best m={:.3}", self.base + (rel + best.1) as u64, best.0);
         }
         // Only accept a peak that lies strictly inside the window: a
         // best at the trailing edge is the rising shoulder of a burst
         // still entering the span — anchoring there hands the Viterbi a
         // mis-timed window and skips the real one. The cursor advance
         // recenters it into the next hunt.
-        (best.0 > CORR_THRESHOLD && best.1 + SPB * 8 < span).then_some(best.1)
+        (best.0 > self.corr_threshold && best.1 + SPB * 8 < span).then_some(best.1)
     }
 
     /// Anchor accepted: estimate CFO + phase, Viterbi the payload with
@@ -461,9 +565,40 @@ impl CoherentDemod {
     fn try_decode(&self, window: &[Complex<f32>]) -> Vec<Vec<u8>> {
         static TABLES: std::sync::OnceLock<[[[f32; SPB]; 8]; 2]> = std::sync::OnceLock::new();
         let tables = TABLES.get_or_init(|| [gmsk_bit_waveforms(), msk_bit_waveforms()]);
+        // Decode hypotheses beyond the nominal estimate: at deep-weak
+        // SNR the template CFO estimate is noisy and the decision-
+        // directed phase tracking can lose lock (gain 0 = open loop).
+        // The FCS arbitrates, so wrong hypotheses cost only CPU — and
+        // these run only on anchored bursts. Live trims the CFO wings
+        // (the off-air rescues came from gain/timing, not CFO).
+        const HYP_MAX: &[(f32, f32)] = &[
+            (0.0, 0.25), (0.0, 0.1), (0.0, 0.0),
+            (-60.0, 0.25), (-60.0, 0.1), (-60.0, 0.0),
+            (60.0, 0.25), (60.0, 0.1), (60.0, 0.0),
+            (-120.0, 0.25), (-120.0, 0.1), (-120.0, 0.0),
+            (120.0, 0.25), (120.0, 0.1), (120.0, 0.0),
+        ];
+        let hyp = HYP_MAX;
+        let mut out = Vec::new();
+        for &(cfo_off, gain) in hyp {
+            for table in tables {
+                if let Some(bits) = self.try_decode_with(window, table, cfo_off, gain) {
+                    out.push(bits);
+                }
+            }
+        }
+        out
+    }
+
+    /// The single nominal hypothesis — today's behavior; everything in
+    /// `try_decode` beyond it is a rescue and gets the stricter
+    /// acceptance policy in `process`.
+    fn try_decode_nominal(&self, window: &[Complex<f32>]) -> Vec<Vec<u8>> {
+        static TABLES: std::sync::OnceLock<[[[f32; SPB]; 8]; 2]> = std::sync::OnceLock::new();
+        let tables = TABLES.get_or_init(|| [gmsk_bit_waveforms(), msk_bit_waveforms()]);
         let mut out = Vec::new();
         for table in tables {
-            if let Some(bits) = self.try_decode_with(window, &table) {
+            if let Some(bits) = self.try_decode_with(window, table, 0.0, 0.25) {
                 out.push(bits);
             }
         }
@@ -474,6 +609,8 @@ impl CoherentDemod {
         &self,
         window: &[Complex<f32>],
         wf: &[[f32; SPB]; 8],
+        cfo_off: f32,
+        phase_gain: f32,
     ) -> Option<Vec<u8>> {
         let tmpl_len = self.template.len();
         // CFO estimate: maximize coherent template correlation on a grid.
@@ -535,7 +672,7 @@ impl CoherentDemod {
             rot *= step;
         }
         let dphi = (c2 * c1.conj()).arg();
-        let cfo = cfo + dphi / (2.0 * PI * (tmpl_len as f32 / 2.0) / self.fs);
+        let cfo = cfo + dphi / (2.0 * PI * (tmpl_len as f32 / 2.0) / self.fs) + cfo_off;
         // Re-correlate at the refined CFO for the carrier phase.
         let step = Complex::from_polar(1.0, -2.0 * PI * cfo / self.fs);
         let mut rot = Complex::new(1.0f32, 0.0);
@@ -591,7 +728,6 @@ impl CoherentDemod {
         let mut back: Vec<[u8; NS]> = Vec::with_capacity(nbits);
         let mut rot_k = rot;
         let mut trim = Complex::new(1.0f32, 0.0);
-        const PHASE_GAIN: f32 = 0.25;
         for bit in 0..nbits {
             let sm = &payload[bit * SPB..(bit + 1) * SPB];
             // Pre-rotate the received samples once.
@@ -639,8 +775,8 @@ impl CoherentDemod {
                 }
             }
             if let Some((_, c)) = best_resid {
-                if c.norm() > 1e-9 {
-                    trim *= Complex::from_polar(1.0, -PHASE_GAIN * c.arg());
+                if c.norm() > 1e-9 && phase_gain > 0.0 {
+                    trim *= Complex::from_polar(1.0, -phase_gain * c.arg());
                 }
             }
             metric = nm;

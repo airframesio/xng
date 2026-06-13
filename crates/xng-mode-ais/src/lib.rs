@@ -77,6 +77,12 @@ impl AisChannelDecoder {
         })
     }
 
+    /// Max effort: anchor down to the deep-weak detection floor
+    /// (~3× hunt CPU; see coherent.rs).
+    pub fn set_max_effort(&mut self, max: bool) {
+        self.coherent.set_max_effort(max);
+    }
+
     /// Feed wideband IQ; returns decoded frames with their NMEA sentences.
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<(frame::AisFrame, Vec<String>)> {
         let channel: &[Complex<f32>] = match &mut self.ddc {

@@ -158,7 +158,11 @@ impl ModeChannel {
     ) -> Result<Self, String> {
         match mode {
             Mode::AcarsPoa => Ok(Self::Acars(AcarsChannelDecoder::new(sample_rate, offset)?)),
-            Mode::Ais => Ok(Self::Ais(AisChannelDecoder::new(sample_rate, offset, freq)?)),
+            Mode::Ais => {
+                let mut d = AisChannelDecoder::new(sample_rate, offset, freq)?;
+                d.set_max_effort(effort == DemodEffort::Max);
+                Ok(Self::Ais(d))
+            }
             Mode::Vdl2 => Ok(Self::Vdl2(Vdl2ChannelDecoder::new(sample_rate, offset)?)),
             Mode::AeroL => Ok(Self::Aero(AeroChannelDecoder::new(sample_rate, offset)?)),
             Mode::AeroC => Ok(Self::AeroBurst(AeroBurstDecoder::new(sample_rate, offset)?)),
