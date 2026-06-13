@@ -862,7 +862,11 @@ fn http_get(addr: &str, path: &str) -> std::io::Result<String> {
     use std::io::{Read, Write};
     let mut stream = std::net::TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-    write!(stream, "GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")?;
+    // One write_all, not write!: the latter issues a syscall per format
+    // fragment, and the server reads the request only once — a split
+    // request leaves it parsing no path and serving the HTML page.
+    let req = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes())?;
     stream.flush()?;
     // Accumulate until EOF. A minimal server may RST rather than send a
     // clean FIN; tolerate a reset once we already have the response.
