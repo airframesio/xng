@@ -186,3 +186,63 @@ fn decodes_gr_iridium_capture_via_wideband() {
         .count();
     assert_eq!(violations, 0, "PRBS15 must hold");
 }
+
+/// The wideband path must work at the rates the station actually uses,
+/// not just 2 MS/s. Upsample the real gr-iridium reference burst to
+/// each rate (the modulator's fixed-tap RRC can't synthesize a clean
+/// signal at high sps, so reuse real samples like the 2 MS/s test) and
+/// confirm it still detects + demodulates.
+#[test]
+fn decodes_real_burst_at_station_rates() {
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/data/grtest_prbs15_250k.i16"
+    ))
+    .expect("fixture present");
+    let chan: Vec<Complex<f32>> = raw
+        .chunks_exact(4)
+        .map(|b| {
+            Complex::new(
+                i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0,
+                i16::from_le_bytes([b[2], b[3]]) as f32 / 32768.0,
+            )
+        })
+        .collect();
+    for &(fs, off) in &[(2_000_000.0f64, 400_000.0f64), (6_000_000.0, -1_900_000.0), (6_000_000.0, 500_000.0)] {
+        let up = (fs / 250_000.0).round() as usize; // 8 at 2M, 24 at 6M
+        let mut sig = vec![Complex::new(0.0f32, 0.0); (0.05 * fs) as usize];
+        sig.extend(chan.iter().flat_map(|&s| std::iter::repeat(s).take(up)));
+        sig.extend(std::iter::repeat(Complex::new(0.0f32, 0.0)).take((0.2 * fs) as usize));
+        for (i, s) in sig.iter_mut().enumerate() {
+            let ph = std::f64::consts::TAU * off * i as f64 / fs;
+            *s *= Complex::from_polar(1.0, ph as f32);
+        }
+        // light noise
+        let mut z = 0x1234_5678_9abc_def0u64;
+        for s in &mut sig {
+            z ^= z << 13; z ^= z >> 7; z ^= z << 17;
+            let n1 = (z as f32 / u64::MAX as f32) - 0.5;
+            z ^= z << 13; z ^= z >> 7; z ^= z << 17;
+            let n2 = (z as f32 / u64::MAX as f32) - 0.5;
+            *s += Complex::new(n1 * 0.01, n2 * 0.01);
+        }
+        let mut wb = IridiumWideband::new(fs).unwrap();
+        let mut bursts = Vec::new();
+        for chunk in sig.chunks(65_536) {
+            bursts.extend(wb.process(chunk));
+        }
+        assert!(!bursts.is_empty(), "fs={fs} off={off}: no burst found");
+        // Nearest the fundamental (ZOH leaves ±250 kHz images).
+        let b = bursts
+            .iter()
+            .min_by(|a, b| (a.offset_hz - off).abs().partial_cmp(&(b.offset_hz - off).abs()).unwrap())
+            .unwrap();
+        assert_eq!(&b.bits[..24], &frame::ACCESS_DL[..], "fs={fs} off={off}: preamble");
+        let payload = &b.bits[24..];
+        let violations = (15..payload.len())
+            .filter(|&i| payload[i] != (payload[i - 15] ^ payload[i - 14]))
+            .count();
+        assert_eq!(violations, 0, "fs={fs} off={off}: PRBS15 must hold");
+        eprintln!("fs={fs} off={off}: decoded {} bursts, PRBS15 clean", bursts.len());
+    }
+}
