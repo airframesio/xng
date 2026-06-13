@@ -12,6 +12,14 @@ use std::sync::Arc;
 
 /// Detection threshold over the per-bin noise floor (gr-iridium: 16 dB).
 const THRESHOLD: f32 = 40.0; // linear ≈ 16 dB
+/// Frames to average into the noise floor before detecting. Seeding the
+/// floor from a single frame (its random per-bin magnitude) leaves many
+/// bins initialized near a noise null, so for the EMA's whole settling
+/// time those bins read tens of dB "hot" and fire spuriously — fatal at
+/// the larger FFTs of higher capture rates. A short warmup mean fixes
+/// the floor before any detection. 64 frames ≈ 33 ms, well before the
+/// first real burst.
+const WARMUP_FRAMES: u64 = 64;
 /// Maximum burst duration in seconds.
 const MAX_BURST_S: f64 = 0.092;
 /// Time to keep capturing after the burst leaves the detector.
@@ -44,6 +52,8 @@ pub struct IridiumWideband {
     start_abs: u64,
     /// Next FFT frame index to process.
     next_frame: u64,
+    /// Frames folded into the floor so far (for the warmup mean).
+    floor_frames: u64,
     active: Vec<ActiveBurst>,
 }
 
@@ -88,6 +98,7 @@ impl IridiumWideband {
             buf: Vec::new(),
             start_abs: 0,
             next_frame: 0,
+            floor_frames: 0,
             active: Vec::new(),
             recent: Vec::new(),
         })
@@ -114,13 +125,23 @@ impl IridiumWideband {
             self.fft.process(&mut spec);
             let mag: Vec<f32> = spec.iter().map(|c| c.norm_sqr()).collect();
 
-            // Update floors and find hot bins.
+            // Update the per-bin noise floor. Warm up with a running
+            // mean over the first WARMUP_FRAMES (no detection yet), then
+            // track with the slow EMA. Detecting before the floor is
+            // settled produces band-wide false bursts.
             if self.floor.is_empty() {
-                self.floor = mag.clone();
+                self.floor = vec![0.0; self.nfft];
             }
+            self.floor_frames += 1;
+            let warming = self.floor_frames <= WARMUP_FRAMES;
             let mut hot = vec![false; self.nfft];
             for (k, &m) in mag.iter().enumerate() {
                 let f = &mut self.floor[k];
+                if warming {
+                    // Incremental mean of the frames seen so far.
+                    *f += (m - *f) / self.floor_frames as f32;
+                    continue;
+                }
                 hot[k] = m > *f * THRESHOLD;
                 // Bursts are brief; the slow EMA dilutes them like
                 // gr-iridium's 512-frame history.
