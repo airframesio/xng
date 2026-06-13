@@ -3702,7 +3702,7 @@ dependencies = [
 
 [[package]]
 name = "xng"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3743,7 +3743,7 @@ dependencies = [
 
 [[package]]
 name = "xng-acars"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "base64",
  "crc",
@@ -3755,7 +3755,7 @@ dependencies = [
 
 [[package]]
 name = "xng-dsp"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "crc",
  "num-complex",
@@ -3764,7 +3764,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-acars"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -3776,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-adsb"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -3787,7 +3787,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-aero"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -3801,7 +3801,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-ais"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -3812,7 +3812,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-hfdl"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -3825,7 +3825,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-iridium"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "crc",
@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-stdc"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -3853,7 +3853,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-vdl2"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -3866,7 +3866,7 @@ dependencies = [
 
 [[package]]
 name = "xng-proto"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "prost",
@@ -3877,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "xng-sdr"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "num-complex",
  "pkg-config",
@@ -3888,7 +3888,7 @@ dependencies = [
 
 [[package]]
 name = "xng-types"
-version = "0.16.0"
+version = "0.17.0"
 dependencies = [
  "chrono",
  "serde",
