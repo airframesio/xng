@@ -26,11 +26,16 @@ struct Dash {
     vessels: HashMap<u32, Value>,
     recent: VecDeque<Value>,
     totals: HashMap<String, u64>,
+    /// Last time (unix secs) a message of each mode was seen — drives
+    /// the `xng status` per-session liveness column.
+    last_seen: HashMap<String, u64>,
     /// Monotonic message id — lets the page keep expansion state
     /// across poll re-renders.
     next_id: u64,
     station: String,
     started: u64,
+    /// Static per-session descriptors (SDR, mode, tuning) for status.
+    sessions: Vec<Value>,
 }
 
 /// Append to the entity's position trail (decimated: only when moved
@@ -57,6 +62,7 @@ fn now_s() -> u64 {
 fn update(d: &mut Dash, m: &Message) {
     let mode = m.mode.as_str().to_string();
     *d.totals.entry(mode.clone()).or_insert(0) += 1;
+    d.last_seen.insert(mode.clone(), now_s());
 
     match &m.body {
         MessageBody::ModeS {
@@ -170,10 +176,12 @@ fn snapshot(d: &mut Dash) -> String {
     json!({
         "station": d.station,
         "started": d.started,
+        "sessions": d.sessions,
         "aircraft": d.aircraft.values().collect::<Vec<_>>(),
         "vessels": d.vessels.values().collect::<Vec<_>>(),
         "messages": d.recent.iter().rev().take(100).collect::<Vec<_>>(),
         "totals": d.totals,
+        "last_seen": d.last_seen,
         "now": now_s(),
     })
     .to_string()
@@ -183,10 +191,12 @@ pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     addr: String,
     station: String,
+    sessions: Vec<Value>,
 ) -> std::io::Result<()> {
     let state = Arc::new(Mutex::new(Dash {
         station,
         started: now_s(),
+        sessions,
         ..Dash::default()
     }));
 

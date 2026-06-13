@@ -365,10 +365,41 @@ impl ModeChannel {
 }
 
 /// Spawn the configured output sinks on the current tokio runtime.
+/// JSON descriptor of one decode session for the dashboard / `xng status`.
+fn session_descriptor(
+    sdr: &Option<SdrInfo>,
+    mode: Mode,
+    center_hz: u64,
+    channels_hz: &[u64],
+    sample_rate: f64,
+) -> serde_json::Value {
+    let (selector, serial) = match sdr {
+        Some(s) => (s.id.clone(), s.serial.clone().or_else(|| parse_serial(&s.id))),
+        None => ("file".to_string(), None),
+    };
+    serde_json::json!({
+        "sdr": selector,
+        "serial": serial,
+        "mode": mode.as_str(),
+        "center_mhz": center_hz as f64 / 1e6,
+        "channels": channels_hz.iter().map(|c| *c as f64 / 1e6).collect::<Vec<_>>(),
+        "sample_rate": sample_rate,
+    })
+}
+
+/// Pull `serial=…` out of a SoapySDR-style selector string.
+fn parse_serial(selector: &str) -> Option<String> {
+    selector.split(',').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k.trim() == "serial").then(|| v.trim().to_string())
+    })
+}
+
 fn spawn_outputs(
     bus: &MessageBus,
     outputs: &OutputConfig,
     station: &StationIdentity,
+    sessions: &[serde_json::Value],
 ) -> Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> {
     let mut output_tasks = Vec::new();
     output_tasks.push(tokio::spawn({
@@ -402,7 +433,8 @@ fn spawn_outputs(
     if let Some(addr) = outputs.http.clone() {
         let rx = bus.subscribe();
         let ident = station.ident.clone();
-        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr, ident)));
+        let sessions = sessions.to_vec();
+        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr, ident, sessions)));
     }
     if let Some(url) = outputs.mqtt.clone() {
         let rx = bus.subscribe();
@@ -477,7 +509,9 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 }
             });
         }
-        let output_tasks = spawn_outputs(&bus, &cfg.outputs, &station);
+        let desc =
+            vec![session_descriptor(&cfg.sdr, cfg.mode, capture_center, &cfg.channels_hz, sample_rate)];
+        let output_tasks = spawn_outputs(&bus, &cfg.outputs, &station, &desc);
 
         // Ctrl-C → graceful stop.
         tokio::spawn({
@@ -664,6 +698,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         capture_center: u64,
     }
     let mut prepared = Vec::new();
+    let mut sessions_desc = Vec::new();
     for (source, cfg) in sessions {
         let sample_rate = source.sample_rate();
         let capture_center =
@@ -695,6 +730,13 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
             sample_rate,
             capture_center as f64 / 1e6
         );
+        sessions_desc.push(session_descriptor(
+            &cfg.sdr,
+            cfg.mode,
+            capture_center,
+            &cfg.channels_hz,
+            sample_rate,
+        ));
         prepared.push(Prepared { source, decoders, cfg, capture_center });
     }
 
@@ -714,7 +756,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                 }
             });
         }
-        let output_tasks = spawn_outputs(&bus, &prepared[0].cfg.outputs, &station);
+        let output_tasks = spawn_outputs(&bus, &prepared[0].cfg.outputs, &station, &sessions_desc);
 
         tokio::spawn({
             let stop = stop.clone();
