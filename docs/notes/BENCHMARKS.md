@@ -121,6 +121,45 @@ decision-directed trim are both load-bearing).
 
 Reproduce:
 
+**Deep-weak campaign (2026-06-12): 36 → 48 unique (91 %), fixture
+51 → 71 frames, zero false decodes.** The 17 then-missing payloads
+were localized exactly — 16 were type-4 base-station reports from the
+two stations already being decoded (UTC is in the payload; an offset
+fit against our anchor log matched 20/21 decoded bursts at c = 1.23 s)
+— and the campaign falsified the *detection* hypotheses one by one:
+
+- Power gate 2.0 → 1.2: 36 (no change — the gate was never the blocker).
+- Anchor threshold 0.72 → 0.60: 36 at 2.5× the CPU (detection
+  threshold not the blocker either).
+- Both + span-skip 48 → 12 bits: still 36.
+- Instrumented absolute hunt metrics showed every miss window already
+  firing anchors (peak metrics 0.56–0.60): **the bursts anchor; the
+  decode fails.**
+- Decode-stage CFO ± phase-gain hypotheses (open-loop gain 0 included;
+  FCS arbitrates): 36 → 40 → 41 with the full 15-point grid.
+- **Shifted decode windows (±1..±4 samples): 41 → 48.** Timing was the
+  dominant failure: the stride-2 hunt lands a sample or two off on
+  weak bursts and the fractional refine only spans ±0.5.
+- The hypothesis fan-out (~90 FCS trials per failed anchor) made
+  random FCS-16 passes a real rate — one phantom "type 53" appeared,
+  exactly as the math predicts. Rescue-decoded frames now require a
+  sane message type (1–27) and a confirmed source MMSI (already seen,
+  or a second held frame from the same MMSI — the ADS-B two-sighting
+  policy transplanted). Back to a clean subset.
+- Gate and span-skip restored to the originals afterwards: counts
+  unchanged, confirming they never mattered.
+
+Live effort keeps the proven 0.72 anchor threshold and caps the shift
+search at ±2 — and still reaches the same 48 (everything decodable
+anchored at ≥0.72 all along; max digs to 0.55 for headroom on other
+captures). Measured on the 96 kS/s fixture: live 71 frames at 8.4×
+realtime (unchanged CPU), max 72 at 5.2×. Baseline raised 48 → 65.
+
+The remaining 5 payloads anchor but never produce an FCS-valid frame
+under any tested hypothesis — the deepest fades on this capture. Next
+documented lever: soft-bit list repair (flip the lowest-confidence
+trellis bits, FCS-verify, MMSI-confirm), worth an estimated 1–2 dB.
+
 ```
 xng decode ais_6m.cs16 -f cs16 -m ais -r 6000000 -c 162000000 --channels 161.975,162.025
 AIS-catcher -r CS16 ais_6m.cs16 -s 6000000 -n

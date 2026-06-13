@@ -65,7 +65,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
 | Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, **pager messages (IMS) with multi-part reassembly**, **voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction**, **IP-channel frames (IIP ARQ / IIQ / IIR)**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle |
-| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors; off-air benchmark vs AIS-catcher (68 % and closing), CI-fenced |
+| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
 | Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), single-bit CRC repair, per-aircraft tracking, **SBS + Beast outputs**; any rate ≥ 2 MS/s including **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
 
 All multi-channel modes decode any number of channels from one capture.
@@ -102,11 +102,12 @@ hypothesis](docs/notes/BENCHMARKS.md); fenced in CI by
 | Mode S @2.4 MS/s | readsb (`--no-fix`) | 167 | **164** | 98 % | 5 |
 | Mode S @2 MS/s | dump1090-fa (`--no-fix`) | 162 | **161** | 99 % | 7 |
 | HFDL | dumphfdl | 37 | 33 | 89 % | — |
-| AIS | AIS-catcher | 53 | 36 | 68 % | — |
+| AIS | AIS-catcher | 53 | 48 | 91 % | 0 |
 
 The HFDL and AIS gaps are characterized down to the burst: the missing
-frames are the weakest signals (4–5 dB SNR) at the margin of one
-inland antenna — not protocol or decode defects. Decode speed
+frames are the weakest signals at the margin of one inland antenna —
+not protocol or decode defects (the AIS campaign that took 68 % → 91 %
+is documented falsification-by-falsification in the notes). Decode speed
 (Apple M-series; `bench/cpu.sh`): VDL2 85×, HFDL 283×, AIS 8.6×
 realtime; Mode S 16.6× at live effort / 5.3× at max — every mode
 runs real-time on Pi-class hardware via `--demod-effort`.
