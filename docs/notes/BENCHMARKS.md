@@ -244,3 +244,12 @@ required a cached ICAO, so they now inherit confirmed-only trust.
 Measured cost: zero. modes1 is a single heavily-repeated aircraft —
 the gate still reads 323 at 2 MS/s. Measured benefit: the quiet live
 capture drops from 70 phantoms to exactly 0, matching both oracles.
+
+Follow-ups locked in by CI: the first 20 s of the quiet capture is now
+a release-asset fixture with a **ceiling gate** (`adsb_quiet_max = 4`,
+measured 1) — any future relaxation of the candidate gates that brings
+the phantoms back fails the bench job. And live demod effort at
+fractional rates was raised from 2 to 4 sub-sample passes after the
+same live session showed 2-pass live decoding 7 msgs/45 s where max
+got 36: on modes1 resampled to 2.4 MS/s, live goes 281 → 296 of max's
+313 while still running ~5.9× realtime.

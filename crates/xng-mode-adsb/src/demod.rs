@@ -307,9 +307,12 @@ impl PpmDemod {
             // bytes + position.
             let mut found: Vec<(usize, AdsbFrame)> = Vec::new();
             // Effort follows the integer path's grid choice: live (one
-            // extra phase configured) runs 2 passes; max runs 16
+            // extra phase configured) runs 4 passes; max runs 16
             // (measured asymptote: 157 → 163 → 164 unique at 4/8/16).
-            let npass: usize = if self.fracs.len() <= 1 { 2 } else { 16 };
+            // Live was 2 until real-RF testing showed it left frames
+            // on the table (modes1@2.4M: 281 → 296 of max's 313 going
+            // 2 → 4 passes).
+            let npass: usize = if self.fracs.len() <= 1 { 4 } else { 16 };
             for (pass, frac) in
                 (0..npass).map(|k| k as f64 / npass as f64).enumerate()
             {
