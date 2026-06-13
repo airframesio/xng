@@ -89,3 +89,42 @@ Validation: iridium-toolkit's parser run offline as an oracle on
 generated frames (bit-identical field decode), vectors vendored into
 unit tests; live RA channel needs only an L-band antenna (bursts every
 few seconds worldwide).
+
+## Wideband (wave 2) — decoding real off-air bursts
+
+The full-band hunter (`wideband.rs`) detects bursts by FFT, downmixes
+each to baseband, and feeds the single-channel demod. Getting this to
+decode a real 6 MS/s off-air capture (SAWbird+IR / Maxtena PN100) took
+three fixes, each isolated and tested:
+
+1. **Channelize with the DDC, not a boxcar.** A boxcar-of-decim averager
+   is a poor anti-alias filter — its sinc sidelobes fold ~8 dB of
+   wideband noise into the 250 kHz channel (measured peak/noise 8.5 dB
+   vs 16.6 dB through a real FIR on the same burst). Each burst now goes
+   through `xng_dsp::Ddc` (the same two-stage windowed-sinc the
+   single-channel path uses) at a 50 kHz one-sided passband (wider than
+   the single channel's 25 kHz so the demod's ±30 kHz tone-CFO search can
+   recover off-center detections).
+2. **Seed the demod noise floor (the decisive fix).** The demod's
+   asymmetric noise EMA starts at 1.0 and needs ~1400 quiet samples to
+   converge. A continuous stream gives it that; an isolated
+   wideband-extracted burst has only ~1000 channel samples of pre-roll,
+   so the floor froze ~18 dB high when the burst arrived and the
+   acquisition gate (`noise·8`) sat *above* the signal — zero energetic
+   windows, no UW fit attempted. The front end now estimates the
+   channel's noise (20th-percentile power) and `seed_noise()`s the demod
+   so the gate is correct from the first sample. This alone took the real
+   capture from 0 → decoding (clean UW costs 0.003–0.04).
+3. **Don't over-reject in the BCH/classify gates.** `ecc_blocks` trusts a
+   weight-1 BCH correction even when the separate even-parity bit is
+   flipped (an unambiguous correction on this d=5 code; the parity flip
+   is just a second, harmless error), and `classify` accepts
+   BCH-*correctable* RA headers, not only zero-syndrome ones.
+
+Frame typing: **ITL ("TL", Time-Location)** must be classified *before*
+IRA. Its 96-bit header is `11` + 94 zeros, which is a valid (degenerate)
+all-zero BCH codeword — so without an explicit ITL check it falls through
+to the IRA classifier and mis-decodes as a ring alert with an all-zero
+satellite/position. The real captures are dominated by ITL bursts; they
+are now reported as `kind:"itl"` (full satellite/plane PRS decode via the
+toolkit's `itl.py` tables is still TODO).

@@ -135,10 +135,17 @@ pub fn ecc_blocks(blocks: &[Vec<u8>], poly: u32) -> (Vec<u8>, u32) {
         let Some(errs) = bch_repair(poly, &mut b31) else {
             break;
         };
-        // Whole-block even parity (over the repaired 31 bits + parity).
+        // Whole-block even parity (over the repaired 31 bits + parity)
+        // guards against BCH miscorrection. A weight-1 correction on this
+        // d=5 BCH(31,21) is unambiguous (no weight-≤2 error shares a
+        // single-flip syndrome), so an odd overall parity after errs≤1
+        // means the separate parity bit was the second flipped bit — a
+        // harmless error that does not touch the 21 data bits. Only an
+        // errs==2 correction (BCH at its t=2 limit) with bad parity
+        // signals a likely >2-error miscorrection worth truncating on.
         let ones: u32 =
             b31.iter().map(|&v| v as u32).sum::<u32>() + block[31] as u32;
-        if ones % 2 == 1 && errs > 0 {
+        if ones % 2 == 1 && errs >= 2 {
             break;
         }
         if errs > 0 {
@@ -174,6 +181,9 @@ pub enum FrameKind {
     Bc,
     /// Messaging header seen (payload not parsed in v1).
     Ms,
+    /// Time-Location ("TL", satellite ranging broadcast). 96-bit header
+    /// `11` + 94 zeros; the payload is descrambled, not BCH-coded.
+    Itl,
     /// LCW-bearing duplex frame (DA/voice/IP/sync by frame type).
     Lw,
     Unknown,
@@ -184,6 +194,21 @@ pub enum FrameKind {
 pub fn classify(data: &[u8]) -> FrameKind {
     if data.len() >= 32 && data[..32] == HEADER_MESSAGING[..] {
         return FrameKind::Ms;
+    }
+    // ITL ("TL", Time-Location): 96-bit header is `11` followed by 94
+    // zeros (toolkit `header_time_location`). Match tolerantly — the
+    // 24-bit access + UW fit already confirmed a real burst, so a handful
+    // of off-air bit errors in the header must not let an ITL frame fall
+    // through to the IRA classifier, where its near-all-zero header is a
+    // valid (degenerate) BCH codeword and would mis-decode as an all-zero
+    // ring alert.
+    if data.len() >= 96 {
+        let diff = (data[0] == 0) as u32
+            + (data[1] == 0) as u32
+            + data[2..96].iter().map(|&b| b as u32).sum::<u32>();
+        if diff <= 3 {
+            return FrameKind::Itl;
+        }
     }
     if data.len() > 6 + 64 && ndivide(HDR_POLY, &data[..6]) == 0 {
         let (b1, b2) = de_interleave2(&data[6..6 + 64]);
@@ -207,12 +232,24 @@ pub fn classify(data: &[u8]) -> FrameKind {
         }
     }
     if data.len() >= 96 {
-        let (b1, b2, b3) = de_interleave3(&data[..96]);
-        if ndivide(RINGALERT_BCH_POLY, &b1[..31]) == 0
-            && ndivide(RINGALERT_BCH_POLY, &b2[..31]) == 0
-            && ndivide(RINGALERT_BCH_POLY, &b3[..31]) == 0
-        {
-            return FrameKind::Ra;
+        let (mut b1, mut b2, mut b3) = de_interleave3(&data[..96]);
+        let zeros = (ndivide(RINGALERT_BCH_POLY, &b1[..31]) == 0) as u32
+            + (ndivide(RINGALERT_BCH_POLY, &b2[..31]) == 0) as u32
+            + (ndivide(RINGALERT_BCH_POLY, &b3[..31]) == 0) as u32;
+        // Accept BCH-*correctable* headers, not just all-zero syndromes:
+        // a real off-air RA burst routinely carries one correctable bit
+        // error in the header, which the downstream ecc_blocks fixes. The
+        // 24-bit access code already gated this as a genuine burst, so
+        // requiring >=1 clean block + a small total error budget keeps
+        // false classifications away while not dropping real frames.
+        if let (Some(e1), Some(e2), Some(e3)) = (
+            bch_repair(RINGALERT_BCH_POLY, &mut b1[..31]),
+            bch_repair(RINGALERT_BCH_POLY, &mut b2[..31]),
+            bch_repair(RINGALERT_BCH_POLY, &mut b3[..31]),
+        ) {
+            if zeros >= 1 && e1 + e2 + e3 <= 3 {
+                return FrameKind::Ra;
+            }
         }
     }
     FrameKind::Unknown
@@ -345,6 +382,56 @@ mod tests {
         b31[17] ^= 1;
         assert_eq!(bch_repair(RINGALERT_BCH_POLY, &mut b31), Some(2));
         assert_eq!(&b31[..21], &data[..]);
+    }
+
+    #[test]
+    fn itl_header_classifies_as_itl_not_ra() {
+        // ITL ("TL"): 96-bit header `11` + 94 zeros, then payload.
+        let mut data = vec![0u8; 96 + 64];
+        data[0] = 1;
+        data[1] = 1;
+        for i in 96..data.len() {
+            data[i] = ((i * 7) % 3 == 0) as u8;
+        }
+        assert_eq!(classify(&data), FrameKind::Itl);
+        // A couple of off-air bit errors in the zero run still match ITL.
+        let mut noisy = data.clone();
+        noisy[40] = 1;
+        noisy[71] = 1;
+        assert_eq!(classify(&noisy), FrameKind::Itl);
+        // A degenerate all-zero header must never become a ring alert (its
+        // blocks are the trivially-valid all-zero BCH codeword).
+        assert_ne!(classify(&vec![0u8; 96 + 64]), FrameKind::Ra);
+    }
+
+    #[test]
+    fn ira_header_still_classifies_as_ra() {
+        // A real IRA header (nonzero data) is well clear of the ITL
+        // tolerance and must still classify as RA.
+        let b1 = bch_encode(RINGALERT_BCH_POLY, &rand_bits(21, 101));
+        let b2 = bch_encode(RINGALERT_BCH_POLY, &rand_bits(21, 102));
+        let b3 = bch_encode(RINGALERT_BCH_POLY, &rand_bits(21, 103));
+        let mut data = interleave3(&b1, &b2, &b3);
+        data.extend(std::iter::repeat(0u8).take(64));
+        assert_eq!(classify(&data), FrameKind::Ra);
+    }
+
+    #[test]
+    fn ecc_blocks_tolerates_flipped_parity_bit() {
+        // Three valid RA header blocks; block 2 carries one correctable
+        // BCH error AND a flipped overall-parity bit. The weight-1 BCH
+        // correction is unambiguous, so the block (and the whole frame)
+        // must survive rather than truncate at the parity mismatch.
+        let mut blocks = vec![
+            bch_encode(RINGALERT_BCH_POLY, &rand_bits(21, 11)),
+            bch_encode(RINGALERT_BCH_POLY, &rand_bits(21, 12)),
+            bch_encode(RINGALERT_BCH_POLY, &rand_bits(21, 13)),
+        ];
+        blocks[2][5] ^= 1; // BCH-correctable bit error
+        blocks[2][31] ^= 1; // overall even-parity bit flipped
+        let (payload, fixed) = ecc_blocks(&blocks, RINGALERT_BCH_POLY);
+        assert_eq!(payload.len(), 63, "all three blocks must survive");
+        assert!(fixed >= 1);
     }
 }
 

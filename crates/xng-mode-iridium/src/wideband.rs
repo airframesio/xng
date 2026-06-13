@@ -9,6 +9,7 @@ use crate::CHANNEL_RATE;
 use num_complex::Complex;
 use rustfft::Fft;
 use std::sync::Arc;
+use xng_dsp::Ddc;
 
 /// Detection threshold over the per-bin noise floor (gr-iridium: 16 dB).
 const THRESHOLD: f32 = 40.0; // linear ≈ 16 dB
@@ -26,6 +27,12 @@ const MAX_BURST_S: f64 = 0.092;
 const POST_S: f64 = 0.012;
 /// Pre-burst samples to include (preamble ramp).
 const PRE_S: f64 = 0.004;
+/// One-sided channel passband for the per-burst DDC. Wider than the
+/// single-channel decoder's 25 kHz so the demod's ±30 kHz tone-CFO search
+/// can still recover bursts whose detection centroid sits well off the
+/// true channel center under spectral leakage; the extra noise this admits
+/// is removed again by the demod's own matched processing.
+const WIDEBAND_PASSBAND_HZ: f64 = 50_000.0;
 
 struct ActiveBurst {
     /// Center bin of the detection.
@@ -41,7 +48,6 @@ pub struct IridiumWideband {
     /// suppressing duplicate split detections.
     recent: Vec<(u64, u64, usize)>,
     input_rate: f64,
-    decim: usize,
     fft: Arc<dyn Fft<f32>>,
     nfft: usize,
     window: Vec<f32>,
@@ -55,6 +61,8 @@ pub struct IridiumWideband {
     /// Frames folded into the floor so far (for the warmup mean).
     floor_frames: u64,
     active: Vec<ActiveBurst>,
+    /// Emit per-burst detection diagnostics (XNG_IRIDIUM_DEBUG set).
+    debug: bool,
 }
 
 /// A demodulated burst: bit stream plus its frequency offset from the
@@ -86,7 +94,6 @@ impl IridiumWideband {
             .collect();
         Ok(Self {
             input_rate,
-            decim,
             fft: rustfft::FftPlanner::new().plan_fft_forward(nfft),
             nfft,
             window,
@@ -101,6 +108,7 @@ impl IridiumWideband {
             floor_frames: 0,
             active: Vec::new(),
             recent: Vec::new(),
+            debug: std::env::var("XNG_IRIDIUM_DEBUG").is_ok(),
         })
     }
 
@@ -278,29 +286,61 @@ impl IridiumWideband {
         } else {
             (bin as f64 - self.nfft as f64) * self.input_rate / self.nfft as f64
         };
-        // Mix to baseband and decimate with a simple boxcar-of-decim FIR
-        // (the demod's own processing tolerates the soft rolloff).
+        if self.debug {
+            eprintln!(
+                "burst: bin {bin}, offset {f_off:+.0} Hz, frames {}..{} (t={:.4}s, {} frames)",
+                b.start_frame,
+                b.last_frame,
+                (b.start_frame * frame_len) as f64 / self.input_rate,
+                b.last_frame - b.start_frame + 1,
+            );
+        }
+        // Mix to baseband and decimate with a proper windowed-sinc DDC.
+        // A boxcar-of-decim averager is a poor anti-alias filter: its sinc
+        // sidelobes fold ~8 dB of wideband noise into the 250 kHz channel
+        // (measured peak/mean 8.5 dB vs 16.6 dB through a real anti-alias
+        // FIR on the same burst) — enough to push a marginal burst below
+        // the demod's acquisition gate. The DDC's two-stage Blackman-Harris
+        // FIR rejects the out-of-channel noise the same way the
+        // single-channel decoder does.
         let rel0 = (s0 - self.start_abs) as usize;
         let rel1 = (s1 - self.start_abs) as usize;
-        let step = -std::f64::consts::TAU * f_off / self.input_rate;
-        let mut chan: Vec<Complex<f32>> = Vec::with_capacity((rel1 - rel0) / self.decim + 1);
-        let mut acc = Complex::new(0.0f32, 0.0);
-        let mut n = 0usize;
-        for (i, s) in self.buf[rel0..rel1].iter().enumerate() {
-            let ph = step * (rel0 + i) as f64;
-            acc += s * Complex::from_polar(1.0, ph as f32);
-            n += 1;
-            if n == self.decim {
-                chan.push(acc / self.decim as f32);
-                acc = Complex::new(0.0, 0.0);
-                n = 0;
-            }
+        let mut ddc = Ddc::new(self.input_rate, CHANNEL_RATE, f_off, WIDEBAND_PASSBAND_HZ).ok()?;
+        let mut chan: Vec<Complex<f32>> = Vec::new();
+        ddc.process(&self.buf[rel0..rel1], &mut chan);
+
+        // Robust noise-floor estimate (20th percentile of channel power):
+        // the segment is pre-roll + burst + post, so a low order statistic
+        // lands in the noise regardless of burst length. This seeds the
+        // demod, whose own EMA floor would not converge within this short
+        // isolated segment (see IridiumDemod::seed_noise).
+        let mut powers: Vec<f32> = chan.iter().map(|s| s.norm_sqr()).collect();
+        let noise_floor = if powers.is_empty() {
+            1.0
+        } else {
+            let k = powers.len() / 5;
+            powers.select_nth_unstable_by(k, |a, b| a.total_cmp(b));
+            powers[k]
+        };
+        if self.debug {
+            let n = chan.len().max(1);
+            let mean = chan.iter().map(|s| s.norm_sqr()).sum::<f32>() / n as f32;
+            let peak = chan.iter().map(|s| s.norm_sqr()).fold(0.0f32, f32::max);
+            eprintln!(
+                "  channel: {} samples, mean pwr {:.2e}, peak pwr {:.2e}, noise {:.2e}, peak/noise {:.1} dB",
+                chan.len(),
+                mean,
+                peak,
+                noise_floor,
+                10.0 * (peak / noise_floor.max(1e-12)).log10()
+            );
         }
         // Quiet tail so the demod's burst-end detection and lookahead
         // complete within this call.
         chan.extend(std::iter::repeat(Complex::new(0.0f32, 0.0)).take((CHANNEL_RATE * 0.15) as usize));
 
         let mut demod = IridiumDemod::new(CHANNEL_RATE);
+        demod.seed_noise(noise_floor);
         let mut bits_out = demod.process(&chan);
         bits_out
             .pop()

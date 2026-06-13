@@ -43,6 +43,8 @@ pub struct IridiumDemod {
     pwr_pos: usize,
     pwr_sum: f32,
     level: f32,
+    /// Emit per-trigger acquisition diagnostics (XNG_IRIDIUM_DEBUG set).
+    debug: bool,
 }
 
 impl IridiumDemod {
@@ -60,7 +62,19 @@ impl IridiumDemod {
             pwr_pos: 0,
             pwr_sum: 0.0,
             level: 0.0,
+            debug: std::env::var("XNG_IRIDIUM_DEBUG").is_ok(),
         }
+    }
+
+    /// Seed the noise floor. The asymmetric EMA starts at 1.0 and needs
+    /// ~1400 samples of quiet to converge; a continuous stream gives it
+    /// that, but an isolated wideband-extracted burst has only a short
+    /// pre-roll, so without seeding the floor freezes ~18 dB high when the
+    /// burst arrives and the acquisition gate (`noise·8`) sits above the
+    /// signal. The wideband front end seeds this from the channel's own
+    /// measured noise.
+    pub fn seed_noise(&mut self, noise: f32) {
+        self.noise = noise.max(1e-12);
     }
 
     fn sample(&self, abs_pos: f64) -> Option<Complex<f32>> {
@@ -200,6 +214,8 @@ impl IridiumDemod {
             let theta0 = (2.0 * std::f64::consts::PI * cfo / SYMBOL_RATE) as f32;
             let burst_gate = self.noise * 8.0;
             let mut found: Option<(f32, f64, f32, f32, &'static [u8; 24])> = None;
+            let mut dbg_best = f32::INFINITY;
+            let mut dbg_energetic = 0u32;
             let mut hunt = 6.0 * self.sps;
             while hunt < (PRE_SYMS + 26.0) * self.sps {
                 let cand = bstart + hunt;
@@ -222,8 +238,10 @@ impl IridiumDemod {
                 if !energetic {
                     continue;
                 }
+                dbg_energetic += 1;
                 for (uw, access) in [(&UW_DL, ACCESS_DL), (&UW_UL, ACCESS_UL)] {
                     if let Some((cost, p2, th, ph)) = self.uw_fit(cand, uw, theta0) {
+                        dbg_best = dbg_best.min(cost);
                         if cost < 0.05 && found.map(|(c, ..)| cost < c).unwrap_or(true) {
                             found = Some((cost, p2, th, ph, access));
                         }
@@ -232,6 +250,19 @@ impl IridiumDemod {
                 if found.is_some() && hunt > 10.0 * self.sps {
                     break;
                 }
+            }
+            if self.debug {
+                eprintln!(
+                    "  trigger @ {:.0} (t={:.4}s): noise {:.2e} gate {:.2e}, cfo {:+.0} Hz, {} energetic windows, best UW cost {:.4}{}",
+                    pos,
+                    pos / (SYMBOL_RATE * self.sps),
+                    self.noise,
+                    burst_gate,
+                    cfo,
+                    dbg_energetic,
+                    dbg_best,
+                    if found.is_some() { "  SYNC" } else { "" }
+                );
             }
             let Some((_, uw_pos, theta, phase, access)) = found else {
                 // No UW: skip past this energy region.
