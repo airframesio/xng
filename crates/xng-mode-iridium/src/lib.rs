@@ -6,6 +6,8 @@ pub mod demod;
 pub mod frame;
 pub mod iip;
 pub mod ira;
+pub mod itl;
+mod itl_tables;
 pub mod ms;
 pub mod sbd;
 pub mod voice;
@@ -126,20 +128,26 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
             })
         }
         frame::FrameKind::Itl => {
-            // Time-Location (satellite ranging broadcast). The 96-bit
-            // `11`+0… header is recognized; the descrambled payload's
-            // satellite/plane PRS decode needs the toolkit's lookup tables
-            // and is deferred, but the frame is reported with its true
-            // type rather than mis-decoded as an all-zero ring alert.
-            Some(ira::IridiumFrame {
-                kind: "itl",
-                details: serde_json::json!({
+            // Time-Location (satellite ranging broadcast): PRS-decode the
+            // payload after the 96-bit header into satellite / plane /
+            // message, falling back to a typed-but-unparsed frame if the
+            // payload is too short or doesn't resolve.
+            let details = match itl::decode_itl(&data[96..]) {
+                Some(f) => serde_json::json!({
+                    "type": "time-location",
+                    "version": f.version,
+                    "plane": f.plane,
+                    "sat": f.sat,
+                    "msg_type": f.msg_type,
+                    "msg": f.msg,
+                    "msg_types": f.types,
+                }),
+                None => serde_json::json!({
                     "type": "time-location",
                     "payload_bits": data.len().saturating_sub(96),
                 }),
-                acars: None,
-                raw_bits: bits.to_vec(),
-            })
+            };
+            Some(ira::IridiumFrame { kind: "itl", details, acars: None, raw_bits: bits.to_vec() })
         }
         _ => None,
     }
