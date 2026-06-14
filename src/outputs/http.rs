@@ -38,6 +38,10 @@ struct Dash {
     iridium_sats: HashMap<u64, Value>,
     /// Iridium ring/beam ground footprints, keyed by "sat-beam".
     iridium_rings: HashMap<String, Value>,
+    /// Reconstructed 48-beam pattern, projected under tracked satellites.
+    beams: crate::beam::BeamReconstructor,
+    /// Last unix-secs the beam pattern was persisted.
+    beams_saved: u64,
     recent: VecDeque<Value>,
     totals: HashMap<String, u64>,
     /// Last time (unix secs) a message of each mode was seen — drives
@@ -175,6 +179,16 @@ fn update(d: &mut Dash, m: &Message) {
             let sat = details.get("sat").and_then(Value::as_u64);
             if let (Some(lat), Some(lon), Some(alt), Some(sat)) = (lat, lon, alt, sat) {
                 let beam = details.get("beam").and_then(Value::as_u64).unwrap_or(0);
+                // Feed the 48-beam reconstructor with the raw ECEF position
+                // (details carry x/y/z in units of 4 km).
+                if let (Some(x), Some(y), Some(z)) = (
+                    details.get("x").and_then(Value::as_i64),
+                    details.get("y").and_then(Value::as_i64),
+                    details.get("z").and_then(Value::as_i64),
+                ) {
+                    let ecef = [x as f64 * 4.0, y as f64 * 4.0, z as f64 * 4.0];
+                    d.beams.observe(sat, alt, ecef, beam as u8, m.timestamp.timestamp() as f64);
+                }
                 if alt > SAT_ALT_MIN_KM {
                     let e = d.iridium_sats.entry(sat).or_insert_with(|| json!({}));
                     let o = e.as_object_mut().unwrap();
@@ -227,6 +241,12 @@ fn snapshot(d: &mut Dash) -> String {
     let ring_cut = now_s().saturating_sub(RING_EXPIRE_S);
     d.iridium_sats.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= sat_cut);
     d.iridium_rings.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
+    // Persist the accumulated beam pattern occasionally so it survives
+    // restarts and keeps refining across sessions.
+    if now_s().saturating_sub(d.beams_saved) > 120 {
+        d.beams.save(&crate::beam::BeamReconstructor::default_path());
+        d.beams_saved = now_s();
+    }
     json!({
         "station": d.station,
         "started": d.started,
@@ -235,6 +255,7 @@ fn snapshot(d: &mut Dash) -> String {
         "vessels": d.vessels.values().collect::<Vec<_>>(),
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
+        "iridium_beam_cells": d.beams.project(now_s() as f64, SAT_EXPIRE_S as f64),
         "messages": d.recent.iter().rev().take(100).collect::<Vec<_>>(),
         "totals": d.totals,
         "last_seen": d.last_seen,
@@ -249,12 +270,10 @@ pub async fn run(
     station: String,
     sessions: Vec<Value>,
 ) -> std::io::Result<()> {
-    let state = Arc::new(Mutex::new(Dash {
-        station,
-        started: now_s(),
-        sessions,
-        ..Dash::default()
-    }));
+    let mut dash = Dash { station, started: now_s(), sessions, ..Dash::default() };
+    // Resume the accumulated 48-beam pattern across restarts.
+    dash.beams = crate::beam::BeamReconstructor::load(&crate::beam::BeamReconstructor::default_path());
+    let state = Arc::new(Mutex::new(dash));
 
     // HTTP listener.
     let listener = tokio::net::TcpListener::bind(&addr).await?;

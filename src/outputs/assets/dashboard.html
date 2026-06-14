@@ -99,17 +99,23 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
 // auto-fit so global satellite positions never yank the view.
 const satLayer = L.layerGroup();
 const ringLayer = L.layerGroup();
+// Beam pattern: the full reconstructed 48-cell pattern projected under each
+// tracked satellite (off by default — a denser power-user view).
+const patternLayer = L.layerGroup();
 L.control.layers(null,
-  { '🛰 Iridium satellites': satLayer, '◎ Spot beams': ringLayer },
+  { '🛰 Iridium satellites': satLayer, '◎ Spot beams': ringLayer, '⬡ Beam pattern': patternLayer },
   { position: 'topright', collapsed: false }).addTo(map);
 if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
 if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
+if (localStorage.getItem('xng.patternLayer') === '1') patternLayer.addTo(map);
 map.on('overlayadd overlayremove', () => {
   localStorage.setItem('xng.satLayer', map.hasLayer(satLayer) ? '1' : '0');
   localStorage.setItem('xng.ringLayer', map.hasLayer(ringLayer) ? '1' : '0');
+  localStorage.setItem('xng.patternLayer', map.hasLayer(patternLayer) ? '1' : '0');
 });
 const satMarkers = new Map();  // sat id -> {marker, trail}
 const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
+const patternMarkers = new Map(); // "sat-beam" -> projected pattern cell
 
 // Aircraft silhouettes: PlaneWatch pw-silhouettes (CC BY-NC-SA 4.0,
 // used with permission). Resolved by ICAO type designator via the
@@ -288,6 +294,28 @@ function syncIridium(s) {
   for (const [k, m] of ringMarkers) if (!seenRing.has(k)) {
     ringLayer.removeLayer(m);
     ringMarkers.delete(k);
+  }
+
+  // Reconstructed beam pattern: all 48 cells projected under each tracked
+  // satellite (sparser fill so the tiling reads under the spot-beam cells).
+  const seenCell = new Set();
+  for (const c of (s.iridium_beam_cells || [])) {
+    const key = c.sat + '-' + c.beam;
+    seenCell.add(key);
+    const col = beamColor(c.beam);
+    let m = patternMarkers.get(key);
+    if (!m) {
+      m = L.circle([c.lat, c.lon], { radius: 130000, color: col, weight: 1, fillColor: col, fillOpacity: 0.05 }).addTo(patternLayer);
+      m.bindPopup(`pattern: sat ${c.sat} / beam ${c.beam}`);
+      patternMarkers.set(key, m);
+    } else {
+      m.setLatLng([c.lat, c.lon]);
+      m.setStyle({ color: col, fillColor: col });
+    }
+  }
+  for (const [k, m] of patternMarkers) if (!seenCell.has(k)) {
+    patternLayer.removeLayer(m);
+    patternMarkers.delete(k);
   }
 }
 

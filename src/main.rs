@@ -3,6 +3,7 @@
 //! M1: native ACARS decoding from SDR hardware or IQ recordings, with
 //! console/JSONL outputs and acarsdec-compatible Airframes feeding.
 
+mod beam;
 mod bus;
 mod commands;
 mod tui;
