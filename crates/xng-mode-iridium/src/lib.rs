@@ -155,6 +155,16 @@ fn handle_bits(
     pager: &mut ms::PagerReassembler,
     out: &mut Vec<ira::IridiumFrame>,
 ) {
+    // Drop degenerate idle/all-zero bursts up front. Their post-access bits
+    // BCH-correct to the trivially-valid all-zero codeword, which would
+    // otherwise surface as a false all-zero ring alert or an empty voice
+    // frame (and the all-zero LCW decodes to ft=0). Every real frame
+    // carries a roughly half-ones payload; an idle burst has almost none.
+    let payload = if bits.len() > 24 { &bits[24..] } else { bits };
+    let ones: usize = payload.iter().map(|&b| b as usize).sum();
+    if ones * 10 < payload.len() {
+        return;
+    }
     let n0 = out.len();
     if let Some(f) = decode_bits(bits) {
         // Multi-part pages: emit the assembled text when complete.

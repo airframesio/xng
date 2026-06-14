@@ -240,3 +240,12 @@ fn oracle_validated_ims_vector() {
         Some("CALL OPS +14155550100")
     );
 }
+
+#[test]
+fn rejects_all_zero_ring_alert() {
+    // A degenerate all-zero header (an idle/noisy burst whose blocks
+    // BCH-correct to the trivially-valid zero codeword) must NOT emit a
+    // bogus ring alert at sat 0 / position (0,0,0).
+    let zero = vec![0u8; 96];
+    assert!(xng_mode_iridium::ira::parse_ra(&zero, 0, &[]).is_none());
+}
