@@ -25,9 +25,45 @@ const INC0_DEG: f64 = 84.0;
 /// A satellite's high-altitude fix is "current" for a footprint within
 /// this many seconds (matches beam-plotter's staleness gate).
 const FRESH_S: f64 = 10.0;
-/// Altitude split: above is the satellite, below is a ground footprint.
-const SAT_ALT_MIN_KM: f64 = 500.0;
-const GROUND_ALT_MAX_KM: f64 = 100.0;
+/// Altitude bands (km above the surface) that tell a satellite's own
+/// position report from a ground beam footprint, and reject decodes whose
+/// altitude is physically impossible. A BCH false-pass can yield a garbage
+/// position; on the live map one bad satellite fix both plants a phantom
+/// marker and corrupts every footprint de-rotated against it for the next
+/// few seconds, so altitudes outside these bands are dropped. Operational
+/// Iridium flies at ~780 km; footprints sit on the ground.
+const SAT_ALT_MIN_KM: f64 = 600.0;
+const SAT_ALT_MAX_KM: f64 = 1100.0;
+const GROUND_ALT_MIN_KM: f64 = -150.0;
+const GROUND_ALT_MAX_KM: f64 = 200.0;
+/// Footprints a beam needs before it is confident enough to project: a
+/// lone observation can sit far off through a stale satellite fix or a
+/// mis-judged travel direction, so singletons are accumulated but not yet
+/// drawn.
+const MIN_OBS: u32 = 2;
+
+/// How an IRA altitude reading is interpreted.
+pub enum AltClass {
+    /// The broadcasting satellite's own position (~780 km).
+    Satellite,
+    /// A ground beam footprint.
+    Footprint,
+    /// Physically impossible — a decode error to be ignored.
+    Implausible,
+}
+
+/// Classify an IRA altitude (km above the surface) into satellite /
+/// footprint / implausible. Shared by the reconstructor and the dashboard
+/// so the map and the pattern agree on what is real.
+pub fn classify_altitude(alt_km: f64) -> AltClass {
+    if (SAT_ALT_MIN_KM..=SAT_ALT_MAX_KM).contains(&alt_km) {
+        AltClass::Satellite
+    } else if (GROUND_ALT_MIN_KM..=GROUND_ALT_MAX_KM).contains(&alt_km) {
+        AltClass::Footprint
+    } else {
+        AltClass::Implausible
+    }
+}
 
 fn inc_rad(north: i8) -> f64 {
     if north < 0 {
@@ -93,8 +129,10 @@ impl Pattern {
         e.1 += along;
         e.2 += 1;
     }
-    fn mean(&self, beam: u8) -> Option<(f64, f64)> {
-        self.cells.get(&beam).filter(|c| c.2 > 0).map(|c| (c.0 / c.2 as f64, c.1 / c.2 as f64))
+    /// Mean (cross, along) offset for a beam, but only once it has at least
+    /// `min` observations (confidence gate).
+    fn mean(&self, beam: u8, min: u32) -> Option<(f64, f64)> {
+        self.cells.get(&beam).filter(|c| c.2 >= min).map(|c| (c.0 / c.2 as f64, c.1 / c.2 as f64))
     }
 }
 
@@ -135,29 +173,33 @@ impl BeamReconstructor {
     /// update the satellite track; low-altitude frames (a beam footprint)
     /// are de-rotated into the matching-direction pattern.
     pub fn observe(&mut self, sat: u64, alt_km: f64, ecef: [f64; 3], beam: u8, time: f64) {
-        if alt_km > SAT_ALT_MIN_KM {
-            let north = match self.tracks.get(&sat) {
-                Some(t) if time - t.time < FRESH_S => {
-                    let dz = ecef[2] - t.z_prev;
-                    if dz > 0.0 {
-                        1
-                    } else if dz < 0.0 {
-                        -1
-                    } else {
-                        t.north
+        match classify_altitude(alt_km) {
+            AltClass::Satellite => {
+                let north = match self.tracks.get(&sat) {
+                    Some(t) if time - t.time < FRESH_S => {
+                        let dz = ecef[2] - t.z_prev;
+                        if dz > 0.0 {
+                            1
+                        } else if dz < 0.0 {
+                            -1
+                        } else {
+                            t.north
+                        }
+                    }
+                    _ => 0,
+                };
+                self.tracks.insert(sat, SatTrack { pos: ecef, z_prev: ecef[2], north, time });
+            }
+            AltClass::Footprint => {
+                if let Some(t) = self.tracks.get(&sat) {
+                    if t.north != 0 && time - t.time < FRESH_S {
+                        let (cross, along) = to_sat_frame(t.pos, ecef, t.north);
+                        let pat = if t.north < 0 { &mut self.south } else { &mut self.north };
+                        pat.add(beam, cross, along);
                     }
                 }
-                _ => 0,
-            };
-            self.tracks.insert(sat, SatTrack { pos: ecef, z_prev: ecef[2], north, time });
-        } else if alt_km < GROUND_ALT_MAX_KM {
-            if let Some(t) = self.tracks.get(&sat) {
-                if t.north != 0 && time - t.time < FRESH_S {
-                    let (cross, along) = to_sat_frame(t.pos, ecef, t.north);
-                    let pat = if t.north < 0 { &mut self.south } else { &mut self.north };
-                    pat.add(beam, cross, along);
-                }
             }
+            AltClass::Implausible => {}
         }
     }
 
@@ -172,7 +214,7 @@ impl BeamReconstructor {
             }
             let pat = if t.north < 0 { &self.south } else { &self.north };
             for beam in 1..=48u8 {
-                if let Some((cross, along)) = pat.mean(beam) {
+                if let Some((cross, along)) = pat.mean(beam, MIN_OBS) {
                     let e = to_ecef(t.pos, cross, along, t.north);
                     let (lat, lon) = lat_lon(e);
                     out.push(Cell {
@@ -267,16 +309,36 @@ mod tests {
     fn reconstruct_and_project() {
         let mut r = BeamReconstructor::new();
         let t0 = 1000.0;
-        // Track satellite 5 northbound (two rising high fixes), then a
-        // footprint for beam 12 just north-east of it.
+        // Track satellite 5 northbound (two rising high fixes), then two
+        // footprints for beam 12 (one is below the confidence gate).
         r.observe(5, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
         r.observe(5, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
         r.observe(5, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 12, t0 + 2.0);
+        // A single observation is held back (MIN_OBS gate).
+        assert!(r.project(t0 + 3.0, 60.0).iter().all(|c| c.beam != 12));
+        r.observe(5, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 12, t0 + 3.0);
         assert_eq!(r.beams_known(), 1);
-        let cells = r.project(t0 + 3.0, 60.0);
+        let cells = r.project(t0 + 4.0, 60.0);
         let c = cells.iter().find(|c| c.beam == 12).expect("beam 12 projected");
         // Re-projected under the same (still-current) satellite → original.
         assert!((c.lat - 41.5).abs() < 0.1, "lat {}", c.lat);
         assert!((c.lon - (-119.0)).abs() < 0.1, "lon {}", c.lon);
+    }
+
+    #[test]
+    fn rejects_implausible_altitude() {
+        // A BCH false-pass yields a garbage position at an impossible
+        // altitude. It must neither create a satellite track nor be taken
+        // as a footprint, so it cannot corrupt the pattern.
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(9, 3836.0, ecef(47.0, -52.0, R_EARTH_KM + 3836.0), 21, t0);
+        assert!(r.project(t0 + 1.0, 60.0).is_empty(), "no track from a bad fix");
+        // A real northbound satellite, then a garbage "footprint" at 1900 km
+        // (outside the ground band) must be ignored.
+        r.observe(9, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 2.0);
+        r.observe(9, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 3.0);
+        r.observe(9, 1900.0, ecef(41.5, -119.0, R_EARTH_KM + 1900.0), 7, t0 + 4.0);
+        assert_eq!(r.beams_known(), 0, "implausible footprint not recorded");
     }
 }
