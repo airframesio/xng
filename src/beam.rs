@@ -48,6 +48,11 @@ const GROUND_ALT_MAX_KM: f64 = 200.0;
 /// mis-judged travel direction, so singletons are accumulated but not yet
 /// drawn.
 const MIN_OBS: u32 = 2;
+/// Bounds on a reconstructed cell's drawn radius (km). A single Iridium
+/// spot beam covers a few hundred km, so the scatter-derived size is
+/// clamped to a plausible beam footprint range.
+const CELL_RADIUS_MIN_KM: f64 = 40.0;
+const CELL_RADIUS_MAX_KM: f64 = 600.0;
 
 /// How an IRA altitude reading is interpreted.
 pub enum AltClass {
@@ -121,25 +126,36 @@ fn to_ecef(sat: [f64; 3], y: f64, z: f64, north: i8) -> [f64; 3] {
     rot_z(p[0], p[1], p[2], lon)
 }
 
-/// One direction's accumulated 48-beam pattern: per beam, the running mean
-/// of the (cross, along) offset.
+/// One direction's accumulated 48-beam pattern: per beam, the running sums
+/// needed for both the mean offset and its spread (so a cell can be drawn
+/// at its actual reconstructed extent, as iridium-toolkit's beam-plotter
+/// sizes each cell by the scatter of its observations).
 #[derive(Default, Serialize, Deserialize)]
 struct Pattern {
-    /// beam id (1..=48) -> (sum_cross, sum_along, count)
-    cells: HashMap<u8, (f64, f64, u32)>,
+    /// beam id (1..=48) -> (sum_cross, sum_along, sum_sq_radial, count),
+    /// where sum_sq_radial accumulates cross²+along² for the variance.
+    cells: HashMap<u8, (f64, f64, f64, u32)>,
 }
 
 impl Pattern {
     fn add(&mut self, beam: u8, cross: f64, along: f64) {
-        let e = self.cells.entry(beam).or_insert((0.0, 0.0, 0));
+        let e = self.cells.entry(beam).or_insert((0.0, 0.0, 0.0, 0));
         e.0 += cross;
         e.1 += along;
-        e.2 += 1;
+        e.2 += cross * cross + along * along;
+        e.3 += 1;
     }
-    /// Mean (cross, along) offset for a beam, but only once it has at least
-    /// `min` observations (confidence gate).
-    fn mean(&self, beam: u8, min: u32) -> Option<(f64, f64)> {
-        self.cells.get(&beam).filter(|c| c.2 >= min).map(|c| (c.0 / c.2 as f64, c.1 / c.2 as f64))
+    /// Mean (cross, along) offset for a beam and its footprint radius (km),
+    /// but only once it has at least `min` observations (confidence gate).
+    /// The radius is ~2σ of the radial scatter — the live-map analogue of
+    /// beam-plotter's per-cell circle — clamped to a plausible beam size.
+    fn mean(&self, beam: u8, min: u32) -> Option<(f64, f64, f64)> {
+        let &(sx, sy, sq, n) = self.cells.get(&beam).filter(|c| c.3 >= min)?;
+        let n = n as f64;
+        let (mx, my) = (sx / n, sy / n);
+        let radial_var = (sq / n - (mx * mx + my * my)).max(0.0);
+        let radius = (2.0 * radial_var.sqrt()).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM);
+        Some((mx, my, radius))
     }
 }
 
@@ -151,13 +167,15 @@ struct SatTrack {
     time: f64,
 }
 
-/// One projected beam cell.
+/// One projected beam cell, with the reconstructed footprint radius (m) so
+/// the map can draw each beam at its actual extent.
 #[derive(Serialize)]
 pub struct Cell {
     pub sat: u64,
     pub beam: u8,
     pub lat: f64,
     pub lon: f64,
+    pub radius_m: f64,
 }
 
 /// Live reconstructor: fed every ring-alert frame, accumulates the pattern,
@@ -226,7 +244,7 @@ impl BeamReconstructor {
             }
             let pat = if t.north < 0 { &self.south } else { &self.north };
             for beam in 1..=48u8 {
-                if let Some((cross, along)) = pat.mean(beam, MIN_OBS) {
+                if let Some((cross, along, radius_km)) = pat.mean(beam, MIN_OBS) {
                     let e = to_ecef(t.pos, cross, along, t.north);
                     let (lat, lon) = lat_lon(e);
                     out.push(Cell {
@@ -234,6 +252,7 @@ impl BeamReconstructor {
                         beam,
                         lat: lat.to_degrees(),
                         lon: lon.to_degrees(),
+                        radius_m: radius_km * 1000.0,
                     });
                 }
             }
@@ -393,6 +412,28 @@ mod tests {
         r.observe(3, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t2);
         r.observe(3, 16.0, ecef(40.5, -119.0, R_EARTH_KM), 14, t2 + 1.0);
         assert_eq!(r.beams_known(), 1, "no new beam after a direction reset");
+    }
+
+    #[test]
+    fn cell_radius_reflects_observation_spread() {
+        // A tightly-clustered beam draws at the minimum radius; a beam whose
+        // footprints scatter draws wider (beam-plotter's per-cell extent).
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(1, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(1, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
+        // beam 5: identical footprints → ~zero spread → min radius.
+        r.observe(1, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 5, t0 + 2.0);
+        r.observe(1, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 5, t0 + 3.0);
+        // beam 6: separated footprints → larger radius.
+        r.observe(1, 16.0, ecef(41.0, -119.0, R_EARTH_KM), 6, t0 + 4.0);
+        r.observe(1, 16.0, ecef(42.0, -118.0, R_EARTH_KM), 6, t0 + 5.0);
+        let cells = r.project(t0 + 6.0, 60.0);
+        let c5 = cells.iter().find(|c| c.beam == 5).expect("beam 5");
+        let c6 = cells.iter().find(|c| c.beam == 6).expect("beam 6");
+        assert!((c5.radius_m - 40_000.0).abs() < 1.0, "tight → min, got {}", c5.radius_m);
+        assert!(c6.radius_m > c5.radius_m, "spread wider: {} vs {}", c6.radius_m, c5.radius_m);
+        assert!(c6.radius_m <= 600_000.0, "radius capped, got {}", c6.radius_m);
     }
 
     #[test]

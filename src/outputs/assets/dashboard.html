@@ -297,19 +297,24 @@ function syncIridium(s) {
   }
 
   // Reconstructed beam pattern: all 48 cells projected under each tracked
-  // satellite (sparser fill so the tiling reads under the spot-beam cells).
+  // satellite. Each cell is drawn at its reconstructed footprint radius
+  // (the scatter of its de-rotated observations, as iridium-toolkit's
+  // beam-plotter sizes each cell), with a sparse fill so the tiling reads
+  // under the spot-beam cells.
   const seenCell = new Set();
   for (const c of (s.iridium_beam_cells || [])) {
     const key = c.sat + '-' + c.beam;
     seenCell.add(key);
     const col = beamColor(c.beam);
+    const rad = c.radius_m || 130000;
     let m = patternMarkers.get(key);
     if (!m) {
-      m = L.circle([c.lat, c.lon], { radius: 130000, color: col, weight: 1, fillColor: col, fillOpacity: 0.05 }).addTo(patternLayer);
+      m = L.circle([c.lat, c.lon], { radius: rad, color: col, weight: 1, fillColor: col, fillOpacity: 0.05 }).addTo(patternLayer);
       m.bindPopup(`pattern: sat ${c.sat} / beam ${c.beam}`);
       patternMarkers.set(key, m);
     } else {
       m.setLatLng([c.lat, c.lon]);
+      m.setRadius(rad);
       m.setStyle({ color: col, fillColor: col });
     }
   }
