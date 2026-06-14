@@ -9,6 +9,7 @@ mod tui;
 mod freq;
 mod outputs;
 mod runtime;
+mod satmap;
 mod sdr_args;
 
 use clap::{Args, Parser, Subcommand};
@@ -129,6 +130,11 @@ struct OutputOpts {
     /// (default 127.0.0.1:4729 when given without an address)
     #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4729")]
     gsmtap: Option<String>,
+    /// Label Iridium ring alerts with the broadcasting satellite via SGP4
+    /// (default: auto-fetch Iridium-NEXT TLEs from Celestrak; or give a
+    /// local TLE file path)
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto")]
+    iridium_satmap: Option<String>,
     /// JSON file mapping hex VDL2 ground-station addresses to names
     /// (shown in console output)
     #[arg(long)]
@@ -178,6 +184,12 @@ impl OutputOpts {
             let n = outputs::dbinfo::AircraftDb::load(p)?;
             tracing::info!("aircraft db: {n} entries");
         }
+        if let Some(src) = &self.iridium_satmap {
+            match satmap::init(src) {
+                Ok(n) => tracing::info!("iridium satmap: {n} satellites ({src})"),
+                Err(e) => tracing::warn!("iridium satmap disabled: {e}"),
+            }
+        }
         let ident = self.station_id.clone().unwrap_or_else(|| "XNG-DEV".to_owned());
         Ok((
             runtime::OutputConfig {
@@ -192,6 +204,7 @@ impl OutputOpts {
                 beast: self.beast.clone(),
                 nmea_tcp: self.nmea_tcp.clone(),
                 gsmtap: self.gsmtap.clone(),
+                iridium_satmap: self.iridium_satmap.clone(),
                 http: self.http.clone(),
                 mqtt: self.mqtt.clone(),
                 mqtt_topic: self.mqtt_topic.clone(),
@@ -669,6 +682,7 @@ fn main() -> anyhow::Result<()> {
                         beast: None,
                         nmea_tcp: None,
                         gsmtap: None,
+                        iridium_satmap: None,
                         http: None,
                         mqtt: None,
                         mqtt_topic: "xng".into(),
@@ -707,6 +721,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         beast: st.outputs.beast.clone(),
         nmea_tcp: st.outputs.nmea_tcp.clone(),
         gsmtap: st.outputs.gsmtap.clone(),
+        iridium_satmap: st.outputs.iridium_satmap.clone(),
         http: st.outputs.http.clone(),
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
@@ -715,6 +730,12 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
     if let Some(p) = &st.outputs.aircraft_db {
         let n = outputs::dbinfo::AircraftDb::load(p)?;
         tracing::info!("aircraft db: {n} entries");
+    }
+    if let Some(src) = &st.outputs.iridium_satmap {
+        match satmap::init(src) {
+            Ok(n) => tracing::info!("iridium satmap: {n} satellites ({src})"),
+            Err(e) => tracing::warn!("iridium satmap disabled: {e}"),
+        }
     }
     let mut sessions = Vec::new();
     for (i, sess) in st.sessions.iter().enumerate() {

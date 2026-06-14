@@ -48,6 +48,7 @@ pub struct OutputsToml {
     pub beast: Option<String>,
     pub nmea_tcp: Option<String>,
     pub gsmtap: Option<String>,
+    pub iridium_satmap: Option<String>,
     pub http: Option<String>,
     pub aircraft_db: Option<PathBuf>,
     pub mqtt: Option<String>,
