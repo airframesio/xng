@@ -100,7 +100,7 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
 const satLayer = L.layerGroup();
 const ringLayer = L.layerGroup();
 L.control.layers(null,
-  { '🛰 Iridium satellites': satLayer, '◎ Ring locations': ringLayer },
+  { '🛰 Iridium satellites': satLayer, '◎ Spot beams': ringLayer },
   { position: 'topright', collapsed: false }).addTo(map);
 if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
 if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
@@ -109,7 +109,7 @@ map.on('overlayadd overlayremove', () => {
   localStorage.setItem('xng.ringLayer', map.hasLayer(ringLayer) ? '1' : '0');
 });
 const satMarkers = new Map();  // sat id -> {marker, trail}
-const ringMarkers = new Map(); // "sat-beam" -> circleMarker
+const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
 
 // Aircraft silhouettes: PlaneWatch pw-silhouettes (CC BY-NC-SA 4.0,
 // used with permission). Resolved by ICAO type designator via the
@@ -211,6 +211,11 @@ const shipIcon = (cog, type) => {
     iconSize: [16, 16], iconAnchor: [8, 8] });
 };
 const IRIDIUM = '#73daca';
+// Spot-beam coverage cell: ~200 km radius footprint, hue per beam id
+// (1–48) so the cells under a satellite read as a coloured tiling — the
+// map equivalent of iridium-toolkit's beam-pattern plot.
+const BEAM_RADIUS_M = 200000;
+const beamColor = b => `hsl(${((b || 0) * 360 / 48) | 0},70%,55%)`;
 const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
   iconSize: [20, 20], iconAnchor: [10, 10] });
@@ -259,19 +264,24 @@ function syncIridium(s) {
   for (const r of (s.iridium_rings || [])) {
     const key = r.sat + '-' + r.beam;
     seenRing.add(key);
-    const popup = entityPopup('', escapeHtml(`ring S${r.sat}/B${r.beam}`), [
+    const col = beamColor(r.beam);
+    const popup = entityPopup('', escapeHtml(`spot beam S${r.sat}/B${r.beam}`), [
       ['sat id', r.sat],
       ['beam', r.beam],
-      ['position', `${r.lat.toFixed(2)}, ${r.lon.toFixed(2)}`],
+      ['center', `${r.lat.toFixed(2)}, ${r.lon.toFixed(2)}`],
       ['seen', `${fmtAge(s.now - r.seen)} ago`],
     ]);
     let m = ringMarkers.get(key);
     if (!m) {
-      m = L.circleMarker([r.lat, r.lon], { radius: 6, color: IRIDIUM, weight: 1, fillColor: IRIDIUM, fillOpacity: 0.15 }).addTo(ringLayer);
+      // The spot beam projected on the ground: a geographic coverage cell
+      // (scales with zoom), coloured by beam id, labelled at its center.
+      m = L.circle([r.lat, r.lon], { radius: BEAM_RADIUS_M, color: col, weight: 1, fillColor: col, fillOpacity: 0.08 }).addTo(ringLayer);
+      m.bindTooltip(`B${r.beam}`, { permanent: true, direction: 'center', className: 'lbl' });
       m.bindPopup(popup);
       ringMarkers.set(key, m);
     } else {
       m.setLatLng([r.lat, r.lon]);
+      m.setStyle({ color: col, fillColor: col });
       m.setPopupContent(popup);
     }
   }
