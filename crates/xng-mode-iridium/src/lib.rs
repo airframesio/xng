@@ -65,7 +65,7 @@ impl IridiumChannelDecoder {
         let time = self.samples_seen as f64 / CHANNEL_RATE;
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
-            handle_bits(&burst.bits, time, &mut self.sbd, &mut self.pager, &mut out);
+            handle_bits(&burst.bits, time, 0.0, &mut self.sbd, &mut self.pager, &mut out);
         }
         out
     }
@@ -159,6 +159,7 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
 fn handle_bits(
     bits: &[u8],
     time: f64,
+    freq: f64,
     sbd: &mut sbd::SbdReassembler,
     pager: &mut ms::PagerReassembler,
     out: &mut Vec<ira::IridiumFrame>,
@@ -216,7 +217,8 @@ fn handle_bits(
             acars: None,
             raw_bits: raw,
         });
-        if let Some(msg) = sbd.push(&da, time) {
+        let ul = bits.len() >= 24 && bits[..24] == frame::ACCESS_UL[..];
+        if let Some(msg) = sbd.push(&da, time, freq, ul) {
             out.push(ira::IridiumFrame {
                 kind: "sbd",
                 details: msg.details.clone(),
@@ -272,7 +274,7 @@ impl IridiumWidebandDecoder {
         let mut out = Vec::new();
         for burst in self.wb.process(input) {
             let mut frames = Vec::new();
-            handle_bits(&burst.bits, time, &mut self.sbd, &mut self.pager, &mut frames);
+            handle_bits(&burst.bits, time, burst.offset_hz, &mut self.sbd, &mut self.pager, &mut frames);
             out.extend(frames.into_iter().map(|f| (burst.offset_hz, f)));
         }
         out

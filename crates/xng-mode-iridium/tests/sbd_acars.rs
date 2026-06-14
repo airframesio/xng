@@ -77,7 +77,7 @@ fn sbd_acars_end_to_end() {
         let bits = da_burst_bits(cont, (i % 8) as u8, chunk.len() as u8, &payload);
         let (da, _) = xng_mode_iridium::decode_da_bits(&bits).expect("fragment decodes");
         assert!(da.crc_ok);
-        if let Some(msg) = reasm.push(&da, i as f64 * 0.09) {
+        if let Some(msg) = reasm.push(&da, i as f64 * 0.09, 0.0, false) {
             result = Some(msg);
         }
     }
@@ -87,6 +87,64 @@ fn sbd_acars_end_to_end() {
     assert_eq!(acars.core.tail.as_deref(), Some("N321AB"));
     assert_eq!(acars.core.label, "Q0");
     assert_eq!(acars.core.flight.as_deref(), Some("UA1234"));
+}
+
+#[test]
+fn reassembles_interleaved_channels() {
+    // Two messages whose fragments interleave in time but sit on different
+    // frequencies must each reassemble. The old single-slot, frequency-
+    // blind reassembler would clobber one with the other — this is the
+    // wideband-path bug that stopped ACARS from ever completing.
+    fn l2_for(tail: &str, flight: &str) -> Vec<u8> {
+        let block = xng_acars::block::build(
+            '2', tail, None, "Q0", '5', Some("M01A"), Some(flight), "", false,
+        );
+        let mut l2: Vec<u8> = vec![0x06, 0x00];
+        let mut prehdr = vec![0u8; 29];
+        prehdr[0] = 0x20;
+        prehdr[15] = 1;
+        l2.extend_from_slice(&prehdr);
+        l2.extend_from_slice(&block);
+        l2
+    }
+    fn da_frames(l2: &[u8]) -> Vec<frame::DaFrame> {
+        let chunks: Vec<&[u8]> = l2.chunks(20).collect();
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let mut p = [0u8; 20];
+                p[..c.len()].copy_from_slice(c);
+                let bits = da_burst_bits(i + 1 < chunks.len(), (i % 8) as u8, c.len() as u8, &p);
+                xng_mode_iridium::decode_da_bits(&bits).expect("frag decodes").0
+            })
+            .collect()
+    }
+    let a = da_frames(&l2_for("N321AB", "UA1234"));
+    let b = da_frames(&l2_for("N555CD", "DL9999"));
+    assert!(a.len() >= 2 && b.len() >= 2, "need multi-fragment messages");
+
+    let mut reasm = SbdReassembler::new();
+    let (mut got_a, mut got_b) = (None, None);
+    for i in 0..a.len().max(b.len()) {
+        let t = i as f64 * 0.1;
+        if let Some(f) = a.get(i) {
+            if let Some(m) = reasm.push(f, t, 100_000.0, false) {
+                got_a = Some(m);
+            }
+        }
+        if let Some(f) = b.get(i) {
+            if let Some(m) = reasm.push(f, t, 200_000.0, false) {
+                got_b = Some(m);
+            }
+        }
+    }
+    let ma = got_a.expect("channel A reassembled").acars.expect("A ACARS");
+    let mb = got_b.expect("channel B reassembled").acars.expect("B ACARS");
+    assert_eq!(ma.core.flight.as_deref(), Some("UA1234"));
+    assert_eq!(ma.core.tail.as_deref(), Some("N321AB"));
+    assert_eq!(mb.core.flight.as_deref(), Some("DL9999"));
+    assert_eq!(mb.core.tail.as_deref(), Some("N555CD"));
 }
 
 #[test]
