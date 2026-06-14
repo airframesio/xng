@@ -461,6 +461,33 @@ fn spawn_outputs(
     output_tasks
 }
 
+/// Resolve when the process is asked to stop — Ctrl-C (SIGINT) or SIGTERM.
+/// Handling SIGTERM matters for SDR sources: `pkill`/service stop send
+/// SIGTERM, and without this the process dies before `Drop` runs, leaving
+/// e.g. the Airspy still streaming so the next open finds a wedged device
+/// (needs an external reset). A graceful stop lets the source close cleanly.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Run a decode session until the source ends or `stop` is set.
 pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<()> {
     let sample_rate = source.sample_rate();
@@ -517,10 +544,9 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         tokio::spawn({
             let stop = stop.clone();
             async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    tracing::info!("interrupt received, stopping session");
-                    stop.store(true, Ordering::Relaxed);
-                }
+                shutdown_signal().await;
+                tracing::info!("interrupt received, stopping session");
+                stop.store(true, Ordering::Relaxed);
             }
         });
 
@@ -761,10 +787,9 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         tokio::spawn({
             let stop = stop.clone();
             async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    tracing::info!("interrupt received, stopping station");
-                    stop.store(true, Ordering::Relaxed);
-                }
+                shutdown_signal().await;
+                tracing::info!("interrupt received, stopping station");
+                stop.store(true, Ordering::Relaxed);
             }
         });
 
