@@ -99,8 +99,9 @@ pub fn parse_ra(data: &[u8], fixed: u32, raw_bits: &[u8]) -> Option<IridiumFrame
 
 /// Convert an Iridium broadcast time counter to a Unix timestamp
 /// (iridium-toolkit `fmt_iritime`: ERA2 epoch 2014-05-11, 90 ms ticks,
-/// minus the two leap seconds that have elapsed since).
-fn iri_time_unix(iritime: u32) -> f64 {
+/// minus the two leap seconds that have elapsed since). Reused by the SBD
+/// transport decoder for the registration timestamp.
+pub(crate) fn iri_time_unix(iritime: u32) -> f64 {
     let mut ux = iritime as f64 * 90.0 / 1000.0 + 1_399_818_235.0;
     if ux > 1_435_708_799.0 {
         ux -= 1.0; // 2015-06-30T23:59:60Z
