@@ -251,10 +251,21 @@ impl BeamReconstructor {
         s
     }
 
-    /// Persist the accumulated patterns (best-effort).
+    /// Persist the accumulated patterns (best-effort). Two safeguards keep a
+    /// hard-won pattern from being lost across restarts: never overwrite the
+    /// file with an empty pattern (a cold start or a failed load would
+    /// otherwise clobber good data on the next checkpoint), and write
+    /// atomically via a temp file + rename so a process killed mid-write
+    /// cannot truncate the live file.
     pub fn save(&self, path: &std::path::Path) {
+        if self.beams_known() == 0 {
+            return;
+        }
         let v = serde_json::json!({ "north": &self.north, "south": &self.south });
-        let _ = std::fs::write(path, v.to_string());
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, v.to_string()).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
     }
 
     /// Number of distinct beams reconstructed (either direction).
@@ -323,6 +334,30 @@ mod tests {
         // Re-projected under the same (still-current) satellite → original.
         assert!((c.lat - 41.5).abs() < 0.1, "lat {}", c.lat);
         assert!((c.lon - (-119.0)).abs() < 0.1, "lon {}", c.lon);
+    }
+
+    #[test]
+    fn pattern_survives_save_load_round_trip() {
+        // Accumulate a beam, persist, reload — the means must survive so a
+        // restart does not discard the hard-won pattern.
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(7, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(7, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
+        r.observe(7, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 12, t0 + 2.0);
+        r.observe(7, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 12, t0 + 3.0);
+        assert_eq!(r.beams_known(), 1);
+        let path = std::env::temp_dir().join("xng_beampattern_test.json");
+        r.save(&path);
+        let r2 = BeamReconstructor::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(r2.beams_known(), 1, "reloaded pattern lost its beam");
+        // And it projects under a fresh directional track.
+        let mut r2 = r2;
+        r2.observe(7, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 100.0);
+        r2.observe(7, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 101.0);
+        let cells = r2.project(t0 + 102.0, 60.0);
+        assert!(cells.iter().any(|c| c.beam == 12), "reloaded beam did not project");
     }
 
     #[test]
