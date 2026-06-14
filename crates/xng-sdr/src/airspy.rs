@@ -15,7 +15,9 @@ use crate::pump::{SamplePump, sample_channel};
 use crate::{IqSource, SdrError};
 use num_complex::Complex;
 use std::os::raw::{c_int, c_void};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
+use std::sync::Arc;
 
 mod ffi {
     use std::os::raw::{c_int, c_void};
@@ -110,8 +112,20 @@ pub fn linearity_index(gain_db: f64) -> u8 {
     (gain_db / 45.0 * 21.0).round().clamp(0.0, 21.0) as u8
 }
 
+#[derive(Default)]
+struct StreamStats {
+    transfers: AtomicU64,
+    /// Samples libairspy dropped at the USB/device level (its own counter).
+    usb_dropped: AtomicU64,
+    /// Transfers dropped because our consumer channel was full.
+    chan_dropped: AtomicU64,
+    /// Transfers that arrived essentially all-zero (a device stall).
+    near_zero: AtomicU64,
+}
+
 struct StreamCtx {
     tx: SyncSender<Vec<Complex<f32>>>,
+    stats: Arc<StreamStats>,
 }
 
 unsafe extern "C" fn rx_callback(transfer: *mut ffi::Transfer) -> c_int {
@@ -120,9 +134,19 @@ unsafe extern "C" fn rx_callback(transfer: *mut ffi::Transfer) -> c_int {
         let n = t.sample_count as usize;
         let samples = std::slice::from_raw_parts(t.samples as *const Complex<f32>, n);
         let ctx = &*(t.ctx as *const StreamCtx);
+        ctx.stats.transfers.fetch_add(1, Ordering::Relaxed);
+        if t.dropped_samples > 0 {
+            ctx.stats.usb_dropped.fetch_add(t.dropped_samples, Ordering::Relaxed);
+        }
+        let head_pwr: f32 = samples.iter().take(64).map(|s| s.norm_sqr()).sum();
+        if head_pwr < 1e-9 {
+            ctx.stats.near_zero.fetch_add(1, Ordering::Relaxed);
+        }
         // Drop the transfer if the consumer is behind; stalling the USB
         // thread only moves the overflow into the device.
-        let _ = ctx.tx.try_send(samples.to_vec());
+        if ctx.tx.try_send(samples.to_vec()).is_err() {
+            ctx.stats.chan_dropped.fetch_add(1, Ordering::Relaxed);
+        }
     }
     0
 }
@@ -135,6 +159,8 @@ pub struct AirspyIqSource {
     pump: SamplePump,
     sample_rate: f64,
     center_freq_hz: u64,
+    stats: Arc<StreamStats>,
+    reads: u64,
 }
 
 // The device handle is only touched from Drop; samples arrive via the channel.
@@ -206,13 +232,14 @@ impl AirspyIqSource {
         check("set_freq", unsafe { ffi::airspy_set_freq(dev, center_freq_hz as u32) })?;
 
         let (tx, pump) = sample_channel();
-        let ctx = Box::new(StreamCtx { tx });
+        let stats = Arc::new(StreamStats::default());
+        let ctx = Box::new(StreamCtx { tx, stats: stats.clone() });
         check("start_rx", unsafe {
             ffi::airspy_start_rx(dev, rx_callback, &*ctx as *const StreamCtx as *mut c_void)
         })?;
 
         std::mem::forget(guard);
-        Ok(Self { dev, _ctx: ctx, pump, sample_rate, center_freq_hz })
+        Ok(Self { dev, _ctx: ctx, pump, sample_rate, center_freq_hz, stats, reads: 0 })
     }
 }
 
@@ -258,6 +285,22 @@ impl IqSource for AirspyIqSource {
     }
 
     fn read(&mut self, buf: &mut [Complex<f32>]) -> Result<usize, SdrError> {
+        self.reads += 1;
+        // Stream-health watchdog: warn (periodically) only if the device or
+        // pipeline is actually losing samples — silent when healthy.
+        if self.reads % 500 == 0 {
+            let s = &self.stats;
+            let usb = s.usb_dropped.load(Ordering::Relaxed);
+            let chan = s.chan_dropped.load(Ordering::Relaxed);
+            let nz = s.near_zero.load(Ordering::Relaxed);
+            if usb > 0 || chan > 0 || nz > 0 {
+                eprintln!(
+                    "airspy stream WARNING: usb_dropped={usb}, chan_dropped={chan}, near_zero={nz} \
+                     over {} transfers",
+                    s.transfers.load(Ordering::Relaxed)
+                );
+            }
+        }
         self.pump.read(buf)
     }
 }
