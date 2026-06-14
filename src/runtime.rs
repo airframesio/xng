@@ -43,6 +43,8 @@ pub struct OutputConfig {
     pub nmea_tcp: Option<String>,
     /// GSMTAP/UDP target for Iridium GSM frames (Wireshark).
     pub gsmtap: Option<String>,
+    /// Iridium satellite-name matching TLE source ("auto" or a path).
+    pub iridium_satmap: Option<String>,
     /// Web dashboard listen address (live map + message stream).
     pub http: Option<String>,
     /// MQTT broker URL (mqtt://[user:pass@]host[:port]).
@@ -700,6 +702,9 @@ pub(crate) fn decode_loop(
                 if let Some((r, files)) = reasm.as_deref_mut() {
                     apply_reassembly(&mut msg, r, files);
                 }
+                // Label Iridium ring alerts with the broadcasting satellite
+                // (no-op unless a TLE satellite map was loaded at startup).
+                crate::satmap::enrich(&mut msg);
                 if !label_filter.allows(&msg) {
                     continue;
                 }
