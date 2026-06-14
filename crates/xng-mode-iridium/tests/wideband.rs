@@ -179,8 +179,10 @@ fn decodes_gr_iridium_capture_via_wideband() {
         })
         .unwrap();
     assert!((b.offset_hz - off).abs() < 40_000.0, "offset {}", b.offset_hz);
-    assert_eq!(&b.bits[..24], &frame::ACCESS_DL[..]);
-    let payload = &b.bits[24..];
+    // Demod output is canonical; PRBS15 holds on gr-iridium RAW order.
+    let raw = frame::symbol_reverse(&b.bits);
+    assert_eq!(&raw[..24], &frame::ACCESS_DL[..]);
+    let payload = &raw[24..];
     let violations = (15..payload.len())
         .filter(|&i| payload[i] != (payload[i - 15] ^ payload[i - 14]))
         .count();
@@ -237,8 +239,10 @@ fn decodes_real_burst_at_station_rates() {
             .iter()
             .min_by(|a, b| (a.offset_hz - off).abs().partial_cmp(&(b.offset_hz - off).abs()).unwrap())
             .unwrap();
-        assert_eq!(&b.bits[..24], &frame::ACCESS_DL[..], "fs={fs} off={off}: preamble");
-        let payload = &b.bits[24..];
+        // Demod output is canonical; PRBS15 holds on gr-iridium RAW order.
+        let raw = frame::symbol_reverse(&b.bits);
+        assert_eq!(&raw[..24], &frame::ACCESS_DL[..], "fs={fs} off={off}: preamble");
+        let payload = &raw[24..];
         let violations = (15..payload.len())
             .filter(|&i| payload[i] != (payload[i - 15] ^ payload[i - 14]))
             .count();

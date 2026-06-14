@@ -174,7 +174,6 @@ fn handle_bits(
     if ones * 10 < payload.len() {
         return;
     }
-    let n0 = out.len();
     if let Some(f) = decode_bits(bits) {
         // Multi-part pages: emit the assembled text when complete.
         if f.kind == "msg" {
@@ -226,16 +225,6 @@ fn handle_bits(
                 raw_bits: Vec::new(),
             });
         }
-    }
-    // Diagnose access-matched bursts that produced nothing (XNG_IRIDIUM_DEBUG).
-    if out.len() == n0 && std::env::var("XNG_IRIDIUM_DEBUG").is_ok() {
-        let data = if bits.len() > 24 { &bits[24..] } else { bits };
-        let head: String = data.iter().take(48).map(|&b| if b == 1 { '1' } else { '0' }).collect();
-        eprintln!(
-            "  DROP {} bits, classify={:?}, data[0..48]={head}",
-            bits.len(),
-            frame::classify(data)
-        );
     }
 }
 

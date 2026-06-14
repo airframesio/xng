@@ -106,7 +106,10 @@ pub fn decode_itl(payload: &[u8]) -> Option<ItlFrame> {
     let mut qch = [0u8; 384];
     let mut acc = 0u8;
     for k in 0..384 {
-        let m = (p[2 * k] << 1) | p[2 * k + 1];
+        // The demod emits each symbol's bits in `symbol_reverse`d order
+        // (toolkit convention); undo that here to recover the mapped
+        // symbol `m = DQPSK_MAP[d]` before inverting the differential.
+        let m = (p[2 * k + 1] << 1) | p[2 * k];
         acc = (acc + INV_DQPSK[m as usize]) % 4;
         // split_qpsk gray map: 0→(0,0) 1→(1,0) 2→(1,1) 3→(0,1)
         let (i, q) = match acc {
