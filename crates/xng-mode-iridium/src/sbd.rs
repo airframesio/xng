@@ -40,6 +40,8 @@ pub struct SbdReassembler {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SbdMessage {
+    /// Frame kind for the emitted message: "sbd", "gsm", or "mt-position".
+    pub kind: &'static str,
     pub details: serde_json::Value,
     pub acars: Option<xng_acars::block::AcarsBlock>,
 }
@@ -75,13 +77,13 @@ impl SbdReassembler {
                 return None;
             }
             let p = self.buf.remove(i);
-            return Self::parse_l2(&p.data);
+            return Self::parse_l2(&p.data, p.ul);
         }
 
         // No continuation: a fresh single packet, a new long packet, or an
         // orphan continuation (dropped).
         match (f.ctr, f.continuation) {
-            (0, false) => Self::parse_l2(bytes),
+            (0, false) => Self::parse_l2(bytes, ul),
             (0, true) => {
                 self.buf.push(Pending {
                     freq,
@@ -96,10 +98,20 @@ impl SbdReassembler {
         }
     }
 
-    /// Parse an assembled L2 stream: SBD transport framing, then ACARS.
-    fn parse_l2(data: &[u8]) -> Option<SbdMessage> {
+    /// Parse an assembled L2 stream. Three parallel decoders run on the
+    /// reassembled IDA packet: a mobile-terminal position (paging frames),
+    /// GSM CC/MM/SMS signalling, and the SBD transport → ACARS path.
+    fn parse_l2(data: &[u8], ul: bool) -> Option<SbdMessage> {
         if data.len() < 5 {
             return None;
+        }
+        // Mobile-terminal position embedded in paging/uplink frames.
+        if let Some(pos) = crate::mtpos::extract(data, ul) {
+            return Some(SbdMessage { kind: "mt-position", details: pos, acars: None });
+        }
+        // GSM call-control / mobility / SMS signalling.
+        if let Some(g) = crate::gsm::decode(data) {
+            return Some(SbdMessage { kind: "gsm", details: g, acars: None });
         }
         // SBD packet types (toolkit ReassembleIDASBD).
         let (typ, mut rest): (u16, &[u8]) = match (data[0], data[1]) {
@@ -151,6 +163,7 @@ impl SbdReassembler {
     fn parse_acars(typ: u16, payload: &[u8]) -> Option<SbdMessage> {
         if payload.first() != Some(&0x01) || payload.len() < 16 {
             return Some(SbdMessage {
+                kind: "sbd",
                 details: json!({
                     "type": format!("{typ:04x}"),
                     "payload_hex": payload.iter().map(|b| format!("{b:02x}")).collect::<String>(),
@@ -168,6 +181,7 @@ impl SbdReassembler {
         };
         let acars = xng_acars::block::parse(&body);
         Some(SbdMessage {
+            kind: "sbd",
             details: json!({
                 "type": format!("{typ:04x}"),
                 "acars_ok": acars.as_ref().map(|a| a.crc_ok),
