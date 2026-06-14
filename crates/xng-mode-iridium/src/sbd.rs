@@ -6,13 +6,36 @@
 use crate::frame::DaFrame;
 use serde_json::json;
 
-/// Reassembles DA fragments (matched by counter continuity and burst
-/// time proximity; single-channel, so no frequency matching) into L2
-/// byte streams, then parses the SBD transport and extracts ACARS.
+/// Frequency match window for grouping a channel's fragments (Hz). The
+/// duplex channels are ~41.7 kHz apart, so this is comfortably narrow
+/// enough not to confuse neighbours while tolerating per-burst CFO drift.
+/// (iridium-toolkit uses ±260 Hz on gr-iridium's finer estimates.)
+const FREQ_TOL_HZ: f64 = 2000.0;
+/// Max gap between consecutive fragments of one message (toolkit 280 ms).
+const FRAG_GAP_S: f64 = 0.28;
+/// In-flight buffer lifetime before it is abandoned (toolkit 1000 ms).
+const EXPIRE_S: f64 = 1.0;
+
+/// One in-flight multi-fragment message.
+struct Pending {
+    freq: f64,
+    ul: bool,
+    /// Counter the next fragment must carry ((last + 1) mod 8).
+    next_ctr: u8,
+    data: Vec<u8>,
+    last_time: f64,
+}
+
+/// Reassembles DA fragments into L2 byte streams, then parses the SBD
+/// transport and extracts ACARS. Fragments are grouped exactly as
+/// iridium-toolkit's `ReassembleIDA` does — by frequency (same duplex
+/// channel), direction, sequential 3-bit counter, and time proximity —
+/// keeping a list of concurrent in-flight messages, which is essential in
+/// the wideband path where many channels are active at once (the old
+/// single-slot, frequency-blind reassembler interleaved fragments from
+/// different channels and almost never completed).
 pub struct SbdReassembler {
-    /// In-flight multi-fragment message: (next expected ctr, data,
-    /// last fragment time in seconds).
-    pending: Option<(u8, Vec<u8>, f64)>,
+    buf: Vec<Pending>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,43 +46,53 @@ pub struct SbdMessage {
 
 impl SbdReassembler {
     pub fn new() -> Self {
-        Self { pending: None }
+        Self { buf: Vec::new() }
     }
 
-    /// Feed one CRC-valid DA frame observed at `time` seconds.
-    pub fn push(&mut self, f: &DaFrame, time: f64) -> Option<SbdMessage> {
+    /// Feed one CRC-valid DA frame observed at `time` seconds on the burst
+    /// `freq` (Hz, any consistent reference) and direction (`ul`).
+    pub fn push(&mut self, f: &DaFrame, time: f64, freq: f64, ul: bool) -> Option<SbdMessage> {
         if !f.crc_ok {
             return None;
         }
-        // Expire stale assembly (toolkit: 280 ms between fragments).
-        if let Some((_, _, t)) = &self.pending {
-            if time - t > 0.3 {
-                self.pending = None;
-            }
-        }
+        self.buf.retain(|p| time - p.last_time < EXPIRE_S);
         let bytes = &f.data[..(f.len as usize).min(20)];
-        match (&mut self.pending, f.ctr, f.continuation) {
-            (None, 0, false) => Self::parse_l2(bytes),
-            (None, 0, true) => {
-                self.pending = Some((1, bytes.to_vec(), time));
+
+        // Continue an in-flight message: same channel + direction, the
+        // expected next counter, and within the inter-fragment window.
+        let m = self.buf.iter().position(|p| {
+            (p.freq - freq).abs() < FREQ_TOL_HZ
+                && p.ul == ul
+                && p.next_ctr == f.ctr
+                && time >= p.last_time
+                && time <= p.last_time + FRAG_GAP_S
+        });
+        if let Some(i) = m {
+            self.buf[i].data.extend_from_slice(bytes);
+            self.buf[i].last_time = time;
+            if f.continuation {
+                self.buf[i].next_ctr = (f.ctr + 1) % 8;
+                return None;
+            }
+            let p = self.buf.remove(i);
+            return Self::parse_l2(&p.data);
+        }
+
+        // No continuation: a fresh single packet, a new long packet, or an
+        // orphan continuation (dropped).
+        match (f.ctr, f.continuation) {
+            (0, false) => Self::parse_l2(bytes),
+            (0, true) => {
+                self.buf.push(Pending {
+                    freq,
+                    ul,
+                    next_ctr: 1,
+                    data: bytes.to_vec(),
+                    last_time: time,
+                });
                 None
             }
-            (Some((next, data, _)), ctr, cont) if ctr == *next => {
-                data.extend_from_slice(bytes);
-                if cont {
-                    let d = data.clone();
-                    self.pending = Some(((ctr + 1) % 8, d, time));
-                    None
-                } else {
-                    let d = data.clone();
-                    self.pending = None;
-                    Self::parse_l2(&d)
-                }
-            }
-            _ => {
-                self.pending = None;
-                None
-            }
+            _ => None,
         }
     }
 
@@ -75,13 +108,17 @@ impl SbdReassembler {
             _ => return None,
         };
         match typ {
+            // HELLO / registration: a 29-byte pre-header (any sub-type —
+            // toolkit accepts sub-types 0x10/0x20/0x40/0x50/0x70).
             0x0600 => {
-                if rest.first() != Some(&0x20) || rest.len() < 29 {
+                if rest.len() < 29 {
                     return None;
                 }
                 rest = &rest[29..];
             }
-            0x7608 => {
+            // All 76xx SBD subtypes (7608/7609/760a/760c/d/e) carry a
+            // 0x26 (7-byte) or 0x20 (5-byte) pre-header.
+            t if t >> 8 == 0x76 => {
                 let skip = match rest.first() {
                     Some(0x26) => 7,
                     Some(0x20) => 5,
