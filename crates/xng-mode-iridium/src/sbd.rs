@@ -126,19 +126,22 @@ impl SbdReassembler {
         // stripping it (toolkit ReassembleIDASBD / ReassembleIDAPP).
         let mut hdr = serde_json::Map::new();
         match typ {
-            // Mobile-originated registration ("HELLO"): a 29-byte pre-header
-            // carrying the terminal IMEI, MO sequence number, message count
-            // and the registration time. (Toolkit accepts sub-types
-            // 0x10/0x20/0x40/0x50/0x70; the layout below holds across them.)
+            // Mobile-originated registration ("HELLO"): a 29-byte pre-header.
+            // Only the 0x20 sub-type lays out an IMEI + MO sequence number
+            // there; 0x10/0x40/0x50/0x70 reuse those bytes for other fields
+            // (toolkit reassembler.py). The message count (byte 15) and the
+            // registration timestamp (bytes 25..29) are common to all.
             0x0600 => {
                 if rest.len() < 29 {
                     return None;
                 }
                 let h = &rest[..29];
-                if let Some(imei) = imei_bcd(&h[5..13]) {
-                    hdr.insert("imei".into(), json!(imei));
+                if h[0] == 0x20 {
+                    if let Some(imei) = imei_bcd(&h[5..13]) {
+                        hdr.insert("imei".into(), json!(imei));
+                    }
+                    hdr.insert("momsn".into(), json!(u16::from_be_bytes([h[13], h[14]])));
                 }
-                hdr.insert("momsn".into(), json!(u16::from_be_bytes([h[13], h[14]])));
                 hdr.insert("msg_count".into(), json!(h[15]));
                 let it = u32::from_be_bytes([h[25], h[26], h[27], h[28]]);
                 if it != 0 {
@@ -146,27 +149,25 @@ impl SbdReassembler {
                 }
                 rest = &rest[29..];
             }
-            // SBD transfer (7608/7609/760a/760c/d/e): a 0x26 (7-byte) or 0x20
-            // (5-byte) pre-header. The 0x26 form carries the mobile-terminated
-            // sequence number, this transfer's packet count and the queued
-            // backlog still waiting at the gateway.
-            t if t >> 8 == 0x76 => {
-                let skip = match rest.first() {
-                    Some(0x26) if rest.len() >= 5 => {
-                        hdr.insert("mtmsn".into(), json!(u16::from_be_bytes([rest[1], rest[2]])));
-                        hdr.insert("packets".into(), json!(rest[3]));
-                        hdr.insert("backlog".into(), json!(rest[4]));
-                        7
-                    }
-                    Some(0x26) => 7,
-                    Some(0x20) => 5,
-                    _ => 7,
-                };
-                if rest.len() < skip {
-                    return None;
+            // SBD transfer: a recognised 0x26 (7-byte) or 0x20 (5-byte)
+            // pre-header (toolkit DL 7608/7609/760a). The 0x26 form carries
+            // the mobile-terminated sequence number, this transfer's packet
+            // count and the queued backlog. An unrecognised first byte (e.g.
+            // a UL 760c/d/e 0x50 echo-back) is left for the generic strips
+            // below — never blindly skip a fixed count, which would corrupt a
+            // header-less body.
+            t if t >> 8 == 0x76 => match rest.first() {
+                Some(0x26) if rest.len() >= 7 => {
+                    hdr.insert("mtmsn".into(), json!(u16::from_be_bytes([rest[1], rest[2]])));
+                    hdr.insert("packets".into(), json!(rest[3]));
+                    hdr.insert("backlog".into(), json!(rest[4]));
+                    rest = &rest[7..];
                 }
-                rest = &rest[skip..];
-            }
+                Some(0x20) if rest.len() >= 5 => {
+                    rest = &rest[5..];
+                }
+                _ => {}
+            },
             _ => {}
         }
         // Optional ack/nack prefix on uplinks and the 0x10 len/cnt header.
@@ -274,6 +275,27 @@ mod tests {
         assert_eq!(m.details["payload_hex"], json!("deadbeef"));
         // Time field absent when the timestamp is zero.
         assert!(m.details.get("time_unix").is_none());
+    }
+
+    #[test]
+    fn sbd_0600_non_0x20_subtype_omits_imei() {
+        // A non-0x20 sub-type (here 0x10) does not lay out IMEI/MOMSN at
+        // those offsets, even though the bytes happen to be valid BCD; only
+        // the common message count must surface.
+        let mut data = vec![0x06, 0x00];
+        let mut h = vec![0u8; 29];
+        h[0] = 0x10; // not the 0x20 IMEI-bearing sub-type
+        h[5..13].copy_from_slice(&[0x33, 0x00, 0x32, 0x04, 0x23, 0x91, 0x27, 0x01]);
+        h[13] = 0x01;
+        h[14] = 0x2c;
+        h[15] = 9;
+        data.extend_from_slice(&h);
+        data.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        let m = SbdReassembler::parse_l2(&data, false).expect("sbd message");
+        assert_eq!(m.details["type"], json!("0600"));
+        assert!(m.details.get("imei").is_none(), "imei must be 0x20-only");
+        assert!(m.details.get("momsn").is_none(), "momsn must be 0x20-only");
+        assert_eq!(m.details["msg_count"], json!(9));
     }
 
     #[test]
