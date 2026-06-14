@@ -20,11 +20,10 @@ const RECENT_CAP: usize = 200;
 /// Drop map entities not heard from in this many seconds.
 const EXPIRE_S: u64 = 300;
 
-/// Iridium ring-alert positions split by altitude (cf. iridium-toolkit
-/// live-map): a frame's geocentric position is either the broadcasting
-/// satellite (~800 km) or a ground beam footprint (~0 km).
-const SAT_ALT_MIN_KM: f64 = 500.0;
-const RING_ALT_MAX_KM: f64 = 100.0;
+/// Iridium ring-alert positions are split by altitude (cf. iridium-toolkit
+/// live-map) via `crate::beam::classify_altitude`: a frame's geocentric
+/// position is either the broadcasting satellite (~780 km) or a ground beam
+/// footprint (~0 km).
 /// Satellites move continuously (keep longer); ground footprints are
 /// transient.
 const SAT_EXPIRE_S: u64 = 600;
@@ -189,27 +188,35 @@ fn update(d: &mut Dash, m: &Message) {
                     let ecef = [x as f64 * 4.0, y as f64 * 4.0, z as f64 * 4.0];
                     d.beams.observe(sat, alt, ecef, beam as u8, m.timestamp.timestamp() as f64);
                 }
-                if alt > SAT_ALT_MIN_KM {
-                    let e = d.iridium_sats.entry(sat).or_insert_with(|| json!({}));
-                    let o = e.as_object_mut().unwrap();
-                    o.insert("sat".into(), json!(sat));
-                    o.insert("beam".into(), json!(beam));
-                    o.insert("lat".into(), json!(lat));
-                    o.insert("lon".into(), json!(lon));
-                    o.insert("alt".into(), json!(alt.round()));
-                    o.insert("seen".into(), json!(now_s()));
-                    if let Some(name) = details.get("satellite") {
-                        o.insert("name".into(), name.clone());
+                // Same altitude classifier the reconstructor uses, so a
+                // garbage decode (implausible altitude) never plants a
+                // phantom satellite marker or ground footprint.
+                match crate::beam::classify_altitude(alt) {
+                    crate::beam::AltClass::Satellite => {
+                        let e = d.iridium_sats.entry(sat).or_insert_with(|| json!({}));
+                        let o = e.as_object_mut().unwrap();
+                        o.insert("sat".into(), json!(sat));
+                        o.insert("beam".into(), json!(beam));
+                        o.insert("lat".into(), json!(lat));
+                        o.insert("lon".into(), json!(lon));
+                        o.insert("alt".into(), json!(alt.round()));
+                        o.insert("seen".into(), json!(now_s()));
+                        if let Some(name) = details.get("satellite") {
+                            o.insert("name".into(), name.clone());
+                        }
+                        push_trail(o, lat, lon); // satellite ground track
                     }
-                    push_trail(o, lat, lon); // satellite ground track
-                } else if alt < RING_ALT_MAX_KM {
-                    let e = d.iridium_rings.entry(format!("{sat}-{beam}")).or_insert_with(|| json!({}));
-                    let o = e.as_object_mut().unwrap();
-                    o.insert("sat".into(), json!(sat));
-                    o.insert("beam".into(), json!(beam));
-                    o.insert("lat".into(), json!(lat));
-                    o.insert("lon".into(), json!(lon));
-                    o.insert("seen".into(), json!(now_s()));
+                    crate::beam::AltClass::Footprint => {
+                        let e =
+                            d.iridium_rings.entry(format!("{sat}-{beam}")).or_insert_with(|| json!({}));
+                        let o = e.as_object_mut().unwrap();
+                        o.insert("sat".into(), json!(sat));
+                        o.insert("beam".into(), json!(beam));
+                        o.insert("lat".into(), json!(lat));
+                        o.insert("lon".into(), json!(lon));
+                        o.insert("seen".into(), json!(now_s()));
+                    }
+                    crate::beam::AltClass::Implausible => {}
                 }
             }
         }
