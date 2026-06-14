@@ -25,6 +25,13 @@ const INC0_DEG: f64 = 84.0;
 /// A satellite's high-altitude fix is "current" for a footprint within
 /// this many seconds (matches beam-plotter's staleness gate).
 const FRESH_S: f64 = 10.0;
+/// A satellite's travel direction is stable across a whole pass, so once
+/// established it is kept (sticky) across high-fix gaps up to this long
+/// rather than reset to unknown on every gap — which otherwise leaves most
+/// sparsely-seen satellites at direction 0, recording no footprints and
+/// projecting nothing. Reset after this (a later sighting is a new pass,
+/// possibly the opposite direction).
+const DIR_STICKY_S: f64 = 600.0;
 /// Altitude bands (km above the surface) that tell a satellite's own
 /// position report from a ground beam footprint, and reject decodes whose
 /// altitude is physically impossible. A BCH false-pass can yield a garbage
@@ -176,6 +183,8 @@ impl BeamReconstructor {
         match classify_altitude(alt_km) {
             AltClass::Satellite => {
                 let north = match self.tracks.get(&sat) {
+                    // Two fixes close together: recompute direction from the
+                    // climb/descent of the geocentric z component.
                     Some(t) if time - t.time < FRESH_S => {
                         let dz = ecef[2] - t.z_prev;
                         if dz > 0.0 {
@@ -186,6 +195,9 @@ impl BeamReconstructor {
                             t.north
                         }
                     }
+                    // Short gap: keep the last known direction (sticky).
+                    Some(t) if time - t.time < DIR_STICKY_S => t.north,
+                    // First fix or a long gap (likely a new pass): unknown.
                     _ => 0,
                 };
                 self.tracks.insert(sat, SatTrack { pos: ecef, z_prev: ecef[2], north, time });
@@ -358,6 +370,29 @@ mod tests {
         r2.observe(7, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 101.0);
         let cells = r2.project(t0 + 102.0, 60.0);
         assert!(cells.iter().any(|c| c.beam == 12), "reloaded beam did not project");
+    }
+
+    #[test]
+    fn direction_is_sticky_across_short_gaps() {
+        // Establish northbound direction, then a high fix after a gap longer
+        // than FRESH_S but shorter than DIR_STICKY_S: the direction must
+        // persist (not reset to 0), so a following footprint still records.
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(3, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(3, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
+        // Gap of 60 s (> FRESH_S 10, < DIR_STICKY_S 600): direction sticky.
+        let t1 = t0 + 61.0;
+        r.observe(3, 780.0, ecef(50.0, -120.0, R_EARTH_KM + 780.0), 0, t1);
+        r.observe(3, 16.0, ecef(50.5, -119.0, R_EARTH_KM), 9, t1 + 1.0);
+        r.observe(3, 16.0, ecef(50.5, -119.0, R_EARTH_KM), 9, t1 + 2.0);
+        assert_eq!(r.beams_known(), 1, "footprint recorded via sticky direction");
+        // A long gap (> DIR_STICKY_S) resets direction to unknown: a lone
+        // high fix after it cannot record a footprint.
+        let t2 = t1 + 700.0;
+        r.observe(3, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t2);
+        r.observe(3, 16.0, ecef(40.5, -119.0, R_EARTH_KM), 14, t2 + 1.0);
+        assert_eq!(r.beams_known(), 1, "no new beam after a direction reset");
     }
 
     #[test]
