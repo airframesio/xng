@@ -313,8 +313,17 @@ impl IridiumDemod {
                 let d = (s + 4 - old) % 4;
                 old = s;
                 let m = DQPSK_MAP[d as usize];
-                bits.push(m >> 1);
+                // Emit each symbol's two bits in iridium-toolkit
+                // (`symbol_reverse`d) order so the downstream BCH
+                // de-interleavers see the canonical stream. gr-iridium's
+                // native "RAW" order is the un-reversed `m>>1, m&1`; only
+                // the all-00/11 access code and ITL/IMS headers are
+                // invariant under the swap, which is why those decode
+                // either way and the BCH frames (RA/IBC/LCW/IDA) do not.
+                // ITL recovers absolute symbols by inverting this in its
+                // own pair read.
                 bits.push(m & 1);
+                bits.push(m >> 1);
             }
             // Sanity: access code must match what the UW fit promised.
             if bits.len() >= 24 && bits[..24] == access[..] {

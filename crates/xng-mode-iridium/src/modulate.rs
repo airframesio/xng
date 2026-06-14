@@ -54,7 +54,9 @@ pub fn modulate(
     amplitude: f32,
 ) -> Vec<Complex<f32>> {
     let sps = sample_rate / super::demod::SYMBOL_RATE;
-    let symbols = bits_to_symbols(bits);
+    // The demod emits canonical (`symbol_reverse`d) bits; undo that here so
+    // a canonical bit stream round-trips through modulate→demod unchanged.
+    let symbols = bits_to_symbols(&super::frame::symbol_reverse(bits));
     let total_syms = pre_syms + symbols.len() + 4;
     let total = (total_syms as f64 * sps) as usize;
     let mut i_imp = vec![Complex::new(0.0f32, 0.0); total];

@@ -73,6 +73,23 @@ pub fn bch_repair(poly: u32, block: &mut [u8]) -> Option<u32> {
     None
 }
 
+/// Swap the two bits of every QPSK symbol pair (toolkit `symbol_reverse`).
+///
+/// Our demod emits bits in gr-iridium "RAW" order — each symbol's two
+/// bits in the order they were received. iridium-toolkit's BCH
+/// de-interleavers operate on the symbol-reversed stream, so this must be
+/// applied once before parsing. The access code and the ITL/IMS headers
+/// are made entirely of `00`/`11` pairs and so are invariant under this
+/// swap (which is why they decode without it); the BCH-coded RA / IBC /
+/// LCW / IDA frames are not, and only decode after it.
+pub fn symbol_reverse(bits: &[u8]) -> Vec<u8> {
+    let mut out = bits.to_vec();
+    for pair in out.chunks_exact_mut(2) {
+        pair.swap(0, 1);
+    }
+    out
+}
+
 /// 2-way symbol-pair deinterleave: 64 bits → two 32-bit blocks.
 /// Operates on QPSK symbol pairs with the two bits of each pair swapped,
 /// reading symbols from the end backwards (toolkit `de_interleave`).
