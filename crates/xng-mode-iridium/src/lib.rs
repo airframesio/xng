@@ -8,7 +8,9 @@ pub mod iip;
 pub mod ira;
 pub mod itl;
 mod itl_tables;
+pub mod gsm;
 pub mod ms;
+pub mod mtpos;
 pub mod sbd;
 pub mod u3;
 pub mod voice;
@@ -225,7 +227,7 @@ fn handle_bits(
         let ul = bits.len() >= 24 && bits[..24] == frame::ACCESS_UL[..];
         if let Some(msg) = sbd.push(&da, time, freq, ul) {
             out.push(ira::IridiumFrame {
-                kind: "sbd",
+                kind: msg.kind,
                 details: msg.details.clone(),
                 acars: msg.acars,
                 raw_bits: Vec::new(),
