@@ -20,10 +20,24 @@ const RECENT_CAP: usize = 200;
 /// Drop map entities not heard from in this many seconds.
 const EXPIRE_S: u64 = 300;
 
+/// Iridium ring-alert positions split by altitude (cf. iridium-toolkit
+/// live-map): a frame's geocentric position is either the broadcasting
+/// satellite (~800 km) or a ground beam footprint (~0 km).
+const SAT_ALT_MIN_KM: f64 = 500.0;
+const RING_ALT_MAX_KM: f64 = 100.0;
+/// Satellites move continuously (keep longer); ground footprints are
+/// transient.
+const SAT_EXPIRE_S: u64 = 600;
+const RING_EXPIRE_S: u64 = 300;
+
 #[derive(Default)]
 struct Dash {
     aircraft: HashMap<String, Value>,
     vessels: HashMap<u32, Value>,
+    /// Iridium satellite positions, keyed by satellite id.
+    iridium_sats: HashMap<u64, Value>,
+    /// Iridium ring/beam ground footprints, keyed by "sat-beam".
+    iridium_rings: HashMap<String, Value>,
     recent: VecDeque<Value>,
     totals: HashMap<String, u64>,
     /// Last time (unix secs) a message of each mode was seen — drives
@@ -149,6 +163,42 @@ fn update(d: &mut Dash, m: &Message) {
                 }
             }
         }
+        // Iridium ring alerts carry the broadcasting satellite's geocentric
+        // position; split into satellite positions (high altitude) and
+        // targeted ground beam footprints (low altitude) for the map.
+        MessageBody::Iridium { kind, details } if kind == "ring-alert" => {
+            let (lat, lon, alt) = (
+                details.get("lat").and_then(Value::as_f64),
+                details.get("lon").and_then(Value::as_f64),
+                details.get("alt_km").and_then(Value::as_f64),
+            );
+            let sat = details.get("sat").and_then(Value::as_u64);
+            if let (Some(lat), Some(lon), Some(alt), Some(sat)) = (lat, lon, alt, sat) {
+                let beam = details.get("beam").and_then(Value::as_u64).unwrap_or(0);
+                if alt > SAT_ALT_MIN_KM {
+                    let e = d.iridium_sats.entry(sat).or_insert_with(|| json!({}));
+                    let o = e.as_object_mut().unwrap();
+                    o.insert("sat".into(), json!(sat));
+                    o.insert("beam".into(), json!(beam));
+                    o.insert("lat".into(), json!(lat));
+                    o.insert("lon".into(), json!(lon));
+                    o.insert("alt".into(), json!(alt.round()));
+                    o.insert("seen".into(), json!(now_s()));
+                    if let Some(name) = details.get("satellite") {
+                        o.insert("name".into(), name.clone());
+                    }
+                    push_trail(o, lat, lon); // satellite ground track
+                } else if alt < RING_ALT_MAX_KM {
+                    let e = d.iridium_rings.entry(format!("{sat}-{beam}")).or_insert_with(|| json!({}));
+                    let o = e.as_object_mut().unwrap();
+                    o.insert("sat".into(), json!(sat));
+                    o.insert("beam".into(), json!(beam));
+                    o.insert("lat".into(), json!(lat));
+                    o.insert("lon".into(), json!(lon));
+                    o.insert("seen".into(), json!(now_s()));
+                }
+            }
+        }
         _ => {}
     }
 
@@ -173,12 +223,18 @@ fn snapshot(d: &mut Dash) -> String {
     let cutoff = now_s().saturating_sub(EXPIRE_S);
     d.aircraft.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.vessels.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    let sat_cut = now_s().saturating_sub(SAT_EXPIRE_S);
+    let ring_cut = now_s().saturating_sub(RING_EXPIRE_S);
+    d.iridium_sats.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= sat_cut);
+    d.iridium_rings.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
     json!({
         "station": d.station,
         "started": d.started,
         "sessions": d.sessions,
         "aircraft": d.aircraft.values().collect::<Vec<_>>(),
         "vessels": d.vessels.values().collect::<Vec<_>>(),
+        "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
+        "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
         "messages": d.recent.iter().rev().take(100).collect::<Vec<_>>(),
         "totals": d.totals,
         "last_seen": d.last_seen,
@@ -239,4 +295,48 @@ pub async fn run(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xng_types::{AppInfo, Mode, Provenance, StationIdentity};
+
+    fn ring_alert(sat: u64, alt_km: f64) -> Message {
+        Message {
+            mode: Mode::Iridium,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 1_626_270_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: MessageBody::Iridium {
+                kind: "ring-alert".into(),
+                details: json!({
+                    "sat": sat, "beam": 5, "lat": 40.0, "lon": -120.0,
+                    "alt_km": alt_km, "satellite": "IRIDIUM 106"
+                }),
+            },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn buckets_iridium_satellites_and_rings_by_altitude() {
+        let mut d = Dash::default();
+        update(&mut d, &ring_alert(44, 797.0)); // satellite altitude → sat
+        update(&mut d, &ring_alert(77, 16.0)); // ground footprint → ring
+        assert_eq!(d.iridium_sats.len(), 1);
+        assert_eq!(d.iridium_rings.len(), 1);
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        assert_eq!(snap["iridium_sats"][0]["sat"], 44);
+        assert_eq!(snap["iridium_sats"][0]["name"], "IRIDIUM 106");
+        assert_eq!(snap["iridium_rings"][0]["sat"], 77);
+        assert_eq!(snap["iridium_rings"][0]["beam"], 5);
+    }
 }

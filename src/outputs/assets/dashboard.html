@@ -93,6 +93,24 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; OpenStreetMap, &copy; CARTO · silhouettes &copy; <a href="https://github.com/plane-watch/pw-silhouettes">Plane Watch</a>', maxZoom: 18,
 }).addTo(map);
 
+// Optional Iridium overlays: satellite positions + the targeted ring/beam
+// ground footprints (cf. iridium-toolkit live-map). Toggle via the layer
+// control; visibility is persisted. Kept out of the aircraft/vessel
+// auto-fit so global satellite positions never yank the view.
+const satLayer = L.layerGroup();
+const ringLayer = L.layerGroup();
+L.control.layers(null,
+  { '🛰 Iridium satellites': satLayer, '◎ Ring locations': ringLayer },
+  { position: 'topright', collapsed: false }).addTo(map);
+if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
+if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
+map.on('overlayadd overlayremove', () => {
+  localStorage.setItem('xng.satLayer', map.hasLayer(satLayer) ? '1' : '0');
+  localStorage.setItem('xng.ringLayer', map.hasLayer(ringLayer) ? '1' : '0');
+});
+const satMarkers = new Map();  // sat id -> {marker, trail}
+const ringMarkers = new Map(); // "sat-beam" -> circleMarker
+
 // Aircraft silhouettes: PlaneWatch pw-silhouettes (CC BY-NC-SA 4.0,
 // used with permission). Resolved by ICAO type designator via the
 // repo's airframes/<TYPE>.json metadata (follows aliasOf), fetched
@@ -192,6 +210,76 @@ const shipIcon = (cog, type) => {
     `fill="${color}" stroke="#0b0e14" stroke-width="1.5"/></svg>`,
     iconSize: [16, 16], iconAnchor: [8, 8] });
 };
+const IRIDIUM = '#73daca';
+const satIcon = () => L.divIcon({ className: '', html:
+  `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
+  iconSize: [20, 20], iconAnchor: [10, 10] });
+
+// Sync the optional Iridium layers from the state snapshot. Satellite
+// markers (with a faint ground track) and ring/beam footprint circles
+// are managed in their own layer groups, independent of the main marker
+// cull, and never contribute to the auto-fit bounds.
+function syncIridium(s) {
+  const seenSat = new Set();
+  for (const sat of (s.iridium_sats || [])) {
+    seenSat.add(sat.sat);
+    const name = sat.name || ('S' + String(sat.sat).padStart(2, '0'));
+    const label = escapeHtml(name);
+    const popup = entityPopup('', label, [
+      ['satellite', sat.name ? escapeHtml(sat.name) : null],
+      ['sat id', sat.sat],
+      ['beam', sat.beam],
+      ['position', `${sat.lat.toFixed(2)}, ${sat.lon.toFixed(2)}`],
+      ['altitude', sat.alt != null ? `${sat.alt} km` : null],
+      ['seen', `${fmtAge(s.now - sat.seen)} ago`],
+    ]);
+    let e = satMarkers.get(sat.sat);
+    if (!e) {
+      e = { marker: L.marker([sat.lat, sat.lon], { icon: satIcon() }).addTo(satLayer) };
+      e.marker.bindTooltip(label, { permanent: true, direction: 'right', offset: [10, 0], className: 'lbl' });
+      e.marker.bindPopup(popup);
+      satMarkers.set(sat.sat, e);
+    } else {
+      e.marker.setLatLng([sat.lat, sat.lon]);
+      e.marker.setTooltipContent(label);
+      e.marker.setPopupContent(popup);
+    }
+    if (sat.trail && sat.trail.length > 1) {
+      if (e.trail) e.trail.setLatLngs(sat.trail);
+      else e.trail = L.polyline(sat.trail, { color: IRIDIUM, weight: 1, opacity: 0.4, dashArray: '3,4' }).addTo(satLayer);
+    }
+  }
+  for (const [k, e] of satMarkers) if (!seenSat.has(k)) {
+    satLayer.removeLayer(e.marker);
+    if (e.trail) satLayer.removeLayer(e.trail);
+    satMarkers.delete(k);
+  }
+
+  const seenRing = new Set();
+  for (const r of (s.iridium_rings || [])) {
+    const key = r.sat + '-' + r.beam;
+    seenRing.add(key);
+    const popup = entityPopup('', escapeHtml(`ring S${r.sat}/B${r.beam}`), [
+      ['sat id', r.sat],
+      ['beam', r.beam],
+      ['position', `${r.lat.toFixed(2)}, ${r.lon.toFixed(2)}`],
+      ['seen', `${fmtAge(s.now - r.seen)} ago`],
+    ]);
+    let m = ringMarkers.get(key);
+    if (!m) {
+      m = L.circleMarker([r.lat, r.lon], { radius: 6, color: IRIDIUM, weight: 1, fillColor: IRIDIUM, fillOpacity: 0.15 }).addTo(ringLayer);
+      m.bindPopup(popup);
+      ringMarkers.set(key, m);
+    } else {
+      m.setLatLng([r.lat, r.lon]);
+      m.setPopupContent(popup);
+    }
+  }
+  for (const [k, m] of ringMarkers) if (!seenRing.has(k)) {
+    ringLayer.removeLayer(m);
+    ringMarkers.delete(k);
+  }
+}
 
 const markers = new Map(); // key -> {marker, trail}
 let fitted = false;
@@ -397,11 +485,14 @@ function render() {
       markers.delete(k);
     }
   });
+  syncIridium(s);
   if (!fitted && pts.length) { map.fitBounds(pts, { maxZoom: 9, padding: [40, 40] }); fitted = true; }
 
   if (s.station) document.getElementById('station').textContent = s.station;
+  const nsat = (s.iridium_sats || []).length;
   document.getElementById('status').textContent =
-    `up ${fmtUptime(s.now - s.started)} · ${s.aircraft.length} aircraft · ${s.vessels.length} vessels`;
+    `up ${fmtUptime(s.now - s.started)} · ${s.aircraft.length} aircraft · ${s.vessels.length} vessels` +
+    (nsat ? ` · ${nsat} sats` : '');
 
   const rate = rates();
   document.getElementById('chips').innerHTML = Object.entries(s.totals)
