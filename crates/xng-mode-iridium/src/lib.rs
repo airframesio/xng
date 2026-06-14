@@ -420,6 +420,15 @@ pub fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
         if let serde_json::Value::Object(extra) = u3::parse_u3(payload) {
             details.as_object_mut().unwrap().extend(extra);
         }
+    } else if ft == 7 {
+        // Sync/idle channel: the payload after the LCW is a constant
+        // alternating filler, so adjacent equal bits are deviations from
+        // that pattern. The count is a channel-quality / anomaly indicator
+        // (a clean idle sync scores 0); the timing/frequency offsets ride
+        // in the LCW (decoded above as the sync descriptor).
+        let errs = payload.windows(2).filter(|w| w[0] == w[1]).count();
+        details["sync_errors"] = serde_json::json!(errs);
+        details["sync_idle"] = serde_json::json!(errs == 0 && !payload.is_empty());
     }
     Some(ira::IridiumFrame {
         kind,

@@ -122,19 +122,42 @@ impl SbdReassembler {
             (0x06, 0x00) => (0x0600, &data[2..]),
             _ => return None,
         };
+        // Decode and expose the SBD transport pre-header rather than just
+        // stripping it (toolkit ReassembleIDASBD / ReassembleIDAPP).
+        let mut hdr = serde_json::Map::new();
         match typ {
-            // HELLO / registration: a 29-byte pre-header (any sub-type —
-            // toolkit accepts sub-types 0x10/0x20/0x40/0x50/0x70).
+            // Mobile-originated registration ("HELLO"): a 29-byte pre-header
+            // carrying the terminal IMEI, MO sequence number, message count
+            // and the registration time. (Toolkit accepts sub-types
+            // 0x10/0x20/0x40/0x50/0x70; the layout below holds across them.)
             0x0600 => {
                 if rest.len() < 29 {
                     return None;
                 }
+                let h = &rest[..29];
+                if let Some(imei) = imei_bcd(&h[5..13]) {
+                    hdr.insert("imei".into(), json!(imei));
+                }
+                hdr.insert("momsn".into(), json!(u16::from_be_bytes([h[13], h[14]])));
+                hdr.insert("msg_count".into(), json!(h[15]));
+                let it = u32::from_be_bytes([h[25], h[26], h[27], h[28]]);
+                if it != 0 {
+                    hdr.insert("time_unix".into(), json!(crate::ira::iri_time_unix(it)));
+                }
                 rest = &rest[29..];
             }
-            // All 76xx SBD subtypes (7608/7609/760a/760c/d/e) carry a
-            // 0x26 (7-byte) or 0x20 (5-byte) pre-header.
+            // SBD transfer (7608/7609/760a/760c/d/e): a 0x26 (7-byte) or 0x20
+            // (5-byte) pre-header. The 0x26 form carries the mobile-terminated
+            // sequence number, this transfer's packet count and the queued
+            // backlog still waiting at the gateway.
             t if t >> 8 == 0x76 => {
                 let skip = match rest.first() {
+                    Some(0x26) if rest.len() >= 5 => {
+                        hdr.insert("mtmsn".into(), json!(u16::from_be_bytes([rest[1], rest[2]])));
+                        hdr.insert("packets".into(), json!(rest[3]));
+                        hdr.insert("backlog".into(), json!(rest[4]));
+                        7
+                    }
                     Some(0x26) => 7,
                     Some(0x20) => 5,
                     _ => 7,
@@ -157,20 +180,27 @@ impl SbdReassembler {
                 rest = &rest[..len];
             }
         }
-        Self::parse_acars(typ, rest)
+        Self::parse_acars(typ, rest, hdr)
     }
 
     /// ACARS-over-SBD: payload begins with SOH (0x01); an optional
     /// 8-byte header tagged 0x03 follows; the rest is a standard
-    /// parity-bearing ACARS block ending ETX/ETB + CRC + DEL.
-    fn parse_acars(typ: u16, payload: &[u8]) -> Option<SbdMessage> {
+    /// parity-bearing ACARS block ending ETX/ETB + CRC + DEL. The decoded
+    /// transport header (`hdr`) is merged into the emitted details.
+    fn parse_acars(
+        typ: u16,
+        payload: &[u8],
+        mut hdr: serde_json::Map<String, serde_json::Value>,
+    ) -> Option<SbdMessage> {
+        hdr.insert("type".into(), json!(format!("{typ:04x}")));
         if payload.first() != Some(&0x01) || payload.len() < 16 {
+            hdr.insert(
+                "payload_hex".into(),
+                json!(payload.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+            );
             return Some(SbdMessage {
                 kind: "sbd",
-                details: json!({
-                    "type": format!("{typ:04x}"),
-                    "payload_hex": payload.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                }),
+                details: serde_json::Value::Object(hdr),
                 acars: None,
             });
         }
@@ -183,14 +213,85 @@ impl SbdReassembler {
             payload.to_vec()
         };
         let acars = xng_acars::block::parse(&body);
-        Some(SbdMessage {
-            kind: "sbd",
-            details: json!({
-                "type": format!("{typ:04x}"),
-                "acars_ok": acars.as_ref().map(|a| a.crc_ok),
-            }),
-            acars,
-        })
+        hdr.insert("acars_ok".into(), json!(acars.as_ref().map(|a| a.crc_ok)));
+        Some(SbdMessage { kind: "sbd", details: serde_json::Value::Object(hdr), acars })
+    }
+}
+
+/// Decode an Iridium 15-digit IMEI from 8 BCD bytes (low nibble then high
+/// nibble per byte; the first nibble is a leading type indicator, so the
+/// IMEI proper is the next 15 digits). Returns None unless every nibble is
+/// a decimal digit — i.e. the bytes really are a BCD identity, not some
+/// other 0x0600 sub-type that happens to reach here.
+fn imei_bcd(b: &[u8]) -> Option<String> {
+    if b.len() < 8 {
+        return None;
+    }
+    let mut digits = Vec::with_capacity(16);
+    for &x in &b[..8] {
+        digits.push(x & 0xf);
+        digits.push(x >> 4);
+    }
+    if digits.iter().any(|&d| d > 9) {
+        return None;
+    }
+    Some(digits[1..16].iter().map(|d| char::from(b'0' + d)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn imei_bcd_decodes_15_digits() {
+        // Nibbles (low then high per byte): leading 3, IMEI "300234032197210".
+        let bytes = [0x33, 0x00, 0x32, 0x04, 0x23, 0x91, 0x27, 0x01];
+        assert_eq!(imei_bcd(&bytes).as_deref(), Some("300234032197210"));
+        // A non-decimal nibble (0xA) means this isn't a BCD identity.
+        let bad = [0xa3, 0x00, 0x32, 0x04, 0x23, 0x91, 0x27, 0x01];
+        assert_eq!(imei_bcd(&bad), None);
+        assert_eq!(imei_bcd(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn sbd_0600_registration_exposes_imei_momsn_count() {
+        let mut data = vec![0x06, 0x00];
+        let mut h = vec![0u8; 29];
+        h[0] = 0x20; // sub-type (not an mt-position uplink marker)
+        h[5..13].copy_from_slice(&[0x33, 0x00, 0x32, 0x04, 0x23, 0x91, 0x27, 0x01]);
+        h[13] = 0x01; // MOMSN 300 = 0x012c
+        h[14] = 0x2c;
+        h[15] = 5; // message count
+        data.extend_from_slice(&h);
+        data.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // non-ACARS payload
+        let m = SbdReassembler::parse_l2(&data, true).expect("sbd message");
+        assert_eq!(m.kind, "sbd");
+        assert_eq!(m.details["type"], json!("0600"));
+        assert_eq!(m.details["imei"], json!("300234032197210"));
+        assert_eq!(m.details["momsn"], json!(300));
+        assert_eq!(m.details["msg_count"], json!(5));
+        assert_eq!(m.details["payload_hex"], json!("deadbeef"));
+        // Time field absent when the timestamp is zero.
+        assert!(m.details.get("time_unix").is_none());
+    }
+
+    #[test]
+    fn sbd_7608_transfer_exposes_mtmsn_packets_backlog() {
+        // 7608 with a 0x26 (7-byte) pre-header then a non-ACARS payload.
+        let data = [
+            0x76, 0x08, // SBD transfer type
+            0x26, 0x00, 0x07, // pre-header tag + MTMSN 7
+            0x01, 0x02, // packets 1, backlog 2
+            0x00, 0x00, // remainder of the 7-byte pre-header
+            0xca, 0xfe, // payload
+        ];
+        let m = SbdReassembler::parse_l2(&data, false).expect("sbd message");
+        assert_eq!(m.details["type"], json!("7608"));
+        assert_eq!(m.details["mtmsn"], json!(7));
+        assert_eq!(m.details["packets"], json!(1));
+        assert_eq!(m.details["backlog"], json!(2));
+        assert_eq!(m.details["payload_hex"], json!("cafe"));
     }
 }
 
