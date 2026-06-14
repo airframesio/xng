@@ -125,6 +125,10 @@ struct OutputOpts {
     /// Serve raw NMEA AIVDM over TCP (e.g. 0.0.0.0:10110)
     #[arg(long)]
     nmea_tcp: Option<String>,
+    /// Send Iridium GSM (CC/MM/SMS) frames to Wireshark via GSMTAP/UDP
+    /// (default 127.0.0.1:4729 when given without an address)
+    #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4729")]
+    gsmtap: Option<String>,
     /// JSON file mapping hex VDL2 ground-station addresses to names
     /// (shown in console output)
     #[arg(long)]
@@ -187,6 +191,7 @@ impl OutputOpts {
                 sbs: self.sbs.clone(),
                 beast: self.beast.clone(),
                 nmea_tcp: self.nmea_tcp.clone(),
+                gsmtap: self.gsmtap.clone(),
                 http: self.http.clone(),
                 mqtt: self.mqtt.clone(),
                 mqtt_topic: self.mqtt_topic.clone(),
@@ -663,6 +668,7 @@ fn main() -> anyhow::Result<()> {
                         sbs: None,
                         beast: None,
                         nmea_tcp: None,
+                        gsmtap: None,
                         http: None,
                         mqtt: None,
                         mqtt_topic: "xng".into(),
@@ -700,6 +706,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         sbs: st.outputs.sbs.clone(),
         beast: st.outputs.beast.clone(),
         nmea_tcp: st.outputs.nmea_tcp.clone(),
+        gsmtap: st.outputs.gsmtap.clone(),
         http: st.outputs.http.clone(),
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),

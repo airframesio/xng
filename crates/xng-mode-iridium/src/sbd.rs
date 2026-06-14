@@ -110,7 +110,10 @@ impl SbdReassembler {
             return Some(SbdMessage { kind: "mt-position", details: pos, acars: None });
         }
         // GSM call-control / mobility / SMS signalling.
-        if let Some(g) = crate::gsm::decode(data) {
+        if let Some(mut g) = crate::gsm::decode(data) {
+            // Carry the raw L2 bytes + direction for GSMTAP/Wireshark export.
+            g["raw_l2_hex"] = json!(data.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            g["ul"] = json!(ul);
             return Some(SbdMessage { kind: "gsm", details: g, acars: None });
         }
         // SBD packet types (toolkit ReassembleIDASBD).

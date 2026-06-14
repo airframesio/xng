@@ -426,6 +426,7 @@ fn dwell(
             sbs: None,
             beast: None,
             nmea_tcp: None,
+            gsmtap: None,
             http: None,
             mqtt: None,
             mqtt_topic: "xng".into(),
