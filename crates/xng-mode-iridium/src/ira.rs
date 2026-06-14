@@ -35,6 +35,13 @@ pub fn parse_ra(data: &[u8], fixed: u32, raw_bits: &[u8]) -> Option<IridiumFrame
     let x = pos_component(data, 13);
     let y = pos_component(data, 25);
     let z = pos_component(data, 37);
+    // Reject the degenerate all-zero header: an idle/noisy burst whose
+    // blocks BCH-correct to the trivially-valid all-zero codeword would
+    // otherwise emit a bogus ring alert at sat 0 / position (0,0,0). No
+    // real broadcasting satellite sits at Earth's center.
+    if sat == 0 && x == 0 && y == 0 && z == 0 {
+        return None;
+    }
     let ra_int = field(data, 49..56);
     let ts = data[56];
     let eip = data[57];
