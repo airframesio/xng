@@ -76,6 +76,12 @@ pub fn parse_ra(data: &[u8], fixed: u32, raw_bits: &[u8]) -> Option<IridiumFrame
         details: json!({
             "sat": sat,
             "beam": beam,
+            // Raw geocentric ECEF position (units of 4 km) plus the derived
+            // geodetic-ish lat/lon/alt. The raw components feed downstream
+            // Doppler/satellite-position work.
+            "x": x,
+            "y": y,
+            "z": z,
             "lat": lat,
             "lon": lon,
             "alt_km": alt_km,
@@ -91,24 +97,91 @@ pub fn parse_ra(data: &[u8], fixed: u32, raw_bits: &[u8]) -> Option<IridiumFrame
     })
 }
 
-/// Minimal IBC summary (type from the BCH(7,3) header; payload data bits
-/// reported but not field-parsed in v1).
+/// Convert an Iridium broadcast time counter to a Unix timestamp
+/// (iridium-toolkit `fmt_iritime`: ERA2 epoch 2014-05-11, 90 ms ticks,
+/// minus the two leap seconds that have elapsed since).
+fn iri_time_unix(iritime: u32) -> f64 {
+    let mut ux = iritime as f64 * 90.0 / 1000.0 + 1_399_818_235.0;
+    if ux > 1_435_708_799.0 {
+        ux -= 1.0; // 2015-06-30T23:59:60Z
+    }
+    if ux > 1_483_228_799.0 {
+        ux -= 1.0; // 2016-12-31T23:59:60Z
+    }
+    ux
+}
+
+/// Full IBC (broadcast channel) decode (iridium-toolkit `IridiumBCMessage`).
+/// `data` is the concatenated 21-bit BCH data fields, which IBC packs as
+/// 42-bit blocks (exactly four for a well-formed frame): a satellite/beam
+/// descriptor, a type-tagged info block (broadcast time / TMSI expiry /
+/// max uplink power), and zero or more channel-assignment blocks.
 pub fn parse_bc(bc_type: u32, data: &[u8], fixed: u32, raw_bits: &[u8]) -> IridiumFrame {
-    let hex: String = data
-        .chunks(8)
-        .map(|c| {
-            let v = c.iter().fold(0u8, |a, &b| (a << 1) | b);
-            format!("{:02x}", v << (8 - c.len()))
-        })
-        .collect();
+    let blocks: Vec<&[u8]> = data.chunks(42).filter(|c| c.len() == 42).collect();
+    let mut d = serde_json::Map::new();
+    d.insert("bc_type".into(), json!(bc_type));
+
+    let mut next = 0usize;
+    // Sub-block 1: satellite / cell descriptor (only for bc_type 0).
+    if bc_type == 0 && next < blocks.len() {
+        let b = blocks[next];
+        next += 1;
+        d.insert("sat".into(), json!(field(b, 0..7)));
+        d.insert("beam".into(), json!(field(b, 7..13)));
+        d.insert("slot".into(), json!(b[14]));
+        d.insert("sv_blocking".into(), json!(b[15]));
+        d.insert("acq_classes".into(), json!(field(b, 16..32)));
+        d.insert("acq_sub_band".into(), json!(field(b, 32..37)));
+        d.insert("acq_channels".into(), json!(field(b, 37..40)));
+    }
+    // Sub-block 2: type-tagged info (broadcast time / tmsi expiry / power).
+    if bc_type == 0 && next < blocks.len() {
+        let b = blocks[next];
+        next += 1;
+        let t = field(b, 0..6);
+        d.insert("info_type".into(), json!(t));
+        match t {
+            0 => {
+                d.insert("max_uplink_pwr".into(), json!(field(b, 36..42)));
+            }
+            1 => {
+                let it = field(b, 10..42);
+                d.insert("iri_time".into(), json!(it));
+                d.insert("iri_time_unix".into(), json!(iri_time_unix(it)));
+            }
+            2 => {
+                let ex = field(b, 10..42);
+                d.insert("tmsi_expiry".into(), json!(ex));
+                d.insert("tmsi_expiry_unix".into(), json!(iri_time_unix(ex)));
+            }
+            _ => {}
+        }
+    }
+    // Remaining blocks: channel assignments (skip the all-"111"+0 filler).
+    let mut assignments = Vec::new();
+    for b in &blocks[next..] {
+        let is_filler = b[0] == 1 && b[1] == 1 && b[2] == 1 && b[3..].iter().all(|&v| v == 0);
+        if is_filler {
+            continue;
+        }
+        assignments.push(json!({
+            "random_id": field(b, 3..11),
+            "timeslot": 1 + field(b, 11..13),
+            "uplink_sub_band": field(b, 13..18),
+            "downlink_sub_band": field(b, 18..23),
+            "access": 1 + field(b, 23..26),
+            "dtoa": field(b, 26..34),
+            "dfoa": field(b, 34..40),
+        }));
+    }
+    if !assignments.is_empty() {
+        d.insert("assignments".into(), json!(assignments));
+    }
+    d.insert("bch_corrected".into(), json!(fixed));
     IridiumFrame {
         kind: "broadcast",
         acars: None,
-        details: json!({
-            "bc_type": bc_type,
-            "data_hex": hex,
-            "bch_corrected": fixed,
-        }),
+        details: serde_json::Value::Object(d),
         raw_bits: raw_bits.to_vec(),
     }
 }

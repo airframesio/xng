@@ -13,7 +13,7 @@
 //! BCH-coded RA / IDA frames decode at all (regression for the fix where
 //! only the reverse-invariant ITL/IMS-header frames decoded).
 
-use xng_mode_iridium::{decode_bits, decode_da_bits, frame};
+use xng_mode_iridium::{decode_bits, decode_da_bits, frame, lcw_traffic_frame};
 
 fn canonical(raw: &str) -> Vec<u8> {
     frame::symbol_reverse(&raw.bytes().map(|c| (c == b'1') as u8).collect::<Vec<_>>())
@@ -41,4 +41,54 @@ fn offair_ida_sbd_decodes_with_crc() {
     assert!(da.crc_ok, "DA CRC must validate");
     assert_eq!(da.ctr, 0);
     assert!(!da.continuation);
+}
+
+#[test]
+fn offair_ibc_matches_toolkit() {
+    // iridium-parser.py: IBC bc:0 sat:013 cell:15 slot:0 sv_blkn:0
+    // aq_cl:1111111111111111 aq_sb:20 aq_ch:2 ... max_uplink_pwr + assignment
+    const RAW: &str = "0011000000110000111100110000000000111110010011111101110011011100000110111111011110111011011100111101101101010011100011101110010000001010101110111000001000000011001011100100101011011011100011101100111110100010111100000110111100101110011000101101101110001110110011101110001011110010111011";
+    let f = decode_bits(&canonical(RAW)).expect("IBC decodes");
+    assert_eq!(f.kind, "broadcast");
+    let d = &f.details;
+    assert_eq!(d["bc_type"], 0);
+    assert_eq!(d["sat"], 13);
+    assert_eq!(d["beam"], 15);
+    assert_eq!(d["slot"], 0);
+    assert_eq!(d["sv_blocking"], 0);
+    assert_eq!(d["acq_classes"], 65535); // 1111111111111111
+    assert_eq!(d["acq_sub_band"], 20);
+    assert_eq!(d["acq_channels"], 2);
+    assert_eq!(d["info_type"], 0);
+    assert_eq!(d["max_uplink_pwr"], 20);
+    // Channel-assignment block(s) decoded.
+    let a = &d["assignments"][0];
+    assert_eq!(a["random_id"], 153);
+    assert_eq!(a["timeslot"], 4);
+    assert_eq!(a["downlink_sub_band"], 22);
+    assert_eq!(a["access"], 6);
+}
+
+#[test]
+fn offair_ibc_tmsi_expiry_time() {
+    // iridium-parser.py: IBC ... tmsi_expiry:2014-05-11T15:13:0x
+    const RAW: &str = "001100000011000011110011000000000011111001001111110111001101110000011011111101111011101101110000110101110011100110010000000000000000000000000000000110000000000110000011001110100100100110001010110011101100000111110010111011011000001100111010010010011000101011001110110000011111001011101100";
+    let f = decode_bits(&canonical(RAW)).expect("IBC decodes");
+    assert_eq!(f.kind, "broadcast");
+    let d = &f.details;
+    assert_eq!(d["info_type"], 2);
+    // fmt_iritime(32768) = 1399818235 + 32768*0.09 = 1399821184.12
+    let ux = d["tmsi_expiry_unix"].as_f64().unwrap();
+    assert!((ux - 1_399_821_184.12).abs() < 1.0, "tmsi_expiry_unix={ux}");
+}
+
+#[test]
+fn offair_u3_lcw_handoff() {
+    // iridium-parser.py: IU3: LCW(3,T:hndof,C:handoff_cand,...)
+    const RAW: &str = "001100000011000011110011001100011000000101100001110100010111110100010000101100110110000000000101000000010000011011001100100000100100010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    let f = lcw_traffic_frame(&canonical(RAW)).expect("U3 LCW frame decodes");
+    assert_eq!(f.kind, "u3");
+    assert_eq!(f.details["frame_ft"], 3);
+    assert_eq!(f.details["lcw"]["type"], "hndof");
+    assert_eq!(f.details["lcw"]["code"], "handoff_cand");
 }
