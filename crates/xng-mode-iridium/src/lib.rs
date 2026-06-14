@@ -201,6 +201,9 @@ fn handle_bits(
     // LCW-bearing duplex frames: DA (SBD data) → reassembly → SBD
     // transport → ACARS.
     if let Some((da, raw)) = decode_da_bits(bits) {
+        let lcw = decode_lcw_bits(bits)
+            .map(|(_, _, l2, l3)| lcw_descriptor(l2, l3))
+            .unwrap_or(serde_json::Value::Null);
         out.push(ira::IridiumFrame {
             kind: "ida",
             details: serde_json::json!({
@@ -208,6 +211,8 @@ fn handle_bits(
                 "ctr": da.ctr,
                 "len": da.len,
                 "crc_ok": da.crc_ok,
+                "bch_corrected": da.bch_corrected,
+                "lcw": lcw,
                 "data_hex": da.data[..da.len.min(20) as usize]
                     .iter()
                     .map(|b| format!("{b:02x}"))
@@ -276,18 +281,17 @@ impl IridiumWidebandDecoder {
 
 /// Decode an LCW-bearing burst's DA frame, if it is one (ft == 2).
 pub fn decode_da_bits(bits: &[u8]) -> Option<(frame::DaFrame, Vec<u8>)> {
-    match decode_lcw_bits(bits)? {
-        (2, data) => {
-            let da = frame::decode_da(&data[46..])?;
-            Some((da, bits.to_vec()))
-        }
-        _ => None,
+    let (ft, data, _, _) = decode_lcw_bits(bits)?;
+    if ft != 2 {
+        return None;
     }
+    let da = frame::decode_da(&data[46..])?;
+    Some((da, bits.to_vec()))
 }
 
 /// Classify an LCW-bearing duplex burst: returns the LCW frame type and
 /// the post-access-code data bits.
-fn decode_lcw_bits(bits: &[u8]) -> Option<(u8, &[u8])> {
+fn decode_lcw_bits(bits: &[u8]) -> Option<(u8, &[u8], u32, u32)> {
     let data = if bits.len() > 24 && bits[..24] == frame::ACCESS_DL[..] {
         &bits[24..]
     } else if bits.len() > 24 && bits[..24] == frame::ACCESS_UL[..] {
@@ -303,7 +307,7 @@ fn decode_lcw_bits(bits: &[u8]) -> Option<(u8, &[u8])> {
     // frame. The 24-bit access code has already confirmed a genuine burst,
     // and the frame type is validated by the callers (voice/ip/sync/DA),
     // with a CRC on the DA path.
-    let (ft, _, _, errs) = frame::decode_lcw(data)?;
+    let (ft, lcw2, lcw3, errs) = frame::decode_lcw(data)?;
     // DA (ft=2) carries ACARS/SBD and is CRC-protected downstream, so a bad
     // LCW correction is caught there — give it the BCH's full reach. The
     // CRC-less classes (voice/IP/sync) get a tight bound so a noisy LCW
@@ -312,19 +316,74 @@ fn decode_lcw_bits(bits: &[u8]) -> Option<(u8, &[u8])> {
     if errs > max_errs {
         return None;
     }
-    Some((ft, data))
+    Some((ft, data, lcw2, lcw3))
 }
 
-/// Tag the non-DA duplex traffic classes by LCW frame type: voice (AMBE
-/// payload bytes extracted for external decoding — the codec itself is
-/// proprietary), IP data, and sync bursts (iridium-toolkit ft mapping).
-fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
-    let (ft, data) = decode_lcw_bits(bits)?;
+/// Decode the LCW (Link Control Word) control fields carried by every
+/// duplex burst: the control type (maint / acchl / hndof / rsrvd) and its
+/// per-code sub-fields (iridium-toolkit `bitsparser` LCW decode). `lcw2`
+/// is the 6-bit `[lcw_ft(2) | lcw_code(4)]` word; `lcw3` is 21 bits.
+fn lcw_descriptor(lcw2: u32, lcw3: u32) -> serde_json::Value {
+    let lcw_ft = (lcw2 >> 4) & 0x3;
+    let lcw_code = lcw2 & 0xF;
+    // Extract string-index range [a,b) from the 21-bit MSB-first lcw3.
+    let f = |a: usize, b: usize| (lcw3 >> (21 - b)) & ((1u32 << (b - a)) - 1);
+    let (ty, code): (&str, serde_json::Value) = match lcw_ft {
+        0 => (
+            "maint",
+            match lcw_code {
+                6 => serde_json::json!("geoloc"),
+                15 => serde_json::json!("<silent>"),
+                12 => serde_json::json!({"code":"maint[1]","lqi": f(19,21), "power": f(16,19)}),
+                0 => serde_json::json!({"code":"sync","status": f(1,2), "dtoa": f(3,13), "dfoa": f(13,21)}),
+                3 => serde_json::json!({"code":"maint[2]","lqi": f(1,3), "power": f(3,6), "f_dtoa": f(6,13), "f_dfoa": f(13,20)}),
+                1 => serde_json::json!({"code":"switch","dtoa": f(3,13), "dfoa": f(13,21)}),
+                c => serde_json::json!(format!("rsrvd({c})")),
+            },
+        ),
+        1 => (
+            "acchl",
+            if lcw_code == 1 {
+                serde_json::json!("acchl")
+            } else {
+                serde_json::json!(format!("rsrvd({lcw_code})"))
+            },
+        ),
+        2 => (
+            "hndof",
+            match lcw_code {
+                12 => serde_json::json!("handoff_cand"),
+                3 => serde_json::json!({
+                    "code": "handoff_resp",
+                    "cand": if f(2,3) == 1 { "S" } else { "P" },
+                    "denied": f(3,4), "ref": f(4,5), "slot": 1 + f(6,8),
+                    "sband_up": f(8,13), "sband_dn": f(13,18), "access": 1 + f(18,21),
+                }),
+                15 => serde_json::json!("<silent>"),
+                c => serde_json::json!(format!("rsrvd({c})")),
+            },
+        ),
+        _ => ("rsrvd", serde_json::json!(format!("<{lcw_code}>"))),
+    };
+    serde_json::json!({ "type": ty, "code": code })
+}
+
+/// Tag the non-DA duplex traffic classes by LCW frame type and attach the
+/// decoded LCW control word. Frame type (`ft` from lcw1): 0 voice (AMBE
+/// payload — codec proprietary), 1 IP data, 7 sync, 3 U3 (mission-control
+/// in-band signalling), 6 U6; any other valid-LCW ft surfaces as a generic
+/// `lcw` frame so no duplex burst is silently dropped. ft 2 (DA) returns
+/// None so `decode_da_bits` handles it (→ ida + SBD).
+pub fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
+    let (ft, data, lcw2, lcw3) = decode_lcw_bits(bits)?;
     let kind = match ft {
         0 => "voice",
         1 => "ip-data",
         7 => "sync",
-        _ => return None,
+        3 => "u3",
+        6 => "u6",
+        2 => return None,
+        _ => "lcw",
     };
     let payload = &data[46..];
     let payload_hex: String = payload
@@ -333,8 +392,15 @@ fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
             format!("{:02x}", c.iter().fold(0u8, |v, &b| (v << 1) | b))
         })
         .collect();
-    let mut details =
-        serde_json::json!({ "payload_hex": payload_hex, "payload_bits": payload.len() });
+    let mut details = serde_json::json!({
+        "payload_hex": payload_hex,
+        "payload_bits": payload.len(),
+        "lcw": lcw_descriptor(lcw2, lcw3),
+    });
+    // Record the raw frame type for the non-standard classes (U3/U6/other).
+    if !matches!(ft, 0 | 1 | 7) {
+        details["frame_ft"] = serde_json::json!(ft);
+    }
     if ft == 0 {
         // Voice channel: run the VDA/VO6/VOD/VOZ/VOC classification
         // ladder and fold its result into the details.
