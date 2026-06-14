@@ -75,13 +75,13 @@ impl Gf64 {
     }
 }
 
-const RS6_N: usize = 52;
+pub(crate) const RS6_N: usize = 52;
 const RS6_NPAR: usize = 10;
 const RS6_FCR: u32 = 54;
 
 /// Errors-only RS decode of the 52×6-bit voice codeword. Returns the
 /// number of corrected symbols, or Err if the word is uncorrectable.
-fn rs6_correct(cw: &mut [u8; RS6_N]) -> Result<usize, ()> {
+pub(crate) fn rs6_correct(cw: &mut [u8; RS6_N]) -> Result<usize, ()> {
     let gf = Gf64::new();
     let n = RS6_N;
 
@@ -209,7 +209,7 @@ fn rs6_correct(cw: &mut [u8; RS6_N]) -> Result<usize, ()> {
 
 /// GF(256) RS for the VOD byte view: 31 data + 8 transmitted checks +
 /// 8 untransmitted (erased) checks, fcr 0, prim 0x11d.
-fn vod_correct(payload: &[u8; 39]) -> Option<[u8; 31]> {
+pub(crate) fn vod_correct(payload: &[u8; 39]) -> Option<[u8; 31]> {
     let rs = ReedSolomon::new(0x11d, 16, 0);
     // Embed as the tail of a full 255-symbol codeword; the 8 missing
     // check octets are erasures at the end.

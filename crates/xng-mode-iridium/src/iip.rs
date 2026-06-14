@@ -25,7 +25,7 @@ fn iip_type_name(t: u8) -> &'static str {
 /// The toolkit's 16-bit one's-complement-style checksum over the
 /// 31-byte RS message: sum of 14 LE u16 + 1 byte + 1 LE u16, carry
 /// folded once, complemented.
-fn checksum_16(msg: &[u8; 31]) -> u16 {
+pub(crate) fn checksum_16(msg: &[u8; 31]) -> u16 {
     let mut sum: u32 = 0;
     for w in msg[..28].chunks_exact(2) {
         sum += u16::from_le_bytes([w[0], w[1]]) as u32;

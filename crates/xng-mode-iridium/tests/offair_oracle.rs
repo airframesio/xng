@@ -91,4 +91,6 @@ fn offair_u3_lcw_handoff() {
     assert_eq!(f.details["frame_ft"], 3);
     assert_eq!(f.details["lcw"]["type"], "hndof");
     assert_eq!(f.details["lcw"]["code"], "handoff_cand");
+    // iridium-parser.py decoded this one as IU3 (RS did not correct).
+    assert_eq!(f.details["u3_type"], "IU3");
 }

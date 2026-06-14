@@ -10,6 +10,7 @@ pub mod itl;
 mod itl_tables;
 pub mod ms;
 pub mod sbd;
+pub mod u3;
 pub mod voice;
 pub mod wideband;
 pub mod modulate;
@@ -410,6 +411,11 @@ pub fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
     } else if ft == 1 {
         // IP channel: IIP/IIQ/IIR frame classification.
         if let Some(serde_json::Value::Object(extra)) = iip::parse_ip_payload(payload) {
+            details.as_object_mut().unwrap().extend(extra);
+        }
+    } else if ft == 3 {
+        // U3 (mission-control in-band signalling): RS8/RS6 inner decode.
+        if let serde_json::Value::Object(extra) = u3::parse_u3(payload) {
             details.as_object_mut().unwrap().extend(extra);
         }
     }
