@@ -7,6 +7,7 @@
 use crate::demod::IridiumDemod;
 use crate::CHANNEL_RATE;
 use num_complex::Complex;
+use rayon::prelude::*;
 use rustfft::Fft;
 use std::sync::Arc;
 use xng_dsp::Ddc;
@@ -116,23 +117,44 @@ impl IridiumWideband {
     /// their frequency offsets).
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<WidebandBurst> {
         self.buf.extend_from_slice(input);
-        let mut out = Vec::new();
+        // Bursts that finish this call; demodulated in parallel below. The
+        // detection loop stays sequential (the noise-floor EMA is stateful),
+        // but per-burst extract is independent and the heavy part (DDC +
+        // demod over a whole burst at the input rate), so it parallelizes.
+        let mut to_extract: Vec<ActiveBurst> = Vec::new();
         let frame_len = self.nfft as u64;
 
-        loop {
-            let frame_start = self.next_frame * frame_len;
-            if frame_start + frame_len > self.start_abs + self.buf.len() as u64 {
-                break;
+        // Each frame's windowed FFT magnitude spectrum is an independent
+        // computation, and the FFTs dominate the per-frame cost at high
+        // capture rates. Compute them all in parallel up front; the stateful
+        // noise-floor + burst detection below then runs sequentially over
+        // them in frame order, so the result is identical to the previous
+        // inline single-threaded version.
+        let buf_end = self.start_abs + self.buf.len() as u64;
+        let frame_rels: Vec<usize> = {
+            let mut rels = Vec::new();
+            let mut nf = self.next_frame;
+            while nf * frame_len + frame_len <= buf_end {
+                rels.push((nf * frame_len - self.start_abs) as usize);
+                nf += 1;
             }
-            let rel = (frame_start - self.start_abs) as usize;
-            let mut spec: Vec<Complex<f32>> = self.buf[rel..rel + self.nfft]
-                .iter()
-                .zip(&self.window)
-                .map(|(s, &w)| s * w)
-                .collect();
-            self.fft.process(&mut spec);
-            let mag: Vec<f32> = spec.iter().map(|c| c.norm_sqr()).collect();
+            rels
+        };
+        let (fft, samples, window, nfft) = (&self.fft, &self.buf, &self.window, self.nfft);
+        let mags: Vec<Vec<f32>> = frame_rels
+            .par_iter()
+            .map(|&rel| {
+                let mut spec: Vec<Complex<f32>> = samples[rel..rel + nfft]
+                    .iter()
+                    .zip(window)
+                    .map(|(s, &w)| s * w)
+                    .collect();
+                fft.process(&mut spec);
+                spec.iter().map(|c| c.norm_sqr()).collect()
+            })
+            .collect();
 
+        for mag in &mags {
             // Update the per-bin noise floor. Warm up with a running
             // mean over the first WARMUP_FRAMES (no detection yet), then
             // track with the slow EMA. Detecting before the floor is
@@ -241,13 +263,19 @@ impl IridiumWideband {
                 if self.recent.len() > 8 {
                     self.recent.remove(0);
                 }
-                if let Some(burst) = self.extract(&b) {
-                    out.push(burst);
-                }
+                to_extract.push(b);
             }
 
             self.next_frame += 1;
         }
+
+        // Demodulate finished bursts in parallel (extract is &self, reads the
+        // sample buffer immutably; par_iter().collect() preserves order, so
+        // the output is identical to the previous inline single-threaded
+        // extraction). Done before the buffer is drained below.
+        let this = &*self;
+        let out: Vec<WidebandBurst> =
+            to_extract.par_iter().filter_map(|b| this.extract(b)).collect();
 
         // Drop samples no longer needed: everything before the earliest
         // active burst (minus pre-roll) or the current frame.
