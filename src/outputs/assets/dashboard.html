@@ -286,11 +286,6 @@ const IRIDIUM = '#73daca';
 // footprint prefers its reconstructed per-beam radius when the beam pattern
 // has resolved that beam; this nominal radius is the fallback.
 const BEAM_RADIUS_M = 200000;
-// Full Iridium satellite footprint (~4700 km diameter): the 48 spot beams
-// tile this disc. A single ground station only reconstructs the beams that
-// sweep over it (one cross-track side, ~20 of 48), so the pattern looks
-// gappy; this faint disc shows the full intended coverage underneath.
-const FOOTPRINT_RADIUS_M = 2350000;
 const beamColor = b => `hsl(${((b || 0) * 360 / 48) | 0},70%,55%)`;
 const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
@@ -301,9 +296,13 @@ const satIcon = () => L.divIcon({ className: '', html:
 // are managed in their own layer groups, independent of the main marker
 // cull, and never contribute to the auto-fit bounds.
 function syncIridium(s) {
-  // Per-satellite beam tally (reconstructed vs mirrored estimate) for popups.
+  // Group beam cells by satellite — for the popup tally and for sizing each
+  // satellite's coverage footprint to its own beams.
+  const cellsBySat = new Map();
   const beamStats = new Map();
   for (const c of (s.iridium_beam_cells || [])) {
+    if (!cellsBySat.has(c.sat)) cellsBySat.set(c.sat, []);
+    cellsBySat.get(c.sat).push(c);
     const st = beamStats.get(c.sat) || { seen: 0, est: 0 };
     if (c.estimated) st.est++; else st.seen++;
     beamStats.set(c.sat, st);
@@ -353,18 +352,30 @@ function syncIridium(s) {
       if (e.trail) e.trail.setLatLngs(sat.trail);
       else e.trail = L.polyline(sat.trail, { color: IRIDIUM, weight: 1, opacity: 0.4, dashArray: '3,4' }).addTo(satLayer);
     }
-    // Full-footprint coverage disc (in the beam-pattern layer, beneath the
-    // reconstructed cells): shows the intended ~4700 km coverage as one
-    // contiguous area so single-station gaps between observed beams don't
-    // read as missing coverage.
+    // Coverage footprint (in the beam-pattern layer, beneath the cells): a
+    // contiguous disc sized to enclose THIS satellite's reconstructed +
+    // estimated beams, so it matches the beam placements and grows toward the
+    // true ~2350 km footprint as more beams are mapped. Skipped until the
+    // satellite has a pattern.
+    let fpRad = 0;
+    for (const c of (cellsBySat.get(sat.sat) || [])) {
+      const d = map.distance([sat.lat, sat.lon], [c.lat, c.lon]) + (c.radius_m || 200000);
+      if (d > fpRad) fpRad = d;
+    }
     let fp = footprintMarkers.get(sat.sat);
-    if (!fp) {
-      fp = L.circle([sat.lat, sat.lon], { radius: FOOTPRINT_RADIUS_M, color: IRIDIUM,
-        weight: 1, opacity: 0.22, fillColor: IRIDIUM, fillOpacity: 0.04,
-        dashArray: '4 6', interactive: false }).addTo(patternLayer);
-      footprintMarkers.set(sat.sat, fp);
-    } else {
-      fp.setLatLng([sat.lat, sat.lon]);
+    if (fpRad > 0) {
+      if (!fp) {
+        fp = L.circle([sat.lat, sat.lon], { radius: fpRad, color: IRIDIUM,
+          weight: 1, opacity: 0.22, fillColor: IRIDIUM, fillOpacity: 0.04,
+          dashArray: '4 6', interactive: false }).addTo(patternLayer);
+        footprintMarkers.set(sat.sat, fp);
+      } else {
+        fp.setLatLng([sat.lat, sat.lon]);
+        fp.setRadius(fpRad);
+      }
+    } else if (fp) {
+      patternLayer.removeLayer(fp);
+      footprintMarkers.delete(sat.sat);
     }
   }
   for (const [k, e] of satMarkers) if (!seenSat.has(k)) {
@@ -428,7 +439,7 @@ function syncIridium(s) {
     const col = est ? '#8b93b3' : beamColor(c.beam);
     const rad = c.radius_m || 200000;
     const style = est
-      ? { color: col, fillColor: col, weight: 1, opacity: 0.14, fillOpacity: 0, dashArray: '1 8' }
+      ? { color: col, fillColor: col, weight: 1, opacity: 0.32, fillOpacity: 0.02, dashArray: '2 6' }
       : (c.active
         ? { color: col, fillColor: col, weight: 2, opacity: 0.85, fillOpacity: 0.28, dashArray: null }
         : { color: col, fillColor: col, weight: 1, opacity: 0.35, fillOpacity: 0.03, dashArray: '2 5' });
