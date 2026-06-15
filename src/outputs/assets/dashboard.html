@@ -291,6 +291,28 @@ const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
   iconSize: [20, 20], iconAnchor: [10, 10], popupAnchor: [0, -14] });
 
+// Convex hull (Andrew's monotone chain) of [lat,lon] points → the outline of
+// the satellite's combined beam coverage. The real footprint is the union of
+// all 48 beams — roughly circular but a lobed polygon, not a perfect circle.
+function convexHull(pts) {
+  if (pts.length < 3) return pts.slice();
+  const p = pts.slice().sort((a, b) => a[1] - b[1] || a[0] - b[0]);
+  const cross = (o, a, b) => (a[1] - o[1]) * (b[0] - o[0]) - (a[0] - o[0]) * (b[1] - o[1]);
+  const lower = [];
+  for (const q of p) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0) lower.pop();
+    lower.push(q);
+  }
+  const upper = [];
+  for (let i = p.length - 1; i >= 0; i--) {
+    const q = p[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0) upper.pop();
+    upper.push(q);
+  }
+  lower.pop(); upper.pop();
+  return lower.concat(upper);
+}
+
 // Sync the optional Iridium layers from the state snapshot. Satellite
 // markers (with a faint ground track) and ring/beam footprint circles
 // are managed in their own layer groups, independent of the main marker
@@ -304,7 +326,7 @@ function syncIridium(s) {
     if (!cellsBySat.has(c.sat)) cellsBySat.set(c.sat, []);
     cellsBySat.get(c.sat).push(c);
     const st = beamStats.get(c.sat) || { seen: 0, est: 0 };
-    if (c.estimated) st.est++; else st.seen++;
+    if (c.decoded) st.seen++; else st.est++;
     beamStats.set(c.sat, st);
   }
   const seenSat = new Set();
@@ -319,9 +341,9 @@ function syncIridium(s) {
       ? (tr[tr.length - 1][0] >= tr[0][0] ? 'northbound ↑' : 'southbound ↓')
       : null;
     const note = bs.seen
-      ? '<div class="note">One ground station hears only the beams that sweep over it ' +
-        '(~half the 48). Faint grey cells are the unobserved side, mirrored from the ' +
-        'reconstructed pattern.</div>'
+      ? '<div class="note">A single ground station decodes only the beams that sweep ' +
+        'over it. Faint cells are the rest of the satellite’s 48-beam pattern, ' +
+        'not yet decoded from here.</div>'
       : '';
     const popup = entityPopup('', label, [
       ['satellite', sat.name ? escapeHtml(sat.name) : null],
@@ -330,7 +352,7 @@ function syncIridium(s) {
       ['position', `${sat.lat.toFixed(2)}, ${sat.lon.toFixed(2)}`],
       ['altitude', sat.alt != null ? `${sat.alt} km` : null],
       ['heading', heading],
-      ['beams', bs.seen ? `${bs.seen}/48 reconstructed${bs.est ? ` · ${bs.est} estimated` : ''}` : null],
+      ['beams', bs.seen ? `${bs.seen} of 48 decoded${bs.est ? ` · ${bs.est} modelled` : ''}` : null],
       ['seen', `${fmtAge(s.now - sat.seen)} ago`],
     ]) + note;
     let e = satMarkers.get(sat.sat);
@@ -352,26 +374,23 @@ function syncIridium(s) {
       if (e.trail) e.trail.setLatLngs(sat.trail);
       else e.trail = L.polyline(sat.trail, { color: IRIDIUM, weight: 1, opacity: 0.4, dashArray: '3,4' }).addTo(satLayer);
     }
-    // Coverage footprint (in the beam-pattern layer, beneath the cells): a
-    // contiguous disc sized to enclose THIS satellite's reconstructed +
-    // estimated beams, so it matches the beam placements and grows toward the
-    // true ~2350 km footprint as more beams are mapped. Skipped until the
-    // satellite has a pattern.
-    let fpRad = 0;
+    // Coverage footprint (in the beam-pattern layer, beneath the cells): the
+    // convex hull of THIS satellite's beam footprints — the true combined
+    // coverage envelope (a lobed polygon, not a perfect circle), so it matches
+    // the beam placements exactly. Skipped until the satellite has a pattern.
+    const fpPts = [];
     for (const c of (cellsBySat.get(sat.sat) || [])) {
-      const d = map.distance([sat.lat, sat.lon], [c.lat, c.lon]) + (c.radius_m || 200000);
-      if (d > fpRad) fpRad = d;
+      if (c.poly) for (const pt of c.poly) fpPts.push(pt);
     }
     let fp = footprintMarkers.get(sat.sat);
-    if (fpRad > 0) {
+    if (fpPts.length >= 3) {
+      const hull = convexHull(fpPts);
       if (!fp) {
-        fp = L.circle([sat.lat, sat.lon], { radius: fpRad, color: IRIDIUM,
-          weight: 1, opacity: 0.22, fillColor: IRIDIUM, fillOpacity: 0.04,
-          dashArray: '4 6', interactive: false }).addTo(patternLayer);
+        fp = L.polygon(hull, { color: IRIDIUM, weight: 1, opacity: 0.22, fillColor: IRIDIUM,
+          fillOpacity: 0.04, dashArray: '4 6', interactive: false }).addTo(patternLayer);
         footprintMarkers.set(sat.sat, fp);
       } else {
-        fp.setLatLng([sat.lat, sat.lon]);
-        fp.setRadius(fpRad);
+        fp.setLatLngs(hull);
       }
     } else if (fp) {
       patternLayer.removeLayer(fp);

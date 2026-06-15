@@ -68,9 +68,12 @@ const TIER_RADIUS_KM: [f64; 4] = [152.0, 351.0, 744.0, 1475.0];
 /// an outer edge symmetric to the inner gap. Used to size each beam's radial
 /// extent so adjacent tiers tile.
 const TIER_BOUND_KM: [f64; 5] = [0.0, 251.0, 547.0, 1109.0, 1841.0];
-/// Footprints are drawn a touch larger than touching so neighbours overlap,
-/// as real Iridium beams do for handoff (contiguous, gap-free coverage).
-const BEAM_OVERLAP_F: f64 = 1.06;
+/// Each beam is sized ~√2 larger than its half-cell so the ellipse covers the
+/// whole cell including the corners where cells meet (an inscribed ellipse
+/// would leave corner gaps). Real Iridium beams overlap this much — usable
+/// coverage runs well past the −3 dB contour — so coverage is contiguous and
+/// gap-free.
+const BEAM_OVERLAP_F: f64 = 1.45;
 /// A canonical slot counts as decoded (drawn solid) when a reconstructed beam
 /// sits within this distance of it; otherwise it renders faint as a
 /// not-yet-decoded beam.
