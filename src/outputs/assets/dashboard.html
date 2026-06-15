@@ -124,10 +124,10 @@ const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
 const patternMarkers = new Map(); // "sat-beam" -> projected pattern cell
 const patternBySat = new Map(); // sat id -> [pattern cell markers] (for hover link)
 const deviceMarkers = new Map(); // "lat,lon" -> terminal marker
+let pinnedSat = null; // satellite whose pattern stays highlighted (click)
 
-// Hover a satellite to light up its whole beam pattern (the visual link
-// between a satellite and the cells it projects); mouse-out restores each
-// cell to its active/muted base style.
+// Light up (or restore) a satellite's whole beam pattern — the visual link
+// between a satellite and the cells it projects.
 function highlightSatPattern(satId, on) {
   const cells = patternBySat.get(satId);
   if (!cells) return;
@@ -136,6 +136,20 @@ function highlightSatPattern(satId, on) {
       fillOpacity: Math.min(m._base.fillOpacity + 0.18, 0.5) });
     else if (m._base) m.setStyle(m._base);
   }
+}
+// Hover shows a satellite's pattern transiently; click pins it so it stays
+// shown (and ensures the beam-pattern layer is visible). Click again (or
+// another satellite) to move/clear the pin.
+function hoverSat(satId, on) {
+  if (on) highlightSatPattern(satId, true);
+  else if (satId !== pinnedSat) highlightSatPattern(satId, false);
+}
+function pinSat(satId) {
+  if (pinnedSat === satId) { pinnedSat = null; highlightSatPattern(satId, false); return; }
+  if (pinnedSat !== null) highlightSatPattern(pinnedSat, false);
+  pinnedSat = satId;
+  if (!map.hasLayer(patternLayer)) patternLayer.addTo(map); // reveal the pattern
+  highlightSatPattern(satId, true);
 }
 
 // Aircraft silhouettes: PlaneWatch pw-silhouettes (CC BY-NC-SA 4.0,
@@ -238,10 +252,12 @@ const shipIcon = (cog, type) => {
     iconSize: [16, 16], iconAnchor: [8, 8] });
 };
 const IRIDIUM = '#73daca';
-// Spot-beam coverage cell: ~200 km radius footprint, hue per beam id
-// (1–48) so the cells under a satellite read as a coloured tiling — the
-// map equivalent of iridium-toolkit's beam-pattern plot.
-const BEAM_RADIUS_M = 200000;
+// Spot-beam coverage cell: an Iridium spot beam lights ~350 km of ground
+// (the 48 beams tile a ~4700 km footprint), hue per beam id (1–48) so the
+// cells under a satellite read as a coloured tiling. The reconstructed
+// beam-pattern cells size themselves per-beam from neighbour spacing; this
+// fixed radius is for the observed-footprint markers.
+const BEAM_RADIUS_M = 350000;
 const beamColor = b => `hsl(${((b || 0) * 360 / 48) | 0},70%,55%)`;
 const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
@@ -270,9 +286,10 @@ function syncIridium(s) {
       e = { marker: L.marker([sat.lat, sat.lon], { icon: satIcon() }).addTo(satLayer) };
       e.marker.bindTooltip(label, { permanent: true, direction: 'right', offset: [10, 0], className: 'lbl' });
       e.marker.bindPopup(popup);
-      const sid = sat.sat; // link this satellite to its beam pattern on hover
-      e.marker.on('mouseover', () => highlightSatPattern(sid, true));
-      e.marker.on('mouseout', () => highlightSatPattern(sid, false));
+      const sid = sat.sat; // link this satellite to its beam pattern
+      e.marker.on('mouseover', () => hoverSat(sid, true));
+      e.marker.on('mouseout', () => hoverSat(sid, false));
+      e.marker.on('click', () => pinSat(sid)); // pin its pattern (stays shown)
       satMarkers.set(sat.sat, e);
     } else {
       e.marker.setLatLng([sat.lat, sat.lon]);
@@ -355,6 +372,8 @@ function syncIridium(s) {
     patternLayer.removeLayer(m);
     patternMarkers.delete(k);
   }
+  // Re-apply a pinned satellite's highlight after the per-tick rebuild.
+  if (pinnedSat !== null) highlightSatPattern(pinnedSat, true);
 
   // Iridium mobile terminals: customer devices that reported their own
   // position (the real device locations, vs the beam footprints above).
