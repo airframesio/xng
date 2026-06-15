@@ -62,6 +62,14 @@ const CELL_RADIUS_MIN_KM: f64 = 150.0;
 const CELL_RADIUS_MAX_KM: f64 = 450.0;
 /// Radius for a beam with no reconstructed neighbour yet (≈ footprint/48).
 const DEFAULT_BEAM_RADIUS_KM: f64 = 200.0;
+/// A single ground station only hears the beams that sweep over it (one
+/// cross-track side). To sketch the unobserved half toward the full 48-beam
+/// pattern, each reconstructed beam beyond this cross-track distance is
+/// mirrored across the ground track (cross → −cross) as an *estimated* cell.
+const MIRROR_MIN_CROSS_KM: f64 = 250.0;
+/// A mirrored estimate is dropped if a real (or already-mirrored) beam is
+/// already within this distance of the mirror point.
+const MIRROR_MERGE_KM: f64 = 250.0;
 /// A beam counts as "active" (currently illuminating, drawn bright) if this
 /// satellite was seen on it within this many seconds; older beams stay in
 /// the pattern but render muted.
@@ -195,6 +203,10 @@ pub struct Cell {
     pub lon: f64,
     pub radius_m: f64,
     pub active: bool,
+    /// True for a beam this station has not actually decoded — a mirror of a
+    /// reconstructed beam across the ground track, drawn faintly so the map
+    /// conveys the full ~48-beam pattern (not just the observed half).
+    pub estimated: bool,
 }
 
 /// Live reconstructor: fed every ring-alert frame, accumulates the pattern,
@@ -287,10 +299,12 @@ impl BeamReconstructor {
             let means: Vec<(u8, f64, f64)> = (1..=48u8)
                 .filter_map(|b| pat.mean(b, MIN_OBS).map(|(c, a)| (b, c, a)))
                 .collect();
-            for &(beam, cross, along) in &means {
-                // Radius = a little over half the distance to the nearest
-                // neighbouring beam, so cells tile the footprint at the beam's
-                // real ground coverage (not the reconstruction's tightness).
+            // Emit one cell, sizing its radius from the spacing to the nearest
+            // neighbouring beam (beams tile the footprint, so a little over
+            // half the centre-to-centre spacing is the cell's real ground
+            // coverage). Takes `out` by ref so the closure doesn't conflict
+            // with the loops feeding it.
+            let emit = |out: &mut Vec<Cell>, beam: u8, cross: f64, along: f64, active: bool, estimated: bool| {
                 let nn = means
                     .iter()
                     .filter(|&&(b2, _, _)| b2 != beam)
@@ -301,9 +315,7 @@ impl BeamReconstructor {
                 } else {
                     DEFAULT_BEAM_RADIUS_KM
                 };
-                let e = to_ecef(t.pos, cross, along, t.north);
-                let (lat, lon) = lat_lon(e);
-                let active = t.seen_beams.get(&beam).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
+                let (lat, lon) = lat_lon(to_ecef(t.pos, cross, along, t.north));
                 out.push(Cell {
                     sat,
                     beam,
@@ -311,7 +323,33 @@ impl BeamReconstructor {
                     lon: lon.to_degrees(),
                     radius_m: radius_km * 1000.0,
                     active,
+                    estimated,
                 });
+            };
+            // Reconstructed beams: what this station has actually decoded.
+            let mut placed: Vec<(f64, f64)> = Vec::new();
+            for &(beam, cross, along) in &means {
+                let active = t.seen_beams.get(&beam).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
+                emit(&mut out, beam, cross, along, active, false);
+                placed.push((cross, along));
+            }
+            // Estimated beams: mirror each reconstructed beam across the ground
+            // track to sketch the unobserved cross-track half (a single station
+            // never hears it), skipping any mirror that lands on a beam already
+            // drawn. Flagged `estimated` so the map renders them faintly.
+            for &(beam, cross, along) in &means {
+                if cross.abs() < MIRROR_MIN_CROSS_KM {
+                    continue;
+                }
+                let (mc, ma) = (-cross, along);
+                if placed
+                    .iter()
+                    .any(|&(c, a)| ((c - mc).powi(2) + (a - ma).powi(2)).sqrt() < MIRROR_MERGE_KM)
+                {
+                    continue;
+                }
+                emit(&mut out, beam, mc, ma, false, true);
+                placed.push((mc, ma));
             }
         }
         out
@@ -464,6 +502,27 @@ mod tests {
             r.project(t0 + 64.0, 600.0).iter().any(|c| c.beam == 9),
             "pattern projects for a sparsely-fixed satellite",
         );
+    }
+
+    #[test]
+    fn unobserved_half_is_mirror_estimated() {
+        // A beam well off one cross-track side should project as a real cell
+        // and also be mirrored to an `estimated` cell on the opposite side, so
+        // the map sketches the unobserved half of the 48-beam pattern.
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(5, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(5, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
+        // Footprint ~4° east of the N–S track → ~330 km cross (> MIRROR_MIN).
+        r.observe(5, 16.0, ecef(41.2, -116.0, R_EARTH_KM), 20, t0 + 2.0);
+        r.observe(5, 16.0, ecef(41.2, -116.0, R_EARTH_KM), 20, t0 + 3.0);
+        let cells = r.project(t0 + 4.0, 60.0);
+        let real: Vec<_> = cells.iter().filter(|c| !c.estimated).collect();
+        let est: Vec<_> = cells.iter().filter(|c| c.estimated).collect();
+        assert!(real.iter().any(|c| c.beam == 20), "real beam projects");
+        assert_eq!(est.len(), 1, "one mirrored estimate for the off-track beam");
+        // The mirror lands on the opposite (west) side of the ground track.
+        assert!(est[0].lon < -121.0, "mirror is west of the track: {}", est[0].lon);
     }
 
     #[test]

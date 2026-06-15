@@ -45,16 +45,19 @@
   .silh, .silh svg { width: 100%; height: 100%; display: block; }
   .silh svg * { fill: currentColor !important; stroke: none !important; }
   .silh svg image { display: none !important; }
-  .leaflet-popup-content-wrapper { background: #16161e; color: #c8ccd4; border: 1px solid #2a2f41; border-radius: 6px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; box-shadow: 0 3px 14px rgba(0,0,0,0.5); }
-  .leaflet-popup-content { margin: 10px 12px; }
-  .leaflet-popup-tip { background: #16161e; border: 1px solid #2a2f41; }
-  .leaflet-popup-close-button { color: #565f89 !important; }
+  .leaflet-popup-content-wrapper { background: linear-gradient(180deg, #1a1f2e, #13161f); color: #c8ccd4; border: 1px solid #2a3147; border-radius: 8px; font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; box-shadow: 0 8px 28px rgba(0,0,0,0.6); }
+  .leaflet-popup-content { margin: 11px 14px; }
+  .leaflet-popup-tip { background: #13161f; border: 1px solid #2a3147; }
+  .leaflet-popup-close-button { color: #565f89 !important; padding: 6px 8px 0 0 !important; }
+  .leaflet-popup-close-button:hover { color: #c8ccd4 !important; }
   .pp { display: flex; gap: 12px; align-items: flex-start; min-width: 210px; }
   .pp .pic { width: 64px; height: 64px; flex: none; margin-top: 2px; }
-  .pp h3 { margin: 0 0 3px; font-size: 14px; color: #7aa2f7; }
+  .pp h3 { margin: 0 0 6px; padding-bottom: 5px; font-size: 14px; color: #7aa2f7; border-bottom: 1px solid #232a3d; letter-spacing: 0.02em; }
   .pp table { border-collapse: collapse; }
-  .pp td { padding: 0 8px 0 0; vertical-align: baseline; }
-  .pp td.k { color: #565f89; }
+  .pp td { padding: 1px 10px 1px 0; vertical-align: baseline; }
+  .pp td.k { color: #565f89; text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; padding-right: 12px; }
+  /* Explanatory footnote under a popup card (e.g. the satellite beam note). */
+  .note { margin-top: 8px; padding-top: 7px; border-top: 1px solid #232a3d; color: #8b93b3; font-size: 11px; line-height: 1.45; max-width: 260px; }
   #msgbar { display: flex; gap: 6px; padding: 6px 10px; border-bottom: 1px solid #1c2230; align-items: center; }
   #msgbar input { flex: 1; background: #11141c; border: 1px solid #2a2f41; border-radius: 4px; color: #c8ccd4; padding: 3px 8px; font: inherit; outline: none; }
   #msgbar button { background: #16161e; border: 1px solid #2a2f41; border-radius: 4px; color: #c8ccd4; padding: 3px 10px; font: inherit; cursor: pointer; }
@@ -244,10 +247,10 @@ function altColor(alt) {
 }
 const planeIcon = (trk, alt, sil) => sil
   ? L.divIcon({ className: '', html: silDiv(sil, altColor(alt), trk),
-      iconSize: [28, 28], iconAnchor: [14, 14] })
+      iconSize: [28, 28], iconAnchor: [14, 14], popupAnchor: [0, -18] })
   : L.divIcon({ className: '', html:
       `<div style="transform:rotate(${trk||0}deg);font-size:18px;color:${altColor(alt)}">&#9650;</div>`,
-      iconSize: [18, 18], iconAnchor: [9, 9] });
+      iconSize: [18, 18], iconAnchor: [9, 9], popupAnchor: [0, -12] });
 // Vessel category from the AIS ship-type code (ITU-R M.1371): a
 // label and a tint. Kept coarse — at marker size colour reads where
 // hull-shape detail can't. No suitable open vessel-silhouette set
@@ -273,7 +276,7 @@ const shipIcon = (cog, type) => {
     `<svg width="16" height="16" viewBox="0 0 24 24" style="transform:rotate(${cog||0}deg)">` +
     `<path d="M12 1 L18 9 L18 20 Q18 23 15 23 L9 23 Q6 23 6 20 L6 9 Z" ` +
     `fill="${color}" stroke="#0b0e14" stroke-width="1.5"/></svg>`,
-    iconSize: [16, 16], iconAnchor: [8, 8] });
+    iconSize: [16, 16], iconAnchor: [8, 8], popupAnchor: [0, -10] });
 };
 const IRIDIUM = '#73daca';
 // Spot-beam coverage cell: an Iridium spot beam covers ~400 km of ground
@@ -291,26 +294,46 @@ const FOOTPRINT_RADIUS_M = 2350000;
 const beamColor = b => `hsl(${((b || 0) * 360 / 48) | 0},70%,55%)`;
 const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
-  iconSize: [20, 20], iconAnchor: [10, 10] });
+  iconSize: [20, 20], iconAnchor: [10, 10], popupAnchor: [0, -14] });
 
 // Sync the optional Iridium layers from the state snapshot. Satellite
 // markers (with a faint ground track) and ring/beam footprint circles
 // are managed in their own layer groups, independent of the main marker
 // cull, and never contribute to the auto-fit bounds.
 function syncIridium(s) {
+  // Per-satellite beam tally (reconstructed vs mirrored estimate) for popups.
+  const beamStats = new Map();
+  for (const c of (s.iridium_beam_cells || [])) {
+    const st = beamStats.get(c.sat) || { seen: 0, est: 0 };
+    if (c.estimated) st.est++; else st.seen++;
+    beamStats.set(c.sat, st);
+  }
   const seenSat = new Set();
   for (const sat of (s.iridium_sats || [])) {
     seenSat.add(sat.sat);
     const name = sat.name || ('S' + String(sat.sat).padStart(2, '0'));
     const label = escapeHtml(name);
+    const bs = beamStats.get(sat.sat) || { seen: 0, est: 0 };
+    // Travel direction from the ground track (latitude trend).
+    const tr = sat.trail;
+    const heading = (tr && tr.length > 1)
+      ? (tr[tr.length - 1][0] >= tr[0][0] ? 'northbound ↑' : 'southbound ↓')
+      : null;
+    const note = bs.seen
+      ? '<div class="note">One ground station hears only the beams that sweep over it ' +
+        '(~half the 48). Faint grey cells are the unobserved side, mirrored from the ' +
+        'reconstructed pattern.</div>'
+      : '';
     const popup = entityPopup('', label, [
       ['satellite', sat.name ? escapeHtml(sat.name) : null],
       ['sat id', sat.sat],
-      ['beam', sat.beam],
+      ['active beam', sat.beam],
       ['position', `${sat.lat.toFixed(2)}, ${sat.lon.toFixed(2)}`],
       ['altitude', sat.alt != null ? `${sat.alt} km` : null],
+      ['heading', heading],
+      ['beams', bs.seen ? `${bs.seen}/48 reconstructed${bs.est ? ` · ${bs.est} estimated` : ''}` : null],
       ['seen', `${fmtAge(s.now - sat.seen)} ago`],
-    ]);
+    ]) + note;
     let e = satMarkers.get(sat.sat);
     if (!e) {
       e = { marker: L.marker([sat.lat, sat.lon], { icon: satIcon() }).addTo(satLayer) };
@@ -375,7 +398,7 @@ function syncIridium(s) {
       // (scales with zoom), coloured by beam id, labelled at its center.
       m = L.circle([r.lat, r.lon], { radius: rad, color: col, weight: 1, fillColor: col, fillOpacity: 0.08 }).addTo(ringLayer);
       m.bindTooltip(`B${r.beam}`, { permanent: true, direction: 'center', className: 'lbl' });
-      m.bindPopup(popup);
+      m.bindPopup(popup, { offset: [0, -6] });
       ringMarkers.set(key, m);
     } else {
       m.setLatLng([r.lat, r.lon]);
@@ -389,23 +412,26 @@ function syncIridium(s) {
     ringMarkers.delete(k);
   }
 
-  // Reconstructed beam pattern: the full set of reconstructed cells under
-  // each tracked satellite, each drawn at its reconstructed footprint radius
-  // (the scatter of its de-rotated observations, as iridium-toolkit's
-  // beam-plotter sizes each cell). Currently-illuminated beams (active)
-  // render bright in their per-beam colour; the rest of the pattern is kept
-  // but muted (faint dashed outline) so you see the whole pattern without it
-  // overpowering the live beams. Hover a satellite to light up its pattern.
+  // Reconstructed beam pattern under each tracked satellite, each cell at its
+  // reconstructed footprint radius. Currently-illuminated beams (active) render
+  // bright in their per-beam colour; reconstructed-but-idle beams are muted
+  // (faint dashed); **estimated** beams — the unobserved cross-track half,
+  // mirrored from the reconstructed beams so the full ~48-beam pattern shows —
+  // render fainter still in neutral grey. Hover/click a satellite to light its
+  // pattern.
   const seenCell = new Set();
   patternBySat.clear();
   for (const c of (s.iridium_beam_cells || [])) {
-    const key = c.sat + '-' + c.beam;
+    const est = !!c.estimated;
+    const key = c.sat + '-' + c.beam + (est ? '-e' : '');
     seenCell.add(key);
-    const col = beamColor(c.beam);
+    const col = est ? '#8b93b3' : beamColor(c.beam);
     const rad = c.radius_m || 200000;
-    const style = c.active
-      ? { color: col, fillColor: col, weight: 2, opacity: 0.85, fillOpacity: 0.28, dashArray: null }
-      : { color: col, fillColor: col, weight: 1, opacity: 0.35, fillOpacity: 0.03, dashArray: '2 5' };
+    const style = est
+      ? { color: col, fillColor: col, weight: 1, opacity: 0.25, fillOpacity: 0.015, dashArray: '1 6' }
+      : (c.active
+        ? { color: col, fillColor: col, weight: 2, opacity: 0.85, fillOpacity: 0.28, dashArray: null }
+        : { color: col, fillColor: col, weight: 1, opacity: 0.35, fillOpacity: 0.03, dashArray: '2 5' });
     let m = patternMarkers.get(key);
     if (!m) {
       m = L.circle([c.lat, c.lon], { radius: rad, ...style }).addTo(patternLayer);
@@ -416,7 +442,10 @@ function syncIridium(s) {
       m.setStyle(style);
     }
     m._base = style;
-    m.bindPopup(`pattern: sat ${c.sat} / beam ${c.beam}${c.active ? ' · active' : ' · muted'}`);
+    m.bindPopup(est
+      ? `sat ${c.sat} · estimated beam<br>mirror of the reconstructed pattern (this side is not heard from one station)`
+      : `sat ${c.sat} · beam ${c.beam}${c.active ? ' · active' : ' · reconstructed'}`,
+      { offset: [0, -4] });
     if (!patternBySat.has(c.sat)) patternBySat.set(c.sat, []);
     patternBySat.get(c.sat).push(m);
   }
@@ -442,7 +471,7 @@ function syncIridium(s) {
       m = L.circleMarker([dvc.lat, dvc.lon],
         { radius: 4, color: '#f59e0b', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.7 })
         .addTo(deviceLayer);
-      m.bindPopup(popup);
+      m.bindPopup(popup, { offset: [0, -6] });
       deviceMarkers.set(key, m);
     } else {
       m.setPopupContent(popup);
