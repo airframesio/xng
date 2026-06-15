@@ -73,11 +73,7 @@ const TIER_BOUND_KM: [f64; 5] = [0.0, 251.0, 547.0, 1109.0, 1841.0];
 /// would leave corner gaps). Real Iridium beams overlap this much — usable
 /// coverage runs well past the −3 dB contour — so coverage is contiguous and
 /// gap-free.
-const BEAM_OVERLAP_F: f64 = 1.45;
-/// A canonical slot counts as decoded (drawn solid) when a reconstructed beam
-/// sits within this distance of it; otherwise it renders faint as a
-/// not-yet-decoded beam.
-const DECODE_MATCH_KM: f64 = 280.0;
+const BEAM_OVERLAP_F: f64 = 1.5;
 /// A beam counts as "active" (currently illuminating, drawn bright) if this
 /// satellite was seen on it within this many seconds; older beams stay in
 /// the pattern but render muted.
@@ -132,16 +128,6 @@ fn lat_lon(p: [f64; 3]) -> (f64, f64) {
     (p[2].atan2((p[0] * p[0] + p[1] * p[1]).sqrt()), p[1].atan2(p[0]))
 }
 
-/// Which of the 4 concentric tiers a beam at ground distance `d` (km) from
-/// nadir belongs to (nearest tier radius).
-fn nearest_tier(d: f64) -> usize {
-    (0..4)
-        .min_by(|&a, &b| {
-            (d - TIER_RADIUS_KM[a]).abs().total_cmp(&(d - TIER_RADIUS_KM[b]).abs())
-        })
-        .unwrap()
-}
-
 /// A tier's beam footprint as (radial semi-axis, azimuthal semi-axis) in km.
 /// Radial = half the tier's radial band (so tiers tile inward/outward);
 /// azimuthal = half the chord to the adjacent beam in the same tier. Outer
@@ -149,7 +135,10 @@ fn nearest_tier(d: f64) -> usize {
 fn tier_axes(tier: usize) -> (f64, f64) {
     let r = TIER_RADIUS_KM[tier];
     let radial = (r - TIER_BOUND_KM[tier]).max(TIER_BOUND_KM[tier + 1] - r);
-    let azim = r * (std::f64::consts::PI / TIER_COUNT[tier] as f64).sin();
+    // Azimuthal half-width taken at the tier's OUTER edge — the widest part of
+    // the wedge-shaped cell — so the ellipse covers the outer corners where
+    // azimuthally-adjacent beams would otherwise leave a gap.
+    let azim = TIER_BOUND_KM[tier + 1] * (std::f64::consts::PI / TIER_COUNT[tier] as f64).sin();
     (radial * BEAM_OVERLAP_F, azim * BEAM_OVERLAP_F)
 }
 
@@ -398,57 +387,43 @@ impl BeamReconstructor {
                 }
             }
 
-            // Match each decoded beam to its single nearest canonical slot
-            // (within DECODE_MATCH_KM); those slots are then "decoded" and not
-            // redrawn as faint, so one decoded beam frees exactly one slot.
+            // Snap each decoded beam to its nearest canonical slot, then emit
+            // exactly one cell per slot so the 48 beams tile cleanly, gap-free.
+            // The canonical model is the accurate beam layout; the measured
+            // positions are noisy samples of it, so snapping removes the tiling
+            // gaps that scatter would cause. A slot with a beam assigned draws
+            // solid (and takes that beam's id/active state); the rest draw faint
+            // as not-yet-decoded.
             let slots = slots_at(phase);
-            let mut matched = vec![false; slots.len()];
-            for &(_, c, a) in &means {
-                let mut best = (DECODE_MATCH_KM, None);
+            let mut slot_beam = vec![0u8; slots.len()];
+            for &(b, c, a) in &means {
+                let mut bi = 0usize;
+                let mut bd = f64::INFINITY;
                 for (i, &(_, sc, sa)) in slots.iter().enumerate() {
-                    let d = ((c - sc).powi(2) + (a - sa).powi(2)).sqrt();
-                    if d < best.0 {
-                        best = (d, Some(i));
+                    let d = (c - sc).powi(2) + (a - sa).powi(2);
+                    if d < bd {
+                        bd = d;
+                        bi = i;
                     }
                 }
-                if let Some(i) = best.1 {
-                    matched[i] = true;
-                }
+                slot_beam[bi] = b;
             }
-            // Decoded beams: drawn solid at their measured positions, sized by
-            // the tier their distance-from-nadir falls in.
-            for &(beam, cross, along) in &means {
-                let (a_rad, b_az) = tier_axes(nearest_tier((cross * cross + along * along).sqrt()));
-                let active = t.seen_beams.get(&beam).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
-                let (lat, lon) = lat_lon(to_ecef(t.pos, cross, along, t.north));
-                out.push(Cell {
-                    sat,
-                    beam,
-                    lat: lat.to_degrees(),
-                    lon: lon.to_degrees(),
-                    radius_m: (a_rad + b_az) / 2.0 * 1000.0,
-                    poly: ellipse_poly(t.pos, t.north, cross, along, a_rad, b_az),
-                    active,
-                    decoded: true,
-                });
-            }
-            // Not-yet-decoded slots: every unmatched canonical slot, drawn
-            // faint so the full 48-beam pattern is visible.
             for (i, &(tier, sc, sa)) in slots.iter().enumerate() {
-                if matched[i] {
-                    continue;
-                }
+                let beam_id = slot_beam[i];
+                let decoded = beam_id != 0;
+                let active =
+                    decoded && t.seen_beams.get(&beam_id).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
                 let (a_rad, b_az) = tier_axes(tier);
                 let (lat, lon) = lat_lon(to_ecef(t.pos, sc, sa, t.north));
                 out.push(Cell {
                     sat,
-                    beam: 0,
+                    beam: beam_id,
                     lat: lat.to_degrees(),
                     lon: lon.to_degrees(),
                     radius_m: (a_rad + b_az) / 2.0 * 1000.0,
                     poly: ellipse_poly(t.pos, t.north, sc, sa, a_rad, b_az),
-                    active: false,
-                    decoded: false,
+                    active,
+                    decoded,
                 });
             }
         }
@@ -557,9 +532,11 @@ mod tests {
         assert_eq!(r.beams_known(), 1);
         let cells = r.project(t0 + 4.0, 60.0);
         let c = cells.iter().find(|c| c.beam == 12).expect("beam 12 projected");
-        // Re-projected under the same (still-current) satellite → original.
-        assert!((c.lat - 41.5).abs() < 0.1, "lat {}", c.lat);
-        assert!((c.lon - (-119.0)).abs() < 0.1, "lon {}", c.lon);
+        // Beam 12 snaps to its nearest canonical slot (the fit aligns that slot
+        // to the observation), so it lands near — not exactly on — the measured
+        // footprint, offset by the tier-radius snap.
+        assert!((c.lat - 41.5).abs() < 1.0, "lat {}", c.lat);
+        assert!((c.lon - (-119.0)).abs() < 1.0, "lon {}", c.lon);
     }
 
     #[test]
@@ -616,9 +593,8 @@ mod tests {
         r.observe(5, 16.0, ecef(41.2, -116.0, R_EARTH_KM), 20, t0 + 2.0);
         r.observe(5, 16.0, ecef(41.2, -116.0, R_EARTH_KM), 20, t0 + 3.0);
         let cells = r.project(t0 + 4.0, 60.0);
-        // 48-beam pattern: decoded beam frees its one nearest slot (48), or
-        // none if it's too far from any (49).
-        assert!((47..=49).contains(&cells.len()), "full pattern, got {}", cells.len());
+        // Exactly the 48-beam pattern (one cell per canonical slot).
+        assert_eq!(cells.len(), 48, "full 48-beam pattern");
         assert!(cells.iter().any(|c| c.decoded && c.beam == 20), "decoded beam is solid");
         assert!(cells.iter().any(|c| !c.decoded && c.beam == 0), "undecoded slots fill the rest");
         assert!(cells.iter().all(|c| c.poly.len() >= 8), "every beam has a footprint polygon");
@@ -688,7 +664,7 @@ mod tests {
         );
         for c in [inner, outer] {
             assert!(
-                (80_000.0..=450_000.0).contains(&c.radius_m),
+                (80_000.0..=600_000.0).contains(&c.radius_m),
                 "plausible footprint, got {}",
                 c.radius_m
             );
