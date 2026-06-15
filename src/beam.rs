@@ -25,6 +25,11 @@ const INC0_DEG: f64 = 84.0;
 /// A satellite's high-altitude fix is "current" for a footprint within
 /// this many seconds (matches beam-plotter's staleness gate).
 const FRESH_S: f64 = 10.0;
+/// Re-derive travel direction from two high fixes up to this far apart. A
+/// visible pass is monotonic in latitude, and ring-alerts can be sparse, so
+/// this is much wider than the footprint freshness gate — the sign of the
+/// z change between fixes a minute or two apart is still unambiguous.
+const DIR_RECOMPUTE_S: f64 = 120.0;
 /// A satellite's travel direction is stable across a whole pass, so once
 /// established it is kept (sticky) across high-fix gaps up to this long
 /// rather than reset to unknown on every gap — which otherwise leaves most
@@ -212,9 +217,15 @@ impl BeamReconstructor {
         match classify_altitude(alt_km) {
             AltClass::Satellite => {
                 let north = match self.tracks.get(&sat) {
-                    // Two fixes close together: recompute direction from the
-                    // climb/descent of the geocentric z component.
-                    Some(t) if time - t.time < FRESH_S => {
+                    // Any prior fix within the recompute window gives a
+                    // reliable heading: across a visible pass the satellite
+                    // moves monotonically in latitude, so the sign of the
+                    // geocentric-z change is unambiguous even for fixes a
+                    // minute or two apart. Requiring two fixes <10 s apart
+                    // (beam-plotter's gate) was too strict for the sparse
+                    // ring-alert rate here, leaving most satellites with no
+                    // direction (and therefore projecting no pattern).
+                    Some(t) if time - t.time < DIR_RECOMPUTE_S => {
                         let dz = ecef[2] - t.z_prev;
                         if dz > 0.0 {
                             1
@@ -420,6 +431,24 @@ mod tests {
         r2.observe(7, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 101.0);
         let cells = r2.project(t0 + 102.0, 60.0);
         assert!(cells.iter().any(|c| c.beam == 12), "reloaded beam did not project");
+    }
+
+    #[test]
+    fn direction_acquired_from_sparse_fixes() {
+        // Two high fixes 60 s apart (never <10 s apart) must still establish
+        // a heading, so a sparsely-seen satellite projects its pattern.
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(8, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(8, 780.0, ecef(46.0, -121.0, R_EARTH_KM + 780.0), 0, t0 + 60.0);
+        // Footprints close to the latest fix get recorded → beam known.
+        r.observe(8, 16.0, ecef(46.5, -120.0, R_EARTH_KM), 9, t0 + 62.0);
+        r.observe(8, 16.0, ecef(46.5, -120.0, R_EARTH_KM), 9, t0 + 63.0);
+        assert_eq!(r.beams_known(), 1, "sparse fixes still establish direction");
+        assert!(
+            r.project(t0 + 64.0, 600.0).iter().any(|c| c.beam == 9),
+            "pattern projects for a sparsely-fixed satellite",
+        );
     }
 
     #[test]
