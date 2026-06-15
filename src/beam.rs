@@ -53,6 +53,10 @@ const MIN_OBS: u32 = 2;
 /// clamped to a plausible beam footprint range.
 const CELL_RADIUS_MIN_KM: f64 = 40.0;
 const CELL_RADIUS_MAX_KM: f64 = 600.0;
+/// A beam counts as "active" (currently illuminating, drawn bright) if this
+/// satellite was seen on it within this many seconds; older beams stay in
+/// the pattern but render muted.
+const ACTIVE_WINDOW_S: f64 = 30.0;
 
 /// How an IRA altitude reading is interpreted.
 pub enum AltClass {
@@ -159,16 +163,22 @@ impl Pattern {
     }
 }
 
-/// Tracks each satellite's latest high-altitude fix and travel direction.
+/// Tracks each satellite's latest high-altitude fix and travel direction,
+/// plus when each of its beams was last seen illuminating the ground (so a
+/// projected cell can be marked active vs merely reconstructed).
 struct SatTrack {
     pos: [f64; 3],
     z_prev: f64,
     north: i8,
     time: f64,
+    /// beam id -> last footprint time observed for THIS satellite.
+    seen_beams: HashMap<u8, f64>,
 }
 
 /// One projected beam cell, with the reconstructed footprint radius (m) so
-/// the map can draw each beam at its actual extent.
+/// the map can draw each beam at its actual extent. `active` is true when
+/// this satellite was seen illuminating this beam within ACTIVE_WINDOW_S
+/// (so the map can brighten live beams and mute the rest of the pattern).
 #[derive(Serialize)]
 pub struct Cell {
     pub sat: u64,
@@ -176,6 +186,7 @@ pub struct Cell {
     pub lat: f64,
     pub lon: f64,
     pub radius_m: f64,
+    pub active: bool,
 }
 
 /// Live reconstructor: fed every ring-alert frame, accumulates the pattern,
@@ -218,16 +229,31 @@ impl BeamReconstructor {
                     // First fix or a long gap (likely a new pass): unknown.
                     _ => 0,
                 };
-                self.tracks.insert(sat, SatTrack { pos: ecef, z_prev: ecef[2], north, time });
+                // Preserve the per-beam observation history across fixes.
+                let e = self.tracks.entry(sat).or_insert_with(|| SatTrack {
+                    pos: ecef,
+                    z_prev: ecef[2],
+                    north,
+                    time,
+                    seen_beams: HashMap::new(),
+                });
+                e.pos = ecef;
+                e.z_prev = ecef[2];
+                e.north = north;
+                e.time = time;
             }
             AltClass::Footprint => {
-                if let Some(t) = self.tracks.get(&sat) {
-                    if t.north != 0 && time - t.time < FRESH_S {
-                        let (cross, along) = to_sat_frame(t.pos, ecef, t.north);
-                        let pat = if t.north < 0 { &mut self.south } else { &mut self.north };
-                        pat.add(beam, cross, along);
-                    }
+                // Read what we need from the track, then borrow the pattern.
+                let (north, pos) = match self.tracks.get(&sat) {
+                    Some(t) if t.north != 0 && time - t.time < FRESH_S => (t.north, t.pos),
+                    _ => return,
+                };
+                let (cross, along) = to_sat_frame(pos, ecef, north);
+                if let Some(t) = self.tracks.get_mut(&sat) {
+                    t.seen_beams.insert(beam, time); // mark this beam active
                 }
+                let pat = if north < 0 { &mut self.south } else { &mut self.north };
+                pat.add(beam, cross, along);
             }
             AltClass::Implausible => {}
         }
@@ -247,12 +273,17 @@ impl BeamReconstructor {
                 if let Some((cross, along, radius_km)) = pat.mean(beam, MIN_OBS) {
                     let e = to_ecef(t.pos, cross, along, t.north);
                     let (lat, lon) = lat_lon(e);
+                    let active = t
+                        .seen_beams
+                        .get(&beam)
+                        .is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
                     out.push(Cell {
                         sat,
                         beam,
                         lat: lat.to_degrees(),
                         lon: lon.to_degrees(),
                         radius_m: radius_km * 1000.0,
+                        active,
                     });
                 }
             }
@@ -412,6 +443,23 @@ mod tests {
         r.observe(3, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t2);
         r.observe(3, 16.0, ecef(40.5, -119.0, R_EARTH_KM), 14, t2 + 1.0);
         assert_eq!(r.beams_known(), 1, "no new beam after a direction reset");
+    }
+
+    #[test]
+    fn active_flag_reflects_recent_footprint() {
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(2, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(2, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
+        r.observe(2, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 7, t0 + 2.0);
+        r.observe(2, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 7, t0 + 3.0);
+        // Seen ~1 s ago → active.
+        let c = r.project(t0 + 4.0, 600.0).into_iter().find(|c| c.beam == 7).expect("beam 7");
+        assert!(c.active, "recently-seen beam must be active");
+        // Long past the active window but track still current → still in the
+        // pattern, but muted (inactive).
+        let c = r.project(t0 + 50.0, 600.0).into_iter().find(|c| c.beam == 7).expect("still present");
+        assert!(!c.active, "beam not seen for >30 s must be muted");
     }
 
     #[test]

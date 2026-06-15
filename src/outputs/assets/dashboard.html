@@ -122,7 +122,21 @@ map.on('overlayadd overlayremove', () => {
 const satMarkers = new Map();  // sat id -> {marker, trail}
 const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
 const patternMarkers = new Map(); // "sat-beam" -> projected pattern cell
+const patternBySat = new Map(); // sat id -> [pattern cell markers] (for hover link)
 const deviceMarkers = new Map(); // "lat,lon" -> terminal marker
+
+// Hover a satellite to light up its whole beam pattern (the visual link
+// between a satellite and the cells it projects); mouse-out restores each
+// cell to its active/muted base style.
+function highlightSatPattern(satId, on) {
+  const cells = patternBySat.get(satId);
+  if (!cells) return;
+  for (const m of cells) {
+    if (on && m._base) m.setStyle({ weight: m._base.weight + 2, opacity: 1,
+      fillOpacity: Math.min(m._base.fillOpacity + 0.18, 0.5) });
+    else if (m._base) m.setStyle(m._base);
+  }
+}
 
 // Aircraft silhouettes: PlaneWatch pw-silhouettes (CC BY-NC-SA 4.0,
 // used with permission). Resolved by ICAO type designator via the
@@ -256,6 +270,9 @@ function syncIridium(s) {
       e = { marker: L.marker([sat.lat, sat.lon], { icon: satIcon() }).addTo(satLayer) };
       e.marker.bindTooltip(label, { permanent: true, direction: 'right', offset: [10, 0], className: 'lbl' });
       e.marker.bindPopup(popup);
+      const sid = sat.sat; // link this satellite to its beam pattern on hover
+      e.marker.on('mouseover', () => highlightSatPattern(sid, true));
+      e.marker.on('mouseout', () => highlightSatPattern(sid, false));
       satMarkers.set(sat.sat, e);
     } else {
       e.marker.setLatLng([sat.lat, sat.lon]);
@@ -303,27 +320,36 @@ function syncIridium(s) {
     ringMarkers.delete(k);
   }
 
-  // Reconstructed beam pattern: all 48 cells projected under each tracked
-  // satellite. Each cell is drawn at its reconstructed footprint radius
+  // Reconstructed beam pattern: the full set of reconstructed cells under
+  // each tracked satellite, each drawn at its reconstructed footprint radius
   // (the scatter of its de-rotated observations, as iridium-toolkit's
-  // beam-plotter sizes each cell), with a sparse fill so the tiling reads
-  // under the spot-beam cells.
+  // beam-plotter sizes each cell). Currently-illuminated beams (active)
+  // render bright in their per-beam colour; the rest of the pattern is kept
+  // but muted (faint dashed outline) so you see the whole pattern without it
+  // overpowering the live beams. Hover a satellite to light up its pattern.
   const seenCell = new Set();
+  patternBySat.clear();
   for (const c of (s.iridium_beam_cells || [])) {
     const key = c.sat + '-' + c.beam;
     seenCell.add(key);
     const col = beamColor(c.beam);
     const rad = c.radius_m || 130000;
+    const style = c.active
+      ? { color: col, fillColor: col, weight: 2, opacity: 0.85, fillOpacity: 0.28, dashArray: null }
+      : { color: col, fillColor: col, weight: 1, opacity: 0.35, fillOpacity: 0.03, dashArray: '2 5' };
     let m = patternMarkers.get(key);
     if (!m) {
-      m = L.circle([c.lat, c.lon], { radius: rad, color: col, weight: 1, fillColor: col, fillOpacity: 0.05 }).addTo(patternLayer);
-      m.bindPopup(`pattern: sat ${c.sat} / beam ${c.beam}`);
+      m = L.circle([c.lat, c.lon], { radius: rad, ...style }).addTo(patternLayer);
       patternMarkers.set(key, m);
     } else {
       m.setLatLng([c.lat, c.lon]);
       m.setRadius(rad);
-      m.setStyle({ color: col, fillColor: col });
+      m.setStyle(style);
     }
+    m._base = style;
+    m.bindPopup(`pattern: sat ${c.sat} / beam ${c.beam}${c.active ? ' · active' : ' · muted'}`);
+    if (!patternBySat.has(c.sat)) patternBySat.set(c.sat, []);
+    patternBySat.get(c.sat).push(m);
   }
   for (const [k, m] of patternMarkers) if (!seenCell.has(k)) {
     patternLayer.removeLayer(m);
