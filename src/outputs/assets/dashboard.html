@@ -423,51 +423,37 @@ function syncIridium(s) {
     ringMarkers.delete(k);
   }
 
-  // Reconstructed beam pattern under each tracked satellite, each cell at its
-  // reconstructed footprint radius. Currently-illuminated beams (active) render
-  // bright in their per-beam colour; reconstructed-but-idle beams are muted
-  // (faint dashed); **estimated** beams — the unobserved cross-track half,
-  // mirrored from the reconstructed beams so the full ~48-beam pattern shows —
-  // render fainter still in neutral grey. Hover/click a satellite to light its
-  // pattern.
-  const seenCell = new Set();
+  // Beam pattern: the full 48-beam canonical pattern (4 concentric tiers)
+  // under each tracked satellite, each beam an elliptical footprint polygon
+  // sized per tier so neighbours overlap into contiguous coverage. Decoded
+  // beams render solid at their measured positions — bright when currently
+  // active, muted otherwise; not-yet-decoded slots render faint dashed grey,
+  // so the whole intended pattern shows plus exactly what's been heard.
+  // Polygons are cheap, so rebuild them each tick rather than diff.
   patternBySat.clear();
-  for (const c of (s.iridium_beam_cells || [])) {
-    const est = !!c.estimated;
-    const key = c.sat + '-' + c.beam + (est ? '-e' : '');
-    seenCell.add(key);
-    const col = est ? '#8b93b3' : beamColor(c.beam);
-    const rad = c.radius_m || 200000;
-    const style = est
-      ? { color: col, fillColor: col, weight: 1, opacity: 0.32, fillOpacity: 0.02, dashArray: '2 6' }
+  for (const m of patternMarkers.values()) patternLayer.removeLayer(m);
+  patternMarkers.clear();
+  (s.iridium_beam_cells || []).forEach((c, i) => {
+    if (!c.poly || c.poly.length < 3) return;
+    const col = c.decoded ? beamColor(c.beam) : '#8b93b3';
+    const style = !c.decoded
+      ? { color: col, fillColor: col, weight: 1, opacity: 0.30, fillOpacity: 0.03, dashArray: '2 5' }
       : (c.active
-        ? { color: col, fillColor: col, weight: 2, opacity: 0.85, fillOpacity: 0.28, dashArray: null }
-        : { color: col, fillColor: col, weight: 1, opacity: 0.35, fillOpacity: 0.03, dashArray: '2 5' });
-    let m = patternMarkers.get(key);
-    if (!m) {
-      m = L.circle([c.lat, c.lon], { radius: rad, ...style }).addTo(patternLayer);
-      patternMarkers.set(key, m);
-    } else {
-      m.setLatLng([c.lat, c.lon]);
-      m.setRadius(rad);
-      m.setStyle(style);
-    }
+        ? { color: col, fillColor: col, weight: 2, opacity: 0.9, fillOpacity: 0.30, dashArray: null }
+        : { color: col, fillColor: col, weight: 1, opacity: 0.5, fillOpacity: 0.07, dashArray: null });
+    const m = L.polygon(c.poly, style).addTo(patternLayer);
     m._base = style;
-    m.bindPopup(est
-      ? `sat ${c.sat} · estimated beam<br>mirror of the reconstructed pattern (this side is not heard from one station)`
-      : `sat ${c.sat} · beam ${c.beam}${c.active ? ' · active' : ' · reconstructed'}`,
+    m.bindPopup(c.decoded
+      ? `sat ${c.sat} · beam ${c.beam}${c.active ? ' · active' : ' · decoded'}`
+      : `sat ${c.sat} · beam not yet decoded (modelled from the 48-beam pattern)`,
       { offset: [0, -4] });
-    // Only reconstructed cells join the hover/pin highlight; estimates stay
-    // faint so the unobserved side never dominates.
-    if (!est) {
+    patternMarkers.set(c.sat + '-' + i, m);
+    // Only decoded beams join the hover/pin highlight.
+    if (c.decoded) {
       if (!patternBySat.has(c.sat)) patternBySat.set(c.sat, []);
       patternBySat.get(c.sat).push(m);
     }
-  }
-  for (const [k, m] of patternMarkers) if (!seenCell.has(k)) {
-    patternLayer.removeLayer(m);
-    patternMarkers.delete(k);
-  }
+  });
   // Re-apply a pinned satellite's highlight after the per-tick rebuild.
   if (pinnedSat !== null) highlightSatPattern(pinnedSat, true);
 

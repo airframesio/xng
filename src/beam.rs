@@ -53,26 +53,28 @@ const GROUND_ALT_MAX_KM: f64 = 200.0;
 /// mis-judged travel direction, so singletons are accumulated but not yet
 /// drawn.
 const MIN_OBS: u32 = 2;
-/// A beam's drawn ground radius is derived from the spacing to its nearest
-/// neighbouring beam (beams tile the footprint, so half the centre-to-centre
-/// spacing is the cell radius; Iridium beams overlap, so a little more than
-/// half). Clamped to a plausible single-beam footprint.
-const BEAM_OVERLAP: f64 = 0.62;
-const CELL_RADIUS_MIN_KM: f64 = 150.0;
-// A real Iridium beam footprint is ~150-200 km (iridium-sniffer); edge beams
-// project obliquely and run larger, so allow some headroom but not the full
-// across-pattern span.
-const CELL_RADIUS_MAX_KM: f64 = 300.0;
-/// Radius for a beam with no reconstructed neighbour yet (≈ footprint/48).
-const DEFAULT_BEAM_RADIUS_KM: f64 = 200.0;
-/// A single ground station only hears the beams that sweep over it (one
-/// cross-track side). To sketch the unobserved half toward the full 48-beam
-/// pattern, each reconstructed beam beyond this cross-track distance is
-/// mirrored across the ground track (cross → −cross) as an *estimated* cell.
-const MIRROR_MIN_CROSS_KM: f64 = 250.0;
-/// A mirrored estimate is dropped if a real (or already-mirrored) beam is
-/// already within this distance of the mirror point.
-const MIRROR_MERGE_KM: f64 = 250.0;
+/// Iridium's 48 beams are a fixed **4-tier concentric pattern** — 3 Main
+/// Mission Antennas, each painting a 16-beam sector (1+3+5+7), so the tiers
+/// hold 3 / 9 / 15 / 21 beams from the inner ring outward (structure per the
+/// MathWorks Satellite Communications Toolbox Iridium model, FCC filings).
+const TIER_COUNT: [usize; 4] = [3, 9, 15, 21];
+/// Each tier's ground radius from nadir (km), from the off-nadir boresight
+/// angles (~11° / 24° / 42° / 57°) projected from 780 km onto the Earth
+/// sphere. Calibrated so the outer tier matches the observed ~1480 km extent
+/// (the MathWorks example's 45°/834 km undershoots real coverage, which runs
+/// to ~8° elevation ≈ 57° off-nadir).
+const TIER_RADIUS_KM: [f64; 4] = [152.0, 351.0, 744.0, 1475.0];
+/// Radial band boundaries between tiers (km), midway between tier radii, with
+/// an outer edge symmetric to the inner gap. Used to size each beam's radial
+/// extent so adjacent tiers tile.
+const TIER_BOUND_KM: [f64; 5] = [0.0, 251.0, 547.0, 1109.0, 1841.0];
+/// Footprints are drawn a touch larger than touching so neighbours overlap,
+/// as real Iridium beams do for handoff (contiguous, gap-free coverage).
+const BEAM_OVERLAP_F: f64 = 1.06;
+/// A canonical slot counts as decoded (drawn solid) when a reconstructed beam
+/// sits within this distance of it; otherwise it renders faint as a
+/// not-yet-decoded beam.
+const DECODE_MATCH_KM: f64 = 280.0;
 /// A beam counts as "active" (currently illuminating, drawn bright) if this
 /// satellite was seen on it within this many seconds; older beams stay in
 /// the pattern but render muted.
@@ -125,6 +127,46 @@ fn rot_x(x: f64, y: f64, z: f64, a: f64) -> [f64; 3] {
 
 fn lat_lon(p: [f64; 3]) -> (f64, f64) {
     (p[2].atan2((p[0] * p[0] + p[1] * p[1]).sqrt()), p[1].atan2(p[0]))
+}
+
+/// Which of the 4 concentric tiers a beam at ground distance `d` (km) from
+/// nadir belongs to (nearest tier radius).
+fn nearest_tier(d: f64) -> usize {
+    (0..4)
+        .min_by(|&a, &b| {
+            (d - TIER_RADIUS_KM[a]).abs().total_cmp(&(d - TIER_RADIUS_KM[b]).abs())
+        })
+        .unwrap()
+}
+
+/// A tier's beam footprint as (radial semi-axis, azimuthal semi-axis) in km.
+/// Radial = half the tier's radial band (so tiers tile inward/outward);
+/// azimuthal = half the chord to the adjacent beam in the same tier. Outer
+/// tiers come out radially elongated, matching the real oblique projection.
+fn tier_axes(tier: usize) -> (f64, f64) {
+    let r = TIER_RADIUS_KM[tier];
+    let radial = (r - TIER_BOUND_KM[tier]).max(TIER_BOUND_KM[tier + 1] - r);
+    let azim = r * (std::f64::consts::PI / TIER_COUNT[tier] as f64).sin();
+    (radial * BEAM_OVERLAP_F, azim * BEAM_OVERLAP_F)
+}
+
+/// Build a beam's elliptical ground footprint (boundary lat/lon in degrees)
+/// for a beam centred at satellite-frame offset (cross, along): an ellipse
+/// with semi-major `a_rad` along the radial direction (nadir→beam) and
+/// semi-minor `b_az` across it, re-projected to ECEF then lat/lon.
+fn ellipse_poly(sat: [f64; 3], north: i8, cross: f64, along: f64, a_rad: f64, b_az: f64) -> Vec<(f64, f64)> {
+    let rmag = (cross * cross + along * along).sqrt().max(1.0);
+    let (urc, ura) = (cross / rmag, along / rmag); // radial unit (cross, along)
+    let (utc, uta) = (-ura, urc); // azimuthal unit (perpendicular)
+    (0..18)
+        .map(|p| {
+            let (s, c) = (std::f64::consts::TAU * p as f64 / 18.0).sin_cos();
+            let dc = a_rad * c * urc + b_az * s * utc;
+            let da = a_rad * c * ura + b_az * s * uta;
+            let (lat, lon) = lat_lon(to_ecef(sat, cross + dc, along + da, north));
+            (lat.to_degrees(), lon.to_degrees())
+        })
+        .collect()
 }
 
 /// De-rotate an ECEF footprint (km) into the satellite frame; returns the
@@ -201,15 +243,20 @@ struct SatTrack {
 #[derive(Serialize)]
 pub struct Cell {
     pub sat: u64,
+    /// Decoded beam id (1..=48), or 0 for a not-yet-decoded canonical slot.
     pub beam: u8,
     pub lat: f64,
     pub lon: f64,
+    /// Representative radius (m) — mean of the elliptical axes — kept for the
+    /// coverage-footprint disc and the spot-beam markers that reuse it.
     pub radius_m: f64,
+    /// Elliptical footprint boundary (lat, lon degrees), radially elongated
+    /// per the oblique projection so beams tile contiguously.
+    pub poly: Vec<(f64, f64)>,
     pub active: bool,
-    /// True for a beam this station has not actually decoded — a mirror of a
-    /// reconstructed beam across the ground track, drawn faintly so the map
-    /// conveys the full ~48-beam pattern (not just the observed half).
-    pub estimated: bool,
+    /// True when this station has actually decoded a beam at this slot; false
+    /// for a modelled (not-yet-decoded) slot, drawn faint.
+    pub decoded: bool,
 }
 
 /// Live reconstructor: fed every ring-alert frame, accumulates the pattern,
@@ -288,10 +335,29 @@ impl BeamReconstructor {
         }
     }
 
-    /// Project the reconstructed pattern under every satellite whose track
-    /// is current (within `max_age` s of `now`), returning all 48 cells per
-    /// satellite that have been reconstructed for that travel direction.
+    /// Project the full 48-beam pattern under every satellite whose track is
+    /// current. Beams we have decoded render at their measured positions; the
+    /// rest of the canonical 4-tier layout fills in as not-yet-decoded slots,
+    /// so the map shows the whole intended pattern, gap-free, plus exactly
+    /// what's been heard. Each beam is an elliptical footprint sized from its
+    /// tier so neighbours overlap into contiguous coverage.
     pub fn project(&self, now: f64, max_age: f64) -> Vec<Cell> {
+        let two_pi = std::f64::consts::TAU;
+        // The 48 canonical slot centres (cross, along) for a given azimuth
+        // phase, tier by tier (a small per-tier stagger breaks ring alignment).
+        let slots_at = |phase: f64| -> Vec<(usize, f64, f64)> {
+            let mut v = Vec::with_capacity(48);
+            for (tier, &n) in TIER_COUNT.iter().enumerate() {
+                let r = TIER_RADIUS_KM[tier];
+                let off = phase + tier as f64 * 0.35;
+                for k in 0..n {
+                    let psi = off + k as f64 * two_pi / n as f64;
+                    v.push((tier, r * psi.sin(), r * psi.cos()));
+                }
+            }
+            v
+        };
+
         let mut out = Vec::new();
         for (&sat, t) in &self.tracks {
             if t.north == 0 || now - t.time > max_age {
@@ -302,59 +368,85 @@ impl BeamReconstructor {
             let means: Vec<(u8, f64, f64)> = (1..=48u8)
                 .filter_map(|b| pat.mean(b, MIN_OBS).map(|(c, a)| (b, c, a)))
                 .collect();
-            // Mirror each off-axis reconstructed beam across the ground track to
-            // estimate the unobserved cross-track half (a single station never
-            // hears it), skipping any mirror that lands on a beam already placed.
-            let mut mirrors: Vec<(u8, f64, f64)> = Vec::new();
-            let mut placed: Vec<(f64, f64)> = means.iter().map(|&(_, c, a)| (c, a)).collect();
-            for &(beam, cross, along) in &means {
-                if cross.abs() < MIRROR_MIN_CROSS_KM {
-                    continue;
+
+            // Fit the canonical pattern's azimuth phase to the decoded beams
+            // (coarse search), so the modelled slots line up with what we've
+            // actually heard and the not-yet-decoded slots land in the gaps.
+            let mut phase = 0.0;
+            if !means.is_empty() {
+                let mut best = f64::INFINITY;
+                for s in 0..120 {
+                    let p = two_pi * s as f64 / 120.0;
+                    let slots = slots_at(p);
+                    let cost: f64 = means
+                        .iter()
+                        .map(|&(_, c, a)| {
+                            slots
+                                .iter()
+                                .map(|&(_, sc, sa)| (c - sc).powi(2) + (a - sa).powi(2))
+                                .fold(f64::INFINITY, f64::min)
+                                .sqrt()
+                        })
+                        .sum();
+                    if cost < best {
+                        best = cost;
+                        phase = p;
+                    }
                 }
-                let (mc, ma) = (-cross, along);
-                if placed.iter().any(|&(c, a)| ((c - mc).powi(2) + (a - ma).powi(2)).sqrt() < MIRROR_MERGE_KM) {
-                    continue;
-                }
-                mirrors.push((beam, mc, ma));
-                placed.push((mc, ma));
             }
-            // Per-beam ground radius from the spacing to the nearest neighbouring
-            // beam (across ALL cells — reconstructed + mirrored), a little over
-            // half so adjacent beams OVERLAP into contiguous coverage: Iridium is
-            // a cellular system with overlapping beams (handoff), and edge beams
-            // are spaced — and project — larger than nadir beams, so a single
-            // uniform size leaves false gaps. Clamped to the ~150-300 km real
-            // footprint scale; any remaining gap is a beam we have not mapped,
-            // not a true coverage hole. Takes `out` by ref so the closure
-            // doesn't conflict with the loops feeding it.
-            let push_cell = |out: &mut Vec<Cell>, beam: u8, cross: f64, along: f64, active: bool, estimated: bool| {
-                let nn = placed
-                    .iter()
-                    .map(|&(c, a)| ((cross - c).powi(2) + (along - a).powi(2)).sqrt())
-                    .filter(|&d| d > 1.0)
-                    .fold(f64::INFINITY, f64::min);
-                let radius_km = if nn.is_finite() {
-                    (nn * BEAM_OVERLAP).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM)
-                } else {
-                    DEFAULT_BEAM_RADIUS_KM
-                };
+
+            // Match each decoded beam to its single nearest canonical slot
+            // (within DECODE_MATCH_KM); those slots are then "decoded" and not
+            // redrawn as faint, so one decoded beam frees exactly one slot.
+            let slots = slots_at(phase);
+            let mut matched = vec![false; slots.len()];
+            for &(_, c, a) in &means {
+                let mut best = (DECODE_MATCH_KM, None);
+                for (i, &(_, sc, sa)) in slots.iter().enumerate() {
+                    let d = ((c - sc).powi(2) + (a - sa).powi(2)).sqrt();
+                    if d < best.0 {
+                        best = (d, Some(i));
+                    }
+                }
+                if let Some(i) = best.1 {
+                    matched[i] = true;
+                }
+            }
+            // Decoded beams: drawn solid at their measured positions, sized by
+            // the tier their distance-from-nadir falls in.
+            for &(beam, cross, along) in &means {
+                let (a_rad, b_az) = tier_axes(nearest_tier((cross * cross + along * along).sqrt()));
+                let active = t.seen_beams.get(&beam).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
                 let (lat, lon) = lat_lon(to_ecef(t.pos, cross, along, t.north));
                 out.push(Cell {
                     sat,
                     beam,
                     lat: lat.to_degrees(),
                     lon: lon.to_degrees(),
-                    radius_m: radius_km * 1000.0,
+                    radius_m: (a_rad + b_az) / 2.0 * 1000.0,
+                    poly: ellipse_poly(t.pos, t.north, cross, along, a_rad, b_az),
                     active,
-                    estimated,
+                    decoded: true,
                 });
-            };
-            for &(beam, cross, along) in &means {
-                let active = t.seen_beams.get(&beam).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
-                push_cell(&mut out, beam, cross, along, active, false);
             }
-            for &(beam, mc, ma) in &mirrors {
-                push_cell(&mut out, beam, mc, ma, false, true);
+            // Not-yet-decoded slots: every unmatched canonical slot, drawn
+            // faint so the full 48-beam pattern is visible.
+            for (i, &(tier, sc, sa)) in slots.iter().enumerate() {
+                if matched[i] {
+                    continue;
+                }
+                let (a_rad, b_az) = tier_axes(tier);
+                let (lat, lon) = lat_lon(to_ecef(t.pos, sc, sa, t.north));
+                out.push(Cell {
+                    sat,
+                    beam: 0,
+                    lat: lat.to_degrees(),
+                    lon: lon.to_degrees(),
+                    radius_m: (a_rad + b_az) / 2.0 * 1000.0,
+                    poly: ellipse_poly(t.pos, t.north, sc, sa, a_rad, b_az),
+                    active: false,
+                    decoded: false,
+                });
             }
         }
         out
@@ -510,24 +602,23 @@ mod tests {
     }
 
     #[test]
-    fn unobserved_half_is_mirror_estimated() {
-        // A beam well off one cross-track side should project as a real cell
-        // and also be mirrored to an `estimated` cell on the opposite side, so
-        // the map sketches the unobserved half of the 48-beam pattern.
+    fn full_pattern_fills_undecoded_slots() {
+        // The canonical 4-tier model projects all 48 beams: the decoded ones
+        // solid at their measured positions, the rest as faint not-yet-decoded
+        // slots — so the map always shows the whole intended pattern.
         let mut r = BeamReconstructor::new();
         let t0 = 1000.0;
         r.observe(5, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
         r.observe(5, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
-        // Footprint ~4° east of the N–S track → ~330 km cross (> MIRROR_MIN).
         r.observe(5, 16.0, ecef(41.2, -116.0, R_EARTH_KM), 20, t0 + 2.0);
         r.observe(5, 16.0, ecef(41.2, -116.0, R_EARTH_KM), 20, t0 + 3.0);
         let cells = r.project(t0 + 4.0, 60.0);
-        let real: Vec<_> = cells.iter().filter(|c| !c.estimated).collect();
-        let est: Vec<_> = cells.iter().filter(|c| c.estimated).collect();
-        assert!(real.iter().any(|c| c.beam == 20), "real beam projects");
-        assert_eq!(est.len(), 1, "one mirrored estimate for the off-track beam");
-        // The mirror lands on the opposite (west) side of the ground track.
-        assert!(est[0].lon < -121.0, "mirror is west of the track: {}", est[0].lon);
+        // 48-beam pattern: decoded beam frees its one nearest slot (48), or
+        // none if it's too far from any (49).
+        assert!((47..=49).contains(&cells.len()), "full pattern, got {}", cells.len());
+        assert!(cells.iter().any(|c| c.decoded && c.beam == 20), "decoded beam is solid");
+        assert!(cells.iter().any(|c| !c.decoded && c.beam == 0), "undecoded slots fill the rest");
+        assert!(cells.iter().all(|c| c.poly.len() >= 8), "every beam has a footprint polygon");
     }
 
     #[test]
@@ -571,30 +662,34 @@ mod tests {
     }
 
     #[test]
-    fn cell_radius_tracks_beam_spacing() {
-        // The drawn radius comes from the spacing to the nearest neighbouring
-        // beam (real ground coverage), clamped to a plausible beam size.
+    fn beam_footprint_sized_by_tier() {
+        // Footprints are sized by concentric tier: an outer beam (spaced and
+        // projected wider) gets a larger footprint than an inner beam.
         let mut r = BeamReconstructor::new();
         let t0 = 1000.0;
         r.observe(1, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
         r.observe(1, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
-        // Two beams ~330 km apart on the ground (4° of longitude at 41.5°N).
-        r.observe(1, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 5, t0 + 2.0);
-        r.observe(1, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 5, t0 + 3.0);
-        r.observe(1, 16.0, ecef(41.5, -123.0, R_EARTH_KM), 6, t0 + 4.0);
-        r.observe(1, 16.0, ecef(41.5, -123.0, R_EARTH_KM), 6, t0 + 5.0);
+        // Inner beam (~84 km from nadir) and an outer beam (~1170 km east).
+        r.observe(1, 16.0, ecef(41.0, -119.0, R_EARTH_KM), 5, t0 + 2.0);
+        r.observe(1, 16.0, ecef(41.0, -119.0, R_EARTH_KM), 5, t0 + 3.0);
+        r.observe(1, 16.0, ecef(41.0, -106.0, R_EARTH_KM), 6, t0 + 4.0);
+        r.observe(1, 16.0, ecef(41.0, -106.0, R_EARTH_KM), 6, t0 + 5.0);
         let cells = r.project(t0 + 6.0, 60.0);
-        let c5 = cells.iter().find(|c| c.beam == 5).expect("beam 5");
-        // Both within the clamp, and well above the old scatter-based size
-        // (which collapsed near-zero for repeated identical footprints).
-        for c in [c5] {
+        let inner = cells.iter().find(|c| c.beam == 5).expect("inner beam");
+        let outer = cells.iter().find(|c| c.beam == 6).expect("outer beam");
+        assert!(
+            outer.radius_m > inner.radius_m,
+            "outer-tier beam larger: {} vs {}",
+            outer.radius_m,
+            inner.radius_m
+        );
+        for c in [inner, outer] {
             assert!(
-                (150_000.0..=450_000.0).contains(&c.radius_m),
-                "radius in plausible beam range, got {}",
+                (80_000.0..=450_000.0).contains(&c.radius_m),
+                "plausible footprint, got {}",
                 c.radius_m
             );
         }
-        assert!(c5.radius_m > 150_000.0, "spaced neighbours give a real radius");
     }
 
     #[test]
