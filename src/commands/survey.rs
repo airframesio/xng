@@ -135,12 +135,31 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
         opts.duration_secs
     );
 
+    // Whole-command clock: --duration bounds the TOTAL run (gain sweep +
+    // survey loop), so the command never overruns what the user asked for.
+    // (Previously the sweep ran *before* this clock started, so a tune-gain
+    // survey always took duration + sweep time.)
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(opts.duration_secs);
+
     // ── Gain ───────────────────────────────────────────────────────────
     let mut sweep_rows = Vec::new();
     let (gain, gain_desc) = if opts.tune_gain && !abort.load(Ordering::Relaxed) {
-        let (g, rows) = sweep_gain(&opts, mode, rate, &groups, &abort)?;
-        sweep_rows = rows;
-        (Some(g), format!("{g} dB (swept)"))
+        // A failed, empty, or interrupted sweep must NOT sink the survey or
+        // its report — fall back to the requested gain / AGC and carry on.
+        match sweep_gain(&opts, mode, rate, &groups, &abort, deadline) {
+            Ok((g, rows)) => {
+                sweep_rows = rows;
+                (Some(g), format!("{g} dB (swept)"))
+            }
+            Err(e) => {
+                println!("gain sweep did not complete ({e}); continuing");
+                match opts.gain {
+                    Some(g) => (Some(g), format!("{g} dB (fixed)")),
+                    None => (None, "hardware AGC".to_string()),
+                }
+            }
+        }
     } else {
         match opts.gain {
             Some(g) => (Some(g), format!("{g} dB (fixed)")),
@@ -159,8 +178,6 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     };
 
     let mut acc: std::collections::BTreeMap<u64, ChanAcc> = Default::default();
-    let started = Instant::now();
-    let deadline = started + Duration::from_secs(opts.duration_secs);
     let mut next_interim = started + Duration::from_secs(opts.interim_secs);
     let mut gi = 0usize;
     let mut ever_ok = false;
@@ -329,12 +346,13 @@ fn sweep_gain(
     rate: f64,
     groups: &[(u64, Vec<u64>)],
     abort: &Arc<AtomicBool>,
+    deadline: Instant,
 ) -> anyhow::Result<(f64, Vec<SweepRow>)> {
     const LADDER: [f64; 5] = [12.0, 21.0, 30.0, 39.0, 48.0];
     let (center, group) =
         groups.iter().max_by_key(|(_, g)| g.len()).expect("at least one group");
     println!(
-        "gain sweep on {:.3} MHz window: {:?} dB, {}s each",
+        "gain sweep on {:.3} MHz window: {:?} dB, up to {}s each",
         *center as f64 / 1e6,
         LADDER,
         opts.tune_dwell_secs
@@ -346,9 +364,16 @@ fn sweep_gain(
         if abort.load(Ordering::Relaxed) {
             break;
         }
+        // Keep the whole command within --duration: cap each step to the
+        // time left and stop the sweep once the budget is spent.
+        let remaining = deadline.saturating_duration_since(Instant::now()).as_secs();
+        let dwell_secs = opts.tune_dwell_secs.min(remaining);
+        if dwell_secs == 0 {
+            break;
+        }
         // Let the device settle between rapid reopen cycles.
         std::thread::sleep(Duration::from_millis(500));
-        match dwell(&opts.sdr, Some(g), mode, rate, *center, group, opts.tune_dwell_secs, abort, &bus)
+        match dwell(&opts.sdr, Some(g), mode, rate, *center, group, dwell_secs, abort, &bus)
         {
             Ok(stats) => {
                 let frames: u64 = stats.iter().map(|s| s.1).sum();
