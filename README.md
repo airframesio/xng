@@ -78,7 +78,7 @@ second-class path — they get every xng output and the application layer.
 | Device | `--sdr` | Backend | Notes |
 |---|---|---|---|
 | RTL-SDR | `driver=rtlsdr` | SoapySDR | The budget workhorse for VHF (ACARS, VDL2, AIS) and — with an L-band antenna + LNA — Aero, STD-C, Iridium, ADS-B |
-| Airspy R2 / Mini | `driver=airspy` | **native** (libairspy, `--features airspy`) | 24 MHz–1.75 GHz, 12-bit; `serial=…` (hex) selects a unit, `bias=1` powers an LNA. Validated live (Mini: off-air ACARS at 6 MS/s) |
+| Airspy R2 / Mini | `driver=airspy` | **native** (libairspy, `--features airspy`) | 24 MHz–1.75 GHz, 12-bit; `serial=…` (hex) selects a unit, `bias=1` powers an LNA. Validated live (Mini: off-air ACARS at 6 MS/s; R2: full-band Iridium at 10 MS/s) |
 | Airspy HF+ / Discovery | `driver=airspyhf` | **native** (libairspyhf, `--features airspyhf`) | The classic HFDL receiver; 768 kS/s divides cleanly into every xng HF/VHF channel rate |
 | SDRplay (RSP series) | `driver=sdrplay` | SoapySDR | The Soapy module wraps the proprietary API |
 | Anything else | per its Soapy module | SoapySDR | HackRF, LimeSDR, USRP, BladeRF, … |
@@ -122,9 +122,9 @@ The binaries need `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf`
 for native Airspy):
 
 ```bash
-sudo apt install ./xng-0.14.0-arm64.deb    # pulls runtime deps
+sudo apt install ./xng-0.18.0-arm64.deb    # pulls runtime deps
 # or
-tar xzf xng-v0.14.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
+tar xzf xng-v0.18.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
 ```
 
 Multi-arch Docker images (amd64/arm64/armv7) are published per tag:
@@ -219,6 +219,13 @@ xng listen --sdr driver=rtlsdr --mode std-c -r 2400000 -c 1537.500M \
 # the capture center:
 xng listen --sdr driver=rtlsdr --mode iridium -r 2000000 -c 1626.000M \
     --channels 1626.000
+
+# Full-band Iridium on an Airspy R2 (native): 10 MS/s spans the whole
+# 1616–1626.5 MHz downlink in one capture (ring alerts included). The
+# wideband FFT + per-burst demod parallelize across cores; --decode-threads
+# sets the worker count (default: auto = all available cores):
+xng listen --sdr driver=airspy --mode iridium -r 10000000 -c 1622.000M \
+    --channels 1622.000 --decode-threads 8
 
 # Iridium, fixed channels: just the simplex ring-alert/messaging
 # frequencies (cheaper; live satellite positions every few seconds)
@@ -344,12 +351,24 @@ with **position trails** and altitude-colored icons, a click-to-focus
 **entity table**, countries from the ICAO/MID allocation tables,
 registrations/types from an optional `--aircraft-db` CSV
 (tar1090/Mictronics format), and a streaming message panel with
-per-mode **filter chips and live rates**, pause and text search, and
+per-mode **filter chips and live rates**, text search, and
 click-to-expand full decoded JSON for any message — the tar1090 /
 AIS-catcher-viewer experience, for every mode at once, with zero extra
-software. The header shows the station id and uptime. The page is
-embedded in the binary (CDN assets are SRI-pinned; RF-sourced strings
-are HTML-escaped).
+software. **Pause** freezes only the message list (the map, entity
+table and the open message details keep updating, and resuming catches
+the log up). The header shows the station id, the running **xng
+version**, and uptime, with a collapsible **SDR-status pane** (per
+session: SDR, mode, tuning, and a live/stale "last message" age). The
+page is embedded in the binary (CDN assets are SRI-pinned; RF-sourced
+strings are HTML-escaped).
+
+For **Iridium** the map adds toggleable overlays (cf. the
+iridium-toolkit live map): satellite positions with ground tracks and
+resolved names, targeted spot-beam footprints, the reconstructed
+**48-beam pattern** drawn under each satellite over its full intended
+~4700 km coverage footprint (click a satellite to pin its pattern), and
+self-reported mobile-terminal positions — each its own layer, visibility
+persisted.
 
 Aircraft on the map are drawn with type-specific silhouettes from
 [PlaneWatch pw-silhouettes](https://github.com/plane-watch/pw-silhouettes)
