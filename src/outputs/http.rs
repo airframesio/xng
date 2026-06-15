@@ -391,4 +391,41 @@ mod tests {
         assert_eq!(snap["iridium_rings"][0]["sat"], 77);
         assert_eq!(snap["iridium_rings"][0]["beam"], 5);
     }
+
+    fn mt_position(lat: f64, lon: f64) -> Message {
+        Message {
+            mode: Mode::Iridium,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 1_622_000_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: MessageBody::Iridium {
+                kind: "mt-position".into(),
+                details: json!({
+                    "type": "mt-position", "msg_type": "7605",
+                    "lat": lat, "lon": lon, "alt_km": 0,
+                }),
+            },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn maps_iridium_terminal_positions() {
+        let mut d = Dash::default();
+        update(&mut d, &mt_position(37.78, -122.50));
+        update(&mut d, &mt_position(37.781, -122.501)); // same ~0.01° cell → coalesces
+        update(&mut d, &mt_position(39.01, -123.79)); // distinct terminal
+        assert_eq!(d.iridium_devices.len(), 2, "two distinct terminal cells");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        assert_eq!(snap["iridium_devices"].as_array().unwrap().len(), 2);
+        // mt-position must NOT leak into the beam-footprint (spot beam) layer.
+        assert_eq!(snap["iridium_rings"].as_array().unwrap().len(), 0);
+    }
 }
