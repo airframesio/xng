@@ -199,6 +199,18 @@ impl SbdReassembler {
                 "payload_hex".into(),
                 json!(payload.iter().map(|b| format!("{b:02x}")).collect::<String>()),
             );
+            // SBD is a generic transport; most payloads are not ACARS (no
+            // 0x01 SOH) but device telemetry/status, often plain text (e.g.
+            // "ST_TXT:ID:01"). Surface a printable rendering so the content
+            // is legible, and flag when it's mostly text.
+            let printable = payload.iter().filter(|&&b| (0x20..0x7f).contains(&b)).count();
+            if printable * 2 >= payload.len() {
+                let text: String = payload
+                    .iter()
+                    .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+                    .collect();
+                hdr.insert("payload_text".into(), json!(text));
+            }
             return Some(SbdMessage {
                 kind: "sbd",
                 details: serde_json::Value::Object(hdr),
@@ -296,6 +308,18 @@ mod tests {
         assert!(m.details.get("imei").is_none(), "imei must be 0x20-only");
         assert!(m.details.get("momsn").is_none(), "momsn must be 0x20-only");
         assert_eq!(m.details["msg_count"], json!(9));
+    }
+
+    #[test]
+    fn sbd_text_payload_is_rendered() {
+        // A 7608 SBD whose body is a printable status text gets a readable
+        // payload_text (these are common — device status, not ACARS).
+        let mut data = vec![0x76, 0x08, 0x26, 0, 0, 0, 0, 0, 0];
+        data.extend_from_slice(b"ST_TXT:ID:01");
+        let m = SbdReassembler::parse_l2(&data, false).expect("sbd message");
+        assert_eq!(m.details["type"], json!("7608"));
+        assert_eq!(m.details["payload_text"], json!("ST_TXT:ID:01"));
+        assert!(m.acars.is_none(), "not ACARS (no 0x01 SOH)");
     }
 
     #[test]
