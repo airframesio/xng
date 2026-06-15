@@ -281,6 +281,7 @@ fn snapshot(d: &mut Dash) -> String {
     }
     json!({
         "station": d.station,
+        "version": env!("CARGO_PKG_VERSION"),
         "started": d.started,
         "sessions": d.sessions,
         "aircraft": d.aircraft.values().collect::<Vec<_>>(),
@@ -386,6 +387,7 @@ mod tests {
         assert_eq!(d.iridium_sats.len(), 1);
         assert_eq!(d.iridium_rings.len(), 1);
         let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        assert_eq!(snap["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(snap["iridium_sats"][0]["sat"], 44);
         assert_eq!(snap["iridium_sats"][0]["name"], "IRIDIUM 106");
         assert_eq!(snap["iridium_rings"][0]["sat"], 77);

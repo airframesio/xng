@@ -67,13 +67,35 @@
   .msg pre { margin: 6px 0 2px; padding: 6px 8px; background: #11141c; border: 1px solid #1c2230; border-radius: 4px; overflow-x: auto; font-size: 11px; color: #9aa5ce; cursor: text; }
   .leaflet-container { background: #0b0e14; }
   .lbl { background: #16161e; border: 1px solid #2a2f41; border-radius: 3px; color: #c8ccd4; padding: 1px 4px; font: 11px ui-monospace, monospace; white-space: nowrap; }
+  /* Running build, shown dim next to the station name in the header. */
+  #head .ver { color: #565f89; font-size: 11px; font-weight: 400; }
+  /* Collapsible SDR / receiver status pane (collapsed by default). */
+  #sdr { border-bottom: 1px solid #1c2230; flex: none; }
+  #sdrhdr { padding: 5px 12px; display: flex; align-items: baseline; gap: 6px; cursor: pointer; user-select: none; color: #8b93b3; }
+  #sdrhdr:hover { background: #11141c; }
+  #sdrhdr .tw { color: #565f89; width: 1em; display: inline-block; }
+  #sdrhdr .sub { color: #565f89; font-size: 11px; }
+  #sdrbody { padding: 2px 12px 8px 12px; }
+  #sdrbody[hidden] { display: none; }
+  #sdrbody table { width: 100%; border-collapse: collapse; }
+  #sdrbody td { padding: 1px 8px 1px 0; vertical-align: baseline; white-space: nowrap; }
+  #sdrbody td.k { color: #565f89; }
+  #sdrbody .sdrhead { color: #73daca; padding-top: 5px; }
+  #sdrbody .live { color: #9ece6a; }
+  #sdrbody .stale { color: #e0af68; }
+  /* Fixed-width icons so layer-control rows align despite emoji width. */
+  .lyr-ic { display: inline-block; width: 1.5em; text-align: center; font-style: normal; }
 </style>
 </head>
 <body>
 <div id="map"></div>
 <div id="hres" title="Drag to resize"></div>
 <div id="side">
-  <div id="head"><b id="station">xng station</b><span class="sub" id="status"></span></div>
+  <div id="head"><span><b id="station">xng station</b> <span class="ver" id="ver"></span></span><span class="sub" id="status"></span></div>
+  <div id="sdr">
+    <div id="sdrhdr" title="Show receiver / SDR status"><span class="tw" id="sdrtw">▸</span><span>SDR status</span><span class="sub" id="sdrsum"></span></div>
+    <div id="sdrbody" hidden></div>
+  </div>
   <div id="entities"></div>
   <div id="vres" title="Drag to resize"></div>
   <div id="logpane">
@@ -106,8 +128,8 @@ const patternLayer = L.layerGroup();
 // that report their own position — distinct from the beam footprints.
 const deviceLayer = L.layerGroup();
 L.control.layers(null,
-  { '🛰 Iridium satellites': satLayer, '◎ Spot beams': ringLayer,
-    '⬡ Beam pattern': patternLayer, '📟 Iridium terminals': deviceLayer },
+  { '<i class="lyr-ic">🛰</i>Iridium satellites': satLayer, '<i class="lyr-ic">◎</i>Spot beams': ringLayer,
+    '<i class="lyr-ic">⬡</i>Beam pattern': patternLayer, '<i class="lyr-ic">📟</i>Iridium terminals': deviceLayer },
   { position: 'topright', collapsed: false }).addTo(map);
 if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
 if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
@@ -123,6 +145,7 @@ const satMarkers = new Map();  // sat id -> {marker, trail}
 const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
 const patternMarkers = new Map(); // "sat-beam" -> projected pattern cell
 const patternBySat = new Map(); // sat id -> [pattern cell markers] (for hover link)
+const footprintMarkers = new Map(); // sat id -> full-footprint coverage disc
 const deviceMarkers = new Map(); // "lat,lon" -> terminal marker
 let pinnedSat = null; // satellite whose pattern stays highlighted (click)
 
@@ -130,12 +153,13 @@ let pinnedSat = null; // satellite whose pattern stays highlighted (click)
 // between a satellite and the cells it projects.
 function highlightSatPattern(satId, on) {
   const cells = patternBySat.get(satId);
-  if (!cells) return;
-  for (const m of cells) {
+  if (cells) for (const m of cells) {
     if (on && m._base) m.setStyle({ weight: m._base.weight + 2, opacity: 1,
       fillOpacity: Math.min(m._base.fillOpacity + 0.18, 0.5) });
     else if (m._base) m.setStyle(m._base);
   }
+  const fp = footprintMarkers.get(satId);
+  if (fp) fp.setStyle(on ? { opacity: 0.6, fillOpacity: 0.10 } : { opacity: 0.22, fillOpacity: 0.04 });
 }
 // Hover shows a satellite's pattern transiently; click pins it so it stays
 // shown (and ensures the beam-pattern layer is visible). Click again (or
@@ -258,6 +282,11 @@ const IRIDIUM = '#73daca';
 // beam-pattern cells size themselves per-beam from neighbour spacing; this
 // fixed radius is for the observed-footprint markers.
 const BEAM_RADIUS_M = 350000;
+// Full Iridium satellite footprint (~4700 km diameter): the 48 spot beams
+// tile this disc. A single ground station only reconstructs the beams that
+// sweep over it (one cross-track side, ~20 of 48), so the pattern looks
+// gappy; this faint disc shows the full intended coverage underneath.
+const FOOTPRINT_RADIUS_M = 2350000;
 const beamColor = b => `hsl(${((b || 0) * 360 / 48) | 0},70%,55%)`;
 const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
@@ -300,11 +329,26 @@ function syncIridium(s) {
       if (e.trail) e.trail.setLatLngs(sat.trail);
       else e.trail = L.polyline(sat.trail, { color: IRIDIUM, weight: 1, opacity: 0.4, dashArray: '3,4' }).addTo(satLayer);
     }
+    // Full-footprint coverage disc (in the beam-pattern layer, beneath the
+    // reconstructed cells): shows the intended ~4700 km coverage as one
+    // contiguous area so single-station gaps between observed beams don't
+    // read as missing coverage.
+    let fp = footprintMarkers.get(sat.sat);
+    if (!fp) {
+      fp = L.circle([sat.lat, sat.lon], { radius: FOOTPRINT_RADIUS_M, color: IRIDIUM,
+        weight: 1, opacity: 0.22, fillColor: IRIDIUM, fillOpacity: 0.04,
+        dashArray: '4 6', interactive: false }).addTo(patternLayer);
+      footprintMarkers.set(sat.sat, fp);
+    } else {
+      fp.setLatLng([sat.lat, sat.lon]);
+    }
   }
   for (const [k, e] of satMarkers) if (!seenSat.has(k)) {
     satLayer.removeLayer(e.marker);
     if (e.trail) satLayer.removeLayer(e.trail);
     satMarkers.delete(k);
+    const fp = footprintMarkers.get(k);
+    if (fp) { patternLayer.removeLayer(fp); footprintMarkers.delete(k); }
   }
 
   const seenRing = new Set();
@@ -403,8 +447,10 @@ function syncIridium(s) {
 }
 
 const markers = new Map(); // key -> {marker, trail}
+let state = null; // latest /api/state snapshot
 let fitted = false;
 let paused = false;
+let logMsgs = []; // log items currently shown; frozen in place while paused
 let selected = null; // entity key ('a'+icao / 'v'+mmsi)
 const hiddenModes = new Set();
 const expanded = new Set();
@@ -442,6 +488,16 @@ function setLogMin(min) {
   setTimeout(() => map.invalidateSize(), 50);
 }
 collapseBtn.onclick = () => setLogMin(!document.body.classList.contains('logmin'));
+
+// SDR / receiver status pane: collapsed by default, expand state persisted.
+function setSdrOpen(open) {
+  document.getElementById('sdrbody').hidden = !open;
+  document.getElementById('sdrtw').textContent = open ? '▾' : '▸';
+  localStorage.setItem('xng.sdr', open ? '1' : '0');
+  if (open && state) renderSdr(state);
+}
+document.getElementById('sdrhdr').onclick = () => setSdrOpen(document.getElementById('sdrbody').hidden);
+if (localStorage.getItem('xng.sdr') === '1') setSdrOpen(true);
 
 // Draggable pane sizes, persisted. The horizontal handle resizes the
 // side panel width; the vertical handle resizes the entities/log split.
@@ -532,6 +588,37 @@ function fmtUptime(s) {
   return h ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
 }
 
+// SDR / receiver status pane. The collapsed header always shows a one-line
+// summary; the body (built only when expanded) lists each session's SDR,
+// mode, tuning and per-mode liveness from last_seen.
+function renderSdr(s) {
+  const sess = s.sessions || [];
+  const n = sess.length;
+  document.getElementById('sdrsum').textContent =
+    n ? `${n} receiver${n > 1 ? 's' : ''} · ${[...new Set(sess.map(x => x.mode).filter(Boolean))].join(', ')}` : 'none';
+  const body = document.getElementById('sdrbody');
+  if (body.hidden) return; // skip the table build while collapsed
+  if (!n) { body.innerHTML = '<span class="sub">no active receivers</span>'; return; }
+  body.innerHTML = sess.map(se => {
+    const mode = se.mode || '';
+    const seen = (s.last_seen || {})[mode];
+    const age = seen != null ? s.now - seen : null;
+    const liveTxt = age == null ? '—'
+      : `<span class="${age < 30 ? 'live' : 'stale'}">${fmtAge(age)} ago</span>`;
+    const ch = Array.isArray(se.channels) ? se.channels.length : (se.channels || 1);
+    const rows = [
+      ['mode', escapeHtml(mode)],
+      ['center', se.center_mhz != null ? `${(+se.center_mhz).toFixed(3)} MHz` : null],
+      ['sample rate', se.sample_rate ? `${(se.sample_rate / 1e6).toFixed(1)} MS/s` : null],
+      ['channels', ch],
+      ['serial', se.serial ? escapeHtml(String(se.serial)) : null],
+      ['last msg', liveTxt],
+    ].filter(([, v]) => v != null && v !== '')
+      .map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('');
+    return `<table><tr><td class="sdrhead" colspan="2">${escapeHtml(se.sdr || 'SDR')}</td></tr>${rows}</table>`;
+  }).join('');
+}
+
 // msgs/min per mode over the last 60 s of samples.
 function rates() {
   const now = Date.now();
@@ -544,8 +631,6 @@ function rates() {
   for (const m of Object.keys(b)) r[m] = ((b[m] || 0) - (a[m] || 0)) / dt;
   return r;
 }
-
-let state = null;
 
 async function tick() {
   try {
@@ -610,10 +695,12 @@ function render() {
   if (!fitted && pts.length) { map.fitBounds(pts, { maxZoom: 9, padding: [40, 40] }); fitted = true; }
 
   if (s.station) document.getElementById('station').textContent = s.station;
+  document.getElementById('ver').textContent = s.version ? 'xng v' + s.version : '';
   const nsat = (s.iridium_sats || []).length;
   document.getElementById('status').textContent =
     `up ${fmtUptime(s.now - s.started)} · ${s.aircraft.length} aircraft · ${s.vessels.length} vessels` +
     (nsat ? ` · ${nsat} sats` : '');
+  renderSdr(s);
 
   const rate = rates();
   document.getElementById('chips').innerHTML = Object.entries(s.totals)
@@ -649,23 +736,26 @@ function render() {
     ? `<table><tr><th>id</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th><th>seen</th></tr>${rows.join('')}</table>`
     : '';
 
-  if (!paused) {
-    const q = document.getElementById('search').value.toLowerCase();
-    document.getElementById('msgs').innerHTML = s.messages
-      .filter(m => !hiddenModes.has(m.mode))
-      .filter(m => !q || m.text.toLowerCase().includes(q) || m.mode.includes(q))
-      .map(m => {
-        const c = modeColor(m.mode);
-        const det = expanded.has(m.id)
-          ? `<pre onclick="event.stopPropagation()">${escapeHtml(JSON.stringify(m.detail, null, 1))}</pre>`
-          : '';
-        return `<div class="msg" onclick="toggleMsg(${m.id})">` +
-          `<span class="meta">${m.t.slice(11, 19)}</span> ` +
-          `<span class="tag" style="background:${c}">${escapeHtml(m.mode)}</span> ` +
-          `<span class="meta">${(m.freq / 1e6).toFixed(3)}</span> ${escapeHtml(m.text)}${det}</div>`;
-      })
-      .join('');
-  }
+  // Pause freezes only which log items are listed: capture the live list
+  // while running, then always render from the captured list so message
+  // details still toggle while paused and resuming catches up to the
+  // latest. The map, entities table and chips above keep updating live.
+  if (!paused) logMsgs = s.messages;
+  const q = document.getElementById('search').value.toLowerCase();
+  document.getElementById('msgs').innerHTML = logMsgs
+    .filter(m => !hiddenModes.has(m.mode))
+    .filter(m => !q || m.text.toLowerCase().includes(q) || m.mode.includes(q))
+    .map(m => {
+      const c = modeColor(m.mode);
+      const det = expanded.has(m.id)
+        ? `<pre onclick="event.stopPropagation()">${escapeHtml(JSON.stringify(m.detail, null, 1))}</pre>`
+        : '';
+      return `<div class="msg" onclick="toggleMsg(${m.id})">` +
+        `<span class="meta">${m.t.slice(11, 19)}</span> ` +
+        `<span class="tag" style="background:${c}">${escapeHtml(m.mode)}</span> ` +
+        `<span class="meta">${(m.freq / 1e6).toFixed(3)}</span> ${escapeHtml(m.text)}${det}</div>`;
+    })
+    .join('');
 }
 function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
