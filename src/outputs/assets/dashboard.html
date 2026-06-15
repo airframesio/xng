@@ -428,7 +428,7 @@ function syncIridium(s) {
     const col = est ? '#8b93b3' : beamColor(c.beam);
     const rad = c.radius_m || 200000;
     const style = est
-      ? { color: col, fillColor: col, weight: 1, opacity: 0.25, fillOpacity: 0.015, dashArray: '1 6' }
+      ? { color: col, fillColor: col, weight: 1, opacity: 0.14, fillOpacity: 0, dashArray: '1 8' }
       : (c.active
         ? { color: col, fillColor: col, weight: 2, opacity: 0.85, fillOpacity: 0.28, dashArray: null }
         : { color: col, fillColor: col, weight: 1, opacity: 0.35, fillOpacity: 0.03, dashArray: '2 5' });
@@ -446,8 +446,12 @@ function syncIridium(s) {
       ? `sat ${c.sat} · estimated beam<br>mirror of the reconstructed pattern (this side is not heard from one station)`
       : `sat ${c.sat} · beam ${c.beam}${c.active ? ' · active' : ' · reconstructed'}`,
       { offset: [0, -4] });
-    if (!patternBySat.has(c.sat)) patternBySat.set(c.sat, []);
-    patternBySat.get(c.sat).push(m);
+    // Only reconstructed cells join the hover/pin highlight; estimates stay
+    // faint so the unobserved side never dominates.
+    if (!est) {
+      if (!patternBySat.has(c.sat)) patternBySat.set(c.sat, []);
+      patternBySat.get(c.sat).push(m);
+    }
   }
   for (const [k, m] of patternMarkers) if (!seenCell.has(k)) {
     patternLayer.removeLayer(m);

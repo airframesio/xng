@@ -299,22 +299,34 @@ impl BeamReconstructor {
             let means: Vec<(u8, f64, f64)> = (1..=48u8)
                 .filter_map(|b| pat.mean(b, MIN_OBS).map(|(c, a)| (b, c, a)))
                 .collect();
-            // Emit one cell, sizing its radius from the spacing to the nearest
-            // neighbouring beam (beams tile the footprint, so a little over
-            // half the centre-to-centre spacing is the cell's real ground
-            // coverage). Takes `out` by ref so the closure doesn't conflict
+            // One uniform cell radius for the whole pattern, from the MEDIAN
+            // nearest-neighbour spacing of the reconstructed beams (× overlap,
+            // clamped). Beams tile the footprint at roughly one size, so a
+            // single representative radius keeps every cell consistent —
+            // reconstructed, mirrored estimate, and the spot-beam markers that
+            // reuse these radii. (Per-cell nearest-neighbour sizing made the
+            // mirrored cells balloon to the clamp, since their nearest *real*
+            // neighbour sits clear across the pattern.)
+            let mut nns: Vec<f64> = means
+                .iter()
+                .map(|&(beam, cross, along)| {
+                    means
+                        .iter()
+                        .filter(|&&(b2, _, _)| b2 != beam)
+                        .map(|&(_, c2, a2)| ((cross - c2).powi(2) + (along - a2).powi(2)).sqrt())
+                        .fold(f64::INFINITY, f64::min)
+                })
+                .filter(|x| x.is_finite())
+                .collect();
+            nns.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let radius_km = if nns.is_empty() {
+                DEFAULT_BEAM_RADIUS_KM
+            } else {
+                (nns[nns.len() / 2] * BEAM_OVERLAP).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM)
+            };
+            // Emit one cell. Takes `out` by ref so the closure doesn't conflict
             // with the loops feeding it.
             let emit = |out: &mut Vec<Cell>, beam: u8, cross: f64, along: f64, active: bool, estimated: bool| {
-                let nn = means
-                    .iter()
-                    .filter(|&&(b2, _, _)| b2 != beam)
-                    .map(|&(_, c2, a2)| ((cross - c2).powi(2) + (along - a2).powi(2)).sqrt())
-                    .fold(f64::INFINITY, f64::min);
-                let radius_km = if nn.is_finite() {
-                    (nn * BEAM_OVERLAP).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM)
-                } else {
-                    DEFAULT_BEAM_RADIUS_KM
-                };
                 let (lat, lon) = lat_lon(to_ecef(t.pos, cross, along, t.north));
                 out.push(Cell {
                     sat,
