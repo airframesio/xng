@@ -27,6 +27,12 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
+    /// Decode worker threads for parallel channelization / burst demod
+    /// (Iridium wideband FFT + per-burst extract, and other parallel decode
+    /// paths). Default: auto — all available CPU cores.
+    #[arg(long, global = true)]
+    decode_threads: Option<usize>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -543,6 +549,20 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
     tracing::info!("xng v{}", env!("CARGO_PKG_VERSION"));
+
+    // Size the decode worker pool (parallel channelization / burst demod).
+    // Left unset, rayon lazily uses all logical cores ("auto"); an explicit
+    // --decode-threads pins the count. build_global is one-shot, so only
+    // call it when overriding.
+    if let Some(n) = cli.decode_threads {
+        let n = n.max(1);
+        if rayon::ThreadPoolBuilder::new().num_threads(n).build_global().is_ok() {
+            tracing::info!("decode worker threads: {n}");
+        }
+    } else {
+        let auto = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+        tracing::info!("decode worker threads: auto ({auto} cores)");
+    }
 
     match cli.command {
         Command::Devices { filter } => commands::devices::run(&filter),
