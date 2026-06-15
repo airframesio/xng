@@ -37,6 +37,10 @@ struct Dash {
     iridium_sats: HashMap<u64, Value>,
     /// Iridium ring/beam ground footprints, keyed by "sat-beam".
     iridium_rings: HashMap<String, Value>,
+    /// Iridium mobile-terminal positions (vessels/aircraft/handhelds that
+    /// report their own ECEF), keyed by quantized lat/lon so a stationary
+    /// terminal coalesces and a moving one leaves recent fixes.
+    iridium_devices: HashMap<String, Value>,
     /// Reconstructed 48-beam pattern, projected under tracked satellites.
     beams: crate::beam::BeamReconstructor,
     /// Last unix-secs the beam pattern was persisted.
@@ -220,6 +224,26 @@ fn update(d: &mut Dash, m: &Message) {
                 }
             }
         }
+        // Mobile-terminal self-reported positions: the actual Iridium
+        // customer terminals (vessels/aircraft/handhelds), distinct from the
+        // ring-alert beam footprints above.
+        MessageBody::Iridium { kind, details } if kind == "mt-position" => {
+            if let (Some(lat), Some(lon)) = (
+                details.get("lat").and_then(Value::as_f64),
+                details.get("lon").and_then(Value::as_f64),
+            ) {
+                let key = format!("{lat:.2},{lon:.2}");
+                let e = d.iridium_devices.entry(key).or_insert_with(|| json!({}));
+                let o = e.as_object_mut().unwrap();
+                o.insert("lat".into(), json!(lat));
+                o.insert("lon".into(), json!(lon));
+                o.insert("alt_km".into(), json!(details.get("alt_km").and_then(Value::as_i64).unwrap_or(0)));
+                if let Some(mt) = details.get("msg_type") {
+                    o.insert("msg_type".into(), mt.clone());
+                }
+                o.insert("seen".into(), json!(now_s()));
+            }
+        }
         _ => {}
     }
 
@@ -248,6 +272,7 @@ fn snapshot(d: &mut Dash) -> String {
     let ring_cut = now_s().saturating_sub(RING_EXPIRE_S);
     d.iridium_sats.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= sat_cut);
     d.iridium_rings.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
+    d.iridium_devices.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
     // Persist the accumulated beam pattern occasionally so it survives
     // restarts and keeps refining across sessions.
     if now_s().saturating_sub(d.beams_saved) > 120 {
@@ -262,6 +287,7 @@ fn snapshot(d: &mut Dash) -> String {
         "vessels": d.vessels.values().collect::<Vec<_>>(),
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
+        "iridium_devices": d.iridium_devices.values().collect::<Vec<_>>(),
         "iridium_beam_cells": d.beams.project(now_s() as f64, SAT_EXPIRE_S as f64),
         "messages": d.recent.iter().rev().take(100).collect::<Vec<_>>(),
         "totals": d.totals,

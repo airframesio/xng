@@ -102,20 +102,27 @@ const ringLayer = L.layerGroup();
 // Beam pattern: the full reconstructed 48-cell pattern projected under each
 // tracked satellite (off by default — a denser power-user view).
 const patternLayer = L.layerGroup();
+// Mobile terminals: Iridium customer devices (vessels/aircraft/handhelds)
+// that report their own position — distinct from the beam footprints.
+const deviceLayer = L.layerGroup();
 L.control.layers(null,
-  { '🛰 Iridium satellites': satLayer, '◎ Spot beams': ringLayer, '⬡ Beam pattern': patternLayer },
+  { '🛰 Iridium satellites': satLayer, '◎ Spot beams': ringLayer,
+    '⬡ Beam pattern': patternLayer, '📟 Iridium terminals': deviceLayer },
   { position: 'topright', collapsed: false }).addTo(map);
 if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
 if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
 if (localStorage.getItem('xng.patternLayer') === '1') patternLayer.addTo(map);
+if (localStorage.getItem('xng.deviceLayer') !== '0') deviceLayer.addTo(map);
 map.on('overlayadd overlayremove', () => {
   localStorage.setItem('xng.satLayer', map.hasLayer(satLayer) ? '1' : '0');
   localStorage.setItem('xng.ringLayer', map.hasLayer(ringLayer) ? '1' : '0');
   localStorage.setItem('xng.patternLayer', map.hasLayer(patternLayer) ? '1' : '0');
+  localStorage.setItem('xng.deviceLayer', map.hasLayer(deviceLayer) ? '1' : '0');
 });
 const satMarkers = new Map();  // sat id -> {marker, trail}
 const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
 const patternMarkers = new Map(); // "sat-beam" -> projected pattern cell
+const deviceMarkers = new Map(); // "lat,lon" -> terminal marker
 
 // Aircraft silhouettes: PlaneWatch pw-silhouettes (CC BY-NC-SA 4.0,
 // used with permission). Resolved by ICAO type designator via the
@@ -321,6 +328,32 @@ function syncIridium(s) {
   for (const [k, m] of patternMarkers) if (!seenCell.has(k)) {
     patternLayer.removeLayer(m);
     patternMarkers.delete(k);
+  }
+
+  // Iridium mobile terminals: customer devices that reported their own
+  // position (the real device locations, vs the beam footprints above).
+  const seenDev = new Set();
+  for (const dvc of (s.iridium_devices || [])) {
+    const key = dvc.lat.toFixed(2) + ',' + dvc.lon.toFixed(2);
+    seenDev.add(key);
+    const alt = dvc.alt_km || 0;
+    const popup = `Iridium terminal<br>${dvc.lat.toFixed(3)}, ${dvc.lon.toFixed(3)}` +
+      (alt > 2 ? `<br>alt ~${alt} km` : '') +
+      (dvc.msg_type ? `<br>msg ${dvc.msg_type}` : '');
+    let m = deviceMarkers.get(key);
+    if (!m) {
+      m = L.circleMarker([dvc.lat, dvc.lon],
+        { radius: 4, color: '#f59e0b', weight: 2, fillColor: '#f59e0b', fillOpacity: 0.7 })
+        .addTo(deviceLayer);
+      m.bindPopup(popup);
+      deviceMarkers.set(key, m);
+    } else {
+      m.setPopupContent(popup);
+    }
+  }
+  for (const [k, m] of deviceMarkers) if (!seenDev.has(k)) {
+    deviceLayer.removeLayer(m);
+    deviceMarkers.delete(k);
   }
 }
 
