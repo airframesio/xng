@@ -53,11 +53,15 @@ const GROUND_ALT_MAX_KM: f64 = 200.0;
 /// mis-judged travel direction, so singletons are accumulated but not yet
 /// drawn.
 const MIN_OBS: u32 = 2;
-/// Bounds on a reconstructed cell's drawn radius (km). A single Iridium
-/// spot beam covers a few hundred km, so the scatter-derived size is
-/// clamped to a plausible beam footprint range.
-const CELL_RADIUS_MIN_KM: f64 = 40.0;
-const CELL_RADIUS_MAX_KM: f64 = 600.0;
+/// A beam's drawn ground radius is derived from the spacing to its nearest
+/// neighbouring beam (beams tile the footprint, so half the centre-to-centre
+/// spacing is the cell radius; Iridium beams overlap, so a little more than
+/// half). Clamped to a plausible single-beam footprint.
+const BEAM_OVERLAP: f64 = 0.62;
+const CELL_RADIUS_MIN_KM: f64 = 150.0;
+const CELL_RADIUS_MAX_KM: f64 = 450.0;
+/// Radius for a beam with no reconstructed neighbour yet (≈ footprint/48).
+const DEFAULT_BEAM_RADIUS_KM: f64 = 340.0;
 /// A beam counts as "active" (currently illuminating, drawn bright) if this
 /// satellite was seen on it within this many seconds; older beams stay in
 /// the pattern but render muted.
@@ -154,17 +158,16 @@ impl Pattern {
         e.2 += cross * cross + along * along;
         e.3 += 1;
     }
-    /// Mean (cross, along) offset for a beam and its footprint radius (km),
-    /// but only once it has at least `min` observations (confidence gate).
-    /// The radius is ~2σ of the radial scatter — the live-map analogue of
-    /// beam-plotter's per-cell circle — clamped to a plausible beam size.
-    fn mean(&self, beam: u8, min: u32) -> Option<(f64, f64, f64)> {
-        let &(sx, sy, sq, n) = self.cells.get(&beam).filter(|c| c.3 >= min)?;
+    /// Mean (cross, along) offset for a beam, once it has at least `min`
+    /// observations (confidence gate). The drawn footprint radius is derived
+    /// in `project` from the spacing to neighbouring beams (actual coverage),
+    /// not from this scatter, so the cell tiles the footprint as a real beam
+    /// does rather than collapsing to the reconstruction's tightness.
+    fn mean(&self, beam: u8, min: u32) -> Option<(f64, f64)> {
+        let &(sx, sy, _sq, n) = self.cells.get(&beam).filter(|c| c.3 >= min)?;
         let n = n as f64;
         let (mx, my) = (sx / n, sy / n);
-        let radial_var = (sq / n - (mx * mx + my * my)).max(0.0);
-        let radius = (2.0 * radial_var.sqrt()).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM);
-        Some((mx, my, radius))
+        Some((mx, my))
     }
 }
 
@@ -280,23 +283,35 @@ impl BeamReconstructor {
                 continue;
             }
             let pat = if t.north < 0 { &self.south } else { &self.north };
-            for beam in 1..=48u8 {
-                if let Some((cross, along, radius_km)) = pat.mean(beam, MIN_OBS) {
-                    let e = to_ecef(t.pos, cross, along, t.north);
-                    let (lat, lon) = lat_lon(e);
-                    let active = t
-                        .seen_beams
-                        .get(&beam)
-                        .is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
-                    out.push(Cell {
-                        sat,
-                        beam,
-                        lat: lat.to_degrees(),
-                        lon: lon.to_degrees(),
-                        radius_m: radius_km * 1000.0,
-                        active,
-                    });
-                }
+            // Confident beam means for this direction (cross, along) in km.
+            let means: Vec<(u8, f64, f64)> = (1..=48u8)
+                .filter_map(|b| pat.mean(b, MIN_OBS).map(|(c, a)| (b, c, a)))
+                .collect();
+            for &(beam, cross, along) in &means {
+                // Radius = a little over half the distance to the nearest
+                // neighbouring beam, so cells tile the footprint at the beam's
+                // real ground coverage (not the reconstruction's tightness).
+                let nn = means
+                    .iter()
+                    .filter(|&&(b2, _, _)| b2 != beam)
+                    .map(|&(_, c2, a2)| ((cross - c2).powi(2) + (along - a2).powi(2)).sqrt())
+                    .fold(f64::INFINITY, f64::min);
+                let radius_km = if nn.is_finite() {
+                    (nn * BEAM_OVERLAP).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM)
+                } else {
+                    DEFAULT_BEAM_RADIUS_KM
+                };
+                let e = to_ecef(t.pos, cross, along, t.north);
+                let (lat, lon) = lat_lon(e);
+                let active = t.seen_beams.get(&beam).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
+                out.push(Cell {
+                    sat,
+                    beam,
+                    lat: lat.to_degrees(),
+                    lon: lon.to_degrees(),
+                    radius_m: radius_km * 1000.0,
+                    active,
+                });
             }
         }
         out
@@ -492,25 +507,30 @@ mod tests {
     }
 
     #[test]
-    fn cell_radius_reflects_observation_spread() {
-        // A tightly-clustered beam draws at the minimum radius; a beam whose
-        // footprints scatter draws wider (beam-plotter's per-cell extent).
+    fn cell_radius_tracks_beam_spacing() {
+        // The drawn radius comes from the spacing to the nearest neighbouring
+        // beam (real ground coverage), clamped to a plausible beam size.
         let mut r = BeamReconstructor::new();
         let t0 = 1000.0;
         r.observe(1, 780.0, ecef(40.0, -120.0, R_EARTH_KM + 780.0), 0, t0);
         r.observe(1, 780.0, ecef(41.0, -120.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
-        // beam 5: identical footprints → ~zero spread → min radius.
+        // Two beams ~330 km apart on the ground (4° of longitude at 41.5°N).
         r.observe(1, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 5, t0 + 2.0);
         r.observe(1, 16.0, ecef(41.5, -119.0, R_EARTH_KM), 5, t0 + 3.0);
-        // beam 6: separated footprints → larger radius.
-        r.observe(1, 16.0, ecef(41.0, -119.0, R_EARTH_KM), 6, t0 + 4.0);
-        r.observe(1, 16.0, ecef(42.0, -118.0, R_EARTH_KM), 6, t0 + 5.0);
+        r.observe(1, 16.0, ecef(41.5, -123.0, R_EARTH_KM), 6, t0 + 4.0);
+        r.observe(1, 16.0, ecef(41.5, -123.0, R_EARTH_KM), 6, t0 + 5.0);
         let cells = r.project(t0 + 6.0, 60.0);
         let c5 = cells.iter().find(|c| c.beam == 5).expect("beam 5");
-        let c6 = cells.iter().find(|c| c.beam == 6).expect("beam 6");
-        assert!((c5.radius_m - 40_000.0).abs() < 1.0, "tight → min, got {}", c5.radius_m);
-        assert!(c6.radius_m > c5.radius_m, "spread wider: {} vs {}", c6.radius_m, c5.radius_m);
-        assert!(c6.radius_m <= 600_000.0, "radius capped, got {}", c6.radius_m);
+        // Both within the clamp, and well above the old scatter-based size
+        // (which collapsed near-zero for repeated identical footprints).
+        for c in [c5] {
+            assert!(
+                (150_000.0..=450_000.0).contains(&c.radius_m),
+                "radius in plausible beam range, got {}",
+                c.radius_m
+            );
+        }
+        assert!(c5.radius_m > 150_000.0, "spaced neighbours give a real radius");
     }
 
     #[test]
