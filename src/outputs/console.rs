@@ -159,28 +159,114 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                 }
                 MessageBody::Iridium { kind, details } => {
                     let mut s = format!("IRIDIUM {kind}");
-                    if let Some(ric) = details.pointer("/body/ric").or_else(|| details.get("ric")) {
-                        s.push_str(&format!(" ric={ric}"));
+                    let g = |k: &str| details.get(k);
+                    let gs = |k: &str| details.get(k).and_then(|v| v.as_str());
+
+                    // Sub-frame classification — the single most useful label.
+                    // IP-channel bursts decode to IIP/IIQ/IIR/IIU and voice
+                    // bursts to VOC/VDA/VO6/VOD/VOZ; surface it right after the
+                    // kind so "ip-data"/"voice" stop reading as opaque.
+                    for key in ["ip_frame", "voice_type"] {
+                        if let Some(v) = gs(key) {
+                            s.push_str(&format!(" {v}"));
+                        }
                     }
-                    if let Some(t) = details
-                        .pointer("/body/text")
-                        .or_else(|| details.get("text"))
-                        .and_then(|v| v.as_str())
-                    {
-                        s.push_str(&format!(" | {t}"));
+                    // IP / VDA ARQ header type (ack-idle / data).
+                    if let Some(t) = gs("ip_type") {
+                        s.push_str(&format!(" {t}"));
                     }
+                    // Satellite / beam (IRA ring alerts, IBC broadcast).
                     for key in ["sat", "beam"] {
-                        if let Some(v) = details.get(key) {
+                        if let Some(v) = g(key) {
                             s.push_str(&format!(" {key}={v}"));
                         }
                     }
+                    // IBC broadcast specifics: timeslot, broadcast clock and
+                    // the count of channel assignments it carries.
+                    if kind == "broadcast" {
+                        if let Some(slot) = g("slot") {
+                            s.push_str(&format!(" slot={slot}"));
+                        }
+                        if let Some(t) = g("iri_time_unix").and_then(|v| v.as_f64()) {
+                            if let Some(dt) = chrono::DateTime::from_timestamp(t as i64, 0) {
+                                s.push_str(&format!(" time={}", dt.format("%H:%M:%S")));
+                            }
+                        }
+                        if let Some(a) = g("assignments").and_then(|v| v.as_array()) {
+                            s.push_str(&format!(" asn={}", a.len()));
+                        }
+                    }
+                    // IMS pager: group, identity, format, sequence.
+                    if let Some(grp) = gs("group") {
+                        s.push_str(&format!(" grp={grp}"));
+                    }
+                    if let Some(ric) = details.pointer("/body/ric").or_else(|| g("ric")) {
+                        s.push_str(&format!(" ric={ric}"));
+                    }
+                    if let Some(fmt) = details.pointer("/body/format") {
+                        s.push_str(&format!(" fmt={fmt}"));
+                    }
+                    // Sequence/ack: IP & VDA carry top-level seq/ack; pager
+                    // sequence lives under /body. IIQ carries a 13-bit counter.
+                    if let Some(seq) = g("seq").or_else(|| details.pointer("/body/seq")) {
+                        s.push_str(&format!(" seq={seq}"));
+                    }
+                    if let Some(ack) = g("ack") {
+                        s.push_str(&format!(" ack={ack}"));
+                    }
+                    if let Some(ctr) = g("counter") {
+                        s.push_str(&format!(" ctr={ctr}"));
+                    }
+                    if let Some(rs) = g("rs_corrected") {
+                        s.push_str(&format!(" rs={rs}"));
+                    }
+                    // Position (IRA / mt-position).
                     if let (Some(lat), Some(lon)) = (
-                        details.get("lat").and_then(|v| v.as_f64()),
-                        details.get("lon").and_then(|v| v.as_f64()),
+                        g("lat").and_then(|v| v.as_f64()),
+                        g("lon").and_then(|v| v.as_f64()),
                     ) {
                         s.push_str(&format!(" pos={lat:.2},{lon:.2}"));
                     }
-                    if let Some(p) = details.get("pages").and_then(|v| v.as_array()) {
+                    // LCW control word carried by every duplex burst
+                    // (maint/acchl/hndof) — show its control type unless silent.
+                    if let Some(ty) = details.pointer("/lcw/type").and_then(|v| v.as_str()) {
+                        let code = details.pointer("/lcw/code");
+                        let code_s = code
+                            .and_then(|v| v.as_str())
+                            .map(str::to_owned)
+                            .or_else(|| {
+                                code.and_then(|v| v.get("code"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned)
+                            });
+                        match code_s {
+                            Some(c) if c != "<silent>" => s.push_str(&format!(" lcw={ty}:{c}")),
+                            None => s.push_str(&format!(" lcw={ty}")),
+                            _ => {}
+                        }
+                    }
+                    // Decoded text payloads: pager ASCII / reassembled page /
+                    // IP-or-VDA ASCII / pager BCD digits.
+                    let text = details
+                        .pointer("/body/text")
+                        .or_else(|| g("text"))
+                        .or_else(|| g("data_ascii"))
+                        .or_else(|| details.pointer("/body/digits"))
+                        .and_then(|v| v.as_str())
+                        .filter(|t| !t.is_empty());
+                    if let Some(t) = text {
+                        s.push_str(&format!(" | {t}"));
+                    }
+                    // Multi-part page progress (1-based).
+                    if let (Some(ctr), Some(ctrm)) = (
+                        details.pointer("/body/ctr").and_then(|v| v.as_u64()),
+                        details.pointer("/body/ctr_max").and_then(|v| v.as_u64()),
+                    ) {
+                        if ctrm > 0 {
+                            s.push_str(&format!(" [{}/{}]", ctr + 1, ctrm + 1));
+                        }
+                    }
+                    if let Some(p) = g("pages").and_then(|v| v.as_array()) {
                         s.push_str(&format!(" pages={}", p.len()));
                     }
                     s
@@ -298,5 +384,124 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, fmt: ConsoleFormat) 
             }
             Err(broadcast::error::RecvError::Closed) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use xng_types::{AppInfo, Mode, Provenance, StationIdentity};
+
+    fn line(kind: &'static str, details: serde_json::Value) -> String {
+        let m = Message {
+            mode: Mode::Iridium,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 1_626_000_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: MessageBody::Iridium { kind: kind.into(), details },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        };
+        format_message(&m, ConsoleFormat::Pretty)
+    }
+
+    #[test]
+    fn broadcast_shows_sat_beam_slot_time_assignments() {
+        let s = line(
+            "broadcast",
+            json!({
+                "bc_type": 0, "sat": 12, "beam": 34, "slot": 1,
+                "info_type": 1, "iri_time_unix": 1_700_000_000.0,
+                "assignments": [{"access":1},{"access":2},{"access":3}],
+            }),
+        );
+        assert!(s.contains("IRIDIUM broadcast"), "{s}");
+        assert!(s.contains("sat=12") && s.contains("beam=34"), "{s}");
+        assert!(s.contains("slot=1"), "{s}");
+        assert!(s.contains("time="), "{s}");
+        assert!(s.contains("asn=3"), "{s}");
+    }
+
+    #[test]
+    fn ip_data_iip_shows_frame_type_seq_ack_ascii_and_lcw() {
+        let s = line(
+            "ip-data",
+            json!({
+                "ip_frame": "IIP", "ip_type": "data", "seq": 7, "ack": 99,
+                "data_ascii": "HELLO",
+                "lcw": {"type": "maint", "code": "geoloc"},
+            }),
+        );
+        assert!(s.contains("IRIDIUM ip-data IIP data"), "{s}");
+        assert!(s.contains("seq=7") && s.contains("ack=99"), "{s}");
+        assert!(s.contains("| HELLO"), "{s}");
+        assert!(s.contains("lcw=maint:geoloc"), "{s}");
+    }
+
+    #[test]
+    fn ip_data_iiq_shows_counter() {
+        let s = line("ip-data", json!({ "ip_frame": "IIQ", "flags": 5, "counter": 291 }));
+        assert!(s.contains("IRIDIUM ip-data IIQ"), "{s}");
+        assert!(s.contains("ctr=291"), "{s}");
+    }
+
+    #[test]
+    fn msg_ascii_shows_group_ric_seq_text_and_multipart() {
+        let s = line(
+            "msg",
+            json!({
+                "block": 3, "frame": 9, "group": "1",
+                "body": { "ric": 1234567, "format": 5, "seq": 7, "content": "ascii",
+                          "text": "CALL OPS", "ctr": 0, "ctr_max": 1, "csum_ok": true },
+            }),
+        );
+        assert!(s.contains("IRIDIUM msg"), "{s}");
+        assert!(s.contains("grp=1"), "{s}");
+        assert!(s.contains("ric=1234567"), "{s}");
+        assert!(s.contains("seq=7"), "{s}");
+        assert!(s.contains("| CALL OPS"), "{s}");
+        assert!(s.contains("[1/2]"), "{s}");
+    }
+
+    #[test]
+    fn msg_bcd_shows_digits() {
+        let s = line(
+            "msg",
+            json!({
+                "block": 1, "frame": 2, "group": "0",
+                "body": { "ric": 42, "format": 3, "seq": 1, "content": "bcd", "digits": "4155550100" },
+            }),
+        );
+        assert!(s.contains("| 4155550100"), "{s}");
+    }
+
+    #[test]
+    fn voice_voc_shows_type_and_lcw_nested_code() {
+        let s = line(
+            "voice",
+            json!({
+                "voice_type": "VOC", "ambe_hex": "deadbeef",
+                "lcw": {"type": "hndof", "code": {"code": "handoff_resp"}},
+            }),
+        );
+        assert!(s.contains("IRIDIUM voice VOC"), "{s}");
+        assert!(s.contains("lcw=hndof:handoff_resp"), "{s}");
+    }
+
+    #[test]
+    fn voice_silent_lcw_is_omitted() {
+        let s = line(
+            "voice",
+            json!({ "voice_type": "VOC", "lcw": {"type": "maint", "code": "<silent>"} }),
+        );
+        assert!(s.contains("IRIDIUM voice VOC"), "{s}");
+        assert!(!s.contains("lcw="), "silent lcw should be omitted: {s}");
     }
 }
