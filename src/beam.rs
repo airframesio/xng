@@ -59,7 +59,10 @@ const MIN_OBS: u32 = 2;
 /// half). Clamped to a plausible single-beam footprint.
 const BEAM_OVERLAP: f64 = 0.62;
 const CELL_RADIUS_MIN_KM: f64 = 150.0;
-const CELL_RADIUS_MAX_KM: f64 = 450.0;
+// A real Iridium beam footprint is ~150-200 km (iridium-sniffer); edge beams
+// project obliquely and run larger, so allow some headroom but not the full
+// across-pattern span.
+const CELL_RADIUS_MAX_KM: f64 = 300.0;
 /// Radius for a beam with no reconstructed neighbour yet (≈ footprint/48).
 const DEFAULT_BEAM_RADIUS_KM: f64 = 200.0;
 /// A single ground station only hears the beams that sweep over it (one
@@ -299,34 +302,42 @@ impl BeamReconstructor {
             let means: Vec<(u8, f64, f64)> = (1..=48u8)
                 .filter_map(|b| pat.mean(b, MIN_OBS).map(|(c, a)| (b, c, a)))
                 .collect();
-            // One uniform cell radius for the whole pattern, from the MEDIAN
-            // nearest-neighbour spacing of the reconstructed beams (× overlap,
-            // clamped). Beams tile the footprint at roughly one size, so a
-            // single representative radius keeps every cell consistent —
-            // reconstructed, mirrored estimate, and the spot-beam markers that
-            // reuse these radii. (Per-cell nearest-neighbour sizing made the
-            // mirrored cells balloon to the clamp, since their nearest *real*
-            // neighbour sits clear across the pattern.)
-            let mut nns: Vec<f64> = means
-                .iter()
-                .map(|&(beam, cross, along)| {
-                    means
-                        .iter()
-                        .filter(|&&(b2, _, _)| b2 != beam)
-                        .map(|&(_, c2, a2)| ((cross - c2).powi(2) + (along - a2).powi(2)).sqrt())
-                        .fold(f64::INFINITY, f64::min)
-                })
-                .filter(|x| x.is_finite())
-                .collect();
-            nns.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let radius_km = if nns.is_empty() {
-                DEFAULT_BEAM_RADIUS_KM
-            } else {
-                (nns[nns.len() / 2] * BEAM_OVERLAP).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM)
-            };
-            // Emit one cell. Takes `out` by ref so the closure doesn't conflict
-            // with the loops feeding it.
-            let emit = |out: &mut Vec<Cell>, beam: u8, cross: f64, along: f64, active: bool, estimated: bool| {
+            // Mirror each off-axis reconstructed beam across the ground track to
+            // estimate the unobserved cross-track half (a single station never
+            // hears it), skipping any mirror that lands on a beam already placed.
+            let mut mirrors: Vec<(u8, f64, f64)> = Vec::new();
+            let mut placed: Vec<(f64, f64)> = means.iter().map(|&(_, c, a)| (c, a)).collect();
+            for &(beam, cross, along) in &means {
+                if cross.abs() < MIRROR_MIN_CROSS_KM {
+                    continue;
+                }
+                let (mc, ma) = (-cross, along);
+                if placed.iter().any(|&(c, a)| ((c - mc).powi(2) + (a - ma).powi(2)).sqrt() < MIRROR_MERGE_KM) {
+                    continue;
+                }
+                mirrors.push((beam, mc, ma));
+                placed.push((mc, ma));
+            }
+            // Per-beam ground radius from the spacing to the nearest neighbouring
+            // beam (across ALL cells — reconstructed + mirrored), a little over
+            // half so adjacent beams OVERLAP into contiguous coverage: Iridium is
+            // a cellular system with overlapping beams (handoff), and edge beams
+            // are spaced — and project — larger than nadir beams, so a single
+            // uniform size leaves false gaps. Clamped to the ~150-300 km real
+            // footprint scale; any remaining gap is a beam we have not mapped,
+            // not a true coverage hole. Takes `out` by ref so the closure
+            // doesn't conflict with the loops feeding it.
+            let push_cell = |out: &mut Vec<Cell>, beam: u8, cross: f64, along: f64, active: bool, estimated: bool| {
+                let nn = placed
+                    .iter()
+                    .map(|&(c, a)| ((cross - c).powi(2) + (along - a).powi(2)).sqrt())
+                    .filter(|&d| d > 1.0)
+                    .fold(f64::INFINITY, f64::min);
+                let radius_km = if nn.is_finite() {
+                    (nn * BEAM_OVERLAP).clamp(CELL_RADIUS_MIN_KM, CELL_RADIUS_MAX_KM)
+                } else {
+                    DEFAULT_BEAM_RADIUS_KM
+                };
                 let (lat, lon) = lat_lon(to_ecef(t.pos, cross, along, t.north));
                 out.push(Cell {
                     sat,
@@ -338,30 +349,12 @@ impl BeamReconstructor {
                     estimated,
                 });
             };
-            // Reconstructed beams: what this station has actually decoded.
-            let mut placed: Vec<(f64, f64)> = Vec::new();
             for &(beam, cross, along) in &means {
                 let active = t.seen_beams.get(&beam).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
-                emit(&mut out, beam, cross, along, active, false);
-                placed.push((cross, along));
+                push_cell(&mut out, beam, cross, along, active, false);
             }
-            // Estimated beams: mirror each reconstructed beam across the ground
-            // track to sketch the unobserved cross-track half (a single station
-            // never hears it), skipping any mirror that lands on a beam already
-            // drawn. Flagged `estimated` so the map renders them faintly.
-            for &(beam, cross, along) in &means {
-                if cross.abs() < MIRROR_MIN_CROSS_KM {
-                    continue;
-                }
-                let (mc, ma) = (-cross, along);
-                if placed
-                    .iter()
-                    .any(|&(c, a)| ((c - mc).powi(2) + (a - ma).powi(2)).sqrt() < MIRROR_MERGE_KM)
-                {
-                    continue;
-                }
-                emit(&mut out, beam, mc, ma, false, true);
-                placed.push((mc, ma));
+            for &(beam, mc, ma) in &mirrors {
+                push_cell(&mut out, beam, mc, ma, false, true);
             }
         }
         out
