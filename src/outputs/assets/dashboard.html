@@ -276,12 +276,13 @@ const shipIcon = (cog, type) => {
     iconSize: [16, 16], iconAnchor: [8, 8] });
 };
 const IRIDIUM = '#73daca';
-// Spot-beam coverage cell: an Iridium spot beam lights ~350 km of ground
-// (the 48 beams tile a ~4700 km footprint), hue per beam id (1–48) so the
-// cells under a satellite read as a coloured tiling. The reconstructed
-// beam-pattern cells size themselves per-beam from neighbour spacing; this
-// fixed radius is for the observed-footprint markers.
-const BEAM_RADIUS_M = 350000;
+// Spot-beam coverage cell: an Iridium spot beam covers ~400 km of ground
+// (~200 km radius); the 48 beams tile the ~4700 km footprint, hue per beam
+// id (1–48) so the cells under a satellite read as a coloured tiling. Real
+// beams vary (smaller near nadir, larger at the edge), so a live ring
+// footprint prefers its reconstructed per-beam radius when the beam pattern
+// has resolved that beam; this nominal radius is the fallback.
+const BEAM_RADIUS_M = 200000;
 // Full Iridium satellite footprint (~4700 km diameter): the 48 spot beams
 // tile this disc. A single ground station only reconstructs the beams that
 // sweep over it (one cross-track side, ~20 of 48), so the pattern looks
@@ -351,11 +352,17 @@ function syncIridium(s) {
     if (fp) { patternLayer.removeLayer(fp); footprintMarkers.delete(k); }
   }
 
+  // Per-beam reconstructed radius (sat-beam → m) so a live spot-beam
+  // footprint is drawn at the same size as its reconstructed pattern cell,
+  // rather than a one-size-fits-all circle.
+  const cellRad = new Map();
+  for (const c of (s.iridium_beam_cells || [])) cellRad.set(c.sat + '-' + c.beam, c.radius_m);
   const seenRing = new Set();
   for (const r of (s.iridium_rings || [])) {
     const key = r.sat + '-' + r.beam;
     seenRing.add(key);
     const col = beamColor(r.beam);
+    const rad = cellRad.get(key) || BEAM_RADIUS_M;
     const popup = entityPopup('', escapeHtml(`spot beam S${r.sat}/B${r.beam}`), [
       ['sat id', r.sat],
       ['beam', r.beam],
@@ -366,12 +373,13 @@ function syncIridium(s) {
     if (!m) {
       // The spot beam projected on the ground: a geographic coverage cell
       // (scales with zoom), coloured by beam id, labelled at its center.
-      m = L.circle([r.lat, r.lon], { radius: BEAM_RADIUS_M, color: col, weight: 1, fillColor: col, fillOpacity: 0.08 }).addTo(ringLayer);
+      m = L.circle([r.lat, r.lon], { radius: rad, color: col, weight: 1, fillColor: col, fillOpacity: 0.08 }).addTo(ringLayer);
       m.bindTooltip(`B${r.beam}`, { permanent: true, direction: 'center', className: 'lbl' });
       m.bindPopup(popup);
       ringMarkers.set(key, m);
     } else {
       m.setLatLng([r.lat, r.lon]);
+      m.setRadius(rad);
       m.setStyle({ color: col, fillColor: col });
       m.setPopupContent(popup);
     }
@@ -394,7 +402,7 @@ function syncIridium(s) {
     const key = c.sat + '-' + c.beam;
     seenCell.add(key);
     const col = beamColor(c.beam);
-    const rad = c.radius_m || 130000;
+    const rad = c.radius_m || 200000;
     const style = c.active
       ? { color: col, fillColor: col, weight: 2, opacity: 0.85, fillOpacity: 0.28, dashArray: null }
       : { color: col, fillColor: col, weight: 1, opacity: 0.35, fillOpacity: 0.03, dashArray: '2 5' };

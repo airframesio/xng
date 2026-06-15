@@ -61,7 +61,7 @@ const BEAM_OVERLAP: f64 = 0.62;
 const CELL_RADIUS_MIN_KM: f64 = 150.0;
 const CELL_RADIUS_MAX_KM: f64 = 450.0;
 /// Radius for a beam with no reconstructed neighbour yet (≈ footprint/48).
-const DEFAULT_BEAM_RADIUS_KM: f64 = 340.0;
+const DEFAULT_BEAM_RADIUS_KM: f64 = 200.0;
 /// A beam counts as "active" (currently illuminating, drawn bright) if this
 /// satellite was seen on it within this many seconds; older beams stay in
 /// the pattern but render muted.
