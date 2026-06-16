@@ -457,7 +457,7 @@ function syncIridium(s) {
     } else if (c.decoded) {
       style = { color: '#9aa3bd', fillColor: '#9aa3bd', weight: 1.5, opacity: 0.7, fillOpacity: 0.12, dashArray: null };
     } else {
-      style = { color: '#586079', fillColor: '#586079', weight: 1, opacity: 0.28, fillOpacity: 0.03, dashArray: '2 5' };
+      style = { color: '#586079', fillColor: '#586079', weight: 1, opacity: 0.14, fillOpacity: 0.012, dashArray: '2 5' };
     }
     const m = L.polygon(c.poly, style); // added to the layer by applyPatternFilter
     m._base = style; m._sat = c.sat;
