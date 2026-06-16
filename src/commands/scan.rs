@@ -127,9 +127,11 @@ pub(crate) fn choose_rate(caps: &RateCaps, mode: Mode, plan_rate: f64) -> f64 {
 }
 
 /// Expand advertised rate ranges into discrete candidate rates aligned to the
-/// mode's per-channel rate (so every candidate is a clean DDC multiple).
-/// Whole-capture modes (channel rate 1.0: Mode S) have no DDC grid, so a
-/// coarse 250 kHz step is used just to enumerate sensible widths.
+/// mode's per-channel rate (so each is a clean DDC multiple needing no
+/// resampling). Whole-capture modes (channel rate 1.0: Mode S) have no DDC
+/// grid, so a coarse 250 kHz step enumerates sensible widths. The range
+/// endpoints are added too: if a (narrow or discrete-point) device offers no
+/// aligned rate, the DDC can still resample from an endpoint.
 fn candidates_from_ranges(ranges: &[(f64, f64, f64)], mode: Mode) -> Vec<u32> {
     let ch = channel_rate(mode);
     let unit = if ch > 1.0 { ch } else { 250_000.0 };
@@ -146,6 +148,10 @@ fn candidates_from_ranges(ranges: &[(f64, f64, f64)], mode: Mode) -> Vec<u32> {
             r += unit;
             n += 1;
         }
+        // Endpoints as resampling fallbacks (also captures min==max discrete
+        // points some SoapySDR drivers report as zero-width ranges).
+        out.push(lo.round() as u32);
+        out.push(hi.round() as u32);
     }
     out.sort_unstable();
     out.dedup();
@@ -195,15 +201,28 @@ pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> 
             return r;
         }
     }
-    // Smallest supported, clean-multiple rate at or above the plan rate —
-    // never narrower than the mode was designed for.
+    // Prefer a clean integer-ratio rate at or above the plan: the DDC
+    // integer-decimates, no resampling, and never narrower than the mode needs.
     if let Some(&r) = rates.iter().find(|&&r| r >= plan_rate - 1e-9 && divides(r)) {
         return r;
     }
-    // Nothing clean at/above the plan: take the widest clean multiple offered
-    // (best effort), else the plan rate so the device surfaces a clear error
-    // rather than silently mis-tuning.
-    rates.iter().rev().copied().find(|&r| divides(r)).unwrap_or(plan_rate)
+    // No clean multiple at or above the plan: take the smallest supported rate
+    // there and let the DDC resample to the channel rate. This is what makes,
+    // e.g., a full multi-mode station work on an Airspy R2 — its 10/2.5 MS/s
+    // are integer multiples of neither the 24 kHz (ACARS) nor 48 kHz (AIS)
+    // channel rate, so without resampling those modes had no usable rate.
+    if let Some(&r) = rates.iter().find(|&&r| r >= plan_rate - 1e-9) {
+        return r;
+    }
+    // Nothing at or above the plan: the widest rate offered (DDC resamples),
+    // preferring a clean multiple if one exists.
+    rates
+        .iter()
+        .rev()
+        .copied()
+        .find(|&r| divides(r))
+        .or_else(|| rates.last().copied())
+        .unwrap_or(plan_rate)
 }
 
 /// A one-line hint to show after auto-selecting a rate, when the user might
@@ -640,6 +659,32 @@ mod tests {
         // multiple (2.5 MS/s) — the even-integer preference is Mode S only.
         let r2 = RateCaps::Discrete(vec![10_000_000, 2_500_000]);
         assert_eq!(choose_rate(&r2, Mode::Iridium, 2_400_000.0), 2_500_000.0);
+    }
+
+    #[test]
+    fn airspy_r2_runs_all_modes_via_resampling() {
+        // R2 (10 / 2.5 MS/s) divides neither 24 kHz (ACARS), 48 kHz (AIS) nor
+        // 12 kHz (StdC); without resampling these had no usable rate. Now the
+        // picker returns the smallest rate >= plan and the DDC resamples.
+        let r2 = RateCaps::Discrete(vec![10_000_000, 2_500_000]);
+        assert_eq!(choose_rate(&r2, Mode::AcarsPoa, 2_400_000.0), 2_500_000.0);
+        assert_eq!(choose_rate(&r2, Mode::Ais, 2_400_000.0), 2_500_000.0);
+        assert_eq!(choose_rate(&r2, Mode::StdC, 2_400_000.0), 2_500_000.0);
+        // VDL2 (50 kHz) and Iridium (250 kHz) DO divide 2.5 MS/s → clean
+        // integer path, same rate, no resampling.
+        assert_eq!(choose_rate(&r2, Mode::Vdl2, 2_400_000.0), 2_500_000.0);
+        assert_eq!(choose_rate(&r2, Mode::Iridium, 2_400_000.0), 2_500_000.0);
+        // ADS-B takes the even-integer 10 MS/s (integer demod path).
+        assert_eq!(choose_rate(&r2, Mode::Adsb, 2_000_000.0), 10_000_000.0);
+    }
+
+    #[test]
+    fn ranges_resample_when_no_aligned_rate_fits() {
+        // A device whose only band is a narrow window containing no 24 kHz
+        // multiple still yields a usable (resampled) rate from an endpoint.
+        let narrow = RateCaps::Ranges(vec![(2_450_000.0, 2_460_000.0, 0.0)]);
+        let r = choose_rate(&narrow, Mode::AcarsPoa, 2_400_000.0);
+        assert!((2_450_000.0..=2_460_000.0).contains(&r), "got {r}");
     }
 
     #[test]
