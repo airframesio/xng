@@ -104,6 +104,24 @@ pub struct IridiumDemod {
     cfo_refine: i32,
     /// Residual-CFO grid step in rad/sym for `cfo_refine`. XNG_IRIDIUM_CFO_REFINE_STEP.
     cfo_refine_step: f32,
+    /// gr-iridium end-of-frame rule: trim the burst only after 3 CONSECUTIVE
+    /// symbols fall below peak/8 (−18 dB from the burst's own max), instead of
+    /// breaking on the first payload symbol below noise×4 (absolute). A weak burst
+    /// sits close to noise×4, so one faded/scintillated symbol truncates xng's
+    /// frame below the BCH/CRC length and loses it; gr's peak-relative rule reads
+    /// the whole frame. XNG_IRIDIUM_GREND.
+    gr_frame_end: bool,
+    /// Per-frame symbol cap for the gr end-of-frame path (≈ gr's MAX_FRAME_LENGTH
+    /// of 191 duplex symbols). XNG_IRIDIUM_MAX_FRAME_SYMS.
+    frame_cap: usize,
+    /// Beyond-gr (preamble runway): before slicing the UW, refine the carrier
+    /// phase with a data-aided pass over the 16 known preamble symbols. gr's
+    /// decision-directed PLL runs across the preamble and enters the UW already
+    /// phase-converged; xng seeds the UW from the correlation phase alone. Using
+    /// the high-SNR preamble (known symbols, so noise can't pull it) halves the
+    /// phase variance at the UW start, so weak-burst access codes rotate out of
+    /// quadrant less often. XNG_IRIDIUM_PREAMBLE_PLL.
+    preamble_pll: bool,
     /// Max differential access-code bit errors to accept a frame for full decode.
     /// On weak bursts noise corrupts the 24-bit access code past the default even
     /// when CFO/timing are right, so the frame never reaches BCH/CRC; loosening
@@ -140,6 +158,13 @@ impl IridiumDemod {
             // benchmark (495→506). The gain knees here; refine=3 adds +1 for ~15%
             // more correlation cost. ~+43% single-thread demod time, trivially
             // within the live station's headroom (uses <1 of 12 cores).
+            preamble_pll: std::env::var("XNG_IRIDIUM_PREAMBLE_PLL").is_ok(),
+            frame_cap: env_f32("XNG_IRIDIUM_MAX_FRAME_SYMS", 200.0) as usize,
+            // Default ON: gr-iridium's peak-relative end-of-frame is a large win
+            // (300s CRC-OK IDA 516→758) — xng's old "break on first symbol below
+            // noise×4" truncated weak frames before BCH/CRC. XNG_IRIDIUM_GREND=0
+            // restores the absolute-threshold break.
+            gr_frame_end: std::env::var("XNG_IRIDIUM_GREND").map(|v| v != "0").unwrap_or(true),
             cfo_refine: env_f32("XNG_IRIDIUM_CFO_REFINE", 2.0) as i32,
             cfo_refine_step: env_f32("XNG_IRIDIUM_CFO_REFINE_STEP", 0.08),
             access_tol: env_f32("XNG_IRIDIUM_ACCESS_TOL", ACCESS_TOL as f32) as usize,
@@ -507,19 +532,60 @@ impl IridiumDemod {
     /// Demodulate from a locked UW position: QPSK slice with a payload-only
     /// decision-directed PLL, differential decode in iridium-toolkit pair order,
     /// and access-code validation.
-    fn demod_from(&self, uw_pos: f64, theta: f32, phase: f32, access: &[u8; 24], uw: &[u8]) -> (Option<DemodBurst>, usize) {
+    fn demod_from(&self, uw_pos: f64, theta: f32, phase: f32, access: &[u8; 24], sync: &[u8; 28]) -> (Option<DemodBurst>, usize) {
         let mut symbols: Vec<u8> = Vec::new();
         let mut k = 0usize;
         let mut carr = phase;
+        // Preamble runway (beyond-gr): refine the UW-start carrier phase with a
+        // data-aided pass over the 16 known preamble symbols (sync[0..16]) before
+        // slicing the UW. `c` is the loop phase referenced to the preamble start,
+        // so `c + theta*16` is the phase at the UW; initialize so that equals the
+        // incoming correlation `phase`, then refine. Data-aided (the preamble is
+        // known) so noise cannot pull the loop, and the UW slice stays an honest
+        // decision (the access-code check is not biased).
+        if self.preamble_pll {
+            let mut c = phase - theta * 16.0;
+            for j in 0..16 {
+                let Some(s) = self.sample(uw_pos - (16 - j) as f64 * self.sps) else {
+                    continue;
+                };
+                let e = sync[j] as f32 * PI / 2.0;
+                let err = (s * Complex::from_polar(1.0, -(theta * j as f32) - c - e)).arg();
+                c += 0.2 * err;
+            }
+            carr = c + theta * 16.0;
+        }
         // gr-iridium runs the decision-directed PLL across the whole burst; xng
         // by default freezes it over the UW (k<12) so the UW correlation's phase
         // drives the access code, which is what the access-code check validates.
         let pll_start = if self.pll_full { 0 } else { 12 };
+        let mut peak_sq = 0.0f32;
+        let mut weak_run = 0u32;
         loop {
             let sp = uw_pos + k as f64 * self.sps;
             let Some(s) = self.sample(sp) else { break };
-            if k >= 12 && s.norm_sqr() < self.noise * 4.0 {
-                break;
+            let p = s.norm_sqr();
+            if k >= 12 {
+                if self.gr_frame_end {
+                    // gr-iridium: trim only after 3 consecutive symbols below
+                    // peak/8 (p < peak_sq/64 in power), relative to the burst's own
+                    // max — a single faded payload symbol no longer truncates a
+                    // weak frame. Drop the trailing weak run on break.
+                    peak_sq = peak_sq.max(p);
+                    if p * 64.0 < peak_sq {
+                        weak_run += 1;
+                        if weak_run >= 3 {
+                            for _ in 0..(weak_run - 1) {
+                                symbols.pop();
+                            }
+                            break;
+                        }
+                    } else {
+                        weak_run = 0;
+                    }
+                } else if p < self.noise * 4.0 {
+                    break;
+                }
             }
             let derot = s * Complex::from_polar(1.0, -(theta * k as f32) - carr);
             let ang = derot.arg();
@@ -531,7 +597,12 @@ impl IridiumDemod {
             }
             symbols.push(q);
             k += 1;
-            if k >= 12 + MAX_BURST_SYMS {
+            // With the gr end-of-frame rule, bound each read to one frame (gr's
+            // MAX_FRAME_LENGTH ≈ 191 duplex symbols) so the multi-frame loop finds
+            // the next frame instead of this read swallowing it — also bounds CPU
+            // when back-to-back slots leave no weak gap to break on.
+            let cap = if self.gr_frame_end { self.frame_cap } else { MAX_BURST_SYMS };
+            if k >= 12 + cap {
                 break;
             }
         }
@@ -552,8 +623,8 @@ impl IridiumDemod {
             // gr-iridium check_sync_word: sum of absolute UW symbol distances
             // (a 90° = 3 wrap counts as 1) ≤ 2, on the demodulated symbols.
             let mut diffs = 0i32;
-            for i in 0..12.min(uw.len()) {
-                let mut d = (symbols[i] as i32 - uw[i] as i32).abs();
+            for i in 0..12 {
+                let mut d = (symbols[i] as i32 - sync[16 + i] as i32).abs();
                 if d == 3 {
                     d = 1;
                 }
@@ -600,13 +671,13 @@ impl IridiumDemod {
                 break;
             }
         }
-        let cfo = if self.sq_cfo {
+        let onset_cfo = if self.sq_cfo {
             self.tone_cfo_sq(onset)
         } else {
             self.tone_cfo(onset + 2.0 * self.sps, 10.0)
         };
-        let Some(cfo) = cfo else { return Vec::new() };
-        let theta = (2.0 * std::f64::consts::PI * cfo / SYMBOL_RATE) as f32;
+        let Some(onset_cfo) = onset_cfo else { return Vec::new() };
+        let onset_theta = (2.0 * std::f64::consts::PI * onset_cfo / SYMBOL_RATE) as f32;
         // Full sync words (preamble + UW), absolute QPSK phases.
         const SYNC_DL: [u8; 28] =
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2];
@@ -619,17 +690,35 @@ impl IridiumDemod {
         let min_frame = (12 + 32) as f64 * self.sps;
         let mut out = Vec::new();
         let mut search_lo = (onset - 6.0 * self.sps).max(0.0);
+        // Per-frame CFO position. gr re-runs the squared-FFT CFO from scratch for
+        // EVERY frame in the burst — time-slot frames in one detector window can
+        // be from different satellites / Doppler, so a single onset CFO (even with
+        // the ±640 Hz refine grid below) drops the ones that drift further. Frame 0
+        // estimates at the refined onset; each later frame re-estimates at its own
+        // preamble start (the previous frame's end).
+        let mut cfo_pos = onset;
         // Residual-CFO grid (beyond-gr): [0] when off (gr-faithful single slope),
-        // else ±cfo_refine steps so a weak burst whose onset CFO is slightly off
-        // can still correlate. CRC + access-code gate any false lock downstream.
+        // else ±cfo_refine steps that fine-tune each frame's own CFO estimate.
+        // CRC + access-code gate any false lock downstream.
         let db_grid: Vec<f32> = (-self.cfo_refine..=self.cfo_refine)
             .map(|i| i as f32 * self.cfo_refine_step)
             .collect();
-        for _ in 0..16 {
+        // gr's multi-frame loop is unbounded; cap generously (a 90 ms burst holds
+        // ~11 duplex slots; long IRA/simplex frames fewer).
+        for _ in 0..32 {
             if search_lo + min_frame > end {
                 break;
             }
             let hi = (search_lo + span).min(end);
+            // Re-estimate this frame's CFO from scratch (gr-faithful per-frame
+            // acquisition); fall back to the onset estimate if the FFT fails.
+            let theta = if self.sq_cfo {
+                self.tone_cfo_sq(cfo_pos)
+                    .map(|c| (2.0 * std::f64::consts::PI * c / SYMBOL_RATE) as f32)
+                    .unwrap_or(onset_theta)
+            } else {
+                onset_theta
+            };
             // Best sync peak in [search_lo, hi] (full resolution, no gate). When
             // cfo_refine>0, the residual-CFO slope `db` is searched jointly with
             // timing and carried to the demod (best = corr, o, db, access, sync).
@@ -670,7 +759,7 @@ impl IridiumDemod {
                     acc_uw += s * Complex::from_polar(1.0, -(sync[16 + j] as f32 * PI / 2.0) - theta_eff * j as f32);
                 }
             }
-            let (frame, n_sym) = self.demod_from(uw_pos, theta_eff, acc_uw.arg(), access, &sync[16..]);
+            let (frame, n_sym) = self.demod_from(uw_pos, theta_eff, acc_uw.arg(), access, sync);
             if let Some(f) = frame {
                 out.push(f);
             }
@@ -684,6 +773,9 @@ impl IridiumDemod {
                 break;
             }
             search_lo = next;
+            // The next frame's preamble starts at this frame's end: re-estimate
+            // its CFO there (gr-faithful per-frame acquisition).
+            cfo_pos = next;
         }
         out
     }
