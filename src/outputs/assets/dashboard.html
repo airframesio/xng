@@ -162,7 +162,6 @@ const satMarkers = new Map();  // sat id -> {marker, trail}
 const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
 const patternMarkers = new Map(); // "sat-i" -> projected pattern cell (with _sat)
 const cellByBeam = new Map(); // "sat-beam" -> decoded pattern cell marker (spot-beam link)
-const footprintMarkers = new Map(); // sat id -> full-footprint coverage disc
 const deviceMarkers = new Map(); // "lat,lon" -> terminal marker
 let pinnedSat = null; // satellite whose pattern stays highlighted (click)
 let spotLink = null; // "sat-beam" of a clicked spot beam, linked to its cell
@@ -205,11 +204,6 @@ function applyPatternFilter() {
     const show = patternVisible(m._sat);
     if (show && !patternLayer.hasLayer(m)) patternLayer.addLayer(m);
     else if (!show && patternLayer.hasLayer(m)) patternLayer.removeLayer(m);
-  }
-  for (const [sid, fp] of footprintMarkers) {
-    const show = patternVisible(sid);
-    if (show && !patternLayer.hasLayer(fp)) patternLayer.addLayer(fp);
-    else if (!show && patternLayer.hasLayer(fp)) patternLayer.removeLayer(fp);
   }
 }
 // Select a satellite: pin its pattern (only it shows) and open its detail card.
@@ -340,40 +334,14 @@ const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
   iconSize: [20, 20], iconAnchor: [10, 10], popupAnchor: [0, -14] });
 
-// Convex hull (Andrew's monotone chain) of [lat,lon] points → the outline of
-// the satellite's combined beam coverage. The real footprint is the union of
-// all 48 beams — roughly circular but a lobed polygon, not a perfect circle.
-function convexHull(pts) {
-  if (pts.length < 3) return pts.slice();
-  const p = pts.slice().sort((a, b) => a[1] - b[1] || a[0] - b[0]);
-  const cross = (o, a, b) => (a[1] - o[1]) * (b[0] - o[0]) - (a[0] - o[0]) * (b[1] - o[1]);
-  const lower = [];
-  for (const q of p) {
-    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], q) <= 0) lower.pop();
-    lower.push(q);
-  }
-  const upper = [];
-  for (let i = p.length - 1; i >= 0; i--) {
-    const q = p[i];
-    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], q) <= 0) upper.pop();
-    upper.push(q);
-  }
-  lower.pop(); upper.pop();
-  return lower.concat(upper);
-}
-
 // Sync the optional Iridium layers from the state snapshot. Satellite
 // markers (with a faint ground track) and ring/beam footprint circles
 // are managed in their own layer groups, independent of the main marker
 // cull, and never contribute to the auto-fit bounds.
 function syncIridium(s) {
-  // Group beam cells by satellite — for the popup tally and for sizing each
-  // satellite's coverage footprint to its own beams.
-  const cellsBySat = new Map();
+  // Tally decoded vs modelled beams per satellite for the detail card.
   const beamStats = new Map();
   for (const c of (s.iridium_beam_cells || [])) {
-    if (!cellsBySat.has(c.sat)) cellsBySat.set(c.sat, []);
-    cellsBySat.get(c.sat).push(c);
     const st = beamStats.get(c.sat) || { seen: 0, est: 0 };
     if (c.decoded) st.seen++; else st.est++;
     beamStats.set(c.sat, st);
@@ -421,35 +389,11 @@ function syncIridium(s) {
       if (e.trail) e.trail.setLatLngs(sat.trail);
       else e.trail = L.polyline(sat.trail, { color: IRIDIUM, weight: 1, opacity: 0.4, dashArray: '3,4' }).addTo(satLayer);
     }
-    // Coverage footprint (in the beam-pattern layer, beneath the cells): the
-    // convex hull of THIS satellite's beam footprints — the true combined
-    // coverage envelope (a lobed polygon, not a perfect circle), so it matches
-    // the beam placements exactly. Skipped until the satellite has a pattern.
-    const fpPts = [];
-    for (const c of (cellsBySat.get(sat.sat) || [])) {
-      if (c.poly) for (const pt of c.poly) fpPts.push(pt);
-    }
-    let fp = footprintMarkers.get(sat.sat);
-    if (fpPts.length >= 3) {
-      const hull = convexHull(fpPts);
-      if (!fp) {
-        fp = L.polygon(hull, { color: IRIDIUM, weight: 1, opacity: 0.22, fillColor: IRIDIUM,
-          fillOpacity: 0.04, dashArray: '4 6', interactive: false }).addTo(patternLayer);
-        footprintMarkers.set(sat.sat, fp);
-      } else {
-        fp.setLatLngs(hull);
-      }
-    } else if (fp) {
-      patternLayer.removeLayer(fp);
-      footprintMarkers.delete(sat.sat);
-    }
   }
   for (const [k, e] of satMarkers) if (!seenSat.has(k)) {
     satLayer.removeLayer(e.marker);
     if (e.trail) satLayer.removeLayer(e.trail);
     satMarkers.delete(k);
-    const fp = footprintMarkers.get(k);
-    if (fp) { patternLayer.removeLayer(fp); footprintMarkers.delete(k); }
     if (k === pinnedSat) { pinnedSat = null; hideSatCard(); }
   }
 
