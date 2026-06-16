@@ -207,3 +207,68 @@ gains; the default (2) keeps the soak drop-free at 10 MS/s.
 Not count-gated in CI: the capture is 11 GB, too large to vendor. The demod
 core is fenced by the bit-exact (`demodulates_gr_iridium_test_burst`) and
 field-exact (`offair_ida_sbd_decodes_with_crc`) oracle tests instead.
+
+## Beam-pattern reconstruction (`src/beam.rs`)
+
+IRA ring-alert frames carry two position kinds at different altitudes: the
+broadcasting satellite (~780 km) and a ground beam footprint (~0 km;
+iridium-toolkit's "down" / beam positions). `classify_altitude` splits them
+into satellite-track updates and footprint observations, dropping anything
+outside the physical bands so a BCH/CRC false-pass cannot plant a phantom.
+
+Each footprint is de-rotated into the broadcasting satellite's own frame
+(cross-track / along-track km), so a beam accumulates a stable mean
+regardless of where the satellite is when it is heard. Direction (north/
+south) comes from the geocentric-z trend of successive fixes; it is sticky
+across short gaps so a sparsely-heard satellite still projects.
+
+The drawn pattern is the canonical **48-beam, 4-tier** layout — 3 Main
+Mission Antennas × 16 beams, tiers of 3 / 9 / 15 / 21 from nadir outward
+(MathWorks Satellite Communications Toolbox Iridium model, FCC filings).
+Tier ground radii are the off-nadir boresight angles (~11° / 24° / 42° /
+59°) projected from 780 km onto the Earth sphere via
+`Δ = asin((R+h)/R · sinθ) − θ`, `ground = R·Δ`. The three inner tiers match
+the ~1480 km extent a single station actually decodes; the **outer tier is
+stretched to the documented ~2250 km radius / ~4500 km footprint** (edge
+~62°, just inside the 62.97° horizon limb). The station only demodulates the
+stronger mid-footprint beams, so faint limb beams illuminate the ground but
+rarely decode here — they belong on the map as modelled coverage even when
+unheard. The outer band is wide because oblique projection radially
+elongates limb beams.
+
+Beams render in three tiers of confidence: **active** (a spot beam swept
+this station within ~30 s) in beam colour; merely **decoded** (≥2 low-scatter
+observations) as muted grey at its *measured* position, tracking the
+satellite as it moves; and not-yet-decoded **modelled** slots as a faint
+dashed gap-fill at the canonical position, so the whole intended 48-beam
+pattern always shows plus exactly what has been heard. A polluted average
+(RMS scatter > 600 km, i.e. direction-fold) falls back to the modelled slot.
+
+Footprint polygons and the satellite ground track are **unwrapped across the
+±180° antimeridian**: every cell vertex and trail point is shifted into the
+±180° window of the satellite's sub-point, so a footprint west of the date
+line reads as e.g. -185° and Leaflet draws it across the seam (off the edge)
+instead of the long way across the whole map. The dashboard shows one
+satellite's pattern at a time (click to pin); satellites expire 2 min after
+last contact.
+
+## SBD multi-packet reassembly — Layer B (`crates/xng-mode-iridium/src/sbd.rs`)
+
+SBD reassembly is two layers. **Layer A** rebuilds an IDA packet from its DA
+bursts (by continuation/counter). **Layer B** joins multiple IDA packets into
+one SBD message: a long ACARS/SBD body is split across `packets` IDA frames
+numbered `1..=packets`, whose bodies concatenate in order. The count comes
+from the 7608 downlink `0x26` pre-header (`packets` at byte 3, mapped to
+`msgcnt`); each packet's sequence number is `msgno`.
+
+`parse_l2` routes by header: `msgno==0` (header-less / mailbox-check) or
+`msgcnt<=1 && msgno==1` parse immediately; `msgcnt>1 && msgno==1` buffers a
+`MultiSbd`; `msgno>1` appends to the matching open message (same direction,
+`msgno==prev+1`), completing at `msgno==msgcnt` and tagging the result
+`multi_packets` = packet count. Partials expire after `SBD_MULTI_EXPIRE_S`.
+Covered by `sbd_multi_packet_reassembles` (a 2-packet 7608 message
+reassembles and is marked `multi_packets=2`) and `sbd_multi_packet_expires`.
+
+In practice multi-packet messages are rare: the live downlink is almost all
+single-packet (`packets=1`), control-plane traffic. The path is verified
+against the real frame format and waits for a body that spans two packets.
