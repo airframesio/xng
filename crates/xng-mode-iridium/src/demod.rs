@@ -78,6 +78,10 @@ pub struct IridiumDemod {
     /// Score the full 28-symbol sync word (16 preamble + 12 UW) in single-shot
     /// acquisition, as gr-iridium does. Default on (XNG_IRIDIUM_SYNCCORR=0 → UW only).
     sync_corr: bool,
+    /// Run the decision-directed carrier PLL over the UW symbols too (gr-iridium
+    /// qpsk_demod runs it across the whole burst), instead of freezing it over
+    /// the UW. XNG_IRIDIUM_PLL_FULL.
+    pll_full: bool,
 }
 
 impl IridiumDemod {
@@ -102,6 +106,7 @@ impl IridiumDemod {
             // CRC-OK on the 300 s benchmark). Set XNG_IRIDIUM_SQCFO=0 to disable.
             sq_cfo: std::env::var("XNG_IRIDIUM_SQCFO").map(|v| v != "0").unwrap_or(true),
             sync_corr: std::env::var("XNG_IRIDIUM_SYNCCORR").map(|v| v != "0").unwrap_or(true),
+            pll_full: std::env::var("XNG_IRIDIUM_PLL_FULL").is_ok(),
         }
     }
 
@@ -470,6 +475,10 @@ impl IridiumDemod {
         let mut symbols: Vec<u8> = Vec::new();
         let mut k = 0usize;
         let mut carr = phase;
+        // gr-iridium runs the decision-directed PLL across the whole burst; xng
+        // by default freezes it over the UW (k<12) so the UW correlation's phase
+        // drives the access code, which is what the access-code check validates.
+        let pll_start = if self.pll_full { 0 } else { 12 };
         loop {
             let sp = uw_pos + k as f64 * self.sps;
             let Some(s) = self.sample(sp) else { break };
@@ -481,7 +490,7 @@ impl IridiumDemod {
             let idx_f = (ang / (PI / 2.0)).round();
             let q = (idx_f as i32).rem_euclid(4) as u8;
             let residual = ang - idx_f * (PI / 2.0);
-            if k >= 12 {
+            if k >= pll_start {
                 carr += 0.2 * residual;
             }
             symbols.push(q);

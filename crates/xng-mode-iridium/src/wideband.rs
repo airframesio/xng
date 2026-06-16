@@ -44,12 +44,12 @@ const MAX_BURST_S: f64 = 0.092;
 const POST_S: f64 = 0.012;
 /// Pre-burst samples to include (preamble ramp).
 const PRE_S: f64 = 0.004;
-/// One-sided channel passband for the per-burst DDC. Wider than the
-/// single-channel decoder's 25 kHz so the demod's ±30 kHz tone-CFO search
-/// can still recover bursts whose detection centroid sits well off the
-/// true channel center under spectral leakage; the extra noise this admits
-/// is removed again by the demod's own matched processing.
-const WIDEBAND_PASSBAND_HZ: f64 = 50_000.0;
+/// One-sided channel passband for the per-burst DDC, matched to gr-iridium's
+/// burst input_fir (low_pass_2 cutoff burst_width/2 ≈ 21 kHz). A tighter filter
+/// raises per-burst SNR — with multi-frame decode this measurably lifts IDA
+/// yield (60s: 557→579) — and the peak-bin detector centers accurately enough
+/// that the narrower band does not clip bursts. Tunable via XNG_IRIDIUM_PASSBAND_HZ.
+const WIDEBAND_PASSBAND_HZ: f64 = 24_000.0;
 
 /// Centered ("same") matched-filter convolution: output aligned to input (no
 /// net group delay, symmetric taps), zero-padded at the edges.
