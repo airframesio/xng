@@ -82,6 +82,12 @@ pub struct IridiumDemod {
     /// qpsk_demod runs it across the whole burst), instead of freezing it over
     /// the UW. XNG_IRIDIUM_PLL_FULL.
     pll_full: bool,
+    /// Validate the sync word on the absolute demodulated UW symbols (gr-iridium
+    /// check_sync_word: Σ symbol-distance ≤ 2) instead of the differential
+    /// access code (≤ACCESS_TOL bits). Differential decoding amplifies symbol
+    /// errors, so the absolute check accepts weak bursts the differential one
+    /// rejects. XNG_IRIDIUM_ABSCHECK.
+    abscheck: bool,
 }
 
 impl IridiumDemod {
@@ -107,6 +113,7 @@ impl IridiumDemod {
             sq_cfo: std::env::var("XNG_IRIDIUM_SQCFO").map(|v| v != "0").unwrap_or(true),
             sync_corr: std::env::var("XNG_IRIDIUM_SYNCCORR").map(|v| v != "0").unwrap_or(true),
             pll_full: std::env::var("XNG_IRIDIUM_PLL_FULL").is_ok(),
+            abscheck: std::env::var("XNG_IRIDIUM_ABSCHECK").is_ok(),
         }
     }
 
@@ -471,7 +478,7 @@ impl IridiumDemod {
     /// Demodulate from a locked UW position: QPSK slice with a payload-only
     /// decision-directed PLL, differential decode in iridium-toolkit pair order,
     /// and access-code validation.
-    fn demod_from(&self, uw_pos: f64, theta: f32, phase: f32, access: &[u8; 24]) -> (Option<DemodBurst>, usize) {
+    fn demod_from(&self, uw_pos: f64, theta: f32, phase: f32, access: &[u8; 24], uw: &[u8]) -> (Option<DemodBurst>, usize) {
         let mut symbols: Vec<u8> = Vec::new();
         let mut k = 0usize;
         let mut carr = phase;
@@ -512,8 +519,22 @@ impl IridiumDemod {
             bits.push(m & 1);
             bits.push(m >> 1);
         }
-        let access_errs = bits.iter().take(24).zip(access).filter(|(a, b)| a != b).count();
-        if bits.len() >= 24 && access_errs <= ACCESS_TOL {
+        let valid = if self.abscheck {
+            // gr-iridium check_sync_word: sum of absolute UW symbol distances
+            // (a 90° = 3 wrap counts as 1) ≤ 2, on the demodulated symbols.
+            let mut diffs = 0i32;
+            for i in 0..12.min(uw.len()) {
+                let mut d = (symbols[i] as i32 - uw[i] as i32).abs();
+                if d == 3 {
+                    d = 1;
+                }
+                diffs += d;
+            }
+            diffs <= 2
+        } else {
+            bits.iter().take(24).zip(access).filter(|(a, b)| a != b).count() <= ACCESS_TOL
+        };
+        if bits.len() >= 24 && valid {
             let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
             (Some(DemodBurst { bits, cfo_hz }), n_sym)
         } else {
@@ -608,7 +629,7 @@ impl IridiumDemod {
                     acc_uw += s * Complex::from_polar(1.0, -(sync[16 + j] as f32 * PI / 2.0) - theta * j as f32);
                 }
             }
-            let (frame, n_sym) = self.demod_from(uw_pos, theta, acc_uw.arg(), access);
+            let (frame, n_sym) = self.demod_from(uw_pos, theta, acc_uw.arg(), access, &sync[16..]);
             if let Some(f) = frame {
                 out.push(f);
             }

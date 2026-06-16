@@ -40,8 +40,13 @@ const BURST_WIDTH_HZ: f32 = 40_000.0;
 const WARMUP_FRAMES: u64 = 64;
 /// Maximum burst duration in seconds.
 const MAX_BURST_S: f64 = 0.092;
-/// Time to keep capturing after the burst leaves the detector.
-const POST_S: f64 = 0.012;
+/// Time to keep capturing after the burst leaves the detector. gr-iridium uses
+/// 16 ms; xng goes to 24 ms because it also keeps the burst's *detection* alive
+/// that much longer (the finish test below uses POST_S), bridging the short
+/// TDMA gaps so the multi-frame demod catches adjacent frames in one window.
+/// Measured: 12→24 ms lifts 300s CRC-OK IDA 463→489 (beyond 24 ms total IDA
+/// still rises but CRC-OK plateaus). Tunable via XNG_IRIDIUM_POST_MS.
+const POST_S: f64 = 0.024;
 /// Pre-burst samples to include (preamble ramp).
 const PRE_S: f64 = 0.004;
 /// One-sided channel passband for the per-burst DDC, matched to gr-iridium's
@@ -239,7 +244,8 @@ impl IridiumWideband {
             })
             .collect();
 
-        let post_frames = (POST_S * self.input_rate / frame_len as f64).ceil() as u64;
+        let post_s = crate::demod::env_f32("XNG_IRIDIUM_POST_MS", (POST_S * 1000.0) as f32) as f64 / 1000.0;
+        let post_frames = (post_s * self.input_rate / frame_len as f64).ceil() as u64;
         let max_frames = (MAX_BURST_S * self.input_rate / frame_len as f64).ceil() as u64;
         let hw = self.half_width_bins as i64;
         for mag in &mags {
@@ -432,7 +438,8 @@ impl IridiumWideband {
     fn extract(&self, b: &ActiveBurst) -> Vec<WidebandBurst> {
         let frame_len = self.nfft as u64;
         let pre = (PRE_S * self.input_rate) as u64;
-        let post = (POST_S * self.input_rate) as u64;
+        let post_s = crate::demod::env_f32("XNG_IRIDIUM_POST_MS", (POST_S * 1000.0) as f32) as f64 / 1000.0;
+        let post = (post_s * self.input_rate) as u64;
         let s0 = (b.start_frame * frame_len).saturating_sub(pre).max(self.start_abs);
         let s1 = ((b.last_frame + 1) * frame_len + post)
             .min(self.start_abs + self.buf.len() as u64);
