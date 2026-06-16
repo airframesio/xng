@@ -16,12 +16,12 @@ cores that share one capture, one message model, one application layer,
 and one set of outputs (including first-class
 [airframes.io](https://airframes.io) feeding).
 
-On off-air benchmark captures xng **beats dumpvdl2 on VDL2** and
-decodes **97–99 % of the strongest oracles for Mode S, HFDL, and
-AIS** (readsb, dump1090-fa, dumphfdl, AIS-catcher) while finding
-Mode S frames they miss — see the
-[benchmarks](#benchmarks) below; every number is enforced by a
-[CI regression gate](bench/) on each pull request.
+On off-air benchmark captures xng **beats dumpvdl2 on VDL2 and
+gr-iridium on Iridium**, and decodes **97–99 % of the strongest
+oracles for Mode S, HFDL, and AIS** (readsb, dump1090-fa, dumphfdl,
+AIS-catcher) while finding Mode S frames they miss — see the
+[benchmarks](#benchmarks) below; every count-gated number is enforced
+by a [CI regression gate](bench/) on each pull request.
 
 Releases ship binaries for Linux (x86_64/arm64, tarball + .deb), macOS
 Apple Silicon, and multi-arch Docker images.
@@ -65,7 +65,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC, **C-channel assignment SUs (voice-circuit frequencies from call setup)**; **C-channel voice circuits (8.4 kbps OQPSK): AMBE voice-frame extraction + call-progress/telephony signal units** | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air; C-channel RF loopback |
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
-| Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, **pager messages (IMS) with multi-part reassembly**, **voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction**, **IP-channel frames (IIP ARQ / IIQ / IIR)**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle |
+| Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD**, **pager messages (IMS) with multi-part reassembly**, **voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction**, **IP-channel frames (IIP ARQ / IIQ / IIR)**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle; on a shared 300 s off-air capture xng decodes **758 CRC-OK IDA frames vs gr-iridium's 573 (132 %)** — see [Benchmarks](#benchmarks) |
 | AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
 | Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), single-bit CRC repair, per-aircraft tracking, **SBS + Beast outputs**; any rate ≥ 2 MS/s including **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
 
@@ -99,11 +99,22 @@ hypothesis](docs/notes/BENCHMARKS.md); fenced in CI by
 
 | Mode | Reference decoder | Reference | xng | | xng-exclusive frames |
 |---|---|---:|---:|---|---:|
+| Iridium (IDA) † | gr-iridium | 573 | **758** | **132 %** | — |
 | VDL Mode 2 | dumpvdl2 | 41 | **44** | **107 %** | — |
 | Mode S @2.4 MS/s | readsb (`--no-fix`) | 167 | **164** | 98 % | 5 |
 | Mode S @2 MS/s | dump1090-fa (`--no-fix`) | 162 | **161** | 99 % | 7 |
 | HFDL | dumphfdl | 37 | **36** | 97 % | — |
 | AIS | AIS-catcher | 53 | **48** | 91 % | 0 |
+
+**†** CRC-OK IDA frames over a shared 300 s off-air capture (Airspy R2,
+1622 MHz, 10 MS/s). That capture is 11 GB — too large to vendor in CI,
+so unlike the rows above it is not count-gated; the Iridium demod core is
+fenced instead by bit-exact and field-exact oracle tests. xng decodes
+**758** CRC-OK IDA frames to gr-iridium's **573** on that capture (total
+IDA 1577 vs 1214), and even its **587 distinct-content** frames exceed
+gr-iridium's raw 573 — the gap was weak-burst frame *production*, closed
+by porting gr's peak-relative end-of-frame rule (xng had been truncating
+weak frames on the first faded symbol). See [Iridium notes](docs/notes/IRIDIUM.md).
 
 The HFDL and AIS gaps are characterized down to the burst: the missing
 frames are the weakest signals at the margin of one inland antenna —

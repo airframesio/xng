@@ -102,9 +102,10 @@ three fixes, each isolated and tested:
    wideband noise into the 250 kHz channel (measured peak/noise 8.5 dB
    vs 16.6 dB through a real FIR on the same burst). Each burst now goes
    through `xng_dsp::Ddc` (the same two-stage windowed-sinc the
-   single-channel path uses) at a 50 kHz one-sided passband (wider than
-   the single channel's 25 kHz so the demod's ±30 kHz tone-CFO search can
-   recover off-center detections).
+   single-channel path uses). (Initial bring-up used a 50 kHz one-sided
+   passband; later retuned to **28 kHz** once multi-frame decode and the
+   post-roll change shifted the optimum — see the sensitivity campaign
+   below.)
 2. **Seed the demod noise floor (the decisive fix).** The demod's
    asymmetric noise EMA starts at 1.0 and needs ~1400 quiet samples to
    converge. A continuous stream gives it that; an isolated
@@ -128,3 +129,81 @@ to the IRA classifier and mis-decodes as a ring alert with an all-zero
 satellite/position. The real captures are dominated by ITL bursts; they
 are now reported as `kind:"itl"` (full satellite/plane PRS decode via the
 toolkit's `itl.py` tables is still TODO).
+
+## Sensitivity campaign: matching and beating gr-iridium
+
+The wideband path above got real captures *decoding*; a later campaign took
+the IDA yield from ~2 % of gr-iridium to **ahead of it**. On a shared 300 s
+off-air capture (Airspy R2, 1622 MHz, 10 MS/s, KSMF) the scoreboard is now:
+
+| | xng | gr-iridium |
+|---|---:|---:|
+| CRC-OK IDA frames | **758** | 573 |
+| total IDA frames | 1577 | 1214 |
+| distinct-content CRC-OK | **587** | (573 raw) |
+
+gr-iridium = `iridium-extractor -o -c 1622000000 -r 10000000 -f ci16_le FILE`
+→ `iridium-parser.py -o line` on the same file; CRC-OK = lines with `CRC:OK`.
+xng = `xng decode FILE -f cs16 -r 10000000 -c 1622.000M --channels 1622.000M
+--mode iridium`; CRC-OK = IDA frames with `body.details.crc_ok`. Both
+pass-rates match (~48 %), so the entire gap was IDA-frame **production**
+(weak bursts reaching a valid frame at all), not decode quality.
+
+The acquisition chain is a faithful port of gr-iridium's, plus a few
+beyond-gr refinements (all env-overridable; defaults given):
+
+- **Detector** — gr `fft_burst_tagger`: 512-frame rolling-*mean* baseline,
+  threshold `10^(dB/10)/ENBW` (ENBW 1.72, 16 dB), integer **peak-bin**
+  centering, ±burst_width/2 mask, and the `(fs/burst_width)·0.8` max-bursts
+  squelch. Per-bin freeze keeps a sustained burst from lifting its own floor.
+- **Channelization** — per-burst `Ddc` to the 250 kHz channel rate, **28 kHz**
+  one-sided passband (re-swept after the post-roll/multi-frame changes moved
+  the optimum; gr's gentle `input_fir` passes energy out to ~28 kHz too).
+- **Fine CFO** — gr's squared-FFT estimate: square the preamble+UW (removes
+  the BPSK → tone at 2·CFO), Blackman window, 16× zero-padded FFT, quadratic
+  interpolation, halve. Re-estimated **per frame** in the multi-frame loop;
+  a ±640 Hz residual-CFO grid (`CFO_REFINE=2`) is searched jointly with
+  timing in the sync correlation.
+- **Sync** — full **28-symbol** (16 preamble + 12 UW) coherent correlation at
+  full sample resolution, DL and UL, free initial phase; no magnitude gate
+  (the access code + CRC decide).
+- **Multi-frame** — decode **every** TDMA time-slot frame in one detector
+  window (`handle_multiple_frames_per_burst`), advancing by each frame's
+  symbol count. 24 ms post-roll keeps detection alive across the short
+  inter-slot gaps so adjacent frames land in one window.
+- **Demod** — 1st-order decision-directed PLL (α=0.2) on the payload,
+  carrier seeded from the UW correlation; differential decode in
+  iridium-toolkit pair order.
+- **End-of-frame (the decisive win)** — trim only after **3 consecutive**
+  symbols below **peak/8** (−18 dB from the burst's own max), reading a full
+  ≤191-symbol frame. xng previously broke on the *first* payload symbol below
+  `noise×4` (absolute); a weak burst sits right at that floor, so one faded
+  symbol truncated the frame below the ~190-symbol BCH/CRC length and the
+  whole frame was lost. This rule alone lifted CRC-OK IDA **516 → 758**.
+- **Validation** — differential access-code gate at the random-match boundary
+  (≤12 of 24 bits; the 24-bit CRC, false-pass ≈ 6e-8, is the real arbiter)
+  → BCH (matches iridium-toolkit exactly) → CRC.
+- **Two-filter union** — every burst is demodulated both unfiltered and
+  through the RRC matched filter; the two recover largely *disjoint*
+  populations (strong vs weak: 182 vs 758 CRC-OK alone), so both are emitted
+  and deduped by decoded content.
+
+Campaign deltas (300 s CRC-OK IDA): squared-FFT CFO 337→419, multi-frame
+419→454, 28 kHz channel 454→463, 24 ms post-roll 463→489, residual-CFO
+refine 489→506, access-gate 506→516, **end-of-frame rule 516→758**.
+
+**Tested and rejected** (negative results worth keeping): lowering the
+detector threshold floods with noise detections that never decode; a
+preamble decision-directed PLL *runway* hurts (xng's 28-symbol batch
+correlation already extracts the optimal phase, and the onset preamble
+symbols are RRC-edge-unreliable); the absolute UW `check_sync_word` and a
+whole-burst PLL are both neutral; multi-hypothesis FFT-peak CFO gains nothing
+(the squared-FFT always lands on the right lobe within ±1.6 kHz).
+`MIN_BURST_SPAN=0` (extracting single-frame bursts, as gr does) adds +9
+frames offline but is **offline-only** — on the live station it floods the
+per-channel decode queues and grows `chan_dropped`, losing more than it
+gains; the default (2) keeps the soak drop-free at 10 MS/s.
+
+Not count-gated in CI: the capture is 11 GB, too large to vendor. The demod
+core is fenced by the bit-exact (`demodulates_gr_iridium_test_burst`) and
+field-exact (`offair_ida_sbd_decodes_with_crc`) oracle tests instead.

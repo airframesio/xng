@@ -277,8 +277,22 @@ file decode = max, SDR commands = live).
   logon-resume. Fixture + floor (31) added to the bench gate.
   Earlier: +4.5–5 dB synthetic sensitivity from the selectivity
   filter (PR #77).
-- Iridium/STD-C/Aero: oracle-validated field-exact; no count-style
-  sensitivity comparison run yet
+- **Iridium: count-benchmarked and now ahead of gr-iridium.** On a shared
+  300 s off-air capture (Airspy R2, 1622 MHz, 10 MS/s, KSMF) xng decodes
+  **758 CRC-OK IDA frames vs gr-iridium's 573** (iridium-extractor +
+  iridium-parser.py on the same file; total IDA 1577 vs 1214). Both
+  pass-rates match (~48 %), so the whole gap was IDA-frame *production*:
+  xng was truncating weak frames on the first payload symbol below
+  `noise×4`, while gr trims only after 3 consecutive symbols below
+  `peak/8` (the burst's own max). Porting that end-of-frame rule lifted
+  CRC-OK IDA 516 → 758. Earlier wins in the same campaign: squared-FFT
+  fine CFO, multi-frame-per-burst decode, gr-style FFT detector
+  (512-frame mean / peak-bin / max-bursts squelch), retuned 28 kHz
+  channel, per-frame residual-CFO refine, access-gate at the random-match
+  boundary. NOT CI-count-gated (the capture is 11 GB, too large to
+  vendor); fenced instead by the bit-exact + field-exact oracle tests.
+  Full campaign in [IRIDIUM.md](IRIDIUM.md). STD-C/Aero remain
+  oracle-validated field-exact with no count-style comparison yet.
 
 ## Live-capture authenticity: phantom frames and ICAO confirmation
 
