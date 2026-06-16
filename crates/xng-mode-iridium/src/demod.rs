@@ -29,11 +29,16 @@ const UW_UL: [u8; 12] = [2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2];
 const DQPSK_MAP: [u8; 4] = [0, 2, 3, 1];
 /// Maximum burst length in symbols (90 ms at 25 ksym/s).
 const MAX_BURST_SYMS: usize = 2_250;
-/// Tolerated bit errors in the differentially-decoded 24-bit access code. A
-/// single absolute UW-symbol slip flips up to ~2 differential bits, so a small
-/// tolerance lets weak-but-real bursts through; the downstream BCH/CRC rejects
-/// anything spurious that slips past (gr-iridium's UW check tolerates diffs≤2).
-const ACCESS_TOL: usize = 4;
+/// Tolerated bit errors in the differentially-decoded 24-bit access code. Set at
+/// the random-match boundary (12 = half of 24 bits): on weak bursts noise corrupts
+/// several access-code bits even when CFO/timing are right, so a tight tolerance
+/// drops real frames before they ever reach BCH/CRC. The downstream 24-bit CRC
+/// (false-pass ≈ 6e-8) is the real arbiter, so this gate only needs to reject
+/// frames no better than chance; loosening 4→12 lifts 300s CRC-OK IDA 506→516 and
+/// CRC-OK plateaus exactly at 12 (the gate stops discriminating beyond it). Keeping
+/// it at 12 rather than off still bounds the BCH/CRC attempts (CPU). Env-overridable
+/// via XNG_IRIDIUM_ACCESS_TOL.
+const ACCESS_TOL: usize = 12;
 
 /// Read an `f32` tuning knob from the environment (for sensitivity sweeps),
 /// falling back to `default` when unset or unparseable.
@@ -99,6 +104,12 @@ pub struct IridiumDemod {
     cfo_refine: i32,
     /// Residual-CFO grid step in rad/sym for `cfo_refine`. XNG_IRIDIUM_CFO_REFINE_STEP.
     cfo_refine_step: f32,
+    /// Max differential access-code bit errors to accept a frame for full decode.
+    /// On weak bursts noise corrupts the 24-bit access code past the default even
+    /// when CFO/timing are right, so the frame never reaches BCH/CRC; loosening
+    /// this lets more weak frames attempt the full decode, where the 24-bit CRC
+    /// (false-pass ≈ 6e-8) rejects any junk. XNG_IRIDIUM_ACCESS_TOL.
+    access_tol: usize,
 }
 
 impl IridiumDemod {
@@ -131,6 +142,7 @@ impl IridiumDemod {
             // within the live station's headroom (uses <1 of 12 cores).
             cfo_refine: env_f32("XNG_IRIDIUM_CFO_REFINE", 2.0) as i32,
             cfo_refine_step: env_f32("XNG_IRIDIUM_CFO_REFINE_STEP", 0.08),
+            access_tol: env_f32("XNG_IRIDIUM_ACCESS_TOL", ACCESS_TOL as f32) as usize,
         }
     }
 
@@ -475,7 +487,7 @@ impl IridiumDemod {
             // the correlation locked, tolerating a few bit errors so weak-but-
             // real bursts are not dropped over a single symbol slip.
             let access_errs = bits.iter().take(24).zip(access).filter(|(a, b)| a != b).count();
-            if bits.len() >= 24 && access_errs <= ACCESS_TOL {
+            if bits.len() >= 24 && access_errs <= self.access_tol {
                 // Total carrier offset: per-symbol rotation → Hz.
                 let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
                 out.push(DemodBurst { bits, cfo_hz });
@@ -549,7 +561,7 @@ impl IridiumDemod {
             }
             diffs <= 2
         } else {
-            bits.iter().take(24).zip(access).filter(|(a, b)| a != b).count() <= ACCESS_TOL
+            bits.iter().take(24).zip(access).filter(|(a, b)| a != b).count() <= self.access_tol
         };
         if bits.len() >= 24 && valid {
             let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
