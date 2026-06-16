@@ -21,6 +21,12 @@ const UW_UL: [u8; 12] = [2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2];
 const DQPSK_MAP: [u8; 4] = [0, 2, 3, 1];
 /// Maximum burst length in symbols (90 ms at 25 ksym/s).
 const MAX_BURST_SYMS: usize = 2_250;
+
+/// Read an `f32` tuning knob from the environment (for sensitivity sweeps),
+/// falling back to `default` when unset or unparseable.
+pub(crate) fn env_f32(key: &str, default: f32) -> f32 {
+    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+}
 /// Preamble tone length to search across (long preamble = 64 symbols).
 const PRE_SYMS: f64 = 64.0;
 
@@ -45,6 +51,12 @@ pub struct IridiumDemod {
     level: f32,
     /// Emit per-trigger acquisition diagnostics (XNG_IRIDIUM_DEBUG set).
     debug: bool,
+    /// UW phase-fit acceptance cost (lower = stricter). Tunable via
+    /// XNG_IRIDIUM_UWCOST for sensitivity sweeps.
+    uw_thresh: f32,
+    /// Burst power-gate multiplier over the noise floor. Tunable via
+    /// XNG_IRIDIUM_GATE.
+    gate_mult: f32,
 }
 
 impl IridiumDemod {
@@ -63,6 +75,8 @@ impl IridiumDemod {
             pwr_sum: 0.0,
             level: 0.0,
             debug: std::env::var("XNG_IRIDIUM_DEBUG").is_ok(),
+            uw_thresh: env_f32("XNG_IRIDIUM_UWCOST", 0.05),
+            gate_mult: env_f32("XNG_IRIDIUM_GATE", 8.0),
         }
     }
 
@@ -202,7 +216,7 @@ impl IridiumDemod {
             self.pwr_sum += p - self.pwr_win[self.pwr_pos];
             self.pwr_win[self.pwr_pos] = p;
             self.pwr_pos = (self.pwr_pos + 1) % 16;
-            if self.pwr_sum < self.noise * 8.0 * 16.0 {
+            if self.pwr_sum < self.noise * self.gate_mult * 16.0 {
                 continue;
             }
             // The boxcar trigger fires ~16 samples into the burst; the
@@ -212,7 +226,7 @@ impl IridiumDemod {
             let bstart = pos - 16.0;
             let Some(cfo) = self.tone_cfo(bstart + 2.0 * self.sps, 10.0) else { break };
             let theta0 = (2.0 * std::f64::consts::PI * cfo / SYMBOL_RATE) as f32;
-            let burst_gate = self.noise * 8.0;
+            let burst_gate = self.noise * self.gate_mult;
             let mut found: Option<(f32, f64, f32, f32, &'static [u8; 24])> = None;
             let mut dbg_best = f32::INFINITY;
             let mut dbg_energetic = 0u32;
@@ -242,7 +256,7 @@ impl IridiumDemod {
                 for (uw, access) in [(&UW_DL, ACCESS_DL), (&UW_UL, ACCESS_UL)] {
                     if let Some((cost, p2, th, ph)) = self.uw_fit(cand, uw, theta0) {
                         dbg_best = dbg_best.min(cost);
-                        if cost < 0.05 && found.map(|(c, ..)| cost < c).unwrap_or(true) {
+                        if cost < self.uw_thresh && found.map(|(c, ..)| cost < c).unwrap_or(true) {
                             found = Some((cost, p2, th, ph, access));
                         }
                     }
