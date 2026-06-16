@@ -170,6 +170,47 @@ fn update(d: &mut Dash, m: &Message) {
                 }
             }
         }
+        // ACARS (from any carrier — VHF, VDL2, HFDL, Aero, or Iridium SBD):
+        // surface the aircraft as an entity keyed by tail (else flight), so it
+        // shows in the table even without a position. A position appears only
+        // if the application layer carries one (ADS-C report).
+        MessageBody::Acars(a) => {
+            let id = a
+                .tail
+                .clone()
+                .or_else(|| a.flight.clone())
+                .unwrap_or_else(|| "ACARS".into());
+            let e = d.aircraft.entry(id.clone()).or_insert_with(|| json!({}));
+            let o = e.as_object_mut().unwrap();
+            o.insert("icao".into(), json!(id)); // displayed id (tail/flight, not hex)
+            o.insert("seen".into(), json!(now_s()));
+            if let Some(reg) = &a.tail {
+                o.insert("reg".into(), json!(reg));
+            }
+            if let Some(flight) = &a.flight {
+                o.insert("callsign".into(), json!(flight.trim()));
+            }
+            let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+            o.insert("msgs".into(), json!(msgs + 1));
+            // ADS-C position report from the application layer, if present.
+            if let Some(app) = &a.app {
+                if app.get("app").and_then(|v| v.as_str()) == Some("adsc") {
+                    for t in app.get("tags").and_then(Value::as_array).into_iter().flatten() {
+                        if let (Some(lat), Some(lon)) = (
+                            t.get("lat").and_then(Value::as_f64),
+                            t.get("lon").and_then(Value::as_f64),
+                        ) {
+                            push_trail(o, lat, lon);
+                            o.insert("lat".into(), json!(lat));
+                            o.insert("lon".into(), json!(lon));
+                            if let Some(alt) = t.get("alt_ft").and_then(Value::as_i64) {
+                                o.insert("alt".into(), json!(alt));
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // Iridium ring alerts carry the broadcasting satellite's geocentric
         // position; split into satellite positions (high altitude) and
         // targeted ground beam footprints (low altitude) for the map.
@@ -429,5 +470,42 @@ mod tests {
         assert_eq!(snap["iridium_devices"].as_array().unwrap().len(), 2);
         // mt-position must NOT leak into the beam-footprint (spot beam) layer.
         assert_eq!(snap["iridium_rings"].as_array().unwrap().len(), 0);
+    }
+
+    fn acars(tail: &str, flight: &str) -> Message {
+        Message {
+            mode: Mode::AcarsPoa,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 131_550_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: MessageBody::Acars(xng_types::AcarsCore {
+                tail: Some(tail.into()),
+                flight: Some(flight.into()),
+                label: "H1".into(),
+                text: "hi".into(),
+                ..Default::default()
+            }),
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn acars_creates_flight_entity() {
+        let mut d = Dash::default();
+        update(&mut d, &acars("N12345", "UA123"));
+        update(&mut d, &acars("N12345", "UA123")); // same tail coalesces, counts msgs
+        assert_eq!(d.aircraft.len(), 1, "ACARS surfaces an aircraft entity");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let ac = &snap["aircraft"][0];
+        assert_eq!(ac["reg"], "N12345");
+        assert_eq!(ac["callsign"], "UA123");
+        assert_eq!(ac["msgs"], 2);
     }
 }
