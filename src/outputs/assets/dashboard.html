@@ -330,6 +330,18 @@ const shipIcon = (cog, type) => {
 const IRIDIUM = '#73daca';
 // Beam colour by id (1–48), so a satellite's beams read as a coloured tiling.
 const beamColor = b => `hsl(${((b || 0) * 360 / 48) | 0},70%,55%)`;
+// Unwrap a trail's longitudes into a continuous run around a reference
+// longitude (the satellite's current sub-point), so a ground track crossing
+// the ±180° date line draws across the seam (off the edge) instead of
+// shooting all the way across the map. Mirrors the backend cell unwrap.
+function unwrapTrail(trail, refLon) {
+  return trail.map(([la, lo]) => {
+    let l = lo;
+    while (l - refLon > 180) l -= 360;
+    while (l - refLon < -180) l += 360;
+    return [la, l];
+  });
+}
 const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
   iconSize: [20, 20], iconAnchor: [10, 10], popupAnchor: [0, -14] });
@@ -386,8 +398,9 @@ function syncIridium(s) {
     e.detail = popup; // shown in the bottom-left card while this sat is selected
     if (sat.sat === pinnedSat) setSatCard(popup);
     if (sat.trail && sat.trail.length > 1) {
-      if (e.trail) e.trail.setLatLngs(sat.trail);
-      else e.trail = L.polyline(sat.trail, { color: IRIDIUM, weight: 1, opacity: 0.4, dashArray: '3,4' }).addTo(satLayer);
+      const tr2 = unwrapTrail(sat.trail, sat.lon); // continuous across the date line
+      if (e.trail) e.trail.setLatLngs(tr2);
+      else e.trail = L.polyline(tr2, { color: IRIDIUM, weight: 1, opacity: 0.4, dashArray: '3,4' }).addTo(satLayer);
     }
   }
   for (const [k, e] of satMarkers) if (!seenSat.has(k)) {
@@ -455,9 +468,9 @@ function syncIridium(s) {
       const col = beamColor(c.beam);
       style = { color: col, fillColor: col, weight: 2, opacity: 0.95, fillOpacity: 0.32, dashArray: null };
     } else if (c.decoded) {
-      style = { color: '#9aa3bd', fillColor: '#9aa3bd', weight: 1.5, opacity: 0.7, fillOpacity: 0.12, dashArray: null };
+      style = { color: '#9aa3bd', fillColor: '#9aa3bd', weight: 1, opacity: 0.38, fillOpacity: 0.04, dashArray: null };
     } else {
-      style = { color: '#586079', fillColor: '#586079', weight: 1, opacity: 0.14, fillOpacity: 0.012, dashArray: '2 5' };
+      style = { color: '#586079', fillColor: '#586079', weight: 1, opacity: 0.09, fillOpacity: 0.005, dashArray: '2 5' };
     }
     const m = L.polygon(c.poly, style); // added to the layer by applyPatternFilter
     m._base = style; m._sat = c.sat;
