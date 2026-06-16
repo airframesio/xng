@@ -59,15 +59,21 @@ const MIN_OBS: u32 = 2;
 /// MathWorks Satellite Communications Toolbox Iridium model, FCC filings).
 const TIER_COUNT: [usize; 4] = [3, 9, 15, 21];
 /// Each tier's ground radius from nadir (km), from the off-nadir boresight
-/// angles (~11° / 24° / 42° / 57°) projected from 780 km onto the Earth
-/// sphere. Calibrated so the outer tier matches the observed ~1480 km extent
-/// (the MathWorks example's 45°/834 km undershoots real coverage, which runs
-/// to ~8° elevation ≈ 57° off-nadir).
-const TIER_RADIUS_KM: [f64; 4] = [152.0, 351.0, 744.0, 1475.0];
+/// angles (~11° / 24° / 42° / 59°) projected from 780 km onto the Earth
+/// sphere. The three inner tiers match the ~1480 km extent the station
+/// actually decodes; the outer tier is stretched to the documented
+/// full-coverage footprint (~2250 km radius / ~4500 km diameter per the
+/// MathWorks toolbox model, FCC filings, and published Iridium coverage),
+/// not the decoded extent. The station only demodulates the stronger
+/// mid-footprint beams, so the faint limb beams (~59-62° off-nadir, near
+/// the 62.97° horizon limb) illuminate the ground but rarely decode here —
+/// they belong on the map as modelled coverage even when unheard. The outer
+/// band is wide because oblique projection radially elongates limb beams.
+const TIER_RADIUS_KM: [f64; 4] = [152.0, 351.0, 744.0, 1680.0];
 /// Radial band boundaries between tiers (km), midway between tier radii, with
-/// an outer edge symmetric to the inner gap. Used to size each beam's radial
-/// extent so adjacent tiers tile.
-const TIER_BOUND_KM: [f64; 5] = [0.0, 251.0, 547.0, 1109.0, 1841.0];
+/// the outer edge at the documented ~2250 km footprint extent. Used to size
+/// each beam's radial extent so adjacent tiers tile.
+const TIER_BOUND_KM: [f64; 5] = [0.0, 251.0, 547.0, 1109.0, 2250.0];
 /// Each beam is sized ~√2 larger than its half-cell so the ellipse covers the
 /// whole cell including the corners where cells meet (an inscribed ellipse
 /// would leave corner gaps). Real Iridium beams overlap this much — usable
