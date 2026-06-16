@@ -117,6 +117,12 @@ pub struct IridiumWideband {
     /// Burst-mask half-width in bins (±this is masked around each detected
     /// burst so neighbours stay separate). From XNG_IRIDIUM_BURST_WIDTH_HZ.
     half_width_bins: usize,
+    /// Minimum FFT-frame span (`last_frame - start_frame`) for a burst to be
+    /// extracted. gr-iridium tags every burst hot in even a single FFT frame; xng
+    /// originally required ≥2 (span≥3 frames) to drop single-frame noise blips, but
+    /// that also dropped weak bursts whose energy only clears threshold briefly.
+    /// XNG_IRIDIUM_MIN_BURST_SPAN.
+    min_burst_span: u64,
     /// Recent decoded-bit hashes, to drop duplicate re-detections of one burst
     /// (a strong burst's skirt re-detected off center decodes to the same bits).
     recent_bits: std::collections::VecDeque<u64>,
@@ -180,6 +186,7 @@ impl IridiumWideband {
                 let db = crate::demod::env_f32("XNG_IRIDIUM_THRESHOLD_DB", THRESHOLD_DB);
                 10f32.powf(db / 10.0) / ENBW
             },
+            min_burst_span: crate::demod::env_f32("XNG_IRIDIUM_MIN_BURST_SPAN", 2.0) as u64,
             half_width_bins: {
                 // ±20 kHz mask around each burst (gr-iridium burst_width 40 kHz).
                 // Duplex channels are ~41.7 kHz apart, so neighbours are not
@@ -340,7 +347,9 @@ impl IridiumWideband {
             let max_bursts = ((self.input_rate / BURST_WIDTH_HZ as f64) * 0.8) as usize;
             if self.active.len() > max_bursts {
                 for a in &self.active {
-                    if a.start_frame < self.next_frame && a.last_frame > a.start_frame + 1 {
+                    if a.start_frame < self.next_frame
+                        && a.last_frame - a.start_frame >= self.min_burst_span
+                    {
                         to_extract.push(ActiveBurst {
                             bin: a.bin,
                             start_frame: a.start_frame,
@@ -371,8 +380,9 @@ impl IridiumWideband {
                 if cur >= a.last_frame + post_frames
                     || a.last_frame - a.start_frame > max_frames
                 {
-                    // Iridium bursts are ≥7 ms; ignore single-frame blips.
-                    if a.last_frame > a.start_frame + 1 {
+                    // gr-iridium tags even single-frame bursts; min_burst_span
+                    // (default 2) controls how short a burst xng still extracts.
+                    if a.last_frame - a.start_frame >= self.min_burst_span {
                         to_extract.push(ActiveBurst {
                             bin: a.bin,
                             start_frame: a.start_frame,
