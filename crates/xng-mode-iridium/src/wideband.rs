@@ -138,13 +138,12 @@ impl IridiumWideband {
             det_threshold: crate::demod::env_f32("XNG_IRIDIUM_THRESHOLD", THRESHOLD),
             dedup_bins: crate::demod::env_f32("XNG_IRIDIUM_DEDUP_BINS", 120.0) as i64,
             // Root-raised-cosine matched filter (matched to Iridium's RRC
-            // transmit pulse; gr-iridium uses RRC alpha 0.4, 51 taps). On real
-            // captures it ~17x's CRC-OK IDA yield, but the strict UW-cost/timing
-            // acquisition still drops some *clean* bursts post-filter, so it is
-            // opt-in (XNG_IRIDIUM_RC_ALPHA=0.4) pending a demod re-tune. alpha
-            // ≤ 0 disables it (default).
+            // transmit pulse; gr-iridium uses RRC alpha 0.4, 51 taps). Applied
+            // as a fallback after the unfiltered demod (see `extract`), it
+            // ~17x's CRC-OK IDA yield on real captures without regressing clean
+            // bursts. On by default; XNG_IRIDIUM_RC_ALPHA=0 disables it.
             mf_taps: {
-                let alpha = crate::demod::env_f32("XNG_IRIDIUM_RC_ALPHA", 0.0);
+                let alpha = crate::demod::env_f32("XNG_IRIDIUM_RC_ALPHA", 0.4);
                 if alpha > 0.0 {
                     crate::modulate::rrc_taps(CHANNEL_RATE / crate::demod::SYMBOL_RATE, 51, alpha as f64)
                 } else {
@@ -377,47 +376,46 @@ impl IridiumWideband {
         let mut ddc = Ddc::new(self.input_rate, CHANNEL_RATE, f_off, WIDEBAND_PASSBAND_HZ).ok()?;
         let mut chan: Vec<Complex<f32>> = Vec::new();
         ddc.process(&self.buf[rel0..rel1], &mut chan);
-        // Raised-cosine matched filter (gr-iridium-style) before the noise
-        // estimate + demod: lifts per-symbol SNR a few dB, lowering the UW
-        // acquisition cost and cleaning the bits the IDA FEC sees.
-        if !self.mf_taps.is_empty() {
-            chan = matched_filter(&chan, &self.mf_taps);
+        // Try the unfiltered burst first: clean/strong bursts decode without
+        // the matched filter and don't pay its slight per-symbol cost penalty,
+        // so high-SNR decode stays bit-exact (and the detection-centroid offset
+        // a narrow filter would clip is a non-issue). Fall back to the
+        // raised-cosine matched filter only when the clean path finds nothing —
+        // that lifts weak bursts above the demod's acquisition gate (~17x more
+        // CRC-OK IDA on real captures). Net: no regression on strong bursts,
+        // big gain on weak ones, so the matched filter is on by default.
+        if let Some(w) = self.demod_channel(chan.clone(), f_off) {
+            return Some(w);
         }
+        if !self.mf_taps.is_empty() {
+            let filtered = matched_filter(&chan, &self.mf_taps);
+            return self.demod_channel(filtered, f_off);
+        }
+        None
+    }
 
-        // Robust noise-floor estimate (20th percentile of channel power):
-        // the segment is pre-roll + burst + post, so a low order statistic
-        // lands in the noise regardless of burst length. This seeds the
-        // demod, whose own EMA floor would not converge within this short
-        // isolated segment (see IridiumDemod::seed_noise).
-        let mut powers: Vec<f32> = chan.iter().map(|s| s.norm_sqr()).collect();
-        let noise_floor = if powers.is_empty() {
+    /// Seed the per-burst noise floor and run the single-channel demodulator on
+    /// one (optionally matched-filtered) channel segment; returns the first
+    /// burst it recovers, offset back to the capture center.
+    fn demod_channel(&self, mut chan: Vec<Complex<f32>>, f_off: f64) -> Option<WidebandBurst> {
+        // Robust noise-floor estimate (20th percentile of channel power): the
+        // segment is pre-roll + burst + post, so a low order statistic lands in
+        // the noise regardless of burst length. Seeds the demod, whose own EMA
+        // floor would not converge within this short isolated segment.
+        let noise_floor = if chan.is_empty() {
             1.0
         } else {
+            let mut powers: Vec<f32> = chan.iter().map(|s| s.norm_sqr()).collect();
             let k = powers.len() / 5;
             powers.select_nth_unstable_by(k, |a, b| a.total_cmp(b));
             powers[k]
         };
-        if self.debug {
-            let n = chan.len().max(1);
-            let mean = chan.iter().map(|s| s.norm_sqr()).sum::<f32>() / n as f32;
-            let peak = chan.iter().map(|s| s.norm_sqr()).fold(0.0f32, f32::max);
-            eprintln!(
-                "  channel: {} samples, mean pwr {:.2e}, peak pwr {:.2e}, noise {:.2e}, peak/noise {:.1} dB",
-                chan.len(),
-                mean,
-                peak,
-                noise_floor,
-                10.0 * (peak / noise_floor.max(1e-12)).log10()
-            );
-        }
-        // Quiet tail so the demod's burst-end detection and lookahead
-        // complete within this call.
+        // Quiet tail so the demod's burst-end detection and lookahead complete.
         chan.extend(std::iter::repeat(Complex::new(0.0f32, 0.0)).take((CHANNEL_RATE * 0.15) as usize));
-
         let mut demod = IridiumDemod::new(CHANNEL_RATE);
         demod.seed_noise(noise_floor);
-        let mut bits_out = demod.process(&chan);
-        bits_out
+        demod
+            .process(&chan)
             .pop()
             .map(|b| WidebandBurst { offset_hz: f_off + b.cfo_hz, bits: b.bits })
     }
