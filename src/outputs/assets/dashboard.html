@@ -148,9 +148,28 @@ const satMarkers = new Map();  // sat id -> {marker, trail}
 const ringMarkers = new Map(); // "sat-beam" -> coverage-cell L.circle
 const patternMarkers = new Map(); // "sat-beam" -> projected pattern cell
 const patternBySat = new Map(); // sat id -> [pattern cell markers] (for hover link)
+const cellByBeam = new Map(); // "sat-beam" -> decoded pattern cell marker (spot-beam link)
 const footprintMarkers = new Map(); // sat id -> full-footprint coverage disc
 const deviceMarkers = new Map(); // "lat,lon" -> terminal marker
 let pinnedSat = null; // satellite whose pattern stays highlighted (click)
+let spotLink = null; // "sat-beam" of a clicked spot beam, linked to its cell
+let linkLine = null; // connector polyline from a spot beam to its pattern cell
+
+// Link a clicked spot beam (a measured boresight point) to its beam in the
+// pattern: brighten that cell and draw a dotted connector to it. Re-run each
+// tick (the pattern cells are rebuilt) so the highlight + line persist.
+function renderLink() {
+  if (linkLine) { map.removeLayer(linkLine); linkLine = null; }
+  if (!spotLink) return;
+  const ring = ringMarkers.get(spotLink);
+  const cell = cellByBeam.get(spotLink);
+  if (!ring || !cell) return;
+  cell.setStyle({ weight: 3, opacity: 1, fillOpacity: 0.4 });
+  if (!map.hasLayer(patternLayer)) patternLayer.addTo(map);
+  const cc = cell.getBounds().getCenter();
+  linkLine = L.polyline([ring._ll, [cc.lat, cc.lng]],
+    { color: '#fff', weight: 1.5, opacity: 0.8, dashArray: '4 5', interactive: false }).addTo(map);
+}
 
 // Light up (or restore) a satellite's whole beam pattern — the visual link
 // between a satellite and the cells it projects.
@@ -279,13 +298,7 @@ const shipIcon = (cog, type) => {
     iconSize: [16, 16], iconAnchor: [8, 8], popupAnchor: [0, -10] });
 };
 const IRIDIUM = '#73daca';
-// Spot-beam coverage cell: an Iridium spot beam covers ~400 km of ground
-// (~200 km radius); the 48 beams tile the ~4700 km footprint, hue per beam
-// id (1–48) so the cells under a satellite read as a coloured tiling. Real
-// beams vary (smaller near nadir, larger at the edge), so a live ring
-// footprint prefers its reconstructed per-beam radius when the beam pattern
-// has resolved that beam; this nominal radius is the fallback.
-const BEAM_RADIUS_M = 200000;
+// Beam colour by id (1–48), so a satellite's beams read as a coloured tiling.
 const beamColor = b => `hsl(${((b || 0) * 360 / 48) | 0},70%,55%)`;
 const satIcon = () => L.divIcon({ className: '', html:
   `<div style="font-size:18px;line-height:18px;color:${IRIDIUM};text-shadow:0 0 4px #000">&#128752;</div>`,
@@ -405,41 +418,41 @@ function syncIridium(s) {
     if (fp) { patternLayer.removeLayer(fp); footprintMarkers.delete(k); }
   }
 
-  // Per-beam reconstructed radius (sat-beam → m) so a live spot-beam
-  // footprint is drawn at the same size as its reconstructed pattern cell,
-  // rather than a one-size-fits-all circle.
-  const cellRad = new Map();
-  for (const c of (s.iridium_beam_cells || [])) cellRad.set(c.sat + '-' + c.beam, c.radius_m);
+  // Spot beams: where a beam's boresight was just spotted illuminating the
+  // ground (the live ring-alert footprint centre). A ring-alert is a POINT
+  // measurement, so draw it as a labelled dot — the beam's coverage SHAPE is
+  // its cell in the beam pattern. Click a dot to highlight that beam in the
+  // pattern and draw a connector to it.
   const seenRing = new Set();
   for (const r of (s.iridium_rings || [])) {
     const key = r.sat + '-' + r.beam;
     seenRing.add(key);
     const col = beamColor(r.beam);
-    const rad = cellRad.get(key) || BEAM_RADIUS_M;
     const popup = entityPopup('', escapeHtml(`spot beam S${r.sat}/B${r.beam}`), [
       ['sat id', r.sat],
       ['beam', r.beam],
-      ['center', `${r.lat.toFixed(2)}, ${r.lon.toFixed(2)}`],
+      ['boresight', `${r.lat.toFixed(2)}, ${r.lon.toFixed(2)}`],
       ['seen', `${fmtAge(s.now - r.seen)} ago`],
+      ['', 'click to link to its beam in the pattern'],
     ]);
     let m = ringMarkers.get(key);
     if (!m) {
-      // The spot beam projected on the ground: a geographic coverage cell
-      // (scales with zoom), coloured by beam id, labelled at its center.
-      m = L.circle([r.lat, r.lon], { radius: rad, color: col, weight: 1, fillColor: col, fillOpacity: 0.08 }).addTo(ringLayer);
-      m.bindTooltip(`B${r.beam}`, { permanent: true, direction: 'center', className: 'lbl' });
+      m = L.circleMarker([r.lat, r.lon], { radius: 5, color: col, weight: 2, fillColor: col, fillOpacity: 0.6 }).addTo(ringLayer);
+      m.bindTooltip(`B${r.beam}`, { permanent: true, direction: 'right', offset: [6, 0], className: 'lbl' });
       m.bindPopup(popup, { offset: [0, -6] });
+      m.on('click', () => { spotLink = spotLink === key ? null : key; renderLink(); });
       ringMarkers.set(key, m);
     } else {
       m.setLatLng([r.lat, r.lon]);
-      m.setRadius(rad);
       m.setStyle({ color: col, fillColor: col });
       m.setPopupContent(popup);
     }
+    m._ll = [r.lat, r.lon];
   }
   for (const [k, m] of ringMarkers) if (!seenRing.has(k)) {
     ringLayer.removeLayer(m);
     ringMarkers.delete(k);
+    if (spotLink === k) spotLink = null;
   }
 
   // Beam pattern: the full 48-beam canonical pattern (4 concentric tiers)
@@ -450,6 +463,7 @@ function syncIridium(s) {
   // so the whole intended pattern shows plus exactly what's been heard.
   // Polygons are cheap, so rebuild them each tick rather than diff.
   patternBySat.clear();
+  cellByBeam.clear();
   for (const m of patternMarkers.values()) patternLayer.removeLayer(m);
   patternMarkers.clear();
   (s.iridium_beam_cells || []).forEach((c, i) => {
@@ -467,14 +481,16 @@ function syncIridium(s) {
       : `sat ${c.sat} · beam not yet decoded (modelled from the 48-beam pattern)`,
       { offset: [0, -4] });
     patternMarkers.set(c.sat + '-' + i, m);
-    // Only decoded beams join the hover/pin highlight.
+    // Only decoded beams join the hover/pin highlight + the spot-beam link.
     if (c.decoded) {
       if (!patternBySat.has(c.sat)) patternBySat.set(c.sat, []);
       patternBySat.get(c.sat).push(m);
+      cellByBeam.set(c.sat + '-' + c.beam, m);
     }
   });
-  // Re-apply a pinned satellite's highlight after the per-tick rebuild.
+  // Re-apply a pinned satellite's highlight + any spot-beam link after rebuild.
   if (pinnedSat !== null) highlightSatPattern(pinnedSat, true);
+  renderLink();
 
   // Iridium mobile terminals: customer devices that reported their own
   // position (the real device locations, vs the beam footprints above).
