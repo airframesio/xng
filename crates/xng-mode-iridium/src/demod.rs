@@ -75,6 +75,9 @@ pub struct IridiumDemod {
     /// the BPSK on the UW symbols (and the alternating UL preamble), leaving a
     /// clean tone at 2·CFO. Default on; set XNG_IRIDIUM_SQCFO=0 to disable.
     sq_cfo: bool,
+    /// Score the full 28-symbol sync word (16 preamble + 12 UW) in single-shot
+    /// acquisition, as gr-iridium does. Default on (XNG_IRIDIUM_SYNCCORR=0 → UW only).
+    sync_corr: bool,
 }
 
 impl IridiumDemod {
@@ -98,6 +101,7 @@ impl IridiumDemod {
             // Default on (gr-iridium's squared-FFT fine CFO; +16% IDA / +19%
             // CRC-OK on the 300 s benchmark). Set XNG_IRIDIUM_SQCFO=0 to disable.
             sq_cfo: std::env::var("XNG_IRIDIUM_SQCFO").map(|v| v != "0").unwrap_or(true),
+            sync_corr: std::env::var("XNG_IRIDIUM_SYNCCORR").map(|v| v != "0").unwrap_or(true),
         }
     }
 
@@ -455,6 +459,160 @@ impl IridiumDemod {
         if keep_from > 0 && keep_from <= self.buf.len() {
             self.buf.drain(..keep_from);
             self.start_abs += keep_from as f64;
+        }
+        out
+    }
+
+    /// Demodulate from a locked UW position: QPSK slice with a payload-only
+    /// decision-directed PLL, differential decode in iridium-toolkit pair order,
+    /// and access-code validation.
+    fn demod_from(&self, uw_pos: f64, theta: f32, phase: f32, access: &[u8; 24]) -> (Option<DemodBurst>, usize) {
+        let mut symbols: Vec<u8> = Vec::new();
+        let mut k = 0usize;
+        let mut carr = phase;
+        loop {
+            let sp = uw_pos + k as f64 * self.sps;
+            let Some(s) = self.sample(sp) else { break };
+            if k >= 12 && s.norm_sqr() < self.noise * 4.0 {
+                break;
+            }
+            let derot = s * Complex::from_polar(1.0, -(theta * k as f32) - carr);
+            let ang = derot.arg();
+            let idx_f = (ang / (PI / 2.0)).round();
+            let q = (idx_f as i32).rem_euclid(4) as u8;
+            let residual = ang - idx_f * (PI / 2.0);
+            if k >= 12 {
+                carr += 0.2 * residual;
+            }
+            symbols.push(q);
+            k += 1;
+            if k >= 12 + MAX_BURST_SYMS {
+                break;
+            }
+        }
+        let n_sym = symbols.len();
+        if n_sym < 12 + 32 {
+            return (None, n_sym);
+        }
+        let mut bits = Vec::with_capacity(symbols.len() * 2);
+        let mut old = 0u8;
+        for &s in &symbols {
+            let d = (s + 4 - old) % 4;
+            old = s;
+            let m = DQPSK_MAP[d as usize];
+            bits.push(m & 1);
+            bits.push(m >> 1);
+        }
+        let access_errs = bits.iter().take(24).zip(access).filter(|(a, b)| a != b).count();
+        if bits.len() >= 24 && access_errs <= ACCESS_TOL {
+            let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
+            (Some(DemodBurst { bits, cfo_hz }), n_sym)
+        } else {
+            (None, n_sym)
+        }
+    }
+
+    /// gr-iridium `burst_downmix` acquisition with `handle_multiple_frames_per_burst`
+    /// (the iridium-extractor default): decode **every** frame in one detected
+    /// burst window, not just the first — Iridium TDMA packs several time-slot
+    /// frames per frequency. One fine CFO at the power-onset-refined start, then
+    /// repeatedly full-resolution-correlate the 28-symbol sync word (or 12-symbol
+    /// UW if `sync_corr` is off; no gate — the detector isolated the burst, so the
+    /// access-code + CRC decide), demodulate the frame, and advance past it.
+    /// `burst_start` is the detector's pre-roll length in channel samples.
+    pub fn acquire_multi(&mut self, chan: &[Complex<f32>], burst_start: f64) -> Vec<DemodBurst> {
+        self.buf.clear();
+        self.buf.extend_from_slice(chan);
+        self.start_abs = 0.0;
+        // Refine the detector's frame-granular start to the actual power onset:
+        // the single CFO must sit on the preamble, not the pre-roll noise.
+        self.pwr_win = [0.0; 16];
+        self.pwr_pos = 0;
+        self.pwr_sum = 0.0;
+        let scan_from = (burst_start - 8.0 * self.sps).max(0.0) as usize;
+        let mut onset = burst_start;
+        for rel in scan_from..self.buf.len() {
+            let p = self.buf[rel].norm_sqr();
+            self.pwr_sum += p - self.pwr_win[self.pwr_pos];
+            self.pwr_win[self.pwr_pos] = p;
+            self.pwr_pos = (self.pwr_pos + 1) % 16;
+            if self.pwr_sum >= self.noise * self.gate_mult * 16.0 {
+                onset = (rel as f64 - 16.0).max(0.0);
+                break;
+            }
+        }
+        let cfo = if self.sq_cfo {
+            self.tone_cfo_sq(onset)
+        } else {
+            self.tone_cfo(onset + 2.0 * self.sps, 10.0)
+        };
+        let Some(cfo) = cfo else { return Vec::new() };
+        let theta = (2.0 * std::f64::consts::PI * cfo / SYMBOL_RATE) as f32;
+        // Full sync words (preamble + UW), absolute QPSK phases.
+        const SYNC_DL: [u8; 28] =
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 2, 0, 0, 2];
+        const SYNC_UL: [u8; 28] =
+            [2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2];
+        let n_corr = if self.sync_corr { 28usize } else { 12 };
+        let off0 = if self.sync_corr { 0usize } else { 16 };
+        let end = self.buf.len() as f64;
+        let span = (PRE_SYMS + 20.0) * self.sps;
+        let min_frame = (12 + 32) as f64 * self.sps;
+        let mut out = Vec::new();
+        let mut search_lo = (onset - 6.0 * self.sps).max(0.0);
+        for _ in 0..16 {
+            if search_lo + min_frame > end {
+                break;
+            }
+            let hi = (search_lo + span).min(end);
+            // Best sync peak in [search_lo, hi] (full resolution, no gate).
+            let mut best: Option<(f32, f64, &'static [u8; 24], &'static [u8; 28])> = None;
+            let mut o = search_lo;
+            while o < hi {
+                for (sync, access) in [(&SYNC_DL, ACCESS_DL), (&SYNC_UL, ACCESS_UL)] {
+                    let mut acc = Complex::new(0.0f32, 0.0);
+                    let mut mag = 0.0f32;
+                    let mut ok = true;
+                    for k in 0..n_corr {
+                        let Some(s) = self.sample(o + (off0 + k) as f64 * self.sps) else {
+                            ok = false;
+                            break;
+                        };
+                        let e = sync[off0 + k] as f32 * PI / 2.0;
+                        acc += s * Complex::from_polar(1.0, -e - theta * (off0 + k) as f32);
+                        mag += s.norm();
+                    }
+                    if ok && mag > 1e-12 {
+                        let corr = acc.norm() / mag;
+                        if best.map(|(c, ..)| corr > c).unwrap_or(true) {
+                            best = Some((corr, o, access, sync));
+                        }
+                    }
+                }
+                o += 1.0;
+            }
+            let Some((_, o, access, sync)) = best else { break };
+            let uw_pos = o + 16.0 * self.sps;
+            let mut acc_uw = Complex::new(0.0f32, 0.0);
+            for j in 0..12 {
+                if let Some(s) = self.sample(uw_pos + j as f64 * self.sps) {
+                    acc_uw += s * Complex::from_polar(1.0, -(sync[16 + j] as f32 * PI / 2.0) - theta * j as f32);
+                }
+            }
+            let (frame, n_sym) = self.demod_from(uw_pos, theta, acc_uw.arg(), access);
+            if let Some(f) = frame {
+                out.push(f);
+            }
+            // Advance past this frame to look for the next one; a short read
+            // means the burst's sustained power is gone (end of burst).
+            if n_sym < 12 + 32 {
+                break;
+            }
+            let next = uw_pos + n_sym as f64 * self.sps;
+            if next <= search_lo + self.sps {
+                break;
+            }
+            search_lo = next;
         }
         out
     }
