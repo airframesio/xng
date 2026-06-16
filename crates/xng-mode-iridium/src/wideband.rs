@@ -35,6 +35,25 @@ const PRE_S: f64 = 0.004;
 /// is removed again by the demod's own matched processing.
 const WIDEBAND_PASSBAND_HZ: f64 = 50_000.0;
 
+/// Centered ("same") matched-filter convolution: output aligned to input (no
+/// net group delay, symmetric taps), zero-padded at the edges.
+fn matched_filter(x: &[Complex<f32>], taps: &[f32]) -> Vec<Complex<f32>> {
+    let n = taps.len();
+    let half = (n / 2) as isize;
+    (0..x.len() as isize)
+        .map(|i| {
+            let mut acc = Complex::new(0.0f32, 0.0);
+            for (k, &tap) in taps.iter().enumerate() {
+                let idx = i + k as isize - half;
+                if idx >= 0 && (idx as usize) < x.len() {
+                    acc += x[idx as usize] * tap;
+                }
+            }
+            acc
+        })
+        .collect()
+}
+
 struct ActiveBurst {
     /// Center bin of the detection.
     bin: usize,
@@ -64,6 +83,12 @@ pub struct IridiumWideband {
     active: Vec<ActiveBurst>,
     /// Emit per-burst detection diagnostics (XNG_IRIDIUM_DEBUG set).
     debug: bool,
+    /// Detection threshold over the per-bin noise floor (XNG_IRIDIUM_THRESHOLD).
+    det_threshold: f32,
+    /// Split-duplicate suppression width in bins (XNG_IRIDIUM_DEDUP_BINS).
+    dedup_bins: i64,
+    /// Raised-cosine matched-filter taps applied per burst (empty = disabled).
+    mf_taps: Vec<f32>,
 }
 
 /// A demodulated burst: bit stream plus its frequency offset from the
@@ -110,6 +135,22 @@ impl IridiumWideband {
             active: Vec::new(),
             recent: Vec::new(),
             debug: std::env::var("XNG_IRIDIUM_DEBUG").is_ok(),
+            det_threshold: crate::demod::env_f32("XNG_IRIDIUM_THRESHOLD", THRESHOLD),
+            dedup_bins: crate::demod::env_f32("XNG_IRIDIUM_DEDUP_BINS", 120.0) as i64,
+            // Root-raised-cosine matched filter (matched to Iridium's RRC
+            // transmit pulse; gr-iridium uses RRC alpha 0.4, 51 taps). On real
+            // captures it ~17x's CRC-OK IDA yield, but the strict UW-cost/timing
+            // acquisition still drops some *clean* bursts post-filter, so it is
+            // opt-in (XNG_IRIDIUM_RC_ALPHA=0.4) pending a demod re-tune. alpha
+            // ≤ 0 disables it (default).
+            mf_taps: {
+                let alpha = crate::demod::env_f32("XNG_IRIDIUM_RC_ALPHA", 0.0);
+                if alpha > 0.0 {
+                    crate::modulate::rrc_taps(CHANNEL_RATE / crate::demod::SYMBOL_RATE, 51, alpha as f64)
+                } else {
+                    Vec::new()
+                }
+            },
         })
     }
 
@@ -172,7 +213,7 @@ impl IridiumWideband {
                     *f += (m - *f) / self.floor_frames as f32;
                     continue;
                 }
-                hot[k] = m > *f * THRESHOLD;
+                hot[k] = m > *f * self.det_threshold;
                 // Bursts are brief; the slow EMA dilutes them like
                 // gr-iridium's 512-frame history.
                 *f += (m - *f) / 512.0;
@@ -254,7 +295,7 @@ impl IridiumWideband {
                 let dup = self.recent.iter().any(|&(s, e, bin)| {
                     b.start_frame <= e + 2
                         && s <= b.last_frame + 2
-                        && (bin as i64 - b.bin as i64).unsigned_abs() < 120
+                        && (bin as i64 - b.bin as i64).unsigned_abs() < self.dedup_bins as u64
                 });
                 if dup {
                     continue;
@@ -336,6 +377,12 @@ impl IridiumWideband {
         let mut ddc = Ddc::new(self.input_rate, CHANNEL_RATE, f_off, WIDEBAND_PASSBAND_HZ).ok()?;
         let mut chan: Vec<Complex<f32>> = Vec::new();
         ddc.process(&self.buf[rel0..rel1], &mut chan);
+        // Raised-cosine matched filter (gr-iridium-style) before the noise
+        // estimate + demod: lifts per-symbol SNR a few dB, lowering the UW
+        // acquisition cost and cleaning the bits the IDA FEC sees.
+        if !self.mf_taps.is_empty() {
+            chan = matched_filter(&chan, &self.mf_taps);
+        }
 
         // Robust noise-floor estimate (20th percentile of channel power):
         // the segment is pre-roll + burst + post, so a low order statistic
