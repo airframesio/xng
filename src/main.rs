@@ -457,11 +457,11 @@ fn resolve_tune_auto(
     let rate = match tune.sample_rate {
         Some(r) => r,
         None => {
-            let advertised = probe_device_rates(sdr);
-            let r = commands::scan::pick_auto_rate(&advertised, mode, plan_rate);
+            let caps = probe_rate_caps(sdr);
+            let r = commands::scan::choose_rate(&caps, mode, plan_rate);
             if r != plan_rate {
                 tracing::info!(
-                    "auto-tune: device prefers {} S/s over the plan's {} S/s",
+                    "auto-tune: using {} S/s (device does not offer the plan's {} S/s)",
                     r as u64,
                     plan_rate as u64
                 );
@@ -479,7 +479,7 @@ fn resolve_tune_auto(
             .collect::<anyhow::Result<Vec<u64>>>()?;
         let center = match &tune.center_freq {
             Some(c) => freq::parse_hz(c)?,
-            None => centroid_off_dc(&channels),
+            None => centroid_off_dc(&channels, commands::scan::passband(mode) > 0.0),
         };
         return Ok((mode, rate, center, channels));
     }
@@ -518,31 +518,50 @@ fn resolve_tune_auto(
     Ok((mode, rate, center, channels))
 }
 
-/// Advertised sample rates of the device `--sdr` selects, where a native
-/// backend can ask (empty when it can't — SoapySDR devices generally
-/// accept the plan rates).
-pub(crate) fn probe_device_rates(sdr: &str) -> Vec<u32> {
+/// Probe what sample rates the device `--sdr` selects can do. Native backends
+/// report an exact discrete set; SoapySDR devices (RTL-SDR, HackRF, SDRplay…)
+/// report advertised ranges; otherwise [`RateCaps::Unknown`] so callers fall
+/// back to the mode's plan rate.
+pub(crate) fn probe_rate_caps(sdr: &str) -> commands::scan::RateCaps {
+    use commands::scan::RateCaps;
     let args = sdr_args::SdrArgs::parse(sdr);
-    if args.force_soapy {
-        return Vec::new();
-    }
     let serial = || args.serial.as_deref().and_then(|s| sdr_args::parse_airspy_serial(s).ok());
     let _ = &serial; // used only by the cfg'd arms below
-    match args.driver.as_deref() {
-        #[cfg(feature = "airspy")]
-        Some("airspy") => xng_sdr::airspy::device_rates(serial()).unwrap_or_default(),
-        #[cfg(feature = "airspyhf")]
-        Some("airspyhf") => xng_sdr::airspyhf::device_rates(serial()).unwrap_or_default(),
-        _ => Vec::new(),
+    if !args.force_soapy {
+        match args.driver.as_deref() {
+            #[cfg(feature = "airspy")]
+            Some("airspy") => {
+                if let Ok(r) = xng_sdr::airspy::device_rates(serial()) {
+                    return RateCaps::Discrete(r);
+                }
+            }
+            #[cfg(feature = "airspyhf")]
+            Some("airspyhf") => {
+                if let Ok(r) = xng_sdr::airspyhf::device_rates(serial()) {
+                    return RateCaps::Discrete(r);
+                }
+            }
+            _ => {}
+        }
     }
+    #[cfg(feature = "soapy")]
+    {
+        let ranges = xng_sdr::soapy::sample_rate_ranges(&args.soapy);
+        if !ranges.is_empty() {
+            return RateCaps::Ranges(ranges);
+        }
+    }
+    RateCaps::Unknown
 }
 
-/// Midpoint of a channel set, nudged off any exact channel so no carrier
-/// sits at DC.
-fn centroid_off_dc(channels: &[u64]) -> u64 {
+/// Midpoint of a channel set. For DDC modes (`avoid_dc`) the midpoint is
+/// nudged off any exact channel so no carrier sits at DC; whole-capture
+/// modes (Mode S) require the channel AT the center, so they pass
+/// `avoid_dc = false`.
+fn centroid_off_dc(channels: &[u64], avoid_dc: bool) -> u64 {
     let center =
         (channels.iter().min().unwrap() + channels.iter().max().unwrap()) / 2;
-    if channels.contains(&center) { center + 25_000 } else { center }
+    if avoid_dc && channels.contains(&center) { center + 25_000 } else { center }
 }
 
 fn main() -> anyhow::Result<()> {

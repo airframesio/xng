@@ -496,6 +496,22 @@ async fn shutdown_signal() {
     }
 }
 
+/// Spawn the interrupt handler: the first signal sets `stop` for a graceful
+/// drain (sources close cleanly so the device isn't left wedged); a second
+/// signal forces an immediate exit. The escape hatch matters when the decode
+/// loop is blocked in a device read that never observes `stop` — without it a
+/// wedged SDR traps the process until SIGKILL/SIGQUIT.
+fn spawn_interrupt_handler(stop: Arc<AtomicBool>, what: &'static str) {
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        tracing::info!("interrupt received, stopping {what} (signal again to force quit)");
+        stop.store(true, Ordering::Relaxed);
+        shutdown_signal().await;
+        eprintln!("forced quit");
+        std::process::exit(130);
+    });
+}
+
 /// Run a decode session until the source ends or `stop` is set.
 pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<()> {
     let sample_rate = source.sample_rate();
@@ -548,15 +564,8 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
             vec![session_descriptor(&cfg.sdr, cfg.mode, capture_center, &cfg.channels_hz, sample_rate)];
         let output_tasks = spawn_outputs(&bus, &cfg.outputs, &station, &desc);
 
-        // Ctrl-C → graceful stop.
-        tokio::spawn({
-            let stop = stop.clone();
-            async move {
-                shutdown_signal().await;
-                tracing::info!("interrupt received, stopping session");
-                stop.store(true, Ordering::Relaxed);
-            }
-        });
+        // Ctrl-C / SIGTERM → graceful stop, second signal forces quit.
+        spawn_interrupt_handler(stop.clone(), "session");
 
         // DSP loop on a blocking thread.
         let decode = tokio::task::spawn_blocking({
@@ -795,14 +804,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         }
         let output_tasks = spawn_outputs(&bus, &prepared[0].cfg.outputs, &station, &sessions_desc);
 
-        tokio::spawn({
-            let stop = stop.clone();
-            async move {
-                shutdown_signal().await;
-                tracing::info!("interrupt received, stopping station");
-                stop.store(true, Ordering::Relaxed);
-            }
-        });
+        spawn_interrupt_handler(stop.clone(), "station");
 
         let mut decode_tasks = Vec::new();
         for mut prep in prepared {
