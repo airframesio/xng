@@ -91,11 +91,16 @@ pub struct IridiumWideband {
     mf_taps: Vec<f32>,
 }
 
-/// A demodulated burst: bit stream plus its frequency offset from the
-/// capture center.
+/// A demodulated burst: bit stream plus its frequency offset from the capture
+/// center. `bits` is the unfiltered demod; `alt_bits` is the matched-filter
+/// alternate (present only when it differs). The frame/CRC layer decodes
+/// `bits` first and uses `alt_bits` only if the primary yields no valid frame —
+/// so clean strong bursts stay bit-exact while weak bursts get the matched
+/// filter's rescue.
 pub struct WidebandBurst {
     pub offset_hz: f64,
     pub bits: Vec<u8>,
+    pub alt_bits: Option<Vec<u8>>,
 }
 
 impl IridiumWideband {
@@ -138,14 +143,16 @@ impl IridiumWideband {
             det_threshold: crate::demod::env_f32("XNG_IRIDIUM_THRESHOLD", THRESHOLD),
             dedup_bins: crate::demod::env_f32("XNG_IRIDIUM_DEDUP_BINS", 120.0) as i64,
             // Root-raised-cosine matched filter (matched to Iridium's RRC
-            // transmit pulse; gr-iridium uses RRC alpha 0.4, 51 taps). Applied
-            // as a fallback after the unfiltered demod (see `extract`), it
-            // ~17x's CRC-OK IDA yield on real captures without regressing clean
-            // bursts. On by default; XNG_IRIDIUM_RC_ALPHA=0 disables it.
+            // transmit pulse; gr-iridium uses RRC alpha 0.4, 51 taps). The
+            // received TX-RRC pulse convolved with this RX-RRC is a full raised
+            // cosine — Nyquist, so the symbol centers carry no inter-symbol
+            // interference, which the unfiltered primary path does suffer.
+            // Applied as the alternate after the unfiltered demod (see
+            // `extract`); on by default, XNG_IRIDIUM_RC_ALPHA=0 disables it.
             mf_taps: {
-                let alpha = crate::demod::env_f32("XNG_IRIDIUM_RC_ALPHA", 0.4);
+                let alpha = crate::demod::env_f32("XNG_IRIDIUM_RC_ALPHA", 0.4) as f64;
                 if alpha > 0.0 {
-                    crate::modulate::rrc_taps(CHANNEL_RATE / crate::demod::SYMBOL_RATE, 51, alpha as f64)
+                    crate::modulate::rrc_taps(CHANNEL_RATE / crate::demod::SYMBOL_RATE, 51, alpha)
                 } else {
                     Vec::new()
                 }
@@ -315,7 +322,7 @@ impl IridiumWideband {
         // extraction). Done before the buffer is drained below.
         let this = &*self;
         let out: Vec<WidebandBurst> =
-            to_extract.par_iter().filter_map(|b| this.extract(b)).collect();
+            to_extract.par_iter().flat_map_iter(|b| this.extract(b)).collect();
 
         // Drop samples no longer needed: everything before the earliest
         // active burst (minus pre-roll) or the current frame.
@@ -337,7 +344,7 @@ impl IridiumWideband {
     }
 
     /// Downmix one finished burst to the channel rate and demodulate.
-    fn extract(&self, b: &ActiveBurst) -> Option<WidebandBurst> {
+    fn extract(&self, b: &ActiveBurst) -> Vec<WidebandBurst> {
         let frame_len = self.nfft as u64;
         let pre = (PRE_S * self.input_rate) as u64;
         let post = (POST_S * self.input_rate) as u64;
@@ -345,7 +352,7 @@ impl IridiumWideband {
         let s1 = ((b.last_frame + 1) * frame_len + post)
             .min(self.start_abs + self.buf.len() as u64);
         if s1 <= s0 {
-            return None;
+            return Vec::new();
         }
         // Bin → signed frequency offset.
         let bin = b.bin;
@@ -373,25 +380,36 @@ impl IridiumWideband {
         // single-channel decoder does.
         let rel0 = (s0 - self.start_abs) as usize;
         let rel1 = (s1 - self.start_abs) as usize;
-        let mut ddc = Ddc::new(self.input_rate, CHANNEL_RATE, f_off, WIDEBAND_PASSBAND_HZ).ok()?;
+        let Ok(mut ddc) = Ddc::new(self.input_rate, CHANNEL_RATE, f_off, WIDEBAND_PASSBAND_HZ) else {
+            return Vec::new();
+        };
         let mut chan: Vec<Complex<f32>> = Vec::new();
         ddc.process(&self.buf[rel0..rel1], &mut chan);
-        // Try the unfiltered burst first: clean/strong bursts decode without
-        // the matched filter and don't pay its slight per-symbol cost penalty,
-        // so high-SNR decode stays bit-exact (and the detection-centroid offset
-        // a narrow filter would clip is a non-issue). Fall back to the
-        // raised-cosine matched filter only when the clean path finds nothing —
-        // that lifts weak bursts above the demod's acquisition gate (~17x more
-        // CRC-OK IDA on real captures). Net: no regression on strong bursts,
-        // big gain on weak ones, so the matched filter is on by default.
-        if let Some(w) = self.demod_channel(chan.clone(), f_off) {
-            return Some(w);
-        }
-        if !self.mf_taps.is_empty() {
-            let filtered = matched_filter(&chan, &self.mf_taps);
-            return self.demod_channel(filtered, f_off);
-        }
-        None
+        // Emit BOTH the unfiltered and matched-filtered demod candidates and let
+        // the downstream frame/CRC decode keep whichever is valid. The two
+        // populations overlap in SNR and in UW-fit cost, so neither an SNR nor a
+        // cost threshold can route them; only the full data CRC distinguishes a
+        // clean burst (which the matched filter would corrupt) from a weak one
+        // the matched filter rescues. Corrupt candidates fail the frame decode
+        // downstream and drop out; identical-bit duplicates are deduped here.
+        let mf_chan = if self.mf_taps.is_empty() {
+            None
+        } else {
+            Some(matched_filter(&chan, &self.mf_taps))
+        };
+        let primary = self.demod_channel(chan, f_off);
+        let alt = mf_chan.and_then(|mf| self.demod_channel(mf, f_off));
+        let burst = match (primary, alt) {
+            (Some(mut p), Some(a)) => {
+                if p.bits != a.bits {
+                    p.alt_bits = Some(a.bits);
+                }
+                Some(p)
+            }
+            // Only one path decoded (or neither): no alternate to carry.
+            (p, a) => p.or(a),
+        };
+        burst.into_iter().collect()
     }
 
     /// Seed the per-burst noise floor and run the single-channel demodulator on
@@ -417,6 +435,6 @@ impl IridiumWideband {
         demod
             .process(&chan)
             .pop()
-            .map(|b| WidebandBurst { offset_hz: f_off + b.cfo_hz, bits: b.bits })
+            .map(|b| WidebandBurst { offset_hz: f_off + b.cfo_hz, bits: b.bits, alt_bits: None })
     }
 }

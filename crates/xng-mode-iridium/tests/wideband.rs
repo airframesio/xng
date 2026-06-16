@@ -81,7 +81,12 @@ fn finds_bursts_across_the_band() {
     let mut found = Vec::new();
     for chunk in sig.chunks(65_536) {
         for b in wb.process(chunk) {
-            if let Some(f) = decode_bits(&b.bits) {
+            // Mirror the real decoder: the unfiltered primary carries center
+            // ISI (RRC alone is not Nyquist), so fall back to the matched-
+            // filter alternate, which is the path that recovers weak bursts.
+            let f = decode_bits(&b.bits)
+                .or_else(|| b.alt_bits.as_ref().and_then(|a| decode_bits(a)));
+            if let Some(f) = f {
                 found.push((b.offset_hz, f));
             }
         }

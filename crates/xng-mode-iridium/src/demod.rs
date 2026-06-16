@@ -21,6 +21,11 @@ const UW_UL: [u8; 12] = [2, 2, 0, 0, 0, 2, 0, 0, 2, 0, 2, 2];
 const DQPSK_MAP: [u8; 4] = [0, 2, 3, 1];
 /// Maximum burst length in symbols (90 ms at 25 ksym/s).
 const MAX_BURST_SYMS: usize = 2_250;
+/// Tolerated bit errors in the differentially-decoded 24-bit access code. A
+/// single absolute UW-symbol slip flips up to ~2 differential bits, so a small
+/// tolerance lets weak-but-real bursts through; the downstream BCH/CRC rejects
+/// anything spurious that slips past (gr-iridium's UW check tolerates diffs≤2).
+const ACCESS_TOL: usize = 4;
 
 /// Read an `f32` tuning knob from the environment (for sensitivity sweeps),
 /// falling back to `default` when unset or unparseable.
@@ -51,9 +56,9 @@ pub struct IridiumDemod {
     level: f32,
     /// Emit per-trigger acquisition diagnostics (XNG_IRIDIUM_DEBUG set).
     debug: bool,
-    /// UW phase-fit acceptance cost (lower = stricter). Tunable via
-    /// XNG_IRIDIUM_UWCOST for sensitivity sweeps.
-    uw_thresh: f32,
+    /// UW coherent-correlation acceptance (0..1; higher = stricter). Tunable
+    /// via XNG_IRIDIUM_UWCORR for sensitivity sweeps.
+    uw_corr: f32,
     /// Burst power-gate multiplier over the noise floor. Tunable via
     /// XNG_IRIDIUM_GATE.
     gate_mult: f32,
@@ -75,7 +80,7 @@ impl IridiumDemod {
             pwr_sum: 0.0,
             level: 0.0,
             debug: std::env::var("XNG_IRIDIUM_DEBUG").is_ok(),
-            uw_thresh: env_f32("XNG_IRIDIUM_UWCOST", 0.05),
+            uw_corr: env_f32("XNG_IRIDIUM_UWCORR", 0.97),
             gate_mult: env_f32("XNG_IRIDIUM_GATE", 8.0),
         }
     }
@@ -104,36 +109,80 @@ impl IridiumDemod {
         Some(self.buf[i] * (1.0 - frac) + self.buf[i + 1] * frac)
     }
 
-    /// Coarse CFO from the preamble tone: FFT peak over the tone window.
+    /// Fine CFO from the preamble tone. A DFT scan ±30 kHz in 50 Hz steps
+    /// (the tone is strong; the wideband front end's detection centroid can sit
+    /// tens of kHz off the true channel center under spectral leakage), then a
+    /// quadratic interpolation across the peak bin and its neighbours to recover
+    /// sub-step (≈1 Hz) precision. The 50 Hz grid alone leaves up to ±25 Hz of
+    /// residual CFO, which the carrier loop must chase over the whole burst;
+    /// gr-iridium interpolates its CFO FFT peak the same way so the per-symbol
+    /// rotation is right from the first symbol.
     fn tone_cfo(&self, pos: f64, syms: f64) -> Option<f64> {
         let n = (syms * self.sps) as usize;
         let rel = (pos - self.start_abs) as usize;
         if rel + n > self.buf.len() {
             return None;
         }
-        let mut best = (0.0f32, 0.0f64);
-        // Coarse DFT scan ±30 kHz in 50 Hz steps (tone is strong; the
-        // wideband front end's detection centroid can sit tens of kHz
-        // off the true channel center under spectral leakage).
-        let mut f = -30_000.0;
-        while f <= 30_000.0 {
+        const STEP_HZ: f64 = 50.0;
+        const F0: f64 = -30_000.0;
+        const NF: usize = 1201; // -30k..=30k inclusive
+        let mut mags = [0.0f32; NF];
+        for (i, m) in mags.iter_mut().enumerate() {
+            let f = F0 + i as f64 * STEP_HZ;
             let mut acc = Complex::new(0.0f32, 0.0);
-            let step = -2.0 * std::f64::consts::PI * f / (SYMBOL_RATE * self.sps / 1.0);
+            let step = -2.0 * std::f64::consts::PI * f / (SYMBOL_RATE * self.sps);
             for (k, s) in self.buf[rel..rel + n].iter().enumerate() {
                 acc += s * Complex::from_polar(1.0, (step * k as f64) as f32);
             }
-            let m = acc.norm();
-            if m > best.0 {
-                best = (m, f);
-            }
-            f += 50.0;
+            *m = acc.norm();
         }
-        Some(best.1)
+        let peak = (0..NF).max_by(|&a, &b| mags[a].total_cmp(&mags[b]))?;
+        // Quadratic interpolation of the peak (skip if it is at an edge).
+        let frac = if peak > 0 && peak < NF - 1 {
+            let (a, b, c) = (mags[peak - 1], mags[peak], mags[peak + 1]);
+            let denom = a - 2.0 * b + c;
+            if denom.abs() > 1e-12 {
+                (0.5 * (a - c) / denom).clamp(-1.0, 1.0) as f64
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        Some(F0 + (peak as f64 + frac) * STEP_HZ)
     }
 
-    /// Coherent UW fit (timing/phase/CFO jointly) for one UW variant.
-    /// Returns (cost, uw_pos, theta_per_symbol, carrier_phase).
+    /// Matched-filter UW correlation for one UW variant, over a fine timing
+    /// grid. Returns (corr, uw_pos, theta_per_symbol, carrier_phase), where
+    /// `corr` is the normalized coherent correlation in [0, 1] (1 = perfect UW
+    /// match). This is gr-iridium's UW detector: derotate each sample by the
+    /// expected UW symbol and the CFO, sum coherently, and normalize by the
+    /// total amplitude. The carrier phase is free (absorbed by the sum's
+    /// magnitude), so only one degree of freedom is fit — noise correlates near
+    /// 1/√12, while a real UW (with the fine CFO removed) approaches 1. The old
+    /// per-symbol phase-fit instead trusted each symbol's noisy phase and fit a
+    /// free CFO slope, which let noise masquerade as a weak burst.
     fn uw_fit(&self, pos: f64, uw: &[u8; 12], theta0: f32) -> Option<(f32, f64, f32, f32)> {
+        // Derotate the 12 symbols at `cand` by the expected UW and the tone CFO
+        // (plus an optional residual-CFO slope `db`); return (aligned sum,
+        // Σ|s|). For a real UW the terms collapse to |s|·exp(iφ).
+        let project = |cand: f64, db: f32| -> Option<(Complex<f32>, f32)> {
+            let mut acc = Complex::new(0.0f32, 0.0);
+            let mut mag_sum = 0.0f32;
+            for k in 0..12 {
+                let s = self.sample(cand + k as f64 * self.sps)?;
+                let expect = uw[k] as f32 * PI / 2.0;
+                acc += s * Complex::from_polar(1.0, -expect - (theta0 + db) * k as f32);
+                mag_sum += s.norm();
+            }
+            (mag_sum > 1e-12).then_some((acc, mag_sum))
+        };
+
+        // Jointly search symbol timing and a clamped residual-CFO slope: at
+        // each candidate timing, estimate the residual CFO (mean symbol-to-
+        // symbol phase step) and score the CFO-corrected coherent sum. The
+        // joint search matters — the best timing depends on the CFO — and the
+        // clamp keeps noise from fitting a large slope.
         let mut best: Option<(f32, f64, f32, f32)> = None;
         let mut t = -self.sps;
         while t <= self.sps {
@@ -142,49 +191,37 @@ impl IridiumDemod {
             if cand < self.start_abs {
                 continue;
             }
-            let mut r = [0.0f32; 12];
-            let mut w = [0.0f32; 12];
-            let mut prev = 0.0f32;
-            for k in 0..12 {
-                let s = self.sample(cand + k as f64 * self.sps)?;
-                let expect = uw[k] as f32 * PI / 2.0;
-                let mut ph = (s * Complex::from_polar(1.0, -expect - theta0 * k as f32)).arg();
-                while ph - prev > PI {
-                    ph -= 2.0 * PI;
+            // Differential residual-CFO estimate from the UW-derotated symbols.
+            let mut dsum = Complex::new(0.0f32, 0.0);
+            let mut prev = match self.sample(cand) {
+                Some(s) => s * Complex::from_polar(1.0, -(uw[0] as f32 * PI / 2.0)),
+                None => break,
+            };
+            let mut ok = true;
+            for k in 1..12 {
+                match self.sample(cand + k as f64 * self.sps) {
+                    Some(s) => {
+                        let cur =
+                            s * Complex::from_polar(1.0, -(uw[k] as f32 * PI / 2.0) - theta0 * k as f32);
+                        dsum += cur * prev.conj();
+                        prev = cur;
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
                 }
-                while ph - prev < -PI {
-                    ph += 2.0 * PI;
-                }
-                prev = ph;
-                r[k] = ph;
-                w[k] = s.norm_sqr();
             }
-            let sw: f32 = w.iter().sum();
-            if sw < 1e-12 {
+            if !ok {
                 continue;
             }
-            let kbar = w.iter().enumerate().map(|(k, &wk)| wk * k as f32).sum::<f32>() / sw;
-            let rbar = w.iter().zip(&r).map(|(&wk, &rk)| wk * rk).sum::<f32>() / sw;
-            let mut num = 0.0;
-            let mut den = 0.0;
-            for k in 0..12 {
-                let dk = k as f32 - kbar;
-                num += w[k] * dk * (r[k] - rbar);
-                den += w[k] * dk * dk;
-            }
-            if den < 1e-12 {
-                continue;
-            }
-            let b = num / den;
-            let a = rbar - b * kbar;
-            let mut cost = 0.0;
-            for (k, (&wk, &rk)) in w.iter().zip(&r).enumerate() {
-                let e = rk - a - b * k as f32;
-                cost += wk * e * e;
-            }
-            cost /= sw;
-            if best.map(|(c, _, _, _)| cost < c).unwrap_or(true) {
-                best = Some((cost, cand, theta0 + b, a));
+            let db = dsum.arg().clamp(-0.5, 0.5);
+            let Some((acc, mag_sum)) = project(cand, db) else { continue };
+            let corr = acc.norm() / mag_sum;
+            if best.map(|(c, _, _, _)| corr > c).unwrap_or(true) {
+                // theta = tone CFO + recovered residual; the demod's decision-
+                // directed loop tracks anything left. Carrier phase = arg(acc).
+                best = Some((corr, cand, theta0 + db, acc.arg()));
             }
         }
         best
@@ -226,54 +263,42 @@ impl IridiumDemod {
             let bstart = pos - 16.0;
             let Some(cfo) = self.tone_cfo(bstart + 2.0 * self.sps, 10.0) else { break };
             let theta0 = (2.0 * std::f64::consts::PI * cfo / SYMBOL_RATE) as f32;
-            let burst_gate = self.noise * self.gate_mult;
             let mut found: Option<(f32, f64, f32, f32, &'static [u8; 24])> = None;
-            let mut dbg_best = f32::INFINITY;
-            let mut dbg_energetic = 0u32;
+            let mut dbg_best = 0.0f32;
             let mut hunt = 6.0 * self.sps;
             while hunt < (PRE_SYMS + 26.0) * self.sps {
                 let cand = bstart + hunt;
                 hunt += 2.0 * self.sps;
-                // The whole 12-symbol window must carry burst power.
-                let mut energetic = true;
-                for k in 0..12 {
-                    match self.sample(cand + k as f64 * self.sps) {
-                        Some(s) if s.norm_sqr() > burst_gate => {}
-                        Some(_) => {
-                            energetic = false;
-                            break;
-                        }
-                        None => {
-                            energetic = false;
-                            break;
-                        }
-                    }
+                // Cheap reject: the candidate's first symbol must carry some
+                // power. The coherent UW correlation below tolerates individual
+                // weak symbols, so we no longer require the whole 12-symbol
+                // window above the gate (that dropped weak bursts outright).
+                match self.sample(cand) {
+                    Some(s) if s.norm_sqr() > self.noise => {}
+                    _ => continue,
                 }
-                if !energetic {
-                    continue;
-                }
-                dbg_energetic += 1;
                 for (uw, access) in [(&UW_DL, ACCESS_DL), (&UW_UL, ACCESS_UL)] {
-                    if let Some((cost, p2, th, ph)) = self.uw_fit(cand, uw, theta0) {
-                        dbg_best = dbg_best.min(cost);
-                        if cost < self.uw_thresh && found.map(|(c, ..)| cost < c).unwrap_or(true) {
-                            found = Some((cost, p2, th, ph, access));
+                    if let Some((corr, p2, th, ph)) = self.uw_fit(cand, uw, theta0) {
+                        dbg_best = dbg_best.max(corr);
+                        if corr > self.uw_corr && found.map(|(c, ..)| corr > c).unwrap_or(true) {
+                            found = Some((corr, p2, th, ph, access));
                         }
                     }
                 }
-                if found.is_some() && hunt > 10.0 * self.sps {
+                // Stop early once a strong UW is locked (cheap on clean bursts);
+                // keep hunting when only a marginal one is found so a better
+                // position later in the preamble can still win.
+                if found.map(|(c, ..)| c > self.uw_corr + 0.2).unwrap_or(false) && hunt > 10.0 * self.sps {
                     break;
                 }
             }
             if self.debug {
                 eprintln!(
-                    "  trigger @ {:.0} (t={:.4}s): noise {:.2e} gate {:.2e}, cfo {:+.0} Hz, {} energetic windows, best UW cost {:.4}{}",
+                    "  trigger @ {:.0} (t={:.4}s): noise {:.2e}, cfo {:+.0} Hz, best UW corr {:.3}{}",
                     pos,
                     pos / (SYMBOL_RATE * self.sps),
                     self.noise,
-                    burst_gate,
                     cfo,
-                    dbg_energetic,
                     dbg_best,
                     if found.is_some() { "  SYNC" } else { "" }
                 );
@@ -304,9 +329,15 @@ impl IridiumDemod {
                 // (q·π/2 after mod-4 would put −π against +π → −2π).
                 let idx_f = (ang / (PI / 2.0)).round();
                 let q = (idx_f as i32).rem_euclid(4) as u8;
-                // Decision-directed phase trim (PLL α≈0.2 per gr-iridium).
+                // Decision-directed phase trim (PLL α≈0.2 per gr-iridium), but
+                // only over the payload: the UW correlation already set the
+                // carrier across the 12 UW symbols, so running the loop there
+                // just lets it chase the UW's own residual and drift out of the
+                // quadrant by the last UW symbol (corrupting the access code).
                 let residual = ang - idx_f * (PI / 2.0);
-                carr += 0.2 * residual;
+                if k >= 12 {
+                    carr += 0.2 * residual;
+                }
                 symbols.push(q);
                 k += 1;
                 if k >= 12 + MAX_BURST_SYMS {
@@ -339,8 +370,11 @@ impl IridiumDemod {
                 bits.push(m & 1);
                 bits.push(m >> 1);
             }
-            // Sanity: access code must match what the UW fit promised.
-            if bits.len() >= 24 && bits[..24] == access[..] {
+            // Sanity: the differentially-decoded access code must match the UW
+            // the correlation locked, tolerating a few bit errors so weak-but-
+            // real bursts are not dropped over a single symbol slip.
+            let access_errs = bits.iter().take(24).zip(access).filter(|(a, b)| a != b).count();
+            if bits.len() >= 24 && access_errs <= ACCESS_TOL {
                 // Total carrier offset: per-symbol rotation → Hz.
                 let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
                 out.push(DemodBurst { bits, cfo_hz });
