@@ -24,9 +24,11 @@ const EXPIRE_S: u64 = 300;
 /// live-map) via `crate::beam::classify_altitude`: a frame's geocentric
 /// position is either the broadcasting satellite (~780 km) or a ground beam
 /// footprint (~0 km).
-/// Satellites move continuously (keep longer); ground footprints are
-/// transient.
-const SAT_EXPIRE_S: u64 = 600;
+/// Satellites move continuously; drop one ~2 min after it was last heard so a
+/// satellite that has flown out of range (and its projected beam pattern)
+/// clears promptly instead of lingering as a stale ghost. An overhead Iridium
+/// satellite is heard every few seconds, so 2 min is ample margin.
+const SAT_EXPIRE_S: u64 = 120;
 const RING_EXPIRE_S: u64 = 300;
 
 #[derive(Default)]
