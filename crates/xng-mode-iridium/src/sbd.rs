@@ -172,7 +172,10 @@ impl SbdReassembler {
                 self.multi[i].msgno = msgno;
                 self.multi[i].last_time = time;
                 if msgno == self.multi[i].msgcnt {
-                    let m = self.multi.remove(i);
+                    let mut m = self.multi.remove(i);
+                    // Mark the message as Layer-B reassembled (visible in output)
+                    // and how many IDA packets it took.
+                    m.hdr.insert("multi_packets".into(), json!(m.msgcnt));
                     return Self::parse_acars(m.typ, &m.body, m.hdr);
                 }
                 return None; // still assembling
@@ -435,6 +438,7 @@ mod tests {
         let m = r.parse_l2(&p2, false, 0.1).expect("multi-packet message completes");
         assert_eq!(m.details["type"], json!("7608"), "carries first packet's type");
         assert_eq!(m.details["payload_hex"], json!("deadbeef"), "bodies concatenated");
+        assert_eq!(m.details["multi_packets"], json!(2), "marked as 2-packet reassembly");
         // A stray continuation with no buffered head is dropped, not emitted.
         assert!(r.parse_l2(&p2, false, 0.2).is_none(), "orphan continuation dropped");
     }
