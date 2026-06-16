@@ -540,6 +540,10 @@ function selectEntity(key, lat, lon) {
 }
 window.selectEntity = selectEntity;
 window.toggleMode = m => { hiddenModes.has(m) ? hiddenModes.delete(m) : hiddenModes.add(m); render(); };
+window.toggleTerminals = () => {
+  localStorage.setItem('xng.terminals', localStorage.getItem('xng.terminals') === '1' ? '0' : '1');
+  render();
+};
 window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
 document.getElementById('pause').onclick = function () {
   paused = !paused;
@@ -804,6 +808,36 @@ function render() {
       `<td>${escapeHtml(v.country || '')}</td><td>${escapeHtml(shipMeta(v.shiptype).label || '')}</td>` +
       `<td></td><td>${v.sog ?? ''}</td><td></td>` +
       `<td class="age">${fmtAge(s.now - v.seen)}</td></tr>`);
+  }
+  // Iridium satellites (broadcasting overhead) and SBD terminals (identifiable
+  // transmitters on the short-burst-data channel) are entities too.
+  for (const sat of [...(s.iridium_sats || [])].sort((x, y) => (x.sat||0) - (y.sat||0))) {
+    const k = 's' + sat.sat;
+    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
+      `onclick="selectEntity('${k}',${sat.lat ?? 'null'},${sat.lon ?? 'null'})">` +
+      `<td style="color:#bb9af7">🛰 ${escapeHtml(sat.name || ('Iridium ' + sat.sat))}</td>` +
+      `<td></td><td>satellite</td>` +
+      `<td>${sat.alt != null ? Math.round(sat.alt) + 'km' : ''}</td><td></td><td></td>` +
+      `<td class="age">${fmtAge(s.now - sat.seen)}</td></tr>`);
+  }
+  // SBD terminals are interesting but not immediately useful, so they're
+  // collapsed behind a toggle row (state persisted, hidden by default).
+  const terms = s.iridium_terminals || [];
+  if (terms.length) {
+    const showTerm = localStorage.getItem('xng.terminals') === '1';
+    rows.push(`<tr class="row" onclick="toggleTerminals()">` +
+      `<td colspan="7" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
+    if (showTerm) {
+      for (const t of [...terms].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
+        const k = 't' + t.imei;
+        rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
+          `onclick="selectEntity('${k}',null,null)">` +
+          `<td style="color:#e0af68">📟 ${escapeHtml(t.imei)}</td>` +
+          `<td></td><td>SBD${t.text ? ' · ' + escapeHtml(String(t.text).trim().slice(0, 20)) : ''}</td>` +
+          `<td></td><td></td><td>${t.msgs ?? ''}</td>` +
+          `<td class="age">${fmtAge(s.now - t.seen)}</td></tr>`);
+      }
+    }
   }
   document.getElementById('entities').innerHTML = rows.length
     ? `<table><tr><th>id</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th><th>seen</th></tr>${rows.join('')}</table>`

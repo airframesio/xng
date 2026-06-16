@@ -41,6 +41,11 @@ struct Dash {
     /// report their own ECEF), keyed by quantized lat/lon so a stationary
     /// terminal coalesces and a moving one leaves recent fixes.
     iridium_devices: HashMap<String, Value>,
+    /// Iridium SBD terminals seen on the short-burst-data channel, keyed by
+    /// IMEI — the identifiable transmitters behind the "sbd" frames (asset
+    /// trackers, SATCOM modems), surfaced as entities so the activity is
+    /// visible even though most carry no aircraft ACARS payload.
+    iridium_terminals: HashMap<String, Value>,
     /// Reconstructed 48-beam pattern, projected under tracked satellites.
     beams: crate::beam::BeamReconstructor,
     /// Last unix-secs the beam pattern was persisted.
@@ -78,6 +83,16 @@ fn push_trail(o: &mut serde_json::Map<String, Value>, lat: f64, lon: f64) {
 
 fn now_s() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Iridium link-layer housekeeping that carries no user content and arrives at
+/// tens of thousands of frames per session — excluded from the web log feed so
+/// content frames stay visible (still counted in the per-mode totals).
+fn is_link_housekeeping(m: &Message) -> bool {
+    matches!(
+        &m.body,
+        MessageBody::Iridium { kind, .. } if matches!(kind.as_str(), "sync" | "ida" | "itl")
+    )
 }
 
 fn update(d: &mut Dash, m: &Message) {
@@ -285,11 +300,44 @@ fn update(d: &mut Dash, m: &Message) {
                 o.insert("seen".into(), json!(now_s()));
             }
         }
+        // SBD short-burst-data: most frames are transport signaling
+        // (registration, MO/MT control) rather than aircraft ACARS — a real
+        // ACARS payload arrives as MessageBody::Acars above. The frames that
+        // carry an IMEI identify a transmitting terminal (asset tracker,
+        // SATCOM modem), so surface it as an entity to make the activity
+        // visible.
+        MessageBody::Iridium { kind, details } if kind == "sbd" => {
+            if let Some(imei) = details.get("imei").and_then(Value::as_str) {
+                let e = d.iridium_terminals.entry(imei.to_string()).or_insert_with(|| json!({}));
+                let o = e.as_object_mut().unwrap();
+                o.insert("imei".into(), json!(imei));
+                o.insert("seen".into(), json!(now_s()));
+                if let Some(t) = details.get("type") {
+                    o.insert("type".into(), t.clone());
+                }
+                if let Some(mo) = details.get("momsn") {
+                    o.insert("momsn".into(), mo.clone());
+                }
+                let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+                o.insert("msgs".into(), json!(msgs + 1));
+                if let Some(txt) = details.get("payload_text").and_then(Value::as_str) {
+                    if !txt.trim().is_empty() {
+                        o.insert("text".into(), json!(txt));
+                    }
+                }
+            }
+        }
         _ => {}
     }
 
-    // Message stream entry: a one-line summary, plus the full decoded
-    // message for the click-to-expand detail view.
+    // Message stream entry: a one-line summary, plus the full decoded message
+    // for the click-to-expand detail view. The high-rate Iridium link layer
+    // (sync words, IDA link-access, inter-satellite ITL) is housekeeping that
+    // floods the log and buries content frames (SBD/ACARS/ring-alert/MT) — it
+    // still counts in the per-mode totals, but is kept out of the log feed.
+    if is_link_housekeeping(m) {
+        return;
+    }
     let line = crate::outputs::console::format_message(m, crate::outputs::console::ConsoleFormat::Pretty);
     d.next_id += 1;
     d.recent.push_back(json!({
@@ -314,6 +362,7 @@ fn snapshot(d: &mut Dash) -> String {
     d.iridium_sats.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= sat_cut);
     d.iridium_rings.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
     d.iridium_devices.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
+    d.iridium_terminals.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     // Persist the accumulated beam pattern occasionally so it survives
     // restarts and keeps refining across sessions.
     if now_s().saturating_sub(d.beams_saved) > 120 {
@@ -330,6 +379,7 @@ fn snapshot(d: &mut Dash) -> String {
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
         "iridium_devices": d.iridium_devices.values().collect::<Vec<_>>(),
+        "iridium_terminals": d.iridium_terminals.values().collect::<Vec<_>>(),
         "iridium_beam_cells": d.beams.project(now_s() as f64, SAT_EXPIRE_S as f64),
         "messages": d.recent.iter().rev().take(100).collect::<Vec<_>>(),
         "totals": d.totals,
@@ -470,6 +520,52 @@ mod tests {
         assert_eq!(snap["iridium_devices"].as_array().unwrap().len(), 2);
         // mt-position must NOT leak into the beam-footprint (spot beam) layer.
         assert_eq!(snap["iridium_rings"].as_array().unwrap().len(), 0);
+    }
+
+    fn iridium(kind: &str, details: Value) -> Message {
+        Message {
+            mode: Mode::Iridium,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 1_622_000_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: MessageBody::Iridium { kind: kind.into(), details },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn sbd_with_imei_surfaces_a_terminal_entity() {
+        let mut d = Dash::default();
+        update(&mut d, &iridium("sbd", json!({"type": "0600", "imei": "300034012295320", "momsn": 50815})));
+        update(&mut d, &iridium("sbd", json!({"type": "0600", "imei": "300034012295320", "momsn": 50816})));
+        // Same IMEI coalesces; msg count accrues.
+        assert_eq!(d.iridium_terminals.len(), 1);
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        assert_eq!(snap["iridium_terminals"][0]["imei"], "300034012295320");
+        assert_eq!(snap["iridium_terminals"][0]["msgs"], 2);
+        // An SBD frame with no IMEI (transport control) creates no entity.
+        update(&mut d, &iridium("sbd", json!({"type": "7608", "mtmsn": 3})));
+        assert_eq!(d.iridium_terminals.len(), 1);
+    }
+
+    #[test]
+    fn link_housekeeping_is_kept_out_of_the_log_but_counted() {
+        let mut d = Dash::default();
+        update(&mut d, &iridium("sync", json!({"sync_idle": true})));
+        update(&mut d, &iridium("ida", json!({"len": 2})));
+        update(&mut d, &iridium("itl", json!({})));
+        update(&mut d, &iridium("ring-alert", json!({"sat": 5})));
+        // sync/ida/itl are housekeeping: excluded from the log feed.
+        assert_eq!(d.recent.len(), 1, "only the ring-alert reaches the log");
+        // ...but all four still count toward the per-mode total.
+        assert_eq!(*d.totals.get("iridium").unwrap(), 4);
     }
 
     fn acars(tail: &str, flight: &str) -> Message {
