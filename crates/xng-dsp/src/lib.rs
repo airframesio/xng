@@ -9,6 +9,7 @@ pub mod checksum;
 pub mod ddc;
 pub mod fir;
 pub mod nco;
+pub mod resample;
 pub mod rs;
 pub mod scramble;
 pub mod viterbi;
@@ -18,5 +19,6 @@ pub use channelizer::PfbChannelizer;
 pub use ddc::Ddc;
 pub use fir::{lowpass_taps, Fir};
 pub use nco::Nco;
+pub use resample::Resampler;
 
 pub type IqSample = num_complex::Complex<f32>;

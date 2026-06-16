@@ -53,7 +53,9 @@ pub struct AisChannelDecoder {
 }
 
 impl AisChannelDecoder {
-    /// `input_rate` must be an integer multiple of 48 kHz (e.g. 2.4 MS/s).
+    /// `input_rate` is any capture rate ≥ the 48 kHz channel rate; a
+    /// non-integer multiple (e.g. an Airspy's 2.5 MS/s) is resampled by the
+    /// DDC (an integer multiple like 2.4 MS/s skips the resampler).
     /// `freq_offset_hz` is the channel center relative to the capture
     /// center; `frequency_hz` the absolute channel frequency (for the
     /// NMEA channel designator).

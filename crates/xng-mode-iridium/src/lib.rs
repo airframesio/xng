@@ -250,7 +250,8 @@ pub struct IridiumWidebandDecoder {
 }
 
 impl IridiumWidebandDecoder {
-    /// `input_rate` must be an integer multiple of 250 kHz.
+    /// `input_rate` is the wideband capture rate; per sub-channel DDCs resample
+    /// to the 250 kHz channel rate when it is not an integer divisor.
     pub fn new(input_rate: f64) -> Result<Self, String> {
         Ok(Self {
             wb: wideband::IridiumWideband::new(input_rate)?,
