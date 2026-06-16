@@ -150,6 +150,26 @@ fn lat_lon(p: [f64; 3]) -> (f64, f64) {
     (p[2].atan2((p[0] * p[0] + p[1] * p[1]).sqrt()), p[1].atan2(p[0]))
 }
 
+/// Shift a longitude (degrees) into the same ±180° window as a reference
+/// longitude. A footprint that crosses the ±180° antimeridian otherwise has
+/// some vertices at +179° and some at -179°; Leaflet draws vector polygons at
+/// their literal coordinates without wrapping, so that 358° jump renders the
+/// cell the long way across the whole map instead of across the seam. Keeping
+/// every cell vertex within 180° of the satellite sub-point makes the pattern
+/// one continuous coordinate cluster (e.g. a cell west of the date line reads
+/// as -185° next to a satellite at -152°), which Leaflet draws correctly over
+/// the wrapped basemap.
+fn unwrap_lon(lon_deg: f64, ref_deg: f64) -> f64 {
+    let mut l = lon_deg;
+    while l - ref_deg > 180.0 {
+        l -= 360.0;
+    }
+    while l - ref_deg < -180.0 {
+        l += 360.0;
+    }
+    l
+}
+
 /// A tier's beam footprint as (radial semi-axis, azimuthal semi-axis) in km.
 /// Radial = half the tier's radial band (so tiers tile inward/outward);
 /// azimuthal = half the chord to the adjacent beam in the same tier. Outer
@@ -458,6 +478,10 @@ impl BeamReconstructor {
                 slot_beam[bi] = b;
                 slot_pos[bi] = Some((c, a));
             }
+            // Antimeridian reference: every cell of this satellite is unwrapped
+            // to within 180° of its sub-point so date-line-crossing footprints
+            // render across the seam, not across the whole map.
+            let sat_lon = lat_lon(t.pos).1.to_degrees();
             for (i, &(slot_tier, sc, sa)) in slots.iter().enumerate() {
                 let beam_id = slot_beam[i];
                 let decoded = beam_id != 0;
@@ -473,13 +497,17 @@ impl BeamReconstructor {
                 };
                 let (a_rad, b_az) = tier_axes(tier);
                 let (lat, lon) = lat_lon(to_ecef(t.pos, cx, ay, t.north));
+                let poly = ellipse_poly(t.pos, t.north, cx, ay, a_rad, b_az)
+                    .into_iter()
+                    .map(|(la, lo)| (la, unwrap_lon(lo, sat_lon)))
+                    .collect();
                 out.push(Cell {
                     sat,
                     beam: beam_id,
                     lat: lat.to_degrees(),
-                    lon: lon.to_degrees(),
+                    lon: unwrap_lon(lon.to_degrees(), sat_lon),
                     radius_m: (a_rad + b_az) / 2.0 * 1000.0,
-                    poly: ellipse_poly(t.pos, t.north, cx, ay, a_rad, b_az),
+                    poly,
                     active,
                     decoded,
                 });
@@ -721,12 +749,50 @@ mod tests {
             inner.radius_m
         );
         for c in [inner, outer] {
+            // Upper bound covers the stretched outer tier (~680 km half-axis):
+            // limb beams are radially elongated to reach the documented ~2250 km
+            // footprint edge.
             assert!(
-                (80_000.0..=600_000.0).contains(&c.radius_m),
+                (80_000.0..=700_000.0).contains(&c.radius_m),
                 "plausible footprint, got {}",
                 c.radius_m
             );
         }
+    }
+
+    #[test]
+    fn unwrap_lon_keeps_polys_continuous_across_antimeridian() {
+        // unwrap_lon shifts a longitude into the reference's ±180° window.
+        assert!((unwrap_lon(175.0, -178.0) - (-185.0)).abs() < 1e-9, "west-of-dateline vertex → -185");
+        assert!((unwrap_lon(-178.0, 175.0) - 182.0).abs() < 1e-9, "east reference pulls vertex to +182");
+        assert!((unwrap_lon(-120.0, -121.0) - (-120.0)).abs() < 1e-9, "normal lon unchanged");
+
+        // A satellite on the date line projects a footprint that crosses ±180°.
+        // Every cell polygon must stay numerically continuous (no ~360° jump
+        // between consecutive vertices) so Leaflet draws it across the seam, and
+        // the western beams must read past -180° rather than folding to +175°.
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(11, 780.0, ecef(40.0, -178.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(11, 780.0, ecef(41.0, -178.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
+        let cells = r.project(t0 + 2.0, 60.0);
+        assert!(!cells.is_empty(), "date-line satellite still projects");
+        let mut crossed = false;
+        for c in &cells {
+            for w in c.poly.windows(2) {
+                assert!(
+                    (w[0].1 - w[1].1).abs() < 180.0,
+                    "poly continuous, jump {} (sat {} beam {})",
+                    (w[0].1 - w[1].1).abs(),
+                    c.sat,
+                    c.beam
+                );
+            }
+            if c.poly.iter().any(|v| v.1 < -180.0) {
+                crossed = true;
+            }
+        }
+        assert!(crossed, "western beams unwrap past -180 instead of folding to +175");
     }
 
     #[test]
