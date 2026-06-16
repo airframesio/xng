@@ -78,6 +78,22 @@ const BEAM_OVERLAP_F: f64 = 1.5;
 /// satellite was seen on it within this many seconds; older beams stay in
 /// the pattern but render muted.
 const ACTIVE_WINDOW_S: f64 = 30.0;
+/// Maximum RMS scatter (km) of a beam's footprint observations about their
+/// satellite-frame mean before the average is judged polluted and the beam is
+/// drawn as not-yet-decoded (gap-fill) rather than at a wrong measured position.
+/// A real beam's observations cluster within roughly a cell radius; an outlier
+/// (direction-fold pollution) scatters far wider.
+const MAX_SPREAD_KM: f64 = 600.0;
+/// Which concentric tier a measured offset at this nadir radius (km) belongs to,
+/// for sizing its drawn footprint. Saturates at the outer tier.
+fn tier_for_radius(r: f64) -> usize {
+    for t in 0..TIER_COUNT.len() {
+        if r < TIER_BOUND_KM[t + 1] {
+            return t;
+        }
+    }
+    TIER_COUNT.len() - 1
+}
 
 /// How an IRA altitude reading is interpreted.
 pub enum AltClass {
@@ -214,6 +230,20 @@ impl Pattern {
         let (mx, my) = (sx / n, sy / n);
         Some((mx, my))
     }
+    /// RMS scatter (km) of a beam's footprint observations about their mean, in
+    /// the satellite frame. All observations of one beam should land at the same
+    /// satellite-relative offset, so a large scatter flags a polluted average
+    /// (e.g. a mis-detected fly direction folding the along-track sign on some
+    /// passes) — those beams are dropped rather than drawn at a wrong position.
+    fn spread_km(&self, beam: u8) -> Option<f64> {
+        let &(sx, sy, sq, n) = self.cells.get(&beam)?;
+        if n == 0 {
+            return None;
+        }
+        let n = n as f64;
+        let var = (sq / n - (sx / n).powi(2) - (sy / n).powi(2)).max(0.0);
+        Some(var.sqrt())
+    }
 }
 
 /// Tracks each satellite's latest high-altitude fix and travel direction,
@@ -224,10 +254,10 @@ struct SatTrack {
     z_prev: f64,
     north: i8,
     time: f64,
-    /// beam id -> (last footprint time, that footprint's geocentric ECEF) for
-    /// THIS satellite. The boresight lets an active cell be drawn at the exact
-    /// measured ring-alert position rather than the idealized canonical slot.
-    seen_beams: HashMap<u8, (f64, [f64; 3])>,
+    /// beam id -> last footprint time observed for THIS satellite (drives the
+    /// active/idle state; the beam's *position* comes from the accumulated
+    /// per-beam mean in the direction pattern, not from one footprint).
+    seen_beams: HashMap<u8, f64>,
 }
 
 /// One projected beam cell, with the reconstructed footprint radius (m) so
@@ -320,7 +350,7 @@ impl BeamReconstructor {
                 };
                 let (cross, along) = to_sat_frame(pos, ecef, north);
                 if let Some(t) = self.tracks.get_mut(&sat) {
-                    t.seen_beams.insert(beam, (time, ecef)); // beam active; keep its boresight
+                    t.seen_beams.insert(beam, time); // mark this beam active
                 }
                 let pat = if north < 0 { &mut self.south } else { &mut self.north };
                 pat.add(beam, cross, along);
@@ -358,9 +388,19 @@ impl BeamReconstructor {
                 continue;
             }
             let pat = if t.north < 0 { &self.south } else { &self.north };
-            // Confident beam means for this direction (cross, along) in km.
+            // Confident, low-scatter beam means for this direction (cross,
+            // along) in km. A beam needs MIN_OBS observations AND a tight
+            // scatter (≤ MAX_SPREAD_KM); a polluted average is dropped so the
+            // slot falls back to a not-yet-decoded gap-fill rather than drawing
+            // at a wrong measured position.
             let means: Vec<(u8, f64, f64)> = (1..=48u8)
-                .filter_map(|b| pat.mean(b, MIN_OBS).map(|(c, a)| (b, c, a)))
+                .filter_map(|b| {
+                    let (c, a) = pat.mean(b, MIN_OBS)?;
+                    if pat.spread_km(b).is_some_and(|s| s > MAX_SPREAD_KM) {
+                        return None;
+                    }
+                    Some((b, c, a))
+                })
                 .collect();
 
             // Fit the canonical pattern's azimuth phase to the decoded beams
@@ -389,15 +429,16 @@ impl BeamReconstructor {
                 }
             }
 
-            // Snap each decoded beam to its nearest canonical slot, then emit
-            // exactly one cell per slot so the 48 beams tile cleanly, gap-free.
-            // The canonical model is the accurate beam layout; the measured
-            // positions are noisy samples of it, so snapping removes the tiling
-            // gaps that scatter would cause. A slot with a beam assigned draws
-            // solid (and takes that beam's id/active state); the rest draw faint
-            // as not-yet-decoded.
+            // Emit one cell per canonical slot, so the footprint always tiles to
+            // 48 gap-free. Each measured beam snaps to its nearest slot — but is
+            // drawn at its ACTUAL measured offset (the real honeycomb geometry,
+            // which sits on the decoded ring-alerts and tracks the satellite as
+            // it moves), with its tier sized from that offset's radius. Slots no
+            // measured beam claims are drawn at the idealized model position as
+            // not-yet-decoded gap-fill.
             let slots = slots_at(phase);
             let mut slot_beam = vec![0u8; slots.len()];
+            let mut slot_pos: Vec<Option<(f64, f64)>> = vec![None; slots.len()];
             for &(b, c, a) in &means {
                 let mut bi = 0usize;
                 let mut bd = f64::INFINITY;
@@ -409,28 +450,20 @@ impl BeamReconstructor {
                     }
                 }
                 slot_beam[bi] = b;
+                slot_pos[bi] = Some((c, a));
             }
-            for (i, &(tier, sc, sa)) in slots.iter().enumerate() {
+            for (i, &(slot_tier, sc, sa)) in slots.iter().enumerate() {
                 let beam_id = slot_beam[i];
                 let decoded = beam_id != 0;
-                // A beam is "active" if it was seen illuminating the ground within
-                // the window. For an active beam, draw the cell at its LATEST
-                // measured boresight (re-expressed in the current satellite frame,
-                // so it lands on the exact ring-alert ground point) instead of the
-                // idealized canonical slot — the active cell then sits on the
-                // spot-beam it was decoded from. Inactive and modelled cells stay
-                // on the canonical slot so the full footprint still tiles cleanly.
-                let recent = if decoded {
-                    t.seen_beams
-                        .get(&beam_id)
-                        .filter(|&&(ts, _)| now - ts < ACTIVE_WINDOW_S)
+                let active = decoded
+                    && t.seen_beams.get(&beam_id).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
+                // Decoded → measured offset (tier from its real radius);
+                // modelled gap-fill → the canonical slot.
+                let (cx, ay) = slot_pos[i].unwrap_or((sc, sa));
+                let tier = if decoded {
+                    tier_for_radius((cx * cx + ay * ay).sqrt())
                 } else {
-                    None
-                };
-                let active = recent.is_some();
-                let (cx, ay) = match recent {
-                    Some(&(_, bore)) => to_sat_frame(t.pos, bore, t.north),
-                    None => (sc, sa),
+                    slot_tier
                 };
                 let (a_rad, b_az) = tier_axes(tier);
                 let (lat, lon) = lat_lon(to_ecef(t.pos, cx, ay, t.north));
