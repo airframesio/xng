@@ -91,27 +91,38 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     let rate = match opts.sample_rate {
         Some(r) => r,
         None => {
-            let advertised = crate::probe_device_rates(&opts.sdr);
-            let r = scan::pick_auto_rate(&advertised, mode, plan_rate);
+            let caps = crate::probe_rate_caps(&opts.sdr);
+            let r = scan::choose_rate(&caps, mode, plan_rate);
             if r != plan_rate {
-                println!("device prefers {} S/s over the plan's {} S/s", r as u64, plan_rate as u64);
+                println!("using {} S/s (device does not offer the plan's {} S/s)", r as u64, plan_rate as u64);
             }
             r
         }
     };
     let passband = scan::passband(mode);
 
-    // Ctrl-C ends the survey early but still produces the report.
+    // Ctrl-C ends the survey early but still produces the report. A second
+    // Ctrl-C forces an immediate exit: if a device open or stream read is
+    // wedged and never observes `abort`, the first signal can't get us out,
+    // and tokio swallows further signals once nothing is awaiting them — so
+    // we keep awaiting and hard-exit on the second.
     let abort = Arc::new(AtomicBool::new(false));
     {
         let abort = abort.clone();
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_io().build();
-            if let Ok(rt) = rt {
-                let _ = rt.block_on(tokio::signal::ctrl_c());
-                eprintln!("\ninterrupted — finishing up and reporting");
-                abort.store(true, Ordering::Relaxed);
-            }
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_io().build() else {
+                return;
+            };
+            rt.block_on(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    eprintln!("\ninterrupted — finishing up and reporting (Ctrl-C again to quit now)");
+                    abort.store(true, Ordering::Relaxed);
+                }
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    eprintln!("\nforced quit");
+                    std::process::exit(130);
+                }
+            });
         });
     }
 
@@ -650,7 +661,12 @@ fn proposal_command(
         return None;
     }
     let center = (active.iter().min().unwrap() + active.iter().max().unwrap()) / 2;
-    let center = if active.contains(&center) { center + 25_000 } else { center };
+    // Whole-capture modes (passband 0: Mode S) keep the channel at center.
+    let center = if scan::passband(mode) > 0.0 && active.contains(&center) {
+        center + 25_000
+    } else {
+        center
+    };
     let chans: Vec<String> = active.iter().map(|&f| format!("{:.3}", f as f64 / 1e6)).collect();
     let gain_arg = gain.map(|g| format!(" --gain {g}")).unwrap_or_default();
     Some(format!(

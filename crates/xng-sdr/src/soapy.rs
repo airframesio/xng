@@ -29,6 +29,21 @@ pub fn enumerate(filter: &str) -> Result<Vec<DeviceSummary>, SdrError> {
         .collect())
 }
 
+/// Advertised RX sample-rate ranges for the device `args` selects, as
+/// `(min, max, step)` tuples in Hz (`step == 0.0` means the range is
+/// continuous — the common case for RTL-SDR/HackRF/SDRplay). Returns an empty
+/// vec when the device can't be opened or reports nothing, so callers fall
+/// back to the mode's plan rate. Opens the device briefly (no RX stream) and
+/// closes it on return.
+pub fn sample_rate_ranges(args: &str) -> Vec<(f64, f64, f64)> {
+    let Ok(dev) = soapysdr::Device::new(args) else {
+        return Vec::new();
+    };
+    dev.get_sample_rate_range(soapysdr::Direction::Rx, 0)
+        .map(|ranges| ranges.iter().map(|r| (r.minimum, r.maximum, r.step)).collect())
+        .unwrap_or_default()
+}
+
 /// A single-channel RX capture from a SoapySDR device.
 pub struct SoapyIqSource {
     stream: soapysdr::RxStream<Complex<f32>>,

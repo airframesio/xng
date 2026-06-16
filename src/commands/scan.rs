@@ -97,22 +97,83 @@ pub(crate) fn channel_rate(mode: Mode) -> f64 {
     }
 }
 
-/// Choose a capture rate the device can actually do: the smallest
-/// advertised rate that divides the mode's channel rate cleanly (CPU
-/// scales with rate). Falls back to the plan rate when nothing matches
-/// or nothing was probed.
-pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> f64 {
+/// What an SDR can do for sample rate. Native backends (airspy/airspyhf)
+/// report an exact discrete set; SoapySDR devices (RTL-SDR, HackRF, SDRplay…)
+/// report inclusive ranges; `Unknown` when we couldn't ask — callers then
+/// trust the mode's plan rate.
+#[derive(Debug, Clone)]
+pub(crate) enum RateCaps {
+    Discrete(Vec<u32>),
+    /// `(min, max, step)` Hz; `step == 0.0` means continuous.
+    Ranges(Vec<(f64, f64, f64)>),
+    Unknown,
+}
+
+/// Pick a capture rate the device supports for `mode`, given what it can do.
+/// Prefers the mode's plan rate; otherwise the smallest supported rate that is
+/// **at least** the plan rate and (for DDC modes) a clean integer multiple of
+/// the per-channel rate. The "at least" floor keeps a device with a wide rate
+/// menu (e.g. RTL-SDR's 0.25–3.2 MS/s) from stranding a mode at a too-narrow
+/// capture. Falls back to the plan rate when nothing fits or support is
+/// unknown.
+pub(crate) fn choose_rate(caps: &RateCaps, mode: Mode, plan_rate: f64) -> f64 {
+    match caps {
+        RateCaps::Unknown => plan_rate,
+        RateCaps::Discrete(rates) => pick_auto_rate(rates, mode, plan_rate),
+        RateCaps::Ranges(ranges) => {
+            pick_auto_rate(&candidates_from_ranges(ranges, mode), mode, plan_rate)
+        }
+    }
+}
+
+/// Expand advertised rate ranges into discrete candidate rates aligned to the
+/// mode's per-channel rate (so every candidate is a clean DDC multiple).
+/// Whole-capture modes (channel rate 1.0: Mode S) have no DDC grid, so a
+/// coarse 250 kHz step is used just to enumerate sensible widths.
+fn candidates_from_ranges(ranges: &[(f64, f64, f64)], mode: Mode) -> Vec<u32> {
     let ch = channel_rate(mode);
-    let mut rates: Vec<u32> = advertised.to_vec();
-    rates.sort_unstable();
-    if rates.iter().any(|&r| r as f64 == plan_rate && (plan_rate / ch).fract().abs() < 1e-9) {
+    let unit = if ch > 1.0 { ch } else { 250_000.0 };
+    let mut out: Vec<u32> = Vec::new();
+    for &(lo, hi, _step) in ranges {
+        if hi < lo {
+            continue;
+        }
+        // First multiple of `unit` at or above the range floor, then step up.
+        let mut r = (lo / unit).ceil() * unit;
+        let mut n = 0;
+        while r <= hi + 1e-6 && n < 4096 {
+            out.push(r as u32);
+            r += unit;
+            n += 1;
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Choose a capture rate from a discrete advertised set (see [`choose_rate`]).
+pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> f64 {
+    if advertised.is_empty() {
         return plan_rate;
     }
-    rates
-        .iter()
-        .map(|&r| r as f64)
-        .find(|r| (r / ch).fract().abs() < 1e-9)
-        .unwrap_or(plan_rate)
+    let ch = channel_rate(mode);
+    let divides = |r: f64| (r / ch).fract().abs() < 1e-9;
+    let mut rates: Vec<f64> = advertised.iter().map(|&r| r as f64).collect();
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // The plan rate is authoritative when the device offers it exactly.
+    if rates.iter().any(|&r| (r - plan_rate).abs() < 1e-9) {
+        return plan_rate;
+    }
+    // Smallest supported, clean-multiple rate at or above the plan rate —
+    // never narrower than the mode was designed for.
+    if let Some(&r) = rates.iter().find(|&&r| r >= plan_rate - 1e-9 && divides(r)) {
+        return r;
+    }
+    // Nothing clean at/above the plan: take the widest clean multiple offered
+    // (best effort), else the plan rate so the device surfaces a clear error
+    // rather than silently mis-tuning.
+    rates.iter().rev().copied().find(|&r| divides(r)).unwrap_or(plan_rate)
 }
 
 /// Cluster channels into capture-width groups.
@@ -137,8 +198,15 @@ pub(crate) fn group_channels(channels: &[u64], sample_rate: f64, passband: f64) 
         .into_iter()
         .map(|g| {
             let center = (g[0] + g[g.len() - 1]) / 2;
-            // Avoid a channel landing exactly at DC.
-            let center = if g.iter().any(|&c| c == center) { center + 25_000 } else { center };
+            // Avoid a channel landing exactly at DC — except whole-capture
+            // modes (passband 0: Mode S), whose core consumes the entire
+            // capture and requires the channel AT the center. A 25 kHz nudge
+            // there makes the offset non-zero and the decoder rejects it.
+            let center = if passband > 0.0 && g.iter().any(|&c| c == center) {
+                center + 25_000
+            } else {
+                center
+            };
             (center, g)
         })
         .collect()
@@ -206,19 +274,19 @@ pub fn run(
     let mut results: Vec<ChannelResult> = Vec::new();
     let mut groups_total = 0usize;
     let mut plans = Vec::new();
-    // Plan rates target common hardware (RTL-SDR); devices with a fixed
-    // rate list (Airspy) get the smallest advertised rate that divides
-    // the mode's channel rate.
-    let advertised = crate::probe_device_rates(sdr);
+    // Probe once: pick each mode's rate from what this device actually
+    // supports (Airspy's fixed list, a SoapySDR device's ranges), preferring
+    // the plan rate.
+    let caps = crate::probe_rate_caps(sdr);
     for &mode in modes {
         let (plan_rate, channels) = plan(mode);
         if channels.is_empty() {
             tracing::warn!("no built-in frequency plan for mode {mode}; skipping");
             continue;
         }
-        let rate = pick_auto_rate(&advertised, mode, plan_rate);
+        let rate = choose_rate(&caps, mode, plan_rate);
         if rate != plan_rate {
-            tracing::info!("{mode}: device prefers {} S/s over the plan's {} S/s", rate as u64, plan_rate as u64);
+            tracing::info!("{mode}: using {} S/s (device does not offer the plan's {} S/s)", rate as u64, plan_rate as u64);
         }
         let groups = group_channels(&channels, rate, passband(mode));
         groups_total += groups.len();
@@ -324,10 +392,15 @@ pub fn run(
         if active.is_empty() {
             continue;
         }
-        let rate = pick_auto_rate(&advertised, mode, plan(mode).0);
+        let rate = choose_rate(&caps, mode, plan(mode).0);
         let freqs: Vec<u64> = active.iter().map(|r| r.frequency_hz).collect();
         let center = (freqs.iter().min().unwrap() + freqs.iter().max().unwrap()) / 2;
-        let center = if freqs.contains(&center) { center + 25_000 } else { center };
+        // Whole-capture modes (passband 0) must keep the channel at center.
+        let center = if passband(mode) > 0.0 && freqs.contains(&center) {
+            center + 25_000
+        } else {
+            center
+        };
         let chans: Vec<String> =
             freqs.iter().map(|&f| format!("{:.3}", f as f64 / 1e6)).collect();
         proposals.push(format!(
@@ -459,8 +532,42 @@ mod tests {
         assert_eq!(pick_auto_rate(&[6_000_000, 3_000_000], Mode::AcarsPoa, 2_400_000.0), 3_000_000.0);
         // Device that advertises the plan rate keeps it.
         assert_eq!(pick_auto_rate(&[2_400_000], Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
-        // Nothing probed (SoapySDR path): plan rate.
+        // Nothing probed: plan rate.
         assert_eq!(pick_auto_rate(&[], Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
+    }
+
+    #[test]
+    fn choose_rate_from_rtl_ranges() {
+        // RTL-SDR advertises ~0.225–0.3 and ~0.9–3.2 MS/s (two continuous
+        // ranges with a gap), reported as ranges, not a discrete list.
+        let rtl = RateCaps::Ranges(vec![
+            (225_001.0, 300_000.0, 0.0),
+            (900_001.0, 3_200_000.0, 0.0),
+        ]);
+        // ADS-B (whole capture): plan 2.0 MS/s is in range → kept exactly so
+        // the channel stays at the capture center.
+        assert_eq!(choose_rate(&rtl, Mode::Adsb, 2_000_000.0), 2_000_000.0);
+        // ACARS: 2.4 MS/s is supported and a clean 24 kHz multiple → kept.
+        assert_eq!(choose_rate(&rtl, Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
+        // HFDL: plan 768 kS/s lands in the RTL gap; pick the smallest
+        // supported 12 kHz-multiple at or above it (never narrower).
+        let r = choose_rate(&rtl, Mode::Hfdl, 768_000.0);
+        assert!((r / 12_000.0).fract().abs() < 1e-9, "not a 12 kHz multiple: {r}");
+        assert!(r >= 900_001.0, "must land in the supported high range: {r}");
+    }
+
+    #[test]
+    fn choose_rate_unknown_keeps_plan() {
+        assert_eq!(choose_rate(&RateCaps::Unknown, Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
+    }
+
+    #[test]
+    fn choose_rate_floor_avoids_too_narrow_capture() {
+        // A device that also offers sub-plan rates must not strand the mode
+        // at a too-narrow capture just because the small rate "fits".
+        let caps = RateCaps::Discrete(vec![250_000, 1_000_000, 2_000_000, 2_400_000]);
+        assert_eq!(choose_rate(&caps, Mode::Adsb, 2_000_000.0), 2_000_000.0);
+        assert_eq!(choose_rate(&caps, Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
     }
 
     #[test]
@@ -483,8 +590,21 @@ mod tests {
     fn auto_window_handles_single_channel_modes() {
         let (center, chans) = auto_window(Mode::Adsb, 2_000_000.0, 8).unwrap();
         assert_eq!(chans, vec![1_090_000_000]);
-        // Center is nudged off the channel to keep it away from DC.
-        assert_ne!(center, 1_090_000_000);
+        // Mode S consumes the whole capture: the channel must sit AT the
+        // center (a DC nudge would make the offset non-zero and the core
+        // rejects it — "Mode S uses the whole capture").
+        assert_eq!(center, 1_090_000_000);
+    }
+
+    #[test]
+    fn group_channels_keeps_whole_capture_channel_at_center() {
+        // ADS-B (passband 0): the single 1090 MHz channel must land exactly
+        // at the capture center, not nudged 25 kHz off DC.
+        let groups = group_channels(&[1_090_000_000], 2_000_000.0, passband(Mode::Adsb));
+        assert_eq!(groups, vec![(1_090_000_000, vec![1_090_000_000])]);
+        // A DDC mode whose only channel is the midpoint still nudges off DC.
+        let groups = group_channels(&[131_550_000], 2_400_000.0, passband(Mode::AcarsPoa));
+        assert_eq!(groups[0].0, 131_575_000);
     }
 
     #[test]
