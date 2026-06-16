@@ -224,8 +224,10 @@ struct SatTrack {
     z_prev: f64,
     north: i8,
     time: f64,
-    /// beam id -> last footprint time observed for THIS satellite.
-    seen_beams: HashMap<u8, f64>,
+    /// beam id -> (last footprint time, that footprint's geocentric ECEF) for
+    /// THIS satellite. The boresight lets an active cell be drawn at the exact
+    /// measured ring-alert position rather than the idealized canonical slot.
+    seen_beams: HashMap<u8, (f64, [f64; 3])>,
 }
 
 /// One projected beam cell, with the reconstructed footprint radius (m) so
@@ -318,7 +320,7 @@ impl BeamReconstructor {
                 };
                 let (cross, along) = to_sat_frame(pos, ecef, north);
                 if let Some(t) = self.tracks.get_mut(&sat) {
-                    t.seen_beams.insert(beam, time); // mark this beam active
+                    t.seen_beams.insert(beam, (time, ecef)); // beam active; keep its boresight
                 }
                 let pat = if north < 0 { &mut self.south } else { &mut self.north };
                 pat.add(beam, cross, along);
@@ -411,17 +413,34 @@ impl BeamReconstructor {
             for (i, &(tier, sc, sa)) in slots.iter().enumerate() {
                 let beam_id = slot_beam[i];
                 let decoded = beam_id != 0;
-                let active =
-                    decoded && t.seen_beams.get(&beam_id).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
+                // A beam is "active" if it was seen illuminating the ground within
+                // the window. For an active beam, draw the cell at its LATEST
+                // measured boresight (re-expressed in the current satellite frame,
+                // so it lands on the exact ring-alert ground point) instead of the
+                // idealized canonical slot — the active cell then sits on the
+                // spot-beam it was decoded from. Inactive and modelled cells stay
+                // on the canonical slot so the full footprint still tiles cleanly.
+                let recent = if decoded {
+                    t.seen_beams
+                        .get(&beam_id)
+                        .filter(|&&(ts, _)| now - ts < ACTIVE_WINDOW_S)
+                } else {
+                    None
+                };
+                let active = recent.is_some();
+                let (cx, ay) = match recent {
+                    Some(&(_, bore)) => to_sat_frame(t.pos, bore, t.north),
+                    None => (sc, sa),
+                };
                 let (a_rad, b_az) = tier_axes(tier);
-                let (lat, lon) = lat_lon(to_ecef(t.pos, sc, sa, t.north));
+                let (lat, lon) = lat_lon(to_ecef(t.pos, cx, ay, t.north));
                 out.push(Cell {
                     sat,
                     beam: beam_id,
                     lat: lat.to_degrees(),
                     lon: lon.to_degrees(),
                     radius_m: (a_rad + b_az) / 2.0 * 1000.0,
-                    poly: ellipse_poly(t.pos, t.north, sc, sa, a_rad, b_az),
+                    poly: ellipse_poly(t.pos, t.north, cx, ay, a_rad, b_az),
                     active,
                     decoded,
                 });
