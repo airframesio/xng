@@ -11,7 +11,15 @@
 
 use crate::frame::{ACCESS_DL, ACCESS_UL};
 use num_complex::Complex;
+use std::cell::RefCell;
 use std::f32::consts::PI;
+
+thread_local! {
+    /// Cached FFT planner for the fine-CFO FFT. `IridiumDemod` is constructed
+    /// per burst, so a per-thread cached planner avoids re-planning every time
+    /// (rustfft caches plans internally, so a same-size request is cheap).
+    static CFO_PLANNER: RefCell<rustfft::FftPlanner<f32>> = RefCell::new(rustfft::FftPlanner::new());
+}
 
 pub const SYMBOL_RATE: f64 = 25_000.0;
 /// UW absolute QPSK symbol phases (units of π/2).
@@ -62,6 +70,11 @@ pub struct IridiumDemod {
     /// Burst power-gate multiplier over the noise floor. Tunable via
     /// XNG_IRIDIUM_GATE.
     gate_mult: f32,
+    /// Use gr-iridium's squared-FFT fine CFO (Blackman-windowed, over the
+    /// preamble+UW) instead of the plain preamble-tone DFT. Squaring removes
+    /// the BPSK on the UW symbols (and the alternating UL preamble), leaving a
+    /// clean tone at 2·CFO. Default on; set XNG_IRIDIUM_SQCFO=0 to disable.
+    sq_cfo: bool,
 }
 
 impl IridiumDemod {
@@ -82,6 +95,9 @@ impl IridiumDemod {
             debug: std::env::var("XNG_IRIDIUM_DEBUG").is_ok(),
             uw_corr: env_f32("XNG_IRIDIUM_UWCORR", 0.97),
             gate_mult: env_f32("XNG_IRIDIUM_GATE", 8.0),
+            // Default on (gr-iridium's squared-FFT fine CFO; +16% IDA / +19%
+            // CRC-OK on the 300 s benchmark). Set XNG_IRIDIUM_SQCFO=0 to disable.
+            sq_cfo: std::env::var("XNG_IRIDIUM_SQCFO").map(|v| v != "0").unwrap_or(true),
         }
     }
 
@@ -150,6 +166,50 @@ impl IridiumDemod {
             0.0
         };
         Some(F0 + (peak as f64 + frac) * STEP_HZ)
+    }
+
+    /// gr-iridium `burst_downmix` fine CFO (faithful port). Square the
+    /// preamble+UW window (removes the BPSK on the UW and the alternating UL
+    /// preamble, leaving a tone at 2·CFO), Blackman-window it, zero-pad 16×,
+    /// FFT, take the global magnitude peak, quadratically interpolate, and
+    /// halve. FFT length = floor-pow2(sps·(short preamble 16 + 10 UW)), 16×
+    /// oversampled — exactly `burst_downmix_impl.cc`'s `d_cfo_est_fft`.
+    fn tone_cfo_sq(&self, pos: f64) -> Option<f64> {
+        let base = (self.sps * (16.0 + 10.0)) as usize; // PREAMBLE_LENGTH_SHORT + 10 UW
+        if base < 4 {
+            return None;
+        }
+        let n = 1usize << (usize::BITS - 1 - base.leading_zeros()); // floor power of two
+        let m = n * 16; // d_fft_over_size_facor
+        let rel = (pos - self.start_abs) as usize;
+        if rel + n > self.buf.len() {
+            return None;
+        }
+        // Square + Blackman-window the first n samples into a zero-padded buffer.
+        let mut buf = vec![Complex::new(0.0f32, 0.0); m];
+        let denom = (n - 1) as f32;
+        for k in 0..n {
+            let s = self.buf[rel + k];
+            let w = 0.42 - 0.5 * (2.0 * PI * k as f32 / denom).cos()
+                + 0.08 * (4.0 * PI * k as f32 / denom).cos();
+            buf[k] = s * s * w;
+        }
+        let fft = CFO_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(m));
+        fft.process(&mut buf);
+        // Global peak of |·|² over the oversampled spectrum, quadratic interp.
+        let peak = (0..m).max_by(|&a, &b| buf[a].norm_sqr().total_cmp(&buf[b].norm_sqr()))?;
+        let a = buf[(peak + m - 1) % m].norm_sqr();
+        let b = buf[peak].norm_sqr();
+        let c = buf[(peak + 1) % m].norm_sqr();
+        let d = a - 2.0 * b + c;
+        let frac = if d.abs() > 1e-20 { (0.5 * (a - c) / d).clamp(-1.0, 1.0) as f64 } else { 0.0 };
+        // Unshift [0,m) → [-m/2, m/2), normalize to cycles/sample, halve (undo
+        // squaring), convert to Hz.
+        let mut idx = peak as f64 + frac;
+        if idx >= m as f64 / 2.0 {
+            idx -= m as f64;
+        }
+        Some(idx / m as f64 / 2.0 * (SYMBOL_RATE * self.sps))
     }
 
     /// Matched-filter UW correlation for one UW variant, over a fine timing
@@ -261,7 +321,15 @@ impl IridiumDemod {
             // window that is certainly inside the tone, then hunt the UW
             // over the possible preamble lengths (16 short, 64 long).
             let bstart = pos - 16.0;
-            let Some(cfo) = self.tone_cfo(bstart + 2.0 * self.sps, 10.0) else { break };
+            // Fine CFO: gr-iridium's squared-FFT estimate over the preamble+UW
+            // by default (finer, and handles the alternating UL preamble); the
+            // plain preamble-tone DFT is the fallback path (XNG_IRIDIUM_SQCFO=0).
+            let cfo = if self.sq_cfo {
+                self.tone_cfo_sq(bstart)
+            } else {
+                self.tone_cfo(bstart + 2.0 * self.sps, 10.0)
+            };
+            let Some(cfo) = cfo else { break };
             let theta0 = (2.0 * std::f64::consts::PI * cfo / SYMBOL_RATE) as f32;
             let mut found: Option<(f32, f64, f32, f32, &'static [u8; 24])> = None;
             let mut dbg_best = 0.0f32;
