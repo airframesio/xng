@@ -88,6 +88,17 @@ pub struct IridiumDemod {
     /// errors, so the absolute check accepts weak bursts the differential one
     /// rejects. XNG_IRIDIUM_ABSCHECK.
     abscheck: bool,
+    /// Beyond-gr: residual-CFO refinement in the single-shot sync correlation.
+    /// `acquire_multi` derives ONE squared-FFT CFO at the burst onset and then
+    /// correlates the sync word with that fixed slope; on a weak burst the onset
+    /// CFO can sit a few hundred Hz off (squaring doubles the noise), and a fixed
+    /// slope then fails to correlate, losing the whole burst. When >0, each frame
+    /// also searches ±N residual-CFO steps (CFO_REFINE_STEP rad/sym) and keeps the
+    /// best-correlating slope — the access-code + CRC still gate false locks, so
+    /// this only adds, never corrupts. 0 = off (gr-faithful). XNG_IRIDIUM_CFO_REFINE.
+    cfo_refine: i32,
+    /// Residual-CFO grid step in rad/sym for `cfo_refine`. XNG_IRIDIUM_CFO_REFINE_STEP.
+    cfo_refine_step: f32,
 }
 
 impl IridiumDemod {
@@ -114,6 +125,12 @@ impl IridiumDemod {
             sync_corr: std::env::var("XNG_IRIDIUM_SYNCCORR").map(|v| v != "0").unwrap_or(true),
             pll_full: std::env::var("XNG_IRIDIUM_PLL_FULL").is_ok(),
             abscheck: std::env::var("XNG_IRIDIUM_ABSCHECK").is_ok(),
+            // Default 2 (±0.16 rad/sym ≈ ±640 Hz): +11 CRC-OK IDA on the 300 s
+            // benchmark (495→506). The gain knees here; refine=3 adds +1 for ~15%
+            // more correlation cost. ~+43% single-thread demod time, trivially
+            // within the live station's headroom (uses <1 of 12 cores).
+            cfo_refine: env_f32("XNG_IRIDIUM_CFO_REFINE", 2.0) as i32,
+            cfo_refine_step: env_f32("XNG_IRIDIUM_CFO_REFINE_STEP", 0.08),
         }
     }
 
@@ -590,46 +607,58 @@ impl IridiumDemod {
         let min_frame = (12 + 32) as f64 * self.sps;
         let mut out = Vec::new();
         let mut search_lo = (onset - 6.0 * self.sps).max(0.0);
+        // Residual-CFO grid (beyond-gr): [0] when off (gr-faithful single slope),
+        // else ±cfo_refine steps so a weak burst whose onset CFO is slightly off
+        // can still correlate. CRC + access-code gate any false lock downstream.
+        let db_grid: Vec<f32> = (-self.cfo_refine..=self.cfo_refine)
+            .map(|i| i as f32 * self.cfo_refine_step)
+            .collect();
         for _ in 0..16 {
             if search_lo + min_frame > end {
                 break;
             }
             let hi = (search_lo + span).min(end);
-            // Best sync peak in [search_lo, hi] (full resolution, no gate).
-            let mut best: Option<(f32, f64, &'static [u8; 24], &'static [u8; 28])> = None;
+            // Best sync peak in [search_lo, hi] (full resolution, no gate). When
+            // cfo_refine>0, the residual-CFO slope `db` is searched jointly with
+            // timing and carried to the demod (best = corr, o, db, access, sync).
+            let mut best: Option<(f32, f64, f32, &'static [u8; 24], &'static [u8; 28])> = None;
             let mut o = search_lo;
             while o < hi {
                 for (sync, access) in [(&SYNC_DL, ACCESS_DL), (&SYNC_UL, ACCESS_UL)] {
-                    let mut acc = Complex::new(0.0f32, 0.0);
-                    let mut mag = 0.0f32;
-                    let mut ok = true;
-                    for k in 0..n_corr {
-                        let Some(s) = self.sample(o + (off0 + k) as f64 * self.sps) else {
-                            ok = false;
-                            break;
-                        };
-                        let e = sync[off0 + k] as f32 * PI / 2.0;
-                        acc += s * Complex::from_polar(1.0, -e - theta * (off0 + k) as f32);
-                        mag += s.norm();
-                    }
-                    if ok && mag > 1e-12 {
-                        let corr = acc.norm() / mag;
-                        if best.map(|(c, ..)| corr > c).unwrap_or(true) {
-                            best = Some((corr, o, access, sync));
+                    for &db in &db_grid {
+                        let th = theta + db;
+                        let mut acc = Complex::new(0.0f32, 0.0);
+                        let mut mag = 0.0f32;
+                        let mut ok = true;
+                        for k in 0..n_corr {
+                            let Some(s) = self.sample(o + (off0 + k) as f64 * self.sps) else {
+                                ok = false;
+                                break;
+                            };
+                            let e = sync[off0 + k] as f32 * PI / 2.0;
+                            acc += s * Complex::from_polar(1.0, -e - th * (off0 + k) as f32);
+                            mag += s.norm();
+                        }
+                        if ok && mag > 1e-12 {
+                            let corr = acc.norm() / mag;
+                            if best.map(|(c, ..)| corr > c).unwrap_or(true) {
+                                best = Some((corr, o, db, access, sync));
+                            }
                         }
                     }
                 }
                 o += 1.0;
             }
-            let Some((_, o, access, sync)) = best else { break };
+            let Some((_, o, db, access, sync)) = best else { break };
+            let theta_eff = theta + db;
             let uw_pos = o + 16.0 * self.sps;
             let mut acc_uw = Complex::new(0.0f32, 0.0);
             for j in 0..12 {
                 if let Some(s) = self.sample(uw_pos + j as f64 * self.sps) {
-                    acc_uw += s * Complex::from_polar(1.0, -(sync[16 + j] as f32 * PI / 2.0) - theta * j as f32);
+                    acc_uw += s * Complex::from_polar(1.0, -(sync[16 + j] as f32 * PI / 2.0) - theta_eff * j as f32);
                 }
             }
-            let (frame, n_sym) = self.demod_from(uw_pos, theta, acc_uw.arg(), access, &sync[16..]);
+            let (frame, n_sym) = self.demod_from(uw_pos, theta_eff, acc_uw.arg(), access, &sync[16..]);
             if let Some(f) = frame {
                 out.push(f);
             }
