@@ -14,6 +14,10 @@ use xng_dsp::Ddc;
 
 /// Detection threshold over the per-bin noise floor (gr-iridium: 16 dB).
 const THRESHOLD: f32 = 40.0; // linear ≈ 16 dB
+/// Burst spectral width for the detection mask (gr-iridium fft_burst_tagger
+/// default). Each detected burst masks ±BURST_WIDTH_HZ/2 so neighbouring
+/// duplex channels (~41.7 kHz apart) are detected separately, not merged.
+const BURST_WIDTH_HZ: f32 = 40_000.0;
 /// Frames to average into the noise floor before detecting. Seeding the
 /// floor from a single frame (its random per-bin magnitude) leaves many
 /// bins initialized near a noise null, so for the EMA's whole settling
@@ -64,9 +68,6 @@ struct ActiveBurst {
 }
 
 pub struct IridiumWideband {
-    /// Recently extracted bursts (start_frame, last_frame, bin) for
-    /// suppressing duplicate split detections.
-    recent: Vec<(u64, u64, usize)>,
     input_rate: f64,
     fft: Arc<dyn Fft<f32>>,
     nfft: usize,
@@ -85,8 +86,12 @@ pub struct IridiumWideband {
     debug: bool,
     /// Detection threshold over the per-bin noise floor (XNG_IRIDIUM_THRESHOLD).
     det_threshold: f32,
-    /// Split-duplicate suppression width in bins (XNG_IRIDIUM_DEDUP_BINS).
-    dedup_bins: i64,
+    /// Burst-mask half-width in bins (±this is masked around each detected
+    /// burst so neighbours stay separate). From XNG_IRIDIUM_BURST_WIDTH_HZ.
+    half_width_bins: usize,
+    /// Recent decoded-bit hashes, to drop duplicate re-detections of one burst
+    /// (a strong burst's skirt re-detected off center decodes to the same bits).
+    recent_bits: std::collections::VecDeque<u64>,
     /// Raised-cosine matched-filter taps applied per burst (empty = disabled).
     mf_taps: Vec<f32>,
 }
@@ -138,10 +143,17 @@ impl IridiumWideband {
             next_frame: 0,
             floor_frames: 0,
             active: Vec::new(),
-            recent: Vec::new(),
             debug: std::env::var("XNG_IRIDIUM_DEBUG").is_ok(),
             det_threshold: crate::demod::env_f32("XNG_IRIDIUM_THRESHOLD", THRESHOLD),
-            dedup_bins: crate::demod::env_f32("XNG_IRIDIUM_DEDUP_BINS", 120.0) as i64,
+            half_width_bins: {
+                // ±20 kHz mask around each burst (gr-iridium burst_width 40 kHz).
+                // Duplex channels are ~41.7 kHz apart, so neighbours are not
+                // masked into one another.
+                let bw = crate::demod::env_f32("XNG_IRIDIUM_BURST_WIDTH_HZ", BURST_WIDTH_HZ) as f64;
+                let bin_width = input_rate / nfft as f64;
+                ((bw / bin_width / 2.0).round() as usize).max(1)
+            },
+            recent_bits: std::collections::VecDeque::new(),
             // Root-raised-cosine matched filter (matched to Iridium's RRC
             // transmit pulse; gr-iridium uses RRC alpha 0.4, 51 taps). The
             // received TX-RRC pulse convolved with this RX-RRC is a full raised
@@ -201,90 +213,117 @@ impl IridiumWideband {
             })
             .collect();
 
+        let post_frames = (POST_S * self.input_rate / frame_len as f64).ceil() as u64;
+        let max_frames = (MAX_BURST_S * self.input_rate / frame_len as f64).ceil() as u64;
+        let hw = self.half_width_bins as i64;
         for mag in &mags {
-            // Update the per-bin noise floor. Warm up with a running
-            // mean over the first WARMUP_FRAMES (no detection yet), then
-            // track with the slow EMA. Detecting before the floor is
-            // settled produces band-wide false bursts.
+            // Update the per-bin noise floor. Warm up with a running mean over
+            // the first WARMUP_FRAMES (no detection yet), then track with a slow
+            // EMA. Detecting before the floor is settled produces band-wide
+            // false bursts.
             if self.floor.is_empty() {
                 self.floor = vec![0.0; self.nfft];
             }
             self.floor_frames += 1;
-            let warming = self.floor_frames <= WARMUP_FRAMES;
-            let mut hot = vec![false; self.nfft];
-            for (k, &m) in mag.iter().enumerate() {
-                let f = &mut self.floor[k];
-                if warming {
-                    // Incremental mean of the frames seen so far.
-                    *f += (m - *f) / self.floor_frames as f32;
-                    continue;
+            if self.floor_frames <= WARMUP_FRAMES {
+                for (k, &m) in mag.iter().enumerate() {
+                    self.floor[k] += (m - self.floor[k]) / self.floor_frames as f32;
                 }
-                hot[k] = m > *f * self.det_threshold;
-                // Bursts are brief; the slow EMA dilutes them like
-                // gr-iridium's 512-frame history.
-                *f += (m - *f) / 512.0;
+                self.next_frame += 1;
+                continue;
             }
 
-            // Group contiguous hot bins (gaps ≤ 2 bridged) into burst
-            // detections. No width cap: a strong burst's spectral
-            // leakage can light a wide region, and the energy centroid
-            // still lands on the true channel center.
-            let mut k = 0usize;
-            while k < self.nfft {
-                if !hot[k] {
-                    k += 1;
+            // Per-peak burst detection with a fixed-width burst mask
+            // (gr-iridium's fft_burst_tagger). The previous contiguous-bin
+            // grouping plus a 120-bin dedup dropped simultaneous duplex bursts;
+            // the duplex IDA band packs many bursts ~42 kHz apart, so masking
+            // only each claimed ±half_width region and letting the next
+            // strongest peak start its own burst recovers them.
+            let mut hot = vec![false; self.nfft];
+            for k in 0..self.nfft {
+                let f = self.floor[k];
+                hot[k] = f > 0.0 && mag[k] > f * self.det_threshold;
+            }
+
+            // Extend active bursts whose center still carries energy.
+            for a in &mut self.active {
+                let c = a.bin as i64;
+                if (-1..=1).any(|d| {
+                    let b = c + d;
+                    b >= 0 && (b as usize) < self.nfft && hot[b as usize]
+                }) {
+                    a.last_frame = self.next_frame;
+                }
+            }
+
+            // Mask the ±half_width region of every active burst (true = bin
+            // available), so an in-progress burst spawns no duplicate.
+            let mut mask = vec![true; self.nfft];
+            for a in &self.active {
+                let lo = (a.bin as i64 - hw).max(0) as usize;
+                let hi = (a.bin as i64 + hw).min(self.nfft as i64 - 1) as usize;
+                mask[lo..=hi].fill(false);
+            }
+
+            // Every available hot bin is a candidate peak; claim them strongest
+            // first.
+            let mut peaks: Vec<(usize, f32)> = Vec::new();
+            for k in hw as usize..self.nfft - hw as usize {
+                if mask[k] && hot[k] {
+                    peaks.push((k, mag[k] / self.floor[k]));
+                }
+            }
+            peaks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            for (peak_bin, _) in peaks {
+                if !mask[peak_bin] {
                     continue;
                 }
-                let start = k;
-                let mut cold = 0usize;
-                while k < self.nfft && cold <= 2 {
-                    if hot[k] {
-                        cold = 0;
-                    } else {
-                        cold += 1;
-                    }
-                    k += 1;
+                // Center the burst on the energy centroid of its contiguous hot
+                // run so a slightly off-center spectral peak still yields the
+                // true channel center for the DDC.
+                let mut lo = peak_bin;
+                while lo > 0 && mask[lo - 1] && hot[lo - 1] {
+                    lo -= 1;
                 }
-                k -= cold; // do not consume trailing cold bins
-                // Energy-weighted center bin.
+                let mut hi = peak_bin;
+                while hi + 1 < self.nfft && mask[hi + 1] && hot[hi + 1] {
+                    hi += 1;
+                }
                 let (mut num, mut den) = (0.0f64, 0.0f64);
-                for b in start..k {
+                for b in lo..=hi {
                     num += mag[b] as f64 * b as f64;
                     den += mag[b] as f64;
                 }
-                let center = if den > 0.0 { (num / den).round() as usize } else { start };
-                // Attach to an active burst within ±3 bins or start one.
-                let mut attached = false;
-                for a in &mut self.active {
-                    if (a.bin as i64 - center as i64).unsigned_abs() <= 12
-                        && a.last_frame + 2 >= self.next_frame
-                    {
-                        a.last_frame = self.next_frame;
-                        attached = true;
-                        break;
-                    }
-                }
-                if !attached {
-                    self.active.push(ActiveBurst {
-                        bin: center,
-                        start_frame: self.next_frame,
-                        last_frame: self.next_frame,
-                    });
+                let center = if den > 0.0 { (num / den).round() as usize } else { peak_bin };
+                self.active.push(ActiveBurst {
+                    bin: center,
+                    start_frame: self.next_frame,
+                    last_frame: self.next_frame,
+                });
+                let lo = (center as i64 - hw).max(0) as usize;
+                let hi = (center as i64 + hw).min(self.nfft as i64 - 1) as usize;
+                mask[lo..=hi].fill(false);
+            }
+
+            // Track the noise floor only on bins not covered by a burst, so a
+            // sustained burst never lifts its own bins' floor (gr-iridium
+            // freezes its whole baseline during a burst; per-bin is finer).
+            for (k, &m) in mag.iter().enumerate() {
+                if mask[k] {
+                    self.floor[k] += (m - self.floor[k]) / 512.0;
                 }
             }
 
-            // Finish bursts that have gone quiet (or run too long).
-            let post_frames = (POST_S * self.input_rate / frame_len as f64).ceil() as u64;
-            let max_frames = (MAX_BURST_S * self.input_rate / frame_len as f64).ceil() as u64;
+            // Finish bursts that have gone quiet (or run too long). The mask
+            // already prevents split duplicates, so no frequency dedup here.
             let cur = self.next_frame;
-            let mut finished: Vec<ActiveBurst> = Vec::new();
             self.active.retain_mut(|a| {
                 if cur >= a.last_frame + post_frames
                     || a.last_frame - a.start_frame > max_frames
                 {
                     // Iridium bursts are ≥7 ms; ignore single-frame blips.
                     if a.last_frame > a.start_frame + 1 {
-                        finished.push(ActiveBurst {
+                        to_extract.push(ActiveBurst {
                             bin: a.bin,
                             start_frame: a.start_frame,
                             last_frame: a.last_frame,
@@ -295,23 +334,6 @@ impl IridiumWideband {
                     true
                 }
             });
-            for b in finished {
-                // Suppress split duplicates of an already-extracted burst
-                // (time overlap and nearby frequency).
-                let dup = self.recent.iter().any(|&(s, e, bin)| {
-                    b.start_frame <= e + 2
-                        && s <= b.last_frame + 2
-                        && (bin as i64 - b.bin as i64).unsigned_abs() < self.dedup_bins as u64
-                });
-                if dup {
-                    continue;
-                }
-                self.recent.push((b.start_frame, b.last_frame, b.bin));
-                if self.recent.len() > 8 {
-                    self.recent.remove(0);
-                }
-                to_extract.push(b);
-            }
 
             self.next_frame += 1;
         }
@@ -321,8 +343,31 @@ impl IridiumWideband {
         // the output is identical to the previous inline single-threaded
         // extraction). Done before the buffer is drained below.
         let this = &*self;
-        let out: Vec<WidebandBurst> =
+        let mut out: Vec<WidebandBurst> =
             to_extract.par_iter().flat_map_iter(|b| this.extract(b)).collect();
+
+        // Drop duplicate decodes. A strong burst's spectral skirt can light
+        // bins past its ±half_width mask and be re-detected off center; the
+        // wide per-burst DDC then re-recovers the same burst from a nearby bin,
+        // so two detections at ~the same frequency yield identical bit streams.
+        // Key on the bits AND a coarse frequency bucket: a genuinely distinct
+        // channel (or a zero-order-hold image hundreds of kHz away) lands in a
+        // different bucket and is kept, while a same-frequency re-recovery is
+        // dropped.
+        out.retain(|b| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&b.bits, &mut h);
+            let bucket = (b.offset_hz / 60_000.0).round() as i64;
+            let key = std::hash::Hasher::finish(&h) ^ (bucket as u64).wrapping_mul(0x9e3779b97f4a7c15);
+            if self.recent_bits.contains(&key) {
+                return false;
+            }
+            self.recent_bits.push_back(key);
+            if self.recent_bits.len() > 256 {
+                self.recent_bits.pop_front();
+            }
+            true
+        });
 
         // Drop samples no longer needed: everything before the earliest
         // active burst (minus pre-roll) or the current frame.
