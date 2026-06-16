@@ -96,6 +96,9 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
             if r != plan_rate {
                 println!("using {} S/s (device does not offer the plan's {} S/s)", r as u64, plan_rate as u64);
             }
+            if let Some(hint) = scan::rate_choice_hint(mode, r, plan_rate) {
+                println!("note: {hint}");
+            }
             r
         }
     };

@@ -466,6 +466,9 @@ fn resolve_tune_auto(
                     plan_rate as u64
                 );
             }
+            if let Some(hint) = commands::scan::rate_choice_hint(mode, r, plan_rate) {
+                tracing::info!("auto-tune: {hint}");
+            }
             r
         }
     };

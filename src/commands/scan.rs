@@ -152,6 +152,22 @@ fn candidates_from_ranges(ranges: &[(f64, f64, f64)], mode: Mode) -> Vec<u32> {
     out
 }
 
+/// Mode S decodes from the raw capture by pulse position, so an **even
+/// integer** number of samples per µs (2, 4, 6, 10 MS/s …) takes the fast,
+/// higher-recall integer demod path; odd or fractional rates (2.5, 3 MS/s)
+/// fall to a slower fractional path. Other modes channelize through a DDC and
+/// only care that the rate is an integer multiple of their channel rate, so
+/// this preference applies to Mode S alone.
+pub(crate) fn prefers_even_integer_rate(mode: Mode) -> bool {
+    matches!(mode, Mode::Adsb)
+}
+
+/// True when `rate` gives an even integer number of samples per µs.
+fn is_even_integer_rate(rate: f64) -> bool {
+    let spu = rate / 1e6;
+    (spu - spu.round()).abs() < 1e-9 && (spu.round() as i64) % 2 == 0
+}
+
 /// Choose a capture rate from a discrete advertised set (see [`choose_rate`]).
 pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> f64 {
     if advertised.is_empty() {
@@ -161,9 +177,23 @@ pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> 
     let divides = |r: f64| (r / ch).fract().abs() < 1e-9;
     let mut rates: Vec<f64> = advertised.iter().map(|&r| r as f64).collect();
     rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    // The plan rate is authoritative when the device offers it exactly.
+    // The plan rate is authoritative when the device offers it exactly (the
+    // mode plans are even-integer rates, so this already takes the fast path).
     if rates.iter().any(|&r| (r - plan_rate).abs() < 1e-9) {
         return plan_rate;
+    }
+    // Mode S: prefer the smallest even-integer-samples/µs rate at or above the
+    // plan (the fast integer demod path) over a merely-smaller fractional one.
+    // On an Airspy this picks 10 MS/s (R2) / 6 MS/s (Mini) instead of the
+    // 2.5/3 MS/s fractional rate — the whole point of an Airspy for ADS-B.
+    // Pass an explicit -r to override (e.g. -r 2500000 for lighter CPU).
+    if prefers_even_integer_rate(mode) {
+        if let Some(&r) = rates
+            .iter()
+            .find(|&&r| r >= plan_rate - 1e-9 && divides(r) && is_even_integer_rate(r))
+        {
+            return r;
+        }
     }
     // Smallest supported, clean-multiple rate at or above the plan rate —
     // never narrower than the mode was designed for.
@@ -174,6 +204,23 @@ pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> 
     // (best effort), else the plan rate so the device surfaces a clear error
     // rather than silently mis-tuning.
     rates.iter().rev().copied().find(|&r| divides(r)).unwrap_or(plan_rate)
+}
+
+/// A one-line hint to show after auto-selecting a rate, when the user might
+/// reasonably prefer a different one. Currently: Mode S on a device whose
+/// fast integer-path rate sits well above the plan (an Airspy), where a
+/// lighter fractional capture is a sensible alternative via an explicit `-r`.
+pub(crate) fn rate_choice_hint(mode: Mode, chosen: f64, plan_rate: f64) -> Option<String> {
+    if prefers_even_integer_rate(mode) && chosen > plan_rate * 1.5 {
+        Some(format!(
+            "ADS-B at {:.1} MS/s uses the high-resolution integer demod path; \
+             pass an explicit -r for a lighter capture (more CPU headroom, \
+             slightly lower recall)",
+            chosen / 1e6
+        ))
+    } else {
+        None
+    }
 }
 
 /// Cluster channels into capture-width groups.
@@ -568,6 +615,40 @@ mod tests {
         let caps = RateCaps::Discrete(vec![250_000, 1_000_000, 2_000_000, 2_400_000]);
         assert_eq!(choose_rate(&caps, Mode::Adsb, 2_000_000.0), 2_000_000.0);
         assert_eq!(choose_rate(&caps, Mode::AcarsPoa, 2_400_000.0), 2_400_000.0);
+    }
+
+    #[test]
+    fn adsb_prefers_integer_path_rate_on_airspy() {
+        // Airspy R2 (10 / 2.5 MS/s): 2.5 gives fractional samples/µs, 10 is
+        // even-integer → ADS-B takes 10 for the fast integer demod path.
+        let r2 = RateCaps::Discrete(vec![10_000_000, 2_500_000]);
+        assert_eq!(choose_rate(&r2, Mode::Adsb, 2_000_000.0), 10_000_000.0);
+        // Airspy Mini (6 / 3 MS/s): 3 is odd (fractional), 6 is even → 6.
+        let mini = RateCaps::Discrete(vec![6_000_000, 3_000_000]);
+        assert_eq!(choose_rate(&mini, Mode::Adsb, 2_000_000.0), 6_000_000.0);
+        // RTL-SDR keeps 2.0 MS/s: even-integer and already the plan rate.
+        let rtl = RateCaps::Ranges(vec![
+            (225_001.0, 300_000.0, 0.0),
+            (900_001.0, 3_200_000.0, 0.0),
+        ]);
+        assert_eq!(choose_rate(&rtl, Mode::Adsb, 2_000_000.0), 2_000_000.0);
+    }
+
+    #[test]
+    fn integer_path_preference_is_adsb_only() {
+        // Iridium on an Airspy R2 still takes the smallest clean 250 kHz
+        // multiple (2.5 MS/s) — the even-integer preference is Mode S only.
+        let r2 = RateCaps::Discrete(vec![10_000_000, 2_500_000]);
+        assert_eq!(choose_rate(&r2, Mode::Iridium, 2_400_000.0), 2_500_000.0);
+    }
+
+    #[test]
+    fn rate_hint_only_for_elevated_adsb() {
+        assert!(rate_choice_hint(Mode::Adsb, 10_000_000.0, 2_000_000.0).is_some());
+        // Not elevated above the plan → no hint.
+        assert!(rate_choice_hint(Mode::Adsb, 2_000_000.0, 2_000_000.0).is_none());
+        // Not Mode S → no hint.
+        assert!(rate_choice_hint(Mode::AcarsPoa, 6_000_000.0, 2_400_000.0).is_none());
     }
 
     #[test]
