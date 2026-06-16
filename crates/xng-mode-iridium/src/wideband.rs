@@ -49,12 +49,16 @@ const MAX_BURST_S: f64 = 0.092;
 const POST_S: f64 = 0.024;
 /// Pre-burst samples to include (preamble ramp).
 const PRE_S: f64 = 0.004;
-/// One-sided channel passband for the per-burst DDC, matched to gr-iridium's
-/// burst input_fir (low_pass_2 cutoff burst_width/2 ≈ 21 kHz). A tighter filter
-/// raises per-burst SNR — with multi-frame decode this measurably lifts IDA
-/// yield (60s: 557→579) — and the peak-bin detector centers accurately enough
-/// that the narrower band does not clip bursts. Tunable via XNG_IRIDIUM_PASSBAND_HZ.
-const WIDEBAND_PASSBAND_HZ: f64 = 24_000.0;
+/// One-sided channel passband for the per-burst DDC. gr-iridium's input_fir is
+/// a *gentle* low_pass_2 (cutoff burst_width/2 ≈ 20 kHz but a 40 kHz transition,
+/// so it still passes energy out past 28 kHz); xng's DDC is a sharp Blackman-
+/// Harris FIR, so the cutoff that best matches gr's *effective* channel sits
+/// wider than gr's nominal 20 kHz. With the 24 ms post-roll + multi-frame decode
+/// capturing more of each burst, the optimum moved out to 28 kHz: re-sweeping at
+/// the current config, 24→28 kHz lifts 300s CRC-OK IDA 489→495 (60s 286→293),
+/// the wider channel passing more weak-burst energy. Tunable via
+/// XNG_IRIDIUM_PASSBAND_HZ.
+const WIDEBAND_PASSBAND_HZ: f64 = 28_000.0;
 
 /// Centered ("same") matched-filter convolution: output aligned to input (no
 /// net group delay, symmetric taps), zero-padded at the edges.
