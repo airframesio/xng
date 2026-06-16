@@ -1,8 +1,11 @@
 # HFDL (ICAO Annex 10 Vol III Ch. 11 / ARINC 635) — implementation notes
 
 Facts from ICAO Annex 10 Vol III Part I Ch. 11 (free PDF, ffac.ch) plus
-dumphfdl source read for facts only (GPL — re-derive all code). Recorded
-2026-06 for xng-mode-hfdl.
+dumphfdl source read for facts only (GPL, so all code is re-derived).
+
+On the sigidwiki 21931 kHz capture xng decodes 36 events vs dumphfdl's 37
+(97%); CI bench floor is 31. The residual gap is the weakest bursts (4-5
+dB SNR at 300 bps), a sensitivity tail, not a convention bug.
 
 ## PHY
 
@@ -71,7 +74,7 @@ Lfsr15 matches the VDL2 derivation.)
 - Convolutional K=7 rate 1/2, classic 171/133 octal (Karn's 0x6d/0x4f
   are bit-reversed forms). Encoder zero-start, zero-flush (tail inside
   the fixed payload size); decoder traceback to state 0.
-  **Pair order confirmed off-air (2026-06): 133-output first** in each
+  **Pair order confirmed off-air: 133-output first** in each
   coded pair (libcorrect convention), same as Aero. Verified against the
   sigidwiki 21931 kHz capture — with 171-first no FCS validates; with
   133-first the SPDU matches dumphfdl field-for-field.
@@ -128,8 +131,9 @@ slot). Version 12-bit wrapping (newer if (new−old) mod 4096 < 2048).
 
 DDC (channel+1440 Hz) → ~2.8 kHz filter → matched filter → symbol
 timing → carrier (Costas; A1/A2 correlation phase for acquisition) →
-(LMS equalizer trained on T segments — v1 may substitute per-T phase
-re-estimation) → A1/A2 hunt (π-sign bitmask) → M1 shift → 9 T → per
+LMS equalizer (T/2-spaced, 15 taps, trained on the 9 preamble T segments
+and retrained on every embedded T segment) + decision-directed 2nd-order
+carrier loop → A1/A2 hunt (π-sign bitmask) → M1 shift → 9 T → per
 data segment: 30 data symbols (descramble π flips, Gray soft demod
 MSB-first) + T retrain → deinterleave → (rate-1/4: average pairs) →
 Viterbi → bit-reverse bytes → SPDU/MPDU → LPDU FCS → HFNPDU → ACARS.
@@ -142,14 +146,9 @@ Viterbi → bit-reverse bytes → SPDU/MPDU → LPDU FCS → HFNPDU → ACARS.
 - Synthetic TX→RX loopback is fully determined by the above.
 - Live: any HF antenna; 16 ground stations worldwide (systable.conf).
 
-## Channel-rate study (2026-06)
+## Channel rate
 
-Same experiment as VDL2 (the sigidwiki 21931 kHz capture via the offair
-harness): baseline 33 events at 12 kS/s (6.67 sps). Raising the channel
-rate to 24 kS/s — with the A1-fit grid symbol-denominated first (it was
-±4 samples; same latent scaling bug as VDL2's) — DROPPED decodes to 26.
-Conclusion: HFDL's marginal frames are fading/SNR-bound, not
-timing-resolution-bound; the LMS equalizer + DD carrier loop already
-own that domain at 6.67 sps. CHANNEL_RATE stays 12 kS/s; the grid fix
-is kept as hardening (floored at the old width — the 12 kS/s path is
-verified unchanged at 33).
+CHANNEL_RATE is 12 kS/s (6.67 samples/symbol). Raising it to 24 kS/s
+tested worse (decodes dropped), because HFDL's marginal frames are
+fading/SNR-bound, not timing-resolution-bound; the LMS equalizer + DD
+carrier loop already own that domain.

@@ -377,7 +377,7 @@ For **Iridium** the map adds toggleable overlays (cf. the
 iridium-toolkit live map): satellite positions with ground tracks and
 resolved names, targeted spot-beam footprints, the reconstructed
 **48-beam pattern** drawn under each satellite over its full intended
-~4700 km coverage footprint (click a satellite to pin its pattern), and
+~4500 km coverage footprint (click a satellite to pin its pattern), and
 self-reported mobile-terminal positions — each its own layer, visibility
 persisted.
 
@@ -472,11 +472,9 @@ ACARS from any carrier flows through one application layer
 Each core also ships `examples/` harnesses (`offair`, `dumpbits`, …) used
 for the validation campaigns — point them at your own captures.
 
-Architecture, research notes (including the finding-by-finding demod
-campaign notebooks), and benchmark methodology live in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
-[`docs/notes/`](docs/notes/), and [`bench/`](bench/). The pre-rewrite
-xng (a dumphfdl session wrapper) is preserved in git history.
+Architecture, per-mode implementation notes, and benchmark methodology
+live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+[`docs/notes/`](docs/notes/), and [`bench/`](bench/).
 
 ## License
 

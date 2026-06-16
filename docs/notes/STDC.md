@@ -1,9 +1,9 @@
-# Inmarsat STD-C / EGC — implementation notes (for M6 part 3)
+# Inmarsat STD-C / EGC
 
-Facts cross-verified across inmarsatc (cropinghigh, GPL — facts only),
-SatDump (GPL — facts only), and Scytale-C documentation; scrambler table
-and UW numerically re-verified during research (2026-06). Re-derive all
-code; do not port from these GPL sources.
+Facts cross-verified across inmarsatc (GPL, facts only), SatDump (GPL,
+facts only), and Scytale-C documentation; scrambler table and UW
+numerically verified. All code re-derived (not ported from these GPL
+sources).
 
 ## PHY
 
@@ -80,11 +80,14 @@ continuation=0; ~30 s timeout fallback.
 
 ## Test material
 
-- sigidwiki "Inmarsat-C TDM" page hosts `Inmarsat-C_TDM_EGC_IQ.zip` —
-  the de facto public IQ test vector.
-- SatDump writes `.frm` (640-byte descrambled frames) + JSON — run it on
+xng's STD-C is oracle-validated field-exact (no count-style benchmark).
+
+- sigidwiki "Inmarsat-C TDM" page hosts `Inmarsat-C_TDM_EGC_IQ.zip`, the
+  public IQ test vector; validated field-exact against SatDump-derived
+  goldens.
+- SatDump writes `.frm` (640-byte descrambled frames) + JSON: run it on
   the sigidwiki capture for stage-by-stage goldens.
-- Full TX chain is specified above → synthetic roundtrip vectors are
+- Full TX chain is specified above, so synthetic roundtrip vectors are
   straightforward (scramble 639+1 bytes → conv encode → 64×160
   column-write/row-read → inverse row permutation → doubled UW per row).
 
