@@ -15,14 +15,35 @@ const FREQ_TOL_HZ: f64 = 2000.0;
 const FRAG_GAP_S: f64 = 0.28;
 /// In-flight buffer lifetime before it is abandoned (toolkit 1000 ms).
 const EXPIRE_S: f64 = 1.0;
+/// Lifetime of a partially-assembled multi-packet SBD message (toolkit 5 s).
+const SBD_MULTI_EXPIRE_S: f64 = 5.0;
 
-/// One in-flight multi-fragment message.
+/// One in-flight multi-fragment message (Layer A: DA bursts → one IDA packet).
 struct Pending {
     freq: f64,
     ul: bool,
     /// Counter the next fragment must carry ((last + 1) mod 8).
     next_ctr: u8,
     data: Vec<u8>,
+    last_time: f64,
+}
+
+/// One partially-assembled multi-packet SBD message (Layer B: several IDA
+/// packets → one SBD message, keyed by the SBD `msgno`/`msgcnt` fields, per
+/// iridium-toolkit `ReassembleIDASBD`). A long ACARS/SBD payload is split
+/// across `msgcnt` IDA packets numbered `1..=msgcnt`; their bodies concatenate
+/// into the full message.
+struct MultiSbd {
+    /// Highest packet sequence number attached so far.
+    msgno: u8,
+    /// Total packets expected (from the first packet's transport header).
+    msgcnt: u8,
+    /// First packet's SBD type and decoded transport header (carried through).
+    typ: u16,
+    hdr: serde_json::Map<String, serde_json::Value>,
+    ul: bool,
+    /// Concatenated per-packet bodies so far.
+    body: Vec<u8>,
     last_time: f64,
 }
 
@@ -36,6 +57,7 @@ struct Pending {
 /// different channels and almost never completed).
 pub struct SbdReassembler {
     buf: Vec<Pending>,
+    multi: Vec<MultiSbd>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -48,7 +70,7 @@ pub struct SbdMessage {
 
 impl SbdReassembler {
     pub fn new() -> Self {
-        Self { buf: Vec::new() }
+        Self { buf: Vec::new(), multi: Vec::new() }
     }
 
     /// Feed one CRC-valid DA frame observed at `time` seconds on the burst
@@ -77,13 +99,16 @@ impl SbdReassembler {
                 return None;
             }
             let p = self.buf.remove(i);
-            return Self::parse_l2(&p.data, p.ul);
+            return self.parse_l2(&p.data, p.ul, time);
         }
 
         // No continuation: a fresh single packet, a new long packet, or an
         // orphan continuation (dropped).
         match (f.ctr, f.continuation) {
-            (0, false) => Self::parse_l2(bytes, ul),
+            (0, false) => {
+                let bytes = bytes.to_vec();
+                self.parse_l2(&bytes, ul, time)
+            }
             (0, true) => {
                 self.buf.push(Pending {
                     freq,
@@ -98,39 +123,90 @@ impl SbdReassembler {
         }
     }
 
-    /// Parse an assembled L2 stream. Three parallel decoders run on the
-    /// reassembled IDA packet: a mobile-terminal position (paging frames),
-    /// GSM CC/MM/SMS signalling, and the SBD transport → ACARS path.
-    fn parse_l2(data: &[u8], ul: bool) -> Option<SbdMessage> {
+    /// Parse an assembled L2 (IDA) packet. The per-packet decoders run first
+    /// (mobile-terminal position from paging frames, GSM CC/MM/SMS signalling);
+    /// then the SBD transport path adds Layer-B reassembly — stitching multiple
+    /// IDA packets into one SBD message by the `msgno`/`msgcnt` fields (toolkit
+    /// `ReassembleIDASBD`) before the body is parsed as ACARS. `time` drives the
+    /// 5 s expiry of partial multi-packet messages.
+    fn parse_l2(&mut self, data: &[u8], ul: bool, time: f64) -> Option<SbdMessage> {
         if data.len() < 5 {
             return None;
         }
-        // Mobile-terminal position embedded in paging/uplink frames.
+        // Mobile-terminal position embedded in paging/uplink frames (per-packet).
         if let Some(pos) = crate::mtpos::extract(data, ul) {
             return Some(SbdMessage { kind: "mt-position", details: pos, acars: None });
         }
-        // GSM call-control / mobility / SMS signalling.
+        // GSM call-control / mobility / SMS signalling (per-packet).
         if let Some(mut g) = crate::gsm::decode(data) {
             // Carry the raw L2 bytes + direction for GSMTAP/Wireshark export.
             g["raw_l2_hex"] = json!(data.iter().map(|b| format!("{b:02x}")).collect::<String>());
             g["ul"] = json!(ul);
             return Some(SbdMessage { kind: "gsm", details: g, acars: None });
         }
-        // SBD packet types (toolkit ReassembleIDASBD).
+        // SBD transport: split off the type, transport header, sequence info and
+        // body, then reassemble across packets.
+        let (typ, hdr, msgno, msgcnt, body) = Self::sbd_parts(data, ul)?;
+
+        self.multi.retain(|m| time - m.last_time < SBD_MULTI_EXPIRE_S);
+
+        // msgno 0 = mailbox-check / header-less single packet; msgcnt<=1 with
+        // msgno 1 = a single-packet message: parse immediately.
+        if msgno == 0 || (msgcnt <= 1 && msgno == 1) {
+            return Self::parse_acars(typ, &body, hdr);
+        }
+        // First packet of a multi-packet message: buffer it.
+        if msgcnt > 1 && msgno == 1 {
+            self.multi.push(MultiSbd { msgno, msgcnt: msgcnt as u8, typ, hdr, ul, body, last_time: time });
+            return None;
+        }
+        // Continuation: attach to the matching in-flight message (next in
+        // sequence, same direction). Complete when msgno reaches msgcnt.
+        if msgno > 1 {
+            if let Some(i) = self
+                .multi
+                .iter()
+                .position(|m| m.ul == ul && msgno == m.msgno + 1 && msgno <= m.msgcnt)
+            {
+                self.multi[i].body.extend_from_slice(&body);
+                self.multi[i].msgno = msgno;
+                self.multi[i].last_time = time;
+                if msgno == self.multi[i].msgcnt {
+                    let m = self.multi.remove(i);
+                    return Self::parse_acars(m.typ, &m.body, m.hdr);
+                }
+                return None; // still assembling
+            }
+            return None; // orphan continuation (its head was missed)
+        }
+        // msgno 1 with an unknown count: treat as a single packet.
+        Self::parse_acars(typ, &body, hdr)
+    }
+
+    /// Strip the SBD transport framing from one IDA packet: the type, the
+    /// decoded pre-header (exposed as JSON), and the `0x10` length/sequence
+    /// header. Returns `(typ, header_json, msgno, msgcnt, body)`, where `msgno`
+    /// is this packet's sequence number (0 = no header), `msgcnt` is the total
+    /// packet count (`-1` = unknown), and `body` is the payload to reassemble.
+    /// Mirrors toolkit `ReassembleIDASBD.process_l2`.
+    fn sbd_parts(
+        data: &[u8],
+        ul: bool,
+    ) -> Option<(u16, serde_json::Map<String, serde_json::Value>, u8, i16, Vec<u8>)> {
         let (typ, mut rest): (u16, &[u8]) = match (data[0], data[1]) {
             (0x76, t) if t != 5 => (u16::from_be_bytes([data[0], data[1]]), &data[2..]),
             (0x06, 0x00) => (0x0600, &data[2..]),
             _ => return None,
         };
-        // Decode and expose the SBD transport pre-header rather than just
-        // stripping it (toolkit ReassembleIDASBD / ReassembleIDAPP).
         let mut hdr = serde_json::Map::new();
+        let mut msgno: u8 = 0;
+        let mut msgcnt: i16 = -1;
         match typ {
             // Mobile-originated registration ("HELLO"): a 29-byte pre-header.
-            // Only the 0x20 sub-type lays out an IMEI + MO sequence number
-            // there; 0x10/0x40/0x50/0x70 reuse those bytes for other fields
-            // (toolkit reassembler.py). The message count (byte 15) and the
-            // registration timestamp (bytes 25..29) are common to all.
+            // Only the 0x20 sub-type lays out an IMEI + MO sequence number;
+            // 0x10/0x40/0x50/0x70 reuse those bytes. The message count (byte
+            // 15) and registration timestamp (bytes 25..29) are common. 0600
+            // has no 0x10 header: msgno is 1 (or 0 when the count is 0).
             0x0600 => {
                 if rest.len() < 29 {
                     return None;
@@ -147,41 +223,42 @@ impl SbdReassembler {
                 if it != 0 {
                     hdr.insert("time_unix".into(), json!(crate::ira::iri_time_unix(it)));
                 }
-                rest = &rest[29..];
+                msgcnt = h[15] as i16;
+                msgno = if h[15] == 0 { 0 } else { 1 };
+                return Some((typ, hdr, msgno, msgcnt, rest[29..].to_vec()));
             }
-            // SBD transfer: a recognised 0x26 (7-byte) or 0x20 (5-byte)
-            // pre-header (toolkit DL 7608/7609/760a). The 0x26 form carries
-            // the mobile-terminated sequence number, this transfer's packet
-            // count and the queued backlog. An unrecognised first byte (e.g.
-            // a UL 760c/d/e 0x50 echo-back) is left for the generic strips
-            // below — never blindly skip a fixed count, which would corrupt a
-            // header-less body.
-            t if t >> 8 == 0x76 => match rest.first() {
+            // SBD transfer: a 0x26 (7-byte) or 0x20 (5-byte) pre-header carries
+            // the packet count at byte 3 (toolkit `msgcnt=prehdr[3]`); 0x26 also
+            // carries the MT sequence number and queued backlog.
+            t if t >> 8 == 0x76 && (t & 0xff) == 0x08 => match rest.first() {
                 Some(0x26) if rest.len() >= 7 => {
                     hdr.insert("mtmsn".into(), json!(u16::from_be_bytes([rest[1], rest[2]])));
                     hdr.insert("packets".into(), json!(rest[3]));
                     hdr.insert("backlog".into(), json!(rest[4]));
+                    msgcnt = rest[3] as i16;
                     rest = &rest[7..];
                 }
                 Some(0x20) if rest.len() >= 5 => {
+                    msgcnt = rest[3] as i16;
                     rest = &rest[5..];
                 }
                 _ => {}
             },
             _ => {}
         }
-        // Optional ack/nack prefix on uplinks and the 0x10 len/cnt header.
-        if rest.len() >= 3 && (rest[0] == 0x50 || rest[0] == 0x51) {
+        // Optional ack/nack prefix on uplinks, then the 0x10 len/seq header.
+        if ul && rest.len() >= 3 && (rest[0] == 0x50 || rest[0] == 0x51) {
             rest = &rest[3..];
         }
         if rest.len() > 3 && rest[0] == 0x10 {
             let len = rest[1] as usize;
+            msgno = rest[2]; // this packet's sequence number
             rest = &rest[3..];
             if rest.len() > len {
                 rest = &rest[..len];
             }
         }
-        Self::parse_acars(typ, rest, hdr)
+        Some((typ, hdr, msgno, msgcnt, rest.to_vec()))
     }
 
     /// ACARS-over-SBD: payload begins with SOH (0x01); an optional
@@ -275,15 +352,15 @@ mod tests {
         h[5..13].copy_from_slice(&[0x33, 0x00, 0x32, 0x04, 0x23, 0x91, 0x27, 0x01]);
         h[13] = 0x01; // MOMSN 300 = 0x012c
         h[14] = 0x2c;
-        h[15] = 5; // message count
+        h[15] = 1; // message count (single packet)
         data.extend_from_slice(&h);
         data.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // non-ACARS payload
-        let m = SbdReassembler::parse_l2(&data, true).expect("sbd message");
+        let m = SbdReassembler::new().parse_l2(&data, true, 0.0).expect("sbd message");
         assert_eq!(m.kind, "sbd");
         assert_eq!(m.details["type"], json!("0600"));
         assert_eq!(m.details["imei"], json!("300234032197210"));
         assert_eq!(m.details["momsn"], json!(300));
-        assert_eq!(m.details["msg_count"], json!(5));
+        assert_eq!(m.details["msg_count"], json!(1));
         assert_eq!(m.details["payload_hex"], json!("deadbeef"));
         // Time field absent when the timestamp is zero.
         assert!(m.details.get("time_unix").is_none());
@@ -300,14 +377,14 @@ mod tests {
         h[5..13].copy_from_slice(&[0x33, 0x00, 0x32, 0x04, 0x23, 0x91, 0x27, 0x01]);
         h[13] = 0x01;
         h[14] = 0x2c;
-        h[15] = 9;
+        h[15] = 1;
         data.extend_from_slice(&h);
         data.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
-        let m = SbdReassembler::parse_l2(&data, false).expect("sbd message");
+        let m = SbdReassembler::new().parse_l2(&data, false, 0.0).expect("sbd message");
         assert_eq!(m.details["type"], json!("0600"));
         assert!(m.details.get("imei").is_none(), "imei must be 0x20-only");
         assert!(m.details.get("momsn").is_none(), "momsn must be 0x20-only");
-        assert_eq!(m.details["msg_count"], json!(9));
+        assert_eq!(m.details["msg_count"], json!(1));
     }
 
     #[test]
@@ -316,7 +393,7 @@ mod tests {
         // payload_text (these are common — device status, not ACARS).
         let mut data = vec![0x76, 0x08, 0x26, 0, 0, 0, 0, 0, 0];
         data.extend_from_slice(b"ST_TXT:ID:01");
-        let m = SbdReassembler::parse_l2(&data, false).expect("sbd message");
+        let m = SbdReassembler::new().parse_l2(&data, false, 0.0).expect("sbd message");
         assert_eq!(m.details["type"], json!("7608"));
         assert_eq!(m.details["payload_text"], json!("ST_TXT:ID:01"));
         assert!(m.acars.is_none(), "not ACARS (no 0x01 SOH)");
@@ -332,12 +409,47 @@ mod tests {
             0x00, 0x00, // remainder of the 7-byte pre-header
             0xca, 0xfe, // payload
         ];
-        let m = SbdReassembler::parse_l2(&data, false).expect("sbd message");
+        let m = SbdReassembler::new().parse_l2(&data, false, 0.0).expect("sbd message");
         assert_eq!(m.details["type"], json!("7608"));
         assert_eq!(m.details["mtmsn"], json!(7));
         assert_eq!(m.details["packets"], json!(1));
         assert_eq!(m.details["backlog"], json!(2));
         assert_eq!(m.details["payload_hex"], json!("cafe"));
+    }
+
+    #[test]
+    fn sbd_multi_packet_reassembles() {
+        // A 2-packet SBD message (Layer B): the first packet (7608, packets=2,
+        // 0x10 seq=1) buffers; the continuation (760a, 0x10 seq=2) completes it,
+        // concatenating the two bodies into one message.
+        let mut r = SbdReassembler::new();
+        // Packet 1: 7608 + 0x26 pre-header (packets=2) + 0x10(len2,seq1) + de:ad
+        let p1 = [
+            0x76, 0x08, 0x26, 0x00, 0x05, 0x02, 0x00, 0x00, 0x00, // pre-header, packets=2
+            0x10, 0x02, 0x01, // 0x10 header: len 2, seq 1
+            0xde, 0xad,
+        ];
+        assert!(r.parse_l2(&p1, false, 0.0).is_none(), "first packet must buffer");
+        // Packet 2: 760a (continuation) + 0x10(len2,seq2) + be:ef
+        let p2 = [0x76, 0x0a, 0x10, 0x02, 0x02, 0xbe, 0xef];
+        let m = r.parse_l2(&p2, false, 0.1).expect("multi-packet message completes");
+        assert_eq!(m.details["type"], json!("7608"), "carries first packet's type");
+        assert_eq!(m.details["payload_hex"], json!("deadbeef"), "bodies concatenated");
+        // A stray continuation with no buffered head is dropped, not emitted.
+        assert!(r.parse_l2(&p2, false, 0.2).is_none(), "orphan continuation dropped");
+    }
+
+    #[test]
+    fn sbd_multi_packet_expires() {
+        // If the continuation arrives after the 5 s window, the partial is
+        // expired and the late packet is treated as an orphan (dropped).
+        let mut r = SbdReassembler::new();
+        let p1 = [
+            0x76, 0x08, 0x26, 0x00, 0x05, 0x02, 0x00, 0x00, 0x00, 0x10, 0x02, 0x01, 0xde, 0xad,
+        ];
+        assert!(r.parse_l2(&p1, false, 0.0).is_none());
+        let p2 = [0x76, 0x0a, 0x10, 0x02, 0x02, 0xbe, 0xef];
+        assert!(r.parse_l2(&p2, false, 6.0).is_none(), "late continuation expired");
     }
 }
 
