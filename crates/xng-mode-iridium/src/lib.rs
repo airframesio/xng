@@ -271,8 +271,17 @@ impl IridiumWidebandDecoder {
         let time = self.samples_seen as f64 / self.input_rate;
         let mut out = Vec::new();
         for burst in self.wb.process(input) {
+            // Prefer the matched-filter alternate whenever it yields a valid
+            // frame — that's where the weak-burst IDA yield comes from. Fall
+            // back to the unfiltered primary when the alternate is invalid
+            // (a clean strong burst the matched filter would corrupt, or no
+            // alternate). Exactly one SBD-reassembler feed per burst.
+            let bits = match &burst.alt_bits {
+                Some(alt) if bits_valid(alt) => alt.as_slice(),
+                _ => burst.bits.as_slice(),
+            };
             let mut frames = Vec::new();
-            handle_bits(&burst.bits, time, burst.offset_hz, &mut self.sbd, &mut self.pager, &mut frames);
+            handle_bits(bits, time, burst.offset_hz, &mut self.sbd, &mut self.pager, &mut frames);
             out.extend(frames.into_iter().map(|f| (burst.offset_hz, f)));
         }
         out
@@ -281,6 +290,15 @@ impl IridiumWidebandDecoder {
     pub fn level_dbfs(&self) -> f32 {
         10.0 * self.level.max(1e-12).log10()
     }
+}
+
+/// Does this burst's bits yield a valid frame — a recognized simplex frame, an
+/// LCW traffic frame, or a CRC-OK IDA? Used to choose between the unfiltered
+/// bits and the matched-filter alternate without feeding the SBD reassembler.
+fn bits_valid(bits: &[u8]) -> bool {
+    decode_bits(bits).is_some()
+        || lcw_traffic_frame(bits).is_some()
+        || decode_da_bits(bits).map_or(false, |(da, _)| da.crc_ok)
 }
 
 /// Decode an LCW-bearing burst's DA frame, if it is one (ft == 2).

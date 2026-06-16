@@ -69,7 +69,12 @@ pub fn modulate(
         i_imp[at] = Complex::from_polar(1.0, q as f32 * std::f32::consts::FRAC_PI_2);
     }
     let mut shaped = Vec::new();
-    let mut fir = xng_dsp::Fir::new(rrc_taps(sps, 81, 0.4));
+    // RRC spanning ~8 symbols regardless of sps. A fixed 81-tap filter is ~8
+    // symbols at the 250 kHz channel rate (sps 10) but barely one symbol at a
+    // 2 MHz capture (sps 80), which truncates the pulse and adds center ISI;
+    // scaling the length keeps the modulated reference clean at any rate.
+    let ntaps = ((8.0 * sps) as usize) | 1;
+    let mut fir = xng_dsp::Fir::new(rrc_taps(sps, ntaps, 0.4));
     fir.process(&i_imp, &mut shaped);
     shaped
         .iter()

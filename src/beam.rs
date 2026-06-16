@@ -59,15 +59,21 @@ const MIN_OBS: u32 = 2;
 /// MathWorks Satellite Communications Toolbox Iridium model, FCC filings).
 const TIER_COUNT: [usize; 4] = [3, 9, 15, 21];
 /// Each tier's ground radius from nadir (km), from the off-nadir boresight
-/// angles (~11° / 24° / 42° / 57°) projected from 780 km onto the Earth
-/// sphere. Calibrated so the outer tier matches the observed ~1480 km extent
-/// (the MathWorks example's 45°/834 km undershoots real coverage, which runs
-/// to ~8° elevation ≈ 57° off-nadir).
-const TIER_RADIUS_KM: [f64; 4] = [152.0, 351.0, 744.0, 1475.0];
+/// angles (~11° / 24° / 42° / 59°) projected from 780 km onto the Earth
+/// sphere. The three inner tiers match the ~1480 km extent the station
+/// actually decodes; the outer tier is stretched to the documented
+/// full-coverage footprint (~2250 km radius / ~4500 km diameter per the
+/// MathWorks toolbox model, FCC filings, and published Iridium coverage),
+/// not the decoded extent. The station only demodulates the stronger
+/// mid-footprint beams, so the faint limb beams (~59-62° off-nadir, near
+/// the 62.97° horizon limb) illuminate the ground but rarely decode here —
+/// they belong on the map as modelled coverage even when unheard. The outer
+/// band is wide because oblique projection radially elongates limb beams.
+const TIER_RADIUS_KM: [f64; 4] = [152.0, 351.0, 744.0, 1680.0];
 /// Radial band boundaries between tiers (km), midway between tier radii, with
-/// an outer edge symmetric to the inner gap. Used to size each beam's radial
-/// extent so adjacent tiers tile.
-const TIER_BOUND_KM: [f64; 5] = [0.0, 251.0, 547.0, 1109.0, 1841.0];
+/// the outer edge at the documented ~2250 km footprint extent. Used to size
+/// each beam's radial extent so adjacent tiers tile.
+const TIER_BOUND_KM: [f64; 5] = [0.0, 251.0, 547.0, 1109.0, 2250.0];
 /// Each beam is sized ~√2 larger than its half-cell so the ellipse covers the
 /// whole cell including the corners where cells meet (an inscribed ellipse
 /// would leave corner gaps). Real Iridium beams overlap this much — usable
@@ -78,6 +84,22 @@ const BEAM_OVERLAP_F: f64 = 1.5;
 /// satellite was seen on it within this many seconds; older beams stay in
 /// the pattern but render muted.
 const ACTIVE_WINDOW_S: f64 = 30.0;
+/// Maximum RMS scatter (km) of a beam's footprint observations about their
+/// satellite-frame mean before the average is judged polluted and the beam is
+/// drawn as not-yet-decoded (gap-fill) rather than at a wrong measured position.
+/// A real beam's observations cluster within roughly a cell radius; an outlier
+/// (direction-fold pollution) scatters far wider.
+const MAX_SPREAD_KM: f64 = 600.0;
+/// Which concentric tier a measured offset at this nadir radius (km) belongs to,
+/// for sizing its drawn footprint. Saturates at the outer tier.
+fn tier_for_radius(r: f64) -> usize {
+    for t in 0..TIER_COUNT.len() {
+        if r < TIER_BOUND_KM[t + 1] {
+            return t;
+        }
+    }
+    TIER_COUNT.len() - 1
+}
 
 /// How an IRA altitude reading is interpreted.
 pub enum AltClass {
@@ -126,6 +148,26 @@ fn rot_x(x: f64, y: f64, z: f64, a: f64) -> [f64; 3] {
 
 fn lat_lon(p: [f64; 3]) -> (f64, f64) {
     (p[2].atan2((p[0] * p[0] + p[1] * p[1]).sqrt()), p[1].atan2(p[0]))
+}
+
+/// Shift a longitude (degrees) into the same ±180° window as a reference
+/// longitude. A footprint that crosses the ±180° antimeridian otherwise has
+/// some vertices at +179° and some at -179°; Leaflet draws vector polygons at
+/// their literal coordinates without wrapping, so that 358° jump renders the
+/// cell the long way across the whole map instead of across the seam. Keeping
+/// every cell vertex within 180° of the satellite sub-point makes the pattern
+/// one continuous coordinate cluster (e.g. a cell west of the date line reads
+/// as -185° next to a satellite at -152°), which Leaflet draws correctly over
+/// the wrapped basemap.
+fn unwrap_lon(lon_deg: f64, ref_deg: f64) -> f64 {
+    let mut l = lon_deg;
+    while l - ref_deg > 180.0 {
+        l -= 360.0;
+    }
+    while l - ref_deg < -180.0 {
+        l += 360.0;
+    }
+    l
 }
 
 /// A tier's beam footprint as (radial semi-axis, azimuthal semi-axis) in km.
@@ -214,6 +256,20 @@ impl Pattern {
         let (mx, my) = (sx / n, sy / n);
         Some((mx, my))
     }
+    /// RMS scatter (km) of a beam's footprint observations about their mean, in
+    /// the satellite frame. All observations of one beam should land at the same
+    /// satellite-relative offset, so a large scatter flags a polluted average
+    /// (e.g. a mis-detected fly direction folding the along-track sign on some
+    /// passes) — those beams are dropped rather than drawn at a wrong position.
+    fn spread_km(&self, beam: u8) -> Option<f64> {
+        let &(sx, sy, sq, n) = self.cells.get(&beam)?;
+        if n == 0 {
+            return None;
+        }
+        let n = n as f64;
+        let var = (sq / n - (sx / n).powi(2) - (sy / n).powi(2)).max(0.0);
+        Some(var.sqrt())
+    }
 }
 
 /// Tracks each satellite's latest high-altitude fix and travel direction,
@@ -224,7 +280,9 @@ struct SatTrack {
     z_prev: f64,
     north: i8,
     time: f64,
-    /// beam id -> last footprint time observed for THIS satellite.
+    /// beam id -> last footprint time observed for THIS satellite (drives the
+    /// active/idle state; the beam's *position* comes from the accumulated
+    /// per-beam mean in the direction pattern, not from one footprint).
     seen_beams: HashMap<u8, f64>,
 }
 
@@ -356,9 +414,19 @@ impl BeamReconstructor {
                 continue;
             }
             let pat = if t.north < 0 { &self.south } else { &self.north };
-            // Confident beam means for this direction (cross, along) in km.
+            // Confident, low-scatter beam means for this direction (cross,
+            // along) in km. A beam needs MIN_OBS observations AND a tight
+            // scatter (≤ MAX_SPREAD_KM); a polluted average is dropped so the
+            // slot falls back to a not-yet-decoded gap-fill rather than drawing
+            // at a wrong measured position.
             let means: Vec<(u8, f64, f64)> = (1..=48u8)
-                .filter_map(|b| pat.mean(b, MIN_OBS).map(|(c, a)| (b, c, a)))
+                .filter_map(|b| {
+                    let (c, a) = pat.mean(b, MIN_OBS)?;
+                    if pat.spread_km(b).is_some_and(|s| s > MAX_SPREAD_KM) {
+                        return None;
+                    }
+                    Some((b, c, a))
+                })
                 .collect();
 
             // Fit the canonical pattern's azimuth phase to the decoded beams
@@ -387,15 +455,16 @@ impl BeamReconstructor {
                 }
             }
 
-            // Snap each decoded beam to its nearest canonical slot, then emit
-            // exactly one cell per slot so the 48 beams tile cleanly, gap-free.
-            // The canonical model is the accurate beam layout; the measured
-            // positions are noisy samples of it, so snapping removes the tiling
-            // gaps that scatter would cause. A slot with a beam assigned draws
-            // solid (and takes that beam's id/active state); the rest draw faint
-            // as not-yet-decoded.
+            // Emit one cell per canonical slot, so the footprint always tiles to
+            // 48 gap-free. Each measured beam snaps to its nearest slot — but is
+            // drawn at its ACTUAL measured offset (the real honeycomb geometry,
+            // which sits on the decoded ring-alerts and tracks the satellite as
+            // it moves), with its tier sized from that offset's radius. Slots no
+            // measured beam claims are drawn at the idealized model position as
+            // not-yet-decoded gap-fill.
             let slots = slots_at(phase);
             let mut slot_beam = vec![0u8; slots.len()];
+            let mut slot_pos: Vec<Option<(f64, f64)>> = vec![None; slots.len()];
             for &(b, c, a) in &means {
                 let mut bi = 0usize;
                 let mut bd = f64::INFINITY;
@@ -407,21 +476,38 @@ impl BeamReconstructor {
                     }
                 }
                 slot_beam[bi] = b;
+                slot_pos[bi] = Some((c, a));
             }
-            for (i, &(tier, sc, sa)) in slots.iter().enumerate() {
+            // Antimeridian reference: every cell of this satellite is unwrapped
+            // to within 180° of its sub-point so date-line-crossing footprints
+            // render across the seam, not across the whole map.
+            let sat_lon = lat_lon(t.pos).1.to_degrees();
+            for (i, &(slot_tier, sc, sa)) in slots.iter().enumerate() {
                 let beam_id = slot_beam[i];
                 let decoded = beam_id != 0;
-                let active =
-                    decoded && t.seen_beams.get(&beam_id).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
+                let active = decoded
+                    && t.seen_beams.get(&beam_id).is_some_and(|&ts| now - ts < ACTIVE_WINDOW_S);
+                // Decoded → measured offset (tier from its real radius);
+                // modelled gap-fill → the canonical slot.
+                let (cx, ay) = slot_pos[i].unwrap_or((sc, sa));
+                let tier = if decoded {
+                    tier_for_radius((cx * cx + ay * ay).sqrt())
+                } else {
+                    slot_tier
+                };
                 let (a_rad, b_az) = tier_axes(tier);
-                let (lat, lon) = lat_lon(to_ecef(t.pos, sc, sa, t.north));
+                let (lat, lon) = lat_lon(to_ecef(t.pos, cx, ay, t.north));
+                let poly = ellipse_poly(t.pos, t.north, cx, ay, a_rad, b_az)
+                    .into_iter()
+                    .map(|(la, lo)| (la, unwrap_lon(lo, sat_lon)))
+                    .collect();
                 out.push(Cell {
                     sat,
                     beam: beam_id,
                     lat: lat.to_degrees(),
-                    lon: lon.to_degrees(),
+                    lon: unwrap_lon(lon.to_degrees(), sat_lon),
                     radius_m: (a_rad + b_az) / 2.0 * 1000.0,
-                    poly: ellipse_poly(t.pos, t.north, sc, sa, a_rad, b_az),
+                    poly,
                     active,
                     decoded,
                 });
@@ -663,12 +749,50 @@ mod tests {
             inner.radius_m
         );
         for c in [inner, outer] {
+            // Upper bound covers the stretched outer tier (~680 km half-axis):
+            // limb beams are radially elongated to reach the documented ~2250 km
+            // footprint edge.
             assert!(
-                (80_000.0..=600_000.0).contains(&c.radius_m),
+                (80_000.0..=700_000.0).contains(&c.radius_m),
                 "plausible footprint, got {}",
                 c.radius_m
             );
         }
+    }
+
+    #[test]
+    fn unwrap_lon_keeps_polys_continuous_across_antimeridian() {
+        // unwrap_lon shifts a longitude into the reference's ±180° window.
+        assert!((unwrap_lon(175.0, -178.0) - (-185.0)).abs() < 1e-9, "west-of-dateline vertex → -185");
+        assert!((unwrap_lon(-178.0, 175.0) - 182.0).abs() < 1e-9, "east reference pulls vertex to +182");
+        assert!((unwrap_lon(-120.0, -121.0) - (-120.0)).abs() < 1e-9, "normal lon unchanged");
+
+        // A satellite on the date line projects a footprint that crosses ±180°.
+        // Every cell polygon must stay numerically continuous (no ~360° jump
+        // between consecutive vertices) so Leaflet draws it across the seam, and
+        // the western beams must read past -180° rather than folding to +175°.
+        let mut r = BeamReconstructor::new();
+        let t0 = 1000.0;
+        r.observe(11, 780.0, ecef(40.0, -178.0, R_EARTH_KM + 780.0), 0, t0);
+        r.observe(11, 780.0, ecef(41.0, -178.0, R_EARTH_KM + 780.0), 0, t0 + 1.0);
+        let cells = r.project(t0 + 2.0, 60.0);
+        assert!(!cells.is_empty(), "date-line satellite still projects");
+        let mut crossed = false;
+        for c in &cells {
+            for w in c.poly.windows(2) {
+                assert!(
+                    (w[0].1 - w[1].1).abs() < 180.0,
+                    "poly continuous, jump {} (sat {} beam {})",
+                    (w[0].1 - w[1].1).abs(),
+                    c.sat,
+                    c.beam
+                );
+            }
+            if c.poly.iter().any(|v| v.1 < -180.0) {
+                crossed = true;
+            }
+        }
+        assert!(crossed, "western beams unwrap past -180 instead of folding to +175");
     }
 
     #[test]
