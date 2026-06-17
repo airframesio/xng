@@ -297,10 +297,11 @@ fn decode_extended_squitter(me: &[u8], f: &mut AdsbFrame) {
                 f.callsign = Some(s);
             }
         }
-        // Surface position: CPR over a quarter-globe span; movement and
-        // ground track are present but coarse — position is the value.
+        // Surface position: CPR over a quarter-globe span, plus the
+        // Movement (ground speed) and Ground-Track fields.
         5..=8 => {
             f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: true });
+            f.velocity = decode::surface_velocity(me);
         }
         // Airborne position with barometric altitude.
         9..=18 => {

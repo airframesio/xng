@@ -158,6 +158,47 @@ pub fn velocity(me: &[u8]) -> Option<Velocity> {
     Some(Velocity { speed_kt, track_deg, airspeed, vertical_rate_fpm })
 }
 
+/// Ground speed (knots) from a TC 5–8 surface 7-bit Movement code. `None`
+/// for "not available" (0) and reserved (125–127). Piecewise per DO-260B /
+/// "The 1090 MHz Riddle" §4: 1 = stopped; 2–8 step 0.125; 9–12 step 0.25;
+/// 13–38 step 0.5; 39–93 step 1; 94–108 step 2; 109–123 step 5; 124 = ≥175.
+fn surface_speed_kt(mov: u32) -> Option<f64> {
+    let s = match mov {
+        1 => 0.0,
+        2..=8 => 0.125 + (mov - 2) as f64 * 0.125,
+        9..=12 => 1.0 + (mov - 9) as f64 * 0.25,
+        13..=38 => 2.0 + (mov - 13) as f64 * 0.5,
+        39..=93 => 15.0 + (mov - 39) as f64 * 1.0,
+        94..=108 => 70.0 + (mov - 94) as f64 * 2.0,
+        109..=123 => 100.0 + (mov - 109) as f64 * 5.0,
+        124 => 175.0,
+        _ => return None, // 0 = N/A, 125–127 reserved
+    };
+    Some(s)
+}
+
+/// Decode TC 5–8 surface movement into a [`Velocity`]: ground speed from the
+/// Movement field and true track from the Ground-Track field (when its status
+/// bit is set). Returns `None` unless both a speed and a valid track are
+/// present — a moving surface target reports both; a stopped/track-unknown
+/// target keeps position only (the `Velocity` track is not optional, so we do
+/// not fabricate a 0° heading). Surface has no vertical rate.
+///
+/// ME bit positions (0-indexed): Movement 5–11, track status 12, track 13–19.
+pub fn surface_velocity(me: &[u8]) -> Option<Velocity> {
+    let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+    let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+    if !(5..=8).contains(&field(0, 5)) {
+        return None;
+    }
+    let speed_kt = surface_speed_kt(field(5, 7))?;
+    if bit(12) != 1 {
+        return None; // ground track not valid
+    }
+    let track_deg = field(13, 7) as f64 * 360.0 / 128.0;
+    Some(Velocity { speed_kt, track_deg, airspeed: false, vertical_rate_fpm: None })
+}
+
 /// Decode a TC 31 Aircraft Operational Status ME field (7 bytes) into the
 /// modern accuracy/integrity layer: ADS-B version, NIC supplement, NACp,
 /// SIL (+ supplement), and — airborne only — GVA and barometric-altitude
@@ -661,5 +702,39 @@ mod opstatus_tests {
     fn rejects_wrong_typecode() {
         assert!(operational_status(&me_of(19u64 << 51)).is_none());
         assert!(aircraft_status(&me_of(31u64 << 51)).is_none());
+    }
+
+    /// 7-byte ME slice of a full 28-hex-char message.
+    fn me_hex(frame: &str) -> Vec<u8> {
+        let bytes: Vec<u8> = (0..frame.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&frame[i..i + 2], 16).unwrap())
+            .collect();
+        bytes[4..11].to_vec()
+    }
+
+    #[test]
+    fn surface_velocity_matches_riddle_example() {
+        // "The 1090 MHz Riddle" §4 worked example: movement 41 → 17 kt,
+        // ground track 33 → 92.8125°.
+        let v = surface_velocity(&me_hex("8C4841753A9A153237AEF0F275BE")).unwrap();
+        assert!(!v.airspeed);
+        assert_eq!(v.speed_kt, 17.0);
+        assert!((v.track_deg - 92.8125).abs() < 1e-6, "{}", v.track_deg);
+        assert_eq!(v.vertical_rate_fpm, None);
+    }
+
+    #[test]
+    fn surface_speed_table_boundaries() {
+        assert_eq!(surface_speed_kt(0), None); // not available
+        assert_eq!(surface_speed_kt(1), Some(0.0)); // stopped
+        assert_eq!(surface_speed_kt(2), Some(0.125));
+        assert_eq!(surface_speed_kt(9), Some(1.0));
+        assert_eq!(surface_speed_kt(13), Some(2.0));
+        assert_eq!(surface_speed_kt(39), Some(15.0));
+        assert_eq!(surface_speed_kt(94), Some(70.0));
+        assert_eq!(surface_speed_kt(109), Some(100.0));
+        assert_eq!(surface_speed_kt(124), Some(175.0));
+        assert_eq!(surface_speed_kt(125), None); // reserved
     }
 }

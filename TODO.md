@@ -200,7 +200,7 @@
   - [ ] **ADSB-1.3** TC29 target-state (MCP/FCU selected alt, QNH, selected heading, AP/VNAV/APPROACH/LNAV flags)
   - [x] **ADSB-1.4** TC28 aircraft-status — emergency/priority state (mapped to label, flagged on the map) + ACAS-RA subtype flag. *(full RA decode = ADSB-3.1)*
   - [ ] **ADSB-1.5** Accuracy fields — ✅ NACp/SIL/NIC-supp-A/GVA via TC31; ❌ remaining: NUCp(v0), full NIC computation (TC + supplement), NACv (TC19), SDA, Rc
-- [ ] **ADSB-2** Position/velocity completion — TC5-8 surface movement (ground speed) + ground track; TC9-18 Q=0 Gillham altitude; TC20-22 geometric altitude; VR source bit (GNSS vs baro); geom-minus-baro alt diff; emit NACv
+- [ ] **ADSB-2** Position/velocity completion — ✅ TC5-8 surface movement (ground speed) + ground track *(done: `decode::surface_velocity`, riddle-vector tested)*; ❌ remaining: TC9-18 Q=0 Gillham altitude, TC20-22 geometric altitude, VR source bit (GNSS vs baro), geom-minus-baro alt diff, emit NACv
 - [ ] **ADSB-3** Comm-B BDS register expansion
   - [ ] **ADSB-3.1** BDS 3,0 ACAS/TCAS RA (high safety/intel value)
   - [ ] **ADSB-3.2** BDS 1,0 data-link-capability, 1,7/1,8/1,9 GICB capability, 2,1 registration markings
