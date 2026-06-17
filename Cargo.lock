@@ -4077,6 +4077,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "xng-mode-adsl"
+version = "0.20.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "xng-mode-aero"
 version = "0.20.0"
 dependencies = [
@@ -4096,6 +4104,25 @@ version = "0.20.0"
 dependencies = [
  "chrono",
  "num-complex",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-atcs"
+version = "0.20.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "xng-dsp",
+]
+
+[[package]]
+name = "xng-mode-dsc"
+version = "0.20.0"
+dependencies = [
+ "serde",
  "serde_json",
  "xng-dsp",
  "xng-types",
@@ -4131,12 +4158,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "xng-mode-navtex"
+version = "0.20.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-sarsat"
+version = "0.20.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "xng-mode-sonde"
+version = "0.20.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "xng-mode-stdc"
 version = "0.20.0"
 dependencies = [
  "chrono",
  "num-complex",
  "rustfft",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-uat"
+version = "0.20.0"
+dependencies = [
  "serde",
  "serde_json",
  "xng-dsp",
