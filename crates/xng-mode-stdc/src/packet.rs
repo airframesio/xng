@@ -772,6 +772,17 @@ impl PacketParser {
                 }))
             }
             0xAB => ("les-list", None, json!({})),
+            0x08 if body.len() >= 5 => {
+                // Per inmarsatc decode_08: sat/les body[1], lcn body[2],
+                // uplink channel word body[3..5] — the routing back to the
+                // ship's uplink channel for the acknowledgement.
+                let uw = u16::from_be_bytes([body[3], body[4]]);
+                ("ack-request", None, json!({
+                    "sat_les": sat_les(body[1]),
+                    "lcn": body[2],
+                    "uplink_mhz": round4(uplink_mhz(uw)),
+                }))
+            }
             0x08 => ("ack-request", None, json!({})),
             0x6C if body.len() >= 4 => {
                 // Per inmarsatc decode_6C: body[1] = 8-bit services byte
@@ -1177,6 +1188,25 @@ mod tests {
         let c = out.iter().find(|p| p.name == "confirmation").unwrap();
         assert_eq!(c.text, None);
         assert_eq!(c.details["short_message_len"], 1);
+    }
+
+    #[test]
+    fn ack_request_routing_fields() {
+        // STDC-2. 0x08 layout per inmarsatc decode_08: sat/les body[1],
+        // lcn body[2], uplink channel word body[3..5]. 0x08 is a short
+        // descriptor (length = (0x08 & 0x0F) + 1 = 9), so the body is
+        // 7 bytes + the 2-byte checksum build_packet appends.
+        let mut parser = PacketParser::new();
+        // sat/les 0x44 (AOR-E les 104), lcn 0x21, uplink word 0x2748.
+        let pkt = build_packet(&[0x08, 0x44, 0x21, 0x27, 0x48, 0x00, 0x00]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let a = out.iter().find(|p| p.name == "ack-request").expect("ack-request parses");
+        assert_eq!(a.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(a.details["sat_les"]["les"], 104);
+        assert_eq!(a.details["lcn"], 0x21);
+        assert_eq!(a.details["uplink_mhz"], 1636.64);
     }
 
     #[test]
