@@ -589,10 +589,43 @@ impl PacketParser {
                 "sat_les": sat_les(body[5]),
                 "lcn": body.get(9),
             })),
-            0x83 if body.len() >= 8 => ("logical-channel-assignment", None, json!({
-                "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
-                "lcn": body.get(7),
-            })),
+            0x83 if body.len() >= 8 => {
+                // Per inmarsatc decode_83: mes_id body[2..5], sat/les
+                // body[5], status_bits body[6], lcn body[7], frame_length
+                // body[8], duration body[9], downlink word body[10..12],
+                // uplink word body[12..14], frame_offset body[14],
+                // packetDescriptor1 body[15]. Surface what is present so
+                // the message channel can actually be tuned.
+                let mut details = json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "lcn": body.get(7),
+                });
+                if let Some(obj) = details.as_object_mut() {
+                    obj.insert("sat_les".to_string(), sat_les(body[5]));
+                    obj.insert("status_bits".to_string(), json!(body[6]));
+                    if let Some(&fl) = body.get(8) {
+                        obj.insert("frame_length".to_string(), json!(fl));
+                    }
+                    if let Some(&d) = body.get(9) {
+                        obj.insert("duration".to_string(), json!(d));
+                    }
+                    if body.len() >= 12 {
+                        let dw = u16::from_be_bytes([body[10], body[11]]);
+                        obj.insert("downlink_mhz".to_string(), json!(round4(downlink_mhz(dw))));
+                    }
+                    if body.len() >= 14 {
+                        let uw = u16::from_be_bytes([body[12], body[13]]);
+                        obj.insert("uplink_mhz".to_string(), json!(round4(uplink_mhz(uw))));
+                    }
+                    if let Some(&off) = body.get(14) {
+                        obj.insert("frame_offset".to_string(), json!(off));
+                    }
+                    if let Some(&pd1) = body.get(15) {
+                        obj.insert("packet_descriptor1".to_string(), json!(pd1));
+                    }
+                }
+                ("logical-channel-assignment", None, details)
+            }
             0xAA => {
                 // Message data: assemble per logical channel.
                 if body.len() >= 7 {
@@ -864,6 +897,47 @@ mod tests {
         assert_eq!(msg.details["lcn"], 7);
         assert_eq!(msg.details["parts"], 2);
         assert!(out.iter().any(|p| p.name == "logical-channel-clear"));
+    }
+
+    #[test]
+    fn logical_channel_assignment_full_fields() {
+        // STDC-2. Field layout per inmarsatc decode_83 (spec-derived
+        // packet built to that exact byte map):
+        //   body[2..5]  mes_id              = C1 24 BB
+        //   body[5]     sat/les (0x44)      = AOR-E / les 104
+        //   body[6]     status_bits         = 0x12
+        //   body[7]     lcn                 = 0x21
+        //   body[8]     frame_length        = 0x28
+        //   body[9]     duration            = 0x0A
+        //   body[10..12] downlink word 8400 -> 1531.5 MHz
+        //   body[12..14] uplink word 0x2748 -> 1636.64 MHz
+        //   body[14]    frame_offset        = 0x03
+        //   body[15]    packetDescriptor1   = 0xAA
+        let mut parser = PacketParser::new();
+        let mut body = [
+            0x83, 0x00, 0xC1, 0x24, 0xBB, 0x44, 0x12, 0x21, 0x28, 0x0A, 0x20, 0xD0, 0x27, 0x48,
+            0x03, 0xAA,
+        ];
+        // Medium descriptor: body[1] = total length - 2 (incl. checksum).
+        body[1] = (body.len() + 2 - 2) as u8;
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let a = out
+            .iter()
+            .find(|p| p.name == "logical-channel-assignment")
+            .expect("assignment parses");
+        assert_eq!(a.details["mes_id"], "C124BB");
+        assert_eq!(a.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(a.details["sat_les"]["les"], 104);
+        assert_eq!(a.details["status_bits"], 0x12);
+        assert_eq!(a.details["lcn"], 0x21);
+        assert_eq!(a.details["frame_length"], 0x28);
+        assert_eq!(a.details["duration"], 0x0A);
+        assert_eq!(a.details["downlink_mhz"], 1531.5);
+        assert_eq!(a.details["uplink_mhz"], 1636.64);
+        assert_eq!(a.details["frame_offset"], 0x03);
+        assert_eq!(a.details["packet_descriptor1"], 0xAA);
     }
 
     #[test]
