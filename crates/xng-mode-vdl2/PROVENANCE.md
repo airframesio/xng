@@ -145,6 +145,20 @@ also decode to a big-endian integer alongside the preserved raw hex.
 Address-list parameters (replacement-GS 0x41, GS-address-filter 0x48,
 alternate-GS 0x82, system-mask 0xC5) decode as 4-octet AVLC addresses.
 
+## IDRP + ES-IS completion (2026-06, VDL2-6)
+
+The IDRP (ISO/IEC 10747) decoder gained the sixth BISPDU type RIB-REFRESH
+(type 6), the OPEN PDU body's reliably-framed leading fields (version,
+hold-time, max-PDU-size, source RDI — the variable RIB-Atts-Set /
+Confed-IDs / auth-mech tail stays in raw hex), the credit-offered/avail
+header octets, and named ERROR code + subcode text. The ES-IS (ISO/IEC
+9542) decoder now parses the trailing option TLVs on ESH/ISH PDUs:
+Mobile-Subnetwork-Capabilities (0x81), ATN-Data-Link-Capabilities (0x88),
+Priority (0xCF), and Security (0xC5). The BISPDU-type number (6), the
+error-code/subcode dictionaries, and the ES-IS option-type IDs/names were
+cross-checked against dumpvdl2's `idrp.c`/`idrp.h` and `esis.c` — protocol
+facts (the integer→name assignments) only, not code or formatter text.
+
 ## ATN-B1 CPDLC + CM (2026-06)
 
 Protected-mode CPDLC (ProtectedAircraftPDUs/ProtectedGroundPDUs,
