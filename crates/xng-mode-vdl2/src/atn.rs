@@ -27,14 +27,181 @@ pub struct X25Packet {
     pub more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<u8>,
+    /// Human-readable clearing/reset/restart cause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause_text: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<u8>,
+    /// Human-readable diagnostic-code name (X.25 Annex E / ICAO Doc 9705).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_text: Option<&'static str>,
     /// Negotiated facilities on call packets.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub facilities: Vec<Value>,
     /// Payload (data packets: user data; call packets: CUD).
     #[serde(skip)]
     pub payload: Vec<u8>,
+}
+
+/// X.25 clearing-cause name (ITU-T X.25 Table 5-7).
+fn x25_clear_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x00 => "DTE originated",
+        0x01 => "Number busy",
+        0x03 => "Invalid facility request",
+        0x05 => "Network congestion",
+        0x09 => "Remote procedure error",
+        0x0D => "Not obtainable",
+        0x13 => "Local procedure error",
+        0x15 => "ROA out of order",
+        0x19 => "Reverse charging acceptance not subscribed",
+        0x21 => "Incompatible destination",
+        0x29 => "Fast select acceptance not subscribed",
+        0x39 => "Ship absent",
+        _ => return None,
+    })
+}
+
+/// X.25 reset-cause name (ITU-T X.25 Table 5-7).
+fn x25_reset_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x00 => "DTE originated",
+        0x01 => "Out of order",
+        0x03 => "Remote procedure error",
+        0x05 => "Local procedure error",
+        0x07 => "Network congestion",
+        0x09 => "Remote DTE operational",
+        0x0F => "Network operational",
+        0x11 => "Incompatible destination",
+        0x1D => "Network out of order",
+        _ => return None,
+    })
+}
+
+/// X.25 restart-cause name (ITU-T X.25 Table 5-7).
+fn x25_restart_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x01 => "Local procedure error",
+        0x03 => "Network congestion",
+        0x07 => "Network operational",
+        _ => return None,
+    })
+}
+
+/// X.25 diagnostic-code name (X.25 Annex E + ISO 8208 + ICAO Doc 9705
+/// Table 5.7-3 / Doc 9880 extensions).
+fn x25_diagnostic(d: u8) -> Option<&'static str> {
+    Some(match d {
+        0x00 => "Cleared by system management",
+        0x01 => "Invalid P(S)",
+        0x02 => "Invalid P(R)",
+        0x10 => "Packet type invalid",
+        0x11 => "Packet type invalid for state r1",
+        0x12 => "Packet type invalid for state r2",
+        0x13 => "Packet type invalid for state r3",
+        0x14 => "Packet type invalid for state p1",
+        0x15 => "Packet type invalid for state p2",
+        0x16 => "Packet type invalid for state p3",
+        0x17 => "Packet type invalid for state p4",
+        0x18 => "Packet type invalid for state p5",
+        0x19 => "Packet type invalid for state p6",
+        0x1A => "Packet type invalid for state p7",
+        0x1B => "Packet type invalid for state d1",
+        0x1C => "Packet type invalid for state d2",
+        0x1D => "Packet type invalid for state d3",
+        0x20 => "Packet not allowed",
+        0x21 => "Unidentifiable packet",
+        0x22 => "Call on one-way logical channel",
+        0x23 => "Invalid packet type on a PVC",
+        0x24 => "Packet on unassigned logical channel",
+        0x25 => "Reject not subscribed to",
+        0x26 => "Packet too short",
+        0x27 => "Packet too long",
+        0x28 => "Invalid general format identifier",
+        0x29 => "Restart packet with non-zero reserved bits",
+        0x2A => "Packet type not compatible with facility",
+        0x2B => "Unauthorized interrupt confirmation",
+        0x2C => "Unauthorized interrupt",
+        0x2D => "Unauthorized reject",
+        0x2E => "TOA/NPI address subscription facility not subscribed to",
+        0x30 => "Time expired",
+        0x31 => "Time expired for incoming call",
+        0x32 => "Time expired for clear indication",
+        0x33 => "Time expired for reset indication",
+        0x34 => "Time expired for restart indication",
+        0x35 => "Time expired for call deflection",
+        0x40 => "Call setup or call clearing problem",
+        0x41 => "Facility code not allowed",
+        0x42 => "Facility parameter not allowed",
+        0x43 => "Invalid called DTE address",
+        0x44 => "Invalid calling DTE address",
+        0x45 => "Invalid facility length",
+        0x46 => "Incoming call barred",
+        0x47 => "No logical channel available",
+        0x48 => "Call collision",
+        0x49 => "Duplicate facility requested",
+        0x4A => "Non-zero address length",
+        0x4B => "Non-zero facility length",
+        0x4C => "Facility not provided when expected",
+        0x4D => "Invalid ITU-T specified DTE facility",
+        0x4E => "Max number of call redirections or deflections exceeded",
+        0x50 => "Miscellaneous",
+        0x51 => "Improper cause code from DTE",
+        0x52 => "Not aligned octet",
+        0x53 => "Inconsistent Q-bit setting",
+        0x54 => "NUI problem",
+        0x55 => "ICRD problem",
+        0x70 => "International problem",
+        0x71 => "Remote network problem",
+        0x72 => "International protocol problem",
+        0x73 => "International link out of order",
+        0x74 => "International link busy",
+        0x75 => "Transit network facility problem",
+        0x76 => "Remote network facility problem",
+        0x77 => "International routing problem",
+        0x78 => "Temporary routing problem",
+        0x79 => "Unknown called DNIC",
+        0x7A => "Maintenance action",
+        // ICAO Doc 9705 Table 5.7-3
+        0x80 => "Version number not supported",
+        0x81 => "Invalid length field",
+        0x82 => "Call collision resolution",
+        0x83 => "Proposed directory size too large",
+        0x84 => "LREF cancellation not supported",
+        0x85 => "Received DTE refused, received NET refused or invalid NET selector",
+        0x86 => "Invalid SNCR field",
+        0x87 => "ACA compression not supported",
+        0x88 => "LREF compression not supported",
+        0x8F => "Deflate compression not supported",
+        0x90 => "Idle timer expired",
+        0x91 => "Need to reuse the circuit",
+        0x92 => "System local error",
+        0x93 => "Invalid SEL field value in received NET",
+        // ISO 8208
+        0xE1 => "OSI network disconnect (transient)",
+        0xE2 => "OSI network disconnect (permanent)",
+        0xE3 => "OSI network reject - reason unspecified (transient)",
+        0xE4 => "OSI network reject - reason unspecified (permanent)",
+        0xE5 => "OSI network reject - QoS not available (transient)",
+        0xE6 => "OSI network reject - QoS not available (permanent)",
+        0xE7 => "OSI network reject - NSAP unreachable (transient)",
+        0xE8 => "OSI network reject - NSAP unreachable (permanent)",
+        0xE9 => "OSI network reset - no reason given",
+        0xEA => "OSI network reset - congestion",
+        0xEB => "OSI network reject - NSAP address unknown (permanent)",
+        0xF0 => "System lack of resources",
+        0xF1 => "Higher level initiated disconnect (normal)",
+        0xF2 => "Incompatible information in user data",
+        0xF3 => "Higher level initiated disconnect - incompatible data",
+        0xF4 => "Higher level initiated reject - no reason given (transient)",
+        0xF5 => "Higher level initiated reject - no reason given (permanent)",
+        0xF6 => "Higher level initiated reject - QoS not available (transient)",
+        0xF7 => "Higher level initiated reject - QoS not available (permanent)",
+        0xF8 => "Higher level initiated reject - incompatible data",
+        0xF9 => "Unrecognized protocol ID",
+        0xFA => "Higher level initiated reset - user resync",
+        _ => return None,
+    })
 }
 
 /// Parse one X.25 packet (modulo-8 sequencing, the VDL2 profile).
@@ -56,7 +223,9 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
         pr: None,
         more: false,
         cause: None,
+        cause_text: None,
         diagnostic: None,
+        diagnostic_text: None,
         facilities: Vec::new(),
         payload: Vec::new(),
     };
@@ -92,16 +261,40 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
                 }
             }
         }
-        0x13 | 0x17 => {
-            pkt.kind = if t == 0x13 { "clear-request" } else { "clear-confirmation" };
-            pkt.cause = b.get(3).copied();
-            pkt.diagnostic = b.get(4).copied();
+        0x13 | 0x1B | 0xFB => {
+            // CLEAR / RESET / RESTART request: cause octet then diagnostic.
+            let (kind, namer): (&str, fn(u8) -> Option<&'static str>) = match t {
+                0x13 => ("clear-request", x25_clear_cause),
+                0x1B => ("reset-request", x25_reset_cause),
+                _ => ("restart-request", x25_restart_cause),
+            };
+            pkt.kind = kind;
+            if let Some(&raw) = b.get(3) {
+                // X.25 Table 5-7: bit 8 set means the lower bits are the
+                // remote DTE's cause; normalise to 0 for the dictionary.
+                let cause = if raw & 0x80 != 0 { 0 } else { raw };
+                pkt.cause = Some(cause);
+                pkt.cause_text = namer(cause);
+            }
+            if let Some(&d) = b.get(4) {
+                pkt.diagnostic = Some(d);
+                pkt.diagnostic_text = x25_diagnostic(d);
+            }
         }
-        0x1B | 0x1F => pkt.kind = if t == 0x1B { "reset-request" } else { "reset-confirmation" },
-        0xFB | 0xFF => return None, // restart: not expected on VDL2 SVCs
+        0x17 | 0x1F | 0xFF => {
+            // CLEAR / RESET / RESTART confirmation: no cause/diagnostic.
+            pkt.kind = match t {
+                0x17 => "clear-confirmation",
+                0x1F => "reset-confirmation",
+                _ => "restart-confirmation",
+            };
+        }
         0xF1 => {
             pkt.kind = "diagnostic";
-            pkt.diagnostic = b.get(3).copied();
+            if let Some(&d) = b.get(3) {
+                pkt.diagnostic = Some(d);
+                pkt.diagnostic_text = x25_diagnostic(d);
+            }
         }
         _ if t & 0x1F == 0x01 => {
             pkt.kind = "rr";
@@ -860,6 +1053,63 @@ mod tests {
         let p = parse_x25(&rr).unwrap();
         assert_eq!(p.kind, "rr");
         assert_eq!(p.pr, Some(5));
+    }
+
+    #[test]
+    fn x25_restart_request_and_confirm() {
+        // RESTART REQUEST (0xFB): GFI modulo-8, LCN 0, cause 0x07 (Network
+        // operational in the restart-cause table), diagnostic 0x34
+        // (Time expired for restart indication).
+        let req = [0x10, 0x00, 0xFB, 0x07, 0x34];
+        let p = parse_x25(&req).unwrap();
+        assert_eq!(p.kind, "restart-request");
+        assert_eq!(p.cause, Some(0x07));
+        assert_eq!(p.cause_text, Some("Network operational"));
+        assert_eq!(p.diagnostic, Some(0x34));
+        assert_eq!(p.diagnostic_text, Some("Time expired for restart indication"));
+        // RESTART CONFIRM (0xFF): no cause/diagnostic body.
+        let conf = [0x10, 0x00, 0xFF];
+        let p = parse_x25(&conf).unwrap();
+        assert_eq!(p.kind, "restart-confirmation");
+        assert_eq!(p.cause, None);
+        assert_eq!(p.diagnostic, None);
+    }
+
+    #[test]
+    fn x25_clear_reset_cause_naming() {
+        // CLEAR REQUEST cause 0x01 = "Number busy"; reset uses a different
+        // table where 0x01 = "Out of order".
+        let clear = [0x10, 0x05, 0x13, 0x01, 0x00];
+        let p = parse_x25(&clear).unwrap();
+        assert_eq!(p.kind, "clear-request");
+        assert_eq!(p.cause_text, Some("Number busy"));
+        assert_eq!(p.diagnostic_text, Some("Cleared by system management"));
+        let reset = [0x10, 0x05, 0x1B, 0x01, 0x26];
+        let p = parse_x25(&reset).unwrap();
+        assert_eq!(p.kind, "reset-request");
+        assert_eq!(p.cause, Some(0x01));
+        assert_eq!(p.cause_text, Some("Out of order"));
+        assert_eq!(p.diagnostic_text, Some("Packet too short"));
+    }
+
+    #[test]
+    fn x25_cause_high_bit_masked() {
+        // X.25 Table 5-7: when bit 8 of the cause is set, the lower bits
+        // are the remote DTE's value; the dictionary lookup uses 0.
+        let clear = [0x10, 0x05, 0x13, 0x85, 0x00];
+        let p = parse_x25(&clear).unwrap();
+        assert_eq!(p.cause, Some(0));
+        assert_eq!(p.cause_text, Some("DTE originated"));
+    }
+
+    #[test]
+    fn x25_diagnostic_packet_names_code() {
+        // DIAG (0xF1) with an ICAO Doc 9705 extension code.
+        let diag = [0x10, 0x00, 0xF1, 0x88];
+        let p = parse_x25(&diag).unwrap();
+        assert_eq!(p.kind, "diagnostic");
+        assert_eq!(p.diagnostic, Some(0x88));
+        assert_eq!(p.diagnostic_text, Some("LREF compression not supported"));
     }
 
     #[test]

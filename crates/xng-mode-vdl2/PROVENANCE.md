@@ -159,6 +159,23 @@ error-code/subcode dictionaries, and the ES-IS option-type IDs/names were
 cross-checked against dumpvdl2's `idrp.c`/`idrp.h` and `esis.c` — protocol
 facts (the integer→name assignments) only, not code or formatter text.
 
+## X.25 completion (2026-06, VDL2-4)
+
+The X.25 (ISO/IEC 8208) packet decoder gained RESTART-REQUEST (0xFB,
+carrying cause + diagnostic) and RESTART-CONFIRM (0xFF) — previously
+dropped — and now resolves the clearing/reset/restart cause and the
+diagnostic code to text. Three separate cause tables (clear/reset/restart,
+ITU-T X.25 Table 5-7) and one ~150-entry diagnostic table (X.25 Annex E +
+ISO 8208 + ICAO Doc 9705 Table 5.7-3 / Doc 9880 extensions) are applied;
+RESET-REQUEST now captures its cause + diagnostic too (it previously
+carried neither). The X.25 Table 5-7 rule that a cause octet with bit 8
+set carries the remote DTE's lower bits is honoured by normalising the
+lookup key to 0. The packet-type constants (RESTART 0xFB/0xFF, DIAG 0xF1)
+and the cause/diagnostic dictionaries were cross-checked against
+dumpvdl2's `x25.c`/`x25.h` — protocol facts only, not code or formatter
+text. Facility codes remain numeric (facility naming was out of this
+task's scope).
+
 ## ATN-B1 CPDLC + CM (2026-06)
 
 Protected-mode CPDLC (ProtectedAircraftPDUs/ProtectedGroundPDUs,
