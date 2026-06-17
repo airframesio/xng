@@ -27,14 +27,181 @@ pub struct X25Packet {
     pub more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<u8>,
+    /// Human-readable clearing/reset/restart cause.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause_text: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<u8>,
+    /// Human-readable diagnostic-code name (X.25 Annex E / ICAO Doc 9705).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic_text: Option<&'static str>,
     /// Negotiated facilities on call packets.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub facilities: Vec<Value>,
     /// Payload (data packets: user data; call packets: CUD).
     #[serde(skip)]
     pub payload: Vec<u8>,
+}
+
+/// X.25 clearing-cause name (ITU-T X.25 Table 5-7).
+fn x25_clear_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x00 => "DTE originated",
+        0x01 => "Number busy",
+        0x03 => "Invalid facility request",
+        0x05 => "Network congestion",
+        0x09 => "Remote procedure error",
+        0x0D => "Not obtainable",
+        0x13 => "Local procedure error",
+        0x15 => "ROA out of order",
+        0x19 => "Reverse charging acceptance not subscribed",
+        0x21 => "Incompatible destination",
+        0x29 => "Fast select acceptance not subscribed",
+        0x39 => "Ship absent",
+        _ => return None,
+    })
+}
+
+/// X.25 reset-cause name (ITU-T X.25 Table 5-7).
+fn x25_reset_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x00 => "DTE originated",
+        0x01 => "Out of order",
+        0x03 => "Remote procedure error",
+        0x05 => "Local procedure error",
+        0x07 => "Network congestion",
+        0x09 => "Remote DTE operational",
+        0x0F => "Network operational",
+        0x11 => "Incompatible destination",
+        0x1D => "Network out of order",
+        _ => return None,
+    })
+}
+
+/// X.25 restart-cause name (ITU-T X.25 Table 5-7).
+fn x25_restart_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0x01 => "Local procedure error",
+        0x03 => "Network congestion",
+        0x07 => "Network operational",
+        _ => return None,
+    })
+}
+
+/// X.25 diagnostic-code name (X.25 Annex E + ISO 8208 + ICAO Doc 9705
+/// Table 5.7-3 / Doc 9880 extensions).
+fn x25_diagnostic(d: u8) -> Option<&'static str> {
+    Some(match d {
+        0x00 => "Cleared by system management",
+        0x01 => "Invalid P(S)",
+        0x02 => "Invalid P(R)",
+        0x10 => "Packet type invalid",
+        0x11 => "Packet type invalid for state r1",
+        0x12 => "Packet type invalid for state r2",
+        0x13 => "Packet type invalid for state r3",
+        0x14 => "Packet type invalid for state p1",
+        0x15 => "Packet type invalid for state p2",
+        0x16 => "Packet type invalid for state p3",
+        0x17 => "Packet type invalid for state p4",
+        0x18 => "Packet type invalid for state p5",
+        0x19 => "Packet type invalid for state p6",
+        0x1A => "Packet type invalid for state p7",
+        0x1B => "Packet type invalid for state d1",
+        0x1C => "Packet type invalid for state d2",
+        0x1D => "Packet type invalid for state d3",
+        0x20 => "Packet not allowed",
+        0x21 => "Unidentifiable packet",
+        0x22 => "Call on one-way logical channel",
+        0x23 => "Invalid packet type on a PVC",
+        0x24 => "Packet on unassigned logical channel",
+        0x25 => "Reject not subscribed to",
+        0x26 => "Packet too short",
+        0x27 => "Packet too long",
+        0x28 => "Invalid general format identifier",
+        0x29 => "Restart packet with non-zero reserved bits",
+        0x2A => "Packet type not compatible with facility",
+        0x2B => "Unauthorized interrupt confirmation",
+        0x2C => "Unauthorized interrupt",
+        0x2D => "Unauthorized reject",
+        0x2E => "TOA/NPI address subscription facility not subscribed to",
+        0x30 => "Time expired",
+        0x31 => "Time expired for incoming call",
+        0x32 => "Time expired for clear indication",
+        0x33 => "Time expired for reset indication",
+        0x34 => "Time expired for restart indication",
+        0x35 => "Time expired for call deflection",
+        0x40 => "Call setup or call clearing problem",
+        0x41 => "Facility code not allowed",
+        0x42 => "Facility parameter not allowed",
+        0x43 => "Invalid called DTE address",
+        0x44 => "Invalid calling DTE address",
+        0x45 => "Invalid facility length",
+        0x46 => "Incoming call barred",
+        0x47 => "No logical channel available",
+        0x48 => "Call collision",
+        0x49 => "Duplicate facility requested",
+        0x4A => "Non-zero address length",
+        0x4B => "Non-zero facility length",
+        0x4C => "Facility not provided when expected",
+        0x4D => "Invalid ITU-T specified DTE facility",
+        0x4E => "Max number of call redirections or deflections exceeded",
+        0x50 => "Miscellaneous",
+        0x51 => "Improper cause code from DTE",
+        0x52 => "Not aligned octet",
+        0x53 => "Inconsistent Q-bit setting",
+        0x54 => "NUI problem",
+        0x55 => "ICRD problem",
+        0x70 => "International problem",
+        0x71 => "Remote network problem",
+        0x72 => "International protocol problem",
+        0x73 => "International link out of order",
+        0x74 => "International link busy",
+        0x75 => "Transit network facility problem",
+        0x76 => "Remote network facility problem",
+        0x77 => "International routing problem",
+        0x78 => "Temporary routing problem",
+        0x79 => "Unknown called DNIC",
+        0x7A => "Maintenance action",
+        // ICAO Doc 9705 Table 5.7-3
+        0x80 => "Version number not supported",
+        0x81 => "Invalid length field",
+        0x82 => "Call collision resolution",
+        0x83 => "Proposed directory size too large",
+        0x84 => "LREF cancellation not supported",
+        0x85 => "Received DTE refused, received NET refused or invalid NET selector",
+        0x86 => "Invalid SNCR field",
+        0x87 => "ACA compression not supported",
+        0x88 => "LREF compression not supported",
+        0x8F => "Deflate compression not supported",
+        0x90 => "Idle timer expired",
+        0x91 => "Need to reuse the circuit",
+        0x92 => "System local error",
+        0x93 => "Invalid SEL field value in received NET",
+        // ISO 8208
+        0xE1 => "OSI network disconnect (transient)",
+        0xE2 => "OSI network disconnect (permanent)",
+        0xE3 => "OSI network reject - reason unspecified (transient)",
+        0xE4 => "OSI network reject - reason unspecified (permanent)",
+        0xE5 => "OSI network reject - QoS not available (transient)",
+        0xE6 => "OSI network reject - QoS not available (permanent)",
+        0xE7 => "OSI network reject - NSAP unreachable (transient)",
+        0xE8 => "OSI network reject - NSAP unreachable (permanent)",
+        0xE9 => "OSI network reset - no reason given",
+        0xEA => "OSI network reset - congestion",
+        0xEB => "OSI network reject - NSAP address unknown (permanent)",
+        0xF0 => "System lack of resources",
+        0xF1 => "Higher level initiated disconnect (normal)",
+        0xF2 => "Incompatible information in user data",
+        0xF3 => "Higher level initiated disconnect - incompatible data",
+        0xF4 => "Higher level initiated reject - no reason given (transient)",
+        0xF5 => "Higher level initiated reject - no reason given (permanent)",
+        0xF6 => "Higher level initiated reject - QoS not available (transient)",
+        0xF7 => "Higher level initiated reject - QoS not available (permanent)",
+        0xF8 => "Higher level initiated reject - incompatible data",
+        0xF9 => "Unrecognized protocol ID",
+        0xFA => "Higher level initiated reset - user resync",
+        _ => return None,
+    })
 }
 
 /// Parse one X.25 packet (modulo-8 sequencing, the VDL2 profile).
@@ -56,7 +223,9 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
         pr: None,
         more: false,
         cause: None,
+        cause_text: None,
         diagnostic: None,
+        diagnostic_text: None,
         facilities: Vec::new(),
         payload: Vec::new(),
     };
@@ -92,16 +261,40 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
                 }
             }
         }
-        0x13 | 0x17 => {
-            pkt.kind = if t == 0x13 { "clear-request" } else { "clear-confirmation" };
-            pkt.cause = b.get(3).copied();
-            pkt.diagnostic = b.get(4).copied();
+        0x13 | 0x1B | 0xFB => {
+            // CLEAR / RESET / RESTART request: cause octet then diagnostic.
+            let (kind, namer): (&str, fn(u8) -> Option<&'static str>) = match t {
+                0x13 => ("clear-request", x25_clear_cause),
+                0x1B => ("reset-request", x25_reset_cause),
+                _ => ("restart-request", x25_restart_cause),
+            };
+            pkt.kind = kind;
+            if let Some(&raw) = b.get(3) {
+                // X.25 Table 5-7: bit 8 set means the lower bits are the
+                // remote DTE's cause; normalise to 0 for the dictionary.
+                let cause = if raw & 0x80 != 0 { 0 } else { raw };
+                pkt.cause = Some(cause);
+                pkt.cause_text = namer(cause);
+            }
+            if let Some(&d) = b.get(4) {
+                pkt.diagnostic = Some(d);
+                pkt.diagnostic_text = x25_diagnostic(d);
+            }
         }
-        0x1B | 0x1F => pkt.kind = if t == 0x1B { "reset-request" } else { "reset-confirmation" },
-        0xFB | 0xFF => return None, // restart: not expected on VDL2 SVCs
+        0x17 | 0x1F | 0xFF => {
+            // CLEAR / RESET / RESTART confirmation: no cause/diagnostic.
+            pkt.kind = match t {
+                0x17 => "clear-confirmation",
+                0x1F => "reset-confirmation",
+                _ => "restart-confirmation",
+            };
+        }
         0xF1 => {
             pkt.kind = "diagnostic";
-            pkt.diagnostic = b.get(3).copied();
+            if let Some(&d) = b.get(3) {
+                pkt.diagnostic = Some(d);
+                pkt.diagnostic_text = x25_diagnostic(d);
+            }
         }
         _ if t & 0x1F == 0x01 => {
             pkt.kind = "rr";
@@ -178,14 +371,24 @@ pub fn parse_network(b: &[u8]) -> Option<Value> {
     }
 }
 
+/// ES-IS (ISO 9542) option-TLV name (the parameters profiled for ATN).
+fn esis_option_name(t: u8) -> &'static str {
+    match t {
+        0x81 => "mobile-subnetwork-capabilities",
+        0x88 => "atn-data-link-capabilities",
+        0xCF => "priority",
+        0xC5 => "security",
+        _ => "unknown",
+    }
+}
+
 /// ES-IS (ISO 9542) header: type and the advertised network entity
-/// titles / addresses (hex NSAPs).
+/// titles / addresses (hex NSAPs), plus the trailing option TLVs.
 fn parse_esis(b: &[u8]) -> Value {
     let mut out = json!({ "protocol": "ES-IS", "payload_len": b.len() });
     if b.len() < 9 {
         return out;
     }
-    let hdr_len = b[1] as usize;
     let type_code = b[4] & 0x1F;
     out["type"] = json!(match type_code {
         2 => "ESH",
@@ -197,30 +400,66 @@ fn parse_esis(b: &[u8]) -> Value {
     // ESH: count + SA(s); ISH: single NET. Both length-prefixed.
     let mut pos = 9usize;
     let mut addrs = Vec::new();
-    if type_code == 2 && pos < b.len().min(hdr_len) {
-        let n = b[pos] as usize;
-        pos += 1;
-        for _ in 0..n {
-            let Some(&len) = b.get(pos) else { break };
-            let len = len as usize;
+    if type_code == 2 {
+        if let Some(&n) = b.get(pos) {
             pos += 1;
-            if pos + len > b.len() || len > 20 {
-                break;
+            for _ in 0..n {
+                let Some(&len) = b.get(pos) else { break };
+                let len = len as usize;
+                pos += 1;
+                if pos + len > b.len() || len > 20 {
+                    break;
+                }
+                addrs.push(
+                    b[pos..pos + len].iter().map(|x| format!("{x:02x}")).collect::<String>(),
+                );
+                pos += len;
             }
-            addrs.push(b[pos..pos + len].iter().map(|x| format!("{x:02x}")).collect::<String>());
-            pos += len;
         }
     } else if type_code == 4 {
         if let Some(&len) = b.get(pos) {
             let len = len as usize;
             pos += 1;
             if pos + len <= b.len() && len <= 20 {
-                addrs.push(b[pos..pos + len].iter().map(|x| format!("{x:02x}")).collect::<String>());
+                addrs.push(
+                    b[pos..pos + len].iter().map(|x| format!("{x:02x}")).collect::<String>(),
+                );
+                pos += len;
             }
         }
     }
     if !addrs.is_empty() {
         out["addresses"] = json!(addrs);
+    }
+    // Option TLVs follow the addresses on ESH/ISH PDUs (ISO 9542 + the
+    // ATN profile: Mobile-Subnetwork-Capabilities 0x81, ATN-Data-Link-
+    // Capabilities 0x88, Priority 0xCF, Security 0xC5).
+    if matches!(type_code, 2 | 4) {
+        let opts = parse_esis_options(&b[pos..]);
+        if !opts.is_empty() {
+            out["options"] = json!(opts);
+        }
+    }
+    out
+}
+
+/// Parse ES-IS option TLVs: each is `type(1) | length(1) | value`.
+fn parse_esis_options(b: &[u8]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 2 <= b.len() {
+        let t = b[pos];
+        let len = b[pos + 1] as usize;
+        pos += 2;
+        if pos + len > b.len() {
+            break;
+        }
+        out.push(json!({
+            "type": esis_option_name(t),
+            "type_code": t,
+            "value_hex": b[pos..pos + len].iter().map(|x| format!("{x:02x}")).collect::<String>(),
+        }));
+        pos += len;
     }
     out
 }
@@ -249,6 +488,60 @@ fn idrp_attr_name(t: u8) -> &'static str {
     }
 }
 
+/// IDRP BISPDU type name (ISO/IEC 10747 §7.1).
+fn idrp_pdu_type_name(t: u8) -> &'static str {
+    match t {
+        1 => "OPEN",
+        2 => "UPDATE",
+        3 => "ERROR",
+        4 => "KEEPALIVE",
+        5 => "CEASE",
+        6 => "RIB-REFRESH",
+        _ => "?",
+    }
+}
+
+/// IDRP ERROR top-level error-code name (ISO/IEC 10747 §7.10).
+fn idrp_error_code_name(c: u8) -> &'static str {
+    match c {
+        1 => "Open PDU error",
+        2 => "Update PDU error",
+        3 => "Hold timer expired",
+        4 => "FSM error",
+        5 => "RIB Refresh PDU error",
+        _ => "?",
+    }
+}
+
+/// IDRP ERROR error-subcode name, keyed by the error code.
+fn idrp_error_subcode_name(code: u8, sub: u8) -> Option<&'static str> {
+    Some(match (code, sub) {
+        (1, 1) => "Unsupported version number",
+        (1, 2) => "Bad max PDU size",
+        (1, 3) => "Bad peer RD",
+        (1, 4) => "Unsupported auth code",
+        (1, 5) => "Auth failure",
+        (1, 6) => "Bad RIB-AttsSet",
+        (1, 7) => "RDC Mismatch",
+        (2, 1) => "Malformed attribute list",
+        (2, 2) => "Unrecognized well-known attribute",
+        (2, 3) => "Missing well-known attribute",
+        (2, 4) => "Attribute flags error",
+        (2, 5) => "Attribute length error",
+        (2, 6) => "RD routing loop",
+        (2, 7) => "Invalid NEXT_HOP attribute",
+        (2, 8) => "Optional attribute error",
+        (2, 9) => "Invalid reachability information",
+        (2, 10) => "Misconfigured RDCs",
+        (2, 11) => "Malformed NLRI",
+        (2, 12) => "Duplicated attributes",
+        (2, 13) => "Illegal RD path segment",
+        (5, 1) => "Invalid opcode",
+        (5, 2) => "Unsupported RIB-Atts",
+        _ => return None,
+    })
+}
+
 fn parse_idrp(b: &[u8]) -> Value {
     let mut out = json!({ "protocol": "IDRP", "payload_len": b.len() });
     if b.len() < 4 {
@@ -257,39 +550,75 @@ fn parse_idrp(b: &[u8]) -> Value {
     let len = u16::from_be_bytes([b[1], b[2]]);
     out["bispdu_len"] = json!(len);
     let pdu_type = b[3];
-    out["type"] = json!(match pdu_type {
-        1 => "OPEN",
-        2 => "UPDATE",
-        3 => "ERROR",
-        4 => "KEEPALIVE",
-        5 => "CEASE",
-        _ => "?",
-    });
+    out["type"] = json!(idrp_pdu_type_name(pdu_type));
     if b.len() >= 12 {
         out["sequence"] = json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]));
         out["ack"] = json!(u32::from_be_bytes([b[8], b[9], b[10], b[11]]));
     }
-    // BISPDU common header is 30 octets (pid, len, type, seq, ack,
-    // credit offered/available, 16-octet validation).
+    if b.len() >= 14 {
+        out["credit_offered"] = json!(b[12]);
+        out["credit_avail"] = json!(b[13]);
+    }
+    // BISPDU common header is 30 octets (pid, len(2), type, seq(4),
+    // ack(4), credit offered/available, 16-octet validation).
     let body = match b.get(30..) {
         Some(rest) if !rest.is_empty() => rest,
         _ => return out,
     };
     match pdu_type {
+        1 => {
+            if let Some(v) = parse_idrp_open(body) {
+                out["open"] = v;
+            }
+        }
         2 => {
             if let Some(v) = parse_idrp_update(body) {
                 out["update"] = v;
             }
         }
         3 => {
-            out["error_code"] = json!(body[0]);
+            let code = body[0];
+            out["error_code"] = json!(code);
+            out["error"] = json!(idrp_error_code_name(code));
             if body.len() >= 2 {
-                out["error_subcode"] = json!(body[1]);
+                let sub = body[1];
+                out["error_subcode"] = json!(sub);
+                if let Some(name) = idrp_error_subcode_name(code, sub) {
+                    out["error_subcode_text"] = json!(name);
+                }
             }
         }
         _ => {}
     }
     out
+}
+
+/// OPEN BISPDU body (ISO/IEC 10747 §7.10): version(1), hold-time(2),
+/// max-PDU-size(2), source-RDI (length-prefixed), then RIB-Atts-Set /
+/// Confed-IDs / auth-mech (variable, complex) — we decode the fixed
+/// leading fields and the source RDI, which are the reliably-framed part.
+fn parse_idrp_open(b: &[u8]) -> Option<Value> {
+    if b.len() < 6 {
+        return None;
+    }
+    let version = b[0];
+    let hold_time = u16::from_be_bytes([b[1], b[2]]);
+    let max_pdu_size = u16::from_be_bytes([b[3], b[4]]);
+    let rdi_len = b[5] as usize;
+    let mut out = json!({
+        "version": version,
+        "hold_time_s": hold_time,
+        "max_pdu_size": max_pdu_size,
+    });
+    if 6 + rdi_len <= b.len() {
+        out["src_rdi"] = json!(
+            b[6..6 + rdi_len].iter().map(|x| format!("{x:02x}")).collect::<String>()
+        );
+        // The RIB-Atts-Set, Confed-IDs and auth-mech/auth-data fields
+        // follow the source RDI but are variable-length and complex; they
+        // remain in the preserved raw hex rather than being guessed at.
+    }
+    Some(out)
 }
 
 /// UPDATE BISPDU body: withdrawn route IDs, path attributes
@@ -596,6 +925,101 @@ mod tests {
         assert_eq!(v["bispdu_len"], 12);
     }
 
+    /// Build an IDRP BISPDU: 30-octet common header (with the given type
+    /// and seq/ack/credit fields zeroed unless noted) followed by `body`.
+    fn idrp_pdu(pdu_type: u8, body: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x83, 0x00, 0x00, pdu_type];
+        b.extend([0u8; 8]); // seq, ack
+        b.extend([0u8; 2]); // credit offered/avail
+        b.extend([0u8; 16]); // validation
+        b.extend_from_slice(body);
+        let total = b.len() as u16;
+        b[1..3].copy_from_slice(&total.to_be_bytes());
+        b
+    }
+
+    #[test]
+    fn idrp_rib_refresh_is_sixth_type() {
+        // PDU type 6 must decode as RIB-REFRESH (ISO/IEC 10747 §7.1).
+        let b = idrp_pdu(6, &[]);
+        let v = parse_network(&b).unwrap();
+        assert_eq!(v["type"], "RIB-REFRESH");
+    }
+
+    #[test]
+    fn idrp_open_body_fields_decode() {
+        // OPEN body: version=1, hold-time=90 s, max-PDU=1024, src-RDI len 3.
+        let body: &[u8] = &[
+            0x01, 0x00, 0x5A, 0x04, 0x00, 0x03, 0x47, 0x00, 0x27,
+        ];
+        let v = parse_network(&idrp_pdu(1, body)).unwrap();
+        assert_eq!(v["type"], "OPEN");
+        let o = &v["open"];
+        assert_eq!(o["version"], 1);
+        assert_eq!(o["hold_time_s"], 90);
+        assert_eq!(o["max_pdu_size"], 1024);
+        assert_eq!(o["src_rdi"], "470027");
+    }
+
+    #[test]
+    fn idrp_error_code_and_subcode_text() {
+        // ERROR: code 1 (OPEN PDU error), subcode 2 (Bad max PDU size).
+        let v = parse_network(&idrp_pdu(3, &[0x01, 0x02])).unwrap();
+        assert_eq!(v["type"], "ERROR");
+        assert_eq!(v["error_code"], 1);
+        assert_eq!(v["error"], "Open PDU error");
+        assert_eq!(v["error_subcode"], 2);
+        assert_eq!(v["error_subcode_text"], "Bad max PDU size");
+        // UPDATE PDU error (2) / RD routing loop (6).
+        let v = parse_network(&idrp_pdu(3, &[0x02, 0x06])).unwrap();
+        assert_eq!(v["error"], "Update PDU error");
+        assert_eq!(v["error_subcode_text"], "RD routing loop");
+        // RIB Refresh PDU error (5) / Unsupported RIB-Atts (2).
+        let v = parse_network(&idrp_pdu(3, &[0x05, 0x02])).unwrap();
+        assert_eq!(v["error"], "RIB Refresh PDU error");
+        assert_eq!(v["error_subcode_text"], "Unsupported RIB-Atts");
+    }
+
+    #[test]
+    fn esis_options_decode() {
+        // ISH (type 4), holding time 600 s, NET, then two option TLVs:
+        // Priority (0xCF) len 1, ATN-Data-Link-Capabilities (0x88) len 2.
+        let mut b = vec![0x82, 0x00, 0x01, 0x00, 0x04, 0x02, 0x58, 0x00, 0x00];
+        b.push(3); // NET length
+        b.extend([0x47, 0x00, 0x27]);
+        b.extend([0xCF, 0x01, 0x06]); // Priority = 6
+        b.extend([0x88, 0x02, 0xAB, 0xCD]); // ATN data-link caps
+        let v = parse_network(&b).unwrap();
+        assert_eq!(v["type"], "ISH");
+        assert_eq!(v["addresses"][0], "470027");
+        let opts = v["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0]["type"], "priority");
+        assert_eq!(opts[0]["type_code"], 0xCF);
+        assert_eq!(opts[0]["value_hex"], "06");
+        assert_eq!(opts[1]["type"], "atn-data-link-capabilities");
+        assert_eq!(opts[1]["value_hex"], "abcd");
+    }
+
+    #[test]
+    fn esis_esh_options_after_address_list() {
+        // ESH (type 2): count=1, one SA, then Mobile-Subnetwork-Capabilities
+        // (0x81) and Security (0xC5) options.
+        let mut b = vec![0x82, 0x00, 0x01, 0x00, 0x02, 0x02, 0x58, 0x00, 0x00];
+        b.push(1); // address count
+        b.push(3); // SA length
+        b.extend([0x47, 0x00, 0x27]);
+        b.extend([0x81, 0x01, 0x0F]); // mobile subnetwork caps
+        b.extend([0xC5, 0x02, 0x00, 0x01]); // security
+        let v = parse_network(&b).unwrap();
+        assert_eq!(v["type"], "ESH");
+        assert_eq!(v["addresses"][0], "470027");
+        let opts = v["options"].as_array().unwrap();
+        assert_eq!(opts[0]["type"], "mobile-subnetwork-capabilities");
+        assert_eq!(opts[1]["type"], "security");
+        assert_eq!(opts[1]["value_hex"], "0001");
+    }
+
     #[test]
     fn facilities_class_lengths() {
         // class 0 (1 param byte): 0x01 0xAA; class 1 (2): 0x42 0x01 0x02;
@@ -629,6 +1053,63 @@ mod tests {
         let p = parse_x25(&rr).unwrap();
         assert_eq!(p.kind, "rr");
         assert_eq!(p.pr, Some(5));
+    }
+
+    #[test]
+    fn x25_restart_request_and_confirm() {
+        // RESTART REQUEST (0xFB): GFI modulo-8, LCN 0, cause 0x07 (Network
+        // operational in the restart-cause table), diagnostic 0x34
+        // (Time expired for restart indication).
+        let req = [0x10, 0x00, 0xFB, 0x07, 0x34];
+        let p = parse_x25(&req).unwrap();
+        assert_eq!(p.kind, "restart-request");
+        assert_eq!(p.cause, Some(0x07));
+        assert_eq!(p.cause_text, Some("Network operational"));
+        assert_eq!(p.diagnostic, Some(0x34));
+        assert_eq!(p.diagnostic_text, Some("Time expired for restart indication"));
+        // RESTART CONFIRM (0xFF): no cause/diagnostic body.
+        let conf = [0x10, 0x00, 0xFF];
+        let p = parse_x25(&conf).unwrap();
+        assert_eq!(p.kind, "restart-confirmation");
+        assert_eq!(p.cause, None);
+        assert_eq!(p.diagnostic, None);
+    }
+
+    #[test]
+    fn x25_clear_reset_cause_naming() {
+        // CLEAR REQUEST cause 0x01 = "Number busy"; reset uses a different
+        // table where 0x01 = "Out of order".
+        let clear = [0x10, 0x05, 0x13, 0x01, 0x00];
+        let p = parse_x25(&clear).unwrap();
+        assert_eq!(p.kind, "clear-request");
+        assert_eq!(p.cause_text, Some("Number busy"));
+        assert_eq!(p.diagnostic_text, Some("Cleared by system management"));
+        let reset = [0x10, 0x05, 0x1B, 0x01, 0x26];
+        let p = parse_x25(&reset).unwrap();
+        assert_eq!(p.kind, "reset-request");
+        assert_eq!(p.cause, Some(0x01));
+        assert_eq!(p.cause_text, Some("Out of order"));
+        assert_eq!(p.diagnostic_text, Some("Packet too short"));
+    }
+
+    #[test]
+    fn x25_cause_high_bit_masked() {
+        // X.25 Table 5-7: when bit 8 of the cause is set, the lower bits
+        // are the remote DTE's value; the dictionary lookup uses 0.
+        let clear = [0x10, 0x05, 0x13, 0x85, 0x00];
+        let p = parse_x25(&clear).unwrap();
+        assert_eq!(p.cause, Some(0));
+        assert_eq!(p.cause_text, Some("DTE originated"));
+    }
+
+    #[test]
+    fn x25_diagnostic_packet_names_code() {
+        // DIAG (0xF1) with an ICAO Doc 9705 extension code.
+        let diag = [0x10, 0x00, 0xF1, 0x88];
+        let p = parse_x25(&diag).unwrap();
+        assert_eq!(p.kind, "diagnostic");
+        assert_eq!(p.diagnostic, Some(0x88));
+        assert_eq!(p.diagnostic_text, Some("LREF compression not supported"));
     }
 
     #[test]

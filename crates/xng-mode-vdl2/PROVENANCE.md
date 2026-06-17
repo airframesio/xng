@@ -28,8 +28,12 @@ TL ∈ {1, 100, 1000, 131071}, AVLC FCS residue.
 
 Items flagged for live-capture verification (free spec ambiguity):
 which 2/4 of the 6 RS check octets are transmitted for short rows
-(assumed: first by transmission order), and AVLC FCS octet order (both
-orders accepted, which one matched is recorded).
+(assumed: first by transmission order). The AVLC FCS octet order is now
+pinned to little-endian (low octet transmitted first) per ISO/IEC 13239
+§4.4 — confirmed against the off-air fixture, which decodes only under
+little-endian, and consistent with dumpvdl2's GOOD_FCS=0xF0B8 residue
+check. The earlier "accept either order" behaviour was dropped to remove
+a false-accept path (the byte-swapped FCS matched ~1 bad frame in 65536).
 
 ## Off-air validation (2026-06)
 
@@ -113,9 +117,64 @@ ICAO Doc 9776/9705 — dumpvdl2 (GPL) was not consulted for this module.
 X.25 M-bit sequences reassemble per logical channel before network-
 layer parsing. ATN's LREF/deflate-compressed CLNP variants are labeled
 but deliberately left as hex (layouts not yet verified against the
-spec). XID ground-station list parameters (0x41/0x45) decode as AVLC
-addresses via the standard EN 301 841-2 address parser; the autotune
-frequency parameter stays hex under the same hex-not-guessed policy.
+spec). XID ground-station list parameters decode as AVLC addresses via
+the standard EN 301 841-2 address parser (see the XID completion note
+below).
+
+## XID parameter completion (2026-06, VDL2-3)
+
+The VDL-private parameter-set table (group 0xF0) was completed and
+corrected. The earlier table mis-numbered every entry in the 0x40–0x49
+range (e.g. it labelled 0x42 "destination-airport" — that is parameter
+0x83; 0x42 is Timer T4). The corrected numbering and the added IDs
+(autotune-frequency 0x40, replacement-GS 0x41, T4 0x42, MAC-persistence
+0x43, counter-M1 0x44, TM2 0x45, TG5 0x46, T3min 0x47, GS-address-filter
+0x48, broadcast-connection 0x49, modulation-support 0x81, alternate-GS
+0x82, destination-airport 0x83, aircraft-location 0x84, frequency-
+support-list 0xC0, airport-coverage 0xC1, nearest-airport-id 0xC3,
+ATN-router-NETs 0xC4, system-mask 0xC5, TG3 0xC6, TG4 0xC7, GS-location
+0xC8) plus the public ISO 8885 HDLC parameter set (group 0x80: 0x01–0x0B)
+were cross-checked against the *parameter-ID dictionary* in dumpvdl2's
+`xid.c` (`xid_vdl_params` / `xid_pub_params`) — protocol facts (the
+integer→name assignment and the frequency encoding), not code or
+formatter text. The 2-octet VDL2 frequency field (autotune 0x40 and each
+frequency-support-list entry) decodes to MHz via the SARPs encoding
+`freq_khz = (raw12 + 10000)·10`, rounded up to the next 25 kHz step, with
+the modulation-support nibble in the top 4 bits; timer/counter parameters
+also decode to a big-endian integer alongside the preserved raw hex.
+Address-list parameters (replacement-GS 0x41, GS-address-filter 0x48,
+alternate-GS 0x82, system-mask 0xC5) decode as 4-octet AVLC addresses.
+
+## IDRP + ES-IS completion (2026-06, VDL2-6)
+
+The IDRP (ISO/IEC 10747) decoder gained the sixth BISPDU type RIB-REFRESH
+(type 6), the OPEN PDU body's reliably-framed leading fields (version,
+hold-time, max-PDU-size, source RDI — the variable RIB-Atts-Set /
+Confed-IDs / auth-mech tail stays in raw hex), the credit-offered/avail
+header octets, and named ERROR code + subcode text. The ES-IS (ISO/IEC
+9542) decoder now parses the trailing option TLVs on ESH/ISH PDUs:
+Mobile-Subnetwork-Capabilities (0x81), ATN-Data-Link-Capabilities (0x88),
+Priority (0xCF), and Security (0xC5). The BISPDU-type number (6), the
+error-code/subcode dictionaries, and the ES-IS option-type IDs/names were
+cross-checked against dumpvdl2's `idrp.c`/`idrp.h` and `esis.c` — protocol
+facts (the integer→name assignments) only, not code or formatter text.
+
+## X.25 completion (2026-06, VDL2-4)
+
+The X.25 (ISO/IEC 8208) packet decoder gained RESTART-REQUEST (0xFB,
+carrying cause + diagnostic) and RESTART-CONFIRM (0xFF) — previously
+dropped — and now resolves the clearing/reset/restart cause and the
+diagnostic code to text. Three separate cause tables (clear/reset/restart,
+ITU-T X.25 Table 5-7) and one ~150-entry diagnostic table (X.25 Annex E +
+ISO 8208 + ICAO Doc 9705 Table 5.7-3 / Doc 9880 extensions) are applied;
+RESET-REQUEST now captures its cause + diagnostic too (it previously
+carried neither). The X.25 Table 5-7 rule that a cause octet with bit 8
+set carries the remote DTE's lower bits is honoured by normalising the
+lookup key to 0. The packet-type constants (RESTART 0xFB/0xFF, DIAG 0xF1)
+and the cause/diagnostic dictionaries were cross-checked against
+dumpvdl2's `x25.c`/`x25.h` — protocol facts only, not code or formatter
+text. Facility codes remain numeric (facility naming was out of this
+task's scope).
 
 ## ATN-B1 CPDLC + CM (2026-06)
 
