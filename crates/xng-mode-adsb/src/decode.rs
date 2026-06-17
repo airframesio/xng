@@ -407,7 +407,10 @@ pub fn df18_cf_class(cf: u8) -> (&'static str, &'static str, &'static str) {
 }
 
 /// 13-bit Mode S altitude field (AC, DF0/4/16/20): M-bit metric flag,
-/// Q-bit 25 ft, else 100 ft Gillham.
+/// Q-bit 25 ft, else 100 ft Gillham. The Gillham branch routes through the
+/// dump1090-verified Mode A/C ladder ([`crate::mode_ac::gillham_ac13_ft`]),
+/// which matches both dump1090 (`decodeAC13Field`) and pyModeS
+/// (`_altcode.altcode_to_altitude`) exactly across all 4096 codes.
 pub fn altitude13(ac: u32) -> Option<i32> {
     if ac == 0 {
         return None;
@@ -421,52 +424,30 @@ pub fn altitude13(ac: u32) -> Option<i32> {
         let n = ((ac & 0x1F80) >> 2) | ((ac & 0x20) >> 1) | (ac & 0x0F);
         return Some(n as i32 * 25 - 1000);
     }
-    gillham(gray_reorder(ac))
+    crate::mode_ac::gillham_ac13_ft(ac)
 }
 
-/// Reorder the interleaved AC bits (C1 A1 C2 A2 C4 A4 [M] B1 [Q] B2 D2
-/// B4 D4) into Gillham D2 D4 A1 A2 A4 B1 B2 B4 C1 C2 C4.
-fn gray_reorder(ac: u32) -> u32 {
-    let b = |k: u32| (ac >> k) & 1; // k = bit from LSB
-    // AC bits, MSB-first positions: C1=12 A1=11 C2=10 A2=9 C4=8 A4=7
-    // M=6 B1=5 Q=4 B2=3 D2=2 B4=1 D4=0
-    let (c1, a1, c2, a2, c4, a4) = (b(12), b(11), b(10), b(9), b(8), b(7));
-    let (b1, b2, d2, b4, d4) = (b(5), b(3), b(2), b(1), b(0));
-    (d2 << 10)
-        | (d4 << 9)
-        | (a1 << 8)
-        | (a2 << 7)
-        | (a4 << 6)
-        | (b1 << 5)
-        | (b2 << 4)
-        | (b4 << 3)
-        | (c1 << 2)
-        | (c2 << 1)
-        | c4
+/// 12-bit ADS-B airborne-position altitude field (TC 9–18): a 13-bit AC
+/// field with the M bit removed (always 0). Q=1 → 25 ft linear; Q=0 →
+/// 100 ft Gillham. Reinserts a zero M bit at position 6 and delegates to
+/// [`altitude13`] — the dump1090 `decodeAC12Field` procedure, which both
+/// dump1090 and pyModeS `bds05` follow. `None` for a zero field or an
+/// invalid Gillham code.
+pub fn altitude12(ac12: u32) -> Option<i32> {
+    if ac12 == 0 {
+        return None;
+    }
+    // Insert a zero M bit at position 6: top 6 bits shift up by one, low 6
+    // bits stay (dump1090 `decodeAC12Field` Gillham branch).
+    let ac13 = ((ac12 & 0x0FC0) << 1) | (ac12 & 0x003F);
+    altitude13(ac13)
 }
 
-/// Gillham (Gray-coded) altitude: 500 ft Gray ladder + reflected 100 ft
-/// subdivision. Input: D2 D4 A1 A2 A4 B1 B2 B4 | C1 C2 C4.
-fn gillham(g: u32) -> Option<i32> {
-    let mut n500 = g >> 3;
-    // Gray → binary.
-    let mut mask = n500 >> 1;
-    while mask != 0 {
-        n500 ^= mask;
-        mask >>= 1;
-    }
-    let mut n100 = match g & 7 {
-        0b001 => 0,
-        0b011 => 1,
-        0b010 => 2,
-        0b110 => 3,
-        0b100 => 4,
-        _ => return None, // 0, 5, 7 invalid
-    };
-    if n500 % 2 == 1 {
-        n100 = 4 - n100; // odd 500 ft rungs count back down
-    }
-    Some(n500 as i32 * 500 + n100 * 100 - 1300)
+/// 12-bit GNSS-height field (TC 20–22 geometric altitude): an unsigned
+/// integer count of metres, converted to feet. pyModeS `bds05`
+/// (`int(ac * 3.28084)`). `None` for a zero field (not available).
+pub fn gnss_height_ft(ac12: u32) -> Option<i32> {
+    (ac12 != 0).then(|| (ac12 as f64 * 3.28084) as i32)
 }
 
 /// 13-bit identity field (DF5/21) → 4-digit squawk. Bit order (MSB
@@ -754,15 +735,48 @@ mod tests {
     }
 
     #[test]
-    fn gillham_altitude_examples() {
-        // Published Gillham example: C1 A1 C2 A2 C4 A4 B1 B2 D2 B4 D4 for
-        // 1300 ft is all-zeros except C1+C4? Use the identity: 0 ft case.
-        // Validate via inverse property on a few rungs instead.
-        for alt in [-1000i32, 0, 1100, 5000, 12_400] {
-            // encode: find g such that gillham(g)==alt by brute force
-            let found = (0..2048u32).find(|&g| gillham(g) == Some(alt));
-            assert!(found.is_some(), "no Gillham code decodes to {alt}");
+    fn altitude13_gillham_matches_dump1090_pymodes() {
+        // Oracle: the dump1090 `decodeAC13Field` Gillham branch
+        // (`modeAToModeC(decodeID13Field(ac))`), which matches pyModeS
+        // `_altcode.altcode_to_altitude` byte-for-byte. AC13 fields are
+        // built by re-inserting the M=0 bit into the verified AC12 Gillham
+        // samples (ac12 << shifting per dump1090 decodeAC12Field):
+        // ac12 0x248 → 5000 ft, 0x0C8 → 4800 ft, 0x0C2 → 5800 ft.
+        for (ac12, exp) in [(0x248u32, 5000i32), (0x0C8, 4800), (0x0C2, 5800)] {
+            let ac13 = ((ac12 & 0x0FC0) << 1) | (ac12 & 0x003F);
+            assert_eq!(altitude13(ac13), Some(exp), "ac12 {ac12:#05x}");
         }
+    }
+
+    #[test]
+    fn altitude12_q1_and_q0_match_pymodes() {
+        // Q=1 (25-ft linear) path, from the pyModeS test_adsb altitude
+        // vectors (the 12-bit ME altitude field of each frame):
+        //   8D40621D58C382… → 38000 ft;  8d484fde5803b647… → -325 ft.
+        let ac_of = |frame: &str| -> u32 {
+            let me = me_of(frame);
+            let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+            (8..20).fold(0u32, |v, i| (v << 1) | bit(i))
+        };
+        assert_eq!(altitude12(ac_of("8D40621D58C382D690C8AC2863A7")), Some(38000));
+        assert_eq!(altitude12(ac_of("8d484fde5803b647ecec4fcdd74f")), Some(-325));
+        assert_eq!(altitude12(ac_of("8d346355580b064116e70a269f97")), Some(1000));
+        // Q=0 (Gillham) path, from CRC-valid pyModeS-verified frames built
+        // around the verified AC12 Gillham samples.
+        assert_eq!(altitude12(ac_of("8D40621D582482B504C5C9D9B414")), Some(5000));
+        assert_eq!(altitude12(ac_of("8D40621D580C82B504C5C92B2279")), Some(4800));
+        assert_eq!(altitude12(ac_of("8D40621D580C22B504C5C930E8B0")), Some(5800));
+        // Zero field → not available.
+        assert_eq!(altitude12(0), None);
+    }
+
+    #[test]
+    fn gnss_height_matches_pymodes() {
+        // pyModeS bds05 GNSS-height conversion: int(ac * 3.28084).
+        // TC20 frame with ac12 = 3000 m → 9842 ft (pyModeS decode()).
+        assert_eq!(gnss_height_ft(3000), Some(9842));
+        assert_eq!(gnss_height_ft(1000), Some(3280));
+        assert_eq!(gnss_height_ft(0), None);
     }
 
     #[test]

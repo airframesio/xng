@@ -333,14 +333,10 @@ fn decode_extended_squitter(me: &[u8], f: &mut AdsbFrame) {
             f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: true });
             f.velocity = decode::surface_velocity(me);
         }
-        // Airborne position with barometric altitude.
+        // Airborne position with barometric altitude (Q=1 25-ft linear or
+        // Q=0 100-ft Gillham — both decoded via the dump1090/pyModeS path).
         9..=18 => {
-            let alt12 = field(8, 12);
-            let q = (alt12 >> 4) & 1;
-            if q == 1 {
-                let n = ((alt12 & 0xFE0) >> 1) | (alt12 & 0x00F);
-                f.altitude_ft = Some((n as i32) * 25 - 1000);
-            }
+            f.altitude_ft = decode::altitude12(field(8, 12));
             f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false });
             // Per-fix position quality: version-0 NUCp from the TC plus the
             // in-message NICb supplement bit (ME bit 7). Version-aware NIC
@@ -368,11 +364,18 @@ fn decode_extended_squitter(me: &[u8], f: &mut AdsbFrame) {
                 f.adsb_status = Some(serde_json::Value::Object(o));
             }
         }
-        // Airborne position with GNSS height: take the position; the
-        // altitude encoding differs (HAE) and is left undecoded.
+        // Airborne position with GNSS (geometric) height: the 12-bit
+        // altitude is HAE metres, not barometric — surfaced under
+        // adsb_status.geometric_altitude_ft rather than altitude_ft.
         20..=22 => {
             f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false });
-            f.adsb_status = decode::position_quality(tc, bit(7), None, 0, 0);
+            let mut q = decode::position_quality(tc, bit(7), None, 0, 0)
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            if let Some(geo) = decode::gnss_height_ft(field(8, 12)) {
+                q.insert("geometric_altitude_ft".into(), serde_json::json!(geo));
+            }
+            f.adsb_status = Some(serde_json::Value::Object(q));
         }
         // Aircraft status (emergency/priority + ACAS RA broadcast).
         28 => f.adsb_status = decode::aircraft_status(me),
@@ -423,6 +426,59 @@ mod tests {
         assert_eq!(f.icao, 0x40621D);
         assert_eq!(f.altitude_ft, Some(38_000));
         assert_eq!(v.released[0].1.altitude_ft, Some(38_000));
+        // The 38000 ft frame is a TC11 airborne position → NUCp 7 in the
+        // per-fix position-quality object (ADSB-1.5/2 wiring).
+        let st = f.adsb_status.expect("position quality present");
+        assert_eq!(st["nuc_p"], 7);
+        assert_eq!(st["nuc_p_radius_m"], 93);
+    }
+
+    /// Hex → 14-byte frame.
+    fn frame_bytes(hex: &str) -> [u8; 14] {
+        let mut b = [0u8; 14];
+        for i in 0..14 {
+            b[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        b
+    }
+
+    #[test]
+    fn decodes_q0_gillham_airborne_altitude() {
+        // CRC-valid DF17 TC11 frame whose AC12 is a Q=0 Gillham code for
+        // 5000 ft (pyModeS decode() → altitude 5000). Confirms the
+        // airborne-position path now decodes the legacy 100-ft encoding.
+        let mut v = FrameValidator::new();
+        let frame = frame_bytes("8D40621D582482B504C5C9D9B414");
+        let f = confirmed(&mut v, &frame);
+        assert_eq!(f.icao, 0x40621D);
+        assert_eq!(f.altitude_ft, Some(5000));
+    }
+
+    #[test]
+    fn decodes_geometric_altitude_into_status() {
+        // CRC-valid DF17 TC20 frame with a GNSS height of 3000 m
+        // (pyModeS decode() → altitude 9842 ft). The geometric altitude
+        // lands in adsb_status, not the barometric altitude_ft field.
+        let mut v = FrameValidator::new();
+        let frame = frame_bytes("8D40621DA0BB82B504C5C90C5BBF");
+        let f = confirmed(&mut v, &frame);
+        assert_eq!(f.altitude_ft, None, "geometric is not barometric alt");
+        let st = f.adsb_status.expect("status present");
+        assert_eq!(st["geometric_altitude_ft"], 9842);
+        assert_eq!(st["nuc_p"], 9); // TC20 → NUCp 9
+    }
+
+    #[test]
+    fn velocity_quality_folds_into_status() {
+        // CRC-valid DF17 TC19 velocity frame (the published ground-speed
+        // example): NACv/VR-source/geo-minus-baro fold into adsb_status.
+        let mut v = FrameValidator::new();
+        let frame = frame_bytes("8D485020994409940838175B284F");
+        let f = confirmed(&mut v, &frame);
+        let st = f.adsb_status.expect("velocity quality present");
+        assert_eq!(st["nac_v"], 0);
+        assert_eq!(st["vertical_rate_source"], "gnss");
+        assert_eq!(st["geo_minus_baro_ft"], 550);
     }
 
     #[test]

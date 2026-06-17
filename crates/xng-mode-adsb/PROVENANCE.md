@@ -177,3 +177,29 @@ every airborne position frame under `adsb_status.nuc_p`; NACv/VR-source/
 geo-baro fold into `adsb_status` on TC19; the version-aware NIC is exposed
 by `position_quality` for a caller that pairs a position TC with the
 aircraft's last operational-status supplement.
+
+## Q=0 Gillham + geometric altitude (ADSB-2, 2026-06)
+
+The airborne-position altitude path was completed: TC 9–18 Q=0 (100-ft
+Gillham) altitude (previously left `None`, only Q=1 25-ft was decoded) and
+TC 20–22 geometric (GNSS) altitude. The Gillham branch of `altitude13`
+(and the new `altitude12`, the M-bit-removed 12-bit ADS-B field) now
+routes through `mode_ac::gillham_ac13_ft`, a port of the documented
+dump1090 `decodeID13Field` → `internalModeAToModeC` ladder
+(`decodeAC13Field` / `decodeAC12Field` Gillham branches). This both
+*corrects a latent off-by-100-ft bug* in the old `gillham`/`gray_reorder`
+helpers (a divergent n100 convention) and adds the ADS-B path — the new
+ladder matches dump1090 AND pyModeS `_altcode.altcode_to_altitude`
+byte-for-byte across all 4096 AC codes (exhaustively cross-checked).
+`gnss_height_ft` follows pyModeS `bds05` (`int(metres·3.28084)`).
+Verification (external, not loopback): `altitude12`/`altitude13` Gillham
+asserts use AC fields whose pyModeS `decode()` altitude was confirmed on
+CRC-valid DF17 frames (`8D40621D582482B5…` → 5000 ft Q=0, plus 4800/5800);
+Q=1 asserts reuse the published pyModeS `test_adsb` altitude vectors
+(38000, −325, 1000 ft); `gnss_height_ft` is pinned to a pyModeS-decoded
+TC20 frame (3000 m → 9842 ft); `mode_ac::gillham_ac13_ft` is pinned to the
+dump1090/pyModeS ladder. Barometric altitude continues to populate
+`altitude_ft`; geometric altitude is surfaced under
+`adsb_status.geometric_altitude_ft` (it is HAE, not barometric). The
+vertical-rate source bit and the GNSS-minus-baro difference (the rest of
+ADSB-2) were delivered with the velocity trailer in ADSB-1.5 above.
