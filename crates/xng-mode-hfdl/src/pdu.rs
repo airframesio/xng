@@ -127,6 +127,11 @@ pub struct HfdlEvent {
     pub details: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acars: Option<AcarsBlock>,
+    /// Coded symbols the Viterbi decoder corrected for the burst this event
+    /// came from (HFDL-5). Set by the demod path; `None` for events built
+    /// directly from bytes (tests, reassembled system tables).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fec_corrected: Option<u32>,
     #[serde(skip_serializing)]
     pub raw: Vec<u8>,
 }
@@ -197,6 +202,7 @@ impl PduParser {
                 "neighbor3_gs_id": (p[60] >> 4) as u16 | ((p[61] as u16 & 0x7) << 4),
             }),
             acars: None,
+            fec_corrected: None,
             raw: p[..66].to_vec(),
         });
         let _ = bps;
@@ -285,12 +291,14 @@ impl PduParser {
                 kind: "logon-request".into(),
                 details: json!({ "icao": icao(&body[1..4]), "who": who }),
                 acars: None,
+                fec_corrected: None,
                 raw: l.to_vec(),
             }),
             0x4F if body.len() >= 4 => out.push(HfdlEvent {
                 kind: "logon-resume".into(),
                 details: json!({ "icao": icao(&body[1..4]), "who": who }),
                 acars: None,
+                fec_corrected: None,
                 raw: l.to_vec(),
             }),
             0x9F | 0x5F if body.len() >= 5 => {
@@ -302,6 +310,7 @@ impl PduParser {
                     kind: "logon-confirm".into(),
                     details: json!({ "icao": icao_str, "assigned_id": body[4], "who": who }),
                     acars: None,
+                    fec_corrected: None,
                     raw: l.to_vec(),
                 });
             }
@@ -319,6 +328,7 @@ impl PduParser {
                         "who": who,
                     }),
                     acars: None,
+                    fec_corrected: None,
                     raw: l.to_vec(),
                 });
             }
@@ -337,6 +347,7 @@ impl PduParser {
                         "who": who,
                     }),
                     acars: None,
+                    fec_corrected: None,
                     raw: l.to_vec(),
                 });
             }
@@ -344,6 +355,7 @@ impl PduParser {
                 kind: "lpdu".into(),
                 details: json!({ "type": t, "type_name": lpdu_type_name(t), "who": who }),
                 acars: None,
+                fec_corrected: None,
                 raw: l.to_vec(),
             }),
         }
@@ -362,6 +374,7 @@ impl PduParser {
                     "data_hex": h.iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 }),
                 acars: None,
+                fec_corrected: None,
                 raw: h.to_vec(),
             });
         };
@@ -377,6 +390,7 @@ impl PduParser {
                         kind: "acars".into(),
                         details: json!({ "who": who, "bps": bps }),
                         acars: Some(b),
+                        fec_corrected: None,
                         raw: h.to_vec(),
                     });
                 } else {
@@ -427,6 +441,7 @@ impl PduParser {
                         "who": who,
                     }),
                     acars: None,
+                    fec_corrected: None,
                     raw: h.to_vec(),
                 });
             }
@@ -473,6 +488,7 @@ impl PduParser {
                         "who": who,
                     }),
                     acars: None,
+                    fec_corrected: None,
                     raw: h.to_vec(),
                 });
             }
@@ -483,6 +499,7 @@ impl PduParser {
                     kind: "systable-partial".into(),
                     details: json!({ "seq": seq, "total": total, "version": version }),
                     acars: None,
+                    fec_corrected: None,
                     raw: h.to_vec(),
                 });
                 if let Some(table) = self.systable.store(version, seq, total, &h[5..]) {
@@ -490,6 +507,7 @@ impl PduParser {
                         kind: "systable-complete".into(),
                         details: serde_json::to_value(&table).unwrap_or_default(),
                         acars: None,
+                        fec_corrected: None,
                         raw: Vec::new(),
                     });
                 }
@@ -504,6 +522,7 @@ impl PduParser {
                         "who": who,
                     }),
                     acars: None,
+                    fec_corrected: None,
                     raw: h.to_vec(),
                 });
             }
@@ -513,6 +532,7 @@ impl PduParser {
                     kind: "delayed-echo".into(),
                     details: json!({ "who": who }),
                     acars: None,
+                    fec_corrected: None,
                     raw: h.to_vec(),
                 });
             }
@@ -524,6 +544,7 @@ impl PduParser {
                     "who": who,
                 }),
                 acars: None,
+                fec_corrected: None,
                 raw: h.to_vec(),
             }),
         }

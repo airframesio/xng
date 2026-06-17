@@ -81,7 +81,12 @@ impl HfdlChannelDecoder {
         };
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
-            out.extend(self.parser.parse(&burst.payload, burst.bps));
+            for mut e in self.parser.parse(&burst.payload, burst.bps) {
+                // Stamp every event from this burst with the Viterbi
+                // corrected-symbol count (HFDL-5).
+                e.fec_corrected = Some(burst.fec_corrected);
+                out.push(e);
+            }
         }
         out
     }
@@ -110,7 +115,7 @@ pub fn to_message(e: &pdu::HfdlEvent, frequency_hz: u64, level_dbfs: f32, source
         timestamp: Utc::now(),
         frequency_hz,
         signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
-        decode: DecodeQuality { crc_ok, fec_corrected: None, errors },
+        decode: DecodeQuality { crc_ok, fec_corrected: e.fec_corrected, errors },
         body,
         raw: Some(e.raw.clone()),
         source,

@@ -31,16 +31,22 @@ fn decodes_real_squitter() {
     for chunk in samples.chunks(65_536) {
         for e in dec.process(chunk) {
             if e.kind == "squitter" {
-                squitters.push(e.details.clone());
+                squitters.push(e.clone());
             }
         }
     }
     assert!(!squitters.is_empty(), "no squitter decoded from the off-air capture");
     // Ground truth from dumphfdl 1.7.0 on the same recording.
-    let s = &squitters[0];
+    let s = &squitters[0].details;
     assert_eq!(s["gs_id"], 4, "ground station (Riverhead)");
     assert_eq!(s["frame_index"], 2397);
     assert_eq!(s["frame_offset"], 1);
     assert_eq!(s["systable_version"], 52);
     assert_eq!(s["utc_sync"], true);
+    // HFDL-5: the demod path stamps the Viterbi corrected-symbol count on
+    // every real-signal event (it CRC-validated, so the count is bounded).
+    assert!(
+        squitters[0].fec_corrected.is_some(),
+        "fec_corrected populated on the off-air squitter"
+    );
 }
