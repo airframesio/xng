@@ -18,6 +18,14 @@ file and the crate documentation provide. Ported structures (from
 - IRA field layout (sat/beam/x/y/z/interval/timeslot/EPI/sub-band +
   42-bit pages terminated by an all-ones page) and the geocentric
   position conversion.
+- MS messaging frame layout incl. the acquisition group ("AQ", group
+  "A" / ms_type==1) header: `unknown1`/`secondary` (header bits 19/20)
+  and the 12-bit pre-message counter `ctr1`, per toolkit
+  `IridiumMSMessage`. IRID-1 note: the toolkit/sniffer have no distinct
+  `IridiumNXTMessage` or a `10`-prefixed sync type — only the `11`-prefix
+  Time-Location (ISY) header is a real typed frame, so NXT is left out
+  (no reference to verify against) and the acquisition path exposes the
+  group-A fields rather than discarding them.
 
 PHY facts (no code) from **gr-iridium** and **iridium-sniffer**
 (https://github.com/alphafox02/iridium-sniffer, both GPL-3): 25 000
@@ -44,6 +52,45 @@ len/count header, multi-message merge) from
 iridiumtk/reassembler/{ida,sbd}.py. The ACARS payload is a standard
 SOH-prefixed parity ACARS block, parsed by xng-acars and emitted as a
 first-class ACARS message.
+
+Broadcast-time (`iri_time` / `tmsi_expiry`) conversion follows
+iridium-toolkit `util.fmt_iritime` (90 ms ticks, the two ERA2-window
+leap seconds 2015-06-30 / 2016-12-31) but extends it for the network's
+periodic **re-epoch** (L-Band Frame Number reset), which the stock
+toolkit does not handle: the counter restarts near zero at each re-epoch
+(ERA1 2007-03-08, ERA2 2014-05-11, ERA3 2025-02-14, ERA4 2026-01-14
+18:08 UTC per the MetOcean technical bulletin / 2026 security analysis),
+so `ira::iri_time_unix` selects the era in force at the frame's
+wall-clock receive time. Without this, every post-2025 frame decoded
+~11 years into the past. The ERA2 path remains bit-identical to
+`fmt_iritime` (pinned in `ira::time_tests` against toolkit-generated
+values and in the off-air `tmsi_expiry` oracle).
+
+GSM layer-3 message labelling (`gsm.rs`, IRID-3) extends the
+CC/MM/SMS transaction-identifier map with the Radio Resource (RR, PD
+0x06), GPRS-MM (0x08) and SS (0x0b) protocol discriminators.
+iridium-toolkit only forwards the raw L2 bytes over GSMTAP for
+Wireshark to dissect (`-m lap`), so the on-air RR subset is taken from
+the toolkit's `IDA-GSM.txt` (06.05 SI-5bis, 06.07 SI-2quater, 06.3a
+Immediate-Assignment-reject, 06.3b Additional-Assignment, 08.05 GMM
+Detach, 0b.3b Register) and the Immediate-Assignment / Paging /
+System-Information families are the standard GSM 04.08 / 3GPP TS 44.018
+§10.4 message-type values. The 0x0600 opcode is left to the SBD/ACARS
+transport path (it is the Register/SBD-uplink type, not RR). The LCW
+link-control layer is already exposed as structured JSON
+(`lib::lcw_descriptor`) on duplex traffic / U3 frames.
+
+Upper-layer IP credential recovery (`iip.rs`, IRID-2) scans the
+plaintext IIP/IIR data payloads (the IP channel is ~88% unencrypted) for
+PPP PAP Authenticate-Request credentials (peer-id + password; framing per
+RFC 1334 §2.2, PPP protocol id 0xC023) and HTTP Basic-Auth headers
+(`Authorization: Basic <base64>` → user:pass, RFC 7617 + RFC 4648
+base64). Neither iridium-toolkit nor iridium-sniffer decode this layer
+(they stop at the "IP via PPP" framing), so the parser is verified
+against the published RFC byte layouts and base64 test vectors rather
+than a decoder oracle. Scope is per-frame plaintext (one PAP request or
+HTTP header within a single IIP/IIR frame); cross-frame IP-session
+reassembly is left for a future stateful pass.
 
 ## Validation
 
