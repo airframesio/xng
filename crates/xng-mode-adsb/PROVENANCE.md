@@ -47,6 +47,26 @@ unit tests; AC13 altitude reuses the existing `altitude13` decoder (proven
 identical to pyModeS `altcode_to_altitude`). Added to the `bds_infer`
 exactly-one-validates candidate set and emitted under `comm_b`.
 
+## Comm-B BDS 4,4 / 4,5 — meteorological registers (2026-06)
+
+BDS 4,4 (Meteorological Routine Air Report, ICAO Doc 9871 Table A-2-33:
+FOM, wind speed/direction, static air temperature, pressure, turbulence,
+humidity) and BDS 4,5 (Meteorological Hazard Report, Table A-2-32:
+turbulence / wind-shear / microburst / icing / wake-vortex levels +
+temperature / pressure / radio height) MB-field layouts, the sign-magnitude
+temperature convention, the status/value-consistency gates, and the BDS 1,7
+disambiguation for 4,5 were cross-checked against the pyModeS `bds44` /
+`bds45` decoders and their `test_bds_commb` TestBds44*/TestBds45* vectors
+(golden frames `A0001692185BD5CF400000DFC696` → wind 22 kt / 344.5° /
+−48.75 °C and `A00004190001FB80000000000000` → −4.5 °C, plus the multi-
+field / multi-hazard synthetic payloads) — facts/positions only, no code
+ported; those real vectors are vendored as `decode.rs` unit tests. Both are
+heuristic registers that collide with the EHS layouts, so — mirroring
+pyModeS's `include_meteo` separation — they are NOT in the strict
+exactly-one-validates set: `bds_infer` tries them only as a fallback when
+the ELS/EHS set is unambiguously empty, leaving existing decoding
+unperturbed. Emitted under `comm_b`.
+
 ## Operational status / aircraft status (2026-06)
 
 TC 31 (Aircraft Operational Status — BDS 6,5) and TC 28 (Aircraft Status)

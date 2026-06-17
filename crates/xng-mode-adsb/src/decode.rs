@@ -530,6 +530,22 @@ fn mb_signed(mb: &[u8], sign_bit: usize, start: usize, len: usize) -> i32 {
     if mb_bit(mb, sign_bit) == 1 { v - (1 << len) } else { v }
 }
 
+/// Sign-magnitude combine: a `len`-bit magnitude and a separate sign bit
+/// (1 = negative). Mirrors pyModeS `_helpers.signed` — NOT two's
+/// complement: sign=1, magnitude=0 represents −2^len.
+fn sign_mag(magnitude: u32, len: usize, sign: u32) -> i32 {
+    if sign == 1 { magnitude as i32 - (1 << len) } else { magnitude as i32 }
+}
+
+/// Status/value consistency gate (pyModeS `_helpers.wrong_status`): a
+/// status-gated field must have an all-zero value field when its status
+/// bit is clear. Returns true when status == 0 but the value is nonzero
+/// (corrupt frame or a non-matching register that passed the format-ID).
+/// All positions are 1-indexed (the `mb_bit`/`mb_field` convention).
+fn wrong_status(mb: &[u8], status_bit: usize, value_start: usize, value_len: usize) -> bool {
+    mb_bit(mb, status_bit) == 0 && mb_field(mb, value_start, value_len) != 0
+}
+
 /// BDS 2,0 — aircraft identification.
 pub fn bds20(mb: &[u8]) -> Option<serde_json::Value> {
     if mb_field(mb, 1, 8) != 0x20 {
@@ -704,14 +720,175 @@ pub fn bds60(mb: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+/// Strict BDS 1,7 (GICB capability) pattern test: the BDS 2,0 capability
+/// (MB bit 7) is mandatory and MB bits 25–56 (32 bits) must be zero
+/// (pyModeS `bds17.is_bds17`). Used both by `bds17` and to disambiguate
+/// the meteorological registers from a capability report.
+fn is_bds17_pattern(mb: &[u8]) -> bool {
+    if mb.iter().all(|&b| b == 0) {
+        return false;
+    }
+    if mb_bit(mb, 7) == 0 {
+        return false;
+    }
+    mb_field(mb, 25, 32) == 0
+}
+
+/// BDS 4,4 — Meteorological Routine Air Report (MRAR): wind, static air
+/// temperature, pressure, turbulence, humidity at the aircraft's position
+/// (ICAO Doc 9871 Table A-2-33). A pilot-optional, heuristic register —
+/// like pyModeS it is kept out of the default `bds_infer` set (it collides
+/// with the EHS registers) and offered via the meteo-aware path.
+///
+/// MB positions (1-indexed): FOM 1–4, wind status 5, wind speed 6–14 (kt),
+/// wind direction 15–23 (raw·180/256°), temp sign 24, temp 25–34
+/// (signed·0.25 °C), pressure status 35, pressure 36–46 (hPa), turbulence
+/// status 47, turbulence 48–49, humidity status 50, humidity 51–56
+/// (raw·100/64 %).
+pub fn bds44(mb: &[u8]) -> Option<serde_json::Value> {
+    if mb.iter().all(|&b| b == 0) {
+        return None;
+    }
+    let fom = mb_field(mb, 1, 4);
+    if fom > 4 {
+        return None;
+    }
+    // Wind must be present (pyModeS heuristic).
+    if mb_bit(mb, 5) == 0 {
+        return None;
+    }
+    if wrong_status(mb, 35, 36, 11) || wrong_status(mb, 47, 48, 2) || wrong_status(mb, 50, 51, 6) {
+        return None;
+    }
+    let wind_speed = mb_field(mb, 6, 9);
+    if wind_speed > 250 {
+        return None;
+    }
+    let wind_dir_raw = mb_field(mb, 15, 9);
+    let temp_raw = mb_field(mb, 25, 10);
+    let temp_c = sign_mag(temp_raw, 10, mb_bit(mb, 24)) as f64 * 0.25;
+    if !(-80.0..=60.0).contains(&temp_c) {
+        return None;
+    }
+    // Reject all-zero meteorological data.
+    if wind_speed == 0 && wind_dir_raw == 0 && temp_raw == 0 {
+        return None;
+    }
+    let mut o = serde_json::Map::new();
+    o.insert("bds".into(), "4,4".into());
+    o.insert("figure_of_merit".into(), serde_json::json!(fom));
+    o.insert("wind_speed".into(), serde_json::json!(wind_speed));
+    o.insert("wind_direction".into(), serde_json::json!(wind_dir_raw as f64 * 180.0 / 256.0));
+    o.insert("static_air_temperature".into(), serde_json::json!(temp_c));
+    if mb_bit(mb, 35) == 1 {
+        o.insert("static_pressure".into(), serde_json::json!(mb_field(mb, 36, 11)));
+    }
+    if mb_bit(mb, 47) == 1 {
+        o.insert("turbulence".into(), serde_json::json!(mb_field(mb, 48, 2)));
+    }
+    if mb_bit(mb, 50) == 1 {
+        o.insert("humidity".into(), serde_json::json!(mb_field(mb, 51, 6) as f64 * 100.0 / 64.0));
+    }
+    Some(serde_json::Value::Object(o))
+}
+
+/// BDS 4,5 — Meteorological Hazard Report (MHR): turbulence, wind shear,
+/// microburst, icing, wake-vortex hazard levels plus static air
+/// temperature, pressure, and radio height (ICAO Doc 9871 Table A-2-32).
+/// Heuristic register; offered via the meteo-aware path only.
+///
+/// MB positions (1-indexed): turbulence status 1 / level 2–3; wind shear
+/// status 4 / level 5–6; microburst status 7 / level 8–9; icing status 10
+/// / level 11–12; wake vortex status 13 / level 14–15; temp status 16 /
+/// sign 17 / magnitude 18–26 (signed·0.25 °C); pressure status 27 /
+/// pressure 28–38 (hPa); radio-height status 39 / height 40–51 (raw·16 ft);
+/// reserved 52–56 (must be zero).
+pub fn bds45(mb: &[u8]) -> Option<serde_json::Value> {
+    if mb.iter().all(|&b| b == 0) {
+        return None;
+    }
+    // Disambiguate from a BDS 1,7 capability report (pyModeS gate).
+    if is_bds17_pattern(mb) {
+        return None;
+    }
+    // Reserved bits 52–56 must be zero.
+    if mb_field(mb, 52, 5) != 0 {
+        return None;
+    }
+    let gates = [
+        (1usize, 2usize, 2usize),  // turbulence
+        (4, 5, 2),                 // wind shear
+        (7, 8, 2),                 // microburst
+        (10, 11, 2),               // icing
+        (13, 14, 2),               // wake vortex
+        (16, 17, 10),              // temperature (sign + 9-bit magnitude)
+        (27, 28, 11),              // static pressure
+        (39, 40, 12),              // radio height
+    ];
+    for (s, vs, vl) in gates {
+        if wrong_status(mb, s, vs, vl) {
+            return None;
+        }
+    }
+    // Temperature range check (only when its status bit is set).
+    if mb_bit(mb, 16) == 1 {
+        let temp_c = sign_mag(mb_field(mb, 18, 9), 9, mb_bit(mb, 17)) as f64 * 0.25;
+        if !(-80.0..=60.0).contains(&temp_c) {
+            return None;
+        }
+    }
+    let mut o = serde_json::Map::new();
+    o.insert("bds".into(), "4,5".into());
+    if mb_bit(mb, 1) == 1 {
+        o.insert("turbulence".into(), serde_json::json!(mb_field(mb, 2, 2)));
+    }
+    if mb_bit(mb, 4) == 1 {
+        o.insert("wind_shear".into(), serde_json::json!(mb_field(mb, 5, 2)));
+    }
+    if mb_bit(mb, 7) == 1 {
+        o.insert("microburst".into(), serde_json::json!(mb_field(mb, 8, 2)));
+    }
+    if mb_bit(mb, 10) == 1 {
+        o.insert("icing".into(), serde_json::json!(mb_field(mb, 11, 2)));
+    }
+    if mb_bit(mb, 13) == 1 {
+        o.insert("wake_vortex".into(), serde_json::json!(mb_field(mb, 14, 2)));
+    }
+    if mb_bit(mb, 16) == 1 {
+        let temp_c = sign_mag(mb_field(mb, 18, 9), 9, mb_bit(mb, 17)) as f64 * 0.25;
+        o.insert("static_air_temperature".into(), serde_json::json!(temp_c));
+    }
+    if mb_bit(mb, 27) == 1 {
+        o.insert("static_pressure".into(), serde_json::json!(mb_field(mb, 28, 11)));
+    }
+    if mb_bit(mb, 39) == 1 {
+        o.insert("radio_height".into(), serde_json::json!(mb_field(mb, 40, 12) * 16));
+    }
+    Some(serde_json::Value::Object(o))
+}
+
 /// Infer the BDS register of a DF20/21 MB field: accept only when
 /// exactly one decoder validates (the pyModeS approach).
+///
+/// The strict candidate set (ELS/EHS: BDS 2,0 / 3,0 / 4,0 / 5,0 / 6,0) is
+/// tried first. Only if it is unambiguously empty are the heuristic
+/// meteorological registers (BDS 4,4 MRAR / 4,5 MHR) considered — these
+/// collide with the EHS layouts (pyModeS hides them behind an
+/// `include_meteo` flag for the same reason), so the strict result always
+/// wins and existing ELS/EHS decoding is never perturbed.
 pub fn bds_infer(mb: &[u8]) -> Option<serde_json::Value> {
     let cands: Vec<serde_json::Value> =
         [bds20(mb), bds30(mb), bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
     match cands.len() {
         1 => Some(cands.into_iter().next().unwrap()),
-        _ => None, // none or ambiguous
+        // Strict set empty: fall back to the meteo registers, again
+        // requiring exactly one to validate.
+        0 => {
+            let met: Vec<serde_json::Value> =
+                [bds44(mb), bds45(mb)].into_iter().flatten().collect();
+            (met.len() == 1).then(|| met.into_iter().next().unwrap())
+        }
+        _ => None, // ambiguous within the strict set
     }
 }
 
@@ -872,6 +1049,129 @@ mod bds_tests {
         assert_eq!(v["mach"], 0.42);
         assert_eq!(v["baro_vertical_rate"], -1920);
         assert_eq!(v["inertial_vertical_rate"], -1920);
+    }
+
+    // Oracle: pyModeS bds44 / test_bds_commb TestBds44* (golden frame
+    // A0001692185BD5CF400000DFC696 + synthetic multi-field payloads).
+
+    #[test]
+    fn bds44_golden_vector_matches_pymodes() {
+        let v = bds44(&mb_of("A0001692185BD5CF400000DFC696")).unwrap();
+        assert_eq!(v["bds"], "4,4");
+        assert_eq!(v["figure_of_merit"], 1);
+        assert_eq!(v["wind_speed"], 22);
+        assert!((v["wind_direction"].as_f64().unwrap() - 344.5).abs() < 0.5);
+        assert!((v["static_air_temperature"].as_f64().unwrap() - (-48.75)).abs() < 0.1);
+        assert!(v.get("static_pressure").is_none());
+        assert!(v.get("humidity").is_none());
+    }
+
+    #[test]
+    fn bds44_multi_field_matches_pymodes() {
+        // test_multi_field_decode: pressure/turbulence/humidity branches.
+        let payload = (1u64 << (55 - 3))    // FOM = 1
+            | (1 << (55 - 4))               // wind status
+            | (50 << (55 - 13))             // wind speed 50 kt
+            | (256 << (55 - 22))            // wind dir raw 256 → 180.0°
+            | (1 << (55 - 34))              // pressure status
+            | (1013 << (55 - 45))           // pressure 1013 hPa
+            | (1 << (55 - 46))              // turbulence status
+            | (0b10 << (55 - 48))           // turbulence level 2
+            | (1 << (55 - 49))              // humidity status
+            | (32 << (55 - 55)); // humidity raw 32 → 50.0%
+        let v = bds44(&mb_payload(payload)).unwrap();
+        assert_eq!(v["wind_speed"], 50);
+        assert!((v["wind_direction"].as_f64().unwrap() - 180.0).abs() < 0.01);
+        assert_eq!(v["static_pressure"], 1013);
+        assert_eq!(v["turbulence"], 2);
+        assert!((v["humidity"].as_f64().unwrap() - 50.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn bds44_validity_gates_match_pymodes() {
+        // FOM > 4, wind speed > 250, |temp| out of range, all-zero meteo.
+        assert!(bds44(&mb_payload(0)).is_none());
+        let base = (1u64 << (55 - 3)) | (1 << (55 - 4)) | (50 << (55 - 13)) | (100 << (55 - 33));
+        assert!(bds44(&mb_payload(base)).is_some());
+        // FOM = 5.
+        assert!(bds44(&mb_payload((base & !(0xF << (55 - 3))) | (5 << (55 - 3)))).is_none());
+        // Wind speed 251.
+        assert!(bds44(&mb_payload((1 << (55 - 3)) | (1 << (55 - 4)) | (251 << (55 - 13)))).is_none());
+        // Temperature +60.25 °C (raw 241).
+        assert!(bds44(&mb_payload((1 << (55 - 3)) | (1 << (55 - 4)) | (50 << (55 - 13)) | (241 << (55 - 33)))).is_none());
+        // All-zero meteo (wind/dir/temp all 0) with FOM+wind-status set.
+        assert!(bds44(&mb_payload((1 << (55 - 3)) | (1 << (55 - 4)))).is_none());
+        // Pressure status clear but raw nonzero.
+        assert!(bds44(&mb_payload((1 << (55 - 3)) | (1 << (55 - 4)) | (50 << (55 - 13)) | (100 << (55 - 33)) | (1 << (55 - 45)))).is_none());
+    }
+
+    // Oracle: pyModeS bds45 / test_bds_commb TestBds45* (golden frame
+    // A00004190001FB80000000000000 + synthetic multi-hazard payloads).
+
+    #[test]
+    fn bds45_golden_temperature_only_matches_pymodes() {
+        let v = bds45(&mb_of("A00004190001FB80000000000000")).unwrap();
+        assert_eq!(v["bds"], "4,5");
+        assert!((v["static_air_temperature"].as_f64().unwrap() - (-4.5)).abs() < 0.1);
+        for k in ["turbulence", "wind_shear", "microburst", "icing", "wake_vortex", "static_pressure", "radio_height"] {
+            assert!(v.get(k).is_none(), "unexpected {k}");
+        }
+    }
+
+    #[test]
+    fn bds45_multi_hazard_matches_pymodes() {
+        // test_multi_hazard_decode: the 5 hazard branches + pressure +
+        // radio height (raw 500 → 8000 ft).
+        let payload = (1u64 << (55 - 0))    // turbulence status
+            | (0b10 << (55 - 2))            // turbulence 2
+            | (1 << (55 - 3))               // wind shear status
+            | (0b01 << (55 - 5))            // wind shear 1
+            | (1 << (55 - 6))               // microburst status
+            | (0b11 << (55 - 8))            // microburst 3
+            | (1 << (55 - 9))               // icing status
+            | (0b10 << (55 - 11))           // icing 2
+            | (1 << (55 - 12))              // wake vortex status
+            | (0b01 << (55 - 14))           // wake vortex 1
+            | (1 << (55 - 26))              // pressure status
+            | (1013 << (55 - 37))           // pressure 1013 hPa
+            | (1 << (55 - 38))              // radio height status
+            | (500 << (55 - 50)); // radio height raw 500 → 8000 ft
+        let v = bds45(&mb_payload(payload)).unwrap();
+        assert_eq!(v["turbulence"], 2);
+        assert_eq!(v["wind_shear"], 1);
+        assert_eq!(v["microburst"], 3);
+        assert_eq!(v["icing"], 2);
+        assert_eq!(v["wake_vortex"], 1);
+        assert_eq!(v["static_pressure"], 1013);
+        assert_eq!(v["radio_height"], 8000);
+        assert!(v.get("static_air_temperature").is_none());
+    }
+
+    #[test]
+    fn bds45_validity_gates_match_pymodes() {
+        let golden = mb_of("A00004190001FB80000000000000");
+        assert!(bds45(&golden).is_some());
+        assert!(bds45(&mb_payload(0)).is_none());
+        // Reserved tail nonzero → reject.
+        let mut bad = golden.clone();
+        *bad.last_mut().unwrap() |= 0x01;
+        assert!(bds45(&bad).is_none());
+        // Temperature +60.25 °C (status set, raw 241).
+        assert!(bds45(&mb_payload((1 << (55 - 15)) | (241 << (55 - 25)))).is_none());
+        // Turbulence status clear but level nonzero (wrong_status).
+        assert!(bds45(&mb_payload(0b01 << (55 - 2))).is_none());
+        // BDS 1,7-shaped payload → rejected by the disambiguation gate.
+        assert!(bds45(&mb_payload(0xFF81C300000000)).is_none());
+    }
+
+    #[test]
+    fn bds_infer_routes_meteo_when_strict_set_empty() {
+        // The strict ELS/EHS set rejects these; the meteo fallback then
+        // surfaces them. Confirms met reports reach comm_b unambiguously.
+        let v = bds_infer(&mb_of("A0001692185BD5CF400000DFC696")).unwrap();
+        assert_eq!(v["bds"], "4,4");
+        let v = bds_infer(&mb_of("A00004190001FB80000000000000")).unwrap();
+        assert_eq!(v["bds"], "4,5");
     }
 }
 
