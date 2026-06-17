@@ -80,6 +80,18 @@ transport path (it is the Register/SBD-uplink type, not RR). The LCW
 link-control layer is already exposed as structured JSON
 (`lib::lcw_descriptor`) on duplex traffic / U3 frames.
 
+Upper-layer IP credential recovery (`iip.rs`, IRID-2) scans the
+plaintext IIP/IIR data payloads (the IP channel is ~88% unencrypted) for
+PPP PAP Authenticate-Request credentials (peer-id + password; framing per
+RFC 1334 §2.2, PPP protocol id 0xC023) and HTTP Basic-Auth headers
+(`Authorization: Basic <base64>` → user:pass, RFC 7617 + RFC 4648
+base64). Neither iridium-toolkit nor iridium-sniffer decode this layer
+(they stop at the "IP via PPP" framing), so the parser is verified
+against the published RFC byte layouts and base64 test vectors rather
+than a decoder oracle. Scope is per-frame plaintext (one PAP request or
+HTTP header within a single IIP/IIR frame); cross-frame IP-session
+reassembly is left for a future stateful pass.
+
 ## Validation
 
 - **Oracle-validated against iridium-toolkit**: a generated ring-alert

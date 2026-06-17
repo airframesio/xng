@@ -51,6 +51,138 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Minimal standard-alphabet base64 decoder (RFC 4648); returns None on any
+/// invalid character so a false `Authorization: Basic` match can't panic.
+fn base64_decode(s: &[u8]) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let s: Vec<u8> = s.iter().copied().take_while(|&c| c != b'=').collect();
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0u32;
+    for &c in &s {
+        acc = (acc << 6) | val(c)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// Scan a plaintext IP-session payload for recoverable upper-layer
+/// credentials (IRID-2). ~88% of Iridium IP traffic is unencrypted, so the
+/// PPP authentication exchange and HTTP Basic-Auth headers appear in clear.
+/// Recovers PPP PAP Authenticate-Request peer-id/password (RFC 1334 §2.2,
+/// PPP protocol 0xC023) and HTTP `Authorization: Basic <b64>` user:pass
+/// (RFC 7617). Returns one JSON object per credential found.
+pub(crate) fn scan_credentials(bytes: &[u8]) -> Vec<Value> {
+    let mut found = Vec::new();
+    scan_ppp_pap(bytes, &mut found);
+    scan_http_basic(bytes, &mut found);
+    found
+}
+
+/// PPP PAP Authenticate-Request: protocol 0xC023 then code 0x01.
+/// Packet (RFC 1334): code(1) id(1) length(2,BE) peer_len(1) peer[..]
+/// passwd_len(1) passwd[..].
+fn scan_ppp_pap(bytes: &[u8], out: &mut Vec<Value>) {
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        // PPP protocol field for PAP is 0xC023 (may be preceded by HDLC
+        // FF 03 or ACFC-compressed — we anchor on the protocol id itself).
+        if bytes[i] == 0xC0 && bytes[i + 1] == 0x23 {
+            let p = &bytes[i + 2..];
+            // code 0x01 = Authenticate-Request.
+            if p.len() >= 5 && p[0] == 0x01 {
+                let length = u16::from_be_bytes([p[2], p[3]]) as usize;
+                // Bound the packet to its declared length where sane.
+                let pkt = if length >= 4 && length <= p.len() { &p[..length] } else { p };
+                if pkt.len() >= 5 {
+                    let peer_len = pkt[4] as usize;
+                    if 5 + peer_len < pkt.len() {
+                        let peer = &pkt[5..5 + peer_len];
+                        let pw_off = 5 + peer_len;
+                        let pw_len = pkt[pw_off] as usize;
+                        if pw_off + 1 + pw_len <= pkt.len() {
+                            let pw = &pkt[pw_off + 1..pw_off + 1 + pw_len];
+                            out.push(json!({
+                                "kind": "ppp-pap",
+                                "username": String::from_utf8_lossy(peer),
+                                "password": String::from_utf8_lossy(pw),
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
+/// HTTP `Authorization: Basic <base64>` header (case-insensitive scheme).
+fn scan_http_basic(bytes: &[u8], out: &mut Vec<Value>) {
+    const NEEDLE: &[u8] = b"Authorization:";
+    let mut from = 0usize;
+    while let Some(rel) = find_ci(&bytes[from..], NEEDLE) {
+        let mut j = from + rel + NEEDLE.len();
+        // Skip whitespace, then require the "Basic" scheme.
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if matches_ci(&bytes[j..], b"Basic") {
+            j += 5;
+            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                j += 1;
+            }
+            let start = j;
+            while j < bytes.len() && is_b64(bytes[j]) {
+                j += 1;
+            }
+            if j > start {
+                if let Some(dec) = base64_decode(&bytes[start..j]) {
+                    if let Some(colon) = dec.iter().position(|&b| b == b':') {
+                        out.push(json!({
+                            "kind": "http-basic",
+                            "username": String::from_utf8_lossy(&dec[..colon]),
+                            "password": String::from_utf8_lossy(&dec[colon + 1..]),
+                        }));
+                    }
+                }
+            }
+        }
+        from += rel + NEEDLE.len();
+    }
+}
+
+fn is_b64(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'='
+}
+
+fn matches_ci(hay: &[u8], needle: &[u8]) -> bool {
+    hay.len() >= needle.len()
+        && hay[..needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn find_ci(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| matches_ci(&hay[i..], needle))
+}
+
 /// Parse a CRC-valid IIP frame from the bit-reversed payload bytes
 /// (also the body of a VDA frame on the voice channel).
 pub fn parse_iip_frame(payload_r: &[u8]) -> Value {
@@ -75,12 +207,18 @@ pub fn parse_iip_frame(payload_r: &[u8]) -> Value {
             // First byte is the payload length; the rest should be
             // zero-fill.
             let len = (data[0] as usize).min(data.len() - 1);
-            out["data_hex"] = json!(hex(&data[1..1 + len]));
-            let text: String = data[1..1 + len]
+            let payload = &data[1..1 + len];
+            out["data_hex"] = json!(hex(payload));
+            let text: String = payload
                 .iter()
                 .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
                 .collect();
             out["data_ascii"] = json!(text);
+            // Upper-layer plaintext credentials (PPP-PAP / HTTP Basic-Auth).
+            let creds = scan_credentials(payload);
+            if !creds.is_empty() {
+                out["credentials"] = json!(creds);
+            }
         }
         0x01 => {
             // ACK/IDLE: trailing zeros stripped.
@@ -121,10 +259,15 @@ pub fn parse_ip_payload(payload_bits: &[u8]) -> Option<Value> {
         pf.copy_from_slice(&payload_f[..39]);
         if let Some(msg) = rs8_fix(&pf) {
             if checksum_16(&msg) == 0 {
-                return Some(json!({
+                let mut v = json!({
                     "ip_frame": "IIR",
                     "data_hex": hex(&msg[..29]),
-                }));
+                });
+                let creds = scan_credentials(&msg[..29]);
+                if !creds.is_empty() {
+                    v["credentials"] = json!(creds);
+                }
+                return Some(v);
             }
             let val = u16::from_le_bytes([msg[0], msg[1]]);
             return Some(json!({
@@ -213,5 +356,98 @@ mod tests {
     fn iiu_fallback() {
         let v = parse_ip_payload(&bits_of_hex(IIU)).unwrap();
         assert_eq!(v["ip_frame"], "IIU");
+    }
+
+    // ---- IRID-2: upper-layer plaintext credential recovery ----
+
+    /// base64 decode matches RFC 4648 test vectors.
+    #[test]
+    fn base64_rfc4648_vectors() {
+        assert_eq!(base64_decode(b"Zm9v"), Some(b"foo".to_vec()));
+        assert_eq!(base64_decode(b"Zm9vYg=="), Some(b"foob".to_vec()));
+        assert_eq!(base64_decode(b"Zm9vYmFy"), Some(b"foobar".to_vec()));
+        // "Aladdin:open sesame" -> classic RFC 7617 example.
+        assert_eq!(
+            base64_decode(b"QWxhZGRpbjpvcGVuIHNlc2FtZQ=="),
+            Some(b"Aladdin:open sesame".to_vec())
+        );
+        assert_eq!(base64_decode(b"not base64!"), None);
+    }
+
+    /// PPP PAP Authenticate-Request, byte layout per RFC 1334 §2.2 (PPP
+    /// protocol 0xC023): code 0x01, id, length, peer-id-len, peer-id,
+    /// passwd-len, passwd. Username/password must be recovered verbatim.
+    #[test]
+    fn ppp_pap_authenticate_request() {
+        let user = b"sat-user";
+        let pass = b"hunter2";
+        let mut pkt = vec![0xC0, 0x23]; // PPP protocol = PAP
+        // PAP packet:
+        let mut body = vec![0x01, 0x42]; // code=Authenticate-Request, id
+        let length = 4 + 1 + user.len() + 1 + pass.len();
+        body.extend_from_slice(&(length as u16).to_be_bytes());
+        body.push(user.len() as u8);
+        body.extend_from_slice(user);
+        body.push(pass.len() as u8);
+        body.extend_from_slice(pass);
+        pkt.extend_from_slice(&body);
+
+        let creds = scan_credentials(&pkt);
+        assert_eq!(creds.len(), 1, "one credential expected");
+        assert_eq!(creds[0]["kind"], "ppp-pap");
+        assert_eq!(creds[0]["username"], "sat-user");
+        assert_eq!(creds[0]["password"], "hunter2");
+    }
+
+    /// HTTP Basic-Auth header (RFC 7617): `Authorization: Basic <b64>` where
+    /// the base64 decodes to `user:pass`. Scheme match is case-insensitive.
+    #[test]
+    fn http_basic_auth_header() {
+        // base64("admin:s3cr3t") = YWRtaW46czNjcjN0
+        let payload = b"GET / HTTP/1.1\r\nAuthorization: Basic YWRtaW46czNjcjN0\r\n\r\n";
+        let creds = scan_credentials(payload);
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0]["kind"], "http-basic");
+        assert_eq!(creds[0]["username"], "admin");
+        assert_eq!(creds[0]["password"], "s3cr3t");
+
+        // Lower-case scheme + the canonical RFC 7617 example.
+        let p2 = b"authorization: basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==";
+        let c2 = scan_credentials(p2);
+        assert_eq!(c2[0]["username"], "Aladdin");
+        assert_eq!(c2[0]["password"], "open sesame");
+    }
+
+    /// Plain payloads with no auth content yield nothing (no false hits).
+    #[test]
+    fn no_credentials_in_plain_payload() {
+        assert!(scan_credentials(b"GET /index.html HTTP/1.1\r\nHost: x\r\n").is_empty());
+        assert!(scan_credentials(&[0u8; 29]).is_empty());
+        // PAP protocol id but a non-auth-request code must not match.
+        assert!(scan_credentials(&[0xC0, 0x23, 0x02, 0x01, 0x00, 0x04]).is_empty());
+    }
+
+    /// End-to-end: a PAP request carried in an IIP "data" frame surfaces the
+    /// credentials in the frame JSON.
+    #[test]
+    fn iip_data_frame_surfaces_pap_credentials() {
+        // Build the inner PAP payload (user "u", pass "p").
+        let mut payload = vec![0xC0, 0x23, 0x01, 0x01];
+        let length = 4 + 1 + 1 + 1 + 1;
+        payload.extend_from_slice(&(length as u16).to_be_bytes());
+        payload.push(1);
+        payload.push(b'u');
+        payload.push(1);
+        payload.push(b'p');
+        // IIP data frame: hdr=0x04, seq, ack, cs, then [len][payload].
+        // parse_iip_frame strips a trailing 3-byte CRC, so pad it.
+        let mut frame = vec![0x04, 0x00, 0x00, 0x00, payload.len() as u8];
+        frame.extend_from_slice(&payload);
+        frame.extend_from_slice(&[0u8, 0u8, 0u8]); // CRC placeholder
+        let v = parse_iip_frame(&frame);
+        let creds = v["credentials"].as_array().expect("credentials present");
+        assert_eq!(creds[0]["kind"], "ppp-pap");
+        assert_eq!(creds[0]["username"], "u");
+        assert_eq!(creds[0]["password"], "p");
     }
 }
