@@ -29,8 +29,16 @@ pub struct AeroEvent {
     pub user: su::AeroUserData,
     pub acars: Option<xng_acars::block::AcarsBlock>,
     pub bit_rate: u32,
-    /// Set when this event is a C-channel assignment SU.
-    pub assignment: Option<serde_json::Value>,
+    /// Set when this event is a structured (non-user-data) P-channel SU:
+    /// a C-channel/T-channel assignment, a log-on/log-off control event, a
+    /// call announcement, or an AES system-table broadcast. The value's
+    /// `su_type` field names the SU (see [`su::parse_p_su`]).
+    pub su_event: Option<serde_json::Value>,
+    /// Physical channel this event came from. L-band P-channel events are
+    /// `Mode::AeroL`; C-band feeder R/T bursts are `Mode::AeroC`. Carried
+    /// per-event so [`to_message`] tags the message with the correct mode
+    /// instead of hard-coding one (AERO-8.1).
+    pub mode: Mode,
 }
 
 /// One demod + framing chain at a fixed bit rate.
@@ -48,8 +56,10 @@ struct Framer {
     /// When collecting: soft bits gathered after the UW (header + coded).
     collecting: Option<Vec<f32>>,
     reasm: su::Reassembler,
-    /// C-channel assignment SUs decoded this push (drained per chunk).
-    assignments: Vec<serde_json::Value>,
+    /// Structured (non-user-data) P-channel SUs decoded this push, drained
+    /// per chunk (assignments, log-on/log-off control, call announcements,
+    /// system-table broadcasts — see [`su::parse_p_su`]).
+    su_events: Vec<serde_json::Value>,
 }
 
 impl Framer {
@@ -59,7 +69,7 @@ impl Framer {
             shift: 0,
             collecting: None,
             reasm: su::Reassembler::new(),
-            assignments: Vec::new(),
+            su_events: Vec::new(),
         }
     }
 
@@ -71,8 +81,8 @@ impl Framer {
                 let bytes = self.decoder.decode(coded);
                 for su_bytes in bytes.chunks_exact(su::SU_LEN) {
                     if su::su_crc_ok(su_bytes) {
-                        if let Some(a) = su::parse_c_assignment(su_bytes) {
-                            self.assignments.push(a);
+                        if let Some(a) = su::parse_p_su(su_bytes) {
+                            self.su_events.push(a);
                         }
                         if let Some(u) = self.reasm.push(su_bytes) {
                             out.push(u);
@@ -172,10 +182,16 @@ impl AeroChannelDecoder {
             }
             for user in users {
                 let acars = su::parse_acars(&user.data);
-                out.push(AeroEvent { user, acars, bit_rate: chain.rate, assignment: None });
+                out.push(AeroEvent {
+                    user,
+                    acars,
+                    bit_rate: chain.rate,
+                    su_event: None,
+                    mode: Mode::AeroL,
+                });
             }
-            for a in chain.framer.assignments.drain(..) {
-                out.push(assignment_event(a, chain.rate));
+            for a in chain.framer.su_events.drain(..) {
+                out.push(su_event_msg(a, chain.rate, Mode::AeroL));
             }
         }
 
@@ -197,10 +213,16 @@ impl AeroChannelDecoder {
             }
             for user in hr_users {
                 let acars = su::parse_acars(&user.data);
-                out.push(AeroEvent { user, acars, bit_rate: oqpsk::BIT_RATE, assignment: None });
+                out.push(AeroEvent {
+                    user,
+                    acars,
+                    bit_rate: oqpsk::BIT_RATE,
+                    su_event: None,
+                    mode: Mode::AeroL,
+                });
             }
-            for a in hr.framer.assignments.drain(..) {
-                out.push(assignment_event(a, oqpsk::BIT_RATE));
+            for a in hr.framer.su_events.drain(..) {
+                out.push(su_event_msg(a, oqpsk::BIT_RATE, Mode::AeroL));
             }
         }
         out
@@ -254,7 +276,13 @@ impl AeroBurstDecoder {
                 if let Some(result) = self.packetizers[i].process(&bits) {
                     for user in result.users {
                         let acars = su::parse_acars(&user.data);
-                        out.push(AeroEvent { user, acars, bit_rate: rate, assignment: None });
+                        out.push(AeroEvent {
+                            user,
+                            acars,
+                            bit_rate: rate,
+                            su_event: None,
+                            mode: Mode::AeroC,
+                        });
                     }
                     break; // one rate decoded this burst
                 }
@@ -326,7 +354,7 @@ impl CChannelDecoder {
     }
 }
 
-fn assignment_event(a: serde_json::Value, bit_rate: u32) -> AeroEvent {
+fn su_event_msg(a: serde_json::Value, bit_rate: u32, mode: Mode) -> AeroEvent {
     let user = su::AeroUserData {
         aes_id: a["aes_id"].as_str().unwrap_or("").to_owned(),
         ges_id: a["ges_id"].as_u64().unwrap_or(0) as u8,
@@ -334,22 +362,22 @@ fn assignment_event(a: serde_json::Value, bit_rate: u32) -> AeroEvent {
         refno: 0,
         data: Vec::new(),
     };
-    AeroEvent { user, acars: None, bit_rate, assignment: Some(a) }
+    AeroEvent { user, acars: None, bit_rate, su_event: Some(a), mode }
 }
 
 /// Convert a decoded event into the normalized message model.
 pub fn to_message(e: &AeroEvent, frequency_hz: u64, level_dbfs: f32, source: Provenance) -> Message {
-    let (body, crc_ok, errors) = match (&e.acars, &e.assignment) {
+    let (body, crc_ok, errors) = match (&e.acars, &e.su_event) {
         (Some(b), _) => (MessageBody::Acars(b.core.clone()), b.crc_ok, Some(b.parity_errors)),
         (None, Some(a)) => (
-            MessageBody::Aero { kind: "c-channel-assignment".to_owned(), details: a.clone() },
+            MessageBody::Aero { kind: su::p_su_kind(a), details: a.clone() },
             true,
             None,
         ),
         (None, None) => (MessageBody::Undecoded, true, None),
     };
     Message {
-        mode: Mode::AeroL,
+        mode: e.mode,
         timestamp: Utc::now(),
         frequency_hz,
         signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },

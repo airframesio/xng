@@ -424,8 +424,9 @@ pub struct HrFramer {
     /// When collecting: (soft bits after UW, rail inversion masks).
     collecting: Option<(Vec<f32>, [f32; 2])>,
     pub reasm: su::Reassembler,
-    /// C-channel assignment SUs decoded this push (drained per chunk).
-    pub assignments: Vec<serde_json::Value>,
+    /// Structured (non-user-data) P-channel SUs decoded this push, drained
+    /// per chunk (see [`su::parse_p_su`]).
+    pub su_events: Vec<serde_json::Value>,
 }
 
 /// Check a 64-bit window: even-position bits = one rail's 32-bit UW,
@@ -457,7 +458,7 @@ impl HrFramer {
             shift: 0,
             collecting: None,
             reasm: su::Reassembler::new(),
-            assignments: Vec::new(),
+            su_events: Vec::new(),
         }
     }
 
@@ -470,8 +471,8 @@ impl HrFramer {
                 let bytes = self.decoder.decode(coded);
                 for su_bytes in bytes.chunks_exact(su::SU_LEN) {
                     if su::su_crc_ok(su_bytes) {
-                        if let Some(a) = su::parse_c_assignment(su_bytes) {
-                            self.assignments.push(a);
+                        if let Some(a) = su::parse_p_su(su_bytes) {
+                            self.su_events.push(a);
                         }
                         if let Some(u) = self.reasm.push(su_bytes) {
                             out.push(u);
