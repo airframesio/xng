@@ -84,16 +84,40 @@ loopback.
   those families the crate still returns the verified common fields (hex ID,
   country code, protocol type, BCH); detailed sub-fields are left to a
   follow-up rather than shipped unverified.
-- **IQ demodulator (IQ → bits)**: not implemented. FGB modulation is biphase-L
-  (Manchester) phase modulation at 400 bps on the 406 MHz carrier, preceded by
-  an unmodulated carrier, a bit-sync run and a 9-bit frame sync. Documented as
-  a TODO; no demod path is shipped.
-- **Modulator (bits → IQ)**: out of scope.
+- **IQ demodulator (IQ → bits)**: implemented (`src/demod.rs` +
+  `SarsatChannelDecoder` in `src/lib.rs`). FGB modulation is biphase-L
+  (Manchester) phase modulation at ±1.1 rad, 400 bps on the 406 MHz carrier,
+  preceded by an unmodulated carrier, a 15-bit bit-sync `1` run and a 9-bit
+  frame sync. The channel decoder owns an `xng_dsp::Ddc` (mix by the channel
+  offset + decimate the capture IQ down to `CHANNEL_RATE` = 8 kHz), recovers the
+  residual carrier with a one-pole complex average (the role the unmodulated
+  carrier preamble plays in a real receiver — the ±1.1 rad deviation leaves a
+  non-zero mean carrier component to lock to), slices the derotated phase into
+  biphase half-symbols with a zero-crossing timing loop, correlates the
+  bit-sync + frame-sync preamble, pairs the half-symbols into data bits, and
+  hands the assembled hex to the existing oracle-anchored `decode_hex`.
+- **Modulator (bits → IQ)**: `src/modulate.rs` exists **only** as a
+  self-generated test-signal source for the demod loopback (it is not a
+  spec-compliance encoder and is not used by the decode core).
+- **Demod validation (self-generated loopback, not an IQ oracle)**: there is no
+  public COSPAS-SARSAT IQ reference vector, so the demod is validated
+  self-consistently in `tests/demod_synth.rs`: a KNOWN-GOOD beacon hex (one of
+  the `amsa-code/fgb-decoder` compliance vectors already pinned in
+  `tests/oracle.rs`) is modulated at the biphase-L ±1.1 rad / 400 bps waveform,
+  run through the real `SarsatChannelDecoder::process` (including the
+  DDC mix+decimate and a carrier offset in one case), and the recovered
+  beacon's decoded fields are asserted equal to the oracle-known values. The
+  modulate→demod path is therefore self-generated; the **decode core remains
+  oracle-anchored** by `tests/oracle.rs`. The tests are suffixed `_synth_iq`.
 - **Second-generation beacons (C/S T.018, SGB)**: not decoded (no public oracle
   vectors were used).
 
 ## Workspace integration
 
-This crate is intentionally **not** wired into the `xng` binary, the
-`xng_types::Mode` enum, the runtime, or the CLI. It is a standalone decode
-library; the runtime integration is a separate follow-up.
+The crate exports the channelized decode interface the `xng` binary wires
+uniformly across modes: `CHANNEL_RATE`, `CHANNEL_PASSBAND_HZ`,
+`SarsatChannelDecoder::{new, process, level_dbfs}`, and `to_message`, which
+emits `xng_types::MessageBody::Sarsat { kind, details }` with `mode =
+Mode::Sarsat`. The `Mode::Sarsat` / `MessageBody::Sarsat` variants live in
+`xng-types`. The final bin/runtime/CLI hookup (instantiating the channel
+decoder from the capture plan) is a separate integration step.

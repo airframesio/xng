@@ -15,9 +15,12 @@
 //!   absolute lat/lon for User Location, coarse for Return Link Service),
 //! * BCH(21,15) PDF-1 and BCH(12,7) PDF-2 error-correction verification.
 //!
-//! This is the **message/frame decoder** (hex/bits -> structured fields). A
-//! spec-faithful modulator and an IQ demodulator (IQ -> bits) are out of scope
-//! for this layer — see PROVENANCE.md and the TODO at the bottom of this file.
+//! This crate provides both the **message/frame decoder** (hex/bits ->
+//! structured fields, [`decode_hex`]) and the **IQ demodulator**
+//! ([`SarsatChannelDecoder`]): a DDC + biphase-L (Manchester) PSK demod that
+//! recovers the beacon from channelized capture IQ and feeds it to
+//! [`decode_hex`]. The decode core is oracle-anchored; the demod path is
+//! validated by a self-generated modulate->demod loopback — see PROVENANCE.md.
 //!
 //! Second-generation beacons (C/S T.018, SGB) are not decoded here.
 //!
@@ -28,6 +31,8 @@
 //! the C/S T.001 worked examples. See PROVENANCE.md.
 
 pub mod bits;
+pub mod demod;
+pub mod modulate;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,6 +40,262 @@ use bits::{
     bits_to_hex, bits_to_octal, bits_to_u64, expected_bch1, expected_bch2, hex_to_bits,
     transmitted_bch1, transmitted_bch2,
 };
+
+use num_complex::Complex;
+use xng_dsp::Ddc;
+use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality};
+
+// ============================================================================
+// IQ demodulation front-end (IQ → beacon) — wires the existing `decode_hex`
+// core to a biphase-L PSK demodulator. The decode core stays oracle-anchored
+// by tests/oracle.rs; the demod path is validated by a self-generated
+// modulate→demod loopback (see tests/demod_synth.rs and PROVENANCE.md).
+// ============================================================================
+
+/// Internal demod sample rate: 20 samples per 400 bps data bit (10 per biphase
+/// half-symbol). A clean integer divisor of common capture rates via the DDC.
+pub const CHANNEL_RATE: f64 = 8_000.0;
+/// One-sided DDC passband. COSPAS-SARSAT 406 MHz beacons are narrowband; the
+/// biphase-L ±1.1 rad spectrum at 400 bps fits inside ±1.5 kHz.
+pub const CHANNEL_PASSBAND_HZ: f64 = 1_500.0;
+
+/// Bit-sync `1`-run length (C/S T.001).
+const BIT_SYNC_ONES: usize = 15;
+/// Normal-mode 9-bit frame sync (C/S T.001 distress message).
+const FRAME_SYNC: [u8; 9] = [0, 0, 0, 1, 0, 1, 1, 1, 1];
+/// Long-message data-bit count after sync (= 120 bits = 30 hex).
+const LONG_DATA_BITS: usize = 120;
+
+/// One decoded beacon plus the wire bits it came from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SarsatFrame {
+    /// The decoded beacon.
+    pub beacon: SarsatBeacon,
+    /// The beacon hex handed to `decode_hex` (15 or 30 hex).
+    pub hex: String,
+}
+
+/// Decodes COSPAS-SARSAT 406 MHz beacons from a (channelized) capture.
+///
+/// Owns an internal [`xng_dsp::Ddc`] that mixes the capture by `freq_offset_hz`
+/// and decimates to [`CHANNEL_RATE`]; [`BiphaseDemod`](demod::BiphaseDemod)
+/// recovers the biphase half-symbols, which this struct pairs into data bits and
+/// frames before handing the hex to the existing [`decode_hex`].
+pub struct SarsatChannelDecoder {
+    ddc: Option<Ddc>,
+    demod: demod::BiphaseDemod,
+    channel_buf: Vec<Complex<f32>>,
+    /// Rolling biphase half-symbol history for sync correlation + assembly.
+    halves: Vec<u8>,
+    /// Recently emitted hex strings (dedup across overlapping detections).
+    recent: Vec<String>,
+}
+
+impl SarsatChannelDecoder {
+    /// `input_rate` is any capture rate ≥ [`CHANNEL_RATE`]; the DDC resamples a
+    /// non-integer multiple. `freq_offset_hz` is the beacon center relative to
+    /// the capture center.
+    pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let ddc = if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+            None
+        } else {
+            Some(Ddc::new(input_rate, CHANNEL_RATE, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
+        };
+        Ok(Self {
+            ddc,
+            demod: demod::BiphaseDemod::new(),
+            channel_buf: Vec::new(),
+            halves: Vec::new(),
+            recent: Vec::new(),
+        })
+    }
+
+    /// Feed capture IQ; returns decoded beacon frames.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<SarsatFrame> {
+        let channel: &[Complex<f32>] = match &mut self.ddc {
+            Some(ddc) => {
+                self.channel_buf.clear();
+                ddc.process(input, &mut self.channel_buf);
+                &self.channel_buf
+            }
+            None => input,
+        };
+        self.demod.process(channel, &mut self.halves);
+
+        let mut out = Vec::new();
+        // Scan the accumulated half-symbol stream for frames.
+        let mut search_from = 0usize;
+        while let Some((next, frame)) = find_frame(&self.halves, search_from) {
+            search_from = next;
+            if let Some(f) = frame {
+                if !self.recent.contains(&f.hex) {
+                    self.recent.push(f.hex.clone());
+                    if self.recent.len() > 64 {
+                        self.recent.remove(0);
+                    }
+                    out.push(f);
+                }
+            }
+        }
+        // Keep only a tail long enough to span a frame straddling chunk
+        // boundaries (a long frame is 2·144 ≈ 288 half-symbols).
+        const KEEP: usize = 1024;
+        if self.halves.len() > KEEP {
+            let drop = self.halves.len() - KEEP;
+            self.halves.drain(0..drop);
+        }
+        out
+    }
+
+    /// Smoothed channel power in dBFS.
+    pub fn level_dbfs(&self) -> f32 {
+        self.demod.level_dbfs()
+    }
+}
+
+/// Expected biphase half-symbol pattern for the preamble: 15 bit-sync `1`s
+/// followed by the 9-bit frame sync. biphase-L: data `1` → halves (1,0),
+/// data `0` → halves (0,1).
+fn preamble_halves() -> Vec<u8> {
+    let mut sync_bits = Vec::with_capacity(BIT_SYNC_ONES + FRAME_SYNC.len());
+    sync_bits.extend(std::iter::repeat_n(1u8, BIT_SYNC_ONES));
+    sync_bits.extend_from_slice(&FRAME_SYNC);
+    let mut halves = Vec::with_capacity(sync_bits.len() * 2);
+    for b in sync_bits {
+        if b == 1 {
+            halves.push(1);
+            halves.push(0);
+        } else {
+            halves.push(0);
+            halves.push(1);
+        }
+    }
+    halves
+}
+
+/// Decode one data bit from a half-symbol pair. `(1,0)` → 1, `(0,1)` → 0,
+/// a doubled half (no mid-bit transition) is invalid.
+fn pair_to_bit(a: u8, b: u8) -> Option<u8> {
+    match (a, b) {
+        (1, 0) => Some(1),
+        (0, 1) => Some(0),
+        _ => None,
+    }
+}
+
+/// Search `halves[from..]` for the preamble (allowing a few bit errors), then
+/// decode and assemble the following message. Returns `(next_search_index,
+/// maybe_frame)`. `maybe_frame` is `None` when a candidate sync matched but the
+/// message did not decode (so the caller advances past it). Returns `None` only
+/// when no further candidate exists.
+fn find_frame(halves: &[u8], from: usize) -> Option<(usize, Option<SarsatFrame>)> {
+    let pre = preamble_halves();
+    let pre_len = pre.len();
+    // Allow up to this many mismatched half-symbols in the preamble.
+    let max_errs = 6usize;
+    if halves.len() < from + pre_len + 2 {
+        return None;
+    }
+    let last_start = halves.len() - pre_len - 2;
+    for start in from..=last_start {
+        let errs = pre
+            .iter()
+            .zip(&halves[start..start + pre_len])
+            .filter(|(a, b)| a != b)
+            .count();
+        if errs > max_errs {
+            continue;
+        }
+        // Sync found. Data half-symbols begin right after the preamble.
+        let data_start = start + pre_len;
+        let frame = assemble(&halves[data_start..]);
+        // Advance past this preamble regardless of decode success.
+        return Some((start + pre_len, frame));
+    }
+    None
+}
+
+/// Pair the post-sync half-symbols into data bits and run the existing decoder.
+/// Reads the format flag (first data bit) to pick the long (30-hex) vs short
+/// (15-hex) form.
+fn assemble(data_halves: &[u8]) -> Option<SarsatFrame> {
+    // Need at least the format flag + the 15-hex ID body (61 data bits → 122
+    // half-symbols).
+    if data_halves.len() < 122 {
+        return None;
+    }
+    // Decode up to LONG_DATA_BITS data bits.
+    let mut bits = Vec::with_capacity(LONG_DATA_BITS);
+    let mut i = 0;
+    while i + 1 < data_halves.len() && bits.len() < LONG_DATA_BITS {
+        match pair_to_bit(data_halves[i], data_halves[i + 1]) {
+            Some(b) => bits.push(b),
+            None => return None, // lost biphase alignment
+        }
+        i += 2;
+    }
+    let format_long = bits[0] == 1;
+    let hex = if format_long {
+        if bits.len() < LONG_DATA_BITS {
+            return None;
+        }
+        bits_to_hex(&to_bitstr(&bits[..LONG_DATA_BITS]))
+    } else {
+        // Short: the 15-hex beacon ID is data bits 1..61 (T.001 bits 26..85).
+        if bits.len() < 61 {
+            return None;
+        }
+        bits_to_hex(&to_bitstr(&bits[1..61]))
+    };
+    let beacon = decode_hex(&hex).ok()?;
+    Some(SarsatFrame { beacon, hex })
+}
+
+fn to_bitstr(bits: &[u8]) -> String {
+    bits.iter().map(|&b| if b == 1 { '1' } else { '0' }).collect()
+}
+
+/// Convert a decoded beacon into the normalized message model.
+pub fn to_message(
+    f: &SarsatFrame,
+    frequency_hz: u64,
+    level_dbfs: f32,
+    source: Provenance,
+) -> Message {
+    let crc_ok = f.beacon.bch1.ok && f.beacon.bch2.as_ref().map(|b| b.ok).unwrap_or(true);
+    let raw = hex_to_raw_bytes(&f.hex);
+    Message {
+        mode: Mode::Sarsat,
+        timestamp: chrono::Utc::now(),
+        frequency_hz,
+        signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
+        decode: DecodeQuality { crc_ok, fec_corrected: None, errors: None },
+        body: MessageBody::Sarsat {
+            kind: f.beacon.protocol_type.clone(),
+            details: serde_json::to_value(&f.beacon).unwrap_or(serde_json::Value::Null),
+        },
+        raw: Some(raw),
+        source,
+    }
+}
+
+/// Pack the beacon hex into wire bytes (4 bits/nibble, MSB-first); an odd
+/// trailing nibble (15-hex form) is left-justified into its byte.
+fn hex_to_raw_bytes(hex: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(hex.len().div_ceil(2));
+    let nibbles: Vec<u8> = hex
+        .chars()
+        .filter_map(|c| c.to_digit(16).map(|v| v as u8))
+        .collect();
+    let mut i = 0;
+    while i < nibbles.len() {
+        let hi = nibbles[i];
+        let lo = if i + 1 < nibbles.len() { nibbles[i + 1] } else { 0 };
+        out.push((hi << 4) | lo);
+        i += 2;
+    }
+    out
+}
 
 /// Short vs long message, from the C/S T.001 format flag (bit 25) / protocol
 /// flag (bit 26). When decoding a 15-hex string the format flag is unknown, so
@@ -714,12 +975,17 @@ fn user_location(bits: &str) -> Option<Position> {
 }
 
 // =====================================================================
-// TODO (out of scope for this layer; documented in PROVENANCE.md):
-//   * IQ -> bits demodulator: COSPAS-SARSAT FGB uses biphase-L (Manchester)
-//     PSK at 400 bps with +/-1.1 rad phase modulation on the 406.025/406.028/
-//     406.037 MHz carrier, a 160 ms unmodulated carrier, then a 15-bit bit-sync
-//     "1" run + 9-bit frame sync. That demod path is not implemented here.
-//   * Spec-faithful modulator/encoder (bits -> IQ).
+// Implemented above (this layer):
+//   * IQ -> bits demodulator (SarsatChannelDecoder): COSPAS-SARSAT FGB
+//     biphase-L (Manchester) PSK at 400 bps with +/-1.1 rad phase modulation,
+//     a DDC to CHANNEL_RATE, carrier recovery (one-pole, anchored by the
+//     unmodulated-carrier preamble), half-symbol timing recovery, the 15-bit
+//     bit-sync "1" run + 9-bit frame sync, message assembly, then decode_hex.
+//     Validated by a self-generated modulate->demod loopback (see
+//     src/modulate.rs, tests/demod_synth.rs); the DECODE CORE remains
+//     oracle-anchored by tests/oracle.rs.
+//
+// Still out of scope (documented in PROVENANCE.md):
 //   * Second-generation beacons (C/S T.018 SGB, 250-bit / spread-spectrum).
 // =====================================================================
 
