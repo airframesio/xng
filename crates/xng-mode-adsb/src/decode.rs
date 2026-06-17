@@ -550,6 +550,70 @@ pub fn bds20(mb: &[u8]) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "bds": "2,0", "callsign": cs }))
 }
 
+/// BDS 3,0 — ACAS active Resolution Advisory (TCAS RA), per ICAO Annex 10
+/// Vol IV §4.3.8.4.2.4. Carries the ARA bits (what RA is issued), the RAC
+/// bits (manoeuvres the aircraft must NOT take), terminal flags, and the
+/// threat identity (TTI 1 = ICAO; TTI 2 = altitude/range/bearing).
+///
+/// MB bit positions are 1-indexed (the `mb_bit`/`mb_field` convention):
+/// BDS id 1–8 (= 0x30), ARA 9–15 (issued/corrective/down/inc-rate/
+/// reversal/crossing/positive), ARA-reserved 16–22 (< 48 gate), RAC 23–26
+/// (no below/above/left/right), RA-terminated 27, multiple-threat 28, TTI
+/// 29–30, TID 31–56.
+pub fn bds30(mb: &[u8]) -> Option<serde_json::Value> {
+    // BDS identifier must be 0x30.
+    if mb_field(mb, 1, 8) != 0x30 {
+        return None;
+    }
+    // The all-zero (no-id) case is already excluded by the id check.
+    // ARA reserved-for-ACAS-III (MB 16–22) must be < 48 (pyModeS gate).
+    if mb_field(mb, 16, 7) >= 48 {
+        return None;
+    }
+    let tti = mb_field(mb, 29, 2);
+    // TTI = 0b11 is reserved → reject.
+    if tti == 0b11 {
+        return None;
+    }
+    let mut o = serde_json::Map::new();
+    o.insert("bds".into(), "3,0".into());
+    o.insert("threat_type_indicator".into(), serde_json::json!(tti));
+    o.insert("issued_ra".into(), serde_json::json!(mb_bit(mb, 9) == 1));
+    o.insert("corrective".into(), serde_json::json!(mb_bit(mb, 10) == 1));
+    o.insert("downward_sense".into(), serde_json::json!(mb_bit(mb, 11) == 1));
+    o.insert("increased_rate".into(), serde_json::json!(mb_bit(mb, 12) == 1));
+    o.insert("sense_reversal".into(), serde_json::json!(mb_bit(mb, 13) == 1));
+    o.insert("altitude_crossing".into(), serde_json::json!(mb_bit(mb, 14) == 1));
+    o.insert("positive".into(), serde_json::json!(mb_bit(mb, 15) == 1));
+    o.insert("no_below".into(), serde_json::json!(mb_bit(mb, 23) == 1));
+    o.insert("no_above".into(), serde_json::json!(mb_bit(mb, 24) == 1));
+    o.insert("no_left".into(), serde_json::json!(mb_bit(mb, 25) == 1));
+    o.insert("no_right".into(), serde_json::json!(mb_bit(mb, 26) == 1));
+    o.insert("ra_terminated".into(), serde_json::json!(mb_bit(mb, 27) == 1));
+    o.insert("multiple_threat".into(), serde_json::json!(mb_bit(mb, 28) == 1));
+
+    match tti {
+        // 24-bit ICAO at MB 31–54.
+        1 => {
+            let icao = mb_field(mb, 31, 24);
+            o.insert("threat_icao".into(), serde_json::json!(format!("{icao:06X}")));
+        }
+        // Altitude (AC13, MB 31–43), range (MB 44–50), bearing (MB 51–56).
+        2 => {
+            let ac13 = mb_field(mb, 31, 13);
+            o.insert("threat_altitude".into(), serde_json::json!(altitude13(ac13)));
+            let range_raw = mb_field(mb, 44, 7);
+            let range = (range_raw > 0).then(|| (range_raw as f64 - 1.0) / 10.0);
+            o.insert("threat_range".into(), serde_json::json!(range));
+            let bearing_raw = mb_field(mb, 51, 6);
+            let bearing = (bearing_raw > 0).then(|| 6 * (bearing_raw - 1) + 3);
+            o.insert("threat_bearing".into(), serde_json::json!(bearing));
+        }
+        _ => {}
+    }
+    Some(serde_json::Value::Object(o))
+}
+
 /// BDS 4,0 — selected vertical intention.
 pub fn bds40(mb: &[u8]) -> Option<serde_json::Value> {
     // Reserved bits 40..=47 and 52..=53 must be zero.
@@ -644,7 +708,7 @@ pub fn bds60(mb: &[u8]) -> Option<serde_json::Value> {
 /// exactly one decoder validates (the pyModeS approach).
 pub fn bds_infer(mb: &[u8]) -> Option<serde_json::Value> {
     let cands: Vec<serde_json::Value> =
-        [bds20(mb), bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
+        [bds20(mb), bds30(mb), bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
     match cands.len() {
         1 => Some(cands.into_iter().next().unwrap()),
         _ => None, // none or ambiguous
@@ -662,6 +726,13 @@ mod bds_tests {
             .collect()
     }
 
+    /// Build the 7-byte MB from a 56-bit MSB-first payload integer (the
+    /// representation pyModeS uses for its BDS payloads).
+    fn mb_payload(p: u64) -> [u8; 7] {
+        let b = p.to_be_bytes();
+        [b[1], b[2], b[3], b[4], b[5], b[6], b[7]]
+    }
+
     // Oracle: pyModeS v3 decode() on these frames (2026-06-11).
 
     #[test]
@@ -669,6 +740,107 @@ mod bds_tests {
         let v = bds_infer(&mb_of("A000083E202CC371C31DE0AA1CCF")).unwrap();
         assert_eq!(v["bds"], "2,0");
         assert_eq!(v["callsign"], "KLM1017");
+    }
+
+    // Oracle: pyModeS bds30 / test_bds_commb TestBds30* synthetic
+    // payloads (bit-exact, every shift constant pinned by those tests).
+
+    #[test]
+    fn bds30_minimal_ra_no_threat_matches_pymodes() {
+        // test_minimal_ra_no_threat: payload 0x30_80_00_00_00_00_00.
+        let v = bds30(&mb_payload(0x30_80_00_00_00_00_00)).unwrap();
+        assert_eq!(v["bds"], "3,0");
+        assert_eq!(v["threat_type_indicator"], 0);
+        assert_eq!(v["issued_ra"], true);
+        assert_eq!(v["corrective"], false);
+        assert_eq!(v["downward_sense"], false);
+        assert_eq!(v["increased_rate"], false);
+        assert_eq!(v["sense_reversal"], false);
+        assert_eq!(v["altitude_crossing"], false);
+        assert_eq!(v["positive"], false);
+        assert_eq!(v["no_below"], false);
+        assert_eq!(v["no_above"], false);
+        assert_eq!(v["no_left"], false);
+        assert_eq!(v["no_right"], false);
+        assert_eq!(v["ra_terminated"], false);
+        assert_eq!(v["multiple_threat"], false);
+    }
+
+    #[test]
+    fn bds30_multi_flag_matches_pymodes() {
+        // test_multi_flag_decode: issued_ra, corrective, sense_reversal,
+        // no_above, multiple_threat set; pins every ARA/RAC shift.
+        let payload = 0x30_00_00_00_00_00_00u64
+            | (1 << (55 - 8))  // issued_ra
+            | (1 << (55 - 9))  // corrective
+            | (1 << (55 - 12)) // sense_reversal
+            | (1 << (55 - 23)) // no_above
+            | (1 << (55 - 27)); // multiple_threat
+        let v = bds30(&mb_payload(payload)).unwrap();
+        assert_eq!(v["issued_ra"], true);
+        assert_eq!(v["corrective"], true);
+        assert_eq!(v["sense_reversal"], true);
+        assert_eq!(v["no_above"], true);
+        assert_eq!(v["multiple_threat"], true);
+        // Everything else stays false.
+        assert_eq!(v["downward_sense"], false);
+        assert_eq!(v["altitude_crossing"], false);
+        assert_eq!(v["no_below"], false);
+        assert_eq!(v["ra_terminated"], false);
+    }
+
+    #[test]
+    fn bds30_tti1_icao_threat_matches_pymodes() {
+        // test_tti_1_icao_threat: TTI=1, threat ICAO ABCDEF at bits 30-53.
+        let payload =
+            0x30_80_00_00_00_00_00u64 | (1 << (55 - 29)) | (0xABCDEFu64 << 2);
+        let v = bds30(&mb_payload(payload)).unwrap();
+        assert_eq!(v["threat_type_indicator"], 1);
+        assert_eq!(v["threat_icao"], "ABCDEF");
+    }
+
+    #[test]
+    fn bds30_tti2_alt_range_bearing_matches_pymodes() {
+        // test_tti_2_altitude_range_bearing: range raw 10 → 0.9 NM,
+        // bearing raw 3 → 15°, altitude 0 → None.
+        let payload = 0x30_80_00_00_00_00_00u64
+            | (0b10 << (55 - 29))
+            | (10 << (55 - 49))
+            | (3 << (55 - 55));
+        let v = bds30(&mb_payload(payload)).unwrap();
+        assert_eq!(v["threat_type_indicator"], 2);
+        assert!((v["threat_range"].as_f64().unwrap() - 0.9).abs() < 1e-9);
+        assert_eq!(v["threat_bearing"], 15);
+        assert!(v["threat_altitude"].is_null());
+    }
+
+    #[test]
+    fn bds30_tti2_altitude_delegates_to_altcode() {
+        // test_tti_2_altitude_delegates_to_altcode: AC13 0x1010 → 24600 ft.
+        let payload =
+            0x30_80_00_00_00_00_00u64 | (0b10 << (55 - 29)) | (0x1010u64 << 13);
+        let v = bds30(&mb_payload(payload)).unwrap();
+        assert_eq!(v["threat_type_indicator"], 2);
+        assert_eq!(v["threat_altitude"], 24600);
+    }
+
+    #[test]
+    fn bds30_validity_gates_match_pymodes() {
+        // is_bds30 rejects: wrong BDS id, TTI=0b11, ARA-reserved >= 48.
+        assert!(bds30(&mb_payload(0)).is_none());
+        assert!(bds30(&mb_payload(0x30_80_00_00_00_00_00 | (0b11 << (55 - 29)))).is_none());
+        assert!(bds30(&mb_payload(0x30_80_00_00_00_00_00 | (48 << (55 - 21)))).is_none());
+        // Boundary: ARA-reserved == 47 accepted.
+        assert!(bds30(&mb_payload(0x30_80_00_00_00_00_00 | (47 << (55 - 21)))).is_some());
+    }
+
+    #[test]
+    fn bds30_inferred_through_commb() {
+        // test_commb_bds30_end_to_end equivalent: bds_infer routes a
+        // minimal BDS30 payload to the 3,0 register unambiguously.
+        let v = bds_infer(&mb_payload(0x30_80_00_00_00_00_00)).unwrap();
+        assert_eq!(v["bds"], "3,0");
+        assert_eq!(v["issued_ra"], true);
     }
 
     #[test]

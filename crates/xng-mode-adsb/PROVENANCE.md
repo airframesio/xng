@@ -29,6 +29,24 @@ within 10 s, local decode against a fix fresher than 180 s) mirrors the
 standard surveillance practice; SBS-1 output line format follows the de
 facto BaseStation convention as served by dump1090-family tools.
 
+## Comm-B BDS 3,0 — ACAS active RA (2026-06)
+
+BDS 3,0 (ACAS active Resolution Advisory) MB-field layout is ICAO Annex 10
+Vol IV §4.3.8.4.2.4: BDS id (MB 1–8 = 0x30), ARA bits (9–15: issued /
+corrective / downward-sense / increased-rate / sense-reversal / altitude-
+crossing / positive), ARA-reserved-for-ACAS-III (16–22), RAC bits (23–26:
+no-below / -above / -left / -right), RA-terminated (27), multiple-threat
+(28), threat-type indicator (29–30) and threat-identity data (31–56:
+TTI 1 = 24-bit ICAO; TTI 2 = AC13 altitude + 7-bit range ((n−1)/10 NM) +
+6-bit bearing (6(n−1)+3°)). Validity gates (BDS id == 0x30, ARA-reserved
+< 48, TTI ≠ reserved 0b11) and field formulas were cross-checked against
+the pyModeS `bds30` decoder and its `test_bds_commb` TestBds30* synthetic
+payloads — facts/positions only, no code ported. Those bit-exact pyModeS
+payloads (every ARA/RAC/TTI shift constant) are vendored as the `decode.rs`
+unit tests; AC13 altitude reuses the existing `altitude13` decoder (proven
+identical to pyModeS `altcode_to_altitude`). Added to the `bds_infer`
+exactly-one-validates candidate set and emitted under `comm_b`.
+
 ## Operational status / aircraft status (2026-06)
 
 TC 31 (Aircraft Operational Status — BDS 6,5) and TC 28 (Aircraft Status)
