@@ -3,6 +3,7 @@
 use num_complex::Complex;
 use xng_mode_acars::modulate::{burst_iq, FrameSpec};
 use xng_mode_acars::AcarsChannelDecoder;
+use xng_types::{MessageBody, Provenance};
 
 fn downlink<'a>(text: &'a str, flight: &'a str) -> FrameSpec<'a> {
     FrameSpec {
@@ -50,6 +51,48 @@ fn decodes_at_channel_rate() {
     assert_eq!(f.flight.as_deref(), Some("XG0042"));
     assert_eq!(f.msg_num.as_deref(), Some("M42A"));
     assert_eq!(f.text, "POSN 4737.2N 12218.1W");
+}
+
+#[test]
+fn oooi_fields_surface_in_message_body() {
+    // ACARS-2.1: a real documented QQ "OFF Report" (research/QQ.md:
+    // origin KEWR, dest KSWF) flows through the full RF path and the OOOI
+    // fields appear in the message body's `app` JSON (acarsdec field names).
+    let spec = FrameSpec {
+        mode: '2',
+        tail: "N471XG",
+        ack: None,
+        label: "QQ",
+        block_id: '4',
+        msg_num: Some("M01A"),
+        flight: Some("XG0042"),
+        text: "KEWRKSWF20041942",
+        etb: false,
+    };
+    let mut iq = vec![Complex::new(0.0, 0.0); 500];
+    iq.extend(burst_iq(&spec, 24_000.0, 0.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 500]);
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(1024) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 1, "expected one frame");
+    assert!(frames[0].crc_ok);
+
+    let source = Provenance {
+        station: xng_types::StationIdentity::new("XX-TEST-ACARS"),
+        app: xng_types::AppInfo::xng(),
+        sdr: None,
+        channel: None,
+    };
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, source);
+    let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
+    let app = core.app.as_ref().expect("OOOI should populate app JSON");
+    assert_eq!(app["depa"], "KEWR");
+    assert_eq!(app["dsta"], "KSWF");
+    assert_eq!(app["wloff"], "2004");
 }
 
 #[test]

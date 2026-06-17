@@ -79,6 +79,35 @@ impl AcarsChannelDecoder {
     }
 }
 
+/// Combine the structured application decode and any OOOI fields into the
+/// single `app` JSON value carried by the message body. Returns `None` when
+/// there is neither. OOOI fields are flattened to the top level (matching
+/// acarsdec's flat JSON), alongside the `app` object when both are present.
+fn build_app_value(
+    app: Option<&xng_acars::AcarsApp>,
+    oooi: Option<&xng_acars::oooi::Oooi>,
+) -> Option<serde_json::Value> {
+    let app_val = app.map(|a| serde_json::to_value(a).unwrap_or_default());
+    let oooi_val = oooi.and_then(|o| serde_json::to_value(o).ok());
+
+    match (app_val, oooi_val) {
+        (None, None) => None,
+        (Some(a), None) => Some(a),
+        (None, Some(o)) => Some(o),
+        (Some(a), Some(serde_json::Value::Object(oooi_map))) => {
+            // Merge OOOI fields, then nest the structured app object so both
+            // are visible without collision.
+            let mut obj = serde_json::Map::new();
+            for (k, v) in oooi_map {
+                obj.insert(k, v);
+            }
+            obj.insert("app".to_string(), a);
+            Some(serde_json::Value::Object(obj))
+        }
+        (Some(a), Some(_)) => Some(a),
+    }
+}
+
 /// Convert a decoded frame into the normalized message model.
 pub fn to_message(
     f: &frame::AcarsFrame,
@@ -98,6 +127,13 @@ pub fn to_message(
         },
         body: {
             let appdec = xng_acars::decode(&f.label, &f.text, f.downlink);
+            // Carry the structured application decode plus any OOOI
+            // (OUT/OFF/ON/IN gate/wheels times + depa/dsta/eta) extracted
+            // from the text into the body's `app` JSON value (the existing
+            // structured field). OOOI fields are merged at the top of the
+            // object so they serialize like acarsdec's flat JSON
+            // (depa/dsta/eta/gtout/gtin/wloff/wlin).
+            let app = build_app_value(appdec.app.as_ref(), appdec.oooi.as_ref());
             MessageBody::Acars(AcarsCore {
                 mode: f.mode,
                 tail: f.tail.clone(),
@@ -111,7 +147,7 @@ pub fn to_message(
                 text: f.text.clone(),
                 more_to_come: f.more_to_come,
                 reassembled: false,
-                app: appdec.app.map(|a| serde_json::to_value(&a).unwrap_or_default()),
+                app,
             })
         },
         raw: Some(f.raw.clone()),

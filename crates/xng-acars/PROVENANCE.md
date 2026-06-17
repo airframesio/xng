@@ -91,6 +91,20 @@ Report", `QS` "IN Report"). The remaining OOOI-bearing `Q` labels are named
 from the gate/wheels event each carries per f00b4r0/acarsdec `label.c`
 (`QA` gate-out, `QB` wheels-off, `QC` wheels-on, `QD` gate-in, ...).
 
+## OOOI text extraction (2026-06)
+
+`oooi.rs`: OUT/OFF/ON/IN gate and wheels times plus departure/destination
+airports and ETA, extracted from the message text. The per-label field
+offsets and the airport/time event each label carries are a clean-room
+port of f00b4r0/acarsdec `label.c` (`DecodeLabel` + the `label_*` helpers;
+facts only, reimplemented) covering the `Q`-series (Q1/Q2/QA–QT) and the
+airline-application labels acarsdec handles (10/11/12/15/17/1G/20/21/2N/
+2Z/33/39/45/80/83/8D/8E/8S). The emitted JSON field names match acarsdec's
+`output.c` exactly (`depa`/`dsta`/`eta`/`gtout`/`gtin`/`wloff`/`wlin`).
+Unlike acarsdec's raw `memcpy`s we bounds-check every slice and validate
+airport codes (4 alphanumerics) and times (HHMM range), dropping
+misaligned fields rather than emitting junk.
+
 ## MIAM file-transfer reassembly (2026-06)
 
 File transfers spanning multiple label-MA messages reassemble per the

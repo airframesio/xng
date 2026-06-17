@@ -15,6 +15,7 @@ pub mod block;
 pub mod media_adv;
 pub mod miam;
 pub mod ohma;
+pub mod oooi;
 pub mod qseries;
 pub mod reasm;
 pub mod sublabel;
@@ -63,6 +64,12 @@ pub struct AppDecode {
     pub sublabel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mfi: Option<String>,
+    /// OOOI (OUT/OFF/ON/IN) gate/wheels times + departure/destination
+    /// airports + ETA extracted from the text (acarsdec
+    /// `depa`/`dsta`/`eta`/`gtout`/`gtin`/`wloff`/`wlin` fields). Flattened
+    /// so the fields appear at the top level like acarsdec's JSON.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub oooi: Option<oooi::Oooi>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<AcarsApp>,
 }
@@ -89,6 +96,10 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
         _ => qseries::classify(label).map(AcarsApp::QSeries),
     };
+
+    // OOOI fields can be embedded in many labels' text (Q-series and several
+    // airline-application labels); run the extractor on the original text.
+    out.oooi = oooi::decode(label, text);
     out
 }
 

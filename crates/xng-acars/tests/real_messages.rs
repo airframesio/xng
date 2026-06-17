@@ -157,3 +157,39 @@ fn qq_off_report_classified() {
     let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
     assert_eq!(q.description, "OFF Report");
 }
+
+// --- ACARS-2.1: OOOI (OUT/OFF/ON/IN) text extraction ---
+// Offsets/semantics from f00b4r0/acarsdec label.c; reference example
+// strings (and the airports they encode) from airframes'
+// acars-message-documentation.
+
+#[test]
+fn qq_off_report_oooi_fields() {
+    // research/QQ.md: "KEWRKSWF20041942" — KEWR → KSWF, OFF 20:04.
+    let d = decode("QQ", "KEWRKSWF20041942", true);
+    let o = d.oooi.expect("QQ carries OOOI");
+    assert_eq!(o.depa.as_deref(), Some("KEWR"));
+    assert_eq!(o.dsta.as_deref(), Some("KSWF"));
+    assert_eq!(o.wloff.as_deref(), Some("2004"));
+}
+
+#[test]
+fn qq_off_report_with_status_tail() {
+    // research/QQ.md: "KEWRKDFW1829OS KDFW ..." — KEWR → KDFW, OFF 18:29.
+    let d = decode("QQ", "KEWRKDFW1829OS KDFW /FUL0306/MO 1816/APH 0000000", true);
+    let o = d.oooi.expect("QQ carries OOOI");
+    assert_eq!(o.depa.as_deref(), Some("KEWR"));
+    assert_eq!(o.dsta.as_deref(), Some("KDFW"));
+    assert_eq!(o.wloff.as_deref(), Some("1829"));
+}
+
+#[test]
+fn non_oooi_label_has_no_oooi() {
+    // ADS-C envelopes are not OOOI text; the field stays absent.
+    let d = decode(
+        "B6",
+        "/BOMASAI.ADS.VT-ANB072501A070A988CA73248F0E5DC10200000F5EE1ABC000102B885E0A19F5",
+        true,
+    );
+    assert!(d.oooi.is_none());
+}
