@@ -76,7 +76,8 @@ impl Ddc {
 
         let mut stages = Vec::new();
         let mut rate = input_rate;
-        for &d in &factors {
+        let last = factors.len() - 1;
+        for (i, &d) in factors.iter().enumerate() {
             let out = rate / d as f64;
             // Anti-alias: pass `passband_hz`, stop where aliases would fold
             // back into the passband (out - passband).
@@ -86,7 +87,22 @@ impl Ddc {
                     "stage output rate {out} too low for ±{passband_hz} Hz passband"
                 ));
             }
-            let ntaps = ((TAPS_PER_TRANSITION * rate / transition).ceil() as usize | 1).max(9);
+            let mut ntaps = ((TAPS_PER_TRANSITION * rate / transition).ceil() as usize | 1).max(9);
+            // Extreme-ratio (very narrow) final stages must also be sharp enough
+            // to *realize* the narrow `passband_hz` cutoff: with only the
+            // anti-alias tap count, a tiny passband/rate cutoff falls inside the
+            // filter's own transition roll-off and the signal is attenuated —
+            // NAVTEX (rate/passband ≈ 19) and DSC (≈ 16) decoded 0 frames through
+            // the DDC for exactly this reason. Sizing the final stage so its
+            // transition ≤ passband keeps [0, passband] flat. Gated to
+            // out ≥ 12·passband so it touches ONLY those degenerate modes; every
+            // already-validated mode (HFDL ≈8, AIS ≈6, Aero ≈9.6, …) keeps its
+            // exact current filter and channel selectivity. Cheap at the low
+            // final rate; coarse stages are untouched.
+            if i == last && out >= 12.0 * passband_hz {
+                let sharp = ((TAPS_PER_TRANSITION * rate / passband_hz).ceil() as usize | 1).max(9);
+                ntaps = ntaps.max(sharp);
+            }
             if ntaps > MAX_TAPS {
                 return Err(format!(
                     "decimation {decim} from {input_rate} S/s needs {ntaps} taps; \
