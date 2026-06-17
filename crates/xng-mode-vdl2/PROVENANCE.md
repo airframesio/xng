@@ -198,3 +198,27 @@ compounds) implemented from the same vendored Doc 9880 module; decoded
 values render into the module's phraseology templates ("CLIMB TO
 FL360"). Elements whose argument type is not yet supported stop the
 walk explicitly (sizes unknown), matching the staged FANS approach.
+
+## COTP TPDU completion (2026-06, VDL2-2.2 partial)
+
+The COTP (ISO/IEC 8073 / ITU-T X.224) decoder was extended from 5 TPDU
+types to all 10: it now decodes DC, ED, AK, EA and RJ in addition to the
+existing CR/CC/DR/DT/ER. Each TPDU's full fixed header is parsed
+(destination/source references, CR/CC protocol class + options, DR
+disconnect reason, ER reject cause, DT/ED end-of-TPDU flag, and the TPDU
+sequence numbers and flow-control credit for the data-flow TPDUs), in
+both the normal (7-bit sequence) and extended (31-bit sequence) formats —
+the extended format being signalled by an odd length-indicator per X.224.
+The variable part is parsed as `type|length|value` parameters including
+the **ATN checksum (0x08)** profiled by ICAO Doc 9705, the **TPDU-size
+(0xC0, decoded to bytes as 2^value)**, priority (0x87), inactivity timer
+(0xF2) and the rest of the X.224 parameter set; the DR disconnect-reason
+and ER reject-cause dictionaries are applied to text. The TPDU code
+values (CR 0xE0 … ER 0x70), the header octet layouts and variable-part
+offsets, the parameter-code/name table, and the reason/cause dictionaries
+were cross-checked against the ISO/IEC 8073 framing as profiled by ICAO
+Doc 9705 and against dumpvdl2's `src/cotp.{c,h}` — protocol facts (the
+integer→name/layout assignments) only, not code or formatter text. Tests
+pin spec-derived TPDU vectors built octet-by-octet from the X.224 layout
+(no encode→decode loopback). Multipart COTP reassembly and native ATN-B2
+ADS-C over COTP remain the deferred big bet (VDL2-2.3).

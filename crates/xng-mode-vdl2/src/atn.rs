@@ -806,24 +806,297 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
     Some(out)
 }
 
-/// COTP TPDU identification per ISO 8073.
+/// COTP (ISO/IEC 8073 / ITU-T X.224) DR disconnect-reason name.
+fn cotp_dr_reason(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0 => "Reason not specified",
+        1 => "TSAP congestion",
+        2 => "Session entity not attached to TSAP",
+        3 => "Unknown address",
+        128 => "Normal disconnect",
+        129 => "Remote transport entity congestion",
+        130 => "Connection negotiation failed",
+        131 => "Duplicate source reference",
+        132 => "Mismatched references",
+        133 => "Protocol error",
+        135 => "Reference overflow",
+        136 => "Connection request refused",
+        138 => "Header or parameter length invalid",
+        _ => return None,
+    })
+}
+
+/// COTP ER (Error TPDU) reject-cause name (ISO/IEC 8073).
+fn cotp_er_reject_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0 => "Reason not specified",
+        1 => "Invalid parameter code",
+        2 => "Invalid TPDU type",
+        3 => "Invalid parameter value",
+        _ => return None,
+    })
+}
+
+/// COTP variable-part parameter name (ISO/IEC 8073 plus the ATN checksum
+/// 0x08 profiled by ICAO Doc 9705). Only the parameters that occur on
+/// ATN connections are named; others are reported by code.
+fn cotp_param_name(t: u8) -> Option<&'static str> {
+    Some(match t {
+        0x08 => "atn_checksum",
+        0x85 => "ack_time_ms",
+        0x86 => "residual_error_rate",
+        0x87 => "priority",
+        0x88 => "transit_delay",
+        0x89 => "throughput",
+        0x8A => "subseq_num",
+        0x8B => "reassignment_time_sec",
+        0x8C => "flow_control",
+        0x8F => "sack",
+        0xC0 => "tpdu_size",
+        0xC1 => "calling_transport_selector",
+        0xC2 => "called_responding_transport_selector",
+        0xC3 => "checksum",
+        0xC4 => "version",
+        0xC5 => "protection_params",
+        0xC6 => "additional_options",
+        0xC7 => "additional_proto_classes",
+        0xE0 => "additional_info",
+        0xF0 => "preferred_max_tpdu_size",
+        0xF2 => "inactivity_timer_ms",
+        _ => return None,
+    })
+}
+
+/// Parse the COTP variable part: a sequence of `type(1) | length(1) | value`
+/// parameters (ISO/IEC 8073). `b` is the variable-part slice only.
+/// The TPDU-size (0xC0) parameter decodes to bytes via `1 << value`
+/// (ISO/IEC 8073 §13.3.4: values 0x07..0x0D), and the ATN checksum (0x08)
+/// is surfaced as a named octet string.
+fn parse_cotp_params(b: &[u8]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 2 <= b.len() {
+        let t = b[pos];
+        let len = b[pos + 1] as usize;
+        pos += 2;
+        if pos + len > b.len() {
+            break;
+        }
+        let val = &b[pos..pos + len];
+        let mut p = json!({ "code": format!("{t:#04x}") });
+        if let Some(name) = cotp_param_name(t) {
+            p["name"] = json!(name);
+        }
+        match t {
+            // TPDU size: 2^value bytes (valid value range 0x07..0x0D).
+            0xC0 if len == 1 && (0x07..=0x0D).contains(&val[0]) => {
+                p["tpdu_size"] = json!(1u32 << val[0]);
+            }
+            // Ack time / priority / subseq / reassignment: u16.
+            0x85 | 0x87 | 0x8A | 0x8B if len == 2 => {
+                p["value"] = json!(u16::from_be_bytes([val[0], val[1]]));
+            }
+            // Version: u8.
+            0xC4 if len == 1 => p["value"] = json!(val[0]),
+            // Inactivity timer: u32 ms.
+            0xF2 if len == 4 => {
+                p["value"] = json!(u32::from_be_bytes([val[0], val[1], val[2], val[3]]));
+            }
+            _ => {
+                p["value_hex"] =
+                    json!(val.iter().map(|x| format!("{x:02x}")).collect::<String>());
+            }
+        }
+        out.push(p);
+        pos += len;
+    }
+    out
+}
+
+/// COTP TPDU decode per ISO/IEC 8073 / ITU-T X.224, all ten TPDU types,
+/// including the variable part (TPDU-size, ATN checksum 0x08, credit,
+/// EOT and extended sequence numbers). `b` is the COTP TPDU starting with
+/// the length-indicator (LI) octet; the header occupies `b[0..=li]` and
+/// user data (DT/ED) follows at `b[li + 1..]`.
 fn parse_cotp(b: &[u8]) -> Option<Value> {
     let li = *b.first()? as usize;
+    if li == 0 || li == 0xFF || b.len() < 2 + 2 {
+        // Need at least LI + code + dst_ref (X.224 minimum header).
+        return None;
+    }
     let code = *b.get(1)?;
-    let (name, refs) = match code & 0xF0 {
-        0xE0 => ("CR", true),
-        0xD0 => ("CC", true),
-        0x80 => ("DR", true),
-        0xF0 => ("DT", false),
-        0x70 => ("ER", false),
+    // dst_ref occupies b[2..4] for every COTP TPDU.
+    let dst_ref = if b.len() >= 4 {
+        Some(u16::from_be_bytes([b[2], b[3]]))
+    } else {
+        None
+    };
+    // Classify by the high nibble; CR/CC/AK/RJ carry credit in the low
+    // nibble (normal format), DT carries the ROA bit in bit 0.
+    let high = code & 0xF0;
+    let (name, base_code, credit_nibble): (&str, u8, Option<u8>) = match high {
+        0xE0 => ("CR", 0xE0, Some(code & 0x0F)),
+        0xD0 => ("CC", 0xD0, Some(code & 0x0F)),
+        0x80 => ("DR", 0x80, None),
+        0xC0 => ("DC", 0xC0, None),
+        0xF0 => ("DT", 0xF0, None),
+        0x10 => ("ED", 0x10, None),
+        0x60 => ("AK", 0x60, Some(code & 0x0F)),
+        0x20 => ("EA", 0x20, None),
+        0x50 => ("RJ", 0x50, Some(code & 0x0F)),
+        0x70 => ("ER", 0x70, None),
         _ => return None,
     };
     let mut out = json!({ "tpdu": name });
-    if refs && b.len() >= 6 {
-        out["dst_ref"] = json!(u16::from_be_bytes([b[2], b[3]]));
-        out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+    out["dst_ref"] = json!(dst_ref?);
+
+    // Variable-part offset measured from the LI octet (i.e. into `b`);
+    // the variable part is b[var_off..=li]. Per X.224 the extended format
+    // (32-bit sequence numbers) is signalled by an odd LI for DT/ED/AK/EA/RJ.
+    let extended = matches!(name, "DT" | "ED" | "AK" | "EA" | "RJ") && (li & 1 == 1);
+    let var_off: usize;
+    match name {
+        "CR" | "CC" => {
+            // code, dst_ref(2), src_ref(2), class/options(1).
+            if b.len() < 7 {
+                return None;
+            }
+            out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+            out["class"] = json!(b[6] >> 4);
+            out["options"] = json!(b[6] & 0x0F);
+            var_off = 7;
+        }
+        "DR" => {
+            // code, dst_ref(2), src_ref(2), reason(1).
+            if b.len() < 7 {
+                return None;
+            }
+            out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+            let reason = b[6];
+            out["reason"] = json!(reason);
+            if let Some(t) = cotp_dr_reason(reason) {
+                out["reason_text"] = json!(t);
+            }
+            var_off = 7;
+        }
+        "DC" => {
+            // code, dst_ref(2), src_ref(2).
+            if b.len() < 6 {
+                return None;
+            }
+            out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+            var_off = 6;
+        }
+        "ER" => {
+            // code, dst_ref(2), reject-cause(1).
+            if b.len() < 5 {
+                return None;
+            }
+            let cause = b[4];
+            out["reject_cause"] = json!(cause);
+            if let Some(t) = cotp_er_reject_cause(cause) {
+                out["reject_cause_text"] = json!(t);
+            }
+            var_off = 5;
+        }
+        "DT" | "ED" => {
+            // ROA bit is bit 0 of the code for DT.
+            if base_code == 0xF0 {
+                out["roa"] = json!(code & 1 == 1);
+            }
+            if extended {
+                // code, dst_ref(2), EOT|seq(4).
+                if b.len() < 8 {
+                    return None;
+                }
+                out["eot"] = json!(b[4] & 0x80 != 0);
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                var_off = 8;
+            } else {
+                // code, dst_ref(2), EOT|seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["eot"] = json!(b[4] & 0x80 != 0);
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        "AK" => {
+            if extended {
+                // code, dst_ref(2), seq(4), credit(2).
+                if b.len() < 10 {
+                    return None;
+                }
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                out["credit"] = json!(u16::from_be_bytes([b[8], b[9]]));
+                var_off = 10;
+            } else {
+                // code(credit low nibble), dst_ref(2), seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["credit"] = json!(credit_nibble.unwrap_or(0));
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        "EA" => {
+            if extended {
+                // code, dst_ref(2), seq(4).
+                if b.len() < 8 {
+                    return None;
+                }
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                var_off = 8;
+            } else {
+                // code, dst_ref(2), seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        "RJ" => {
+            if extended {
+                // code, dst_ref(2), seq(4), credit(2).
+                if b.len() < 10 {
+                    return None;
+                }
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                out["credit"] = json!(u16::from_be_bytes([b[8], b[9]]));
+                var_off = 10;
+            } else {
+                // code(credit low nibble), dst_ref(2), seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["credit"] = json!(credit_nibble.unwrap_or(0));
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        _ => return None,
     }
-    if name == "DT" && b.len() > li + 1 {
+    if extended {
+        out["extended"] = json!(true);
+    }
+
+    // Variable part: b[var_off..=li] (header runs through index `li`).
+    let hdr_end = li + 1; // one past the last header octet
+    if var_off > 0 && hdr_end > var_off && hdr_end <= b.len() {
+        let params = parse_cotp_params(&b[var_off..hdr_end]);
+        if !params.is_empty() {
+            out["params"] = json!(params);
+        }
+    }
+
+    if matches!(name, "DT" | "ED") && b.len() > li + 1 {
         let user = &b[li + 1..];
         out["user_data_len"] = json!(user.len());
         // ATN-B1 applications ride here (via the ULCS null encoding):
@@ -1119,13 +1392,19 @@ mod tests {
         let mut b = vec![0x81, 15, 1, 0x3F, 0x1C, 0x00, 0x14, 0x00, 0x00];
         b.extend_from_slice(&[2, 0x47, 0x01]); // dst NSAP
         b.extend_from_slice(&[2, 0x47, 0x02]); // src NSAP
-        b.extend_from_slice(&[0x02, 0xF0, 0x80, b'H', b'I']); // COTP DT
+        // COTP DT, normal format: LI=4, code 0xF0, dst_ref=1, EOT|seq=0x80,
+        // then user data "HI" (ISO/IEC 8073 §13.7).
+        b.extend_from_slice(&[0x04, 0xF0, 0x00, 0x01, 0x80, b'H', b'I']);
         let v = parse_network(&b).unwrap();
         assert_eq!(v["protocol"], "CLNP");
         assert_eq!(v["type"], "DT");
         assert_eq!(v["dst_nsap"], "4701");
         assert_eq!(v["src_nsap"], "4702");
         assert_eq!(v["cotp"]["tpdu"], "DT");
+        assert_eq!(v["cotp"]["dst_ref"], 1);
+        assert_eq!(v["cotp"]["eot"], true);
+        assert_eq!(v["cotp"]["tpdu_seq"], 0);
+        assert_eq!(v["cotp"]["user_data_len"], 2);
     }
 
     #[test]
@@ -1134,5 +1413,168 @@ mod tests {
         assert_eq!(v["protocol"], "ES-IS");
         let v = parse_network(&[0x05, 0, 0]).unwrap();
         assert_eq!(v["protocol"], "clnp-compressed?");
+    }
+
+    // --- COTP (ISO/IEC 8073 / ITU-T X.224) TPDU coverage ---
+    // The TPDU code values, header layouts, variable-part parameter codes
+    // (incl. the ATN checksum 0x08), DR disconnect-reason and ER reject-cause
+    // dictionaries are cross-checked against the ISO/IEC 8073 framing as
+    // profiled by ICAO Doc 9705 and against dumpvdl2's src/cotp.{c,h}
+    // (protocol facts only — no code or formatter text was copied).
+
+    #[test]
+    fn cotp_cr_with_tpdu_size_and_atn_checksum() {
+        // CR (0xE0 | credit 0): code, dst_ref(2), src_ref(2), class|opt(1),
+        // then variable part: TPDU-size 0xC0 len 1 value 0x0A (=1024),
+        // ATN checksum 0x08 len 2. LI counts every header octet after LI.
+        // header after LI: code(1)+dstref(2)+srcref(2)+class(1)
+        //                  + [C0 01 0A] + [08 02 12 34] = 6 + 3 + 4 = 13.
+        let b = [
+            0x0D, 0xE0, 0x00, 0x05, 0x12, 0x34, 0x40, // CR, dst 5, src 0x1234, class 4
+            0xC0, 0x01, 0x0A, // TPDU size 2^10
+            0x08, 0x02, 0x12, 0x34, // ATN checksum
+        ];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "CR");
+        assert_eq!(v["dst_ref"], 5);
+        assert_eq!(v["src_ref"], 0x1234);
+        assert_eq!(v["class"], 4);
+        let params = v["params"].as_array().unwrap();
+        assert_eq!(params[0]["name"], "tpdu_size");
+        assert_eq!(params[0]["tpdu_size"], 1024);
+        assert_eq!(params[1]["name"], "atn_checksum");
+        assert_eq!(params[1]["value_hex"], "1234");
+    }
+
+    #[test]
+    fn cotp_cc_decodes_class_and_refs() {
+        // CC (0xD0): same fixed layout as CR. LI=6 (no variable part).
+        let b = [0x06, 0xD0, 0x12, 0x34, 0x00, 0x07, 0x40];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "CC");
+        assert_eq!(v["dst_ref"], 0x1234);
+        assert_eq!(v["src_ref"], 7);
+        assert_eq!(v["class"], 4);
+        assert_eq!(v["options"], 0);
+    }
+
+    #[test]
+    fn cotp_dr_disconnect_reason_named() {
+        // DR (0x80): code, dst_ref(2), src_ref(2), reason(1)=128 "Normal".
+        let b = [0x06, 0x80, 0x00, 0x09, 0x12, 0x34, 128];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DR");
+        assert_eq!(v["dst_ref"], 9);
+        assert_eq!(v["src_ref"], 0x1234);
+        assert_eq!(v["reason"], 128);
+        assert_eq!(v["reason_text"], "Normal disconnect");
+    }
+
+    #[test]
+    fn cotp_dc_decodes_refs() {
+        // DC (0xC0): code, dst_ref(2), src_ref(2). LI=5.
+        let b = [0x05, 0xC0, 0x00, 0x09, 0x12, 0x34];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DC");
+        assert_eq!(v["dst_ref"], 9);
+        assert_eq!(v["src_ref"], 0x1234);
+    }
+
+    #[test]
+    fn cotp_er_reject_cause_named() {
+        // ER (0x70): code, dst_ref(2), reject-cause(1)=2 "Invalid TPDU type".
+        let b = [0x04, 0x70, 0x00, 0x09, 0x02];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "ER");
+        assert_eq!(v["dst_ref"], 9);
+        assert_eq!(v["reject_cause"], 2);
+        assert_eq!(v["reject_cause_text"], "Invalid TPDU type");
+    }
+
+    #[test]
+    fn cotp_ed_normal_format() {
+        // ED (0x10): like DT, EOT|seq(1). LI=4, normal format, user data.
+        let b = [0x04, 0x10, 0x00, 0x03, 0x85, 0xAB, 0xCD];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "ED");
+        assert_eq!(v["dst_ref"], 3);
+        assert_eq!(v["eot"], true);
+        assert_eq!(v["tpdu_seq"], 5);
+        assert_eq!(v["user_data_len"], 2);
+    }
+
+    #[test]
+    fn cotp_dt_extended_seq() {
+        // DT extended format: odd LI (=7) → 32-bit EOT|seq at b[4..8].
+        // code, dst_ref(2), EOT(1)|seq(31). EOT set, seq=0x000000AA.
+        let b = [0x07, 0xF0, 0x00, 0x02, 0x80, 0x00, 0x00, 0xAA, b'X'];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DT");
+        assert_eq!(v["extended"], true);
+        assert_eq!(v["eot"], true);
+        assert_eq!(v["tpdu_seq"], 0xAA);
+        assert_eq!(v["user_data_len"], 1);
+        assert_eq!(v["roa"], false);
+    }
+
+    #[test]
+    fn cotp_ak_normal_credit_in_nibble() {
+        // AK (0x60 | credit): normal format, code(credit low nibble),
+        // dst_ref(2), seq(1). LI=4 (even). credit=5, seq=3.
+        let b = [0x04, 0x65, 0x00, 0x01, 0x03];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "AK");
+        assert_eq!(v["dst_ref"], 1);
+        assert_eq!(v["credit"], 5);
+        assert_eq!(v["tpdu_seq"], 3);
+    }
+
+    #[test]
+    fn cotp_ak_extended_credit_field() {
+        // AK extended: odd LI (=9) → code, dst_ref(2), seq(4), credit(2).
+        let b = [0x09, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x0A];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "AK");
+        assert_eq!(v["extended"], true);
+        assert_eq!(v["tpdu_seq"], 7);
+        assert_eq!(v["credit"], 10);
+    }
+
+    #[test]
+    fn cotp_ea_and_rj() {
+        // EA (0x20) normal: code, dst_ref(2), seq(1). LI=4.
+        let ea = [0x04, 0x20, 0x00, 0x02, 0x09];
+        let v = parse_cotp(&ea).unwrap();
+        assert_eq!(v["tpdu"], "EA");
+        assert_eq!(v["tpdu_seq"], 9);
+        // RJ (0x50 | credit) normal: code, dst_ref(2), seq(1). credit=2.
+        let rj = [0x04, 0x52, 0x00, 0x02, 0x06];
+        let v = parse_cotp(&rj).unwrap();
+        assert_eq!(v["tpdu"], "RJ");
+        assert_eq!(v["credit"], 2);
+        assert_eq!(v["tpdu_seq"], 6);
+    }
+
+    #[test]
+    fn cotp_dt_with_inactivity_and_priority_params() {
+        // DT extended with variable part: priority 0x87 (u16) and inactivity
+        // timer 0xF2 (u32 ms). LI = 7 (extended fixed) + 4 (priority) + 6
+        // (inactivity) = 17 (odd → extended).
+        let b = [
+            0x11, 0xF0, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, // ext DT, seq 1
+            0x87, 0x02, 0x00, 0x06, // priority = 6
+            0xF2, 0x04, 0x00, 0x00, 0x75, 0x30, // inactivity 30000 ms
+            0x42, // user data
+        ];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DT");
+        assert_eq!(v["extended"], true);
+        assert_eq!(v["tpdu_seq"], 1);
+        let params = v["params"].as_array().unwrap();
+        assert_eq!(params[0]["name"], "priority");
+        assert_eq!(params[0]["value"], 6);
+        assert_eq!(params[1]["name"], "inactivity_timer_ms");
+        assert_eq!(params[1]["value"], 30000);
+        assert_eq!(v["user_data_len"], 1);
     }
 }
