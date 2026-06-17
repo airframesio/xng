@@ -248,3 +248,24 @@ dictionaries were cross-checked against ISO/IEC 8473 (X.233) and ICAO Doc
 Tests pin spec-derived security-label examples built octet-by-octet (no
 loopback). Multipart CLNP reassembly remains the deferred big bet
 (VDL2-2.1 reassembly part).
+
+## X.25 SNDCF field (2026-06, VDL2-4 follow-up)
+
+The X.25 (ISO/IEC 8208) Call-Request / Call-Accept decoder now decodes the
+SNDCF (Subnetwork Dependent Convergence Function) field that the ATN
+profile (ICAO Doc 9705 §5.7) places between the facility block and the call
+user data. On a Call-Request the field is `id(0xC1) | length | version(=1) |
+… | compression-bitfield` (the compression byte is the 4th octet of the
+SNDCF value, length ≥ 4); on a Call-Accept it is a single compression
+octet. The compression-support bitfield is decoded against the ATN
+algorithm set (ACA 0x40, DEFLATE 0x20, LREF 0x02, LREF-CAN 0x01) plus the
+M/I (maintenance/initialisation) bit 0x10. Previously the SNDCF field was
+swallowed into the call user data, so the compression negotiation was
+invisible and the network-protocol identifier in the CUD was offset by the
+SNDCF length. The SNDCF identifier/version constants and the
+compression-algorithm bitfield were cross-checked against ISO/IEC 8208 /
+ICAO Doc 9705 and against dumpvdl2's `src/x25.{c,h}` (`X25_SNDCF_ID`,
+`X25_SNDCF_VERSION`, `x25_comp_algos`) — protocol facts only, not code or
+formatter text. Tests pin spec-derived Call-Request / Call-Accept SNDCF
+vectors and verify the CUD is no longer offset (no loopback). General X.25
+facility naming remains numeric (out of scope, as before).

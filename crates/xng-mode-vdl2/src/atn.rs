@@ -38,6 +38,9 @@ pub struct X25Packet {
     /// Negotiated facilities on call packets.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub facilities: Vec<Value>,
+    /// SNDCF compression negotiation on call packets (ICAO Doc 9705 §5.7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sndcf: Option<Value>,
     /// Payload (data packets: user data; call packets: CUD).
     #[serde(skip)]
     pub payload: Vec<u8>,
@@ -227,6 +230,7 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
         diagnostic: None,
         diagnostic_text: None,
         facilities: Vec::new(),
+        sndcf: None,
         payload: Vec::new(),
     };
     if t & 0x01 == 0 {
@@ -240,9 +244,11 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
     }
     match t {
         0x0B | 0x0F => {
-            pkt.kind = if t == 0x0B { "call-request" } else { "call-accepted" };
+            let is_request = t == 0x0B;
+            pkt.kind = if is_request { "call-request" } else { "call-accepted" };
             // Address block: BCD digit counts (called, calling), then the
-            // digits, facilities length + facilities, then CUD.
+            // digits, facilities length + facilities, then the SNDCF field
+            // (ATN profile, ICAO Doc 9705 §5.7) and finally any CUD.
             if b.len() > 3 {
                 let called_len = (b[3] & 0x0F) as usize;
                 let calling_len = (b[3] >> 4) as usize;
@@ -250,13 +256,26 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
                 let fac_pos = 4 + addr_octets;
                 if b.len() > fac_pos {
                     let fac_len = b[fac_pos] as usize;
-                    let cud_pos = fac_pos + 1 + fac_len;
-                    if fac_len > 0 && fac_pos + 1 + fac_len <= b.len() {
+                    let mut pos = fac_pos + 1 + fac_len;
+                    if fac_len > 0 && pos <= b.len() {
                         pkt.facilities =
                             parse_facilities(&b[fac_pos + 1..fac_pos + 1 + fac_len]);
                     }
-                    if b.len() > cud_pos {
-                        pkt.payload = b[cud_pos..].to_vec();
+                    // SNDCF: on a Call-Request the field is identifier 0xC1,
+                    // length, then a value whose 4th octet (after version 1)
+                    // is the compression-support bitfield; on a Call-Accept
+                    // a single compression octet follows the facilities.
+                    if is_request {
+                        if let Some((sndcf, consumed)) = parse_sndcf_field(&b[pos.min(b.len())..]) {
+                            pkt.sndcf = Some(sndcf);
+                            pos += consumed;
+                        }
+                    } else if pos < b.len() {
+                        pkt.sndcf = Some(decode_x25_compression(b[pos]));
+                        pos += 1;
+                    }
+                    if pos < b.len() {
+                        pkt.payload = b[pos..].to_vec();
                     }
                 }
             }
@@ -719,6 +738,54 @@ fn parse_idrp_update(b: &[u8]) -> Option<Value> {
         out["nlri"] = json!(nlri);
     }
     Some(out)
+}
+
+/// Decode an X.25 SNDCF compression-support octet into the ATN algorithm
+/// set (ICAO Doc 9705 §5.7): ACA 0x40, DEFLATE 0x20, LREF 0x02,
+/// LREF-CAN 0x01, plus the M/I (maintenance/initialisation) bit 0x10.
+fn decode_x25_compression(byte: u8) -> Value {
+    let mut algos = Vec::new();
+    if byte & 0x40 != 0 {
+        algos.push("ACA");
+    }
+    if byte & 0x20 != 0 {
+        algos.push("DEFLATE");
+    }
+    if byte & 0x02 != 0 {
+        algos.push("LREF");
+    }
+    if byte & 0x01 != 0 {
+        algos.push("LREF-CAN");
+    }
+    json!({
+        "compression_options": byte,
+        "compression_algos": algos,
+        "maintenance": byte & 0x10 != 0,
+    })
+}
+
+/// Parse the X.25 Call-Request SNDCF field (ATN profile, ICAO Doc 9705
+/// §5.7 / ISO 8208): identifier 0xC1, length octet, then the value whose
+/// first octet is the SNDCF version (must be 1) and whose 4th octet is the
+/// compression-support bitfield. Returns the decoded value and the number
+/// of octets consumed (`2 + length`). Returns None when the identifier,
+/// version or length do not match (so the caller leaves the bytes as CUD).
+fn parse_sndcf_field(b: &[u8]) -> Option<(Value, usize)> {
+    if b.len() < 2 || b[0] != 0xC1 {
+        return None;
+    }
+    let len = b[1] as usize;
+    // ATN SNDCF value is at least 4 octets (version + 3) and version == 1.
+    if len < 4 || 2 + len > b.len() {
+        return None;
+    }
+    let val = &b[2..2 + len];
+    if val[0] != 0x01 {
+        return None;
+    }
+    let mut out = decode_x25_compression(val[3]);
+    out["version"] = json!(val[0]);
+    Some((out, 2 + len))
 }
 
 /// X.25 facilities: TLVs with class-coded lengths (bits 7-8 of the
@@ -1549,6 +1616,49 @@ mod tests {
         assert_eq!(c.kind, "clear-request");
         assert_eq!(c.cause, Some(5));
         assert_eq!(c.diagnostic, Some(0x42));
+    }
+
+    #[test]
+    fn x25_call_request_sndcf_compression() {
+        // Call-Request (0x0B): no addresses, one fast-select facility, then
+        // the SNDCF field (id 0xC1, len 4, version 1, .., compression 0x70 =
+        // ACA + DEFLATE + M/I bit), then CUD = 0x81 (CLNP). The SNDCF field
+        // sits between facilities and CUD per ICAO Doc 9705 §5.7.
+        let pkt = [
+            0x10, 0x01, 0x0B, 0x00, // GFI/LCN, call-request, no addresses
+            0x02, 0x01, 0x80, // facility length 2, fast-select facility
+            0xC1, 0x04, 0x01, 0x00, 0x00, 0x70, // SNDCF: version 1, comp 0x70
+            0x81, // CUD: CLNP NLPID
+        ];
+        let p = parse_x25(&pkt).unwrap();
+        assert_eq!(p.kind, "call-request");
+        let s = p.sndcf.as_ref().unwrap();
+        assert_eq!(s["version"], 1);
+        assert_eq!(s["compression_options"], 0x70);
+        assert_eq!(s["compression_algos"][0], "ACA");
+        assert_eq!(s["compression_algos"][1], "DEFLATE");
+        assert_eq!(s["maintenance"], true);
+        // CUD (the network-protocol identifier) is no longer swallowed.
+        assert_eq!(p.payload, vec![0x81]);
+        // A non-SNDCF byte sequence is left as CUD (identifier mismatch).
+        let no_sndcf = [0x10, 0x01, 0x0B, 0x00, 0x00, 0x81, 0x01];
+        let p = parse_x25(&no_sndcf).unwrap();
+        assert!(p.sndcf.is_none());
+        assert_eq!(p.payload, vec![0x81, 0x01]);
+    }
+
+    #[test]
+    fn x25_call_accept_single_compression_octet() {
+        // Call-Accepted (0x0F): no addresses, no facilities, then a single
+        // compression octet 0x02 (LREF only), then CUD.
+        let pkt = [0x10, 0x01, 0x0F, 0x00, 0x00, 0x02, 0xAA];
+        let p = parse_x25(&pkt).unwrap();
+        assert_eq!(p.kind, "call-accepted");
+        let s = p.sndcf.as_ref().unwrap();
+        assert_eq!(s["compression_options"], 0x02);
+        assert_eq!(s["compression_algos"][0], "LREF");
+        assert_eq!(s["maintenance"], false);
+        assert_eq!(p.payload, vec![0xAA]);
     }
 
     #[test]
