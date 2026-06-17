@@ -63,6 +63,38 @@ re-estimation papered over it, the DD loop removes it. Off-air result
 on the sigidwiki 21931 kHz capture: 31 events vs 28 before (dumphfdl:
 37; the rest is weak-burst acquisition sensitivity).
 
+## Full HFNPDU/LPDU record decode + AC cache + FEC count (2026-06)
+
+Decode-completeness pass against dumphfdl 1.7.0 (GPL — facts only, wire
+layouts read from src/hfnpdu.c, lpdu.c, ac_cache.c, util.c; all code
+re-derived):
+
+- **Performance data (0xD1)** split out of the shared 0xD5 handler and
+  decoded in full (47-octet record): version, flight_leg, gs_id+name,
+  freq_id, per-leg freq_search_cnt and hf_data_disabled_duration,
+  per-bitrate MPDU rx/rx_err/tx/delivered counters, SPDU rx/missed, and
+  freq_change_code with its cause table.
+- **Frequency data (0xD5)** now emits the up-to-6 per-GS {gs_id,
+  prop_freqs, tuned_freqs} arrays (20-bit packed) it previously dropped.
+- **0xD2 system-table-request**, **0xDE delayed-echo**, **0x2F
+  logon-denied** (with reason table) named; **0x3F logoff** gains its
+  reason text; unknown HFNPDU/LPDU types carry the dumphfdl type-name.
+- **Aircraft-ID → ICAO cache** (ac_cache.rs): records the ICAO from each
+  logon-confirm under its assigned channel-local aircraft ID (per-channel
+  keying, one PduParser per channel), back-fills it on later downlinks,
+  TTL-expires (default 3600 s, dumphfdl AC_CACHE_TTL_DEFAULT) and evicts
+  on logoff/logon-denied.
+- **fec_corrected** populated from the Viterbi: decoded bits are
+  re-encoded through the same convolutional code and the Hamming distance
+  to the received hard decisions (= nearest-codeword distance = corrected
+  symbols) is stamped on every demod-path event. Pure crate-local
+  (Viterbi::encode), no xng-dsp change.
+
+Tests pin the dumphfdl byte offsets/semantics (regressions surface as a
+mismatch against the reference layout); fec_corrected is checked against
+the FEC's own definition (clean burst → 0) and on the real off-air
+capture, never via parser loopback.
+
 ## Coherent A1 sync (2026-06, demod v2 step 2)
 
 The quarter-sample coherent-correlation refinement after the
