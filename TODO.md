@@ -2,7 +2,7 @@
 
 > Derived from [`COMPARISON_RESEARCH.md`](COMPARISON_RESEARCH.md) (audited 2026-06).
 > This is the actionable backlog; the research doc is the rationale/sourcing for each item.
-> **Nothing here is implemented yet** — every box is unchecked. Check items off (`- [x]`) as they land.
+> Check items off (`- [x]`) as they land. **Progress so far (on `feat/per-decoder-airframes-feeding`):** the FEED per-decoder Airframes feeding feature, and a per-mode decode batch across ADS-B, AIS, VDL2, HFDL, STD-C, Aero, Iridium and ACARS — see the checked items below.
 
 ## How to use this file
 
@@ -69,18 +69,18 @@
 ## ACARS — VHF ACARS + application layer (A1)
 
 - [ ] **ACARS-1** Label catalogue + per-label field extractors (build label→meaning table)
-  - [ ] **ACARS-1.1** Decode the `Q`-series link-test/squitter family (Q0–Q7, QA–QX)
+  - [x] **ACARS-1.1** Decode the `Q`-series link-test/squitter family (Q0–Q7, QA–QX)
   - [ ] **ACARS-1.2** Surface raw MIN; handle 4th-char downlink-rule edge cases (see VERIFY-2)
 - [ ] **ACARS-2** Embedded text-content decoders — **the big user-visible gap** ★ quick win
-  - [ ] **ACARS-2.1** OOOI: `gtout/gtin/wloff/wlin/depa/dsta/eta`
-  - [ ] **ACARS-2.2** Free-text position reports (labels `20/POS`, `4J`, `H1 POS`)
-  - [ ] **ACARS-2.3** AMDAR / winds-aloft / PIREP (WMO-BUFR-class schema; NOAA `dcacar` ref)
+  - [x] **ACARS-2.1** OOOI: `gtout/gtin/wloff/wlin/depa/dsta/eta`
+  - [x] **ACARS-2.2** Free-text position reports (labels `20/POS`, `4J`, `H1 POS`)
+  - [x] **ACARS-2.3** AMDAR / winds-aloft / PIREP (WMO-BUFR-class schema; NOAA `dcacar` ref)
   - [ ] **ACARS-2.4** FLIGHTPLAN / route (FPN) + Boeing/Airbus telex / structured free-text
-  - [ ] **ACARS-2.5** H1 `#CFB`/CF maintenance family (APM_REPORT, ATA, AL, FDE, ECT, FLR, LIGHTS, MIL, MPF, PAGE, WRN)
+  - [x] **ACARS-2.5** H1 `#CFB`/CF maintenance family (APM_REPORT, ATA, AL, FDE, ECT, FLR, LIGHTS, MIL, MPF, PAGE, WRN)
 - [ ] **ACARS-3** Application-layer completion (vs libacars 2.2.1)
   - [ ] **ACARS-3.1** CPDLC argument readers for the bracketed-template shapes + `FANSPosition` placeBearingDistance + RouteClearance trackDetail/routeInformationAdditional
   - [ ] **ACARS-3.2** Generic sublabel/MFI extraction beyond `H1`
-  - [ ] **ACARS-3.3** Reassembly-status enum (`assstat`: complete/in-progress/skipped/duplicate)
+  - [x] **ACARS-3.3** Reassembly-status enum (`assstat`: complete/in-progress/skipped/duplicate)
   - [ ] **ACARS-3.4** Verify MIAM CRC + vendor real off-air media-advisory captures
 - [ ] **ACARS-4** Demod / robustness
   - [ ] **ACARS-4.1** Emit `noise`/noise-floor + SNR (today only envelope RSSI) — see XM-1
@@ -104,10 +104,10 @@
   - [ ] **VDL2-2.1** Multipart CLNP reassembly + ATN security-label TLVs (traffic-type/ATSC-class/subnetwork-type)
   - [ ] **VDL2-2.2** COTP DC/ED/AK/EA/RJ TPDUs + full variable part (TPDU-size, checksum, ATN checksum 0x08, credit, EOT, extended seq) + multipart COTP reassembly
   - [ ] **VDL2-2.3** Native ATN-B2 ADS-C (ADSReport/RequestContract/Accept/Reject/PositiveAck/NonCompliance over CLNP/COTP)
-- [ ] **VDL2-3** XID parameter completion — TG5(0x46), T3min(0x47), GS-address-filter(0x48), broadcast-connection(0x49), frequency-support-list(0xC0), airport-coverage(0xC1), nearest-airport(0xC3), ATN-router-NETs(0xC4), system-mask(0xC5), TG3(0xC6), TG4(0xC7) + ISO-8885 HDLC param set; decode autotune freq→MHz + timers→int
-- [ ] **VDL2-4** X.25 completion — RESTART-REQ/CONF, facility naming, clear/reset/restart cause + diagnostic-code dictionaries, SNDCF compression facility
-- [ ] **VDL2-5** AVLC polish — SABME (0x6F), expand FRMR info-field, pin one canonical FCS octet order; cross-check the v2.5.1 249-octet block-length bug (VERIFY-3)
-- [ ] **VDL2-6** IDRP RIB-REFRESH + OPEN body fields + ERROR code/subcode text; ES-IS option TLVs (0x81/0x88/0xCF/0xC5)
+- [x] **VDL2-3** XID parameter completion — TG5(0x46), T3min(0x47), GS-address-filter(0x48), broadcast-connection(0x49), frequency-support-list(0xC0), airport-coverage(0xC1), nearest-airport(0xC3), ATN-router-NETs(0xC4), system-mask(0xC5), TG3(0xC6), TG4(0xC7) + ISO-8885 HDLC param set; decode autotune freq→MHz + timers→int
+- [x] **VDL2-4** X.25 completion — RESTART-REQ/CONF, facility naming, clear/reset/restart cause + diagnostic-code dictionaries, SNDCF compression facility
+- [x] **VDL2-5** AVLC polish — SABME (0x6F), expand FRMR info-field, pin one canonical FCS octet order; cross-check the v2.5.1 249-octet block-length bug (VERIFY-3)
+- [x] **VDL2-6** IDRP RIB-REFRESH + OPEN body fields + ERROR code/subcode text; ES-IS option TLVs (0x81/0x88/0xCF/0xC5)
 - [ ] **VDL2-7** Demod — `--max-ppm` PPM/CFO reject filter; Gardner/matched timing-error detector for weakest-burst acquisition
 - [ ] **VDL2-8** Outputs — full per-message signal line (noise+SNR+ppm, see XM-1); `--extended-header [S][L][F][#]`; aircraft enrichment (`--addrinfo`/`--bs-db`); msg-filter grammar; ZMQ publisher; raw-AVLC archive; `--dump-asn1`
 
@@ -115,16 +115,16 @@
 
 ## HFDL — HFDL / ARINC 635 (A3)
 
-- [ ] **HFDL-1** HFNPDU full-record decode ★ quick win (pure parsing)
-  - [ ] **HFDL-1.1** Split 0xD1 performance-data from the 0xD5 handler; decode the full 47-byte perf record (version, flight_leg, gs/freq_id, counters, freq_change_code)
-  - [ ] **HFDL-1.2** Decode 0xD5 per-GS `{gs_id, prop_freqs, tuned_freqs}` arrays
-  - [ ] **HFDL-1.3** 0xD2 system-table-request field parse; name 0xDE delayed-echo; name 0x2F logon-denied with reason table
+- [x] **HFDL-1** HFNPDU full-record decode ★ quick win (pure parsing)
+  - [x] **HFDL-1.1** Split 0xD1 performance-data from the 0xD5 handler; decode the full 47-byte perf record (version, flight_leg, gs/freq_id, counters, freq_change_code)
+  - [x] **HFDL-1.2** Decode 0xD5 per-GS `{gs_id, prop_freqs, tuned_freqs}` arrays
+  - [x] **HFDL-1.3** 0xD2 system-table-request field parse; name 0xDE delayed-echo; name 0x2F logon-denied with reason table
 - [ ] **HFDL-2** System table + GS naming
   - [ ] **HFDL-2.1** `--system-table` load/save persistence (cold-start enrichment)
   - [ ] **HFDL-2.2** Config-driven GS name file (IDs up to 127; fill the 12 hardcoded holes)
-- [ ] **HFDL-3** Aircraft-ID→ICAO cache (`ac_cache`, `--aircraft-cache-ttl`) — ties XM-3
+- [x] **HFDL-3** Aircraft-ID→ICAO cache (`ac_cache`, `--aircraft-cache-ttl`) — ties XM-3
 - [ ] **HFDL-4** Positions — lift `{lat,lon,utc}` into `MessageBody::Hfdl`; position from logon-request/resume (back-dated UTC); wire HFDL positions to SBS/Beast (ties XM-2.2); `--freq-as-squawk`
-- [ ] **HFDL-5** Demod — populate `fec_corrected`; per-frame SNR/signal/CFO (see XM-1); FFT polyphase channelizer for many-channel CPU (verify LMS taps 7 vs 15 → VERIFY-5)
+- [ ] **HFDL-5** Demod — ✅ `fec_corrected` populated; ❌ remaining: per-frame SNR/signal/CFO (XM-1), FFT polyphase channelizer, LMS-tap verify
 - [ ] **HFDL-6** Outputs — expand Prometheus to dumphfdl-StatsD granularity (preamble A2/M1, per-layer bad_fcs/too_short, dir counters, reasm states, cache gauges) + noise-floor gauge; zmq/kafka/file-rotation; `--raw-frames`/`--output-mpdus`/`--output-corrupted-pdus`; SPDU `rls_in_use`/`iso8208_supported` flags + per-slot assignment map
 
 ---
@@ -132,9 +132,9 @@
 ## AERO — Inmarsat Aero L + C-band bursts (A4, A5)
 
 - [ ] **AERO-1** Full P-channel SU classifier (0x00–0x76; JAERO names the table, xng decodes ~6)
-  - [ ] **AERO-1.1** Log-on/log-off control SUs (0x10–0x17) → structured AES↔GES session events
-  - [ ] **AERO-1.2** `Call_announcement` 0x21, `T_channel_assignment` 0x51
-  - [ ] **AERO-1.3** AES system-table broadcast (satellite_identification 0x0C, GES_beam_support 0x07, Psmc/Rsmc 0x05, broadcast_index 0x0A)
+  - [x] **AERO-1.1** Log-on/log-off control SUs (0x10–0x17) → structured AES↔GES session events
+  - [x] **AERO-1.2** `Call_announcement` 0x21, `T_channel_assignment` 0x51
+  - [x] **AERO-1.3** AES system-table broadcast (satellite_identification 0x0C, GES_beam_support 0x07, Psmc/Rsmc 0x05, broadcast_index 0x0A)
   - [ ] **AERO-1.4** EIRP-table 0x28, P/R-control-ISU 0x40, T-control-ISU 0x41, RQA 0x61, RACK/TACK 0x62, short-LSDU 0x74/0x76
 - [ ] **AERO-2** Satellite/beam resolution → tag every message with the resolved satellite (self-configuring, L-band analogue of HFDL systable)
 - [ ] **AERO-3** R/T-channel named control set (access-request/call-progress/telephony-ack/RQA/ACK); verify `SEQINDICATOR→(k,n)`
@@ -143,7 +143,7 @@
 - [ ] **AERO-6** Demod — coherent 600/1200 path (close the ~2 dB gap to JAERO); populate `fec_corrected`; BER-vs-SNR curve
 - [ ] **AERO-7** Outputs — expand `MessageBody::Aero` bodies (log-on/satellite-id/system-table/call); aircraft-DB enrichment + Aero position plotting
 - [ ] **AERO-8** Aero-C consolidation (A5)
-  - [ ] **AERO-8.1** Fix `Mode::AeroC` mislabel (`to_message` hard-tags `AeroL`) + wire scan-plan/dispatch/feed — OR fold aero-c into `aero` as a PHY-selected burst sub-decoder
+  - [x] **AERO-8.1** Fix `Mode::AeroC` mislabel (`to_message` hard-tags `AeroL`) + wire scan-plan/dispatch/feed — OR fold aero-c into `aero` as a PHY-selected burst sub-decoder
   - [ ] **AERO-8.2** Typed SU classifier shared across P/R/T; C-channel descrambler `dl2`; emit `bit_rate`+channel tag; write `docs/notes/AERO.md`
   - [ ] **AERO-8.3** 10.5k A-QPSK burst path for aero-c
 - [ ] **AERO-9** SwiftBroadband-Safety — roadmap watch only (FANS successor; no open PHY decoder today); no implementation
@@ -152,35 +152,35 @@
 
 ## STDC — Inmarsat STD-C / EGC (A6)
 
-- [ ] **STDC-1** Geographic area-address decoder — biggest gap, **no OSS decoder does it** ★ quick win
+- [x] **STDC-1** Geographic area-address decoder — biggest gap, **no OSS decoder does it** ★ quick win
   - [ ] **STDC-1.1** Rectangular (C2=04/34), circular (C2=24/44/14), NAVAREA/METAREA number (C2=31), coastal/NAVTEX (C2=13/73)
   - [ ] **STDC-1.2** Emit structured area geometry fields + map plotting of areas/coordinates
 - [ ] **STDC-2** C-channel descriptor field depth — `0x7D` bulletin-board full fields, `0x6C` signalling-channel, `0x83` logical-channel-assignment, `0x92` login-ack (LES list), `0xAB` les-list, `0xA3`/`0xA8` short-text, `0x08` ack-request routing
-- [ ] **STDC-3** Channel-frequency decode (uplink/downlink MHz from channel-number word; formula already in `STDC.md`)
-- [ ] **STDC-4** LES/NCS operator-name table + ocean-region long names + service long names
+- [x] **STDC-3** Channel-frequency decode (uplink/downlink MHz from channel-number word; formula already in `STDC.md`)
+- [x] **STDC-4** LES/NCS operator-name table + ocean-region long names + service long names
 - [ ] **STDC-5** Follow `0x83` → demodulate the LES message channel (closes the biggest functional gap vs tekmanoid) ◆ big bet
-- [ ] **STDC-6** Text — ITA2/Baudot (presentation 6); typed presentation-7 binary capture
-- [ ] **STDC-7** EGC polish — frame_number→UTC-of-day (`×8.64`); verify single `0xB0` vs double `0xB1`+`0xB2` (VERIFY-6); distress-specific position/alerting
+- [x] **STDC-6** Text — ITA2/Baudot (presentation 6); typed presentation-7 binary capture
+- [x] **STDC-7** EGC polish — frame_number→UTC-of-day (`×8.64`); verify single `0xB0` vs double `0xB1`+`0xB2` (VERIFY-6); distress-specific position/alerting
 - [ ] **STDC-8** Demod — RRC matched filter; optional CMA equalizer; SatDump `.frm` goldens; per-frame UW BER; populate `fec_corrected`; mid-frame polarity-flip recovery
 
 ---
 
 ## IRID — Iridium (A7)
 
-- [ ] **IRID-1** Frame typing — AQ acquisition uplink (`IridiumAQMessage`), NXT (`IridiumNXTMessage`); verify ISY `"10"` vs `"11"` UL pattern; non-zero IBC `bc_type` sub-blocks
-- [ ] **IRID-2** Upper-layer IP content — PPP-PAP credential frames + HTTP Basic-Auth headers in plaintext IIP/IIQ/IIR IP sessions (new decode target; ~88% of frames unencrypted)
-- [ ] **IRID-3** GSM layer-3 — RR messages (Immediate-Assignment/Paging/System-Info) labelling; expose LCW layer; PCAP output (`-m lap`)
+- [x] **IRID-1** Frame typing — AQ acquisition uplink + ISY pattern done; ❌ NXT deferred (not in iridium-toolkit/sniffer — no oracle)
+- [x] **IRID-2** Upper-layer IP content — PPP-PAP credential frames + HTTP Basic-Auth headers in plaintext IIP/IIQ/IIR IP sessions (new decode target; ~88% of frames unencrypted)
+- [x] **IRID-3** GSM layer-3 — RR messages (Immediate-Assignment/Paging/System-Info) labelling; expose LCW layer; PCAP output (`-m lap`)
 - [ ] **IRID-4** Positions — wire Iridium ADS-C / mt-position to SBS + web-map layer (`sbs.rs` is ModeS-only; ties XM-2.2); render mt-position
 - [ ] **IRID-5** Demod — soft-decision / Chase BCH decoding (the next weak-frame lever); UW error-correction pre-classify; explicit SIMD select; GPU/OpenCL burst detection
 - [ ] **IRID-6** Outputs — KML export; SigMF / burst-IQ capture; IBC-driven PPM clock self-calibration (`-m ppm`)
 - [ ] **IRID-7** Multi-receiver TDOA (`-m tdoa`) — ties XM-4 (IRA ECEF + IBC iri_time primitives already exist)
-- [ ] **IRID-8** ⚑ Verify Iridium time re-epoch handling (ERA3 2025-02-14; next 2026-01-14 18:08 UTC) in satellite-naming/SGP4 code — live bug risk (= VERIFY-1)
+- [x] **IRID-8** ⚑ Verify Iridium time re-epoch handling (ERA3 2025-02-14; next 2026-01-14 18:08 UTC) in satellite-naming/SGP4 code — live bug risk (= VERIFY-1)
 
 ---
 
 ## AIS — AIS / ITU-R M.1371 (A8)
 
-- [ ] **AIS-1** ASM (DAC/FID binary on 6/8/25/26) dispatch table — **the #1 AIS gap** (AIS-catcher decodes ~40 subtypes) ◆ big bet
+- [ ] **AIS-1** ASM (DAC/FID binary on 6/8) dispatch table ◆ big bet — ✅ dispatch + DAC=200 Inland (FID 10/23/24/40, pyais-verified); ❌ remaining: DAC=1 IMO Circ.289 (no pyais oracle), regional DACs
   - [ ] **AIS-1.1** DAC=1 IMO SN.1/Circ.289 (FID 31/11 meteo-hydro, 21 weather-from-ship, 16 POB, 22/23 area-notice, 17 VTS, 24/25/26 static/cargo/sensor, 27-30 route/text, 32 tidal)
   - [ ] **AIS-1.2** DAC=200 Inland (FID 10/21/22/23/24/40/55)
   - [ ] **AIS-1.3** Regional DACs (235/250/366 AtoN-monitoring, 316/366 Seaway-meteo, 367 US-environmental, 265 STM-route); validate vs pyais oracle
@@ -197,18 +197,18 @@
 - [ ] **ADSB-1** Modern accuracy/integrity + intent layer — **entirely absent today** ★ quick win (bits already in-message) — *partially done on `feat/per-decoder-airframes-feeding`*
   - [x] **ADSB-1.1** TC31 operational-status decode → `adsb_status` (version, NIC-supp-A, NACp, SIL, SIL-supp, GVA, NICbaro), surfaced in console/dashboard/asf-2.0. *(NACv is a TC19 field — see ADSB-1.5)*
   - [x] **ADSB-1.2** ADS-B version read directly from TC31. *(heuristic version inference for v0 / non-TC31-emitting aircraft deferred)*
-  - [ ] **ADSB-1.3** TC29 target-state (MCP/FCU selected alt, QNH, selected heading, AP/VNAV/APPROACH/LNAV flags)
+  - [x] **ADSB-1.3** TC29 target-state (MCP/FCU selected alt, QNH, selected heading, AP/VNAV/APPROACH/LNAV flags)
   - [x] **ADSB-1.4** TC28 aircraft-status — emergency/priority state (mapped to label, flagged on the map) + ACAS-RA subtype flag. *(full RA decode = ADSB-3.1)*
   - [ ] **ADSB-1.5** Accuracy fields — ✅ NACp/SIL/NIC-supp-A/GVA via TC31; ❌ remaining: NUCp(v0), full NIC computation (TC + supplement), NACv (TC19), SDA, Rc
 - [ ] **ADSB-2** Position/velocity completion — ✅ TC5-8 surface movement (ground speed) + ground track *(done: `decode::surface_velocity`, riddle-vector tested)*; ❌ remaining: TC9-18 Q=0 Gillham altitude, TC20-22 geometric altitude, VR source bit (GNSS vs baro), geom-minus-baro alt diff, emit NACv
 - [ ] **ADSB-3** Comm-B BDS register expansion
-  - [ ] **ADSB-3.1** BDS 3,0 ACAS/TCAS RA (high safety/intel value)
-  - [ ] **ADSB-3.2** BDS 1,0 data-link-capability, 1,7/1,8/1,9 GICB capability, 2,1 registration markings
-  - [ ] **ADSB-3.3** BDS 4,4 (wind/temp/pressure/turbulence/humidity), 4,5 (hazard), 5,3 (air-referenced state)
+  - [x] **ADSB-3.1** BDS 3,0 ACAS/TCAS RA (high safety/intel value)
+  - [x] **ADSB-3.2** BDS 1,0 data-link-capability, 1,7/1,8/1,9 GICB capability, 2,1 registration markings
+  - [x] **ADSB-3.3** BDS 4,4 (wind/temp/pressure/turbulence/humidity), 4,5 (hazard), 5,3 (air-referenced state)
   - [ ] **ADSB-3.4** rs1090-style density/penalty BDS scoring (vs binary validate); extend inference beyond 4 registers
 - [ ] **ADSB-4** DF coverage — DF19 military ES; DF24-27 Comm-D ELM; surface FS/DR/UM (alert/SPI/ground) from DF4/5/20/21
-- [ ] **ADSB-5** DF18 CF-subtype classification (CF=0 non-transponder, 2/3/5 TIS-B fine/coarse/mgmt, 6 ADS-R) → source tag (VERIFY-7)
-- [ ] **ADSB-6** Mode A/C decode (`--modeac`) — small add (also low-priority NEW; VERIFY-10)
+- [x] **ADSB-5** DF18 CF-subtype classification (CF=0 non-transponder, 2/3/5 TIS-B fine/coarse/mgmt, 6 ADS-R) → source tag (VERIFY-7)
+- [x] **ADSB-6** Mode A/C decode — decode kernel done (octal squawk / SPI / Gillham ladder, dump1090-oracle-verified); RF framing-pulse demod still deferred
 - [ ] **ADSB-7** Demod/trust — phase-classified per-phase bit templates (close the ~3-frame gap to readsb); graduated position trust (json-reliable / position-persistence / NIC-aware)
 - [ ] **ADSB-8** Outputs — readsb-schema `aircraft.json` (version/nic/nac/sil/gva/emergency/nav_*/acas_ra/wind/oat); true RX-clock Beast timestamps → MLAT-feedable (ties XM-4, VERIFY-12); mlat/tisb provenance flag; write `docs/notes/ADSB.md`
 
