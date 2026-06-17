@@ -15,7 +15,7 @@
 //! `encode_rs_char`), so the FEC layer is verified against the reference
 //! implementation, not a self-consistency loop.
 
-use xng_mode_uat::{decode_frame, fec, UatMessage};
+use xng_mode_uat::{decode_frame, fec, modulate, UatChannelDecoder, UatMessage};
 
 fn hex(s: &str) -> Vec<u8> {
     (0..s.len())
@@ -282,4 +282,173 @@ fn uplink_fisb_dlac_winds_text_matches_dump978() {
         assert!(r.text.contains("FT"), "missing FT header: {:?}", r.text);
         assert!(r.text.contains(body), "missing data line {body:?} in {:?}", r.text);
     }
+}
+
+// ---------------------------------------------------------------------------
+// IQ DEMOD end-to-end (self-generated modulate → demod path)
+// ---------------------------------------------------------------------------
+//
+// These validate the CPFSK front-end + sync hunt + bit slicing in
+// `UatChannelDecoder`. The IQ is SYNTHETIC: a KNOWN with-parity frame
+// (whose decode is pinned above against dump978) is CPFSK-modulated by this
+// crate's `modulate` module and demodulated by the channel decoder. The
+// modulate→demod loop is self-generated; the DECODE core remains
+// oracle-anchored by the dump978 vectors above. See PROVENANCE.md.
+
+fn frame_short_type0() -> Vec<u8> {
+    // The pinned short type-0 payload + its libfec parity.
+    let payload = hex("00a66ef135445d525a0c0519119021204800");
+    let parity = fec::encode_downlink_short(&payload);
+    payload.iter().chain(parity.iter()).copied().collect()
+}
+
+fn frame_long_type1() -> Vec<u8> {
+    // The pinned long type-1 payload (N5130E) + its libfec parity.
+    let payload = hex("08a66ef1353e2d525fd4050911882aa038101d06b85d440be2a4c2a0000590000000");
+    let parity = fec::encode_downlink_long(&payload);
+    payload.iter().chain(parity.iter()).copied().collect()
+}
+
+/// Drive a synthetic burst (with quiet padding either side) through a fresh
+/// decoder and return the recovered frames.
+fn demod_synth(frame: &[u8], input_rate: f64) -> Vec<xng_mode_uat::UatFrame> {
+    let chan = xng_mode_uat::CHANNEL_RATE;
+    // At the channel rate, generate the burst at offset 0 (wideband UAT).
+    let burst = modulate::burst_iq(frame, /*downlink=*/ true, input_rate, 0.0, 0.4);
+    // Pad with quiet so the demod's DC tracker settles and the trailing
+    // bits flush out of the integrate-and-dump.
+    let pad = (input_rate / 1000.0) as usize; // ~1 ms
+    let mut iq = vec![num_complex::Complex::new(0.0f32, 0.0); pad];
+    iq.extend_from_slice(&burst);
+    iq.extend(std::iter::repeat(num_complex::Complex::new(0.0f32, 0.0)).take(pad));
+    let _ = chan;
+    let mut dec = UatChannelDecoder::new(input_rate).unwrap();
+    dec.process(&iq)
+}
+
+#[test]
+fn demod_downlink_short_type0_synth_iq() {
+    // Modulate at the native channel rate (DDC bypassed) — exercises the
+    // discriminator, sync hunt, and bit slicing directly.
+    let frame = frame_short_type0();
+    let frames = demod_synth(&frame, xng_mode_uat::CHANNEL_RATE);
+    let f = frames
+        .iter()
+        .find(|f| matches!(f.message, UatMessage::Downlink(_)))
+        .expect("recovered a downlink frame from synthetic IQ");
+    assert_eq!(f.wire_bytes, frame, "recovered the exact with-parity frame");
+    let UatMessage::Downlink(d) = &f.message else { unreachable!() };
+    // The recovered decode equals the dump978-pinned known-good values.
+    assert_eq!(d.address, "a66ef1");
+    assert_eq!(d.payload_type, 0);
+    assert_eq!(d.ground_speed, Some(118));
+    assert_eq!(d.true_track, Some(146.7));
+    let pos = d.position.as_ref().expect("position");
+    assert!((pos.lat - 37.45338).abs() < 1e-4, "lat {}", pos.lat);
+    assert!((pos.lon - (-122.09643)).abs() < 1e-4, "lon {}", pos.lon);
+    assert_eq!(f.kind(), "adsb");
+}
+
+#[test]
+fn demod_downlink_long_type1_synth_iq() {
+    let frame = frame_long_type1();
+    let frames = demod_synth(&frame, xng_mode_uat::CHANNEL_RATE);
+    let f = frames
+        .iter()
+        .find(|f| match &f.message {
+            UatMessage::Downlink(d) => d.payload_type == 1,
+            _ => false,
+        })
+        .expect("recovered the long type-1 frame from synthetic IQ");
+    let UatMessage::Downlink(d) = &f.message else { unreachable!() };
+    assert_eq!(d.callsign.as_deref(), Some("N5130E"));
+    assert_eq!(d.address, "a66ef1");
+    assert_eq!(d.emitter_category.as_deref(), Some("A2"));
+    assert_eq!(d.ground_speed, Some(128));
+    assert_eq!(f.kind(), "adsb");
+}
+
+#[test]
+fn demod_downlink_short_noisy_synth_iq() {
+    // Add deterministic additive noise so the validation is not a clean
+    // loopback: the discriminator, DC tracker, and sync error tolerance
+    // must still recover the known frame.
+    let frame = frame_short_type0();
+    let rate = xng_mode_uat::CHANNEL_RATE;
+    let burst = modulate::burst_iq(&frame, true, rate, 0.0, 0.5);
+    let pad = (rate / 1000.0) as usize;
+    let mut iq = vec![num_complex::Complex::new(0.0f32, 0.0); pad];
+    iq.extend_from_slice(&burst);
+    iq.extend(std::iter::repeat(num_complex::Complex::new(0.0f32, 0.0)).take(pad));
+    // Cheap deterministic PRNG (xorshift) → ~0.1 RMS complex noise.
+    let mut st: u32 = 0x1234_5678;
+    let mut rng = || {
+        st ^= st << 13;
+        st ^= st >> 17;
+        st ^= st << 5;
+        (st as f32 / u32::MAX as f32) - 0.5
+    };
+    for s in iq.iter_mut() {
+        *s += num_complex::Complex::new(rng() * 0.2, rng() * 0.2);
+    }
+    let mut dec = UatChannelDecoder::new(rate).unwrap();
+    let frames = dec.process(&iq);
+    let f = frames
+        .iter()
+        .find(|f| matches!(f.message, UatMessage::Downlink(_)))
+        .expect("recovered the downlink frame under additive noise");
+    let UatMessage::Downlink(d) = &f.message else { unreachable!() };
+    assert_eq!(d.address, "a66ef1");
+    assert_eq!(d.ground_speed, Some(118));
+    // Level estimate is a finite, reasonable dBFS value.
+    assert!(dec.level_dbfs().is_finite());
+}
+
+#[test]
+fn to_message_emits_uat_adsb_variant() {
+    // The wideband interface contract: a recovered downlink frame maps to
+    // MessageBody::Uat{kind:"adsb", details=<UatDownlink JSON>} with the
+    // mode, crc_ok, raw wire bytes, and rssi set.
+    use xng_types::{MessageBody, Mode};
+    let frame = frame_short_type0();
+    let frames = demod_synth(&frame, xng_mode_uat::CHANNEL_RATE);
+    let f = frames
+        .iter()
+        .find(|f| matches!(f.message, UatMessage::Downlink(_)))
+        .expect("downlink frame");
+    let source = xng_types::Provenance {
+        station: xng_types::StationIdentity::new("TEST"),
+        app: xng_types::AppInfo::xng(),
+        sdr: None,
+        channel: None,
+    };
+    let msg = xng_mode_uat::to_message(f, xng_mode_uat::UAT_FREQUENCY_HZ, source);
+    assert_eq!(msg.mode, Mode::Uat);
+    assert_eq!(msg.frequency_hz, 978_000_000);
+    assert!(msg.decode.crc_ok);
+    assert_eq!(msg.raw.as_deref(), Some(&frame[..]));
+    assert!(msg.signal.rssi_db.is_some());
+    match &msg.body {
+        MessageBody::Uat { kind, details } => {
+            assert_eq!(kind, "adsb");
+            assert_eq!(details["address"], "a66ef1");
+        }
+        other => panic!("expected MessageBody::Uat, got {other:?}"),
+    }
+}
+
+#[test]
+fn demod_downlink_short_through_ddc_synth_iq() {
+    // A non-integer capture rate exercises the DDC (decimate + resample)
+    // ahead of the demod, the way a real SDR feeds the wideband decoder.
+    let frame = frame_short_type0();
+    let frames = demod_synth(&frame, 8_000_000.0);
+    let f = frames
+        .iter()
+        .find(|f| matches!(f.message, UatMessage::Downlink(_)))
+        .expect("recovered a downlink frame through the DDC");
+    assert_eq!(f.wire_bytes, frame);
+    let UatMessage::Downlink(d) = &f.message else { unreachable!() };
+    assert_eq!(d.address, "a66ef1");
+    assert_eq!(d.ground_speed, Some(118));
 }
