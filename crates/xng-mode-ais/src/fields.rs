@@ -80,6 +80,92 @@ fn data_hex(bits: &[u8], s: usize) -> String {
         .collect()
 }
 
+/// Application-specific message (ASM) decode for the binary payload of a
+/// type-8 (broadcast) or type-6 (addressed) message, dispatched by DAC/FID.
+/// `p` is the bit offset where the application data begins (after the DAC/FID
+/// header): bit 56 for type 8, bit 88 for type 6. Returns the decoded
+/// application fields when the DAC/FID is recognised and the payload is long
+/// enough; otherwise `None` so the caller falls back to `data_hex`.
+///
+/// DAC=200 (Inland AIS, UNECE ECE/TRANS/SC.3/176) subtypes are verified
+/// against the pyais oracle. Field layouts and conventions (including the
+/// re-use of the 1/600000-degree lat/lon scaling for the EMMA/signal-strength
+/// coordinates) follow pyais so the emitted values match the oracle exactly.
+fn asm_decode(dac: u64, fid: u64, bits: &[u8], p: usize) -> Option<Value> {
+    let mut d = serde_json::Map::new();
+    let mut put = |k: &str, v: Value| {
+        d.insert(k.into(), v);
+    };
+    match (dac, fid) {
+        // Inland ship static & voyage data (UNECE SC.3/176, FID 10).
+        (200, 10) => {
+            put("inland_vin", json!(sixbit(bits, p, 8)?));
+            put("inland_length_m", json!(u(bits, p + 48, 13)? as f64 / 10.0));
+            put("inland_beam_m", json!(u(bits, p + 61, 10)? as f64 / 10.0));
+            put("inland_ship_type", json!(u(bits, p + 71, 14)?));
+            put("inland_hazard", json!(u(bits, p + 85, 3)?));
+            put("inland_draught_m", json!(u(bits, p + 88, 11)? as f64 / 100.0));
+            put("inland_loaded", json!(u(bits, p + 99, 2)?));
+        }
+        // EMMA warning report (FID 23).
+        (200, 23) => {
+            // 1/600000-degree scaling, matching pyais.
+            let ll = |s: usize, n: usize| -> Option<f64> {
+                Some(i(bits, s, n)? as f64 / 600_000.0)
+            };
+            put("start_year", json!(u(bits, p, 8)?));
+            put("start_month", json!(u(bits, p + 8, 4)?));
+            put("start_day", json!(u(bits, p + 12, 5)?));
+            put("end_year", json!(u(bits, p + 17, 8)?));
+            put("end_month", json!(u(bits, p + 25, 4)?));
+            put("end_day", json!(u(bits, p + 29, 5)?));
+            put("start_hour", json!(u(bits, p + 34, 5)?));
+            put("start_minute", json!(u(bits, p + 39, 6)?));
+            put("end_hour", json!(u(bits, p + 45, 5)?));
+            put("end_minute", json!(u(bits, p + 50, 6)?));
+            put("start_lon", json!(ll(p + 56, 28)?));
+            put("start_lat", json!(ll(p + 84, 27)?));
+            put("end_lon", json!(ll(p + 111, 28)?));
+            put("end_lat", json!(ll(p + 139, 27)?));
+            put("emma_type", json!(u(bits, p + 166, 4)?));
+            put("emma_min", json!(i(bits, p + 170, 9)?));
+            put("emma_max", json!(i(bits, p + 179, 9)?));
+            put("emma_intensity", json!(u(bits, p + 188, 2)?));
+            put("emma_wind", json!(u(bits, p + 190, 4)?));
+        }
+        // Water-level report (FID 24): 4 × (gauge id, water level).
+        (200, 24) => {
+            // 12-bit country code (2 × 6-bit ASCII).
+            let country = sixbit(bits, p, 2)?;
+            if !country.is_empty() {
+                put("inland_country", json!(country));
+            }
+            let mut gauges = Vec::new();
+            for k in 0..4 {
+                let s = p + 12 + k * 25;
+                let id = u(bits, s, 11)?;
+                let level = i(bits, s + 11, 14)?;
+                gauges.push(json!({ "gauge_id": id, "water_level": level }));
+            }
+            put("water_gauges", json!(gauges));
+        }
+        // Signal-strength / bridge-status report (FID 40).
+        (200, 40) => {
+            let ll = |s: usize, n: usize| -> Option<f64> {
+                Some(i(bits, s, n)? as f64 / 600_000.0)
+            };
+            put("lon", json!(ll(p, 28)?));
+            put("lat", json!(ll(p + 28, 27)?));
+            put("signal_form", json!(u(bits, p + 55, 4)?));
+            put("signal_facing", json!(u(bits, p + 59, 9)?));
+            put("signal_direction", json!(u(bits, p + 68, 3)?));
+            put("signal_status_raw", json!(u(bits, p + 71, 30)?));
+        }
+        _ => return None,
+    }
+    if d.is_empty() { None } else { Some(Value::Object(d)) }
+}
+
 const NAV_STATUS: [&str; 16] = [
     "under way (engine)",
     "at anchor",
@@ -209,27 +295,35 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
             // DTE: bit 0 = data terminal ready.
             put("dte_ready", json!(u(bits, 422, 1)? == 0));
         }
-        // Addressed binary message.
+        // Addressed binary message. Application data starts at bit 88.
         6 => {
             put("seqno", json!(u(bits, 38, 2)));
             put("dest_mmsi", json!(u(bits, 40, 30)));
             put("retransmit", json!(u(bits, 70, 1)? == 1));
-            put("dac", json!(u(bits, 72, 10)));
-            put("fid", json!(u(bits, 82, 6)));
-            if bits.len() > 88 {
-                put("data_hex", json!(data_hex(bits, 88)));
+            let dac = u(bits, 72, 10)?;
+            let fid = u(bits, 82, 6)?;
+            put("dac", json!(dac));
+            put("fid", json!(fid));
+            match asm_decode(dac, fid, bits, 88) {
+                Some(Value::Object(app)) => put("app", json!(app)),
+                _ if bits.len() > 88 => put("data_hex", json!(data_hex(bits, 88))),
+                _ => {}
             }
         }
         // Binary / safety acknowledgements.
         7 | 13 => {
             put("dest_mmsi", json!(u(bits, 40, 30)));
         }
-        // Broadcast binary message.
+        // Broadcast binary message. Application data starts at bit 56.
         8 => {
-            put("dac", json!(u(bits, 40, 10)));
-            put("fid", json!(u(bits, 50, 6)));
-            if bits.len() > 56 {
-                put("data_hex", json!(data_hex(bits, 56)));
+            let dac = u(bits, 40, 10)?;
+            let fid = u(bits, 50, 6)?;
+            put("dac", json!(dac));
+            put("fid", json!(fid));
+            match asm_decode(dac, fid, bits, 56) {
+                Some(Value::Object(app)) => put("app", json!(app)),
+                _ if bits.len() > 56 => put("data_hex", json!(data_hex(bits, 56))),
+                _ => {}
             }
         }
         // SAR aircraft.
@@ -582,11 +676,111 @@ mod tests {
 
     #[test]
     fn type8_binary_broadcast() {
+        // DAC=1/FID=31 is not (yet) a verified ASM subtype → data_hex fallback.
         let bits = bits_of("83HOI:00Gh420h@", 2);
         let d = decode(8, &bits).unwrap();
         assert_eq!(d["dac"], 1);
         assert_eq!(d["fid"], 31);
         assert_eq!(d["data_hex"], "01020304");
+        assert!(d.get("app").is_none());
+    }
+
+    // AIS-1 ASM dispatch: DAC=200 (Inland AIS) subtypes. Vectors and asserted
+    // field values are from the pyais test suite (test_msg_type_8_inland,
+    // test_msg_type_8_inland_2, _dac_200_fid_23/24/40), decoded with pyais 3.1.
+
+    #[test]
+    fn type8_dac200_fid10_inland_static_matches_pyais() {
+        // Norwegian public feed (pyais test_msg_type_8_inland): beam 7.5.
+        let bits = bits_of("83m;Fa0j2d<<<<<<<0@pUg`50000", 0);
+        let d = decode(8, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 10);
+        let a = &d["app"];
+        assert_eq!(a["inland_length_m"], 13.5);
+        assert_eq!(a["inland_beam_m"], 7.5);
+        assert_eq!(a["inland_ship_type"], 8000);
+        assert_eq!(a["inland_hazard"], 5);
+        assert_eq!(a["inland_draught_m"], 0.0);
+        assert_eq!(a["inland_loaded"], 0);
+    }
+
+    #[test]
+    fn type8_dac200_fid10_inland_static2_matches_pyais() {
+        // pyais test_msg_type_8_inland_2: length 180.6, beam 42, loaded 0.
+        let bits = bits_of("85M67F@j2U=7EW=RAkQkBDITMV=e", 0);
+        let d = decode(8, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 10);
+        let a = &d["app"];
+        assert_eq!(a["inland_vin"], "T4]V\\6IG");
+        assert_eq!(a["inland_length_m"], 180.6);
+        assert_eq!(a["inland_beam_m"], 42.0);
+        assert_eq!(a["inland_ship_type"], 10444);
+        assert_eq!(a["inland_hazard"], 4);
+        assert_eq!(a["inland_draught_m"], 9.47);
+        assert_eq!(a["inland_loaded"], 0);
+        assert!(d.get("data_hex").is_none());
+    }
+
+    #[test]
+    fn type8_dac200_fid23_emma_matches_pyais() {
+        let bits = bits_of("8007R@0j5iaG3BiLuO473qp2N=003=LL0k6wh?2Wf80", 2);
+        let d = decode(8, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 23);
+        let a = &d["app"];
+        assert_eq!(a["start_year"], 26);
+        assert_eq!(a["start_month"], 5);
+        assert_eq!(a["start_day"], 14);
+        assert_eq!(a["end_year"], 26);
+        assert_eq!(a["end_month"], 5);
+        assert_eq!(a["end_day"], 17);
+        assert_eq!(a["start_hour"], 14);
+        assert_eq!(a["start_minute"], 30);
+        assert_eq!(a["end_hour"], 23);
+        assert_eq!(a["end_minute"], 49);
+        assert_eq!(a["start_lon"], 12.34);
+        assert_eq!(a["start_lat"], 34.56);
+        assert_eq!(a["end_lon"], 11.22);
+        assert_eq!(a["end_lat"], 22.33);
+        assert_eq!(a["emma_type"], 3);
+        assert_eq!(a["emma_min"], -123);
+        assert_eq!(a["emma_max"], 123);
+        assert_eq!(a["emma_intensity"], 2);
+        assert_eq!(a["emma_wind"], 2);
+    }
+
+    #[test]
+    fn type8_dac200_fid24_water_level_matches_pyais() {
+        let bits = bits_of("8007R@0j60006000Nh0bJGwewtW4", 0);
+        let d = decode(8, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 24);
+        let g = &d["app"]["water_gauges"];
+        assert_eq!(g[0]["gauge_id"], 12);
+        assert_eq!(g[0]["water_level"], 0);
+        assert_eq!(g[1]["gauge_id"], 123);
+        assert_eq!(g[1]["water_level"], 10);
+        assert_eq!(g[2]["gauge_id"], 1234);
+        assert_eq!(g[2]["water_level"], -10);
+        assert_eq!(g[3]["gauge_id"], 2047);
+        assert_eq!(g[3]["water_level"], 2500);
+    }
+
+    #[test]
+    fn type8_dac200_fid40_signal_strength_matches_pyais() {
+        let bits = bits_of("8007R@0j:1<RL0gfD21PD3cNIN00", 0);
+        let d = decode(8, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 40);
+        let a = &d["app"];
+        assert_eq!(a["lon"], 33.44);
+        assert_eq!(a["lat"], -56.89);
+        assert_eq!(a["signal_form"], 3);
+        assert_eq!(a["signal_facing"], 5);
+        assert_eq!(a["signal_direction"], 0);
+        assert_eq!(a["signal_status_raw"], 123456700);
     }
 
     #[test]

@@ -20,6 +20,23 @@ sentence (type 1, MMSI 477553000) reconstructed back to wire bits, so the
 bit-order/armoring conventions are verified against real-world data, not
 just self-consistency.
 
+## ASM (DAC/FID binary) dispatch — DAC=200 Inland AIS (2026-06)
+
+Type-6/8 application-specific message bodies are dispatched by DAC/FID. The
+DAC=200 (Inland AIS) subtypes — FID 10 (ship static & voyage), FID 23 (EMMA
+warning), FID 24 (water level) and FID 40 (signal strength) — follow the
+field layouts in UNECE ECE/TRANS/SC.3/176 (Inland AIS) and gpsd's published
+AIVDM reference (standards/spec text only). Field offsets, scaling
+conventions (1/10 m length/beam, 1/100 m draught, and the re-use of the
+1/600000-degree lat/lon scaling for the EMMA/signal-strength coordinates),
+and emitted values are anchored to the **pyais** (MIT) decode oracle:
+`tests/test_decode.py::test_msg_type_8_inland`, `_inland_2`,
+`_dac_200_fid_23`, `_dac_200_fid_24`, `_dac_200_fid_40` (pyais 3.1.0). No
+pyais code was copied; the vectors and asserted values are the reference.
+Unrecognised DAC/FID (e.g. DAC=1 IMO Circ.289, which pyais does not decode)
+fall back to the existing `data_hex` field — no unverified subtypes are
+fabricated.
+
 ## Distress device classification (2026-06)
 
 The `distress` tag classifies SART/MOB/EPIRB-AIS transmitters by MMSI
