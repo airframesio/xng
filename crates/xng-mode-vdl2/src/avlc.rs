@@ -193,30 +193,101 @@ pub struct XidParam {
     /// destination airport parameter).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Decoded scalar value for timer/counter parameters (big-endian int).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_int: Option<u32>,
+    /// Decoded frequency in MHz (autotune-frequency parameter).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freq_mhz: Option<f64>,
+    /// Frequency-support-list entries: (ground station address, MHz).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub freq_support: Vec<FreqSupportEntry>,
 }
 
-/// VDL private parameter set names (ICAO Doc 9776 Table 5-3 area).
+/// One entry of the VDL2 frequency-support-list parameter (0xC0).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FreqSupportEntry {
+    /// Ground station 24-bit address (hex).
+    pub gs_addr: String,
+    pub freq_mhz: f64,
+}
+
+/// XID group identifiers (ISO 8885): public (HDLC) and VDL-private.
+pub const XID_GID_PUBLIC: u8 = 0x80;
+pub const XID_GID_PRIVATE: u8 = 0xF0;
+
+/// VDL private parameter-set names (ICAO Doc 9776 Table 5-3 / VDL2 SARPs),
+/// cross-checked against dumpvdl2 `xid_vdl_params` (xid.c). The
+/// previous table mis-numbered 0x40–0x49 entirely (e.g. 0x42 is Timer T4,
+/// not Destination airport — the airport parameter is 0x83 in this group).
 fn vdl_param_name(id: u8) -> Option<&'static str> {
     Some(match id {
         0x00 => "parameter-set-id",
         0x01 => "connection-management",
-        0x02 => "signal-quality",
+        0x02 => "signal-quality", // SQP
         0x03 => "xid-sequencing",
-        0x04 => "avlc-options",
+        0x04 => "avlc-specific-options",
         0x05 => "expedited-sn-connection",
         0x06 => "lcr-cause",
-        0x40 => "modulation-support",
-        0x41 => "acceptable-alternate-ground-stations",
-        0x42 => "destination-airport",
-        0x43 => "aircraft-position",
-        0x44 => "autotune-frequency",
-        0x45 => "replacement-ground-stations",
-        0x46 => "timer-t4",
-        0x47 => "mac-persistence",
-        0x48 => "counter-m1",
-        0x49 => "timer-tm2",
+        0x40 => "autotune-frequency",
+        0x41 => "replacement-ground-stations",
+        0x42 => "timer-t4",
+        0x43 => "mac-persistence",
+        0x44 => "counter-m1",
+        0x45 => "timer-tm2",
+        0x46 => "timer-tg5",
+        0x47 => "timer-t3min",
+        0x48 => "ground-station-address-filter",
+        0x49 => "broadcast-connection",
+        0x81 => "modulation-support",
+        0x82 => "alternate-ground-stations",
+        0x83 => "destination-airport",
+        0x84 => "aircraft-location",
+        0xC0 => "frequency-support-list",
+        0xC1 => "airport-coverage",
+        0xC3 => "nearest-airport-id",
+        0xC4 => "atn-router-nets",
+        0xC5 => "system-mask",
+        0xC6 => "timer-tg3",
+        0xC7 => "timer-tg4",
+        0xC8 => "ground-station-location",
         _ => return None,
     })
+}
+
+/// Public (ISO 8885 HDLC) parameter-set names, group 0x80; cross-checked
+/// against dumpvdl2 `xid_pub_params` (xid.c).
+fn pub_param_name(id: u8) -> Option<&'static str> {
+    Some(match id {
+        0x01 => "parameter-set-id",
+        0x02 => "procedure-classes",
+        0x03 => "hdlc-options",
+        0x05 => "n1-downlink",
+        0x06 => "n1-uplink",
+        0x07 => "k-downlink",
+        0x08 => "k-uplink",
+        0x09 => "timer-t1-downlink",
+        0x0A => "counter-n2",
+        0x0B => "timer-t2",
+        _ => return None,
+    })
+}
+
+/// Decode the 2-octet VDL2 frequency field (autotune / freq-support-list
+/// entries): top nibble = modulation-support bitfield, low 12 bits encode
+/// the channel as `freq_khz = (raw + 10000) * 10`, rounded up to the next
+/// 25 kHz step. Returns (MHz, modulation_bits). Matches dumpvdl2 parse_freq.
+fn decode_vdl2_freq(buf: &[u8]) -> Option<(f64, u8)> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let modulations = buf[0] >> 4;
+    let raw = (u16::from_be_bytes([buf[0], buf[1]]) & 0x0FFF) as u32;
+    let mut freq_khz = (raw + 10_000) * 10;
+    if freq_khz % 25 != 0 {
+        freq_khz += 25 - freq_khz % 25;
+    }
+    Some((freq_khz as f64 / 1000.0, modulations))
 }
 
 /// Parse an XID information field: FI octet, then groups of
@@ -241,15 +312,21 @@ pub fn parse_xid(info: &[u8]) -> Option<Vec<XidParam>> {
             }
             let value = &info[pos..pos + plen];
             pos += plen;
+            let name = match group {
+                XID_GID_PRIVATE => vdl_param_name(id),
+                XID_GID_PUBLIC => pub_param_name(id),
+                _ => None,
+            };
             let printable = value.len() >= 2
                 && value.iter().all(|&b| (0x20..0x7F).contains(&b));
-            // Ground-station list parameters carry 4-octet AVLC
-            // addresses — decodable with the standard address parser.
-            let text = if group == 0xF0
-                && matches!(id, 0x41 | 0x45)
+            // Ground-station-list parameters carry 4-octet AVLC addresses:
+            // replacement (0x41), GS-address-filter (0x48),
+            // alternate (0x82), and system-mask (0xC5).
+            let is_addr_list = group == XID_GID_PRIVATE
+                && matches!(id, 0x41 | 0x48 | 0x82 | 0xC5)
                 && !value.is_empty()
-                && value.len() % 4 == 0
-            {
+                && value.len() % 4 == 0;
+            let text = if is_addr_list {
                 Some(
                     value
                         .chunks_exact(4)
@@ -260,12 +337,55 @@ pub fn parse_xid(info: &[u8]) -> Option<Vec<XidParam>> {
             } else {
                 printable.then(|| String::from_utf8_lossy(value).into_owned())
             };
+            // Autotune frequency (0x40 in the VDL group) → MHz.
+            let freq_mhz = if group == XID_GID_PRIVATE && id == 0x40 {
+                decode_vdl2_freq(value).map(|(mhz, _)| mhz)
+            } else {
+                None
+            };
+            // Frequency-support-list (0xC0): 6-octet entries, freq(2)+gs(4).
+            let freq_support = if group == XID_GID_PRIVATE
+                && id == 0xC0
+                && !value.is_empty()
+                && value.len() % 6 == 0
+            {
+                value
+                    .chunks_exact(6)
+                    .filter_map(|c| {
+                        let (mhz, _) = decode_vdl2_freq(&c[0..2])?;
+                        Some(FreqSupportEntry {
+                            gs_addr: parse_address(&c[2..6]).addr,
+                            freq_mhz: mhz,
+                        })
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Timer / counter parameters carry a big-endian integer
+            // (1–4 octets); decode the scalar in addition to the raw hex.
+            let value_int = match name {
+                Some(n)
+                    if (n.starts_with("timer-") || n.starts_with("counter-"))
+                        && (1..=4).contains(&value.len()) =>
+                {
+                    let mut v: u32 = 0;
+                    for &b in value {
+                        v = (v << 8) | b as u32;
+                    }
+                    Some(v)
+                }
+                _ => None,
+            };
             params.push(XidParam {
                 group,
                 id,
-                name: if group == 0xF0 { vdl_param_name(id) } else { None },
+                name,
                 value_hex: value.iter().map(|b| format!("{b:02x}")).collect(),
                 text,
+                value_int,
+                freq_mhz,
+                freq_support,
             });
         }
         pos = end;
@@ -544,9 +664,11 @@ mod body_tests {
     #[test]
     fn xid_parameters_decode_with_names_and_text() {
         // FI 0x82, VDL private group 0xF0, two params:
-        // parameter-set-id = "V", destination-airport = "KSMF".
+        // parameter-set-id (0x00) = "V", destination-airport (0x83) = "KSMF".
+        // (Destination-airport is parameter 0x83 in the VDL group, per
+        // dumpvdl2 xid_vdl_params — NOT 0x42, which is Timer T4.)
         let info = [
-            0x82, 0xF0, 0x00, 0x09, 0x00, 0x01, b'V', 0x42, 0x04, b'K', b'S', b'M', b'F',
+            0x82, 0xF0, 0x00, 0x09, 0x00, 0x01, b'V', 0x83, 0x04, b'K', b'S', b'M', b'F',
         ];
         let params = parse_xid(&info).expect("params");
         assert_eq!(params.len(), 2);
@@ -621,7 +743,116 @@ mod xid_gs_tests {
         info.extend_from_slice(&gs1);
         info.extend_from_slice(&gs2);
         let params = parse_xid(&info).unwrap();
-        assert_eq!(params[0].name, Some("acceptable-alternate-ground-stations"));
+        // 0x41 in the VDL group is replacement-ground-stations.
+        assert_eq!(params[0].name, Some("replacement-ground-stations"));
         assert_eq!(params[0].text.as_deref(), Some("2C0A55,2D4917"));
+    }
+
+    #[test]
+    fn gs_address_filter_and_system_mask_decode_addresses() {
+        let gs = encode_address(AddressType::GroundIcao, 0x2C0A55, false, true);
+        // GS-address-filter (0x48) and system-mask (0xC5) are address lists.
+        for id in [0x48u8, 0xC5] {
+            let mut info = vec![0x82, 0xF0, 0x00, 6, id, 4];
+            info.extend_from_slice(&gs);
+            let params = parse_xid(&info).unwrap();
+            assert_eq!(params[0].id, id);
+            assert_eq!(params[0].text.as_deref(), Some("2C0A55"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod xid_vdl2_3_tests {
+    use super::*;
+
+    /// Build an XID info field with a single VDL-private parameter.
+    fn vdl_one(id: u8, value: &[u8]) -> Vec<u8> {
+        let glen = 2 + value.len();
+        let mut info = vec![0x82, 0xF0, (glen >> 8) as u8, glen as u8, id, value.len() as u8];
+        info.extend_from_slice(value);
+        info
+    }
+
+    #[test]
+    fn new_vdl_param_names() {
+        // The parameter IDs added in VDL2-3, verified against dumpvdl2
+        // xid_vdl_params.
+        let cases: &[(u8, &str)] = &[
+            (0x46, "timer-tg5"),
+            (0x47, "timer-t3min"),
+            (0x48, "ground-station-address-filter"),
+            (0x49, "broadcast-connection"),
+            (0xC0, "frequency-support-list"),
+            (0xC1, "airport-coverage"),
+            (0xC3, "nearest-airport-id"),
+            (0xC4, "atn-router-nets"),
+            (0xC5, "system-mask"),
+            (0xC6, "timer-tg3"),
+            (0xC7, "timer-tg4"),
+        ];
+        for &(id, name) in cases {
+            assert_eq!(vdl_param_name(id), Some(name), "id {id:#04x}");
+        }
+    }
+
+    #[test]
+    fn public_group_params_named() {
+        // ISO 8885 HDLC parameter set, group 0x80.
+        let info = [
+            0x82, 0x80, 0x00, 0x06, 0x09, 0x02, 0x00, 0x64, 0x0A, 0x00,
+        ];
+        // 0x09 = timer-t1-downlink (len 2, value 0x0064 = 100),
+        // 0x0A = counter-n2 (len 0).
+        let params = parse_xid(&info).unwrap();
+        assert_eq!(params[0].group, XID_GID_PUBLIC);
+        assert_eq!(params[0].name, Some("timer-t1-downlink"));
+        assert_eq!(params[0].value_int, Some(100));
+        assert_eq!(params[1].name, Some("counter-n2"));
+    }
+
+    #[test]
+    fn autotune_frequency_decodes_to_mhz() {
+        // raw=3697 (low 12 bits), top nibble (modulation) = 0 →
+        // freq_khz=(3697+10000)*10=136970, rounded up to 136975 → 136.975.
+        let params = parse_xid(&vdl_one(0x40, &[0x0E, 0x71])).unwrap();
+        assert_eq!(params[0].name, Some("autotune-frequency"));
+        assert_eq!(params[0].freq_mhz, Some(136.975));
+    }
+
+    #[test]
+    fn frequency_support_list_decodes_entries() {
+        // One entry: freq(2)=0x0E71 (136.975) + gs addr.
+        let gs = encode_address(AddressType::GroundIcao, 0x2C0A55, false, true);
+        let mut value = vec![0x0E, 0x71];
+        value.extend_from_slice(&gs);
+        let params = parse_xid(&vdl_one(0xC0, &value)).unwrap();
+        assert_eq!(params[0].name, Some("frequency-support-list"));
+        assert_eq!(params[0].freq_support.len(), 1);
+        assert_eq!(params[0].freq_support[0].gs_addr, "2C0A55");
+        assert_eq!(params[0].freq_support[0].freq_mhz, 136.975);
+    }
+
+    #[test]
+    fn timers_decode_to_int() {
+        // Timer TG5 (0x46), big-endian 2-octet value 0x012C = 300.
+        let params = parse_xid(&vdl_one(0x46, &[0x01, 0x2C])).unwrap();
+        assert_eq!(params[0].name, Some("timer-tg5"));
+        assert_eq!(params[0].value_int, Some(300));
+        // Counter M1 (0x44), single octet 0x05.
+        let params = parse_xid(&vdl_one(0x44, &[0x05])).unwrap();
+        assert_eq!(params[0].name, Some("counter-m1"));
+        assert_eq!(params[0].value_int, Some(5));
+    }
+
+    #[test]
+    fn freq_decode_known_channels() {
+        // Common VDL2 channels; raw = (MHz*1000/10 - 10000), low 12 bits.
+        assert_eq!(decode_vdl2_freq(&[0x0E, 0x70]).unwrap().0, 136.975);
+        assert_eq!(decode_vdl2_freq(&[0x0E, 0x66]).unwrap().0, 136.875);
+        assert_eq!(decode_vdl2_freq(&[0x0E, 0x57]).unwrap().0, 136.725);
+        assert_eq!(decode_vdl2_freq(&[0x0E, 0x4F]).unwrap().0, 136.650);
+        // The modulation bits in the top nibble must not affect the freq.
+        assert_eq!(decode_vdl2_freq(&[0xCE, 0x70]).unwrap(), (136.975, 0xC));
     }
 }

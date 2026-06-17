@@ -117,9 +117,33 @@ ICAO Doc 9776/9705 — dumpvdl2 (GPL) was not consulted for this module.
 X.25 M-bit sequences reassemble per logical channel before network-
 layer parsing. ATN's LREF/deflate-compressed CLNP variants are labeled
 but deliberately left as hex (layouts not yet verified against the
-spec). XID ground-station list parameters (0x41/0x45) decode as AVLC
-addresses via the standard EN 301 841-2 address parser; the autotune
-frequency parameter stays hex under the same hex-not-guessed policy.
+spec). XID ground-station list parameters decode as AVLC addresses via
+the standard EN 301 841-2 address parser (see the XID completion note
+below).
+
+## XID parameter completion (2026-06, VDL2-3)
+
+The VDL-private parameter-set table (group 0xF0) was completed and
+corrected. The earlier table mis-numbered every entry in the 0x40–0x49
+range (e.g. it labelled 0x42 "destination-airport" — that is parameter
+0x83; 0x42 is Timer T4). The corrected numbering and the added IDs
+(autotune-frequency 0x40, replacement-GS 0x41, T4 0x42, MAC-persistence
+0x43, counter-M1 0x44, TM2 0x45, TG5 0x46, T3min 0x47, GS-address-filter
+0x48, broadcast-connection 0x49, modulation-support 0x81, alternate-GS
+0x82, destination-airport 0x83, aircraft-location 0x84, frequency-
+support-list 0xC0, airport-coverage 0xC1, nearest-airport-id 0xC3,
+ATN-router-NETs 0xC4, system-mask 0xC5, TG3 0xC6, TG4 0xC7, GS-location
+0xC8) plus the public ISO 8885 HDLC parameter set (group 0x80: 0x01–0x0B)
+were cross-checked against the *parameter-ID dictionary* in dumpvdl2's
+`xid.c` (`xid_vdl_params` / `xid_pub_params`) — protocol facts (the
+integer→name assignment and the frequency encoding), not code or
+formatter text. The 2-octet VDL2 frequency field (autotune 0x40 and each
+frequency-support-list entry) decodes to MHz via the SARPs encoding
+`freq_khz = (raw12 + 10000)·10`, rounded up to the next 25 kHz step, with
+the modulation-support nibble in the top 4 bits; timer/counter parameters
+also decode to a big-endian integer alongside the preserved raw hex.
+Address-list parameters (replacement-GS 0x41, GS-address-filter 0x48,
+alternate-GS 0x82, system-mask 0xC5) decode as 4-octet AVLC addresses.
 
 ## ATN-B1 CPDLC + CM (2026-06)
 
