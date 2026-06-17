@@ -1488,37 +1488,203 @@ pub fn bds45(mb: &[u8]) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(o))
 }
 
-/// Infer the BDS register of a DF20/21 MB field, mirroring the phased
-/// precedence of pyModeS `_infer.py`:
+// ── rs1090-style density / penalty BDS scoring ──────────────────────
+// A soft, statistics-based replacement for the brittle "exactly one
+// validates" EHS rule, ported (parameters and formulas, not code) from
+// rs1090's `decode::bds::density` / `penalty` modules. Each candidate's
+// score is the *mean* of its per-field log-densities under Gaussian /
+// Laplace distributions (calibrated by xoolive on a month of EUROCONTROL
+// CAT 048 ground truth) plus a within-record cross-field penalty
+// (|TAS−GS|, roll·track-rate turn-sign, IAS/Mach ratio). A candidate is
+// rejected when the combined score falls below DENSITY_THRESHOLD (−3.0).
+// This recovers ambiguous frames the exactly-one rule discards: when two
+// EHS registers structurally validate, the higher-scoring one wins.
+
+/// Mean log-density rejection threshold (rs1090 `DENSITY_THRESHOLD`).
+pub const DENSITY_THRESHOLD: f64 = -3.0;
+
+/// Un-normalised Gaussian log-density (rs1090 `density::gauss`); the shared
+/// normalising constant is dropped — it only shifts the threshold.
+fn gauss_ld(value: f64, mu: f64, sigma: f64) -> f64 {
+    let z = (value - mu) / sigma;
+    -0.5 * z * z
+}
+
+/// Un-normalised Laplace log-density (rs1090 `density::laplace`).
+fn laplace_ld(value: f64, median: f64, b: f64) -> f64 {
+    if b <= 0.0 {
+        return 0.0;
+    }
+    -(value - median).abs() / b
+}
+
+/// Read a numeric field from a decoded BDS JSON object as `f64`.
+fn jf(v: &serde_json::Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(serde_json::Value::as_f64)
+}
+
+/// Mean per-field log-density of a decoded BDS candidate (rs1090
+/// `density::density_score`). `None` when the register exposes no scored
+/// field (then it is accepted unconditionally). Distribution parameters
+/// are the rs1090 CAT-048-calibrated values; xng's field names are mapped
+/// onto rs1090's scored fields.
+pub fn bds_density_score(v: &serde_json::Value) -> Option<f64> {
+    let bds = v.get("bds").and_then(|b| b.as_str())?;
+    let mut total = 0.0;
+    let mut count = 0u32;
+    let mut add = |ld: f64| {
+        total += ld;
+        count += 1;
+    };
+    match bds {
+        "4,0" => {
+            if let Some(x) = jf(v, "baro_pressure_setting") {
+                add(laplace_ld(x, 1013.2, 5.4));
+            }
+            if let Some(x) = jf(v, "selected_altitude_mcp") {
+                add(gauss_ld(x, 24688.0, 10844.0));
+            }
+            if let Some(x) = jf(v, "selected_altitude_fms") {
+                add(gauss_ld(x, 24688.0, 10844.0));
+            }
+        }
+        "5,0" => {
+            if let Some(x) = jf(v, "roll") {
+                add(laplace_ld(x, 0.0, 10.0));
+            }
+            if let Some(x) = jf(v, "track_rate") {
+                add(laplace_ld(x, 0.0, 0.70));
+            }
+            if let Some(x) = jf(v, "true_airspeed") {
+                add(gauss_ld(x, 413.0, 120.0));
+            }
+            if let Some(x) = jf(v, "groundspeed") {
+                add(gauss_ld(x, 418.0, 129.0));
+            }
+        }
+        "6,0" => {
+            if let Some(x) = jf(v, "indicated_airspeed") {
+                add(gauss_ld(x, 272.0, 55.0));
+            }
+            if let Some(x) = jf(v, "mach") {
+                add(gauss_ld(x, 0.69, 0.21));
+            }
+            if let Some(x) = jf(v, "inertial_vertical_rate") {
+                add(gauss_ld(x, -298.0, 1669.0));
+            }
+        }
+        "4,4" => {
+            if let Some(x) = jf(v, "static_air_temperature") {
+                add(laplace_ld(x, -21.0, 9.90));
+            }
+            if let Some(x) = jf(v, "wind_speed") {
+                add(gauss_ld(x, 52.0, 29.0));
+            }
+            if let Some(x) = jf(v, "static_pressure") {
+                add(laplace_ld(x, 393.0, 290.0));
+            }
+        }
+        "4,5" => {
+            if let Some(x) = jf(v, "static_air_temperature") {
+                add(gauss_ld(x, -14.2, 16.4));
+            }
+            if let Some(x) = jf(v, "static_pressure") {
+                add(laplace_ld(x, 393.0, 290.0));
+            }
+        }
+        _ => {}
+    }
+    (count > 0).then(|| total / f64::from(count))
+}
+
+/// Within-record cross-field penalty (rs1090 `penalty::penalty`), always
+/// ≤ 0: BDS 5,0 `−|TAS−GS|/100` and a flat −2.0 when roll and track-rate
+/// disagree in sign during a real turn; BDS 6,0 a flat −3.0 when the
+/// IAS/Mach ratio leaves the atmospheric `[250, 800]` kt band.
+pub fn bds_penalty(v: &serde_json::Value) -> f64 {
+    let bds = v.get("bds").and_then(|b| b.as_str()).unwrap_or("");
+    let mut p = 0.0;
+    match bds {
+        "5,0" => {
+            if let (Some(tas), Some(gs)) = (jf(v, "true_airspeed"), jf(v, "groundspeed")) {
+                p -= (tas - gs).abs() / 100.0;
+            }
+            if let (Some(roll), Some(rate)) = (jf(v, "roll"), jf(v, "track_rate")) {
+                if roll.abs() > 5.0 && rate.abs() > 0.3 && (roll > 0.0) != (rate > 0.0) {
+                    p -= 2.0;
+                }
+            }
+        }
+        "6,0" => {
+            if let (Some(ias), Some(mach)) =
+                (jf(v, "indicated_airspeed"), jf(v, "mach"))
+            {
+                if mach > 0.0 {
+                    let ratio = ias / mach;
+                    if !(250.0..=800.0).contains(&ratio) {
+                        p -= 3.0;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    p
+}
+
+/// Combined rs1090 score: mean log-density + cross-field penalty. A
+/// candidate with no scored field scores 0.0 (always accepted by the
+/// density gate); the penalty still applies where relevant.
+pub fn bds_score(v: &serde_json::Value) -> f64 {
+    bds_density_score(v).unwrap_or(0.0) + bds_penalty(v)
+}
+
+/// Among a candidate set, drop those below [`DENSITY_THRESHOLD`] and
+/// return the highest-scoring survivor (stable on ties — earlier
+/// candidates win, preserving the EHS-first ordering).
+fn best_scored(candidates: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    candidates
+        .into_iter()
+        .filter(|v| bds_score(v) >= DENSITY_THRESHOLD)
+        .map(|v| {
+            let s = bds_score(&v);
+            (v, s)
+        })
+        .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
+        .map(|(v, _)| v)
+}
+
+/// Infer the BDS register of a DF20/21 MB field. Format-ID registers take
+/// precedence; the heuristic / meteorological registers are then
+/// disambiguated by the rs1090 density+penalty score rather than the old
+/// brittle "exactly one validates" rule:
 ///
-/// 1. Format-ID fast path (BDS 1,0 / 1,7 / 2,0 / 3,0): these carry an
-///    explicit identifier byte (or, for 1,7, a strict capability-map
-///    pattern) and are mutually exclusive, so the first that validates
-///    wins outright — the heuristic registers are not even consulted.
-/// 2. Heuristic set (EHS: BDS 4,0 / 5,0 / 6,0): only when no format-ID
-///    register matched, accept only if exactly one validates (xng's
-///    original exactly-one rule, preserved unchanged).
-/// 3. Meteorological fallback (BDS 4,4 MRAR / 4,5 MHR): only when the
-///    heuristic set is empty — these collide with EHS, so pyModeS hides
-///    them behind `include_meteo`; here they are a last resort that never
-///    perturbs ELS/EHS decoding.
+/// 1. Format-ID fast path (BDS 1,0 / 1,7 / 2,0 / 3,0): explicit-identifier
+///    registers, mutually exclusive, first match wins outright.
+/// 2. Heuristic EHS set (BDS 4,0 / 5,0 / 6,0): every register that
+///    structurally validates is scored with [`bds_score`]; candidates
+///    below [`DENSITY_THRESHOLD`] are dropped and the highest remaining
+///    score wins. A lone survivor wins regardless. This preserves the old
+///    single-match behaviour AND recovers ambiguous frames the exactly-one
+///    rule used to discard (the cruise-typical register outscores the
+///    coincidental match).
+/// 3. Meteorological fallback (BDS 4,4 MRAR / 4,5 MHR): only when the EHS
+///    set is empty — these collide with EHS, so (mirroring pyModeS's
+///    `include_meteo` separation) they are a last resort that never
+///    perturbs ELS/EHS decoding. The same score gate applies.
 pub fn bds_infer(mb: &[u8]) -> Option<serde_json::Value> {
     // Phase 1 — format-ID fast path, first match wins.
     if let Some(v) = [bds10(mb), bds17(mb), bds20(mb), bds30(mb)].into_iter().flatten().next() {
         return Some(v);
     }
-    // Phase 2 — heuristic EHS set, exactly one must validate.
+    // Phase 2 — heuristic EHS set, density+penalty scored.
     let ehs: Vec<serde_json::Value> =
         [bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
-    if ehs.len() == 1 {
-        return Some(ehs.into_iter().next().unwrap());
-    }
     if !ehs.is_empty() {
-        return None; // ambiguous within the EHS set
+        return best_scored(ehs);
     }
-    // Phase 3 — meteorological fallback, exactly one must validate.
-    let met: Vec<serde_json::Value> = [bds44(mb), bds45(mb)].into_iter().flatten().collect();
-    (met.len() == 1).then(|| met.into_iter().next().unwrap())
+    // Phase 3 — meteorological fallback, scored (EHS set empty).
+    best_scored([bds44(mb), bds45(mb)].into_iter().flatten().collect())
 }
 
 #[cfg(test)]
@@ -1865,6 +2031,94 @@ mod bds_tests {
         assert_eq!(v["bds"], "4,4");
         let v = bds_infer(&mb_of("A00004190001FB80000000000000")).unwrap();
         assert_eq!(v["bds"], "4,5");
+    }
+
+    // ── rs1090 density / penalty scoring ────────────────────────────
+    // Oracle: rs1090 `decode::bds::density` / `penalty` modules — the
+    // distribution parameters and the hand-computed scores in their unit
+    // tests (`cruise_bds50_passes`, `slow_bds60_fails`, the penalty
+    // cases). Values are reproduced here, not loop-backed.
+
+    #[test]
+    fn density_score_cruise_bds50_passes() {
+        // rs1090 cruise_bds50_passes: TAS 460, GS 470, roll −2°,
+        // track_rate 0 → mean log-density ≈ −0.090, well above −3.0.
+        let v = serde_json::json!({
+            "bds": "5,0", "roll": -2.0, "track_rate": 0.0,
+            "true_airspeed": 460, "groundspeed": 470,
+        });
+        let s = bds_density_score(&v).unwrap();
+        assert!((s - (-0.090)).abs() < 0.02, "mean ld = {s}");
+        assert!(s > DENSITY_THRESHOLD);
+    }
+
+    #[test]
+    fn density_score_slow_bds60_fails() {
+        // rs1090 slow_bds60_fails: IAS 50 kt, Mach 0.05 → mean ≈ −5.2,
+        // below the −3.0 rejection threshold.
+        let v = serde_json::json!({
+            "bds": "6,0", "indicated_airspeed": 50, "mach": 0.05,
+        });
+        let s = bds_density_score(&v).unwrap();
+        assert!(s < DENSITY_THRESHOLD, "mean ld = {s}");
+    }
+
+    #[test]
+    fn density_at_centre_is_zero() {
+        // rs1090 density_at_centre_is_zero: log-density peaks (=0) at the
+        // distribution centre; degenerate Laplace (b≤0) returns 0.
+        assert_eq!(gauss_ld(1.0, 1.0, 2.0), 0.0);
+        assert_eq!(laplace_ld(1013.2, 1013.2, 5.4), 0.0);
+        assert_eq!(laplace_ld(1.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn penalty_bds50_tas_gs_and_turn_sign() {
+        // |TAS−GS|/100 penalty: a 200 kt mismatch → −2.0.
+        let v = serde_json::json!({
+            "bds": "5,0", "true_airspeed": 600, "groundspeed": 400,
+            "roll": 0.0, "track_rate": 0.0,
+        });
+        assert!((bds_penalty(&v) - (-2.0)).abs() < 1e-9);
+        // Roll +10° but track_rate −1°/s during a turn → extra −2.0 flat,
+        // on top of a small |TAS−GS| term.
+        let v = serde_json::json!({
+            "bds": "5,0", "true_airspeed": 410, "groundspeed": 420,
+            "roll": 10.0, "track_rate": -1.0,
+        });
+        let p = bds_penalty(&v);
+        assert!((p - (-0.1 - 2.0)).abs() < 1e-9, "penalty {p}");
+        // Cruise BDS50 (small |TAS−GS|, no turn) → near-zero penalty.
+        let v = serde_json::json!({
+            "bds": "5,0", "true_airspeed": 460, "groundspeed": 470,
+            "roll": -2.0, "track_rate": 0.0,
+        });
+        assert!(bds_penalty(&v) > -1.0);
+    }
+
+    #[test]
+    fn penalty_bds60_ias_mach_ratio() {
+        // IAS/Mach ratio outside [250, 800] → flat −3.0 (rs1090 penalty).
+        // IAS 50 / Mach 0.05 = 1000 → out of band → −3.0.
+        let v = serde_json::json!({
+            "bds": "6,0", "indicated_airspeed": 50, "mach": 0.05,
+        });
+        assert!((bds_penalty(&v) - (-3.0)).abs() < 1e-9);
+        // A normal 272 kt / 0.69 ≈ 394 → in band → no penalty.
+        let v = serde_json::json!({
+            "bds": "6,0", "indicated_airspeed": 272, "mach": 0.69,
+        });
+        assert_eq!(bds_penalty(&v), 0.0);
+    }
+
+    #[test]
+    fn bds_infer_scoring_recovers_real_ehs_frames() {
+        // The existing golden EHS frames still resolve to their register
+        // through the scored path (regression guard that scoring did not
+        // change the single-validating-register outcome).
+        assert_eq!(bds_infer(&mb_of("A000029C85E42F313000007047D3")).unwrap()["bds"], "4,0");
+        assert_eq!(bds_infer(&mb_of("A000139381951536E024D4CCF6B5")).unwrap()["bds"], "5,0");
+        assert_eq!(bds_infer(&mb_of("A00004128F39F91A7E27C46ADC21")).unwrap()["bds"], "6,0");
     }
 }
 

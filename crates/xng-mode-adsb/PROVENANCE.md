@@ -237,3 +237,29 @@ Three downlink-format extensions:
   MD 11..AA, address-overlaid 40621D) with its address recovery and field
   positions pinned, clearly documented as spec-derived (not a loopback).
   Emitted under `comm_b` (the Comm-D message channel).
+
+## rs1090-style density / penalty BDS scoring (ADSB-3.4, 2026-06)
+
+The Comm-B EHS disambiguation in `bds_infer` was upgraded from the brittle
+"exactly one register validates" rule to the rs1090 density + cross-field
+penalty score (`decode::bds_density_score` / `bds_penalty` / `bds_score`).
+The mechanism and all distribution parameters are ported (facts and
+numeric constants only — no code) from rs1090's
+`crates/rs1090/src/decode/bds/density.rs` and `penalty.rs`: each candidate
+register's score is the *mean* of its per-field log-densities under
+Gaussian / Laplace distributions (xoolive calibrated these on a month of
+EUROCONTROL CAT 048 ground truth so that p99 of legitimate scores ≈ −2.0),
+summed with a within-record cross-field penalty (BDS 5,0 `−|TAS−GS|/100`
+and a flat −2.0 for a roll/track-rate turn-sign mismatch; BDS 6,0 a flat
+−3.0 when the IAS/Mach ratio leaves the `[250, 800]` kt atmospheric band).
+A candidate scoring below `DENSITY_THRESHOLD` (−3.0) is rejected; among the
+survivors the highest score wins (stable, EHS-first on ties). This both
+preserves the previous single-match outcomes (regression-tested on the
+BDS 4,0 / 5,0 / 6,0 golden frames) and recovers ambiguous frames the
+exactly-one rule discarded. Format-ID registers (1,0 / 1,7 / 2,0 / 3,0)
+keep their fast-path precedence; the meteorological registers (4,4 / 4,5)
+remain a scored last-resort fallback only when the EHS set is empty.
+Verification (external, not loopback): the scoring helpers are pinned to
+rs1090's own unit-test values — `cruise_bds50_passes` (mean ≈ −0.090),
+`slow_bds60_fails` (mean below −3.0), `density_at_centre_is_zero`, and the
+penalty relations (|TAS−GS|/100, turn-sign −2.0, IAS/Mach −3.0).
