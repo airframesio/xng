@@ -79,12 +79,13 @@ fn parse_control(c: u8) -> Control {
         };
         Control::Supervisory { kind, poll: (c >> 4) & 1 == 1, nr: (c >> 5) & 7 }
     } else {
-        let m = (c & 0xEF) | 0; // mask P/F (bit 5)
+        let m = c & 0xEF; // mask the P/F bit (control bit 5)
         let kind = match m {
             0x03 => "UI",
             0x0F => "DM",
             0x43 => "DISC",
             0x63 => "UA",
+            0x6F => "SABME",
             0x87 => "FRMR",
             0xAF => "XID",
             0xE3 => "TEST",
@@ -116,6 +117,66 @@ pub struct AvlcFrame {
     pub info: Vec<u8>,
     /// Whole frame octets (addresses..FCS) for raw preservation.
     pub raw: Vec<u8>,
+}
+
+/// Expanded FRMR (Frame Reject) information field — ISO/IEC 13239 §5.5.3.5,
+/// basic (modulo-8) format: 3 octets carrying the rejected control field,
+/// the receiver's V(S)/V(R) sequence state, and the W/X/Y/Z reject reason
+/// flags.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FrmrInfo {
+    /// The control field of the frame that was rejected.
+    pub rejected_control: u8,
+    /// Decoded form of the rejected control field.
+    pub rejected: Control,
+    /// Send-state variable V(S) of the rejecting station.
+    pub vs: u8,
+    /// Receive-state variable V(R) of the rejecting station.
+    pub vr: u8,
+    /// C/R bit of the rejected frame (true = the rejected frame was a
+    /// response).
+    pub rejected_was_response: bool,
+    /// W: control field undefined / not implemented.
+    pub w_invalid_control: bool,
+    /// X: info field present in a frame that may not carry one, or the
+    /// rejected control field was invalid AND an info field was present.
+    pub x_info_not_allowed: bool,
+    /// Y: information field length exceeded the maximum (N1).
+    pub y_info_too_long: bool,
+    /// Z: N(R) sequence error (invalid receive count).
+    pub z_invalid_nr: bool,
+}
+
+/// Decode a FRMR information field (basic, modulo-8: exactly 3 octets).
+/// Returns None if the field is the wrong length.
+pub fn parse_frmr(info: &[u8]) -> Option<FrmrInfo> {
+    if info.len() != 3 {
+        return None;
+    }
+    let rejected_control = info[0];
+    // Octet 2 (transmitted LSB-first): bit1=0, bits2-4=V(S), bit5=C/R,
+    // bits6-8=V(R). In a stored octet that is bit0=0, bits1-3=V(S),
+    // bit4=C/R, bits5-7=V(R).
+    let vs = (info[1] >> 1) & 0x07;
+    let rejected_was_response = (info[1] >> 4) & 1 == 1;
+    let vr = (info[1] >> 5) & 0x07;
+    // Octet 3 (LSB-first): bit1=W, bit2=X, bit3=Y, bit4=Z. Stored octet
+    // bit0=W, bit1=X, bit2=Y, bit3=Z.
+    let w_invalid_control = info[2] & 1 == 1;
+    let x_info_not_allowed = (info[2] >> 1) & 1 == 1;
+    let y_info_too_long = (info[2] >> 2) & 1 == 1;
+    let z_invalid_nr = (info[2] >> 3) & 1 == 1;
+    Some(FrmrInfo {
+        rejected_control,
+        rejected: parse_control(rejected_control),
+        vs,
+        vr,
+        rejected_was_response,
+        w_invalid_control,
+        x_info_not_allowed,
+        y_info_too_long,
+        z_invalid_nr,
+    })
 }
 
 /// One XID parameter (ISO 8885 group structure; VDL-specific parameter
@@ -231,13 +292,15 @@ pub fn scan(bits: &[u8]) -> Vec<AvlcFrame> {
         if octets.len() > MAX_FRAME_OCTETS {
             return;
         }
-        // FCS: accept either trailing octet order (free-spec ambiguity;
-        // see PROVENANCE.md).
+        // FCS: HDLC/X.25 transmits the 16-bit FCS low octet first
+        // (little-endian on the wire) — ISO/IEC 13239 §4.4, the same
+        // order dumpvdl2's GOOD_FCS residue check implies and the order
+        // build() emits. Pinning this single order drops a false-accept
+        // path (the byte-swapped variant accepted ~1 in 65536 bad frames).
         let n = octets.len();
         let fcs = HDLC_FCS.checksum(&octets[..n - 2]);
         let le = u16::from_le_bytes([octets[n - 2], octets[n - 1]]);
-        let be = u16::from_be_bytes([octets[n - 2], octets[n - 1]]);
-        if fcs != le && fcs != be {
+        if fcs != le {
             return;
         }
         let dst = parse_address(&octets[0..4]);
@@ -405,6 +468,59 @@ mod tests {
         bits[8 * 12 + 2] ^= 1;
         assert!(scan(&bits).is_empty());
     }
+
+    #[test]
+    fn sabme_u_command_recognized() {
+        // SABME control octet 0x6F (ISO/IEC 13239 §5.5.3.3); 0x7F with
+        // the poll bit set must decode identically with poll=true.
+        assert_eq!(
+            parse_control(0x6F),
+            Control::Unnumbered { kind: "SABME", poll: false }
+        );
+        assert_eq!(
+            parse_control(0x7F),
+            Control::Unnumbered { kind: "SABME", poll: true }
+        );
+    }
+
+    #[test]
+    fn byte_swapped_fcs_now_rejected() {
+        // With the FCS octet order pinned to little-endian, a frame whose
+        // two FCS octets are swapped (the old big-endian accept path) must
+        // be rejected — unless the FCS happens to be a palindrome.
+        let mut octets = test_frame();
+        let fcs = HDLC_FCS.checksum(&octets);
+        let [lo, hi] = fcs.to_le_bytes();
+        if lo == hi {
+            return; // palindromic FCS — swap is a no-op; nothing to test
+        }
+        // Append the FCS in the wrong (big-endian) order, then bit-stuff
+        // and frame it the same way build() does, bypassing build()'s own
+        // (correct) FCS append.
+        octets.push(hi);
+        octets.push(lo);
+        let flag = [0u8, 1, 1, 1, 1, 1, 1, 0];
+        let mut bits: Vec<u8> = Vec::new();
+        bits.extend(flag);
+        let mut ones = 0;
+        for &o in &octets {
+            for i in 0..8 {
+                let b = (o >> i) & 1;
+                bits.push(b);
+                if b == 1 {
+                    ones += 1;
+                    if ones == 5 {
+                        bits.push(0);
+                        ones = 0;
+                    }
+                } else {
+                    ones = 0;
+                }
+            }
+        }
+        bits.extend(flag);
+        assert!(scan(&bits).is_empty(), "byte-swapped FCS must not be accepted");
+    }
 }
 
 #[cfg(test)]
@@ -445,6 +561,51 @@ mod body_tests {
         // Param claims more bytes than the group holds.
         let info = [0x82, 0xF0, 0x00, 0x04, 0x42, 0x40];
         assert!(parse_xid(&info).is_none());
+    }
+}
+
+#[cfg(test)]
+mod frmr_tests {
+    use super::*;
+
+    #[test]
+    fn frmr_info_field_expands() {
+        // ISO/IEC 13239 §5.5.3.5 basic format, 3 octets:
+        //   octet 1: rejected control field = 0x64 (I-frame N(S)=2 N(R)=3)
+        //   octet 2: V(S)=4, C/R=1 (response), V(R)=5
+        //            = (4<<1) | (1<<4) | (5<<5) = 0xB8
+        //   octet 3: Z flag set (N(R) sequence error) = bit3 = 0x08
+        let info = [0x64, 0xB8, 0x08];
+        let frmr = parse_frmr(&info).expect("frmr decodes");
+        assert_eq!(frmr.rejected_control, 0x64);
+        assert_eq!(frmr.rejected, Control::Info { ns: 2, nr: 3, poll: false });
+        assert_eq!(frmr.vs, 4);
+        assert_eq!(frmr.vr, 5);
+        assert!(frmr.rejected_was_response);
+        assert!(!frmr.w_invalid_control);
+        assert!(!frmr.x_info_not_allowed);
+        assert!(!frmr.y_info_too_long);
+        assert!(frmr.z_invalid_nr);
+    }
+
+    #[test]
+    fn frmr_w_and_y_flags() {
+        // octet 3 = W (bit1) | Y (bit3) = 0x01 | 0x04 = 0x05.
+        let frmr = parse_frmr(&[0x6F, 0x00, 0x05]).expect("frmr decodes");
+        // 0x6F = a rejected SABME U-command.
+        assert_eq!(frmr.rejected, Control::Unnumbered { kind: "SABME", poll: false });
+        assert!(frmr.w_invalid_control);
+        assert!(!frmr.x_info_not_allowed);
+        assert!(frmr.y_info_too_long);
+        assert!(!frmr.z_invalid_nr);
+        assert_eq!(frmr.vs, 0);
+        assert_eq!(frmr.vr, 0);
+    }
+
+    #[test]
+    fn frmr_wrong_length_rejected() {
+        assert!(parse_frmr(&[0x64, 0xB8]).is_none());
+        assert!(parse_frmr(&[0x64, 0xB8, 0x08, 0x00]).is_none());
     }
 }
 

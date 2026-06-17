@@ -238,6 +238,11 @@ fn avlc_body(frame: &avlc::AvlcFrame, atn: Option<&serde_json::Value>) -> Messag
             details["params"] = serde_json::json!(params);
         }
     }
+    if matches!(frame.control, Control::Unnumbered { kind: "FRMR", .. }) {
+        if let Some(frmr) = avlc::parse_frmr(&frame.info) {
+            details["frmr"] = serde_json::json!(frmr);
+        }
+    }
     if !frame.info.is_empty() {
         let shown = &frame.info[..frame.info.len().min(64)];
         details["info_hex"] =

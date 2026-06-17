@@ -28,8 +28,12 @@ TL ∈ {1, 100, 1000, 131071}, AVLC FCS residue.
 
 Items flagged for live-capture verification (free spec ambiguity):
 which 2/4 of the 6 RS check octets are transmitted for short rows
-(assumed: first by transmission order), and AVLC FCS octet order (both
-orders accepted, which one matched is recorded).
+(assumed: first by transmission order). The AVLC FCS octet order is now
+pinned to little-endian (low octet transmitted first) per ISO/IEC 13239
+§4.4 — confirmed against the off-air fixture, which decodes only under
+little-endian, and consistent with dumpvdl2's GOOD_FCS=0xF0B8 residue
+check. The earlier "accept either order" behaviour was dropped to remove
+a false-accept path (the byte-swapped FCS matched ~1 bad frame in 65536).
 
 ## Off-air validation (2026-06)
 
