@@ -374,7 +374,14 @@ fn lcw_descriptor(lcw2: u32, lcw3: u32) -> serde_json::Value {
         2 => (
             "hndof",
             match lcw_code {
-                12 => serde_json::json!("handoff_cand"),
+                // Handoff candidate: the toolkit splits lcw3 into an 11-bit and
+                // a 10-bit field (formatted "%03x,%03x"); surface both rather
+                // than dropping the 21-bit payload.
+                12 => serde_json::json!({
+                    "code": "handoff_cand",
+                    "cand_a": f(0, 11),
+                    "cand_b": f(11, 21),
+                }),
                 3 => serde_json::json!({
                     "code": "handoff_resp",
                     "cand": if f(2,3) == 1 { "S" } else { "P" },

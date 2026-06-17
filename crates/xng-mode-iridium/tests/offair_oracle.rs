@@ -118,7 +118,13 @@ fn offair_u3_lcw_handoff() {
     assert_eq!(f.kind, "u3");
     assert_eq!(f.details["frame_ft"], 3);
     assert_eq!(f.details["lcw"]["type"], "hndof");
-    assert_eq!(f.details["lcw"]["code"], "handoff_cand");
+    // iridium-parser.py: LCW(3,T:hndof,C:handoff_cand,34c,120,...). The
+    // handoff candidate carries an 11-bit + a 10-bit lcw3 field that the
+    // toolkit prints as 0x34c / 0x120; surface both rather than dropping them.
+    let code = &f.details["lcw"]["code"];
+    assert_eq!(code["code"], "handoff_cand");
+    assert_eq!(code["cand_a"], 0x34c); // 844
+    assert_eq!(code["cand_b"], 0x120); // 288
     // iridium-parser.py decoded this one as IU3 (RS did not correct).
     assert_eq!(f.details["u3_type"], "IU3");
 }
