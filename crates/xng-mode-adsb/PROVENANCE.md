@@ -28,3 +28,15 @@ airspeed velocity frames). The per-aircraft tracker (even/odd pairing
 within 10 s, local decode against a fix fresher than 180 s) mirrors the
 standard surveillance practice; SBS-1 output line format follows the de
 facto BaseStation convention as served by dump1090-family tools.
+
+## Operational status / aircraft status (2026-06)
+
+TC 31 (Aircraft Operational Status — BDS 6,5) and TC 28 (Aircraft Status)
+ME-field bit layouts are the published DO-260B / "The 1090 MHz Riddle" §6
+fields: TC31 subtype (ME 5–7), ADS-B version (40–42), NIC-supplement-A
+(43), NACp (44–47), GVA (48–49), SIL (50–51), NICbaro (52), SIL-supplement
+(54); TC28 subtype (5–7) with the subtype-1 emergency/priority state
+(8–10). Bit positions were cross-checked against the pyModeS `bds65`
+decoder and its `test_bds65` synthetic vector (facts/positions only — no
+code ported); the synthetic-vector construction is reproduced in
+`decode.rs` unit tests. Emitted under `adsb_status` on the Mode S message.

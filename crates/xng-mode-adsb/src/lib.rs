@@ -196,6 +196,7 @@ pub fn to_message(
             track_deg: f.velocity.map(|v| v.track_deg),
             vertical_rate_fpm: f.velocity.and_then(|v| v.vertical_rate_fpm),
             comm_b: f.comm_b.clone(),
+            adsb_status: f.adsb_status.clone(),
         },
         raw: Some(f.bytes.clone()),
         source,

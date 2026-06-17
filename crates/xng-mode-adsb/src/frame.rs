@@ -69,6 +69,9 @@ pub struct AdsbFrame {
     pub position: Option<(f64, f64)>,
     /// Comm-B register content (DF20/21 MB field, BDS-inferred).
     pub comm_b: Option<serde_json::Value>,
+    /// ADS-B operational status (TC31: version, NACp, SIL, NIC-supp, GVA) or
+    /// aircraft/emergency status (TC28).
+    pub adsb_status: Option<serde_json::Value>,
     /// Signal level at decode time.
     pub level_dbfs: f32,
 }
@@ -171,6 +174,7 @@ impl FrameValidator {
             velocity: None,
             position: None,
             comm_b: None,
+            adsb_status: None,
             level_dbfs,
         };
         match df {
@@ -246,6 +250,7 @@ impl FrameValidator {
             velocity: None,
             position: None,
             comm_b: None,
+            adsb_status: None,
             level_dbfs,
         };
         if df == 17 || df == 18 {
@@ -313,6 +318,10 @@ fn decode_extended_squitter(me: &[u8], f: &mut AdsbFrame) {
         20..=22 => {
             f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false });
         }
+        // Aircraft status (emergency/priority + ACAS RA broadcast).
+        28 => f.adsb_status = decode::aircraft_status(me),
+        // Operational status: ADS-B version + NACp/SIL/NIC-supp/GVA.
+        31 => f.adsb_status = decode::operational_status(me),
         _ => {}
     }
 }

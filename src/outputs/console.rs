@@ -118,6 +118,7 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     track_deg,
                     vertical_rate_fpm,
                     comm_b,
+                    adsb_status,
                 } => {
                     let mut s = format!("MODE-S df={} icao={}", df, icao.as_deref().unwrap_or("-"));
                     if let Some(c) = callsign {
@@ -153,6 +154,19 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                         }
                         if let Some(h) = cb.get("magnetic_heading").and_then(|v| v.as_f64()) {
                             s.push_str(&format!(" hdg={h:.0}"));
+                        }
+                    }
+                    if let Some(st) = adsb_status {
+                        if let Some(em) = st.get("emergency").and_then(|v| v.as_str()) {
+                            if em != "none" {
+                                s.push_str(&format!(" EMERGENCY={em}"));
+                            }
+                        }
+                        if let Some(v) = st.get("version").and_then(|v| v.as_u64()) {
+                            s.push_str(&format!(" adsbv={v}"));
+                        }
+                        if let Some(n) = st.get("nac_p").and_then(|v| v.as_u64()) {
+                            s.push_str(&format!(" nacp={n}"));
                         }
                     }
                     s

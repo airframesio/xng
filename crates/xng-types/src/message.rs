@@ -116,6 +116,10 @@ pub enum MessageBody {
         /// Comm-B register content (BDS-inferred from DF20/21).
         #[serde(skip_serializing_if = "Option::is_none")]
         comm_b: Option<serde_json::Value>,
+        /// ADS-B operational status (TC31: version/NACp/SIL/NIC-supp/GVA) or
+        /// aircraft/emergency status (TC28).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        adsb_status: Option<serde_json::Value>,
     },
     /// Iridium frame (ring alert, broadcast, ...).
     Iridium {

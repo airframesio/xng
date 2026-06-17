@@ -122,6 +122,7 @@ message ModeSBody {
   optional double track_deg = 10;
   optional sint32 vertical_rate_fpm = 11;
   optional string comm_b_json = 12;  // BDS-inferred Comm-B content
+  optional string adsb_status_json = 13;  // TC31 op-status / TC28 status
 }
 
 message DecodedMessage {

@@ -112,6 +112,7 @@ fn update(d: &mut Dash, m: &Message) {
             speed_kt,
             track_deg,
             squawk,
+            adsb_status,
             ..
         } => {
             let e = d.aircraft.entry(icao.clone()).or_insert_with(|| json!({}));
@@ -146,10 +147,22 @@ fn update(d: &mut Dash, m: &Message) {
                 ("spd", speed_kt.map(|v| json!(v.round()))),
                 ("trk", track_deg.map(|v| json!(v.round()))),
                 ("squawk", squawk.as_ref().map(|v| json!(v))),
+                ("adsb_version", adsb_status.as_ref().and_then(|s| s.get("version").cloned())),
+                ("nacp", adsb_status.as_ref().and_then(|s| s.get("nac_p").cloned())),
+                ("sil", adsb_status.as_ref().and_then(|s| s.get("sil").cloned())),
             ] {
                 if let Some(v) = v {
                     o.insert(k.into(), v);
                 }
+            }
+            // Surface a non-"none" emergency as a sticky flag for the map.
+            if let Some(em) = adsb_status
+                .as_ref()
+                .and_then(|s| s.get("emergency"))
+                .and_then(|v| v.as_str())
+                .filter(|e| *e != "none")
+            {
+                o.insert("emergency".into(), json!(em));
             }
         }
         MessageBody::Ais { mmsi: Some(mmsi), details: Some(det), msg_type, .. } => {

@@ -194,12 +194,12 @@
 
 ## ADSB — Mode S / ADS-B 1090 MHz (A9)
 
-- [ ] **ADSB-1** Modern accuracy/integrity + intent layer — **entirely absent today** ★ quick win (bits already in-message)
-  - [ ] **ADSB-1.1** TC31 operational-status → NIC-sup/NACp/NACv/SIL/GVA
-  - [ ] **ADSB-1.2** ADS-B version inference (NIC/NACp/SIL meanings are version-dependent)
+- [ ] **ADSB-1** Modern accuracy/integrity + intent layer — **entirely absent today** ★ quick win (bits already in-message) — *partially done on `feat/per-decoder-airframes-feeding`*
+  - [x] **ADSB-1.1** TC31 operational-status decode → `adsb_status` (version, NIC-supp-A, NACp, SIL, SIL-supp, GVA, NICbaro), surfaced in console/dashboard/asf-2.0. *(NACv is a TC19 field — see ADSB-1.5)*
+  - [x] **ADSB-1.2** ADS-B version read directly from TC31. *(heuristic version inference for v0 / non-TC31-emitting aircraft deferred)*
   - [ ] **ADSB-1.3** TC29 target-state (MCP/FCU selected alt, QNH, selected heading, AP/VNAV/APPROACH/LNAV flags)
-  - [ ] **ADSB-1.4** TC28 aircraft-status (emergency/priority + 1090ES ACAS RA broadcast)
-  - [ ] **ADSB-1.5** Accuracy fields: NUCp(v0), NIC+supplement, NACp, NACv, SIL, SDA, GVA, Rc
+  - [x] **ADSB-1.4** TC28 aircraft-status — emergency/priority state (mapped to label, flagged on the map) + ACAS-RA subtype flag. *(full RA decode = ADSB-3.1)*
+  - [ ] **ADSB-1.5** Accuracy fields — ✅ NACp/SIL/NIC-supp-A/GVA via TC31; ❌ remaining: NUCp(v0), full NIC computation (TC + supplement), NACv (TC19), SDA, Rc
 - [ ] **ADSB-2** Position/velocity completion — TC5-8 surface movement (ground speed) + ground track; TC9-18 Q=0 Gillham altitude; TC20-22 geometric altitude; VR source bit (GNSS vs baro); geom-minus-baro alt diff; emit NACv
 - [ ] **ADSB-3** Comm-B BDS register expansion
   - [ ] **ADSB-3.1** BDS 3,0 ACAS/TCAS RA (high safety/intel value)

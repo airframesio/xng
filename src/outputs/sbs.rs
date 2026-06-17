@@ -112,6 +112,7 @@ mod tests {
                 track_deg: None,
                 vertical_rate_fpm: None,
                 comm_b: None,
+                adsb_status: None,
             },
             raw: None,
             source: Provenance {

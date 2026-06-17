@@ -158,6 +158,82 @@ pub fn velocity(me: &[u8]) -> Option<Velocity> {
     Some(Velocity { speed_kt, track_deg, airspeed, vertical_rate_fpm })
 }
 
+/// Decode a TC 31 Aircraft Operational Status ME field (7 bytes) into the
+/// modern accuracy/integrity layer: ADS-B version, NIC supplement, NACp,
+/// SIL (+ supplement), and — airborne only — GVA and barometric-altitude
+/// integrity. Returns `None` for a non-TC31 field.
+///
+/// ME-relative, 0-indexed bit positions (per "The 1090 MHz Riddle" §6 and
+/// pyModeS `bds65`): subtype 5–7, version 40–42, NIC-supplement-A 43,
+/// NACp 44–47, GVA 48–49, SIL 50–51, NICbaro 52, SIL-supplement 54. NACp/
+/// SIL/NIC-supplement were introduced in version 1; the SIL supplement in
+/// version 2.
+pub fn operational_status(me: &[u8]) -> Option<serde_json::Value> {
+    let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+    let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+    if field(0, 5) != 31 {
+        return None;
+    }
+    let subtype = field(5, 3);
+    let version = field(40, 3);
+    let mut o = serde_json::Map::new();
+    o.insert("subtype".into(), serde_json::json!(if subtype == 1 { "surface" } else { "airborne" }));
+    o.insert("version".into(), serde_json::json!(version));
+    if version >= 1 {
+        o.insert("nic_supp_a".into(), serde_json::json!(bit(43)));
+        o.insert("nac_p".into(), serde_json::json!(field(44, 4)));
+        o.insert("sil".into(), serde_json::json!(field(50, 2)));
+        if subtype == 0 {
+            o.insert("gva".into(), serde_json::json!(field(48, 2)));
+            o.insert("baro_alt_integrity".into(), serde_json::json!(bit(52)));
+        }
+        if version >= 2 {
+            o.insert("sil_supplement".into(), serde_json::json!(bit(54)));
+        }
+    }
+    Some(serde_json::Value::Object(o))
+}
+
+/// Decode a TC 28 Aircraft Status ME field (7 bytes). Subtype 1 carries the
+/// emergency/priority status; subtype 2 is an ACAS RA broadcast (flagged
+/// here — full RA decode is BDS 3,0, a later item). `None` for non-TC28.
+pub fn aircraft_status(me: &[u8]) -> Option<serde_json::Value> {
+    let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+    let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+    if field(0, 5) != 28 {
+        return None;
+    }
+    let subtype = field(5, 3);
+    let mut o = serde_json::Map::new();
+    o.insert("subtype".into(), serde_json::json!(subtype));
+    match subtype {
+        1 => {
+            let es = field(8, 3);
+            o.insert("emergency_state".into(), serde_json::json!(es));
+            o.insert("emergency".into(), serde_json::json!(emergency_label(es)));
+        }
+        2 => {
+            o.insert("acas_ra".into(), serde_json::json!(true));
+        }
+        _ => return None,
+    }
+    Some(serde_json::Value::Object(o))
+}
+
+/// Emergency/priority status code (TC28 subtype 1) → label.
+fn emergency_label(state: u32) -> &'static str {
+    match state {
+        0 => "none",
+        1 => "general",
+        2 => "medical",
+        3 => "minimum fuel",
+        4 => "no communications",
+        5 => "unlawful interference",
+        6 => "downed aircraft",
+        _ => "reserved",
+    }
+}
+
 /// 13-bit Mode S altitude field (AC, DF0/4/16/20): M-bit metric flag,
 /// Q-bit 25 ft, else 100 ft Gillham.
 pub fn altitude13(ac: u32) -> Option<i32> {
@@ -518,5 +594,72 @@ mod bds_tests {
         assert_eq!(v["mach"], 0.42);
         assert_eq!(v["baro_vertical_rate"], -1920);
         assert_eq!(v["inertial_vertical_rate"], -1920);
+    }
+}
+
+#[cfg(test)]
+mod opstatus_tests {
+    use super::*;
+
+    /// Build the 7-byte ME from a 56-bit MSB-first payload integer.
+    fn me_of(payload: u64) -> [u8; 7] {
+        let b = payload.to_be_bytes();
+        [b[1], b[2], b[3], b[4], b[5], b[6], b[7]]
+    }
+
+    #[test]
+    fn operational_status_v2_airborne_matches_bds65_layout() {
+        // Synthetic TC=31 subtype-0 payload using the exact pyModeS bds65
+        // bit layout: version=2, nic_supp_a=1, nac_p=10, sil=3, nic_baro=1.
+        let payload: u64 = (31u64 << 51) | (2 << 13) | (1 << 12) | (10 << 8) | (3 << 4) | (1 << 3);
+        let v = operational_status(&me_of(payload)).unwrap();
+        assert_eq!(v["subtype"], "airborne");
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["nic_supp_a"], 1);
+        assert_eq!(v["nac_p"], 10);
+        assert_eq!(v["sil"], 3);
+        assert_eq!(v["baro_alt_integrity"], 1);
+    }
+
+    #[test]
+    fn operational_status_v0_omits_versioned_fields() {
+        // Version 0 predates NACp/SIL/NICbaro; only subtype+version emit.
+        let payload: u64 = 31u64 << 51; // version 0, subtype 0
+        let v = operational_status(&me_of(payload)).unwrap();
+        assert_eq!(v["version"], 0);
+        assert!(v.get("nac_p").is_none());
+        assert!(v.get("baro_alt_integrity").is_none());
+    }
+
+    #[test]
+    fn operational_status_surface_has_no_gva_or_baro() {
+        let payload: u64 = (31u64 << 51) | (1 << 48) | (2 << 13); // subtype 1, v2
+        let v = operational_status(&me_of(payload)).unwrap();
+        assert_eq!(v["subtype"], "surface");
+        assert!(v.get("gva").is_none());
+        assert!(v.get("baro_alt_integrity").is_none());
+    }
+
+    #[test]
+    fn aircraft_status_decodes_emergency_state() {
+        // TC=28 subtype 1, emergency state 5 (unlawful interference) at ME 8-10.
+        let payload: u64 = (28u64 << 51) | (1 << 48) | (5 << 45);
+        let v = aircraft_status(&me_of(payload)).unwrap();
+        assert_eq!(v["subtype"], 1);
+        assert_eq!(v["emergency_state"], 5);
+        assert_eq!(v["emergency"], "unlawful interference");
+    }
+
+    #[test]
+    fn aircraft_status_flags_acas_ra_subtype() {
+        let payload: u64 = (28u64 << 51) | (2 << 48); // subtype 2
+        let v = aircraft_status(&me_of(payload)).unwrap();
+        assert_eq!(v["acas_ra"], true);
+    }
+
+    #[test]
+    fn rejects_wrong_typecode() {
+        assert!(operational_status(&me_of(19u64 << 51)).is_none());
+        assert!(aircraft_status(&me_of(31u64 << 51)).is_none());
     }
 }
