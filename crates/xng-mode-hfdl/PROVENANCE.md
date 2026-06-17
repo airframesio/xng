@@ -149,3 +149,50 @@ to residual ≈ a + b·k weighted by sample energy. The minimum-cost grid
 point yields timing and per-symbol CFO jointly, with none of the
 2π/127-per-symbol aliasing of the A1→A2 dphi refinement. Off-air
 result: 33 events on the 21931 kHz capture (from 31; dumphfdl: 37).
+
+## System-table persistence + full GS-name roster (2026-06, HFDL-2.1/2.2)
+
+**HFDL-2.1 — system-table persistence API.** `SystemTable` gains serde
+`Deserialize` (alongside the existing `Serialize`) and a load/save pair:
+`SystemTable::save(path)` / `SystemTable::load(path)` plus the
+free-function aliases `save_system_table(table, path)` /
+`load_system_table(path)` named by the task (the `--system-table` CLI
+flag is the documented follow-up, not wired here). Persisted as pretty
+JSON through the crate's existing serde_json channel — the serde
+equivalent of dumphfdl's libconfig `systable_save_config()` /
+`systable_read_from_file()` (szpajder/dumphfdl src/systable.c, GPL —
+read for the persisted-field set only: GS id 0..=127, optional name,
+lat/lon, frequencies, table version). JSON rather than libconfig so it
+needs no new dependency. Purpose: cold-start enrichment — a long-running
+receiver saves the most recent reassembled 0xD0 table so a later run
+starts with known GS positions/frequencies instead of waiting for the
+next over-the-air set.
+
+Round-trip verification (`systable_persistence_round_trip`): a table
+built by running real GS records through `parse_stations` (so name
+enrichment for id 1 and the `None` hole for id 12 are both exercised) is
+saved and reloaded; every integer/string/bool field is asserted equal,
+coordinates to <1e-6° (text f64 round-trip is exact in practice but not
+guaranteed by the serde contract, so coordinates are compared
+approximately), and a save→load cycle is shown to be a bit-exact fixed
+point. `systable_load_missing_file_errors` covers the I/O-error path.
+This is a persistence round-trip, not a decode oracle — the decode
+itself is still grounded against dumphfdl elsewhere.
+
+**HFDL-2.2 — built-in GS-name roster.** The `pdu::gs_name` table is the
+published HFDL/ARINC ground-station roster, verified id-for-id against
+dumphfdl's distributed `etc/systable.conf` (szpajder/dumphfdl, GPL —
+facts only). That roster assigns **exactly ids 1..=11 and 13..=17**; id
+12 is the only hole inside that span and **ids 18..=127 are unassigned**
+in the public roster. The crate table already matched this list, so
+there were no real names to add: the task's "12 holes to fill up to 127"
+does not correspond to any published assignments, and per the
+verification mandate those ids are left `None` rather than filled with
+fabricated names. Coverage is now explicit over the full 7-bit GS-id
+space (0..=127) and pinned by `gs_name_roster_matches_published_list`,
+which asserts the mapping id-for-id against the systable.conf roster
+(every assigned id → its name; every other id in 0..=127 → `None`). The
+only wording difference from systable.conf is id 1 "San Francisco, USA"
+vs the conf's "San Francisco, California" — both name KSFO; the crate's
+string is the one already asserted across the crate's other tests and is
+left unchanged to avoid a cosmetic, test-breaking churn.
