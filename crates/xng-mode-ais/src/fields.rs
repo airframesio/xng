@@ -99,6 +99,18 @@ const NAV_STATUS: [&str; 16] = [
     "undefined",
 ];
 
+/// EPFD (electronic position-fixing device) type names by code.
+fn epfd_name(code: u64) -> &'static str {
+    const EPFD: [&str; 9] = [
+        "undefined", "GPS", "GLONASS", "GPS+GLONASS", "Loran-C", "Chayka",
+        "integrated", "surveyed", "Galileo",
+    ];
+    match code {
+        15 => "internal GNSS",
+        c => EPFD.get(c as usize).copied().unwrap_or("undefined"),
+    }
+}
+
 /// Classify a distress/safety transmitter by its MMSI prefix (ITU-R M.1371 /
 /// the MID allocation for device MMSIs): 970 = AIS-SART (search & rescue
 /// transmitter), 972 = AIS-MOB (man-overboard), 974 = EPIRB-AIS. These
@@ -172,12 +184,27 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
         }
         // Static and voyage data.
         5 => {
+            put("ais_version", json!(u(bits, 38, 2)));
             put("imo", json!(u(bits, 40, 30)));
             put("callsign", json!(sixbit(bits, 70, 7)));
             put("name", json!(sixbit(bits, 112, 20)));
             put("ship_type", json!(u(bits, 232, 8)));
+            put("to_bow", json!(u(bits, 240, 9)));
+            put("to_stern", json!(u(bits, 249, 9)));
+            put("to_port", json!(u(bits, 258, 6)));
+            put("to_starboard", json!(u(bits, 264, 6)));
+            put("epfd", json!(epfd_name(u(bits, 270, 4)?)));
             put("draught_m", json!(u(bits, 294, 8)? as f64 / 10.0));
             put("destination", json!(sixbit(bits, 302, 20)));
+            // ETA (recurring, year-less): month 0 = not available.
+            if let Some(mo) = u(bits, 274, 4) {
+                if mo != 0 {
+                    let (da, h, mi) = (u(bits, 278, 5)?, u(bits, 283, 5)?, u(bits, 288, 6)?);
+                    put("eta", json!(format!("{mo:02}-{da:02}T{h:02}:{mi:02}")));
+                }
+            }
+            // DTE: bit 0 = data terminal ready.
+            put("dte_ready", json!(u(bits, 422, 1)? == 0));
         }
         // Addressed binary message.
         6 => {
@@ -485,6 +512,15 @@ mod tests {
         assert_eq!(d["ship_type"], 99);
         assert_eq!(d["destination"], "SEATTLE");
         assert_eq!(d["draught_m"], 6.0);
+        // AIS-3 type-5 fills (hand-decoded from the same vector):
+        assert_eq!(d["ais_version"], 0);
+        assert_eq!(d["to_bow"], 90);
+        assert_eq!(d["to_stern"], 90);
+        assert_eq!(d["to_port"], 10);
+        assert_eq!(d["to_starboard"], 10);
+        assert_eq!(d["epfd"], "GPS");
+        assert_eq!(d["eta"], "01-02T08:00");
+        assert_eq!(d["dte_ready"], true);
     }
 
     #[test]
