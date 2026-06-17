@@ -21,10 +21,31 @@ This crate implements the **verified decode layer** — symbols → message:
   earlier) and phasing sync.
 - `message` — `ZCZC B1B2B3B4` header parse, body, `NNNN` end, JSON.
 
-The IQ→symbols FSK front end (`demod_fsk`) is a **documented TODO**: it
-cannot be externally verified without a published IQ capture paired with
-ground-truth text, so per the verification rules it is left unimplemented
-rather than shipped unverified.
+...plus a channelized **IQ front end** (`demod` + `NavtexChannelDecoder`):
+an `xng_dsp::Ddc` mixes a wideband capture by the channel offset and
+decimates to `CHANNEL_RATE` (4800 S/s, 48 samples/bit), a frequency
+discriminator with a slow DC tracker recovers the ±85 Hz FSK swing,
+100 Bd integrate-and-dump timing recovery slices one bit per symbol, and
+the bits are packed LSB-first into CCIR 476 codes (trying all seven 7-bit
+alignments) before feeding the verified `decode_symbols` core. The demod
+structure mirrors the AIS `GmskDemod` (this repo's `xng-mode-ais`); no
+GPL decoder code was copied.
+
+### Demod validation — SELF-GENERATED modulate→demod path
+
+There is no published NAVTEX IQ capture paired with ground-truth text, so
+the demod is validated **synthetically**: `modulate.rs` builds the on-air
+100 Bd ±85 Hz FSK waveform for a KNOWN spec-derived frame (the same
+oracle-anchored CCIR 476 symbol stream the decode tests use), and the
+`*_synth_iq` tests in `tests/end_to_end.rs` run that IQ through the real
+`NavtexChannelDecoder` and assert the recovered station / subject / serial
+/ body text. This proves the demod inverts the standard modulation
+(including through the DDC at a carrier offset). The modulator is **not**
+an external reference — it only exercises the front end. The DECODE core
+(tables, FEC-B, framing) remains oracle-anchored by the symbol-stream
+tests below, so the synthetic path does not weaken those guarantees. The
+waveform parameters themselves (100 Bd, ±85 Hz shift) are the published
+on-air NAVTEX spec.
 
 ## Sources (protocol facts / tables / worked example only)
 
