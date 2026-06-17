@@ -78,7 +78,26 @@ System-Information families are the standard GSM 04.08 / 3GPP TS 44.018
 §10.4 message-type values. The 0x0600 opcode is left to the SBD/ACARS
 transport path (it is the Register/SBD-uplink type, not RR). The LCW
 link-control layer is already exposed as structured JSON
-(`lib::lcw_descriptor`) on duplex traffic / U3 frames.
+(`lib::lcw_descriptor`) on duplex traffic / U3 frames. Each GSM message
+also carries `body_hex`, the verbatim L3 body — the toolkit always prints
+the message payload as hex (the trailing-bytes line in
+`ReassembleIDAPP`), so no message (CP-DATA / Setup / Paging / the RR
+information bodies the toolkit does not field-parse) loses its content.
+
+Decode-depth additions cross-checked against iridium-toolkit
+`bitsparser.py` (BSD-2): IBC (`ira::parse_bc`) now mirrors
+`IridiumBCMessage` for non-zero `bc_type` (no descriptor/info block is
+consumed — every 42-bit block runs the assignment loop), surfaces an
+unrecognized / non-filler `info_type` payload as `info_raw`, recognizes
+the one known type-4 filler constant, exposes the descriptor
+`unknown01`/`unknown02` bits, and flags the `{LONG}`/`{SHORT}`
+block-count anomaly. The LCW handoff candidate (`lib::lcw_descriptor`,
+`hndof` code 12) exposes the 11-bit + 10-bit `lcw3` fields the toolkit
+prints (`cand_a`/`cand_b`) instead of a bare string. The ISY sync
+(ft==7) `sync_errors` metric now matches `IridiumSYMessage` exactly: the
+count of 312-bit-payload bytes that differ from `0xAA`. Each is verified
+against the reference class run on identical bits or against the existing
+off-air oracle vectors, never an encode→decode loopback.
 
 Upper-layer IP credential recovery (`iip.rs`, IRID-2) scans the
 plaintext IIP/IIR data payloads (the IP channel is ~88% unencrypted) for

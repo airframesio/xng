@@ -19,6 +19,21 @@ fn field(bits: &[u8], range: std::ops::Range<usize>) -> u32 {
     bits[range].iter().fold(0u32, |v, &b| (v << 1) | b as u32)
 }
 
+/// Pack an MSB-first bit slice into a lowercase hex string (left-aligned: the
+/// last nibble is zero-padded on the right when the length isn't a multiple of
+/// 4). Used to surface IBC sub-blocks the field parser doesn't interpret.
+fn bits_hex(bits: &[u8]) -> String {
+    bits.chunks(4)
+        .map(|c| {
+            let mut v = 0u8;
+            for i in 0..4 {
+                v = (v << 1) | c.get(i).copied().unwrap_or(0);
+            }
+            std::char::from_digit(v as u32, 16).unwrap()
+        })
+        .collect()
+}
+
 /// Sign-magnitude-ish position component: sign bit then 11 bits.
 fn pos_component(bits: &[u8], start: usize) -> i32 {
     let mag = field(bits, start + 1..start + 12) as i32;
@@ -178,24 +193,42 @@ pub(crate) fn iri_time_unix(iritime: u32) -> f64 {
 /// descriptor, a type-tagged info block (broadcast time / TMSI expiry /
 /// max uplink power), and zero or more channel-assignment blocks.
 pub fn parse_bc(bc_type: u32, data: &[u8], fixed: u32, raw_bits: &[u8]) -> IridiumFrame {
-    let blocks: Vec<&[u8]> = data.chunks(42).filter(|c| c.len() == 42).collect();
+    let mut blocks: Vec<&[u8]> = data.chunks(42).filter(|c| c.len() == 42).collect();
     let mut d = serde_json::Map::new();
     d.insert("bc_type".into(), json!(bc_type));
 
+    // IBC is exactly four 42-bit blocks. The toolkit truncates a longer frame
+    // (flagging `{LONG}`) and tags a short one `{SHORT}`; mirror that so the
+    // block-length anomaly is visible and the descriptor/info/assignment
+    // parsers below always see at most the four real blocks.
+    if blocks.len() > 4 {
+        blocks.truncate(4);
+        d.insert("block_trailer".into(), json!("LONG"));
+    } else if blocks.len() < 4 {
+        d.insert("block_trailer".into(), json!("SHORT"));
+    }
+
     let mut next = 0usize;
-    // Sub-block 1: satellite / cell descriptor (only for bc_type 0).
+    // Sub-block 1: satellite / cell descriptor (only for bc_type 0). For any
+    // other bc_type the toolkit does NOT consume a descriptor/info block — all
+    // blocks fall through to the assignment loop — so we mirror that exactly.
     if bc_type == 0 && next < blocks.len() {
         let b = blocks[next];
         next += 1;
         d.insert("sat".into(), json!(field(b, 0..7)));
         d.insert("beam".into(), json!(field(b, 7..13)));
+        d.insert("unknown01".into(), json!(b[13]));
         d.insert("slot".into(), json!(b[14]));
         d.insert("sv_blocking".into(), json!(b[15]));
         d.insert("acq_classes".into(), json!(field(b, 16..32)));
         d.insert("acq_sub_band".into(), json!(field(b, 32..37)));
         d.insert("acq_channels".into(), json!(field(b, 37..40)));
+        d.insert("unknown02".into(), json!(field(b, 40..42)));
     }
-    // Sub-block 2: type-tagged info (broadcast time / tmsi expiry / power).
+    // Sub-block 2: type-tagged info (broadcast time / tmsi expiry / power /
+    // a known-constant filler at type 4). Unrecognized info types surface
+    // their raw 42-bit payload as hex rather than being dropped, matching the
+    // toolkit's `type:NN <bits>` fallthrough.
     if bc_type == 0 && next < blocks.len() {
         let b = blocks[next];
         next += 1;
@@ -215,7 +248,20 @@ pub fn parse_bc(bc_type: u32, data: &[u8], fixed: u32, raw_bits: &[u8]) -> Iridi
                 d.insert("tmsi_expiry".into(), json!(ex));
                 d.insert("tmsi_expiry_unix".into(), json!(iri_time_unix(ex)));
             }
-            _ => {}
+            4 => {
+                // The toolkit treats one exact 42-bit constant as silent filler
+                // and otherwise surfaces the raw payload. Match both arms.
+                const FILLER4: &[u8; 42] = &[
+                    0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0,
+                    0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0,
+                ];
+                if b != &FILLER4[..] {
+                    d.insert("info_raw".into(), json!(bits_hex(b)));
+                }
+            }
+            _ => {
+                d.insert("info_raw".into(), json!(bits_hex(b)));
+            }
         }
     }
     // Remaining blocks: channel assignments (skip the all-"111"+0 filler).
@@ -244,6 +290,111 @@ pub fn parse_bc(bc_type: u32, data: &[u8], fixed: u32, raw_bits: &[u8]) -> Iridi
         acars: None,
         details: serde_json::Value::Object(d),
         raw_bits: raw_bits.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod bc_tests {
+    //! IBC sub-block completeness (non-zero `bc_type`, unrecognized /
+    //! filler `info_type`, the `{LONG}`/`{SHORT}` block-count trailer, and the
+    //! `unknown01`/`unknown02` descriptor bits).
+    //!
+    //! Oracle = iridium-toolkit `IridiumBCMessage` (bitsparser.py). Each
+    //! expected value below was produced by feeding the *identical* 42-bit
+    //! blocks through that class (`IridiumBCMessage.__init__` with a stub
+    //! `imsg`), so these are reference-decoder cross-checks, not loopbacks.
+    use super::parse_bc;
+
+    fn bits(s: &str) -> Vec<u8> {
+        s.bytes().map(|c| (c == b'1') as u8).collect()
+    }
+
+    // A non-filler channel-assignment block the toolkit decodes as
+    //   [111 Rid:001 ts:1 ul_sb:03 dl_sb:22 access:6 dtoa:212 dfoa:17 00]
+    const ASG: &str = "111000000010000011101101011101010001000100";
+    // Descriptor block: sat:013 cell:15 0 slot:0 sv_blkn:0 aq_cl:1111…1
+    // aq_sb:20 aq_ch:2 00 (toolkit `IridiumBCMessage` sub-block 1).
+    const DESC: &str = "000110100111100011111111111111111010001000";
+    // The all-"111"+0 channel-assignment filler the toolkit prints as `[]`.
+    const FILLER_ASG: &str = "111000000000000000000000000000000000000000";
+
+    #[test]
+    fn nonzero_bc_type_blocks_are_not_misparsed_as_descriptor() {
+        // Toolkit: for bc_type != 0 NO descriptor/info block is consumed; every
+        // block runs through the assignment loop. Block 0 here is a real
+        // assignment, the rest are the `111000…` filler (toolkit prints `[]`).
+        let asg = &ASG[..42];
+        let data = bits(&format!("{asg}{FILLER_ASG}{FILLER_ASG}{FILLER_ASG}"));
+        let f = parse_bc(1, &data, 0, &[]);
+        let d = &f.details;
+        assert_eq!(d["bc_type"], 1);
+        // No descriptor/info fields for a non-zero bc_type.
+        assert!(d.get("sat").is_none());
+        assert!(d.get("info_type").is_none());
+        // The single non-filler block is surfaced as a channel assignment,
+        // with the exact fields the toolkit decoded.
+        let a = d["assignments"].as_array().unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0]["random_id"], 1);
+        assert_eq!(a[0]["timeslot"], 1);
+        assert_eq!(a[0]["uplink_sub_band"], 3);
+        assert_eq!(a[0]["downlink_sub_band"], 22);
+        assert_eq!(a[0]["access"], 6);
+        assert_eq!(a[0]["dtoa"], 212);
+        assert_eq!(a[0]["dfoa"], 17);
+    }
+
+    #[test]
+    fn descriptor_unknown_bits_are_surfaced() {
+        // bc_type 0 descriptor + an all-zero info block (info_type 0).
+        let data = bits(&format!("{DESC}{}", "0".repeat(42)));
+        let d = parse_bc(0, &data, 0, &[]).details;
+        assert_eq!(d["sat"], 13);
+        assert_eq!(d["beam"], 15);
+        // Toolkit `unknown01` (bit 13) and `unknown02` (bits 40..42); both 0
+        // for this descriptor (toolkit prints the lone `0` and trailing `00`).
+        assert_eq!(d["unknown01"], 0);
+        assert_eq!(d["unknown02"], 0);
+        assert_eq!(d["acq_sub_band"], 20);
+        assert_eq!(d["acq_channels"], 2);
+    }
+
+    #[test]
+    fn info_type_4_known_filler_is_silent() {
+        // Toolkit recognizes this exact 42-bit constant as type-4 filler and
+        // emits no raw payload.
+        let filler4 = "000100000000100001110000110000110011110000";
+        let data = bits(&format!("{DESC}{filler4}"));
+        let d = parse_bc(0, &data, 0, &[]).details;
+        assert_eq!(d["info_type"], 4);
+        assert!(d.get("info_raw").is_none(), "filler-4 must stay silent");
+    }
+
+    #[test]
+    fn unrecognized_info_type_surfaces_raw_payload() {
+        // info_type 3 (no typed parse): toolkit prints `type:03 <42 bits>`. We
+        // surface those bits as hex rather than dropping them.
+        let info3 = format!("000011{}", "0".repeat(36)); // type=3, rest zero
+        let data = bits(&format!("{DESC}{info3}"));
+        let d = parse_bc(0, &data, 0, &[]).details;
+        assert_eq!(d["info_type"], 3);
+        // 42 bits, MSB-first nibbles -> "0c" then zeros (11 nibbles: the last
+        // is the trailing 2 bits, zero-padded).
+        assert_eq!(d["info_raw"], "0c000000000");
+    }
+
+    #[test]
+    fn block_count_anomaly_is_flagged() {
+        // Fewer than four blocks -> {SHORT}; more than four -> {LONG}.
+        let short = bits(&format!("{DESC}{}", "0".repeat(42)));
+        assert_eq!(parse_bc(0, &short, 0, &[]).details["block_trailer"], "SHORT");
+
+        let asg = &ASG[..42];
+        let long = bits(&format!(
+            "{DESC}{}{asg}{asg}{asg}",
+            "0".repeat(42)
+        ));
+        assert_eq!(parse_bc(0, &long, 0, &[]).details["block_trailer"], "LONG");
     }
 }
 

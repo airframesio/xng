@@ -13,6 +13,44 @@ fn da_burst_bits(cont: bool, ctr: u8, len: u8, payload: &[u8; 20]) -> Vec<u8> {
     bits
 }
 
+/// Build a sync (ISY, ft==7) burst: ACCESS + LCW(ft=7) + a 312-bit payload
+/// of the given sync bytes (the channel filler is 0xAA).
+fn sync_burst_bits(sync_bytes: &[u8; 39]) -> Vec<u8> {
+    let mut bits: Vec<u8> = frame::ACCESS_DL.to_vec();
+    bits.extend(frame::encode_lcw(7, 0, 0));
+    for &byte in sync_bytes {
+        for k in (0..8).rev() {
+            bits.push((byte >> k) & 1);
+        }
+    }
+    bits
+}
+
+/// ISY sync metric must match iridium-toolkit `IridiumSYMessage`: slice the
+/// 312-bit payload into bytes and count how many differ from 0xAA (`Sync=OK`
+/// when zero). Verified here against that exact reference definition rather
+/// than an internal heuristic.
+#[test]
+fn sync_byte_mismatch_matches_toolkit() {
+    // All-0xAA filler -> clean sync (Sync=OK, errs=0).
+    let clean = sync_burst_bits(&[0xAA; 39]);
+    let f = xng_mode_iridium::lcw_traffic_frame(&clean).expect("sync frame decodes");
+    assert_eq!(f.kind, "sync");
+    assert_eq!(f.details["sync_errors"], 0);
+    assert_eq!(f.details["sync_idle"], true);
+
+    // Corrupt three sync bytes -> the toolkit would report errs=3.
+    let mut dirty = [0xAAu8; 39];
+    dirty[0] = 0x00;
+    dirty[10] = 0xFF;
+    dirty[38] = 0x55;
+    let f = xng_mode_iridium::lcw_traffic_frame(&sync_burst_bits(&dirty))
+        .expect("sync frame decodes");
+    assert_eq!(f.kind, "sync");
+    assert_eq!(f.details["sync_errors"], 3);
+    assert_eq!(f.details["sync_idle"], false);
+}
+
 #[test]
 fn da_roundtrip() {
     let mut payload = [0u8; 20];
