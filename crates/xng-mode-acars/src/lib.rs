@@ -8,8 +8,10 @@
 //! See PROVENANCE.md for the clean-room sourcing of every protocol fact.
 
 pub mod demod;
+pub mod fec;
 pub mod frame;
 pub mod modulate;
+pub mod sublabel;
 
 use chrono::Utc;
 use num_complex::Complex;
@@ -134,6 +136,17 @@ pub fn to_message(
         },
         body: {
             let appdec = xng_acars::decode(&f.label, &f.text, f.downlink);
+            // ACARS-3.2: xng-acars sets sublabel/MFI only for H1. Extend the
+            // SAME libacars grammar to the other sublabel-bearing labels (H2,
+            // …) locally, so those families surface `sublabel`/`mfi` too.
+            // Falls back to the H1 values when xng-acars already produced them.
+            let (sublabel, mfi) = match (&appdec.sublabel, &appdec.mfi) {
+                (None, None) => match sublabel::extract(&f.label, &f.text, f.downlink) {
+                    Some(s) => (s.sublabel, s.mfi),
+                    None => (None, None),
+                },
+                _ => (appdec.sublabel.clone(), appdec.mfi.clone()),
+            };
             // Carry the structured application decode plus any OOOI
             // (OUT/OFF/ON/IN gate/wheels times + depa/dsta/eta) extracted
             // from the text into the body's `app` JSON value (the existing
@@ -145,8 +158,8 @@ pub fn to_message(
                 mode: f.mode,
                 tail: f.tail.clone(),
                 label: f.label.clone(),
-                sublabel: appdec.sublabel,
-                mfi: appdec.mfi,
+                sublabel,
+                mfi,
                 block_id: f.block_id,
                 ack: f.ack,
                 flight: f.flight.clone(),
