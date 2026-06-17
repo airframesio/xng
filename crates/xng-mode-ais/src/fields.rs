@@ -163,8 +163,8 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
             }
             put("raim", json!(u(bits, 148, 1)? == 1));
         }
-        // Base station report.
-        4 => {
+        // Base station report (4) / UTC-and-date response (11) — same shape.
+        4 | 11 => {
             if let (Some(y), Some(mo), Some(da), Some(h), Some(mi), Some(s)) = (
                 u(bits, 38, 14),
                 u(bits, 52, 4),
@@ -177,10 +177,13 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
                     put("utc", json!(format!("{y:04}-{mo:02}-{da:02}T{h:02}:{mi:02}:{s:02}Z")));
                 }
             }
+            put("position_accuracy", json!(u(bits, 78, 1)? == 1));
             if let Some((lat, lon)) = position(bits, 79) {
                 put("lat", json!(lat));
                 put("lon", json!(lon));
             }
+            put("epfd", json!(epfd_name(u(bits, 134, 4)?)));
+            put("raim", json!(u(bits, 148, 1)? == 1));
         }
         // Static and voyage data.
         5 => {
@@ -241,13 +244,6 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
                 put("lon", json!(lon));
             }
         }
-        // UTC response: position part of the type-4 shape.
-        11 => {
-            if let Some((lat, lon)) = position(bits, 79) {
-                put("lat", json!(lat));
-                put("lon", json!(lon));
-            }
-        }
         // Addressed safety-related text.
         12 => {
             put("seqno", json!(u(bits, 38, 2)));
@@ -259,35 +255,86 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
         14 => {
             put("text", json!(sixbit(bits, 40, (bits.len().saturating_sub(40)) / 6)));
         }
-        // Class B position reports (19 adds name/type).
+        // Class B position reports (19 adds name/type/dimensions).
         18 | 19 => {
             put("sog_kt", json!(sog(bits, 46)));
+            put("position_accuracy", json!(u(bits, 56, 1)? == 1));
             if let Some((lat, lon)) = position(bits, 57) {
                 put("lat", json!(lat));
                 put("lon", json!(lon));
             }
             put("cog_deg", json!(cog(bits, 112)));
             put("heading_deg", json!(heading(bits, 124)));
-            if msg_type == 19 {
+            if let Some(ts) = u(bits, 133, 6) {
+                if ts < 60 {
+                    put("timestamp_sec", json!(ts));
+                }
+            }
+            if msg_type == 18 {
+                put("raim", json!(u(bits, 147, 1)? == 1));
+            } else {
+                // Type 19 extended: identity + dimensions + EPFD.
                 put("name", json!(sixbit(bits, 143, 20)));
                 put("ship_type", json!(u(bits, 263, 8)));
+                put("to_bow", json!(u(bits, 271, 9)));
+                put("to_stern", json!(u(bits, 280, 9)));
+                put("to_port", json!(u(bits, 289, 6)));
+                put("to_starboard", json!(u(bits, 295, 6)));
+                put("epfd", json!(epfd_name(u(bits, 301, 4)?)));
+                put("raim", json!(u(bits, 305, 1)? == 1));
+                put("dte_ready", json!(u(bits, 306, 1)? == 0));
             }
         }
         // Aids to navigation.
         21 => {
             put("aton_type", json!(u(bits, 38, 5)));
             put("name", json!(sixbit(bits, 43, 20)));
+            put("position_accuracy", json!(u(bits, 163, 1)? == 1));
             if let Some((lat, lon)) = position(bits, 164) {
                 put("lat", json!(lat));
                 put("lon", json!(lon));
             }
+            put("to_bow", json!(u(bits, 219, 9)));
+            put("to_stern", json!(u(bits, 228, 9)));
+            put("to_port", json!(u(bits, 237, 6)));
+            put("to_starboard", json!(u(bits, 243, 6)));
+            put("epfd", json!(epfd_name(u(bits, 249, 4)?)));
+            if let Some(ts) = u(bits, 253, 6) {
+                if ts < 60 {
+                    put("timestamp_sec", json!(ts));
+                }
+            }
+            put("off_position", json!(u(bits, 259, 1)? == 1));
+            put("raim", json!(u(bits, 268, 1)? == 1));
+            put("virtual_aid", json!(u(bits, 269, 1)? == 1));
+            // Optional name extension (6-bit ASCII beyond the 272-bit base).
+            if bits.len() > 272 {
+                if let Some(ext) = sixbit(bits, 272, (bits.len() - 272) / 6) {
+                    if !ext.is_empty() {
+                        put("name_ext", json!(ext));
+                    }
+                }
+            }
         }
-        // Static data report (part A: name; part B: type + callsign).
+        // Static data report (part A: name; part B: type/vendor/dims).
         24 => match u(bits, 38, 2)? {
             0 => put("name", json!(sixbit(bits, 40, 20))),
             1 => {
                 put("ship_type", json!(u(bits, 40, 8)));
+                put("vendor_id", json!(sixbit(bits, 48, 3)));
+                put("model", json!(u(bits, 66, 4)));
+                put("serial", json!(u(bits, 70, 20)));
                 put("callsign", json!(sixbit(bits, 90, 7)));
+                // Auxiliary craft (MMSI 98x) carry a mothership MMSI in place
+                // of dimensions.
+                if (980..=989).contains(&(u(bits, 8, 30)? / 1_000_000)) {
+                    put("mothership_mmsi", json!(u(bits, 132, 30)));
+                } else {
+                    put("to_bow", json!(u(bits, 132, 9)));
+                    put("to_stern", json!(u(bits, 141, 9)));
+                    put("to_port", json!(u(bits, 150, 6)));
+                    put("to_starboard", json!(u(bits, 156, 6)));
+                }
             }
             _ => return None,
         },
@@ -566,6 +613,82 @@ mod tests {
         assert_eq!(d["dac"], 669);
         assert_eq!(d["fid"], 11);
         assert_eq!(d["data_hex"], "55aa");
+    }
+
+    // AIS-3 tail: vectors + expected values from the pyais test suite.
+
+    #[test]
+    fn type4_base_station_matches_pyais() {
+        let bits = bits_of("403OtVAv>lba;o?Ia`E`4G?02H6k", 0);
+        let d = decode(4, &bits).unwrap();
+        assert_eq!(d["position_accuracy"], true);
+        assert_eq!(d["epfd"], "internal GNSS"); // EPFD code 15
+        assert_eq!(d["utc"], "2019-11-09T10:41:11Z");
+    }
+
+    #[test]
+    fn type18_class_b_flags_match_pyais() {
+        let bits = bits_of("B5NJ;PP005l4ot5Isbl03wsUkP06", 0);
+        let d = decode(18, &bits).unwrap();
+        assert_eq!(d["position_accuracy"], false);
+        assert_eq!(d["timestamp_sec"], 55);
+        assert_eq!(d["raim"], false);
+    }
+
+    #[test]
+    fn type19_extended_class_b_matches_pyais() {
+        let bits = bits_of("C5N3SRgPEnJGEBT>NhWAwwo862PaLELTBJ:V00000000S0D:R220", 0);
+        let d = decode(19, &bits).unwrap();
+        assert_eq!(d["name"], "CAPT.J.RIMES");
+        assert_eq!(d["ship_type"], 70);
+        assert_eq!(d["to_bow"], 5);
+        assert_eq!(d["to_stern"], 21);
+        assert_eq!(d["to_port"], 4);
+        assert_eq!(d["to_starboard"], 4);
+        assert_eq!(d["epfd"], "GPS");
+        assert_eq!(d["dte_ready"], true); // dte bit 0 = ready
+        assert_eq!(d["position_accuracy"], false);
+        assert_eq!(d["timestamp_sec"], 46);
+    }
+
+    #[test]
+    fn type21_aton_matches_pyais() {
+        // Two-fragment message: armored payloads concatenate, fill on the last.
+        let bits = bits_of("E4eHJhPR37q0000000000000000KUOSc=rq4h00000a@20", 4);
+        let d = decode(21, &bits).unwrap();
+        assert_eq!(d["aton_type"], 1); // reference point
+        assert_eq!(d["name"], "DFO2");
+        assert_eq!(d["position_accuracy"], true);
+        assert!((d["lat"].as_f64().unwrap() - 48.65457).abs() < 1e-5);
+        assert!((d["lon"].as_f64().unwrap() - -123.429155).abs() < 1e-5);
+        assert_eq!(d["to_bow"], 0);
+        assert_eq!(d["off_position"], true);
+        assert_eq!(d["raim"], true);
+        assert_eq!(d["virtual_aid"], false);
+        assert_eq!(d["epfd"], "GPS");
+        assert!(d.get("name_ext").is_none());
+    }
+
+    #[test]
+    fn type24b_regular_dimensions_match_pyais() {
+        let bits = bits_of("H8=;nnT000000000000000Wg8Jb0", 0);
+        let d = decode(24, &bits).unwrap();
+        assert_eq!(d["to_bow"], 317);
+        assert_eq!(d["to_stern"], 456);
+        assert_eq!(d["to_port"], 26);
+        assert_eq!(d["to_starboard"], 42);
+        assert!(d.get("mothership_mmsi").is_none());
+    }
+
+    #[test]
+    fn type24b_aux_craft_matches_pyais() {
+        let bits = bits_of("H>W@vFTe6??406t2??21J0Wg8Jb0", 0);
+        let d = decode(24, &bits).unwrap();
+        assert_eq!(d["vendor_id"], "FOO");
+        assert_eq!(d["model"], 1);
+        assert_eq!(d["callsign"], "BOOBAZ");
+        assert_eq!(d["mothership_mmsi"], 666666666);
+        assert!(d.get("to_bow").is_none());
     }
 
     #[test]
