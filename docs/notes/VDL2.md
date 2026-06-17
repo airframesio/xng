@@ -236,12 +236,14 @@ Clean-room from the public ISO framings (ISO/IEC 8208 X.25, 8473 CLNP,
 8073 COTP, 9542 ES-IS, 10747 IDRP) as profiled by ICAO Doc 9776/9705/
 9880; dumpvdl2 was consulted only for protocol constants and the
 integer→name dictionaries. ATN rides in I-frame info fields: an ISO 8208
-packet on most links, or bare CLNP/ES-IS/IDRP. Decoded into JSON nested
-under the message body.
+packet on most links, or bare CLNP/ES-IS/IDRP. The network-layer entry
+`parse_network` dispatches on the NLPID first octet (0x81 CLNP / 0x82
+ES-IS / 0x83 IDRP; anything else → `clnp-compressed?` label). Decoded
+into JSON nested under the message body.
 
 - **X.25 packet layer (`parse_x25`)** — modulo-8 profile (GFI 0bxx01,
   tolerates Q/D). DATA (P(S)/P(R)/M-bit + user data), CALL-REQUEST /
-  CALL-ACCEPTED (BCD address block, facilities, call-user-data),
+  CALL-ACCEPTED (BCD address block, facilities, SNDCF, call-user-data),
   CLEAR / RESET / RESTART request (cause + diagnostic) and their
   confirmations, DIAGNOSTIC (0xF1), and RR/RNR/REJ supervisory. Three
   cause tables (clear/reset/restart, ITU-T X.25 Table 5-7) and a
@@ -249,15 +251,63 @@ under the message body.
   Table 5.7-3 / Doc 9880 extensions) resolve to text; a cause octet with
   bit 8 set is normalised to 0 (remote-DTE bits) for the lookup.
   Facilities are reported numerically (code + params) — naming deferred.
+- **X.25 SNDCF (`parse_sndcf_field`)** — the Subnetwork Dependent
+  Convergence Function field the ATN profile (ICAO Doc 9705 §5.7) places
+  between the facility block and the call user data. On Call-Request it is
+  `id(0xC1) | length | version(=1) | … | compression-bitfield`; on
+  Call-Accept it is a single compression octet. The compression-support
+  bitfield decodes against the ATN algorithm set (ACA 0x40, DEFLATE 0x20,
+  LREF 0x02, LREF-CAN 0x01) plus the M/I bit 0x10. Decoding the SNDCF
+  also un-offsets the CUD's network-protocol identifier (previously the
+  field was swallowed into the CUD).
 - **M-bit reassembly (`X25Reassembler`)** — DATA packets with M=1 are
   buffered per logical channel and concatenated until M=0 before the
   network layer is parsed; 60 s per-LCN timeout.
 - **CLNP (`parse_clnp`)** — full uncompressed ISO 8473 header: PDU type
-  (DT 0x1C / ERQ 0x1E / ERP 0x1F / ER 0x01), version, lifetime, segment
-  length, dst/src NSAPs (hex). DT payloads recurse into COTP.
-- **COTP (`parse_cotp`)** — ISO 8073 TPDU identification (CR/CC/DR/DT/ER)
-  with dst/src references; DT user data is handed to the ATN-B1
-  application decoders.
+  (DT 0x1C / ERQ 0x1E / ERP 0x1F / ER 0x01), version, lifetime, the full
+  flags byte (SP 0x80 / MS more-segments 0x40 / E·R 0x20), segment length,
+  dst/src NSAPs (hex), then the options part. The optional 6-octet
+  segmentation part (data-unit id, segment offset, total length) is
+  decoded when SP is set. Unsegmented DT payloads recurse into COTP;
+  a fragment (offset ≠ 0 or MS set) is *not* parsed as COTP — its data is
+  partial, so COTP waits for reassembly (below).
+- **CLNP options (`parse_clnp_options`)** — the header options part walked
+  as `type|length|value`, naming the X.233 set (QoS-maintenance 0xC3,
+  discard-reason 0xC1, padding 0xCC, priority 0xCD, security 0xC5,
+  source-routing 0xC8, record-route 0xCB, …). The **Security option
+  (0xC5)** is expanded as the ATN Security Label (ICAO Doc 9705 §5.6 /
+  Doc 9880): leading globally-unique format octet (0xC0), then the
+  security-registration-ID octet string, then the length-prefixed
+  security-information part. Each tag set
+  (`name-len | name | set-len | value`) is parsed against the ATN
+  security-tag dictionary — **traffic-type (0x0F)** with
+  type/category/route-policy, **security-classification (0x03)**,
+  **subnetwork-type (0x05)** with subnet name + permitted-traffic-types
+  bitfield, **supported-ATSC-classes (0x06/0x07)** as an A..H class
+  bitfield.
+- **CLNP multipart reassembly (`ClnpReassembler`)** — NEW. ISO 8473 §6.7:
+  derived PDUs of one initial PDU share a data-unit identifier; each
+  carries a fragment of the data part at its *segment offset*, and the
+  initial PDU's *total length* (header + complete data) bounds the data
+  unit. Fragments are placed by offset, so **out-of-order arrival
+  reassembles correctly**; the first segment's header is preserved and on
+  completion a single de-segmented CLNP PDU is rebuilt (more-segments flag
+  cleared, `hdr[4] &= !0x40`) and handed to the normal CLNP/COTP walk.
+  Keyed by **(src NSAP, dst NSAP, data-unit id)** with a 60 s timeout
+  (mirrors the X.25 M-bit reassembler). Wired in `lib.rs::decode_network`,
+  *after* X.25 M-bit reassembly; a fragment that does not complete a data
+  unit surfaces its own header plus `reassembling: true`.
+- **COTP (`parse_cotp`, ISO 8073 / X.224)** — all 10 TPDU types:
+  CR/CC/DR/DC/ED/DT/AK/EA/RJ/ER. Each fixed header is parsed
+  (dst/src references, CR/CC protocol-class + options, DR disconnect
+  reason, ER reject cause, DT/ED end-of-TPDU flag, sequence numbers and
+  flow-control credit for the data TPDUs), in both the normal (7-bit
+  sequence) and extended (31-bit sequence) formats — extended signalled by
+  an odd length-indicator. The variable part is parsed as
+  `type|length|value` parameters: ATN checksum (0x08), TPDU-size
+  (0xC0 → 2^value bytes), priority (0x87), inactivity timer (0xF2), and
+  the rest of the X.224 set. DR-reason and ER-cause dictionaries resolve
+  to text. DT/ED user data is handed to the ATN-B1 application decoders.
 - **ES-IS (`parse_esis`, ISO 9542)** — ESH (type 2, count + SAs) / ISH
   (type 4, single NET) with holding time and advertised NSAPs (hex), plus
   the trailing option TLVs: Mobile-Subnetwork-Capabilities (0x81),
@@ -281,7 +331,7 @@ Protected-mode CPDLC and Context Management, decoded from the ICAO Doc
 Wireshark's transcription of the ICAO standard — module text only).
 Encoding is unaligned PER (ITU-T X.691), hand-walked: constrained whole
 numbers, length determinants (no fragmentation), and IA5 strings (7
-bits/char). Reached via COTP DT user data; `parse_apdu` tries protected
+bits/char). Reached via COTP DT/ED user data; `parse_apdu` tries protected
 CPDLC, then `parse_cm_logon`, then `parse_cm_ground`.
 
 - **CPDLC** — ProtectedAircraftPDUs (4 root alts) / ProtectedGroundPDUs
@@ -292,18 +342,52 @@ CPDLC, then `parse_cm_logon`, then `parse_cm_ground`.
   — 238 uplink + 114 downlink `(name, ASN.1 arg type, phraseology)`
   generated from the module (`atn_cpdlc_tables.rs`) — and rendered into
   readable text (`CLIMB TO FL360`, `WILCO`).
-- **CPDLC argument values** — readers for the common element argument
-  types: Level (feet / metres / FL / metric-FL, single + block),
-  Time, Position (fix / navaid / airport / lat-lon), Speed (all seven
-  IAS/TAS/GS/Mach units), Degrees, Direction, Distance, plus the
-  two-component compounds (LevelLevel, TimeLevel, PositionLevel, …) and
-  RouteClearanceIndex. **Route clearances** in `constrainedData` decode
-  departure/destination airports, runways, procedures (arrival/approach/
-  departure + transition), and the RouteInformation leg list (published
-  fix/navaid, lat-lon, place-bearing, place-bearing-distance, ATS route
-  designator). An unsupported argument type stops the element walk
-  explicitly (its size is then unknown) and the element is flagged
-  undecoded rather than guessed past — the staged FANS-1/A approach.
+- **CPDLC argument values** — `read_argument` now covers **~63 argument
+  types** (up from ~22), so the element walk no longer halts at the first
+  previously-unsupported argument. Beyond the original Level / Time /
+  Position / Speed / Degrees / Direction / Distance and their
+  two-component compounds, the round added:
+  - **Frequency** CHOICE (HF kHz / VHF·0.005 / UHF·0.025 MHz / 12-digit
+    SAT NumericString) and UnitNameFrequency / PositionUnitNameFrequency /
+    TimeUnitNameFrequency (UnitName = designation + optional name +
+    facility-function enum);
+  - **Altimeter** CHOICE (english in·0.01 / metric hPa·0.1), plus
+    FacilityDesignation, Facility, FacilityDesignationAltimeter,
+    FacilityDesignationATISCode;
+  - **Code** (4-digit octal squawk), **ATISCode** (single IA5),
+    **FreeText** (IA5 1..256), **VersionNumber** (0..15);
+  - the ENUMERATED arguments TrafficType, ClearanceType, ErrorInformation,
+    ToFrom, SpeedType, FacilityFunction (each with its X.691 extension bit);
+  - **ProcedureName** / PositionProcedureName, **RunwayRVR**,
+    **VerticalRate** CHOICE (·10 fpm / ·10 m/min),
+    **RemainingFuelPersonsOnBoard** (Time + 1..1024);
+  - the level/speed/time/position compound shapes previously unknown
+    (LevelSpeedSpeed, PositionSpeedSpeed, TimeSpeed, SpeedTime,
+    TimeSpeedSpeed, PositionLevelLevel, PositionLevelSpeed,
+    PositionTimeTime, PositionTimeLevel, TimePositionLevel,
+    TimePositionLevelSpeed, SpeedTypeSpeedTypeSpeedType, and that +Speed);
+  - the distance/direction offset family
+    (DistanceSpecifiedDirection, PositionDistanceSpecifiedDirection,
+    TimeDistanceSpecifiedDirection, DistanceSpecifiedDirectionTime) and the
+    to/from reports (ToFromPosition, TimeToFromPosition,
+    TimeDistanceToFromPosition).
+  An unsupported argument type still stops the element walk explicitly
+  (its size is then unknown) and the element is flagged undecoded rather
+  than guessed past — the staged FANS-1/A approach.
+- **Route clearances** in `constrainedData` decode departure/destination
+  airports, runways, procedures (arrival/approach/departure + transition),
+  and the RouteInformation leg list (published fix/navaid, lat-lon,
+  place-bearing, place-bearing-distance, ATS route designator); the
+  routeInformationAdditional tail is flagged present-but-undecoded (it is
+  last in the structure).
+- **HoldClearance** (position/level/degrees/direction + optional LegType
+  CHOICE distance/time) decodes fully. **DepartureClearance** decodes the
+  mandatory head (flight id + clearance-limit position) and flags the
+  deeply-nested FlightInformation / FurtherInstructions optional tail
+  present-but-undecoded. **PositionReport** decodes the 3 mandatory fields
+  (position / time / level) and, if any of the 19 OPTIONAL fields are
+  present, returns `None` to stop the walk (their sizes are then unknown)
+  rather than mis-decode.
 - **CM (`parse_cm_logon`, `parse_cm_ground`)** — the dialogue that
   precedes CPDLC. CMLogonRequest yields the flight id (and a count of
   present optional fields); CMGroundMessage identifies the dialogue type
@@ -327,21 +411,32 @@ info-hex preview. The raw frame octets are preserved on every message.
 - **Off-air oracle: dumpvdl2 2.6.0** on the sigidwiki VDL-M2 capture
   (CC BY-SA, 46.9 s, Amsterdam; I/Q convention inverted — dumpvdl2 also
   decodes nothing until conjugated). xng 44 vs dumpvdl2 41, CI floor 42.
+  `tests/offair.rs` asserts ≥2 AVLC frames and CRC-valid ACARS from
+  HB-IJW on the vendored 6 s slice.
 - **Octet-level ground truth** from dumpvdl2 `--debug burst_detail`
   (post-deinterleave Data+FEC octets) — this, not frame counts, exposed
   the LSB-vs-MSB RS bug (see lessons).
 - **Spec self-test vectors** in the suite: UW phase sequence, first 48
   scrambler keystream bits, header-FEC parity for TL ∈ {1,100,1000,
   131071}, AVLC FCS residue, RS encode/decode roundtrip.
-- **Synthetic UPER vectors** for the ATN-B1 path, built bit-by-bit from
-  the module (WILCO downlink, CLIMB-TO uplink, CM logon-request,
-  CM ground logon-response, cleared-route uplink).
+- **Synthetic UPER vectors** for the ATN-B1 path, hand-assembled
+  bit-by-bit from the module (no encode→decode loopback): WILCO downlink,
+  CLIMB-TO uplink, CM logon-request, CM ground logon-response,
+  cleared-route uplink, plus one worked vector for each newly-added
+  argument type (the expected rendering derived from the module's
+  resolution/unit constraint comments).
+- **Spec-derived transport vectors** built octet-by-octet (no loopback):
+  every COTP TPDU (CR/CC/DR/DC/ED/DT/AK/EA/RJ/ER), the CLNP security label
+  and options, X.25 SNDCF Call-Request/Accept, IDRP OPEN/UPDATE/
+  KEEPALIVE/RIB-REFRESH, and the CLNP reassembler (in-order, out-of-order,
+  unsegmented pass-through, and a COTP DT recovered across two segments).
 - **RF loopback** (`tests/end_to_end.rs`): AOA frame with a real ADS-C
   payload + S-frame, both at 50/100 kS/s, plain and RC(α=0.6)
   pulse-shaped, plus a wideband-with-CFO path; the vendored 6 s off-air
   fixture is guarded by `tests/offair.rs`.
 
-The dictionaries (XID param IDs, X.25 cause/diagnostic codes, IDRP
+The dictionaries (XID param IDs, X.25 cause/diagnostic/SNDCF codes, COTP
+TPDU/parameter/reason codes, CLNP option + ATN security-tag codes, IDRP
 PDU/attr/error codes, ES-IS option IDs) were cross-checked against the
 corresponding dumpvdl2 source tables — the integer→name assignments only,
 never code or formatter text (clean-room; see PROVENANCE.md).
@@ -355,10 +450,15 @@ never code or formatter text (clean-room; see PROVENANCE.md).
 - Compressed CLNP (LREF / deflate) labeled but not expanded.
 - IDRP OPEN's variable tail (RIB-Atts-Set / Confed-IDs / auth) stays hex.
 - CPDLC: extension-marked CHOICE alternatives, fragmented PER lengths,
-  unsupported argument types, the routeInformationAdditional tail, and
-  place-bearing-distance positions are not decoded — each stops its walk
-  explicitly rather than emitting a guess.
+  the still-unsupported argument types, the routeInformationAdditional
+  tail, place-bearing-distance positions, the deeply-nested
+  **DepartureClearance** FlightInformation / FurtherInstructions tail, and
+  the 19 OPTIONAL **PositionReport** fields are not decoded — each stops
+  its walk explicitly rather than emitting a guess. Both deferred tails
+  need a captured PDU to pin the nested SEQUENCE-OF / CHOICE walks.
 - CM: TSAP application-list entries reported present/absent only.
+- **Native ATN-B2 ADS-C over COTP** is not implemented — the deferred big
+  bet (the COTP plumbing and CLNP reassembly that feed it are in place).
 
 ## Standing lessons
 
@@ -398,13 +498,13 @@ collecting burst's UW start means a false header decode that fails RS
 cannot consume a real burst. Lower the trigger threshold only with this
 in place.
 
-**Decode protocol, don't guess it.** Across the XID, X.25, IDRP and
-CPDLC work the recurring discipline is: parse the reliably-framed fields,
-name them from a spec-pinned dictionary cross-checked against the oracle,
-and leave anything whose binary layout is unverified as hex (or stop the
-PER walk explicitly when a size is unknown). A mis-numbered XID table
-(0x42 vs 0x83) shipped before because a name was assumed rather than
-pinned; every dictionary now has a test.
+**Decode protocol, don't guess it.** Across the XID, X.25, COTP, CLNP,
+IDRP and CPDLC work the recurring discipline is: parse the
+reliably-framed fields, name them from a spec-pinned dictionary
+cross-checked against the oracle, and leave anything whose binary layout
+is unverified as hex (or stop the PER walk explicitly when a size is
+unknown). A mis-numbered XID table (0x42 vs 0x83) shipped before because
+a name was assumed rather than pinned; every dictionary now has a test.
 
 ## Architecture vs dumpvdl2
 

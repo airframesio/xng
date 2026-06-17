@@ -131,19 +131,52 @@ service code) then payload; 2-byte checksum.
   0x24 warning-circ, 0x31 NAVAREA/METAREA warning, 0x33 download
   group-id, 0x34 SAR-rect, 0x44 SAR-circ, 0x72 FleetNET chart
   correction, 0x73 SafetyNET chart correction.
-- **Geographic area classification** (STDC-1, `area_shape` / `egc_area`):
-  the C2 service code is classified into its addressing shape +
-  documented C3 field layout per the IMO International SafetyNET Manual
-  (2019) Annex 4 part A §5.2–5.3 — Rectangular (04/34,
-  `D1D2La D3D4D5Lo D6D7 D8D9D10`), Circular (14/24/44,
-  `D1D2 N/S D3D4 E/W M1M2M3`), NavMetArea (31, `X1X2`), Coastal
-  (13/73, `X1X2 B1 B2`), AllShips (00). The structured `area` object
-  carries shape, C2, the C3 format string and the **raw C3 payload
-  bytes** (the C2-repeat byte stripped).
+- **Geographic area address — classified _and_ decoded** (STDC-1 /
+  STDC-1.1 / STDC-1.2, `area_shape` / `egc_area` + `*_geom`): the C2
+  service code is classified into its addressing shape and documented C3
+  field layout (per the IMO International SafetyNET Manual 2019 Annex 4
+  part A §5.2–5.3), **and** the on-air binary C3 address code is now
+  decoded into machine-readable geometry. The structured `details["area"]`
+  object carries `shape`, `c2`, the `c3_format` digit-layout string, the
+  raw `address_payload_hex` (the leading C2-repeat byte stripped), and a
+  nested `geometry` object — see the EGC geometry table below.
 - Assembly (`push_egc`): keyed by message sequence; parts ordered by
   pkt_seq·2 + (part==2); complete when a terminating part arrives
   (single header, or part 2) with continuation cleared; entries age out
   after 8 frames.
+
+### EGC geographic area geometry (STDC-1.1 / STDC-1.2, `egc_area`)
+
+The on-air binary C3 address code is decoded into signed degrees /
+nautical miles and emitted as `details["area"]["geometry"]`. Layout is
+read on the C3 payload (the address field with the leading C2-repeat byte
+stripped). **This is the only known open decode of the C3 binary** —
+inmarsatc, SatDump, sdrangel and inmarsat-sniffer all carry the EGC
+address as raw bytes (each marks the area decode "TODO" / `lat = NaN`).
+
+| Shape | C2 | On-air C3 bytes (post C2-repeat) | `geometry` fields emitted |
+|---|---|---|---|
+| Rectangular | 04, 34 | `[0]` bit7 N(0)/S(1) ∣ bits6-0 SW-lat°; `[1]` SW-lon°; `[2]` bit7 E(0)/W(1) ∣ bits6-0 north extent NM; `[3]` east extent NM | `sw_corner.{lat_deg,lon_deg}` (signed), `north_extent_nm`, `east_extent_nm`, `lat_hemisphere`, `lon_hemisphere` |
+| Circular | 14, 24, 44 | `[0]` bit7 N/S ∣ bits6-0 centre lat°; `[1]` centre lon°; `[2]` bit7 E/W ∣ bits6-0 radius hi; `[3]` radius lo (15-bit NM) | `center.{lat_deg,lon_deg}` (signed), `radius_nm`, `lat_hemisphere`, `lon_hemisphere` |
+| NAVAREA/METAREA | 31 | `[0]` area number 1–21 | `area_number`, `area_roman` (e.g. "XII"), `coordinator` |
+| Coastal / NAVTEX | 13, 73 | `[0]` area number; `[1]` coastal-area letter A–Z; `[2]` subject indicator | `area_number`, `area_roman`, `coordinator`, `coastal_area`, `subject_indicator`, `subject` |
+| All-ships | 00 | — | (no geometry; shape only) |
+
+- **Signs**: latitude bit7 set → south (negative `lat_deg`); the longitude
+  hemisphere bit lives in C3 byte `[2]` bit7 (set → west, negative
+  `lon_deg`). Both the signed degrees **and** the explicit
+  `lat_hemisphere`/`lon_hemisphere` strings are surfaced.
+- **Units note**: the manual's *MSI-provider* rectangular C3 _string_
+  states the extent in degrees (worked example `60N010W30025` = 30°/25°),
+  but the LES re-encodes the on-air binary field in **nautical miles**
+  (Scytale-C). The raw on-air integer (`*_extent_nm` / `radius_nm`) and
+  the corner/centre degrees are both surfaced so a map layer plots without
+  re-deriving the packing.
+- **Coastal subject indicator** (byte `[2]`, IMO Manual Annex 4 §5.3/§3.3):
+  `A` navigational-warnings, `L` other-navigational-warnings, `B`
+  meteorological-warnings, `E` meteorological-forecasts.
+- **NAVAREA/METAREA coordinator** table (issuing authority for area 1–21)
+  is verbatim from Scytale-C `ReturnNavMetAreaCoordinator`.
 
 ### Text / presentation decode (`decode_payload`)
 
@@ -175,6 +208,18 @@ emitted as a `message` event. Stale channels age out after 8 frames.
   region) — both verbatim from inmarsatc `getSatName` / `getLesName`.
 - **EGC service long names** — verbatim from inmarsatc
   `getServiceCodeAndAddressName`.
+- **EGC C3 geometry binary packing** (STDC-1.1/1.2): oracle is
+  **Scytale-C** `PacketDecoderGeoUtils.cs` (`ReturnRectangularArea` /
+  `ReturnCircularArea` / `ReturnNavArea`), whose own cited bibliography is
+  the IMO/USCG International SafetyNET Manual; Scytale-C is the upstream
+  origin of the inmarsatc reference this crate already cross-verifies
+  against (facts only; re-derived in Rust). Verified against the manual's
+  published worked examples — rectangular `60N010W30025` (SW 60°N 010°W,
+  30 NM N, 25 NM E), circular `56N034W035` (centre 56°N 034°W, r 35 NM)
+  and body example `14N 66W 300` (centre 14°N 66°W, r 300 NM) — each
+  re-encodes bit-exact through the Scytale-C layout and is pinned as an
+  inline test vector. A southern/eastern case (38°S 164°E, r 999 NM)
+  pins both negative-lat and positive-lon paths.
 
 ## Output
 
@@ -198,23 +243,28 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
 - **Unit** (`packet.rs`, `frame.rs`): descrambler table prefix, frame
   round-trip (clean / inverted / ~1 % symbol errors), Fletcher checksum,
   LCN assembly, EGC single/multi-part assembly, ITA2 alphabet, area-shape
-  classification, and every field-decode table against its oracle value.
+  classification, the rectangular/circular/NAVAREA/coastal C3 geometry
+  decode against the manual worked examples (incl. a southern/eastern
+  hemisphere case) and end-to-end through the EGC assembly path, and every
+  field-decode table against its oracle value.
 - Oracles cross-referenced: inmarsatc (field tables + formulas), SatDump
-  (`.frm` stage goldens on the sigidwiki capture), IMO International
-  SafetyNET Manual (2019) (EGC area addressing), ITU-T ITA2 (Baudot
-  alphabet). STD-C is oracle-validated field-exact — see
+  (`.frm` stage goldens on the sigidwiki capture), Scytale-C (C3 geometry
+  binary packing + NAVAREA coordinator table), IMO International SafetyNET
+  Manual (2019) (EGC area addressing + worked examples), ITU-T ITA2
+  (Baudot alphabet). STD-C is oracle-validated field-exact — see
   [BENCHMARKS.md](BENCHMARKS.md) (no count-style head-to-head yet).
 
 ## Known limitations / intentional gaps
 
-- **EGC area coordinate extraction deferred.** The C2 shape and C3 field
-  layout are classified per the IMO manual, but the on-air *binary
-  packing* of the C3 coordinate digits is undocumented in every
-  accessible primary source and decoded by no open decoder (inmarsatc,
-  SatDump, sdrangel, inmarsat-sniffer all carry the EGC address as raw
-  bytes). lat/lon/radius extraction is **deliberately not guessed** —
-  the typed raw payload bytes are surfaced for a future
-  verified-against-real-capture decode.
+- **EGC area coordinate extraction — now DONE** (was deferred). The
+  on-air binary C3 address code is decoded into signed degrees /
+  nautical miles for rectangular, circular, NAVAREA/METAREA and
+  coastal/NAVTEX areas, emitted as `details["area"]["geometry"]` (see the
+  EGC geometry table). The binary packing is sourced from Scytale-C and
+  pinned to the SafetyNET Manual worked examples. Remaining gap: no EGC
+  area packet appears in the vendored off-air fixture, so the geometry
+  path is verified against the manual's worked-example byte layouts (round-
+  trip + Scytale-C) rather than against a real area-addressed capture.
 - Many control descriptors (login-ack, confirmation, les-list, the
   ack/request/test family) are recognized and named but their inner
   fields are not yet broken out.
@@ -231,14 +281,23 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
 5. Packet length fields exclude the descriptor byte(s) — add 1/2/3.
 6. 180° ambiguity is resolved at the UW (both polarities), not in demod.
 7. Gardner must be gated on carrier lock or frames slip and corrupt.
+8. EGC C3 geometry: longitude hemisphere bit is in byte `[2]` bit7 (with
+   the N/S extent / radius), not on the longitude byte itself; and the
+   rectangular extent is on-air nautical miles even though the manual's
+   MSI-provider string states degrees.
 
 ## Key references
 
 - inmarsatc (GPL-3) — field tables, channel/frame formulas (facts only).
 - SatDump (GPL-3) — PHY constants, `.frm` stage goldens (facts only).
-- Scytale-C (GPL-3) — frame structure cross-check (facts only).
-- IMO International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3 —
-  EGC geographic area addressing.
+- Scytale-C (GPL-3) — frame structure cross-check and the C3 area
+  geometry binary packing (`PacketDecoderGeoUtils.cs`:
+  `ReturnRectangularArea` / `ReturnCircularArea` / `ReturnNavArea`) +
+  NAVAREA/METAREA coordinator table (`ReturnNavMetAreaCoordinator`)
+  (facts only).
+- IMO International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3 /
+  part B §3.3 — EGC geographic area addressing + worked examples
+  (`60N010W30025`, `56N034W035`, `14N 66W 300`).
 - ITU-T ITA2 (International Telegraph Alphabet No. 2) — Baudot alphabet.
 - sigidwiki Inmarsat-C TDM page — public IQ test vector (CC BY-SA).
 - PROVENANCE.md — sourcing policy and per-table oracle notes.

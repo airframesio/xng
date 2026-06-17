@@ -5,7 +5,7 @@ Native Inmarsat Classic Aero decode core (`crates/xng-mode-aero`),
 implementation; porting permitted with attribution, see `PROVENANCE.md`).
 JAERO source is the structural reference *and* the off-air oracle. This
 note is the as-built state; numbers are what the code does and the tests
-assert (`cargo test -p xng-mode-aero` — 32 tests, 0 ignored).
+assert (`cargo test -p xng-mode-aero` — 46 tests, 0 ignored).
 
 Four physical channels, four front-ends, all feeding one SU/ACARS layer:
 
@@ -22,9 +22,12 @@ mislabelled as `aero-l`.
 ## Pipeline
 
 Per L-band P-channel (`lib.rs::AeroChannelDecoder`): wideband IQ →
-`xng_dsp::Ddc` → channel IQ → demod → 32-bit UW hunt → header skip →
-deinterleave + Viterbi + descramble → 12-byte SUs → CRC → reassembly +
-P-SU classification → ACARS via `xng_acars::block` → `xng_types::Message`.
+`xng_dsp::Ddc` → channel IQ → demod → 32-bit UW hunt → **16-bit header
+parse** → deinterleave + Viterbi + descramble → 12-byte SUs → CRC →
+reassembly + P-SU classification → ACARS via `xng_acars::block` →
+`xng_types::Message`. Every structured SU is also fed to a
+**self-configuring satellite/beam resolver** so each emitted message can
+be tagged with the serving satellite (AERO-2).
 
 Both low rates run in parallel on a 24 kHz channel (600 and 1200 bps
 chains; whichever locks wins). The 10.5 kbps OQPSK chain runs on its own
@@ -65,8 +68,7 @@ statistic (a spinning constellation has deceptively low MSE). The IIR
 coefficients are designed at 48 kHz, so the OQPSK chains are always fed
 48 kHz. **The 10.5k demod decodes end-to-end** (BER 0 at CFO
 0/±120/−250 Hz; ACARS recovered through RF loopback at 120 Hz CFO and
-from a 240 kHz wideband capture at +15 kHz offset) — the earlier "no
-carrier lock" caveat in `PROVENANCE.md` is stale; see Validation.
+from a 240 kHz wideband capture at +15 kHz offset).
 
 **C-band R/T bursts** (`burst.rs`). A `BurstGate` collects samples while
 energy is present (8× noise-floor trigger, 10 dB-drop end relative to a
@@ -93,6 +95,30 @@ clean; a false trigger costs one frame and dies at the SU CRCs).
 - **Scrambler**: the VDL2/HFDL shared 15-stage LFSR (x^15+x+1,
   `xng_dsp::scramble::Lfsr15`), applied to the *decoded* bits, **reset at
   each UW**. Bits pack **LSB-first**.
+
+### P-channel 16-bit frame header (`frame::FrameHeader`, AERO-4)
+
+The 16 bits immediately following the 32-bit UW carry frame sequencing
+metadata. The framer assembles them MSB-first and `FrameHeader` splits
+the word into four JAERO nibbles (oracle: JAERO `aerol.cpp`
+`AeroL::Decode` `frameinfo`):
+
+| Field | Bits | JAERO name |
+|---|---|---|
+| `format_id` | 15..12 | `formatid` (frame content/format selector) |
+| `superframe` | 11..8 | `supfrmaker` (superframe-position marker) |
+| `frame_counter1` | 7..4 | `framecounter1` |
+| `frame_counter2` | 3..0 | `framecounter2` |
+
+`FrameHeader::from_soft_bits` parses the header off the soft bits already
+collected after the UW; `from_u16`/`to_u16` round-trip the word (the
+`FrameEncoder` writes the header through `to_u16` so the wire word and
+the decoder's parse share one definition). The parsed header is latched
+per frame (`Framer::last_header`) and surfaced in the message `details`
+as a nested `frame_header` object. On the **10.5k OQPSK** path the same
+header is parsed from the first 16 bits of the 16+178-bit skip region
+(`oqpsk.rs::HrFramer`). The state machine that *consumes* these fields
+(superframe lock + AFC/DCD) is a deferred follow-up — see limitations.
 
 10.5 kbps OQPSK framing (`oqpsk.rs::HrFramer`): **64-bit dual-rail UW**
 (the same 32-bit UW carried on each rail, bits interleaved; per-rail
@@ -159,17 +185,63 @@ JAERO `AEROTypeP`, field layouts = JAERO `aerol.cpp` handlers):
 - **AES system-table broadcasts** (AERO-1.3): `0x0C`
   satellite_identification (seqno, satid split across byte3/byte4,
   orbital longitude = byte6 × 1.5° with >180 ⇒ west, Psmc1/Psmc2 carriers
-  from byte7/8 and byte9/10 — Psmc2 reported only when non-zero); `0x05`
+  from byte7/8 and byte9/10 — Psmc2 reported only when non-zero, Psmc1
+  spot-beam flag = high bit of byte6); `0x05`
   GES Psmc/Rsmc channels (seqno/lsu from byte3, GES from byte4, three
   16-bit channels; Rsmc transmit carriers offset +101.5 MHz — naming by
   `lsu`: Psmc(RX)+Rsmc0,1 for lsu≤1, Rsmc2..4 / Rsmc5..7 for lsu 2/3);
   `0x07` GES_beam_support and `0x0A` broadcast_index (named by JAERO with
   no further field decode, surfaced as named events). byteN = our su[N-1]
-  (JAERO 1-based octet indexing).
+  (JAERO 1-based octet indexing). These three drive the AERO-2 resolver
+  (below).
 
 User-data ISU/SSU (`0x71`/`0xC0|seq`) and fill (`0x01`) are not
 classified (handled by the reassembler); other types are framed but not
 yet interpreted.
+
+## Satellite / beam resolution (`satellite::SatelliteResolver`, AERO-2)
+
+The L-band analogue of the HFDL system table
+(`xng-mode-hfdl::systable`): a **self-configuring** resolver that learns
+which satellite serves the channel purely from the AES system-table
+broadcast SUs already decoded in AERO-1.3, then tags every emitted
+message with the resolved satellite + beam. There is no scan plan and no
+preset table — like HFDL re-learning its table, a later 0x0C
+re-resolves. The resolver is fed every structured SU on the **P-channel
+framer, the 10.5k OQPSK framer, and the C-band burst decoder** (T-burst
+P-style SUs can carry system-table broadcasts).
+
+| Input SU | `su_type` | What it contributes |
+|---|---|---|
+| `0x0C` satellite_identification | `satellite-id` | authoritative: `satellite_id`, `longitude_deg`, `longitude_dir`, Psmc1 spot-beam → beam |
+| `0x07` GES_beam_support | `ges-beam-support` | sets `ges_beam_support` presence flag |
+| `0x05` GES Psmc/Rsmc channels | `smc-channels` | latches `resolved_ges_id` (context only) |
+
+- **Satellite identity** comes verbatim from the 0x0C broadcast. JAERO
+  (`AES_system_table_broadcast_satellite_identification_COMPLETE`)
+  decodes `satid` and the orbital longitude (`byte6 × 1.5°`, `>180 ⇒ W`)
+  and only *displays* them — it has **no satellite-name table** — so the
+  resolved identity is the numeric `satellite_id` plus its measured
+  `longitude_deg`/`longitude_dir`. No name is invented.
+- **Beam** (global vs spot) is read from the Psmc1 spot-beam flag the
+  0x0C handler surfaces (`psmc1_spotbeam`, high bit of the carrier's high
+  octet). Reported as `beam`: `"spot"` / `"global"` / `"unknown"`.
+- **Ocean region** is a *nominal best-effort* hint only (JAERO names no
+  regions): `OceanRegion::classify` picks the nearest classic Inmarsat
+  slot by orbital longitude within a ±35° tolerance — AOR-W ≈ 54°W,
+  AOR-E ≈ 15.5°W, IOR ≈ 64°E, POR ≈ 178°E (Inmarsat-3 F5 documented at
+  54°W, F3 at 178°E; AOR-E/IOR are the classic centres). A satellite far
+  from every slot is left **unclassified rather than guessed**; longitude
+  wraps at ±180°. The measured longitude is ground truth; the region is
+  secondary.
+- **Output**: `details()` emits `resolved_satellite` (`satellite_id`,
+  `longitude_deg`, `longitude_dir`, optional `region`) plus `beam`, and
+  optional `ges_beam_support` / `resolved_ges_id`. `annotate` /
+  `enrich_details` merge these into the message `details` **without
+  overwriting existing keys**. An event with no structured SU but a
+  resolved satellite or parsed header still emits, on an `aero-frame`
+  body, so the AERO-2 tag and AERO-4 header reach `details` even for
+  otherwise-bare frames.
 
 **C-channel** (`cchannel.rs`, decoded 2714 info bits = 25 sub-blocks of
 1 + 96 + 12 bits):
@@ -206,6 +278,23 @@ yet interpreted.
   and FEC roundtrips. The OQPSK demod's `locks_and_demodulates_with_cfo`
   asserts BER < 0.001 at CFO 0/±120/−250 Hz.
 
+**AERO-4 frame header** (`frame.rs` tests): `frame_header_splits_jaero_nibbles`
+checks the four-nibble split against JAERO's `frameinfo` shifts
+(`0x1234` → 1/2/3/4, `0xFFFF` → all-ones, MSB-first soft-bit parse of
+`0xABCD`); `frame_header_roundtrips_through_encoder` recovers the
+encoder's header (format id 1, superframe 0, both counters = the running
+frame counter) by re-parsing bits 32..48 of the framed output.
+
+**AERO-2 resolver** (`satellite.rs` tests, oracle = JAERO 0x0C field
+layout): `ocean_region_classifies_classic_slots` pins the four slot
+centres, near-slot tolerance, ±180° wrap, and the "far from every slot →
+unclassified" rule; `resolver_learns_satellite_from_0x0c_broadcast`
+feeds the same JAERO-layout 0x0C SU the AERO-1.3 oracle test pins
+(satid 20, longitude index 200 → 60.0°W → AOR-W, global beam) and checks
+`details()` plus the non-clobbering `annotate`;
+`resolver_reconfigures_and_tracks_beam_support` checks self-reconfigure
+on a second 0x0C and the 0x07 beam-support flag.
+
 xng's Aero is **oracle-validated field-exact** with no count-style
 benchmark vs JAERO yet (captures too large to vendor; cf.
 [BENCHMARKS.md](BENCHMARKS.md), where Aero/STD-C/Iridium are fenced by
@@ -213,15 +302,24 @@ exact-result fixtures rather than CI count gates).
 
 ## Known limitations / intentional gaps
 
+- **Superframe-lock / AFC-DCD state machine deferred (AERO-4).** The
+  16-bit header (`format_id` / `superframe` / `frame_counter1/2`) is now
+  parsed and exposed, but the state machine that *consumes* it — JAERO's
+  `FreqOffsetEstimateSlot`, which locks the superframe and drives the
+  channel AFC/DCD — is a documented follow-up. xng channels are DDC-tuned
+  and rely on the unlocked-only coarse CFO for reacquisition.
+- **No satellite-name table (AERO-2).** JAERO has no satid→name map and
+  Inmarsat publishes no public stable satid→spacecraft registry, so the
+  resolved identity stays numeric (`satellite_id`) + measured longitude.
+  The ocean region is a nominal longitude hint only (±35° to a classic
+  slot); a precise satid→spacecraft mapping would need an external
+  registry we cannot ground.
 - **600/1200 demod is a discriminator, not coherent** — ~2 dB below
   JAERO's coherent MSK demod. Intentional v1 simplification; coherent
   upgrade planned (`PROVENANCE.md`).
 - **No off-air OQPSK fixture in CI**. The 10.5k and C-channel chains are
   exercised by RF loopback (and the 10.5k full chain has run against
   JAERO's `10.5k_sample.ogg`), but no OQPSK capture is vendored.
-- **No channel AFC / DCD state machine** (JAERO's
-  `FreqOffsetEstimateSlot`); channels are DDC-tuned and the unlocked-only
-  coarse CFO covers reacquisition.
 - **C-channel scrambler alignment unconfirmed off-air**. JAERO delays
   decoded bits by 2714−6 before the descrambler (`dl2`) for off-air
   alignment; loopback is self-consistent without it — flagged for when an
@@ -232,15 +330,19 @@ exact-result fixtures rather than CI count gates).
   verification.
 - **Partially-decoded SU types**: T_channel_assignment (`0x51`),
   GES_beam_support (`0x07`), broadcast_index (`0x0A`) are named with
-  addressing/raw bytes only — JAERO itself decodes no further fields.
+  addressing/raw bytes only — JAERO itself decodes no further fields
+  (0x07 still contributes its presence flag to the AERO-2 resolver).
 
 ## References
 
 - **JAERO** (Jonathan Olds, MIT) — structural port + off-air oracle:
-  `aerol.cpp/.h`, `mskdemodulator.cpp`, `oqpskdemodulator.cpp`,
-  `coarsefreqestimate.cpp`, `burstmskdemodulator.cpp`,
-  `jconvolutionalcodec.cpp`. See `crates/xng-mode-aero/PROVENANCE.md`.
-- Inmarsat Classic Aero system (P/R/T/C channel model).
+  `aerol.cpp/.h` (incl. `AeroL::Decode` `frameinfo` and
+  `AES_system_table_broadcast_satellite_identification_COMPLETE`),
+  `mskdemodulator.cpp`, `oqpskdemodulator.cpp`, `coarsefreqestimate.cpp`,
+  `burstmskdemodulator.cpp`, `jconvolutionalcodec.cpp`. See
+  `crates/xng-mode-aero/PROVENANCE.md`.
+- Inmarsat Classic Aero system (P/R/T/C channel model); Inmarsat-3
+  operational orbital slots (region-centre hints, `docs/REFERENCES.md`).
 - ARINC 618 ACARS (carriage), handled by `xng-acars`.
 - Shared DSP: `xng_dsp::{Ddc, Fir, scramble::Lfsr15, viterbi::Viterbi,
   checksum::HDLC_FCS}`.

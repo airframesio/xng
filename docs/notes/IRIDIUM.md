@@ -369,6 +369,32 @@ does) adds frames offline but **floods the per-channel decode queues on the
 live station** and grows `chan_dropped`; the default (2,
 `XNG_IRIDIUM_MIN_BURST_SPAN`) keeps the soak drop-free at 10 MS/s.
 
+### Soft-decision weak-frame recovery (IRID-5, opt-in `XNG_IRIDIUM_MAX_EFFORT`)
+
+A beyond-gr lever for the weak-burst tail, **off by default**. When enabled, the
+demod attaches per-bit reliabilities (each DQPSK symbol's amplitude × decision-
+boundary margin) parallel to the hard bits, and the decoder runs (1) a UW
+access-code error-correction pre-classify that snaps a near-threshold
+differential access code to its exact DL/UL word, and (2) **Chase-2 soft-decision
+BCH** (`bch_repair_soft`: flip the `p` least-reliable bits over `2^p` test
+patterns, hard-decode each via the existing `bch_repair`, keep the minimum
+reliability-weighted distance) on the RA/IBC/MS blocks. With `soft = None` the
+path is **bit-identical** to the default decode (`decode_bits_soft(bits, None) ==
+decode_bits(bits)`, pinned by `chase_p0_equals_hard`), so enabling the flag can
+only add frames, never drop them.
+
+Substantiation is an AWGN Monte-Carlo over the shipped decoders: per-block
+decode success rises **77.2 % → 95.8 % (+18.6 pts)** at σ=0.62. On the 300 s
+benchmark capture above, however, max-effort yields **no net new CRC-OK IDA
+frames** (1577 either way) — that capture is *acquisition*-limited, not
+BCH-limited (xng's CRC pass-rate already matches gr's), so there are no
+BCH-recoverable frames left to win. The lever pays off only where the SNR floor
+produces genuine BCH bit-errors on otherwise-acquired frames. A
+no-regression benchmark gate confirmed default and max-effort both hold at 1577.
+Reuses the crate's existing `bch_repair`, deinterleavers, and demod machinery;
+no new dependencies. (Verified against iridium-toolkit's published BCH generator
+polynomials, not a self-encode loopback.)
+
 ## Beam-pattern reconstruction (`src/beam.rs`, app layer)
 
 IRA ring-alert frames carry two position kinds at different altitudes: the
