@@ -13,24 +13,41 @@
 //! Pipeline:
 //!
 //! ```text
-//! packet bytes → [Frame::parse] (length, CRC-24, XXTEA descramble)
-//!              → [IConspicuity::decode] (bit/field decode)
-//!              → serde_json::Value
+//! capture IQ → [Ddc] (NCO mix + decimate to CHANNEL_RATE)
+//!            → [demod::FskDemod] (2-FSK discriminator, chip timing,
+//!               Manchester de-whiten, 8-byte sync, payload invert)
+//!            → wire bytes → [Frame::parse] (length, CRC-24, XXTEA descramble)
+//!            → [IConspicuity::decode] (bit/field decode)
+//!            → serde_json::Value / [xng_types::Message]
 //! ```
 //!
-//! The 868 MHz IQ → bits demodulator (2-FSK, Manchester whitening, IEEE
-//! sync word) is a documented TODO; this crate ships the verified decode
-//! layer. See PROVENANCE.md for the clean-room sourcing of every protocol
-//! fact (the EASA spec field layout + the OGN/SoftRF reference encoder).
+//! See PROVENANCE.md for the clean-room sourcing of every protocol fact (the
+//! EASA spec field layout + the OGN/SoftRF reference encoder/framing). The
+//! IQ → bits front-end ([`demod`]) is validated by a self-generated
+//! modulate→demod loopback ([`modulate`]); the decode core remains anchored
+//! by the independent `decode_vectors` oracle.
 //!
 //! Note: in the xng mode roadmap this is the item tracked as "ADS-K",
 //! interpreted as ADS-L (EASA SRD860 i-Conspicuity).
 
 pub mod crc;
+pub mod demod;
+pub mod modulate;
 pub mod vr;
 pub mod xxtea;
 
+use chrono::Utc;
+use num_complex::Complex;
 use serde::{Deserialize, Serialize};
+use xng_dsp::Ddc;
+use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality};
+
+/// Internal demod sample rate: 5 samples per chip at the 200 kchip/s
+/// Manchester chip rate (100 kbit/s 2-FSK doubled by the line code).
+pub const CHANNEL_RATE: f64 = 1_000_000.0;
+/// One-sided DDC passband. ADS-L uses ±50 kHz deviation in a ~125 kHz RX
+/// channel; 150 kHz preserves the FSK sidebands and Manchester spectrum.
+pub const CHANNEL_PASSBAND_HZ: f64 = 150_000.0;
 
 /// Bytes of the scrambled/payload section (5 × 32-bit words).
 pub const PAYLOAD_BYTES: usize = 20;
@@ -413,6 +430,118 @@ impl IConspicuity {
     #[inline]
     fn raw24(b: &[u8]) -> u32 {
         (b[0] as u32) | ((b[1] as u32) << 8) | ((b[2] as u32) << 16)
+    }
+}
+
+/// A demodulated ADS-L frame: the on-wire bytes (post-sync: Version +
+/// scrambled payload + CRC, exactly as [`Frame::parse`] consumed them) plus
+/// the decoded iConspicuity payload. `process` returns these so the message
+/// layer can keep `raw` faithful to the air interface.
+#[derive(Debug, Clone)]
+pub struct AdslFrame {
+    /// Wire bytes handed to [`Frame::parse`] (Version + 20 payload + 3 CRC).
+    pub wire_bytes: Vec<u8>,
+    /// Decoded iConspicuity fields.
+    pub iconspicuity: IConspicuity,
+}
+
+/// Decodes one ADS-L channel out of a wideband 868 MHz capture.
+///
+/// Mirrors the channelized template (`xng-mode-ais`): owns an internal
+/// [`Ddc`] that mixes by `freq_offset_hz` and decimates capture-rate IQ down
+/// to [`CHANNEL_RATE`], then runs the 2-FSK / Manchester / sync front-end
+/// ([`demod::FskDemod`]) and the existing [`Frame::parse`] decode core.
+pub struct AdslChannelDecoder {
+    ddc: Option<Ddc>,
+    demod: demod::FskDemod,
+    channel_buf: Vec<Complex<f32>>,
+}
+
+impl AdslChannelDecoder {
+    /// `input_rate` is any capture rate ≥ [`CHANNEL_RATE`]; a non-integer
+    /// multiple is resampled by the DDC. `freq_offset_hz` is the channel
+    /// center relative to the capture center.
+    pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let ddc = if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+            None
+        } else {
+            Some(Ddc::new(
+                input_rate,
+                CHANNEL_RATE,
+                freq_offset_hz,
+                CHANNEL_PASSBAND_HZ,
+            )?)
+        };
+        Ok(Self {
+            ddc,
+            demod: demod::FskDemod::new(),
+            channel_buf: Vec::new(),
+        })
+    }
+
+    /// Feed capture IQ; returns every ADS-L frame whose CRC-24 verifies (and
+    /// that carries an iConspicuity payload), already field-decoded.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<AdslFrame> {
+        let channel: &[Complex<f32>] = match &mut self.ddc {
+            Some(ddc) => {
+                self.channel_buf.clear();
+                ddc.process(input, &mut self.channel_buf);
+                &self.channel_buf
+            }
+            None => input,
+        };
+        let mut out = Vec::new();
+        for wire in self.demod.process(channel) {
+            if let Ok(frame) = Frame::parse(&wire) {
+                if let Some(m) = frame.iconspicuity() {
+                    out.push(AdslFrame {
+                        wire_bytes: wire,
+                        iconspicuity: m,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Smoothed channel power level in dBFS.
+    pub fn level_dbfs(&self) -> f32 {
+        self.demod.level_dbfs()
+    }
+}
+
+/// Message-type tag for an iConspicuity broadcast (the only payload type this
+/// crate decodes today).
+pub const KIND_ICONSPICUITY: &str = "iconspicuity";
+
+/// Convert a demodulated ADS-L frame into the normalized message model.
+/// `frequency_hz` is the absolute channel frequency, `level_dbfs` the channel
+/// power, `source` the provenance.
+pub fn to_message(
+    f: &AdslFrame,
+    frequency_hz: u64,
+    level_dbfs: f32,
+    source: Provenance,
+) -> Message {
+    Message {
+        mode: Mode::AdsL,
+        timestamp: Utc::now(),
+        frequency_hz,
+        signal: SignalQuality {
+            rssi_db: Some(level_dbfs),
+            ..Default::default()
+        },
+        decode: DecodeQuality {
+            crc_ok: true,
+            fec_corrected: None,
+            errors: None,
+        },
+        body: MessageBody::AdsL {
+            kind: KIND_ICONSPICUITY.to_string(),
+            details: f.iconspicuity.to_json(),
+        },
+        raw: Some(f.wire_bytes.clone()),
+        source,
     }
 }
 

@@ -92,17 +92,49 @@ examples and to the CRC's defining residue-is-zero property respectively;
 the `xxtea.rs` round-trip test exercises the scrambler whose external anchor
 is the end-to-end decode of the independently-generated vector above.
 
-## Scope / TODO
+## IQ front-end (demod) — self-generated loopback validation
 
-This crate ships the verified **message/frame decoder** (bytes → fields →
-JSON). Two stretch goals are intentionally left as documented TODOs because
-they cannot be externally verified within scope without real reference IQ:
+The crate now also ships the **IQ → bits demodulator** (`src/demod.rs`) and
+the channelized `AdslChannelDecoder` (`src/lib.rs`), plus a matching
+modulator (`src/modulate.rs`). The physical-layer parameters are the SoftRF
+`adsl_proto_desc` facts recorded above:
 
-- **IQ → bits demodulator** (868 MHz 2-FSK at 100 kbps, IEEE-Manchester
-  de-whitening, 8-byte sync-word correlation, payload bit inversion). The
-  framing parameters are recorded above from `ADSL.cpp` for a future
-  implementation.
-- **Spec-faithful modulator/encoder**. An encoder tested against its own
-  decoder would be a loopback, which the verification policy forbids; it is
-  therefore deferred until an external bit/IQ vector is available to anchor
-  it.
+- **2-FSK, 100 kbit/s** (`RF_BITRATE_100KBPS`), **±50 kHz** deviation
+  (`RF_FREQUENCY_DEVIATION_50KHZ`), 125 kHz RX bandwidth.
+- **IEEE-Manchester whitening** (`RF_WHITENING_MANCHESTER`): data `0` → chips
+  `1,0`; data `1` → chips `0,1` (the `ManchesterEncode` table — nibble
+  `0000`→`10101010`, `1111`→`01010101`).
+- **8-byte sync word** `55 99 95 A6 9A 65 A9 6A`, which is itself the
+  Manchester chip pattern for the 4 data bytes `F5 72 4B 18` (verified by the
+  `sync_chip_pattern_decodes_to_f5724b18` unit test).
+- **Payload inverted** (`RF_PAYLOAD_INVERTED`): the whole Version + payload +
+  CRC chip stream is FSK-inverted on air.
+
+The demod is a frequency discriminator + carrier-DC tracker + chip-rate
+integrate-and-dump with zero-crossing timing recovery, then sync correlation
+(both polarities, to absorb carrier-sign ambiguity), Manchester chip-pair
+decode, and MSB-first byte packing into the `Frame::parse` input.
+
+**Verification policy.** There is no public ADS-L reference IQ capture, so the
+front-end is validated by a **self-generated** modulate→demod loopback
+(`tests/demod_synth_iq.rs`, tests suffixed `*_synth_iq`). Critically, the
+bytes that are modulated are the **same independently-generated frame** the
+`decode_vectors` oracle pins (`gen_vector.py` output), so the *decode core*
+(`Frame::parse` / XXTEA / CRC / `IConspicuity`) stays externally anchored;
+only the IQ modulate↔demod transform is self-consistent. The loopback covers
+the DDC-bypass baseband path, the DDC mix+decimate channelized path (2 MS/s,
++250 kHz offset), inverted carrier polarity, and the full `to_message`
+envelope. This is the user-approved synthetic validation for a mode with no
+oracle IQ.
+
+## Scope / TODO (remaining)
+
+- **Real-capture tuning.** The timing recovery, sync error tolerance, and DDC
+  passband were validated on clean synthetic IQ. Real 868 MHz captures
+  (noise, multipath, frequency drift, partial bursts) will likely want a
+  matched-filter chip detector, soft-decision Manchester, and a preamble AGC
+  warm-up tuned against recorded signals — recorded but not yet anchored to a
+  capture.
+- **Spec-faithful modulator/encoder.** `src/modulate.rs` is a validation aid
+  for the demod, not a spec transmitter; a TX-grade encoder remains future
+  work and would need an external bit/IQ vector to anchor independently.
