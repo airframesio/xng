@@ -526,7 +526,7 @@ function selectEntity(key, lat, lon) {
   const e = markers.get(key);
   if (e) e.marker.openPopup();
   render();
-  const row = document.querySelector(`#entities tr[data-k="${key}"]`);
+  const row = document.querySelector(`#entities tr[data-k="${CSS.escape(key)}"]`);
   if (row) row.scrollIntoView({ block: 'nearest' });
 }
 window.selectEntity = selectEntity;
@@ -539,10 +539,25 @@ window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add
 // Aircraft expand: clicking a multi-source aircraft opens per-source rows.
 // Keyed by the stable master id so the open state survives poll re-renders.
 const acExpanded = new Set();
-window.acClick = (id, lat, lon, key, expandable) => {
-  if (expandable) { acExpanded.has(id) ? acExpanded.delete(id) : acExpanded.add(id); }
-  selectEntity(key, lat, lon);
-};
+// ONE delegated click handler for the entities table. Rows carry their identity
+// in escaped data-* attributes (read back via dataset, never re-parsed as
+// HTML/JS), so attacker-controlled fields (ACARS tail/flight, AIS name) can't
+// break out of an inline handler — XSS-safe. Attached once; survives the
+// innerHTML re-render because it lives on the persistent container element.
+document.getElementById('entities').addEventListener('click', e => {
+  const tr = e.target.closest('tr');
+  if (!tr || !tr.dataset) return;
+  if (tr.dataset.act === 'term') { window.toggleTerminals(); return; }
+  const k = tr.dataset.k;
+  if (!k) return;
+  if (tr.dataset.exp === '1') {
+    const id = tr.dataset.id || '';
+    acExpanded.has(id) ? acExpanded.delete(id) : acExpanded.add(id);
+  }
+  const lat = tr.dataset.lat ? parseFloat(tr.dataset.lat) : null;
+  const lon = tr.dataset.lon ? parseFloat(tr.dataset.lon) : null;
+  selectEntity(k, lat, lon);
+});
 document.getElementById('pause').onclick = function () {
   paused = !paused;
   this.classList.toggle('on', paused);
@@ -804,9 +819,8 @@ function render() {
     const expandable = srcs.length > 1;
     const open = acExpanded.has(id);
     const caret = expandable ? (open ? '▾ ' : '▸ ') : '';
-    const idJs = String(id).replace(/'/g, '');
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-      `onclick="acClick('${idJs}',${a.lat ?? 'null'},${a.lon ?? 'null'},'${k}',${expandable})">` +
+    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}" ` +
+      `data-id="${escapeHtml(id)}" data-lat="${a.lat ?? ''}" data-lon="${a.lon ?? ''}" data-exp="${expandable ? 1 : 0}">` +
       `<td style="color:${altColor(a.alt)}">${caret}✈ ${escapeHtml(a.flight || a.reg || a.icao || id)}</td>` +
       `<td>${escapeHtml(a.flight || '')}</td><td>${escapeHtml(a.icao || '')}</td>` +
       `<td>${escapeHtml(a.reg || '')}</td><td>${escapeHtml(a.actype || '')}</td>` +
@@ -825,8 +839,8 @@ function render() {
   }
   for (const v of [...s.vessels].sort((x, y) => (y.mmsi||0) - (x.mmsi||0))) {
     const k = 'v' + v.mmsi;
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-      `onclick="selectEntity('${k}',${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
+    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}" ` +
+      `data-lat="${v.lat ?? ''}" data-lon="${v.lon ?? ''}">` +
       `<td style="color:${shipMeta(v.shiptype).color}">⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
       `<td></td><td></td>` +
       `<td>${escapeHtml(v.country || '')}</td><td>${escapeHtml(shipMeta(v.shiptype).label || '')}</td>` +
@@ -837,8 +851,8 @@ function render() {
   // transmitters on the short-burst-data channel) are entities too.
   for (const sat of [...(s.iridium_sats || [])].sort((x, y) => (x.sat||0) - (y.sat||0))) {
     const k = 's' + sat.sat;
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-      `onclick="selectEntity('${k}',${sat.lat ?? 'null'},${sat.lon ?? 'null'})">` +
+    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}" ` +
+      `data-lat="${sat.lat ?? ''}" data-lon="${sat.lon ?? ''}">` +
       `<td style="color:#bb9af7">🛰 ${escapeHtml(sat.name || ('Iridium ' + sat.sat))}</td>` +
       `<td></td><td></td><td></td><td>satellite</td>` +
       `<td>${sat.alt != null ? Math.round(sat.alt) + 'km' : ''}</td><td></td><td></td>` +
@@ -849,13 +863,12 @@ function render() {
   const terms = s.iridium_terminals || [];
   if (terms.length) {
     const showTerm = localStorage.getItem('xng.terminals') === '1';
-    rows.push(`<tr class="row" onclick="toggleTerminals()">` +
+    rows.push(`<tr class="row" data-act="term">` +
       `<td colspan="9" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
     if (showTerm) {
       for (const t of [...terms].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
         const k = 't' + t.imei;
-        rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-          `onclick="selectEntity('${k}',null,null)">` +
+        rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}">` +
           `<td style="color:#e0af68">📟 ${escapeHtml(t.imei)}</td>` +
           `<td></td><td></td><td></td><td>SBD${t.text ? ' · ' + escapeHtml(String(t.text).trim().slice(0, 20)) : ''}</td>` +
           `<td></td><td></td><td>${t.msgs ?? ''}</td>` +

@@ -99,6 +99,14 @@ struct AcIds {
     reg: Option<String>,
 }
 
+/// Strip control + HTML-significant characters from a decoded identifier.
+/// Defence in depth: these never appear in a legit ARINC/ICAO/AIS identifier,
+/// and the values become the entity id / `data-*` keys on the dashboard (which
+/// also escapes on output). Keeps junk from a corrupt-but-passing frame inert.
+fn sanitize_id(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '"' | '\'' | '&')).collect()
+}
+
 /// Upsert an aircraft entity, coalescing across sources by ICAO > reg > flight.
 /// `contrib` = the display fields this message contributes (latest-wins on the
 /// merged master, recorded verbatim on the per-source row). `source` = the
@@ -110,6 +118,12 @@ fn merge_aircraft(
     contrib: serde_json::Map<String, Value>,
     pos: Option<(f64, f64)>,
 ) {
+    // Sanitize identifiers (defence in depth) before they key the entity.
+    let ids = AcIds {
+        icao: ids.icao.map(|s| sanitize_id(&s)).filter(|s| !s.is_empty()),
+        flight: ids.flight.map(|s| sanitize_id(&s)).filter(|s| !s.is_empty()),
+        reg: ids.reg.map(|s| sanitize_id(&s)).filter(|s| !s.is_empty()),
+    };
     let mut tokens: Vec<String> = Vec::new();
     if let Some(i) = &ids.icao {
         tokens.push(format!("ic:{i}"));
