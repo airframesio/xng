@@ -17,6 +17,14 @@ use xng_mode_hfdl::HfdlChannelDecoder;
 use xng_mode_iridium::{IridiumChannelDecoder, IridiumWidebandDecoder};
 use xng_mode_stdc::StdcChannelDecoder;
 use xng_mode_vdl2::Vdl2ChannelDecoder;
+// New-mode decode cores (IQ demod + ChannelDecoder + to_message per crate).
+use xng_mode_adsl::AdslChannelDecoder;
+use xng_mode_atcs::AtcsChannelDecoder;
+use xng_mode_dsc::DscChannelDecoder;
+use xng_mode_navtex::NavtexChannelDecoder;
+use xng_mode_sarsat::SarsatChannelDecoder;
+use xng_mode_sonde::SondeChannelDecoder;
+use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
 
@@ -153,6 +161,13 @@ pub(crate) enum ModeChannel {
     Hfdl(HfdlChannelDecoder),
     Iridium(IridiumChannelDecoder),
     IridiumWide(IridiumWidebandDecoder),
+    Uat(UatChannelDecoder),
+    Sarsat(SarsatChannelDecoder),
+    Dsc(DscChannelDecoder),
+    Navtex(NavtexChannelDecoder),
+    Sonde(SondeChannelDecoder),
+    Adsl(AdslChannelDecoder),
+    Atcs(AtcsChannelDecoder),
 }
 
 impl ModeChannel {
@@ -195,6 +210,19 @@ impl ModeChannel {
                     AdsbDecoder::new(sample_rate)?
                 }))
             }
+            // UAT 978 MHz is wideband like ADS-B: it consumes the whole capture.
+            Mode::Uat => {
+                if offset.abs() > 1e-6 {
+                    return Err("UAT uses the whole capture: tune -c to 978.000M and pass --channels 978".into());
+                }
+                Ok(Self::Uat(UatChannelDecoder::new(sample_rate)?))
+            }
+            Mode::Sarsat => Ok(Self::Sarsat(SarsatChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Dsc => Ok(Self::Dsc(DscChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Navtex => Ok(Self::Navtex(NavtexChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Sonde => Ok(Self::Sonde(SondeChannelDecoder::new(sample_rate, offset)?)),
+            Mode::AdsL => Ok(Self::Adsl(AdslChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Atcs => Ok(Self::Atcs(AtcsChannelDecoder::new(sample_rate, offset)?)),
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -207,7 +235,13 @@ impl ModeChannel {
             Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
             Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
             Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
-            Mode::Adsb => 0.0, // wideband: offset must be 0, no DDC
+            Mode::Adsb | Mode::Uat => 0.0, // wideband: offset must be 0, no DDC
+            Mode::Sarsat => xng_mode_sarsat::CHANNEL_PASSBAND_HZ,
+            Mode::Dsc => xng_mode_dsc::CHANNEL_PASSBAND_HZ,
+            Mode::Navtex => xng_mode_navtex::CHANNEL_PASSBAND_HZ,
+            Mode::Sonde => xng_mode_sonde::CHANNEL_PASSBAND_HZ,
+            Mode::AdsL => xng_mode_adsl::CHANNEL_PASSBAND_HZ,
+            Mode::Atcs => xng_mode_atcs::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -223,6 +257,13 @@ impl ModeChannel {
             Self::Iridium(_) => xng_mode_iridium::CHANNEL_RATE,
             Self::IridiumWide(_) => xng_mode_iridium::CHANNEL_RATE,
             Self::Adsb(_) => 2_000_000.0,
+            Self::Uat(_) => xng_mode_uat::CHANNEL_RATE,
+            Self::Sarsat(_) => xng_mode_sarsat::CHANNEL_RATE,
+            Self::Dsc(_) => xng_mode_dsc::CHANNEL_RATE,
+            Self::Navtex(_) => xng_mode_navtex::CHANNEL_RATE,
+            Self::Sonde(_) => xng_mode_sonde::CHANNEL_RATE,
+            Self::Adsl(_) => xng_mode_adsl::CHANNEL_RATE,
+            Self::Atcs(_) => xng_mode_atcs::CHANNEL_RATE,
         }
     }
 
@@ -238,6 +279,13 @@ impl ModeChannel {
             Self::Hfdl(d) => d.level_dbfs(),
             Self::Iridium(d) => d.level_dbfs(),
             Self::IridiumWide(d) => d.level_dbfs(),
+            Self::Uat(d) => d.level_dbfs(),
+            Self::Sarsat(d) => d.level_dbfs(),
+            Self::Dsc(d) => d.level_dbfs(),
+            Self::Navtex(d) => d.level_dbfs(),
+            Self::Sonde(d) => d.level_dbfs(),
+            Self::Adsl(d) => d.level_dbfs(),
+            Self::Atcs(d) => d.level_dbfs(),
         }
     }
 
@@ -365,6 +413,77 @@ impl ModeChannel {
                     .map(|f| xng_mode_adsb::to_message(f, freq, prov.clone()))
                     .collect();
                 // The validator only surfaces parity-valid frames.
+                (msgs, seen, seen)
+            }
+            // UAT is wideband (whole-capture), like ADS-B: frame carries its own
+            // level, RS-FEC gates so every surfaced frame is valid.
+            Self::Uat(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_uat::to_message(f, freq, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Sarsat(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_sarsat::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Dsc(dec) => {
+                let msgs_dec = dec.process(iq);
+                let seen = msgs_dec.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = msgs_dec
+                    .iter()
+                    .map(|f| xng_mode_dsc::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Navtex(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_navtex::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Sonde(dec) => {
+                let decoded = dec.process(iq);
+                let seen = decoded.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = decoded
+                    .iter()
+                    .map(|d| xng_mode_sonde::to_message(d, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Adsl(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_adsl::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Atcs(dec) => {
+                let decoded = dec.process(iq);
+                let seen = decoded.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = decoded
+                    .iter()
+                    .map(|d| xng_mode_atcs::to_message(d, freq, level, prov.clone()))
+                    .collect();
                 (msgs, seen, seen)
             }
         }

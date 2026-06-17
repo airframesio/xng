@@ -123,11 +123,21 @@ pub fn mode_suffix(mode: Mode) -> Option<&'static str> {
         Mode::Iridium => Some("IRDM"),
         Mode::StdC => Some("STDC"),
         Mode::Adsb => Some("ADSB"),
+        Mode::Uat => Some("UAT"),
+        Mode::Sarsat => Some("SARSAT"),
+        Mode::Dsc => Some("DSC"),
+        Mode::Navtex => Some("NAVTEX"),
+        Mode::Sonde => Some("SONDE"),
+        Mode::AdsL => Some("ADSL"),
+        Mode::Atcs => Some("ATCS"),
         Mode::Extern => None,
     }
 }
 
-const KNOWN_SUFFIXES: &[&str] = &["ACARS", "VDL2", "HFDL", "AIS", "IMSL", "IRDM", "STDC", "ADSB"];
+const KNOWN_SUFFIXES: &[&str] = &[
+    "ACARS", "VDL2", "HFDL", "AIS", "IMSL", "IRDM", "STDC", "ADSB", "UAT", "SARSAT", "DSC",
+    "NAVTEX", "SONDE", "ADSL", "ATCS",
+];
 
 /// Derive a per-mode station id from a base by stripping a trailing known
 /// mode suffix (if any) and appending this mode's suffix:

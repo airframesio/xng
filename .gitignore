@@ -6,3 +6,6 @@ bench/data/vdl2_105k_conj.s16
 bench/data/hfdl_48k.cs16
 bench/data/adsb_quiet_24m.cu8
 .gstack/
+
+# Claude Code session worktrees/artifacts
+.claude/

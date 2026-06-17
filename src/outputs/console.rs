@@ -457,6 +457,104 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                // --- new decode cores (kind + details JSON) -------------------
+                MessageBody::Uat { kind, details } => {
+                    let mut s = format!("UAT {}", kind.to_uppercase());
+                    for key in ["address", "icao", "callsign", "emitter_category", "ground_speed", "true_track", "altitude", "geometric_altitude", "nic", "product_count"] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {key}={v}"));
+                        }
+                    }
+                    if let (Some(lat), Some(lon)) =
+                        (details.get("lat").and_then(|v| v.as_f64()), details.get("lon").and_then(|v| v.as_f64()))
+                    {
+                        s.push_str(&format!(" pos={lat:.4},{lon:.4}"));
+                    }
+                    s
+                }
+                MessageBody::Sarsat { kind, details } => {
+                    let mut s = format!("SARSAT {kind}");
+                    for (key, label) in [("country", "country"), ("hex_id", "id"), ("beacon_id", "id"), ("serial", "sn"), ("aircraft_address", "icao"), ("call_sign", "cs")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={}", v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())));
+                        }
+                    }
+                    if let (Some(lat), Some(lon)) =
+                        (details.get("latitude").and_then(|v| v.as_f64()), details.get("longitude").and_then(|v| v.as_f64()))
+                    {
+                        s.push_str(&format!(" pos={lat:.4},{lon:.4}"));
+                    }
+                    s
+                }
+                MessageBody::Dsc { kind, details } => {
+                    let mut s = format!("DSC {}", kind.to_uppercase());
+                    for (key, label) in [("category", "cat"), ("from", "from"), ("to", "to"), ("nature", "nature"), ("telecommand1", "tc"), ("frequency", "freq")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={}", v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())));
+                        }
+                    }
+                    if let (Some(lat), Some(lon)) =
+                        (details.get("lat").and_then(|v| v.as_f64()), details.get("lon").and_then(|v| v.as_f64()))
+                    {
+                        s.push_str(&format!(" pos={lat:.4},{lon:.4}"));
+                    }
+                    s
+                }
+                MessageBody::Navtex { kind, details } => {
+                    let mut s = format!("NAVTEX [{kind}]");
+                    for (key, label) in [("station", "stn"), ("subject_category", "subj"), ("message_number", "#")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={}", v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())));
+                        }
+                    }
+                    if let Some(t) = details.get("text").and_then(|v| v.as_str()) {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            s.push_str(&format!(" | {}", t.replace('\n', "·")));
+                        }
+                    }
+                    s
+                }
+                MessageBody::Sonde { kind, details } => {
+                    let mut s = format!("SONDE {}", kind.to_uppercase());
+                    for (key, label) in [("serial", "id"), ("frame_num", "frame"), ("battery_v", "batt"), ("num_sv", "sv")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={v}"));
+                        }
+                    }
+                    if let (Some(lat), Some(lon)) =
+                        (details.get("lat").and_then(|v| v.as_f64()), details.get("lon").and_then(|v| v.as_f64()))
+                    {
+                        s.push_str(&format!(" pos={lat:.4},{lon:.4}"));
+                        if let Some(alt) = details.get("alt_m").and_then(|v| v.as_f64()) {
+                            s.push_str(&format!(" {alt:.0}m"));
+                        }
+                    }
+                    s
+                }
+                MessageBody::AdsL { kind, details } => {
+                    let mut s = format!("ADS-L {kind}");
+                    for (key, label) in [("address", "addr"), ("aircraft_type", "type"), ("ground_speed", "gs"), ("track", "trk"), ("altitude", "alt")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={v}"));
+                        }
+                    }
+                    if let (Some(lat), Some(lon)) =
+                        (details.get("lat").and_then(|v| v.as_f64()), details.get("lon").and_then(|v| v.as_f64()))
+                    {
+                        s.push_str(&format!(" pos={lat:.4},{lon:.4}"));
+                    }
+                    s
+                }
+                MessageBody::Atcs { kind, details } => {
+                    let mut s = format!("ATCS {kind}");
+                    for (key, label) in [("source", "src"), ("destination", "dst"), ("priority", "pri"), ("service_signal", "svc"), ("control", "ctl")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={}", v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())));
+                        }
+                    }
+                    s
+                }
                 MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
             };
             format!(

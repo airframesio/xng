@@ -40,6 +40,13 @@ xng-mode-aero = { path = "crates/xng-mode-aero" }
 xng-mode-stdc = { path = "crates/xng-mode-stdc" }
 xng-mode-hfdl = { path = "crates/xng-mode-hfdl" }
 xng-mode-iridium = { path = "crates/xng-mode-iridium" }
+xng-mode-uat = { path = "crates/xng-mode-uat" }
+xng-mode-sarsat = { path = "crates/xng-mode-sarsat" }
+xng-mode-dsc = { path = "crates/xng-mode-dsc" }
+xng-mode-navtex = { path = "crates/xng-mode-navtex" }
+xng-mode-sonde = { path = "crates/xng-mode-sonde" }
+xng-mode-adsl = { path = "crates/xng-mode-adsl" }
+xng-mode-atcs = { path = "crates/xng-mode-atcs" }
 prost = "0.13"
 tonic = "0.12"
 quinn = "0.11"
@@ -101,6 +108,13 @@ xng-mode-aero.workspace = true
 xng-mode-stdc.workspace = true
 xng-mode-hfdl.workspace = true
 xng-mode-iridium.workspace = true
+xng-mode-uat.workspace = true
+xng-mode-sarsat.workspace = true
+xng-mode-dsc.workspace = true
+xng-mode-navtex.workspace = true
+xng-mode-sonde.workspace = true
+xng-mode-adsl.workspace = true
+xng-mode-atcs.workspace = true
 prost.workspace = true
 tonic.workspace = true
 quinn.workspace = true
