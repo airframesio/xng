@@ -157,9 +157,22 @@ pub fn to_message(
             nmea,
             msg_type: Some(f.msg_type),
             mmsi: Some(f.mmsi),
-            details: fields::decode(f.msg_type, &f.message_bits),
+            details: ais_details(f),
         },
         raw: Some(f.wire_bytes.clone()),
         source,
     }
+}
+
+/// Field decode plus a `distress` tag for SART/MOB/EPIRB-AIS devices
+/// (classified by MMSI prefix — see [`fields::distress_class`]).
+fn ais_details(f: &frame::AisFrame) -> Option<serde_json::Value> {
+    let mut details = fields::decode(f.msg_type, &f.message_bits);
+    if let Some(device) = fields::distress_class(f.mmsi) {
+        let d = details.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = d.as_object_mut() {
+            obj.insert("distress".into(), serde_json::json!(device));
+        }
+    }
+    details
 }

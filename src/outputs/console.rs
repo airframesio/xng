@@ -87,6 +87,7 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                             ("text", "txt"),
                             ("destination", "dest"),
                             ("nav_status", "status"),
+                            ("distress", "DISTRESS"),
                         ] {
                             if let Some(v) = d.get(key).and_then(|v| v.as_str()) {
                                 s.push_str(&format!(" {label}={v}"));

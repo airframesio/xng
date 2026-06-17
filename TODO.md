@@ -186,7 +186,7 @@
   - [ ] **AIS-1.3** Regional DACs (235/250/366 AtoN-monitoring, 316/366 Seaway-meteo, 367 US-environmental, 265 STM-route); validate vs pyais oracle
 - [ ] **AIS-2** Multi-fragment AIVDM reassembly across sentences (long type 5/6/8/26); type-24 Part A+B merge by MMSI; type-5 voyage merge; per-MMSI `AISTracker` state
 - [ ] **AIS-3** Easy sub-field fills ★ quick win — type-5 eta/dte/epfd/dims/pos_accuracy; types 1-3 rot/timestamp/maneuver/raim/radio comm-state; type-21 name-extension/off_position/virtual/dims/epfd/raim; type 4/11 epfd/raim/radio; type 24B vendor_id/model/serial/dims/mothership; ROT decode helper (`4.733·√rot`)
-- [ ] **AIS-4** AIS-SART / MOB / EPIRB-AIS distress tagging ★ quick win — MMSI prefix 970=SART / 972=MOB / 974=EPIRB-AIS + nav_status 14 + Msg 14 text → distress event (ties XM-6; verify mapping → VERIFY-4)
+- [x] **AIS-4** AIS-SART / MOB / EPIRB-AIS distress tagging — `fields::distress_class` (MMSI prefix 970/972/974) tags `distress` in `details`, surfaced in console + dashboard vessel; nav_status 14 (`AIS-SART`) and Msg-14 ACTIVE/TEST text already decode. *(VERIFY-4 resolved: 970/972/974 now mapped; ties XM-6 cross-mode distress overlay)*
 - [ ] **AIS-5** Outputs — NMEA-over-UDP (+ fix README claim); AIVDO own-ship; NMEA tag-blocks; GPSd output/fusion; NMEA2000/N2K; HTTP aggregator push; per-type/MMSI filtering + rate downsample + output dedup; JSON_FULL `details`; fix `channel_letter` silent default-to-'A'
 - [ ] **AIS-6** Demod — low-CPU Pi mode (1.4× headroom is thin); verify CIC5 droop compensation (VERIFY-4)
 
@@ -242,7 +242,7 @@
 - [ ] **NEW-P0-2** COSPAS-SARSAT 406 MHz ELT/EPIRB/PLB — FGB (biphase-L, T.001) + SGB (OQPSK+DSSS, T.018); ties XM-6
 - [ ] **NEW-P0-3** DSC — Digital Selective Calling, VHF Ch70 (FFSK 1200, BCH(10,7)) + HF/MF (M.493); GMDSS distress; ties XM-6
 - [ ] **NEW-P1-1** Radiosondes (RS41/RS92/DFM/M10/M20/iMet/LMS6/iMS-100/MRZ) — GFSK 400–406 MHz; SondeHub/APRS-IS feed; fits the scanner
-- [ ] **NEW-P1-2** AIS-SART / MOB / EPIRB-AIS — implemented under **AIS-4** (cross-reference)
+- [x] **NEW-P1-2** AIS-SART / MOB / EPIRB-AIS — done under **AIS-4** (cross-reference)
 - [ ] **NEW-P1-3** EOT / HOT / DPU rail telemetry — 457/452 MHz Manchester FSK, BCH, clear (brake-pipe pressure, motion, marker) → live train-tail map
 - [ ] **NEW-P1-4** NAVTEX — 518/490/4209.5 kHz SITOR-B / CCIR 476; pairs with DSC (HF FEC shared)
 - [ ] **NEW-P2-1** ADS-L + FANET / OGNTP — EASA SRD860 868/915 MHz 2-GFSK + open LoRa-CSS; do before FLARM
@@ -263,7 +263,7 @@
 - [ ] **VERIFY-1** ⚑ Iridium time re-epoch correctness in satellite-naming/SGP4/TLE code (= IRID-8)
 - [ ] **VERIFY-2** ACARS — raw MIN / 4th-char downlink-rule edge cases; per-label ACARS Prometheus counters exist?; any media-advisory v1+ exists?
 - [ ] **VERIFY-3** VDL2 — SABME folded into `U?`?; Call-Request maintenance/init status bit; ES-IS option-TLV coverage; plain/unprotected CPDLC PDUs; StatsD `good_loud`; `pp_acars`; cross-check v2.5.1 249-octet-multiple block-length bug
-- [ ] **VERIFY-4** AIS — CIC5 droop compensation in xng-dsp; mid-frame polarity-flip recovery; MMSI 970/972/974 mapping (appears NOT today)
+- [ ] **VERIFY-4** AIS — CIC5 droop compensation in xng-dsp; mid-frame polarity-flip recovery. *(MMSI 970/972/974 mapping: RESOLVED — added in AIS-4)*
 - [ ] **VERIFY-5** HFDL — LMS equalizer tap count 7 vs documented 15
 - [ ] **VERIFY-6** STD-C — `0xB0` vs `0xB1`+`0xB2` distinction in surfaced details; mid-frame polarity flip recovery
 - [ ] **VERIFY-7** Ecosystem — dashboard station/receiver-position pin exists?; continuous autogain during `listen`?; non-Iridium trail antimeridian wrapping?; DF18 CF-subtype classification (= ADSB-5)

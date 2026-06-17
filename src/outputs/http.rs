@@ -192,6 +192,10 @@ fn update(d: &mut Dash, m: &Message) {
                     o.insert("shiptype".into(), json!(st));
                 }
             }
+            // Distress beacon (AIS-SART/MOB/EPIRB-AIS by MMSI prefix) — sticky.
+            if let Some(dist) = det.get("distress") {
+                o.insert("distress".into(), dist.clone());
+            }
             for (k, src) in
                 [("lat", "lat"), ("lon", "lon"), ("sog", "sog_kt"), ("cog", "cog_deg"), ("name", "name")]
             {

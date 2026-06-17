@@ -19,3 +19,10 @@ The end-to-end test is anchored to a widely published example AIVDM
 sentence (type 1, MMSI 477553000) reconstructed back to wire bits, so the
 bit-order/armoring conventions are verified against real-world data, not
 just self-consistency.
+
+## Distress device classification (2026-06)
+
+The `distress` tag classifies SART/MOB/EPIRB-AIS transmitters by MMSI
+prefix per the ITU-R M.1371 / MID allocation for device identities:
+970 = AIS-SART, 972 = AIS-MOB, 974 = EPIRB-AIS (standards facts only). The
+devices emit ordinary AIS messages; the prefix marks the distress class.

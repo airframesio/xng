@@ -84,6 +84,20 @@ const NAV_STATUS: [&str; 16] = [
     "undefined",
 ];
 
+/// Classify a distress/safety transmitter by its MMSI prefix (ITU-R M.1371 /
+/// the MID allocation for device MMSIs): 970 = AIS-SART (search & rescue
+/// transmitter), 972 = AIS-MOB (man-overboard), 974 = EPIRB-AIS. These
+/// devices send ordinary AIS messages; the prefix is what marks them as a
+/// distress class. `None` for a normal MMSI.
+pub fn distress_class(mmsi: u32) -> Option<&'static str> {
+    match mmsi / 1_000_000 {
+        970 => Some("AIS-SART"),
+        972 => Some("AIS-MOB"),
+        974 => Some("EPIRB-AIS"),
+        _ => None,
+    }
+}
+
 /// Decode the fields of an AIS message; `None` when the type is not
 /// (yet) field-decoded. Positions in degrees, speeds in knots.
 pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
@@ -468,5 +482,14 @@ mod tests {
         assert_eq!(d["dac"], 669);
         assert_eq!(d["fid"], 11);
         assert_eq!(d["data_hex"], "55aa");
+    }
+
+    #[test]
+    fn distress_class_by_mmsi_prefix() {
+        assert_eq!(distress_class(970_12_3456), Some("AIS-SART"));
+        assert_eq!(distress_class(972_00_0001), Some("AIS-MOB"));
+        assert_eq!(distress_class(974_99_9999), Some("EPIRB-AIS"));
+        assert_eq!(distress_class(366_123_456), None); // ordinary US ship
+        assert_eq!(distress_class(0), None);
     }
 }
