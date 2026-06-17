@@ -2,7 +2,8 @@
 
 Native VDL Mode 2 demod/decode for xng-mode-vdl2 (v0.20.0). D8PSK at
 10 500 sym/s, Annex 10 Vol III. Clean-room — see PROVENANCE.md; dumpvdl2
-is read for facts and used as an off-air oracle only.
+is read for facts (protocol constants, the integer→name dictionaries) and
+used as an off-air oracle only.
 
 Result: 44 AVLC frames on the sigidwiki off-air capture, against
 dumpvdl2 2.6.0's 41, identical at 50 / 100 / 105 kS/s. CI bench floor
@@ -11,9 +12,11 @@ dumpvdl2 2.6.0's 41, identical at 50 / 100 / 105 kS/s. CI bench floor
 
 ## Pipeline
 
-Per channel: wideband IQ → DDC (or selectivity FIR on the no-DDC path) →
-channel IQ → `demod::Vdl2Demod` (acquisition, header FEC, deinterleave +
-RS) → `avlc::scan` → ACARS-over-AVLC or ATN (X.25 / CLNP). Source:
+Per channel (`lib.rs::Vdl2ChannelDecoder`): wideband IQ → DDC (or
+selectivity FIR on the no-DDC path) → channel IQ → `demod::Vdl2Demod`
+(acquisition, header FEC, deinterleave + RS) → `avlc::scan` → per frame:
+ACARS-over-AVLC, or ATN transport (X.25 → CLNP/COTP/ES-IS/IDRP → ATN-B1
+CPDLC / CM), or a structured AVLC body (S/U frames, XID, FRMR). Source:
 `crates/xng-mode-vdl2/src/`.
 
 ## Channel rate
@@ -77,10 +80,10 @@ low trigger threshold is only safe because of buffer retention (below).
 
 Per-symbol differential D8PSK (`collect`): Δφ of consecutive symbol
 centers, derotated by the fitted `theta`, to the nearest π/4 multiple →
-inverse Gray triplet, descrambled on the fly. Decision-directed residual
-tracking adapts `theta` each symbol (`PHASE_GAIN = 0.1`). The |residual|
-at the π/4 grid is kept per symbol as a decision confidence for RS
-erasure marking.
+inverse Gray triplet (`GRAY_INV`), descrambled on the fly. Decision-
+directed residual tracking adapts `theta` each symbol (`PHASE_GAIN =
+0.1`). The |residual| at the π/4 grid is kept per symbol as a decision
+confidence for RS erasure marking.
 
 Differential beats coherent/absolute detection on real captures: the
 sigidwiki signal has oscillator phase wander that differential
@@ -97,6 +100,14 @@ power would inflate the floor for ~0.1 s and shadow rapid back-to-back
 transmissions — exactly the XID/ack exchanges in the capture. Gating it
 took 17 → 19+ frames and made the count flat across `ENERGY_FACTOR` 8-20
 and trigger threshold 0.4-0.6, where the symmetric estimator wobbled.
+
+## Burst header
+
+`header.rs`. Reserved symbol (3 bits) + 17-bit transmission length
+(LSB first) + 5-bit (25,20) header FEC over the spec H matrix (Annex 10
+Table 6-2). Decode checks the syndrome, then corrects a single bit error
+by exhaustive flip; spec-derived parity vectors for TL ∈ {1, 100, 1000,
+131071} pin the H matrix. `MAX_TL = 131_071`.
 
 ## Buffer retention / rewind (makes a low trigger safe)
 
@@ -150,6 +161,205 @@ regression-proof by construction; on the sigidwiki capture (24-30 dB SNR)
 it yields nothing the FCS accepts — that capture's losses were never FEC
 headroom.
 
+## AVLC link layer
+
+`avlc.rs`. The descrambled, RS-corrected bit stream is destuffed and
+scanned for `FLAG(0x7E) | dst(4) | src(4) | control(1) | info | FCS(2)
+| FLAG` frames (ISO/IEC 13239, ETSI EN 301 841-2). Every accepted frame
+is FCS-validated; the FCS octet order is pinned little-endian (low octet
+first, ISO/IEC 13239 §4.4 / dumpvdl2 GOOD_FCS 0xF0B8) — the byte-swapped
+"accept either" path was dropped because it false-accepted ~1 in 65536
+bad frames. RS pass alone never emits a frame; the FCS is load-bearing.
+
+Decoded fields:
+
+- **Addresses** — 27-bit DLS address parsed bit-exact from the 4-octet
+  field: 24-bit specific address (rendered as the 6-hex ICAO address for
+  aircraft), address-type code (`Aircraft`, `GroundIcao`,
+  `GroundDelegated`, `AllStations`, `Reserved`), and the status bit
+  (A/G on dst octet 1, C/R on src octet 5).
+- **Control** — full ISO/IEC 13239 repertoire (`parse_control`):
+  I-frames (N(S)/N(R)/P), Supervisory (RR, RNR, REJ, SREJ), Unnumbered
+  (UI, DM, DISC, UA, SABME, FRMR, XID, TEST). The P/F bit is masked off
+  the U-frame match so SABME 0x6F and 0x7F both decode.
+- **Payload class** — `Acars` (info begins 0xFF, AOA), `Atn{ipi}`
+  (0x81 CLNP / 0x82 ES-IS / 0x83 IDRP per ISO TR 9577), `Xid`, `Empty`,
+  `Other{first}`.
+
+## XID handoff parameters
+
+`avlc::parse_xid` walks the ISO/IEC 8885 structure: FI octet, then
+`GI | GL(2, big endian) | params{PI, PL, PV}`. A param claiming more
+bytes than its group holds returns None rather than emitting half-parsed
+garbage. Two parameter sets are named (`vdl_param_name` /
+`pub_param_name`), cross-checked against dumpvdl2 `xid_vdl_params` /
+`xid_pub_params` (the integer→name assignment only):
+
+- **VDL private (group 0xF0):** parameter-set-id, connection-management,
+  signal-quality, xid-sequencing, avlc-specific-options,
+  expedited-sn-connection, lcr-cause, autotune-frequency (0x40),
+  replacement-ground-stations (0x41), timer-t4 (0x42), mac-persistence,
+  counter-m1, timer-tm2/tg5/t3min, ground-station-address-filter (0x48),
+  broadcast-connection, modulation-support, alternate-ground-stations,
+  destination-airport (0x83), aircraft-location, frequency-support-list
+  (0xC0), airport-coverage, nearest-airport-id, atn-router-nets,
+  system-mask, timer-tg3/tg4, ground-station-location.
+- **Public ISO 8885 HDLC (group 0x80):** parameter-set-id,
+  procedure-classes, hdlc-options, n1/k up/downlink, timer-t1-downlink,
+  counter-n2, timer-t2.
+
+Typed value decode beyond raw hex: the 2-octet VDL2 frequency field
+(autotune 0x40 and each frequency-support-list entry) → MHz via
+`freq_khz = (raw12 + 10000)·10` rounded up to the next 25 kHz, with the
+modulation-support nibble split off the top 4 bits (`decode_vdl2_freq`,
+matches dumpvdl2 `parse_freq`); timer/counter parameters → big-endian
+integer; printable parameters (e.g. destination-airport "KSMF") → text;
+address-list parameters (replacement-GS 0x41, GS-address-filter 0x48,
+alternate-GS 0x82, system-mask 0xC5; frequency-support-list 6-octet
+entries) → AVLC addresses via the standard parser. Parameter IDs whose
+binary layout is not verified against the spec stay as hex, not guessed.
+
+The earlier table mis-numbered the entire 0x40–0x49 range (it labelled
+0x42 "destination-airport" — that is 0x83; 0x42 is Timer T4); fixed and
+pinned by tests.
+
+## FRMR
+
+`avlc::parse_frmr` expands the 3-octet basic (modulo-8) Frame-Reject
+info field (ISO/IEC 13239 §5.5.3.5): the rejected control field (decoded
+via `parse_control`), the rejecting station's V(S)/V(R), the C/R of the
+rejected frame, and the W/X/Y/Z reject-reason flags.
+
+## ATN transport (`atn.rs`)
+
+Clean-room from the public ISO framings (ISO/IEC 8208 X.25, 8473 CLNP,
+8073 COTP, 9542 ES-IS, 10747 IDRP) as profiled by ICAO Doc 9776/9705/
+9880; dumpvdl2 was consulted only for protocol constants and the
+integer→name dictionaries. ATN rides in I-frame info fields: an ISO 8208
+packet on most links, or bare CLNP/ES-IS/IDRP. Decoded into JSON nested
+under the message body.
+
+- **X.25 packet layer (`parse_x25`)** — modulo-8 profile (GFI 0bxx01,
+  tolerates Q/D). DATA (P(S)/P(R)/M-bit + user data), CALL-REQUEST /
+  CALL-ACCEPTED (BCD address block, facilities, call-user-data),
+  CLEAR / RESET / RESTART request (cause + diagnostic) and their
+  confirmations, DIAGNOSTIC (0xF1), and RR/RNR/REJ supervisory. Three
+  cause tables (clear/reset/restart, ITU-T X.25 Table 5-7) and a
+  ~150-entry diagnostic table (X.25 Annex E + ISO 8208 + ICAO Doc 9705
+  Table 5.7-3 / Doc 9880 extensions) resolve to text; a cause octet with
+  bit 8 set is normalised to 0 (remote-DTE bits) for the lookup.
+  Facilities are reported numerically (code + params) — naming deferred.
+- **M-bit reassembly (`X25Reassembler`)** — DATA packets with M=1 are
+  buffered per logical channel and concatenated until M=0 before the
+  network layer is parsed; 60 s per-LCN timeout.
+- **CLNP (`parse_clnp`)** — full uncompressed ISO 8473 header: PDU type
+  (DT 0x1C / ERQ 0x1E / ERP 0x1F / ER 0x01), version, lifetime, segment
+  length, dst/src NSAPs (hex). DT payloads recurse into COTP.
+- **COTP (`parse_cotp`)** — ISO 8073 TPDU identification (CR/CC/DR/DT/ER)
+  with dst/src references; DT user data is handed to the ATN-B1
+  application decoders.
+- **ES-IS (`parse_esis`, ISO 9542)** — ESH (type 2, count + SAs) / ISH
+  (type 4, single NET) with holding time and advertised NSAPs (hex), plus
+  the trailing option TLVs: Mobile-Subnetwork-Capabilities (0x81),
+  ATN-Data-Link-Capabilities (0x88), Priority (0xCF), Security (0xC5).
+- **IDRP (`parse_idrp`, ISO 10747)** — 30-octet BISPDU common header
+  (type, sequence, ack, credit offered/avail). All six PDU types named
+  (OPEN, UPDATE, ERROR, KEEPALIVE, CEASE, RIB-REFRESH). OPEN body decodes
+  version / hold-time / max-PDU-size / source-RDI (the reliably-framed
+  leading fields; the variable RIB-Atts / Confed-IDs / auth tail stays
+  hex). UPDATE decodes withdrawn-route IDs, path attributes (all 16 types
+  named per §7.12; 1-octet scalars decoded, else hex), and NLRI prefixes
+  (CLNP NLRI flagged). ERROR resolves the top-level code (5 names) and
+  the code-keyed subcode dictionary to text.
+- **Compressed CLNP** — ICAO 9705 LREF/deflate variants are labeled
+  (`clnp-compressed?` + first octet) but not expanded; layout unverified.
+
+## ATN-B1 applications (`atn_cpdlc.rs`)
+
+Protected-mode CPDLC and Context Management, decoded from the ICAO Doc
+9880/9705 ASN.1 modules (vendored as spec text in `docs/asn1/`, from
+Wireshark's transcription of the ICAO standard — module text only).
+Encoding is unaligned PER (ITU-T X.691), hand-walked: constrained whole
+numbers, length determinants (no fragmentation), and IA5 strings (7
+bits/char). Reached via COTP DT user data; `parse_apdu` tries protected
+CPDLC, then `parse_cm_logon`, then `parse_cm_ground`.
+
+- **CPDLC** — ProtectedAircraftPDUs (4 root alts) / ProtectedGroundPDUs
+  (6 root alts): abort-user, abort-provider, startup, startdown, send,
+  forward, forward-response. The ATCUplink/DownlinkMessage header decodes
+  msg id/ref, DateTimeGroup (rendered ISO 8601), and the logical-ack
+  preamble. Message elements are looked up in the **full element tables**
+  — 238 uplink + 114 downlink `(name, ASN.1 arg type, phraseology)`
+  generated from the module (`atn_cpdlc_tables.rs`) — and rendered into
+  readable text (`CLIMB TO FL360`, `WILCO`).
+- **CPDLC argument values** — readers for the common element argument
+  types: Level (feet / metres / FL / metric-FL, single + block),
+  Time, Position (fix / navaid / airport / lat-lon), Speed (all seven
+  IAS/TAS/GS/Mach units), Degrees, Direction, Distance, plus the
+  two-component compounds (LevelLevel, TimeLevel, PositionLevel, …) and
+  RouteClearanceIndex. **Route clearances** in `constrainedData` decode
+  departure/destination airports, runways, procedures (arrival/approach/
+  departure + transition), and the RouteInformation leg list (published
+  fix/navaid, lat-lon, place-bearing, place-bearing-distance, ATS route
+  designator). An unsupported argument type stops the element walk
+  explicitly (its size is then unknown) and the element is flagged
+  undecoded rather than guessed past — the staged FANS-1/A approach.
+- **CM (`parse_cm_logon`, `parse_cm_ground`)** — the dialogue that
+  precedes CPDLC. CMLogonRequest yields the flight id (and a count of
+  present optional fields); CMGroundMessage identifies the dialogue type
+  (logon-response, update, contact-request, forward-request, abort,
+  forward-response). Per-entry TSAP application lists are reported
+  present-or-absent (variable-size — staged).
+
+## Outputs (`lib.rs::to_message`)
+
+ACARS-bearing frames emit `MessageBody::Acars` (CRC flag + parity-error
+count carried through; ARINC 622 applications — ADS-C, CPDLC-over-ACARS —
+rendered by `xng_acars`). Every other frame emits `MessageBody::Vdl2 {
+kind, details }`: `kind` is `xid` / `atn` / `avlc-<u/s-frame>` / `avlc-i`;
+`details` always carries dst/src/control, plus the XID params, FRMR
+expansion, ATN protocol label + nested transport JSON, and a truncated
+info-hex preview. The raw frame octets are preserved on every message.
+`fec_corrected` reports the RS-corrected octet count.
+
+## Validation / oracles
+
+- **Off-air oracle: dumpvdl2 2.6.0** on the sigidwiki VDL-M2 capture
+  (CC BY-SA, 46.9 s, Amsterdam; I/Q convention inverted — dumpvdl2 also
+  decodes nothing until conjugated). xng 44 vs dumpvdl2 41, CI floor 42.
+- **Octet-level ground truth** from dumpvdl2 `--debug burst_detail`
+  (post-deinterleave Data+FEC octets) — this, not frame counts, exposed
+  the LSB-vs-MSB RS bug (see lessons).
+- **Spec self-test vectors** in the suite: UW phase sequence, first 48
+  scrambler keystream bits, header-FEC parity for TL ∈ {1,100,1000,
+  131071}, AVLC FCS residue, RS encode/decode roundtrip.
+- **Synthetic UPER vectors** for the ATN-B1 path, built bit-by-bit from
+  the module (WILCO downlink, CLIMB-TO uplink, CM logon-request,
+  CM ground logon-response, cleared-route uplink).
+- **RF loopback** (`tests/end_to_end.rs`): AOA frame with a real ADS-C
+  payload + S-frame, both at 50/100 kS/s, plain and RC(α=0.6)
+  pulse-shaped, plus a wideband-with-CFO path; the vendored 6 s off-air
+  fixture is guarded by `tests/offair.rs`.
+
+The dictionaries (XID param IDs, X.25 cause/diagnostic codes, IDRP
+PDU/attr/error codes, ES-IS option IDs) were cross-checked against the
+corresponding dumpvdl2 source tables — the integer→name assignments only,
+never code or formatter text (clean-room; see PROVENANCE.md).
+
+## Known limitations / intentional gaps
+
+- Acquisition sensitivity, not FEC headroom, is the gap to a perfect
+  haul; on the 24-30 dB sigidwiki capture soft RS yields nothing the FCS
+  accepts.
+- X.25 facilities reported numerically (no naming).
+- Compressed CLNP (LREF / deflate) labeled but not expanded.
+- IDRP OPEN's variable tail (RIB-Atts-Set / Confed-IDs / auth) stays hex.
+- CPDLC: extension-marked CHOICE alternatives, fragmented PER lengths,
+  unsupported argument types, the routeInformationAdditional tail, and
+  place-bearing-distance positions are not decoded — each stops its walk
+  explicitly rather than emitting a guess.
+- CM: TSAP application-list entries reported present/absent only.
+
 ## Standing lessons
 
 **The self-consistent-loopback trap.** The 19 → 44 gap was a single
@@ -187,6 +397,14 @@ re-walks "rescued" bursts that were all RS-passing garbage with zero
 collecting burst's UW start means a false header decode that fails RS
 cannot consume a real burst. Lower the trigger threshold only with this
 in place.
+
+**Decode protocol, don't guess it.** Across the XID, X.25, IDRP and
+CPDLC work the recurring discipline is: parse the reliably-framed fields,
+name them from a spec-pinned dictionary cross-checked against the oracle,
+and leave anything whose binary layout is unverified as hex (or stop the
+PER walk explicitly when a size is unknown). A mis-numbered XID table
+(0x42 vs 0x83) shipped before because a name was assumed rather than
+pinned; every dictionary now has a test.
 
 ## Architecture vs dumpvdl2
 
