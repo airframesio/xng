@@ -51,6 +51,9 @@ pub struct OutputConfig {
     pub mqtt: Option<String>,
     /// MQTT topic prefix (messages publish to `<prefix>/<mode>`).
     pub mqtt_topic: String,
+    /// Per-mode Airframes feed router (legacy per-port native-format push;
+    /// asf-2.0 multiplexes every mode separately under the canonical ident).
+    pub airframes: Option<crate::outputs::airframes::AirframesRouter>,
 }
 
 pub struct SessionConfig {
@@ -421,6 +424,12 @@ fn spawn_outputs(
     for target in outputs.udp.clone() {
         let rx = bus.subscribe();
         output_tasks.push(tokio::spawn(acarsdec_json::run(rx, target)));
+    }
+    if let Some(router) = outputs.airframes.clone() {
+        if !router.is_empty() {
+            let rx = bus.subscribe();
+            output_tasks.push(tokio::spawn(crate::outputs::airframes::run(rx, router)));
+        }
     }
     if let Some(addr) = outputs.sbs.clone() {
         let rx = bus.subscribe();

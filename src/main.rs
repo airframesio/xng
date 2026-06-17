@@ -18,8 +18,6 @@ use outputs::console::ConsoleFormat;
 use std::path::PathBuf;
 use xng_sdr::{FileIqSource, IqFormat};
 
-const AIRFRAMES_ACARS_UDP: &str = "feed.airframes.io:5550";
-
 #[derive(Parser)]
 #[command(name = "xng", version, about = "Next-generation multi-mode SDR decoder (ACARS, VDL2, HFDL, satcom, AIS, ...)")]
 struct Cli {
@@ -176,13 +174,14 @@ impl OutputOpts {
         } else {
             outputs::asf2_quic::TrustMode::SystemRoots
         };
-        let mut udp = self.udp.clone();
+        let udp = self.udp.clone();
         if self.feed_airframes {
             anyhow::ensure!(
                 self.station_id.is_some(),
                 "--feed-airframes requires --station-id (e.g. XX-KSEA-ACARS1)"
             );
-            udp.push(AIRFRAMES_ACARS_UDP.to_owned());
+            // Airframes feeding itself is wired per-session by the caller via
+            // `outputs::airframes::cli_router` (the mode isn't known here).
         }
         if let Some(p) = &self.gs_file {
             outputs::console::load_gs_names(p)?;
@@ -215,6 +214,8 @@ impl OutputOpts {
                 http: self.http.clone(),
                 mqtt: self.mqtt.clone(),
                 mqtt_topic: self.mqtt_topic.clone(),
+                // Set per-session by the caller once the mode is known.
+                airframes: None,
             },
             ident,
         ))
@@ -596,7 +597,9 @@ fn main() -> anyhow::Result<()> {
                 })?,
             };
             let (mode, rate, center_hz, channels_hz) = parse_tune(&tune)?;
-            let (outputs, station_ident) = output.build()?;
+            let (mut outputs, station_ident) = output.build()?;
+            outputs.airframes =
+                Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
             let source = FileIqSource::open(&file, fmt, rate, center_hz)?;
             runtime::run_session(
                 Box::new(source),
@@ -631,7 +634,17 @@ fn main() -> anyhow::Result<()> {
         Command::Extern { format, output, command } => {
             let fmt: commands::extern_cmd::ExternFormat =
                 format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            let (outputs, station_ident) = output.build()?;
+            let (mut outputs, station_ident) = output.build()?;
+            outputs.airframes = Some(outputs::airframes::cli_router(
+                output.feed_airframes,
+                &station_ident,
+                &[
+                    xng_types::Mode::AcarsPoa,
+                    xng_types::Mode::Vdl2,
+                    xng_types::Mode::Hfdl,
+                    xng_types::Mode::Ais,
+                ],
+            ));
             commands::extern_cmd::run(fmt, &command, station_ident, outputs)
         }
         Command::Survey {
@@ -729,6 +742,7 @@ fn main() -> anyhow::Result<()> {
                         http: None,
                         mqtt: None,
                         mqtt_topic: "xng".into(),
+                        airframes: None,
                     },
                 },
             )
@@ -748,10 +762,9 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
     let st = commands::station::load(config)?;
 
     // Shared outputs (the first session's SessionConfig carries them).
-    let mut udp = st.outputs.udp.clone();
-    if st.outputs.feed_airframes {
-        udp.push(AIRFRAMES_ACARS_UDP.to_owned());
-    }
+    // Airframes feeding is routed per-mode/per-session by the router below,
+    // not appended to the generic `udp` sinks.
+    let udp = st.outputs.udp.clone();
     let outputs = runtime::OutputConfig {
         console: if st.outputs.json { ConsoleFormat::Json } else { ConsoleFormat::Pretty },
         jsonl: st.outputs.jsonl.clone(),
@@ -768,6 +781,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         http: st.outputs.http.clone(),
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
+        airframes: Some(commands::station::airframes_router(&st)),
     };
 
     if let Some(p) = &st.outputs.aircraft_db {
@@ -1055,7 +1069,9 @@ fn open_soapy(
 
 fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
     let (mode, rate, center_hz, channels_hz) = parse_tune(tune)?;
-    let (outputs, station_ident) = output.build()?;
+    let (mut outputs, station_ident) = output.build()?;
+    outputs.airframes =
+        Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
     let serial = sdr_args::SdrArgs::parse(sdr).serial;
     let (source, driver) = open_sdr(sdr, rate, center_hz, gain)?;
     runtime::run_session(

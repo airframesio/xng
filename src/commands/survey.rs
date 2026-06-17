@@ -470,6 +470,7 @@ fn dwell(
             http: None,
             mqtt: None,
             mqtt_topic: "xng".into(),
+            airframes: None,
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;

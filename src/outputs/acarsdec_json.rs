@@ -8,8 +8,18 @@ use tokio::sync::broadcast;
 use xng_types::{Message, MessageBody};
 
 /// Render a normalized message in acarsdec's flat JSON shape. Returns `None`
-/// for non-ACARS bodies.
+/// for non-ACARS bodies. Uses the message's own (canonical) station ident.
 pub fn format_acarsdec(msg: &Message) -> Option<serde_json::Value> {
+    format_acarsdec_with_station(msg, None)
+}
+
+/// As [`format_acarsdec`], but stamp `station_id_override` as the `station_id`
+/// field when given (the Airframes per-mode/per-session feed id), leaving the
+/// message's own provenance ident untouched.
+pub fn format_acarsdec_with_station(
+    msg: &Message,
+    station_id_override: Option<&str>,
+) -> Option<serde_json::Value> {
     let MessageBody::Acars(a) = &msg.body else {
         return None;
     };
@@ -18,11 +28,12 @@ pub fn format_acarsdec(msg: &Message) -> Option<serde_json::Value> {
     if !msg.decode.crc_ok {
         return None;
     }
+    let station_id = station_id_override.unwrap_or(msg.source.station.ident.as_str());
     let ts = msg.timestamp.timestamp() as f64 + msg.timestamp.timestamp_subsec_micros() as f64 / 1e6;
     let mut v = serde_json::json!({
         "app": { "name": "xng", "ver": env!("CARGO_PKG_VERSION") },
         "timestamp": ts,
-        "station_id": msg.source.station.ident,
+        "station_id": station_id,
         "channel": msg.source.channel.map(|c| c.index).unwrap_or(0),
         "freq": (msg.frequency_hz as f64 / 1e6 * 1000.0).round() / 1000.0,
         "level": msg.signal.rssi_db.map(|l| (l as f64 * 10.0).round() / 10.0).unwrap_or(0.0),
