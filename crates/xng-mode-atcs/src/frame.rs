@@ -59,7 +59,12 @@ pub struct HdlcDeframer {
 
 impl HdlcDeframer {
     pub fn new() -> Self {
-        Self { shift: 0, collecting: false, ones: 0, buf: Vec::with_capacity(MAX_BITS) }
+        Self {
+            shift: 0,
+            collecting: false,
+            ones: 0,
+            buf: Vec::with_capacity(MAX_BITS),
+        }
     }
 
     /// Push one link bit; returns a frame when a CRC-valid one completes.
@@ -118,20 +123,27 @@ impl HdlcDeframer {
     }
 
     fn close(bits: &[u8]) -> Option<AtcsFrame> {
-        if bits.len() < MIN_BITS || bits.len() % 8 != 0 {
+        if bits.len() < MIN_BITS || !bits.len().is_multiple_of(8) {
             return None;
         }
         // Assemble wire octets LSB-first: bit i of each byte = i-th arrival.
         let wire: Vec<u8> = bits
             .chunks_exact(8)
-            .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | ((v & 1) << i)))
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u8, |b, (i, &v)| b | ((v & 1) << i))
+            })
             .collect();
         if !hdlc_frame_ok(&wire) {
             return None;
         }
         let n = wire.len();
         let fcs = u16::from_le_bytes([wire[n - 2], wire[n - 1]]);
-        Some(AtcsFrame { bytes: wire[..n - 2].to_vec(), fcs })
+        Some(AtcsFrame {
+            bytes: wire[..n - 2].to_vec(),
+            fcs,
+        })
     }
 }
 

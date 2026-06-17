@@ -14,6 +14,9 @@
 //!   (CRC-16/X-25) check → raw frame bytes.
 //! * [`address`] — ATCS address decode: direction/type digit, AAR railroad
 //!   number, line/territory and node, from the BCD digit string.
+//! * [`spec200`] — Spec-200 Layer-3 packet header: control octet
+//!   (priority, ARQ, service-signal flags), the BCD address-length octet,
+//!   the source and destination addresses, and the raw user payload.
 //!
 //! The full payload-protocol decode (the vendor codeline protocols carried
 //! inside the user data, e.g. Genisys / ARES) is intentionally **out of
@@ -35,6 +38,14 @@
 
 pub mod address;
 pub mod frame;
+pub mod spec200;
 
 pub use address::{AddressType, AtcsAddress};
 pub use frame::{AtcsFrame, HdlcDeframer};
+pub use spec200::{decode_packet, Spec200Packet};
+
+/// Decode one HDLC frame's bytes into a Spec-200 packet. Convenience for
+/// the common pipeline frame → packet.
+pub fn decode_frame(frame: &AtcsFrame) -> Option<Spec200Packet> {
+    decode_packet(&frame.bytes)
+}

@@ -125,12 +125,23 @@ impl AtcsAddress {
             digits[1..].parse::<u16>().unwrap_or(0)
         };
 
-        let routing = if bytes.len() > 4 { digits[4..].to_string() } else { String::new() };
+        let routing = if bytes.len() > 4 {
+            digits[4..].to_string()
+        } else {
+            String::new()
+        };
 
         // Documented line/node splits by leading digit and total length.
         let (line, node) = split_line_node(addr_type, &routing);
 
-        Some(AtcsAddress { digits: digits.to_string(), addr_type, railroad, routing, line, node })
+        Some(AtcsAddress {
+            digits: digits.to_string(),
+            addr_type,
+            railroad,
+            routing,
+            line,
+            node,
+        })
     }
 }
 
