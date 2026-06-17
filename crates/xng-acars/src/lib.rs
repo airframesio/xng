@@ -14,6 +14,7 @@ pub mod cpdlc;
 pub mod block;
 pub mod cfb;
 pub mod media_adv;
+pub mod met;
 pub mod miam;
 pub mod ohma;
 pub mod oooi;
@@ -78,6 +79,10 @@ pub struct AppDecode {
     /// (labels `20`/POS, `4J`, `H1` POS).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub position: Option<position::Position>,
+    /// Winds-aloft / met fields from a position-weather report (label `4J`
+    /// POSWX).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub met: Option<met::Met>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<AcarsApp>,
 }
@@ -114,6 +119,8 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
     out.oooi = oooi::decode(label, text);
     // Free-text position reports (labels 20/POS, 4J, H1 POS) → lat/lon.
     out.position = position::decode(label, text);
+    // Winds-aloft / met from the 4J POSWX position-weather report.
+    out.met = met::decode(label, text);
     out
 }
 

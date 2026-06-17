@@ -96,6 +96,11 @@ fn build_app_value(appdec: &xng_acars::AppDecode) -> Option<serde_json::Value> {
     if let Some(pos) = appdec.position.as_ref().and_then(|p| serde_json::to_value(p).ok()) {
         flat.insert("position".to_string(), pos);
     }
+    if let Some(serde_json::Value::Object(met_map)) =
+        appdec.met.as_ref().and_then(|m| serde_json::to_value(m).ok())
+    {
+        flat.extend(met_map);
+    }
 
     let app_val = appdec.app.as_ref().map(|a| serde_json::to_value(a).unwrap_or_default());
 

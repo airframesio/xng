@@ -105,6 +105,20 @@ Unlike acarsdec's raw `memcpy`s we bounds-check every slice and validate
 airport codes (4 alphanumerics) and times (HHMM range), dropping
 misaligned fields rather than emitting junk.
 
+## Winds-aloft / met (2026-06)
+
+`met.rs`: decodes the verifiable winds-aloft met set from the free-text
+`4J` "POSWX" position-and-weather report — wind direction/speed (`/WND
+334060`), static air temperature (`/SAT -032`), true airspeed (`/TAS
+490`) and altitude/flight-level (`/ALT 270` → 27000 ft). Field meanings,
+example string and expected values are from airframes'
+acars-message-documentation `research/4J.md`; the temperature `M`/`P`
+sign convention is airframes' own (`research/H1/POS.md`,
+acars-decoder-typescript `ResultFormatter.temperature`). The WMO-BUFR
+AMDAR binary schema (NOAA `dcacar`) is intentionally out of scope: it is
+not present in any airframes documented example, so there is no real
+reference to verify a decoder against.
+
 ## H1 #CFB maintenance family (2026-06)
 
 `cfb.rs`: classifies the H1 `#CFB` ("Crew Flight Bag") Boeing/Airbus

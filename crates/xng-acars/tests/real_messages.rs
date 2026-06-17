@@ -282,3 +282,25 @@ fn label_4j_position_report() {
     assert!(close3(p.latitude, 39.462), "lat {}", p.latitude);
     assert!(close3(p.longitude, -77.598), "lon {}", p.longitude);
 }
+
+// --- ACARS-2.3: winds-aloft / met from the 4J POSWX report ---
+// Reference string + values are the real documented example from
+// airframes' acars-message-documentation research/4J.md (message 880996538).
+
+#[test]
+fn label_4j_poswx_met_fields() {
+    let text = "4J01 POSWX 0318/20 ETAD/ETAD .00318S\n\
+        /POS N5043.5E01121.8/OVR 0817\n\
+        /ALT 270/TFW 1342/TAS 490/SAT -032\n\
+        /POS GOVEN /OVR 0835\n\
+        /POS DILVI\n\
+        /WND 334060/TRB /SKY DCC3";
+    let d = decode("4J", text, true);
+    let m = d.met.expect("4J POSWX carries met fields");
+    // research/4J.md: WND 334 deg / 60 kt, SAT -32, TAS 490, ALT FL270.
+    assert_eq!(m.wind_dir_deg, Some(334));
+    assert_eq!(m.wind_speed_kt, Some(60));
+    assert_eq!(m.temperature_c, Some(-32));
+    assert_eq!(m.true_airspeed_kt, Some(490));
+    assert_eq!(m.altitude_ft, Some(27000));
+}
