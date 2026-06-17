@@ -447,12 +447,17 @@ pub fn lcw_traffic_frame(bits: &[u8]) -> Option<ira::IridiumFrame> {
             details.as_object_mut().unwrap().extend(extra);
         }
     } else if ft == 7 {
-        // Sync/idle channel: the payload after the LCW is a constant
-        // alternating filler, so adjacent equal bits are deviations from
-        // that pattern. The count is a channel-quality / anomaly indicator
-        // (a clean idle sync scores 0); the timing/frequency offsets ride
-        // in the LCW (decoded above as the sync descriptor).
-        let errs = payload.windows(2).filter(|w| w[0] == w[1]).count();
+        // Sync (ISY) channel: the 312-bit payload after the LCW is a constant
+        // 0xAA byte pattern. iridium-toolkit's IridiumSYMessage slices it into
+        // bytes and counts how many differ from 0xAA (`Sync=OK` when zero,
+        // else `Sync=no errs=N`). Reproduce that exact metric; the
+        // timing/frequency offsets ride in the LCW (the sync descriptor above).
+        let errs = payload
+            .chunks(8)
+            .take(39) // 312 bits / 8 = 39 sync bytes
+            .filter(|c| c.len() == 8)
+            .filter(|c| c.iter().fold(0u8, |v, &b| (v << 1) | b) != 0xAA)
+            .count();
         details["sync_errors"] = serde_json::json!(errs);
         details["sync_idle"] = serde_json::json!(errs == 0 && !payload.is_empty());
     }
