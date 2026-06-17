@@ -585,6 +585,76 @@ pub fn bds20(mb: &[u8]) -> Option<serde_json::Value> {
     Some(serde_json::json!({ "bds": "2,0", "callsign": cs }))
 }
 
+/// BDS 1,0 — Data Link Capability Report (ICAO Doc 9871 Table A-2-16 /
+/// Annex 10 Vol IV §3.1.2.6.10.2): which Comm-A/Comm-B/ELM services and
+/// ACAS features the transponder supports.
+///
+/// MB positions (1-indexed): BDS id 1–8 (= 0x10), config-flag 9, reserved
+/// 10–14, overlay-command 15, ACAS-operational 16, subnetwork version
+/// 17–23, transponder-level-5 24, Mode-S-specific-services 25, uplink ELM
+/// 26–28, downlink ELM 29–32, aircraft-ident-capability 33, squitter 34,
+/// surveillance-identifier-code 35, common-usage-GICB 36, ACAS-hybrid 37,
+/// ACAS-resolution-advisory 38, ACAS-RTCA version 39–40, DTE status 41–56.
+pub fn bds10(mb: &[u8]) -> Option<serde_json::Value> {
+    // BDS identifier must be 0x10.
+    if mb_field(mb, 1, 8) != 0x10 {
+        return None;
+    }
+    // Reserved bits 10–14 must be zero.
+    if mb_field(mb, 10, 5) != 0 {
+        return None;
+    }
+    // pyModeS OVC/subnet consistency heuristic.
+    let ovc = mb_bit(mb, 15);
+    let subnet = mb_field(mb, 17, 7);
+    if (ovc == 1 && subnet < 5) || (ovc == 0 && subnet > 4) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "bds": "1,0",
+        "config": mb_bit(mb, 9) == 1,
+        "overlay_command_capability": ovc == 1,
+        "acas_operational": mb_bit(mb, 16) == 1,
+        "mode_s_subnetwork_version": subnet,
+        "transponder_level5": mb_bit(mb, 24) == 1,
+        "mode_s_specific_services": mb_bit(mb, 25) == 1,
+        "uplink_elm_throughput": mb_field(mb, 26, 3),
+        "downlink_elm_throughput": mb_field(mb, 29, 4),
+        "aircraft_identification_capability": mb_bit(mb, 33) == 1,
+        "squitter_capability": mb_bit(mb, 34) == 1,
+        "surveillance_identifier_code": mb_bit(mb, 35) == 1,
+        "common_usage_gicb_capability": mb_bit(mb, 36) == 1,
+        "acas_hybrid_surveillance": mb_bit(mb, 37) == 1,
+        "acas_resolution_advisory": mb_bit(mb, 38) == 1,
+        "acas_rtca_version": mb_field(mb, 39, 2),
+        "dte_status": mb_field(mb, 41, 16),
+    }))
+}
+
+/// Capability-map index (MB bit 1..24) → BDS register (ICAO Doc 9871
+/// Table A-2-25), as used by BDS 1,7.
+const GICB_CAPABILITY_BDS: [&str; 24] = [
+    "0,5", "0,6", "0,7", "0,8", "0,9", "0,A", "2,0", "2,1", "4,0", "4,1", "4,2", "4,3", "4,4",
+    "4,5", "4,8", "5,0", "5,1", "5,2", "5,3", "5,4", "5,5", "5,6", "5,F", "6,0",
+];
+
+/// BDS 1,7 — Common Usage GICB Capability Report: a 24-bit map (MB 1–24)
+/// of which common-usage registers the transponder will report via ground-
+/// initiated Comm-B. MB 25–56 must be zero and the BDS 2,0 capability
+/// (MB bit 7) must be set (pyModeS `bds17`).
+pub fn bds17(mb: &[u8]) -> Option<serde_json::Value> {
+    if !is_bds17_pattern(mb) {
+        return None;
+    }
+    let supported: Vec<&str> = GICB_CAPABILITY_BDS
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| mb_bit(mb, i + 1) == 1)
+        .map(|(_, &c)| c)
+        .collect();
+    Some(serde_json::json!({ "bds": "1,7", "supported_bds": supported }))
+}
+
 /// BDS 3,0 — ACAS active Resolution Advisory (TCAS RA), per ICAO Annex 10
 /// Vol IV §4.3.8.4.2.4. Carries the ARA bits (what RA is issued), the RAC
 /// bits (manoeuvres the aircraft must NOT take), terminal flags, and the
@@ -886,29 +956,39 @@ pub fn bds45(mb: &[u8]) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(o))
 }
 
-/// Infer the BDS register of a DF20/21 MB field: accept only when
-/// exactly one decoder validates (the pyModeS approach).
+/// Infer the BDS register of a DF20/21 MB field, mirroring the phased
+/// precedence of pyModeS `_infer.py`:
 ///
-/// The strict candidate set (ELS/EHS: BDS 2,0 / 3,0 / 4,0 / 5,0 / 6,0) is
-/// tried first. Only if it is unambiguously empty are the heuristic
-/// meteorological registers (BDS 4,4 MRAR / 4,5 MHR) considered — these
-/// collide with the EHS layouts (pyModeS hides them behind an
-/// `include_meteo` flag for the same reason), so the strict result always
-/// wins and existing ELS/EHS decoding is never perturbed.
+/// 1. Format-ID fast path (BDS 1,0 / 1,7 / 2,0 / 3,0): these carry an
+///    explicit identifier byte (or, for 1,7, a strict capability-map
+///    pattern) and are mutually exclusive, so the first that validates
+///    wins outright — the heuristic registers are not even consulted.
+/// 2. Heuristic set (EHS: BDS 4,0 / 5,0 / 6,0): only when no format-ID
+///    register matched, accept only if exactly one validates (xng's
+///    original exactly-one rule, preserved unchanged).
+/// 3. Meteorological fallback (BDS 4,4 MRAR / 4,5 MHR): only when the
+///    heuristic set is empty — these collide with EHS, so pyModeS hides
+///    them behind `include_meteo`; here they are a last resort that never
+///    perturbs ELS/EHS decoding.
 pub fn bds_infer(mb: &[u8]) -> Option<serde_json::Value> {
-    let cands: Vec<serde_json::Value> =
-        [bds20(mb), bds30(mb), bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
-    match cands.len() {
-        1 => Some(cands.into_iter().next().unwrap()),
-        // Strict set empty: fall back to the meteo registers, again
-        // requiring exactly one to validate.
-        0 => {
-            let met: Vec<serde_json::Value> =
-                [bds44(mb), bds45(mb)].into_iter().flatten().collect();
-            (met.len() == 1).then(|| met.into_iter().next().unwrap())
+    // Phase 1 — format-ID fast path, first match wins.
+    for d in [bds10(mb), bds17(mb), bds20(mb), bds30(mb)] {
+        if let Some(v) = d {
+            return Some(v);
         }
-        _ => None, // ambiguous within the strict set
     }
+    // Phase 2 — heuristic EHS set, exactly one must validate.
+    let ehs: Vec<serde_json::Value> =
+        [bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
+    if ehs.len() == 1 {
+        return Some(ehs.into_iter().next().unwrap());
+    }
+    if !ehs.is_empty() {
+        return None; // ambiguous within the EHS set
+    }
+    // Phase 3 — meteorological fallback, exactly one must validate.
+    let met: Vec<serde_json::Value> = [bds44(mb), bds45(mb)].into_iter().flatten().collect();
+    (met.len() == 1).then(|| met.into_iter().next().unwrap())
 }
 
 #[cfg(test)]
@@ -929,6 +1009,11 @@ mod bds_tests {
         [b[1], b[2], b[3], b[4], b[5], b[6], b[7]]
     }
 
+    /// Inverse of `mb_payload`: a 7-byte MB → the 56-bit payload integer.
+    fn payload56(mb: &[u8]) -> u64 {
+        mb.iter().fold(0u64, |v, &b| (v << 8) | b as u64)
+    }
+
     // Oracle: pyModeS v3 decode() on these frames (2026-06-11).
 
     #[test]
@@ -936,6 +1021,65 @@ mod bds_tests {
         let v = bds_infer(&mb_of("A000083E202CC371C31DE0AA1CCF")).unwrap();
         assert_eq!(v["bds"], "2,0");
         assert_eq!(v["callsign"], "KLM1017");
+    }
+
+    // Oracle: pyModeS bds10 / test_bds_commb TestBds10* golden frame
+    // (A800178D10010080F50000D5893C, full expected field dict).
+
+    #[test]
+    fn bds10_full_field_decode_matches_pymodes() {
+        let v = bds_infer(&mb_of("A800178D10010080F50000D5893C")).unwrap();
+        assert_eq!(v["bds"], "1,0");
+        assert_eq!(v["config"], false);
+        assert_eq!(v["overlay_command_capability"], false);
+        assert_eq!(v["acas_operational"], true);
+        assert_eq!(v["mode_s_subnetwork_version"], 0);
+        assert_eq!(v["transponder_level5"], false);
+        assert_eq!(v["mode_s_specific_services"], true);
+        assert_eq!(v["uplink_elm_throughput"], 0);
+        assert_eq!(v["downlink_elm_throughput"], 0);
+        assert_eq!(v["aircraft_identification_capability"], true);
+        assert_eq!(v["squitter_capability"], true);
+        assert_eq!(v["surveillance_identifier_code"], true);
+        assert_eq!(v["common_usage_gicb_capability"], true);
+        assert_eq!(v["acas_hybrid_surveillance"], false);
+        assert_eq!(v["acas_resolution_advisory"], true);
+        assert_eq!(v["acas_rtca_version"], 1);
+        assert_eq!(v["dte_status"], 0);
+    }
+
+    #[test]
+    fn bds10_validity_gates_match_pymodes() {
+        assert!(bds10(&mb_payload(0)).is_none());
+        // Wrong BDS id (0x20).
+        assert!(bds10(&mb_of("A0001838201584F23468207CDFA5")).is_none());
+        // Reserved bits 10–14 nonzero (set bit 9, 0-indexed → MB 10).
+        let golden = payload56(&mb_of("A800178D10010080F50000D5893C"));
+        assert!(bds10(&mb_payload(golden | (1 << (55 - 9)))).is_none());
+    }
+
+    // Oracle: pyModeS bds17 / test_bds_commb TestBds17* golden frame
+    // (A0000638FA81C10000000081A92F, full capability list).
+
+    #[test]
+    fn bds17_capability_list_matches_pymodes() {
+        let v = bds_infer(&mb_of("A0000638FA81C10000000081A92F")).unwrap();
+        assert_eq!(v["bds"], "1,7");
+        let expected = ["0,5", "0,6", "0,7", "0,8", "0,9", "2,0", "4,0", "5,0", "5,1", "5,2", "6,0"];
+        let got: Vec<&str> =
+            v["supported_bds"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn bds17_validity_gates_match_pymodes() {
+        let golden = payload56(&mb_of("A0000638FA81C10000000081A92F"));
+        assert!(bds17(&mb_payload(golden)).is_some());
+        assert!(bds17(&mb_payload(0)).is_none());
+        // Clear the mandatory BDS 2,0 capability (MB bit 7).
+        assert!(bds17(&mb_payload(golden & !(1 << (55 - 6)))).is_none());
+        // Trailing bits 25–56 nonzero (set bit 24, 0-indexed → MB 25).
+        assert!(bds17(&mb_payload(golden | (1 << (55 - 24)))).is_none());
     }
 
     // Oracle: pyModeS bds30 / test_bds_commb TestBds30* synthetic

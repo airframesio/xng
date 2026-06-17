@@ -29,6 +29,28 @@ within 10 s, local decode against a fix fresher than 180 s) mirrors the
 standard surveillance practice; SBS-1 output line format follows the de
 facto BaseStation convention as served by dump1090-family tools.
 
+## Comm-B BDS 1,0 / 1,7 — capability registers (2026-06)
+
+BDS 1,0 (Data Link Capability Report, ICAO Doc 9871 Table A-2-16 / Annex
+10 Vol IV §3.1.2.6.10.2: config flag, overlay-command, ACAS-operational,
+Mode-S subnetwork version, transponder level 5, Mode-S specific services,
+uplink/downlink ELM throughput, aircraft-ident / squitter / SIC / GICB
+capability, ACAS hybrid / RA / RTCA version, DTE status) and BDS 1,7
+(Common Usage GICB Capability Report: a 24-bit map, Table A-2-25, of the
+registers the transponder will report) MB-field layouts, validity gates
+(BDS id 0x10 + reserved-bits + OVC/subnet heuristic for 1,0; BDS-2,0-bit
+mandatory + 32 trailing-zero bits for 1,7), and the capability-map ordering
+were cross-checked against the pyModeS `bds10` / `bds17` decoders and their
+`test_bds_commb` golden frames (`A800178D10010080F50000D5893C` full field
+dict; `A0000638FA81C10000000081A92F` → [0,5 0,6 0,7 0,8 0,9 2,0 4,0 5,0 5,1
+5,2 6,0]) — facts/positions only, no code ported; those real vectors are
+vendored as `decode.rs` unit tests. `bds_infer` was restructured to the
+phased precedence of pyModeS `_infer.py`: a format-ID fast path (BDS 1,0 /
+1,7 / 2,0 / 3,0, mutually exclusive, first-match-wins) ahead of the EHS
+exactly-one heuristic set (4,0 / 5,0 / 6,0), ahead of the meteo fallback —
+which resolves the real BDS 1,7 vs 4,0 collision the old flat
+exactly-one rule could not.
+
 ## Comm-B BDS 3,0 — ACAS active RA (2026-06)
 
 BDS 3,0 (ACAS active Resolution Advisory) MB-field layout is ICAO Annex 10
