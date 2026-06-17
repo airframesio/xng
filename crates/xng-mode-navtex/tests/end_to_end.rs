@@ -24,7 +24,7 @@
 use xng_mode_navtex::ccir476::{
     CODE_FIGS, CODE_LTRS, CODE_TO_FIGS, CODE_TO_LTRS, CODE_ALPHA, CODE_REP,
 };
-use xng_mode_navtex::decode_symbols;
+use xng_mode_navtex::{decode_symbols, modulate, NavtexChannelDecoder, CHANNEL_RATE};
 
 /// Look up the CCIR 476 code for a single LTRS-shift glyph, straight from
 /// the oracle table (panics if not present, so a typo in the test fails
@@ -183,4 +183,116 @@ fn figures_shift_in_body() {
     let msg = decode_symbols(&stream, Some(FIRST_DATA_DX)).expect("decodes");
     assert_eq!(msg.text, "LAT 50 LON 10");
     assert_eq!(msg.message_number, Some(12));
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic IQ demod validation.
+//
+// These build the on-air FSK waveform for a KNOWN spec-derived NAVTEX frame
+// and run it through the real NavtexChannelDecoder (DDC + FSK discriminator +
+// 100 Bd timing + 7-bit packing + the verified decode core), asserting the
+// recovered header fields and body text. The modulate→demod path is
+// SELF-GENERATED (see modulate.rs / PROVENANCE.md): the CCIR 476 symbol codes
+// are oracle-anchored, the modulator just inverts the demod. The decode core
+// stays oracle-anchored by the symbol-stream tests above.
+// ---------------------------------------------------------------------------
+
+/// Build the interleaved DX/RX symbol stream for `frame`, with leading
+/// phasing pairs so the FEC-B phase finder has context.
+fn frame_to_symbols(frame: &str) -> Vec<u8> {
+    let codes = text_to_codes(frame);
+    let mut stream = vec![CODE_REP, CODE_ALPHA, CODE_REP, CODE_ALPHA];
+    stream.extend(interleave_fec_b(&codes));
+    stream
+}
+
+#[test]
+fn channel_decoder_recovers_message_from_synth_iq() {
+    let frame = "ZCZC CA23\r\nNAVAREA WARNING\r\nNNNN";
+    let symbols = frame_to_symbols(frame);
+
+    // Modulate at channel rate, carrier centered (offset 0) so no DDC needed.
+    let iq = modulate::burst_iq(&symbols, CHANNEL_RATE, 0.0, 0.8);
+
+    let mut dec = NavtexChannelDecoder::new(CHANNEL_RATE, 0.0).expect("decoder");
+    let frames = dec.process(&iq);
+
+    assert!(!frames.is_empty(), "should recover a NAVTEX frame from synth IQ");
+    let m = &frames[0].message;
+    assert!(m.header_ok, "header should parse: {m:?}");
+    assert_eq!(m.station, Some('C'));
+    assert_eq!(m.subject, Some('A'));
+    assert_eq!(m.subject_category.as_deref(), Some("Navigational warning"));
+    assert_eq!(m.message_number, Some(23));
+    assert_eq!(m.text, "NAVAREA WARNING");
+    assert!(m.end_ok, "NNNN end should be seen: {m:?}");
+
+    // dBFS level should be a finite, sane value for a unit-ish amplitude.
+    assert!(dec.level_dbfs().is_finite());
+}
+
+#[test]
+fn channel_decoder_recovers_with_carrier_offset_via_ddc_synth_iq() {
+    // Off-center carrier in a wider capture: the DDC must mix it down and the
+    // discriminator's DC tracker absorb the residual tuning error.
+    let frame = "ZCZC EB07\r\nGALE WARNING IN FORCE\r\nNNNN";
+    let symbols = frame_to_symbols(frame);
+
+    let capture_rate = 24_000.0;
+    let offset_hz = 3_000.0; // carrier 3 kHz off capture center
+    let iq = modulate::burst_iq(&symbols, capture_rate, offset_hz, 0.7);
+
+    let mut dec = NavtexChannelDecoder::new(capture_rate, offset_hz).expect("decoder");
+    let frames = dec.process(&iq);
+
+    assert!(!frames.is_empty(), "should recover through the DDC at an offset");
+    let m = &frames[0].message;
+    assert!(m.header_ok, "{m:?}");
+    assert_eq!(m.station, Some('E'));
+    assert_eq!(m.subject, Some('B'));
+    assert_eq!(m.message_number, Some(7));
+    assert_eq!(m.text, "GALE WARNING IN FORCE");
+}
+
+#[test]
+fn to_message_emits_navtex_body_from_synth_iq() {
+    use xng_types::{AppInfo, MessageBody, Mode, Provenance, StationIdentity};
+
+    // Station C, subject D (Search & rescue), serial 42.
+    let frame = "ZCZC CD42\r\nSAR OPERATION\r\nNNNN";
+    let symbols = frame_to_symbols(frame);
+    let iq = modulate::burst_iq(&symbols, CHANNEL_RATE, 0.0, 0.9);
+
+    let mut dec = NavtexChannelDecoder::new(CHANNEL_RATE, 0.0).expect("decoder");
+    let frames = dec.process(&iq);
+    assert!(!frames.is_empty());
+
+    let msg = xng_mode_navtex::to_message(
+        &frames[0],
+        518_000,
+        dec.level_dbfs(),
+        Provenance {
+            station: StationIdentity::new("TEST-NAVTEX"),
+            app: AppInfo::xng(),
+            sdr: None,
+            channel: None,
+        },
+    );
+
+    assert_eq!(msg.mode, Mode::Navtex);
+    assert_eq!(msg.frequency_hz, 518_000);
+    assert!(msg.decode.crc_ok, "fully framed ZCZC..NNNN should set crc_ok");
+    assert!(msg.signal.rssi_db.is_some());
+    assert!(msg.raw.is_some(), "wire symbols should travel as raw");
+    match &msg.body {
+        MessageBody::Navtex { kind, details } => {
+            assert_eq!(kind, "D", "B2 subject indicator (subject letter of CD42)");
+            assert_eq!(details["station"], "C");
+            assert_eq!(details["subject"], "D");
+            assert_eq!(details["subject_category"], "Search & rescue information, pirate warnings");
+            assert_eq!(details["message_number"], 42);
+            assert_eq!(details["text"], "SAR OPERATION");
+        }
+        other => panic!("expected MessageBody::Navtex, got {other:?}"),
+    }
 }

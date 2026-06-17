@@ -22,23 +22,32 @@
 //! End-to-end: [`decode_symbols`] takes an interleaved DX/RX symbol stream
 //! and returns a [`message::NavtexMessage`].
 //!
-//! # IQ demodulation (TODO — stretch goal, not yet implemented)
+//! # IQ front end
 //!
-//! [`demod_fsk`] is a documented placeholder for the IQ→symbols front end
-//! (100-baud ±85 Hz FSK discriminator, bit timing, 7-bit framing). It is
-//! intentionally unimplemented: an IQ demod cannot be verified against an
-//! external reference without a published IQ capture + ground-truth pair,
-//! so per the crate's verification rules it is left as a TODO rather than
-//! shipped unverified. The decode layer above is fully testable from a
-//! symbol stream and is the verified deliverable.
+//! [`NavtexChannelDecoder`] is the channelized IQ entry point, mirroring the
+//! AIS template: it owns an [`xng_dsp::Ddc`] that mixes a wideband capture by
+//! `freq_offset_hz` and decimates to [`CHANNEL_RATE`], then runs the
+//! narrow-shift FSK [`demod::FskDemod`] (frequency discriminator + 100 Bd
+//! timing recovery) to recover the CCIR 476 bit stream, packs it into 7-bit
+//! codes, and feeds the verified [`decode_symbols`] core. [`to_message`]
+//! normalizes a decoded message into the [`xng_types`] bus form.
+//!
+//! The DECODE core (tables, FEC-B, framing) stays oracle-anchored by its own
+//! tests; the modulate→demod path used to validate the front end is
+//! self-generated (see PROVENANCE.md and the `*_synth_iq` tests).
 
 pub mod ccir476;
+pub mod demod;
 pub mod fec;
 pub mod message;
+pub mod modulate;
 
 pub use message::NavtexMessage;
 
-use xng_dsp::IqSample;
+use chrono::Utc;
+use num_complex::Complex;
+use xng_dsp::{Ddc, IqSample};
+use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality};
 
 /// Decode an interleaved DX/RX CCIR 476 symbol stream into a structured
 /// NAVTEX message.
@@ -76,51 +85,194 @@ pub mod params {
     pub const FREQ_4209K5: u64 = 4_209_500;
 }
 
-/// IQ→symbol front end. **Not yet implemented** — see the crate docs.
+/// Internal demod sample rate: 48 samples per bit at 100 Bd. A clean
+/// integer multiple of the baud rate that resolves the ±85 Hz FSK swing
+/// with margin for the timing loop.
+pub const CHANNEL_RATE: f64 = 4_800.0;
+/// One-sided DDC passband. Comfortably passes both ±85 Hz FSK tones plus a
+/// realistic carrier tuning offset, while rejecting the adjacent NAVTEX
+/// channel (518 / 490 kHz are 28 kHz apart on MF, far outside this).
+pub const CHANNEL_PASSBAND_HZ: f64 = 250.0;
+
+/// IQ→symbol front end: convert channelized NAVTEX IQ to a CCIR 476 symbol
+/// stream via the narrow-shift FSK demod, then pack to 7-bit codes.
 ///
-/// The intended contract: given channelized IQ at `sample_rate` centered
-/// on the NAVTEX carrier, run a 100-baud ±85 Hz FSK discriminator with bit
-/// timing recovery and emit one CCIR 476 code per 7 demodulated bits.
-/// Returns the interleaved symbol stream for [`decode_symbols`].
-///
-/// Left as a TODO because it cannot be externally verified without a
-/// published IQ capture paired with ground-truth text.
-pub fn demod_fsk(_iq: &[IqSample], _sample_rate: f64) -> Result<Vec<u8>, NavtexError> {
-    Err(NavtexError::DemodNotImplemented)
+/// `sample_rate` must equal [`CHANNEL_RATE`]; the wideband case goes through
+/// [`NavtexChannelDecoder`], which owns the DDC. The returned codes are the
+/// interleaved DX/RX symbol stream for [`decode_symbols`]. `bit_phase`
+/// selects the 7-bit packing alignment (0..7).
+pub fn demod_fsk(iq: &[IqSample], sample_rate: f64, bit_phase: usize) -> Vec<u8> {
+    assert!(
+        (sample_rate - CHANNEL_RATE).abs() < 1e-6,
+        "demod_fsk expects channel-rate IQ ({CHANNEL_RATE} S/s)"
+    );
+    let mut demod = demod::FskDemod::new();
+    let mut bits = Vec::new();
+    demod.process(iq, &mut bits);
+    demod::pack_codes(&bits, bit_phase)
 }
 
-/// Errors from the NAVTEX core.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NavtexError {
-    /// The IQ front end is not implemented (stretch goal / TODO).
-    DemodNotImplemented,
+/// One fully decoded NAVTEX frame: the structured message plus the wire
+/// symbols it was recovered from and the phase that locked.
+#[derive(Debug, Clone)]
+pub struct NavtexFrame {
+    /// Parsed message (header fields, body text, end marker).
+    pub message: NavtexMessage,
+    /// The recovered DX/RX symbol stream (one 7-bit CCIR 476 code each).
+    pub symbols: Vec<u8>,
 }
 
-impl std::fmt::Display for NavtexError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NavtexError::DemodNotImplemented => {
-                write!(f, "NAVTEX IQ FSK demod not yet implemented (see crate docs)")
+/// Decodes one NAVTEX channel out of a wideband capture.
+///
+/// Mirrors the AIS [`xng_mode_ais::AisChannelDecoder`] contract: owns an
+/// internal [`Ddc`] that mixes by `freq_offset_hz` and decimates the capture
+/// to [`CHANNEL_RATE`], runs the FSK demod, and emits a [`NavtexFrame`] when
+/// a complete `ZCZC … NNNN` message is recovered.
+pub struct NavtexChannelDecoder {
+    ddc: Option<Ddc>,
+    demod: demod::FskDemod,
+    /// All bits demodulated so far for this channel (NAVTEX bursts are slow
+    /// and long; we buffer the channel's bit history and re-scan on flush).
+    bits: Vec<u8>,
+    channel_buf: Vec<Complex<f32>>,
+    /// Texts already reported, to avoid re-emitting the same message as the
+    /// buffer grows.
+    seen: Vec<String>,
+}
+
+impl NavtexChannelDecoder {
+    /// `input_rate` is any capture rate ≥ [`CHANNEL_RATE`]; a non-integer
+    /// multiple is resampled by the DDC. `freq_offset_hz` is the NAVTEX
+    /// channel center relative to the capture center (0 if the capture is
+    /// already centered on the carrier).
+    pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let ddc = if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+            None
+        } else {
+            Some(Ddc::new(input_rate, CHANNEL_RATE, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
+        };
+        Ok(Self {
+            ddc,
+            demod: demod::FskDemod::new(),
+            bits: Vec::new(),
+            channel_buf: Vec::new(),
+            seen: Vec::new(),
+        })
+    }
+
+    /// Feed capture IQ; returns newly completed NAVTEX frames.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<NavtexFrame> {
+        let channel: &[Complex<f32>] = match &mut self.ddc {
+            Some(ddc) => {
+                self.channel_buf.clear();
+                ddc.process(input, &mut self.channel_buf);
+                &self.channel_buf
+            }
+            None => input,
+        };
+        self.demod.process(channel, &mut self.bits);
+
+        // Try all seven 7-bit packing alignments and keep, for each, the
+        // message the verified core decodes. A NAVTEX frame is only reported
+        // once it has a parsed ZCZC header (so partial buffers don't emit
+        // junk) and it hasn't been reported before.
+        let mut out = Vec::new();
+        let mut best: Option<NavtexFrame> = None;
+        for phase in 0..7usize {
+            let symbols = demod::pack_codes(&self.bits, phase);
+            if symbols.len() < 4 {
+                continue;
+            }
+            if let Some(message) = decode_symbols(&symbols, None) {
+                if message.header_ok {
+                    // Prefer the alignment yielding the most valid codes /
+                    // the longest text (most fully recovered frame).
+                    let better = match &best {
+                        None => true,
+                        Some(b) => message.text.len() > b.message.text.len(),
+                    };
+                    if better {
+                        best = Some(NavtexFrame { message, symbols });
+                    }
+                }
             }
         }
+        if let Some(frame) = best {
+            let key = frame_key(&frame.message);
+            if !self.seen.contains(&key) {
+                self.seen.push(key);
+                out.push(frame);
+            }
+        }
+        out
+    }
+
+    /// Smoothed channel power level in dBFS.
+    pub fn level_dbfs(&self) -> f32 {
+        self.demod.level_dbfs()
     }
 }
 
-impl std::error::Error for NavtexError {}
+/// Dedup key: header identity + body text uniquely names a message.
+fn frame_key(m: &NavtexMessage) -> String {
+    format!(
+        "{:?}{:?}{:?}|{}",
+        m.station, m.subject, m.message_number, m.text
+    )
+}
+
+/// Convert a decoded NAVTEX frame into the normalized bus message.
+///
+/// `kind` is the B2 subject indicator (a single uppercase letter, or
+/// `"?"` when no header parsed). `details` is the [`NavtexMessage`] JSON.
+/// `decode.crc_ok` is set from `header_ok && end_ok` (a fully framed
+/// `ZCZC … NNNN` message). `raw` carries the recovered wire symbols.
+pub fn to_message(
+    f: &NavtexFrame,
+    frequency_hz: u64,
+    level_dbfs: f32,
+    source: Provenance,
+) -> Message {
+    let kind = f
+        .message
+        .subject
+        .map(|c| c.to_ascii_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string());
+    let details = serde_json::to_value(&f.message).unwrap_or(serde_json::Value::Null);
+    Message {
+        mode: Mode::Navtex,
+        timestamp: Utc::now(),
+        frequency_hz,
+        signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
+        decode: DecodeQuality {
+            crc_ok: f.message.header_ok && f.message.end_ok,
+            fec_corrected: None,
+            errors: None,
+        },
+        body: MessageBody::Navtex { kind, details },
+        raw: Some(f.symbols.clone()),
+        source,
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn demod_is_documented_todo() {
-        assert_eq!(demod_fsk(&[], 48_000.0), Err(NavtexError::DemodNotImplemented));
-    }
-
-    #[test]
     fn params_are_spec_values() {
         assert_eq!(params::BAUD, 100.0);
         assert_eq!(params::SHIFT_HZ, 85.0);
         assert_eq!(params::FREQ_518K, 518_000);
+    }
+
+    #[test]
+    fn channel_rate_is_integer_bit_multiple() {
+        // Whole samples per bit (clean 100 Bd timing).
+        let samples_per_bit = CHANNEL_RATE / params::BAUD;
+        assert_eq!(samples_per_bit.fract(), 0.0, "{samples_per_bit} samples/bit");
+        // Output rate must carry the two-sided passband (Nyquist).
+        let min_rate = 2.0 * CHANNEL_PASSBAND_HZ;
+        assert!(CHANNEL_RATE >= min_rate, "{CHANNEL_RATE} < {min_rate}");
     }
 }
