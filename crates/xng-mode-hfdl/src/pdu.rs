@@ -751,6 +751,7 @@ mod tests {
     fn systable_reassembles_across_mpdus() {
         let stations = vec![crate::systable::GroundStation {
             gs_id: 4,
+            gs_name: None, // name is derived on decode, not carried on the wire
             utc_sync: true,
             lat: 40.88,
             lon: -72.64,
@@ -771,6 +772,9 @@ mod tests {
         assert_eq!(ev2[1].kind, "systable-complete");
         assert_eq!(ev2[1].details["version"], 77);
         assert_eq!(ev2[1].details["stations"][0]["gs_id"], 4);
+        // Decode-side enrichment: the reassembled table carries the
+        // human-readable station name (dumphfdl's per-station `name` field).
+        assert_eq!(ev2[1].details["stations"][0]["gs_name"], "Riverhead, New York");
         assert_eq!(ev2[1].details["stations"][0]["frequencies"][0]["freq_hz"], 21_931_000);
     }
 

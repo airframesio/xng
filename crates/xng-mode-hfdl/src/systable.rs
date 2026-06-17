@@ -25,6 +25,12 @@ pub struct GsFrequency {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct GroundStation {
     pub gs_id: u8,
+    /// Human-readable station name from the built-in public ARINC HFDL GS
+    /// list (mirrors dumphfdl's per-station `name` JSON field, which it
+    /// fills from its config systable). Populated on decode; `None` for the
+    /// 12 unassigned IDs in 1..=17 and any ID outside that range.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gs_name: Option<String>,
     pub utc_sync: bool,
     pub lat: f64,
     pub lon: f64,
@@ -85,8 +91,10 @@ pub fn parse_stations(mut buf: &[u8]) -> Option<Vec<GroundStation>> {
                 }
             })
             .collect();
+        let gs_id = buf[0] & 0x7F;
         stations.push(GroundStation {
-            gs_id: buf[0] & 0x7F,
+            gs_id,
+            gs_name: crate::pdu::gs_name(gs_id).map(str::to_string),
             utc_sync: buf[0] & 0x80 != 0,
             lat,
             lon,
@@ -202,6 +210,7 @@ mod tests {
         vec![
             GroundStation {
                 gs_id: 1,
+                gs_name: None,
                 utc_sync: true,
                 lat: 37.0179,
                 lon: -122.9059,
@@ -214,6 +223,7 @@ mod tests {
             },
             GroundStation {
                 gs_id: 13,
+                gs_name: None,
                 utc_sync: true,
                 lat: -37.6691,
                 lon: 144.8410,
@@ -238,6 +248,23 @@ mod tests {
         assert!((parsed[0].lon + 122.9059).abs() < 0.001);
         assert_eq!(parsed[1].gs_id, 13);
         assert!((parsed[1].lat + 37.6691).abs() < 0.001);
+        // Decode-side enrichment from the built-in ARINC GS list: id 1 =
+        // San Francisco, id 13 = Santa Cruz, Bolivia (same public list
+        // asserted by pdu::gs_name and mirroring dumphfdl's `name`).
+        assert_eq!(parsed[0].gs_name.as_deref(), Some("San Francisco, USA"));
+        assert_eq!(parsed[1].gs_name.as_deref(), Some("Santa Cruz, Bolivia"));
+    }
+
+    #[test]
+    fn gs_name_none_for_unassigned_id() {
+        // ID 12 is one of the 12 holes in the public 1..=17 GS list; the
+        // decoded record must leave gs_name unset rather than invent a name.
+        let mut gs = sample_stations()[0].clone();
+        gs.gs_id = 12;
+        let body = build_gs_record(&gs);
+        let parsed = parse_stations(&body).expect("parses");
+        assert_eq!(parsed[0].gs_id, 12);
+        assert_eq!(parsed[0].gs_name, None);
     }
 
     #[test]

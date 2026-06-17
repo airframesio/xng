@@ -117,6 +117,27 @@ the flags and the 48-octet region against the real 21931 kHz capture's
 own decoded bytes (byte0 = 0x10 → rls/iso clear, version 0), i.e. against
 dumphfdl 1.7.0's ground truth on the same recording — not a loopback.
 
+## System-table (0xD0) station-name enrichment (2026-06, HFDL-6)
+
+The reassembled `SystemTable` GS records already matched dumphfdl 1.7.0
+src/systable.c `systable_decode_gs()` field-for-field (gs_id, utc_sync,
+lat/lon, spdu_version, freq_cnt, per-freq BCD frequency + master frame
+slot). The one in-memory field dumphfdl emits that we dropped is the
+per-station **name**: each decoded `GroundStation` now carries `gs_name`
+from the crate's built-in public ARINC HFDL GS list (`pdu::gs_name`),
+mirroring dumphfdl's per-station `name` JSON field. This is decode-side
+enrichment from the same station list already used (and asserted)
+elsewhere in the crate — it needs no external config file (the
+config-driven systable file / GS-name file is HFDL-2.x, deliberately out
+of scope here). Unassigned IDs (the 12 holes in 1..=17, or any ID outside
+it) leave `gs_name` unset rather than invent a name.
+
+Verification: `parse_stations` is asserted to populate the name for known
+IDs (1 → San Francisco, 13 → Santa Cruz) and to leave it `None` for an
+unassigned ID (12); the reassembly test asserts GS 4 → "Riverhead, New
+York" in the completed `systable-complete` event. The ID→name table is
+the public ARINC list, not a loopback.
+
 ## Coherent A1 sync (2026-06, demod v2 step 2)
 
 The quarter-sample coherent-correlation refinement after the
