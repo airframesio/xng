@@ -333,3 +333,65 @@ fn aklcdya_real_cpdlc_contact_with_unit_and_frequency() {
     assert_eq!(m.args, vec!["LUNBI", "AUCKLAND control", "123.900 MHz"]);
     assert_eq!(m.text, "AT LUNBI CONTACT AUCKLAND control 123.900 MHz");
 }
+
+
+// --- ACARS-2.4: H1 FPN flight-plan decode ---
+// Real off-air messages from airframes' acars-decoder-typescript
+// `Label_H1_FPN.test.ts` + acars-message-documentation `research/H1/FPN.md`
+// (https://app.airframes.io/messages/2161761202). The decode goes through
+// the full `decode("H1", ...)` path (H1 sublabel extraction must not eat
+// the `FPN/` text); waypoint coordinates use the documented decimal-minute
+// convention (KAYEX -> 36.487 N, 120.948 W in the TS test).
+#[test]
+fn h1_fpn_flight_plan_with_waypoints() {
+    let d = decode(
+        "H1",
+        "FPN/FNUAL1187/RP:DA:KSFO:AA:KPHX:F:KAYEX,N36292W120569..LOSHN,N35509W120000..BOILE,N34253W118016..BLH,N33358W114457DDFB",
+        true,
+    );
+    let Some(AcarsApp::FlightPlan(fp)) = d.app else {
+        panic!("expected FlightPlan: {:?}", d.app);
+    };
+    assert_eq!(fp.route_status, "Route Planned");
+    assert_eq!(fp.flight_number.as_deref(), Some("UAL1187"));
+    assert_eq!(fp.origin.as_deref(), Some("KSFO"));
+    assert_eq!(fp.destination.as_deref(), Some("KPHX"));
+    assert_eq!(fp.checksum, "0xddfb");
+    let names: Vec<&str> = fp.waypoints.iter().map(|w| w.name.as_str()).collect();
+    assert_eq!(names, ["KAYEX", "LOSHN", "BOILE", "BLH"]);
+    let kayex = fp.waypoints[0].position.expect("KAYEX position");
+    assert!(close3(kayex.latitude, 36.487), "lat {}", kayex.latitude);
+    assert!(close3(kayex.longitude, -120.948), "lon {}", kayex.longitude);
+}
+
+
+// --- ACARS-2.4: label 5Z United telex / structured downlink ---
+// Real documented examples from airframes' acars-decoder-typescript
+// `Label_5Z_Slash.test.ts` and acars-message-documentation `research/5Z.md`.
+#[test]
+fn label_5z_txt_telex() {
+    let d = decode("5Z", "/TXT\r\nDID U GET THE TIMES", true);
+    let Some(AcarsApp::Airline5z(a)) = d.app else {
+        panic!("expected 5Z: {:?}", d.app);
+    };
+    use xng_acars::airline5z::Airline5z;
+    assert_eq!(a, Airline5z::Text { text: "DID U GET THE TIMES".into() });
+}
+
+#[test]
+fn label_5z_b3_departure_clearance() {
+    // Label_5Z_Slash.test.ts "/B3 variant 2": DCA -> ORD, day 14, rwy 27C.
+    let d = decode("5Z", "/B3 DCAORD 14 R27C", true);
+    let Some(AcarsApp::Airline5z(a)) = d.app else {
+        panic!("expected 5Z: {:?}", d.app);
+    };
+    use xng_acars::airline5z::Airline5z;
+    let Airline5z::Typed { message_type, origin, destination, arrival_runway, day, .. } = a else {
+        panic!("expected typed");
+    };
+    assert_eq!(message_type, "B3");
+    assert_eq!(origin.as_deref(), Some("DCA"));
+    assert_eq!(destination.as_deref(), Some("ORD"));
+    assert_eq!(arrival_runway.as_deref(), Some("27C"));
+    assert_eq!(day, Some(14));
+}

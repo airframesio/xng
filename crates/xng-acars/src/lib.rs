@@ -9,10 +9,12 @@
 mod bits;
 
 pub mod adsc;
+pub mod airline5z;
 pub mod arinc622;
 pub mod cpdlc;
 pub mod block;
 pub mod cfb;
+pub mod fpn;
 pub mod media_adv;
 pub mod met;
 pub mod miam;
@@ -61,6 +63,11 @@ pub enum AcarsApp {
     QSeries(qseries::QSeries),
     /// H1 `#CFB` ("Crew Flight Bag") maintenance-telemetry family.
     Cfb(cfb::Cfb),
+    /// ARINC 702 flight plan (H1 `FPN/` preamble).
+    FlightPlan(fpn::FlightPlan),
+    /// Label 5Z "Airline Designated Downlink" (United telex / structured
+    /// free-text).
+    Airline5z(airline5z::Airline5z),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -108,10 +115,12 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
         // is recognized from the original text (the `#CFB` preamble is the
         // H1 `CF` sublabel, already stripped from `body`).
         "H1" => arinc622::parse(body, downlink)
+            .or_else(|| fpn::parse(body).map(AcarsApp::FlightPlan))
             .or_else(|| cfb::classify(text).map(AcarsApp::Cfb))
             .or_else(|| ohma::parse(body).map(|message| AcarsApp::Ohma { message })),
         "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
+        "5Z" => airline5z::parse(body).map(AcarsApp::Airline5z),
         _ => qseries::classify(label).map(AcarsApp::QSeries),
     };
 
@@ -144,6 +153,18 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
             format!("CFB {}", c.description)
         } else {
             format!("CFB {} ({})", c.subtype, c.description)
+        }),
+        AcarsApp::FlightPlan(fp) => Some(format!(
+            "FPN {}{}->{}",
+            fp.flight_number.as_deref().map(|f| format!("{f} ")).unwrap_or_default(),
+            fp.origin.as_deref().unwrap_or("?"),
+            fp.destination.as_deref().unwrap_or("?"),
+        )),
+        AcarsApp::Airline5z(a) => Some(match a {
+            airline5z::Airline5z::Text { text } => format!("5Z TXT {text}"),
+            airline5z::Airline5z::Typed { message_type, description, .. } => {
+                format!("5Z {message_type} ({description})")
+            }
         }),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(

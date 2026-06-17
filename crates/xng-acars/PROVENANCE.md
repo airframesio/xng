@@ -180,6 +180,34 @@ AUCKLAND control 123.900 MHz). FANSPositionReport (the deep position-report
 SEQUENCE) and RouteClearance trackDetail remain undecoded (reported as
 the bracketed template).
 
+## FLIGHTPLAN (FPN) + 5Z telex / structured free-text (2026-06, ACARS-2.4)
+
+`fpn.rs`: decodes the ARINC 702 flight plan carried on label H1 with the
+`FPN/` preamble — header (route status `RI`/`RP`, optional flight number
+`FN`, serial `SN`, timestamp `TS`), the `:`-separated key/value record
+(`DA` origin, `AA` destination, `CR` company route, `R` departure runway,
+`D` departure procedure, `A` arrival procedure, `AP` approach procedure,
+`F` aircraft route), the trailing 4-character message checksum, and the
+route waypoints (name + decoded position). Waypoint coordinates use the
+degrees-plus-decimal-minutes convention (`N40010` → 40° 01.0′ → 40.017°),
+reusing `position::decode_decimal_minutes`. Format, key table, status
+codes and the coordinate conversion are a clean-room reimplementation of
+airframes' own documentation and decoder: acars-message-documentation
+`research/H1/FPN.md` and acars-decoder-typescript `plugins/ARINC_702.ts`
++ `Label_H1_FPN.test.ts` (facts only). Tested against the real off-air
+example messages and their expected field/coordinate values in that test
+suite.
+
+`airline5z.rs`: decodes the label 5Z "Airline Designated Downlink"
+United-Airlines telex / structured free-text family — the `/TXT` plain
+telex message and the typed `/<TYPE> ...` downlinks (message-type table
+from United), with origin/destination (IATA) + day + arrival runway for
+the structured `B3` (request departure clearance) and `C3` (off message)
+variants. Clean-room reimplementation of acars-decoder-typescript
+`plugins/Label_5Z_Slash.ts` + `Label_5Z_Slash.test.ts` and
+acars-message-documentation `research/5Z.md` (facts only). Tested against
+the documented example messages and their expected fields.
+
 ## Raw MIN / 4th-char downlink rule (2026-06, ACARS-1.2)
 
 `min.rs`: splits the downlink Message Identifier Number the way libacars
