@@ -972,10 +972,8 @@ pub fn bds45(mb: &[u8]) -> Option<serde_json::Value> {
 ///    perturbs ELS/EHS decoding.
 pub fn bds_infer(mb: &[u8]) -> Option<serde_json::Value> {
     // Phase 1 — format-ID fast path, first match wins.
-    for d in [bds10(mb), bds17(mb), bds20(mb), bds30(mb)] {
-        if let Some(v) = d {
-            return Some(v);
-        }
+    if let Some(v) = [bds10(mb), bds17(mb), bds20(mb), bds30(mb)].into_iter().flatten().next() {
+        return Some(v);
     }
     // Phase 2 — heuristic EHS set, exactly one must validate.
     let ehs: Vec<serde_json::Value> =

@@ -89,6 +89,23 @@ exactly-one-validates set: `bds_infer` tries them only as a fallback when
 the ELS/EHS set is unambiguously empty, leaving existing decoding
 unperturbed. Emitted under `comm_b`.
 
+## Mode A/C reply decode (2026-06)
+
+The Mode A/C information-word decode (`mode_ac.rs`) — the 16-bit Mode A
+pulse word → 4-digit octal squawk (`word & 0x7777`) + SPI/Ident pulse
+(`0x0080`), and the Mode A→Mode C Gillham altitude ladder — uses the
+documented dump1090 / readsb pulse layout and `internalModeAToModeC`
+algorithm (protocol facts only). For verification the upstream dump1090 C
+function was compiled verbatim and run as an independent external oracle to
+emit (mode_a → altitude) reference pairs (e.g. 0x0020 → −1000 ft, 0x0320 →
+1000 ft, 0x4220 → 5000 ft, 0x5124 → 35000 ft, 0x5424 → 38000 ft, 0x6520 →
+10000 ft; 0x1000 / 0x0050 invalid) and squawk/SPI pairs from
+`decodeModeAMessage`; those values are vendored as the `mode_ac.rs` unit
+tests — a separate authoritative decoder, not an encode→decode loopback.
+Only the deterministic decode kernel is implemented; the RF framing-pulse
+demodulation (a distinct magnitude-domain signal path) is deferred, so this
+module is the decode side a future Mode A/C demod would feed.
+
 ## DF18 CF-field source classification (2026-06)
 
 The DF18 Control Field (frame bits 5–7) classification — CF=0 ADS-B

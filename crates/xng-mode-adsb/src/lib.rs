@@ -12,6 +12,7 @@
 pub mod decode;
 pub mod demod;
 pub mod frame;
+pub mod mode_ac;
 pub mod modulate;
 
 use chrono::Utc;
