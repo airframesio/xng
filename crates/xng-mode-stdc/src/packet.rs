@@ -166,6 +166,41 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
 }
 
+/// ITA2 / Baudot letters (LTRS) shift, indexed by the 5-bit code 0..31.
+/// Standard International Telegraph Alphabet No. 2 (ITU-T); the letters
+/// column is universal. Empty string = shift/control with no glyph.
+const ITA2_LTRS: [&str; 32] = [
+    "\0", "E", "\n", "A", " ", "S", "I", "U", // 0-7  (2=LF, 4=SPACE)
+    "\r", "D", "R", "J", "N", "F", "C", "K", // 8-15 (8=CR)
+    "T", "Z", "L", "W", "H", "Y", "P", "Q", // 16-23
+    "O", "B", "G", "", "M", "X", "V", "", // 24-31 (27=FIGS, 31=LTRS)
+];
+/// ITA2 / Baudot figures (FIGS) shift, ITU-T international variant.
+const ITA2_FIGS: [&str; 32] = [
+    "\0", "3", "\n", "-", " ", "'", "8", "7", //
+    "\r", "\u{5}", "4", "\u{7}", ",", "!", ":", "(", //
+    "5", "+", ")", "2", "\u{a3}", "6", "0", "1", //
+    "9", "?", "&", "", ".", "/", ";", "", //
+];
+
+/// Decode ITA2/Baudot text (EGC presentation code 6). Each on-air byte
+/// carries one 5-bit ITA2 code in its low bits; LTRS (0x1F) / FIGS
+/// (0x1B) select the letters/figures column. Oracle for the alphabet is
+/// the ITU-T ITA2 standard table (deterministic, external reference).
+pub fn ita2_decode(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut figs = false;
+    for &b in bytes {
+        let code = (b & 0x1F) as usize;
+        match code {
+            0x1F => figs = false, // LTRS
+            0x1B => figs = true,  // FIGS
+            _ => out.push_str(if figs { ITA2_FIGS[code] } else { ITA2_LTRS[code] }),
+        }
+    }
+    out
+}
+
 /// EGC address length by service code.
 fn egc_addr_len(service: u8) -> usize {
     match service {
@@ -366,6 +401,8 @@ fn looks_textual(payload: &[u8]) -> bool {
 fn decode_payload(presentation: u8, payload: &[u8]) -> (Option<String>, serde_json::Value) {
     match presentation {
         0 => (Some(ia5(payload)), json!({})),
+        // Presentation 6 = ITA2 / Baudot (5-bit, one code per byte).
+        6 => (Some(ita2_decode(payload)), json!({ "encoding": "ita2" })),
         // Unknown presentation codes: decode as IA5 when the bytes are
         // overwhelmingly printable, otherwise keep hex.
         _ if looks_textual(payload) => (
@@ -714,13 +751,19 @@ mod tests {
         assert!(!checksum_ok(&bad));
     }
 
-    /// Build a medium-format EGC packet (0xB0/B1/B2).
+    /// Build a medium-format EGC packet (0xB0/B1/B2) with IA5 presentation.
     fn egc_packet(desc: u8, service: u8, cont: bool, prio: u8, seq: u16, pkt_no: u8, text: &[u8]) -> Vec<u8> {
+        egc_packet_pres(desc, service, cont, prio, seq, pkt_no, 0, text)
+    }
+
+    /// Build a medium-format EGC packet with an explicit presentation code.
+    #[allow(clippy::too_many_arguments)]
+    fn egc_packet_pres(desc: u8, service: u8, cont: bool, prio: u8, seq: u16, pkt_no: u8, presentation: u8, text: &[u8]) -> Vec<u8> {
         let alen = egc_addr_len(service);
         let mut body = vec![desc, 0u8, service, ((cont as u8) << 7) | (prio << 5) | 1];
         body.extend(seq.to_be_bytes());
         body.push(pkt_no);
-        body.push(0); // IA5
+        body.push(presentation);
         body.extend(std::iter::repeat(0xAB).take(alen));
         body.extend(text);
         body[1] = (body.len() + 2 - 2) as u8; // medium length = total-2
@@ -969,6 +1012,35 @@ mod tests {
         let e = &p.parse_frame(&frame)[0];
         assert_eq!(e.details["area"]["shape"], "circular");
         assert_eq!(e.details["area"]["c2"], 0x14);
+    }
+
+    #[test]
+    fn ita2_decode_matches_standard_alphabet() {
+        // STDC-6. Oracle: ITU-T ITA2 standard alphabet (deterministic).
+        // "HELLO": H=0x14 E=0x01 L=0x12 L=0x12 O=0x18 (LTRS shift).
+        assert_eq!(ita2_decode(&[0x14, 0x01, 0x12, 0x12, 0x18]), "HELLO");
+        // FIGS shift (0x1B) then digits "12345":
+        // 1=0x17 2=0x13 3=0x01 4=0x0A 5=0x10.
+        assert_eq!(
+            ita2_decode(&[0x1B, 0x17, 0x13, 0x01, 0x0A, 0x10]),
+            "12345"
+        );
+        // SPACE = 0x04 in both shifts; shifting back to LTRS (0x1F).
+        // "A B": A=0x03 SP=0x04 B(LTRS)=0x19.
+        assert_eq!(ita2_decode(&[0x03, 0x04, 0x19]), "A B");
+        // Returning from FIGS to LTRS mid-stream: FIGS 5 LTRS E.
+        assert_eq!(ita2_decode(&[0x1B, 0x10, 0x1F, 0x01]), "5E");
+    }
+
+    #[test]
+    fn egc_presentation_6_decodes_ita2() {
+        let mut p = PacketParser::new();
+        // Presentation byte 6 selects ITA2; payload encodes "SOS".
+        // S=0x05 O=0x18 S=0x05.
+        let frame = egc_packet_pres(0xB0, 0x00, false, 3, 1, 1, 6, &[0x05, 0x18, 0x05]);
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(e.text.as_deref(), Some("SOS"));
+        assert_eq!(e.details["encoding"], "ita2");
     }
 
     #[test]
