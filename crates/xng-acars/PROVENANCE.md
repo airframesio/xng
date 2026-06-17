@@ -147,6 +147,85 @@ POS / `4J` `PS`/`POS` degrees-plus-tenths-of-a-minute (`43312` →
 expected lat/lon in airframes' acars-decoder-typescript test suite and
 acars-message-documentation (`research/20/POS.md`, `H1/POS.md`, `4J.md`).
 
+## FANS-1/A additional argument readers (2026-06, ACARS-3.1)
+
+`cpdlc/mod.rs`: further element-argument readers for the shapes that
+previously fell to the bracketed template. PER constraints, CHOICE order
+and value scaling are taken from the libacars asn1c tables (MIT, as
+before) and the libacars text formatters (`asn1-format-cpdlc-text.c`):
+DistanceOffset (CHOICE Nm 1..128 / Km 1..256, integer units), Distance
+(CHOICE Nm 0..9999 tenths / Km 1..1024), Frequency (CHOICE hf
+2850..28000 kHz / vhf 117000..138000 kHz / uhf 225000..399975 kHz both
+rendered in MHz / 12-char NumericString satchannel), BeaconCode
+(SEQUENCE OF SIZE(4) of octal digit 0..7), ProcedureName (SEQUENCE type
+0..2 + IA5 1..6 + optional transition), Altimeter (CHOICE english
+2200..3200 inHg×0.01 / metric 7500..12500 hPa×0.1), ATISCode (IA5
+SIZE 1), RemainingFuel (HH:MM) + RemainingSouls (1..1024),
+ErrorInformation (ENUM 0..16, labels from FANSErrorInformation.c),
+VersionNumber (0..15), ICAOfacilitydesignation (IA5 SIZE 4), Tp4table /
+ToFrom (ENUM 0..1), ICAOUnitName (facility-id CHOICE designation/name +
+function ENUM 0..7) and ICAOUnitNameFrequency, plus the FANSPosition
+`placeBearingDistance` CHOICE alternative (fixName + optional lat/lon +
+degrees + distance). Composite elements (DistanceOffsetDirection,
+PositionICAOunitnameFrequency, TimeDistanceToFromPosition, ...) compose
+these readers.
+
+Verification: each new shape is pinned to a spec-derived UPER body whose
+EXPECTED decode was independently confirmed by running the same body,
+wrapped in a valid ARINC-622 envelope, through the installed libacars
+reference decoder (`decode_acars_apps`) — not an encode→decode loopback.
+The headline case is a real off-air message from libacars'
+`examples/decode_acars_apps.c` (`/AKLCDYA.AT1.9M-MTB...`, uM118 CONTACT
+AUCKLAND control 123.900 MHz). FANSPositionReport (the deep position-report
+SEQUENCE) and RouteClearance trackDetail remain undecoded (reported as
+the bracketed template).
+
+## FLIGHTPLAN (FPN) + 5Z telex / structured free-text (2026-06, ACARS-2.4)
+
+`fpn.rs`: decodes the ARINC 702 flight plan carried on label H1 with the
+`FPN/` preamble — header (route status `RI`/`RP`, optional flight number
+`FN`, serial `SN`, timestamp `TS`), the `:`-separated key/value record
+(`DA` origin, `AA` destination, `CR` company route, `R` departure runway,
+`D` departure procedure, `A` arrival procedure, `AP` approach procedure,
+`F` aircraft route), the trailing 4-character message checksum, and the
+route waypoints (name + decoded position). Waypoint coordinates use the
+degrees-plus-decimal-minutes convention (`N40010` → 40° 01.0′ → 40.017°),
+reusing `position::decode_decimal_minutes`. Format, key table, status
+codes and the coordinate conversion are a clean-room reimplementation of
+airframes' own documentation and decoder: acars-message-documentation
+`research/H1/FPN.md` and acars-decoder-typescript `plugins/ARINC_702.ts`
++ `Label_H1_FPN.test.ts` (facts only). Tested against the real off-air
+example messages and their expected field/coordinate values in that test
+suite.
+
+`airline5z.rs`: decodes the label 5Z "Airline Designated Downlink"
+United-Airlines telex / structured free-text family — the `/TXT` plain
+telex message and the typed `/<TYPE> ...` downlinks (message-type table
+from United), with origin/destination (IATA) + day + arrival runway for
+the structured `B3` (request departure clearance) and `C3` (off message)
+variants. Clean-room reimplementation of acars-decoder-typescript
+`plugins/Label_5Z_Slash.ts` + `Label_5Z_Slash.test.ts` and
+acars-message-documentation `research/5Z.md` (facts only). Tested against
+the documented example messages and their expected fields.
+
+## Raw MIN / 4th-char downlink rule (2026-06, ACARS-1.2)
+
+`min.rs`: splits the downlink Message Identifier Number the way libacars
+(`acars.c`) and acarsdec do — the 3-character message number (`msg_num`)
+plus the 4th character (`msg_num_seq`), the per-message sequence
+character. The block-id class follows libacars' `IS_DOWNLINK_BLK(bid) =
+(bid >= '0' && bid <= '9')`, and the reassembly sequence index is
+`msg_num_seq - 'A'` (`acars.c` `.seq_num = down ? msg->msg_num_seq - 'A'
+: ...`, `.seq_num_first = 0`). The 4th-character edge cases are handled
+explicitly: only `'A'..='Z'` yields a sequence index; other 4th bytes
+(digits, punctuation, the `'.'` libacars substitutes for embedded NULs)
+leave the index unset rather than producing a bogus value. `block.rs`
+surfaces the split on `AcarsBlock::min` (a crate-local field — the shared
+`AcarsCore::msg_num` keeps the combined 4-character value for
+back-compat), and `reasm.rs` now derives its downlink sequence from the
+same `min::split_downlink` helper. Verified against the libacars `acars.c`
+field layout (`msg_num[4]` + `msg_num_seq`).
+
 ## MIAM file-transfer reassembly (2026-06)
 
 File transfers spanning multiple label-MA messages reassemble per the
