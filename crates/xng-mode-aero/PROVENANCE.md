@@ -164,6 +164,23 @@ P-channel SUs are classified into JSON values surfaced as
   - 0x07 GES_beam_support and 0x0A broadcast_index: named by JAERO with no
     further field decode; surfaced as named events (raw bytes carried).
   byteN above = our su[N-1] (JAERO's 1-based octet indexing).
+- AERO-1.4 — remaining P-channel control/user-data types JAERO enumerates
+  in `AEROTypeP` (`aerol.h`); only 0x40 carries fields JAERO decodes:
+  - 0x40 P_R_channel_control_ISU: GES = octet 5 (su[4]); bit-rate code =
+    (byte8>>4)&0x0F (su[7]) mapped through JAERO's table
+    {0→600, 1→1200, 2→2400, 3→4800, 4→6000, 5→5250, 6→10500, 7→8400,
+    9→21000; 8 and ≥10 reserved → JAERO −1, field omitted}; Pd channel =
+    ((byte9&0x7F)<<8)|byte10 (su[8]/su[9]) → ×0.0025+1510.0 MHz; spot-beam =
+    byte9 bit 7. Surfaced as the Pd-carrier advert (`pd_mhz`, `bit_rate`,
+    `spotbeam`, `ges_id`). (JAERO `aerol.cpp` `P_R_channel_control_ISU`.)
+  - 0x28 Data_EIRP_table_broadcast_complete_sequence, 0x41
+    T_channel_control_ISU, 0x61 Request_for_acknowledgement (RQA), 0x62
+    Acknowledge (RACK/TACK): JAERO names these and decodes no further
+    fields; surfaced as named events.
+  - 0x74/0x76 User_data_3-/4-octet_LSDU_RLS_P_channel: short LSDU user-data
+    types JAERO names but does not run through the ISU/SSU reassembler;
+    surfaced as a named `short-lsdu` event carrying the LSDU octet length
+    (3 for 0x74, 4 for 0x76).
 
 Channel/mode tagging (AERO-8.1): each `AeroEvent` carries the physical
 channel it came from. The L-band P-channel decoder (`AeroChannelDecoder`)

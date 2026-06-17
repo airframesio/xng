@@ -421,8 +421,117 @@ pub fn parse_p_su(su: &[u8]) -> Option<serde_json::Value> {
         0x07 => parse_beam_support(su),
         0x0A => parse_broadcast_index(su),
         0x0C => parse_satellite_id(su),
+        0x28 => parse_eirp_table(su),
+        0x40 => parse_pr_control_isu(su),
+        0x41 => parse_t_control_isu(su),
+        0x61 => parse_rqa(su),
+        0x62 => parse_rack_tack(su),
+        0x74 | 0x76 => parse_lsdu(su),
         _ => None,
     }
+}
+
+/// JAERO's P/R-channel-control bit-rate code → bps map (`aerol.cpp`
+/// `P_R_channel_control_ISU` handler, byte8 high nibble). Code 8 is
+/// reserved (JAERO falls through to default −1).
+fn control_isu_bitrate(code: u8) -> Option<u32> {
+    match code {
+        0 => Some(600),
+        1 => Some(1200),
+        2 => Some(2400),
+        3 => Some(4800),
+        4 => Some(6000),
+        5 => Some(5250),
+        6 => Some(10500),
+        7 => Some(8400),
+        9 => Some(21000),
+        _ => None, // JAERO bitrate = -1
+    }
+}
+
+/// Data EIRP-table broadcast, complete sequence (P-channel type 0x28).
+/// JAERO (`AEROTypeP::Data_EIRP_table_broadcast_complete_sequence`) names
+/// this type and decodes no further fields; we surface the named event.
+pub fn parse_eirp_table(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x28 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "eirp-table-broadcast" }))
+}
+
+/// P/R-channel control ISU (P-channel type 0x40): the GES advertises a
+/// Pd (packet-data) carrier — its frequency, bit rate, and whether it is
+/// a spot-beam carrier. JAERO (`aerol.cpp` `P_R_channel_control_ISU`):
+/// - GES   = octet 5                                   [byte5 = su[4]]
+/// - bitrate code = (byte8 >> 4) & 0x0F → bps table    [byte8 = su[7]]
+/// - channel = ((byte9 & 0x7F) << 8) | byte10          [byte9/10 = su[8]/su[9]]
+/// - freq = channel × 0.0025 + 1510.0 MHz; spot beam = byte9 bit 7.
+/// (byteN = our su[N-1], JAERO's 1-based octet indexing.)
+pub fn parse_pr_control_isu(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x40 {
+        return None;
+    }
+    let ges_id = su[4];
+    let bitrate_code = (su[7] >> 4) & 0x0F;
+    let channel = (((su[8] & 0x7F) as u32) << 8) | su[9] as u32;
+    let freq = channel as f64 * 0.0025 + 1510.0;
+    let mut v = serde_json::json!({
+        "su_type": "pr-channel-control-isu",
+        "ges_id": ges_id,
+        "pd_mhz": freq,
+        "spotbeam": su[8] & 0x80 != 0,
+    });
+    // JAERO maps the bit-rate code through a table; reserved codes (8 and
+    // ≥10) become −1 there — we omit the field rather than emit a bogus rate.
+    if let Some(br) = control_isu_bitrate(bitrate_code) {
+        v["bit_rate"] = serde_json::json!(br);
+    }
+    Some(v)
+}
+
+/// T-channel control ISU (P-channel type 0x41): JAERO names this type and
+/// decodes no further fields; we surface the named event.
+pub fn parse_t_control_isu(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x41 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "t-channel-control-isu" }))
+}
+
+/// Request for acknowledgement, RQA (P-channel type 0x61): JAERO names
+/// this type (`Request_for_acknowledgement_RQA_P_channel`) and decodes no
+/// further fields; we surface the named event.
+pub fn parse_rqa(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x61 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "request-for-acknowledgement" }))
+}
+
+/// Acknowledge, RACK/TACK (P-channel type 0x62): JAERO names this type
+/// (`Acknowledge_RACK_TACK_P_channel`) and decodes no further fields; we
+/// surface the named event.
+pub fn parse_rack_tack(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x62 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "acknowledge" }))
+}
+
+/// Short LSDU user-data ISU (P-channel types 0x74/0x76): JAERO names the
+/// 3-octet (0x74) and 4-octet (0x76) LSDU RLS P-channel user-data types
+/// and decodes no further fields (they are not run through the ISU/SSU
+/// reassembler), so we surface the named event with the LSDU length.
+pub fn parse_lsdu(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN {
+        return None;
+    }
+    let octets = match su[0] {
+        0x74 => 3,
+        0x76 => 4,
+        _ => return None,
+    };
+    Some(serde_json::json!({ "su_type": "short-lsdu", "lsdu_octets": octets }))
 }
 
 /// `MessageBody::Aero` kind tag for a structured P-SU value.
@@ -846,6 +955,110 @@ mod tests {
 
         assert!(parse_beam_support(&[0x0A; 12]).is_none());
         assert!(parse_broadcast_index(&[0x07; 12]).is_none());
+    }
+
+    /// AERO-1.4: P/R-channel control ISU 0x40. Field layout from JAERO
+    /// `aerol.cpp` `P_R_channel_control_ISU`: GES = octet 5 (su[4]),
+    /// bit-rate code = (byte8>>4)&0x0F mapped through JAERO's table,
+    /// channel = ((byte9&0x7F)<<8)|byte10 → ×0.0025+1510.0 MHz, spot-beam =
+    /// byte9 bit 7. byteN = su[N-1].
+    #[test]
+    fn pr_control_isu_decodes_jaero_layout() {
+        // GES 0x2A, bit-rate code 1 → 1200 bps, channel 0x0123 (no spot
+        // beam). byte8 = su[7] high nibble = code; byte9/10 = su[8]/su[9].
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x40;
+        su10[4] = 0x2A; // GES (octet 5)
+        su10[7] = 0x10; // byte8: bit-rate code 1 in high nibble
+        su10[8] = 0x01; // byte9 high (no spot-beam bit)
+        su10[9] = 0x23; // byte10
+        let su = su_with_crc(su10);
+        let v = parse_pr_control_isu(&su).unwrap();
+        assert_eq!(v["su_type"], "pr-channel-control-isu");
+        assert_eq!(v["ges_id"], 0x2A);
+        assert_eq!(v["bit_rate"], 1200);
+        assert_eq!(v["pd_mhz"], 0x0123 as f64 * 0.0025 + 1510.0);
+        assert_eq!(v["spotbeam"], false);
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "pr-channel-control-isu");
+
+        // Spot-beam carrier, bit-rate code 6 → 10500 bps.
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x40;
+        su10[4] = 0x11;
+        su10[7] = 0x60; // bit-rate code 6
+        su10[8] = 0x80 | 0x02; // spot beam + channel high
+        su10[9] = 0x00; // channel 0x0200
+        let su = su_with_crc(su10);
+        let v = parse_pr_control_isu(&su).unwrap();
+        assert_eq!(v["bit_rate"], 10500);
+        assert_eq!(v["spotbeam"], true);
+        assert_eq!(v["pd_mhz"], 0x0200 as f64 * 0.0025 + 1510.0);
+
+        // Reserved bit-rate code 8 → JAERO −1; we omit the field.
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x40;
+        su10[7] = 0x80; // code 8 (reserved)
+        let su = su_with_crc(su10);
+        let v = parse_pr_control_isu(&su).unwrap();
+        assert!(v.get("bit_rate").is_none());
+
+        // Whole JAERO bit-rate code table.
+        assert_eq!(control_isu_bitrate(0), Some(600));
+        assert_eq!(control_isu_bitrate(1), Some(1200));
+        assert_eq!(control_isu_bitrate(2), Some(2400));
+        assert_eq!(control_isu_bitrate(3), Some(4800));
+        assert_eq!(control_isu_bitrate(4), Some(6000));
+        assert_eq!(control_isu_bitrate(5), Some(5250));
+        assert_eq!(control_isu_bitrate(6), Some(10500));
+        assert_eq!(control_isu_bitrate(7), Some(8400));
+        assert_eq!(control_isu_bitrate(8), None);
+        assert_eq!(control_isu_bitrate(9), Some(21000));
+        assert_eq!(control_isu_bitrate(10), None);
+
+        assert!(parse_pr_control_isu(&[0x41; 12]).is_none());
+    }
+
+    /// AERO-1.4: the named-only P-channel control/user-data types JAERO
+    /// enumerates in `AEROTypeP` but decodes no further fields — EIRP-table
+    /// 0x28, T-channel-control-ISU 0x41, RQA 0x61, RACK/TACK 0x62, and the
+    /// short 3-/4-octet LSDU user-data types 0x74/0x76. We surface each as
+    /// its named event (LSDU also carries its octet length).
+    #[test]
+    fn named_only_control_types() {
+        let named = [
+            (0x28u8, "eirp-table-broadcast"),
+            (0x41, "t-channel-control-isu"),
+            (0x61, "request-for-acknowledgement"),
+            (0x62, "acknowledge"),
+        ];
+        for (ty, name) in named {
+            let mut su10 = vec![0u8; 10];
+            su10[0] = ty;
+            let su = su_with_crc(su10);
+            assert_eq!(parse_p_su(&su).unwrap()["su_type"], name, "type 0x{ty:02X}");
+        }
+        // Each handler rejects other types.
+        assert!(parse_eirp_table(&[0x41; 12]).is_none());
+        assert!(parse_t_control_isu(&[0x28; 12]).is_none());
+        assert!(parse_rqa(&[0x62; 12]).is_none());
+        assert!(parse_rack_tack(&[0x61; 12]).is_none());
+
+        // Short LSDU 0x74 (3 octets) / 0x76 (4 octets).
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x74;
+        let su = su_with_crc(su10);
+        let v = parse_p_su(&su).unwrap();
+        assert_eq!(v["su_type"], "short-lsdu");
+        assert_eq!(v["lsdu_octets"], 3);
+
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x76;
+        let su = su_with_crc(su10);
+        let v = parse_p_su(&su).unwrap();
+        assert_eq!(v["su_type"], "short-lsdu");
+        assert_eq!(v["lsdu_octets"], 4);
+
+        assert!(parse_lsdu(&[0x71; 12]).is_none());
     }
 
     #[test]

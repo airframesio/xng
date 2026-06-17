@@ -151,6 +151,62 @@ fn t_channel_assignment_decodes_end_to_end() {
 }
 
 #[test]
+fn pr_control_isu_decodes_end_to_end() {
+    // AERO-1.4: 0x40 P/R-channel control ISU through the full chain.
+    // GES 0x2A, bit-rate code 1 → 1200 bps, Pd channel 0x0123.
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x40;
+    su10[4] = 0x2A; // GES (octet 5)
+    su10[7] = 0x10; // byte8 high nibble = bit-rate code 1
+    su10[8] = 0x01; // byte9 (channel high, no spot beam)
+    su10[9] = 0x23; // byte10 (channel low)
+    let events = decode_su10(su10);
+    let v = events
+        .iter()
+        .find(|v| v["su_type"] == "pr-channel-control-isu")
+        .expect("pr-channel-control-isu decoded through the full chain");
+    assert_eq!(v["ges_id"], 0x2A);
+    assert_eq!(v["bit_rate"], 1200);
+    assert_eq!(v["pd_mhz"], 0x0123 as f64 * 0.0025 + 1510.0);
+    assert_eq!(v["spotbeam"], false);
+
+    // And it lands in MessageBody::Aero with the SU type as the kind.
+    let event = xng_mode_aero::AeroEvent {
+        user: su::AeroUserData {
+            aes_id: String::new(),
+            ges_id: 0x2A,
+            qno: 0,
+            refno: 0,
+            data: Vec::new(),
+        },
+        acars: None,
+        bit_rate: 600,
+        su_event: Some(v.clone()),
+        mode: Mode::AeroL,
+    };
+    let msg = to_message(&event, 1_545_000_000, -50.0, prov());
+    match msg.body {
+        MessageBody::Aero { kind, details } => {
+            assert_eq!(kind, "pr-channel-control-isu");
+            assert_eq!(details["bit_rate"], 1200);
+        }
+        other => panic!("expected MessageBody::Aero, got {other:?}"),
+    }
+}
+
+#[test]
+fn eirp_table_decodes_end_to_end() {
+    // AERO-1.4: 0x28 EIRP-table broadcast through the full chain.
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x28;
+    let events = decode_su10(su10);
+    assert!(
+        events.iter().any(|v| v["su_type"] == "eirp-table-broadcast"),
+        "eirp-table-broadcast decoded through the full chain"
+    );
+}
+
+#[test]
 fn satellite_id_decodes_end_to_end() {
     // AERO-1.3: 0x0C satellite_identification through the full chain.
     // satid 5, seqno 10, 150.0°E, Psmc1 channel 0x0200.
