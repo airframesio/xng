@@ -53,6 +53,11 @@ const PRE_SYMS: f64 = 64.0;
 pub struct DemodBurst {
     pub bits: Vec<u8>,
     pub cfo_hz: f64,
+    /// Per-bit reliability (|soft value|, larger = more confident), parallel
+    /// to `bits`, when the max-effort soft-decode path is enabled
+    /// (`XNG_IRIDIUM_MAX_EFFORT`); `None` on the default hard path. Derived
+    /// from each QPSK symbol's distance from its decision boundary (IRID-5).
+    pub soft: Option<Vec<f32>>,
 }
 
 pub struct IridiumDemod {
@@ -128,6 +133,11 @@ pub struct IridiumDemod {
     /// this lets more weak frames attempt the full decode, where the 24-bit CRC
     /// (false-pass ≈ 6e-8) rejects any junk. XNG_IRIDIUM_ACCESS_TOL.
     access_tol: usize,
+    /// Beyond-gr weak-frame recovery (IRID-5): attach per-bit soft reliabilities
+    /// to each burst so the downstream Chase-2 soft-decision BCH decoder can
+    /// recover near-threshold blocks that fail hard-decision BCH. Off by default
+    /// (the hard path is unchanged); set XNG_IRIDIUM_MAX_EFFORT to enable.
+    max_effort: bool,
 }
 
 impl IridiumDemod {
@@ -168,6 +178,7 @@ impl IridiumDemod {
             cfo_refine: env_f32("XNG_IRIDIUM_CFO_REFINE", 2.0) as i32,
             cfo_refine_step: env_f32("XNG_IRIDIUM_CFO_REFINE_STEP", 0.08),
             access_tol: env_f32("XNG_IRIDIUM_ACCESS_TOL", ACCESS_TOL as f32) as usize,
+            max_effort: std::env::var("XNG_IRIDIUM_MAX_EFFORT").map(|v| v != "0").unwrap_or(false),
         }
     }
 
@@ -515,7 +526,9 @@ impl IridiumDemod {
             if bits.len() >= 24 && access_errs <= self.access_tol {
                 // Total carrier offset: per-symbol rotation → Hz.
                 let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
-                out.push(DemodBurst { bits, cfo_hz });
+                // Legacy single-pass path: hard bits only. The soft-decode
+                // max-effort path runs through `acquire_multi`/`demod_from`.
+                out.push(DemodBurst { bits, cfo_hz, soft: None });
             }
             self.cursor = uw_pos + symbols.len() as f64 * self.sps;
         }
@@ -561,6 +574,12 @@ impl IridiumDemod {
         let pll_start = if self.pll_full { 0 } else { 12 };
         let mut peak_sq = 0.0f32;
         let mut weak_run = 0u32;
+        // Per-symbol soft confidence for the IRID-5 max-effort path: the symbol
+        // amplitude (a faded symbol is less trustworthy) attenuated by how close
+        // the derotated phase sits to a QPSK decision boundary (cos(2·residual)
+        // → 1 dead-on a quadrant axis, → 0 at the ±45° boundary). Both emitted
+        // bits of a symbol inherit this confidence. Empty on the hard path.
+        let mut sym_conf: Vec<f32> = Vec::new();
         loop {
             let sp = uw_pos + k as f64 * self.sps;
             let Some(s) = self.sample(sp) else { break };
@@ -595,6 +614,11 @@ impl IridiumDemod {
             if k >= pll_start {
                 carr += 0.2 * residual;
             }
+            if self.max_effort {
+                // amplitude × boundary-margin; clamp ≥0 so a wild residual can't
+                // make the confidence negative.
+                sym_conf.push(derot.norm() * (2.0 * residual).cos().max(0.0));
+            }
             symbols.push(q);
             k += 1;
             // With the gr end-of-frame rule, bound each read to one frame (gr's
@@ -611,13 +635,22 @@ impl IridiumDemod {
             return (None, n_sym);
         }
         let mut bits = Vec::with_capacity(symbols.len() * 2);
+        let mut soft: Vec<f32> = Vec::with_capacity(symbols.len() * 2);
         let mut old = 0u8;
-        for &s in &symbols {
+        for (i, &s) in symbols.iter().enumerate() {
             let d = (s + 4 - old) % 4;
             old = s;
             let m = DQPSK_MAP[d as usize];
             bits.push(m & 1);
             bits.push(m >> 1);
+            if self.max_effort {
+                // A differential decision is no more reliable than the weaker of
+                // the two symbols it spans (the current and the previous).
+                let prev = if i == 0 { sym_conf[i] } else { sym_conf[i - 1] };
+                let c = sym_conf[i].min(prev);
+                soft.push(c);
+                soft.push(c);
+            }
         }
         let valid = if self.abscheck {
             // gr-iridium check_sync_word: sum of absolute UW symbol distances
@@ -636,7 +669,8 @@ impl IridiumDemod {
         };
         if bits.len() >= 24 && valid {
             let cfo_hz = theta as f64 * SYMBOL_RATE / std::f64::consts::TAU;
-            (Some(DemodBurst { bits, cfo_hz }), n_sym)
+            let soft = if self.max_effort { Some(soft) } else { None };
+            (Some(DemodBurst { bits, cfo_hz, soft }), n_sym)
         } else {
             (None, n_sym)
         }

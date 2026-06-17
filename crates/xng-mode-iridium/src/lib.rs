@@ -68,7 +68,15 @@ impl IridiumChannelDecoder {
         let time = self.samples_seen as f64 / CHANNEL_RATE;
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
-            handle_bits(&burst.bits, time, 0.0, &mut self.sbd, &mut self.pager, &mut out);
+            handle_bits(
+                &burst.bits,
+                burst.soft.as_deref(),
+                time,
+                0.0,
+                &mut self.sbd,
+                &mut self.pager,
+                &mut out,
+            );
         }
         out
     }
@@ -80,30 +88,78 @@ impl IridiumChannelDecoder {
 
 /// Decode a demodulated burst bit stream (starting at the access code).
 pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
+    decode_bits_soft(bits, None)
+}
+
+/// Chase-2 soft-decode test-set exponent for the max-effort BCH path
+/// (`bch_repair_soft`); 5 → 32 test patterns per block. The AWGN sweep in
+/// `frame::tests` shows the per-block recovery rate plateauing by p≈5.
+const SOFT_CHASE_P: usize = 5;
+
+/// Decode a demodulated burst, optionally using per-bit soft reliabilities
+/// (`soft`, parallel to `bits`) for the IRID-5 weak-frame recovery path: a UW
+/// (access-code) error-correction pre-classify step plus Chase-2 soft-decision
+/// BCH on the RA/IBC/MS blocks. When `soft` is `None` this is bit-identical to
+/// the hard-decision decode (`decode_bits`), so default-effort behaviour is
+/// unchanged.
+pub fn decode_bits_soft(bits: &[u8], soft: Option<&[f32]>) -> Option<ira::IridiumFrame> {
+    // UW pre-classify (IRID-5): snap a near-threshold access code to its exact
+    // valid word so the data offset is correct even when the differential
+    // access decode carried a few bit errors. Falls back to the strict
+    // prefix-match when no soft path / no correction is wanted.
     let data = if bits.len() > 24 && bits[..24] == frame::ACCESS_DL[..] {
         &bits[24..]
     } else if bits.len() > 24 && bits[..24] == frame::ACCESS_UL[..] {
         &bits[24..]
+    } else if soft.is_some() && frame::correct_access(bits, 5).is_some() {
+        // Max-effort: accept a UW-correctable access code (≤5 of 24 bits). The
+        // payload offset (24) is fixed; the downstream BCH/CRC still arbitrate.
+        &bits[24..]
     } else {
         return None;
     };
+    // Reliabilities for the post-access data bits (parallel to `data`).
+    let rel: Option<&[f32]> = soft.and_then(|s| (s.len() >= 24).then(|| &s[24..]));
     match frame::classify(data) {
         frame::FrameKind::Ra => {
-            let mut blocks = frame::ra_blocks(data);
-            frame::strip_fill(&mut blocks);
-            let (payload, fixed) = frame::ecc_blocks(&blocks, frame::RINGALERT_BCH_POLY);
+            let (payload, fixed) = match rel {
+                Some(r) if r.len() >= data.len() && data.len() >= 96 => {
+                    let (sblocks, srels) = frame::ra_blocks_soft(data, r);
+                    // strip_fill on the bit blocks; keep reliabilities aligned by
+                    // truncating to the same count.
+                    let mut sb = sblocks;
+                    let removed_pairs = frame::strip_fill(&mut sb) as usize;
+                    let keep = sb.len();
+                    let _ = removed_pairs;
+                    let sr: Vec<Vec<f32>> = srels.into_iter().take(keep).collect();
+                    frame::ecc_blocks_soft(&sb, &sr, frame::RINGALERT_BCH_POLY, SOFT_CHASE_P)
+                }
+                _ => {
+                    let mut blocks = frame::ra_blocks(data);
+                    frame::strip_fill(&mut blocks);
+                    frame::ecc_blocks(&blocks, frame::RINGALERT_BCH_POLY)
+                }
+            };
             ira::parse_ra(&payload, fixed, bits)
         }
         frame::FrameKind::Bc => {
             // BCH(7,3) header: first 3 bits are the broadcast type.
             let bc_type = data[..3].iter().fold(0u32, |v, &b| (v << 1) | b as u32);
-            let mut blocks = Vec::new();
-            for chunk in data[6..].chunks_exact(64) {
-                let (o, e) = frame::de_interleave2(chunk);
-                blocks.push(o);
-                blocks.push(e);
-            }
-            let (payload, fixed) = frame::ecc_blocks(&blocks, frame::RINGALERT_BCH_POLY);
+            let (payload, fixed) = match rel {
+                Some(r) if r.len() >= data.len() && data.len() > 6 => {
+                    let (blocks, rels) = frame::chunk_blocks_soft(data, r, 6);
+                    frame::ecc_blocks_soft(&blocks, &rels, frame::RINGALERT_BCH_POLY, SOFT_CHASE_P)
+                }
+                _ => {
+                    let mut blocks = Vec::new();
+                    for chunk in data[6..].chunks_exact(64) {
+                        let (o, e) = frame::de_interleave2(chunk);
+                        blocks.push(o);
+                        blocks.push(e);
+                    }
+                    frame::ecc_blocks(&blocks, frame::RINGALERT_BCH_POLY)
+                }
+            };
             if payload.is_empty() {
                 return None;
             }
@@ -112,14 +168,26 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
         frame::FrameKind::Ms => {
             // After the 32-bit messaging header: 64-bit chunks, each a
             // 2-way symbol interleave of two BCH blocks (toolkit MS path).
-            let mut blocks = Vec::new();
-            for chunk in data[32..].chunks_exact(64) {
-                let (o, e) = frame::de_interleave2(chunk);
-                blocks.push(o);
-                blocks.push(e);
-            }
-            frame::strip_fill(&mut blocks);
-            let (payload, _fixed) = frame::ecc_blocks(&blocks, frame::MESSAGING_BCH_POLY);
+            let payload = match rel {
+                Some(r) if r.len() >= data.len() && data.len() > 32 => {
+                    let (mut blocks, rels) = frame::chunk_blocks_soft(data, r, 32);
+                    let removed = frame::strip_fill(&mut blocks) as usize;
+                    let _ = removed;
+                    let keep = blocks.len();
+                    let rels: Vec<Vec<f32>> = rels.into_iter().take(keep).collect();
+                    frame::ecc_blocks_soft(&blocks, &rels, frame::MESSAGING_BCH_POLY, SOFT_CHASE_P).0
+                }
+                _ => {
+                    let mut blocks = Vec::new();
+                    for chunk in data[32..].chunks_exact(64) {
+                        let (o, e) = frame::de_interleave2(chunk);
+                        blocks.push(o);
+                        blocks.push(e);
+                    }
+                    frame::strip_fill(&mut blocks);
+                    frame::ecc_blocks(&blocks, frame::MESSAGING_BCH_POLY).0
+                }
+            };
             let blocks21: Vec<Vec<u8>> =
                 payload.chunks_exact(21).map(|c| c.to_vec()).collect();
             let f = ms::parse(&blocks21)?;
@@ -161,6 +229,7 @@ pub fn decode_bits(bits: &[u8]) -> Option<ira::IridiumFrame> {
 /// and wideband decoders).
 fn handle_bits(
     bits: &[u8],
+    soft: Option<&[f32]>,
     time: f64,
     freq: f64,
     sbd: &mut sbd::SbdReassembler,
@@ -177,7 +246,7 @@ fn handle_bits(
     if ones * 10 < payload.len() {
         return;
     }
-    if let Some(f) = decode_bits(bits) {
+    if let Some(f) = decode_bits_soft(bits, soft) {
         // Multi-part pages: emit the assembled text when complete.
         if f.kind == "msg" {
             let body = serde_json::from_value::<ms::MsFrame>(f.details.clone())
@@ -276,12 +345,23 @@ impl IridiumWidebandDecoder {
             // back to the unfiltered primary when the alternate is invalid
             // (a clean strong burst the matched filter would corrupt, or no
             // alternate). Exactly one SBD-reassembler feed per burst.
-            let bits = match &burst.alt_bits {
-                Some(alt) if bits_valid(alt) => alt.as_slice(),
-                _ => burst.bits.as_slice(),
+            // Soft reliabilities are parallel to the primary `bits`; they only
+            // apply when we decode the primary (the matched-filter alternate is
+            // a separately demodulated stream with its own — absent — soft data).
+            let (bits, soft): (&[u8], Option<&[f32]>) = match &burst.alt_bits {
+                Some(alt) if bits_valid(alt) => (alt.as_slice(), None),
+                _ => (burst.bits.as_slice(), burst.soft.as_deref()),
             };
             let mut frames = Vec::new();
-            handle_bits(bits, time, burst.offset_hz, &mut self.sbd, &mut self.pager, &mut frames);
+            handle_bits(
+                bits,
+                soft,
+                time,
+                burst.offset_hz,
+                &mut self.sbd,
+                &mut self.pager,
+                &mut frames,
+            );
             out.extend(frames.into_iter().map(|f| (burst.offset_hz, f)));
         }
         out
