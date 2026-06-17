@@ -57,4 +57,17 @@ fn decodes_real_egc_frame() {
         .find(|p| p.name == "signalling-channel")
         .expect("signalling-channel present");
     assert_eq!(sc.details["uplink_mhz"], 1636.64);
+    // STDC-2: the same real 0x6C descriptor carries the 8-bit services
+    // byte (0xB4) and 28 TDM-slot codes. Service bit names per inmarsatc
+    // getServices_short; the slot array is always 28 entries long.
+    assert_eq!(
+        sc.details["services"],
+        serde_json::json!([
+            "MaritimeDistressAlerting",
+            "InmarsatC",
+            "StoreFwd",
+            "FullDuplex"
+        ])
+    );
+    assert_eq!(sc.details["tdm_slots"].as_array().unwrap().len(), 28);
 }

@@ -147,6 +147,71 @@ fn sat_les(b: u8) -> serde_json::Value {
     })
 }
 
+/// Decode the 8-bit station-services bitfield (the high byte of the
+/// services word). Bit names verbatim from inmarsatc `getServices_short`
+/// (the same bits as the high byte of `getServices`). Only the set bits
+/// are returned, in MSB→LSB order, so the array doubles as a compact
+/// capability summary.
+pub fn services_short(is8: u8) -> Vec<&'static str> {
+    const NAMES: [&str; 8] = [
+        "MaritimeDistressAlerting", // 0x80
+        "SafetyNet",                // 0x40
+        "InmarsatC",                // 0x20
+        "StoreFwd",                 // 0x10
+        "HalfDuplex",               // 0x08
+        "FullDuplex",               // 0x04
+        "ClosedNetwork",            // 0x02
+        "FleetNet",                 // 0x01
+    ];
+    (0..8)
+        .filter(|i| is8 & (0x80 >> i) != 0)
+        .map(|i| NAMES[i])
+        .collect()
+}
+
+/// Decode the full 16-bit station-services bitfield. Bit names verbatim
+/// from inmarsatc `getServices` (the high byte matches `services_short`).
+/// Only the set bits are returned, in MSB→LSB order.
+pub fn services_full(iss: u16) -> Vec<&'static str> {
+    const NAMES: [&str; 16] = [
+        "MaritimeDistressAlerting", // 0x8000
+        "SafetyNet",                // 0x4000
+        "InmarsatC",                // 0x2000
+        "StoreFwd",                 // 0x1000
+        "HalfDuplex",               // 0x0800
+        "FullDuplex",               // 0x0400
+        "ClosedNetwork",            // 0x0200
+        "FleetNet",                 // 0x0100
+        "PrefixSF",                 // 0x0080
+        "LandMobileAlerting",       // 0x0040
+        "AeroC",                    // 0x0020
+        "ITA2",                     // 0x0010
+        "DATA",                     // 0x0008
+        "BasicX400",                // 0x0004
+        "EnhancedX400",             // 0x0002
+        "LowPowerCMES",             // 0x0001
+    ];
+    (0..16)
+        .filter(|i| iss & (0x8000 >> i) != 0)
+        .map(|i| NAMES[i])
+        .collect()
+}
+
+/// Decode the 28 TDM-slot allocation codes from a 0x6C signalling-channel
+/// descriptor. Per inmarsatc `decode_6C`: 7 bytes carry 28 two-bit slot
+/// codes, 4 per byte packed MSB→LSB (slot n at bits [7-2n .. 6-2n]).
+/// `bytes` must be the 7 TDM-slot bytes (body[4..11]).
+pub fn tdm_slots(bytes: &[u8]) -> Vec<u8> {
+    let mut slots = Vec::with_capacity(28);
+    for &b in bytes.iter().take(7) {
+        slots.push(b >> 6 & 0x3);
+        slots.push(b >> 4 & 0x3);
+        slots.push(b >> 2 & 0x3);
+        slots.push(b & 0x3);
+    }
+    slots
+}
+
 /// IA5 text: one character per byte, top bit masked.
 fn ia5(bytes: &[u8]) -> String {
     bytes
@@ -593,11 +658,21 @@ impl PacketParser {
             0xAB => ("les-list", None, json!({})),
             0x08 => ("ack-request", None, json!({})),
             0x6C if body.len() >= 4 => {
-                // body[2..4] = uplink channel-number word (inmarsatc 6C).
+                // Per inmarsatc decode_6C: body[1] = 8-bit services byte
+                // (the high byte of the 7D services word), body[2..4] =
+                // uplink channel-number word, body[4..11] = 28 TDM-slot
+                // codes (4 per byte). Surface whatever the packet carries.
                 let word = u16::from_be_bytes([body[2], body[3]]);
-                ("signalling-channel", None, json!({
+                let mut details = json!({
+                    "services": services_short(body[1]),
                     "uplink_mhz": round4(uplink_mhz(word)),
-                }))
+                });
+                if body.len() >= 11 {
+                    if let Some(obj) = details.as_object_mut() {
+                        obj.insert("tdm_slots".to_string(), json!(tdm_slots(&body[4..11])));
+                    }
+                }
+                ("signalling-channel", None, details)
             }
             0x6C => ("signalling-channel", None, json!({})),
             0x2A => ("inbound-message-ack", None, json!({})),
@@ -924,6 +999,80 @@ mod tests {
         let out = p.parse_frame(&frame);
         let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
         assert_eq!(sc.details["uplink_mhz"], 1636.64);
+    }
+
+    #[test]
+    fn services_short_bits_match_inmarsatc() {
+        // STDC-2. Oracle: inmarsatc getServices_short bit→name mapping.
+        // 0xB4 = 1011_0100 → bits 0x80,0x20,0x10,0x04.
+        assert_eq!(
+            services_short(0xB4),
+            vec!["MaritimeDistressAlerting", "InmarsatC", "StoreFwd", "FullDuplex"]
+        );
+        // All bits set → all eight names in MSB→LSB order.
+        assert_eq!(
+            services_short(0xFF),
+            vec![
+                "MaritimeDistressAlerting",
+                "SafetyNet",
+                "InmarsatC",
+                "StoreFwd",
+                "HalfDuplex",
+                "FullDuplex",
+                "ClosedNetwork",
+                "FleetNet",
+            ]
+        );
+        assert!(services_short(0x00).is_empty());
+    }
+
+    #[test]
+    fn services_full_bits_match_inmarsatc() {
+        // STDC-2. Oracle: inmarsatc getServices 16-bit bit→name mapping.
+        // The high byte matches services_short; check a low-byte bit too.
+        // 0x4020 = SafetyNet (0x4000) + AeroC (0x0020).
+        assert_eq!(services_full(0x4020), vec!["SafetyNet", "AeroC"]);
+        // LowPowerCMES is the least significant bit.
+        assert_eq!(services_full(0x0001), vec!["LowPowerCMES"]);
+        // High byte alone resolves identically to services_short.
+        assert_eq!(services_full(0xB400)[..], services_short(0xB4)[..]);
+        assert!(services_full(0x0000).is_empty());
+    }
+
+    #[test]
+    fn tdm_slots_unpacks_two_bit_codes() {
+        // STDC-2. Oracle: inmarsatc decode_6C — 4 two-bit slots per byte,
+        // MSB→LSB. The off-air 0x6C TDM bytes are 02 00 08 00 08 00 02.
+        let slots = tdm_slots(&[0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        assert_eq!(slots.len(), 28);
+        // 0x02 = 0000_0010 → slots 0,0,0,2.
+        assert_eq!(&slots[0..4], &[0, 0, 0, 2]);
+        // 0x08 = 0000_1000 → slots 0,0,2,0 (third byte starts at index 8).
+        assert_eq!(&slots[8..12], &[0, 0, 2, 0]);
+        // Last byte 0x02 → 0,0,0,2.
+        assert_eq!(&slots[24..28], &[0, 0, 0, 2]);
+        // A byte with every bit set yields four code-3 slots.
+        assert_eq!(tdm_slots(&[0xFF])[0..4], [3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn signalling_channel_surfaces_services_and_tdm_slots() {
+        let mut p = PacketParser::new();
+        // Off-air 0x6C body: services 0xB4, uplink word 0x2748, then the
+        // seven TDM-slot bytes.
+        let pkt = build_packet(&[0x6C, 0xB4, 0x27, 0x48, 0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = p.parse_frame(&frame);
+        let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
+        assert_eq!(
+            sc.details["services"],
+            json!(["MaritimeDistressAlerting", "InmarsatC", "StoreFwd", "FullDuplex"])
+        );
+        // 28 TDM slots; slot 3 = code 2, the rest of the first byte = 0.
+        assert_eq!(sc.details["tdm_slots"].as_array().unwrap().len(), 28);
+        assert_eq!(sc.details["tdm_slots"][3], 2);
+        assert_eq!(sc.details["tdm_slots"][0], 0);
     }
 
     #[test]
