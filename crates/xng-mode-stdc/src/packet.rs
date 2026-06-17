@@ -147,6 +147,129 @@ fn sat_les(b: u8) -> serde_json::Value {
     })
 }
 
+/// Decode the 8-bit station-services bitfield (the high byte of the
+/// services word). Bit names verbatim from inmarsatc `getServices_short`
+/// (the same bits as the high byte of `getServices`). Only the set bits
+/// are returned, in MSB→LSB order, so the array doubles as a compact
+/// capability summary.
+pub fn services_short(is8: u8) -> Vec<&'static str> {
+    const NAMES: [&str; 8] = [
+        "MaritimeDistressAlerting", // 0x80
+        "SafetyNet",                // 0x40
+        "InmarsatC",                // 0x20
+        "StoreFwd",                 // 0x10
+        "HalfDuplex",               // 0x08
+        "FullDuplex",               // 0x04
+        "ClosedNetwork",            // 0x02
+        "FleetNet",                 // 0x01
+    ];
+    (0..8)
+        .filter(|i| is8 & (0x80 >> i) != 0)
+        .map(|i| NAMES[i])
+        .collect()
+}
+
+/// Decode the full 16-bit station-services bitfield. Bit names verbatim
+/// from inmarsatc `getServices` (the high byte matches `services_short`).
+/// Only the set bits are returned, in MSB→LSB order.
+pub fn services_full(iss: u16) -> Vec<&'static str> {
+    const NAMES: [&str; 16] = [
+        "MaritimeDistressAlerting", // 0x8000
+        "SafetyNet",                // 0x4000
+        "InmarsatC",                // 0x2000
+        "StoreFwd",                 // 0x1000
+        "HalfDuplex",               // 0x0800
+        "FullDuplex",               // 0x0400
+        "ClosedNetwork",            // 0x0200
+        "FleetNet",                 // 0x0100
+        "PrefixSF",                 // 0x0080
+        "LandMobileAlerting",       // 0x0040
+        "AeroC",                    // 0x0020
+        "ITA2",                     // 0x0010
+        "DATA",                     // 0x0008
+        "BasicX400",                // 0x0004
+        "EnhancedX400",             // 0x0002
+        "LowPowerCMES",             // 0x0001
+    ];
+    (0..16)
+        .filter(|i| iss & (0x8000 >> i) != 0)
+        .map(|i| NAMES[i])
+        .collect()
+}
+
+/// Bulletin-board (0x7D) channel-type name. Values per inmarsatc
+/// decode_7D's channelType switch (the C++ switch omits `break`s, so its
+/// channelTypeName always falls through to "Reserved" — a bug; the
+/// intended per-value names are used here).
+pub fn channel_type_name(channel_type: u8) -> &'static str {
+    match channel_type {
+        1 => "NCS",
+        2 => "LES TDM",
+        3 => "Joint NCS and TDM",
+        4 => "ST-BY NCS",
+        _ => "Reserved",
+    }
+}
+
+/// Decode the bulletin-board (0x7D) status byte into its named boolean
+/// flags. Bit→name mapping verbatim from inmarsatc decode_7D's `status`
+/// string (Bauds600 0x80, Operational 0x40, InService 0x20, Clear 0x10,
+/// LinksOpen 0x08).
+pub fn bulletin_status(status_b: u8) -> serde_json::Value {
+    json!({
+        "bauds_600": status_b & 0x80 != 0,
+        "operational": status_b & 0x40 != 0,
+        "in_service": status_b & 0x20 != 0,
+        "clear": status_b & 0x10 != 0,
+        "links_open": status_b & 0x08 != 0,
+    })
+}
+
+/// Decode a station list (LES directory) of `count` 6-byte records
+/// starting at `recs`. Record layout per inmarsatc `getStations`:
+///   [0]    sat/LES byte (region in bits 7-6, LES id in bits 5-0)
+///   [1]    servicesStart byte
+///   [2..4] 16-bit services bitfield (`getServices`)
+///   [4..6] downlink channel-number word
+/// Returns one JSON object per station; stops early if the slice runs
+/// out. (inmarsatc's downlink formula in getStations reads byte j+4
+/// twice — a transcription slip; the field is the j+4..j+6 word, decoded
+/// here with the oracle-verified downlink formula.)
+pub fn parse_stations(recs: &[u8], count: usize) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = i * 6;
+        let r = match recs.get(off..off + 6) {
+            Some(r) => r,
+            None => break,
+        };
+        let dw = u16::from_be_bytes([r[4], r[5]]);
+        let iss = u16::from_be_bytes([r[2], r[3]]);
+        out.push(json!({
+            "sat_les": sat_les(r[0]),
+            "services_start": r[1],
+            "services": services_full(iss),
+            "downlink_mhz": round4(downlink_mhz(dw)),
+        }));
+    }
+    out
+}
+
+/// Decode the 28 TDM-slot allocation codes from a 0x6C signalling-channel
+/// descriptor. Per inmarsatc `decode_6C`: 7 bytes carry 28 two-bit slot
+/// codes, 4 per byte packed MSB→LSB (slot n at bits [7-2n .. 6-2n]).
+/// `bytes` must be the 7 TDM-slot bytes (body[4..11]).
+pub fn tdm_slots(bytes: &[u8]) -> Vec<u8> {
+    let mut slots = Vec::with_capacity(28);
+    for &b in bytes.iter().take(7) {
+        slots.push(b >> 6 & 0x3);
+        slots.push(b >> 4 & 0x3);
+        slots.push(b >> 2 & 0x3);
+        slots.push(b & 0x3);
+    }
+    slots
+}
+
 /// IA5 text: one character per byte, top bit masked.
 fn ia5(bytes: &[u8]) -> String {
     bytes
@@ -495,17 +618,44 @@ impl PacketParser {
         let body = &pkt[..pkt.len()];
         let (name, text, details): (&'static str, Option<String>, serde_json::Value) = match desc {
             0x7D if body.len() >= 4 => {
+                // Per inmarsatc decode_7D: networkVersion body[1],
+                // frameNumber body[2..4], signallingChannel body[4]>>2,
+                // count (body[5]>>4)*2, channelType body[6]>>5, local
+                // body[6]>>2&7, sat/les body[7], status byte body[8],
+                // 16-bit services body[9..11], randomInterval body[11].
                 let frame_number = u16::from_be_bytes([body[2], body[3]]);
-                (
-                    "bulletin-board",
-                    None,
-                    json!({
-                        "network_version": body.get(1),
-                        "frame_number": frame_number,
-                        "utc_time": frame_to_utc_hms(frame_number),
-                        "channel_type": body.get(6).map(|b| b >> 5),
-                    }),
-                )
+                let mut details = json!({
+                    "network_version": body.get(1),
+                    "frame_number": frame_number,
+                    "utc_time": frame_to_utc_hms(frame_number),
+                    "channel_type": body.get(6).map(|b| b >> 5),
+                });
+                if let Some(obj) = details.as_object_mut() {
+                    if let Some(&b) = body.get(4) {
+                        obj.insert("signalling_channel".to_string(), json!(b >> 2));
+                    }
+                    if let Some(&b) = body.get(5) {
+                        obj.insert("count".to_string(), json!((b >> 4 & 0x0F) * 2));
+                    }
+                    if let Some(&b) = body.get(6) {
+                        obj.insert("channel_type_name".to_string(), json!(channel_type_name(b >> 5)));
+                        obj.insert("local".to_string(), json!(b >> 2 & 0x07));
+                    }
+                    if let Some(&b) = body.get(7) {
+                        obj.insert("sat_les".to_string(), sat_les(b));
+                    }
+                    if let Some(&s) = body.get(8) {
+                        obj.insert("status".to_string(), bulletin_status(s));
+                    }
+                    if body.len() >= 11 {
+                        let iss = u16::from_be_bytes([body[9], body[10]]);
+                        obj.insert("services".to_string(), json!(services_full(iss)));
+                    }
+                    if let Some(&ri) = body.get(11) {
+                        obj.insert("random_interval".to_string(), json!(ri));
+                    }
+                }
+                ("bulletin-board", None, details)
             }
             0x27 if body.len() >= 8 => {
                 // The clear terminates the logical channel: emit any
@@ -524,10 +674,43 @@ impl PacketParser {
                 "sat_les": sat_les(body[5]),
                 "lcn": body.get(9),
             })),
-            0x83 if body.len() >= 8 => ("logical-channel-assignment", None, json!({
-                "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
-                "lcn": body.get(7),
-            })),
+            0x83 if body.len() >= 8 => {
+                // Per inmarsatc decode_83: mes_id body[2..5], sat/les
+                // body[5], status_bits body[6], lcn body[7], frame_length
+                // body[8], duration body[9], downlink word body[10..12],
+                // uplink word body[12..14], frame_offset body[14],
+                // packetDescriptor1 body[15]. Surface what is present so
+                // the message channel can actually be tuned.
+                let mut details = json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "lcn": body.get(7),
+                });
+                if let Some(obj) = details.as_object_mut() {
+                    obj.insert("sat_les".to_string(), sat_les(body[5]));
+                    obj.insert("status_bits".to_string(), json!(body[6]));
+                    if let Some(&fl) = body.get(8) {
+                        obj.insert("frame_length".to_string(), json!(fl));
+                    }
+                    if let Some(&d) = body.get(9) {
+                        obj.insert("duration".to_string(), json!(d));
+                    }
+                    if body.len() >= 12 {
+                        let dw = u16::from_be_bytes([body[10], body[11]]);
+                        obj.insert("downlink_mhz".to_string(), json!(round4(downlink_mhz(dw))));
+                    }
+                    if body.len() >= 14 {
+                        let uw = u16::from_be_bytes([body[12], body[13]]);
+                        obj.insert("uplink_mhz".to_string(), json!(round4(uplink_mhz(uw))));
+                    }
+                    if let Some(&off) = body.get(14) {
+                        obj.insert("frame_offset".to_string(), json!(off));
+                    }
+                    if let Some(&pd1) = body.get(15) {
+                        obj.insert("packet_descriptor1".to_string(), json!(pd1));
+                    }
+                }
+                ("logical-channel-assignment", None, details)
+            }
             0xAA => {
                 // Message data: assemble per logical channel.
                 if body.len() >= 7 {
@@ -588,26 +771,110 @@ impl PacketParser {
                 }
                 return;
             }
+            0x92 if body.len() >= 8 => {
+                // Per inmarsatc decode_92: body[1] = loginAckLength,
+                // body[2..5] = LES id (3 bytes), body[5..7] = downlink
+                // channel word, body[7] = stationStart; when
+                // loginAckLength > 7 a station list follows (count at
+                // body[8], 6-byte records from body[9]).
+                let login_ack_len = body[1];
+                let dw = u16::from_be_bytes([body[5], body[6]]);
+                let mut details = json!({
+                    "login_ack_len": login_ack_len,
+                    "les": hex(&body[2..5]),
+                    "downlink_mhz": round4(downlink_mhz(dw)),
+                    "station_start": body[7],
+                });
+                if login_ack_len > 7 && body.len() >= 9 {
+                    let count = body[8] as usize;
+                    let stations = parse_stations(&body[9..body.len() - 2], count);
+                    if let Some(obj) = details.as_object_mut() {
+                        obj.insert("station_count".to_string(), json!(body[8]));
+                        obj.insert("stations".to_string(), json!(stations));
+                    }
+                }
+                ("login-ack", None, details)
+            }
             0x92 => ("login-ack", None, json!({})),
+            0xA8 if body.len() >= 11 => {
+                // Per inmarsatc decode_A8: mes_id body[2..5], sat/les
+                // body[5], shortMessageLength body[9]; when that length
+                // is > 2 a short IA5 message runs from body[11] up to the
+                // checksum (body.len() == packetLength).
+                let sm_len = body[9];
+                let mut text = None;
+                if sm_len > 2 && body.len() >= 13 {
+                    text = Some(ia5(&body[11..body.len() - 2]));
+                }
+                ("confirmation", text, json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "sat_les": sat_les(body[5]),
+                    "short_message_len": sm_len,
+                }))
+            }
             0xA8 => ("confirmation", None, json!({})),
+            0xAB if body.len() >= 4 => {
+                // Per inmarsatc decode_AB: body[1] = lesListLength,
+                // body[2] = stationStart, body[3] = stationCount, then
+                // 6-byte station records from body[4].
+                let count = body[3] as usize;
+                let stations = parse_stations(&body[4..body.len().saturating_sub(2)], count);
+                ("les-list", None, json!({
+                    "les_list_len": body[1],
+                    "station_start": body[2],
+                    "station_count": body[3],
+                    "stations": stations,
+                }))
+            }
             0xAB => ("les-list", None, json!({})),
+            0x08 if body.len() >= 5 => {
+                // Per inmarsatc decode_08: sat/les body[1], lcn body[2],
+                // uplink channel word body[3..5] — the routing back to the
+                // ship's uplink channel for the acknowledgement.
+                let uw = u16::from_be_bytes([body[3], body[4]]);
+                ("ack-request", None, json!({
+                    "sat_les": sat_les(body[1]),
+                    "lcn": body[2],
+                    "uplink_mhz": round4(uplink_mhz(uw)),
+                }))
+            }
             0x08 => ("ack-request", None, json!({})),
             0x6C if body.len() >= 4 => {
-                // body[2..4] = uplink channel-number word (inmarsatc 6C).
+                // Per inmarsatc decode_6C: body[1] = 8-bit services byte
+                // (the high byte of the 7D services word), body[2..4] =
+                // uplink channel-number word, body[4..11] = 28 TDM-slot
+                // codes (4 per byte). Surface whatever the packet carries.
                 let word = u16::from_be_bytes([body[2], body[3]]);
-                ("signalling-channel", None, json!({
+                let mut details = json!({
+                    "services": services_short(body[1]),
                     "uplink_mhz": round4(uplink_mhz(word)),
-                }))
+                });
+                if body.len() >= 11 {
+                    if let Some(obj) = details.as_object_mut() {
+                        obj.insert("tdm_slots".to_string(), json!(tdm_slots(&body[4..11])));
+                    }
+                }
+                ("signalling-channel", None, details)
             }
             0x6C => ("signalling-channel", None, json!({})),
             0x2A => ("inbound-message-ack", None, json!({})),
             0x91 => ("distress-alert-ack", None, json!({})),
             0x9A => ("enhanced-data-report-ack", None, json!({})),
             0xA0 => ("distress-test-request", None, json!({})),
-            0xA3 if body.len() >= 8 => ("individual-poll", None, json!({
-                "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
-                "sat_les": sat_les(body[5]),
-            })),
+            0xA3 if body.len() >= 8 => {
+                // Per inmarsatc decode_A3: mes_id body[2..5], sat/les
+                // body[5]. When the packet is long enough (inmarsatc:
+                // packetLength >= 38) it carries a short IA5 message from
+                // body[13] up to the checksum. body.len() == packetLength.
+                let mut text = None;
+                if body.len() >= 38 && body.len() >= 15 {
+                    text = Some(ia5(&body[13..body.len() - 2]));
+                }
+                ("individual-poll", text, json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "sat_les": sat_les(body[5]),
+                }))
+            }
             0xAC => ("request-status", None, json!({})),
             0xAD => ("test-result", None, json!({})),
             _ => ("unknown", None, json!({ "hex": hex(body) })),
@@ -792,6 +1059,108 @@ mod tests {
     }
 
     #[test]
+    fn logical_channel_assignment_full_fields() {
+        // STDC-2. Field layout per inmarsatc decode_83 (spec-derived
+        // packet built to that exact byte map):
+        //   body[2..5]  mes_id              = C1 24 BB
+        //   body[5]     sat/les (0x44)      = AOR-E / les 104
+        //   body[6]     status_bits         = 0x12
+        //   body[7]     lcn                 = 0x21
+        //   body[8]     frame_length        = 0x28
+        //   body[9]     duration            = 0x0A
+        //   body[10..12] downlink word 8400 -> 1531.5 MHz
+        //   body[12..14] uplink word 0x2748 -> 1636.64 MHz
+        //   body[14]    frame_offset        = 0x03
+        //   body[15]    packetDescriptor1   = 0xAA
+        let mut parser = PacketParser::new();
+        let mut body = [
+            0x83, 0x00, 0xC1, 0x24, 0xBB, 0x44, 0x12, 0x21, 0x28, 0x0A, 0x20, 0xD0, 0x27, 0x48,
+            0x03, 0xAA,
+        ];
+        // Medium descriptor: body[1] = total length - 2 (incl. checksum).
+        body[1] = (body.len() + 2 - 2) as u8;
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let a = out
+            .iter()
+            .find(|p| p.name == "logical-channel-assignment")
+            .expect("assignment parses");
+        assert_eq!(a.details["mes_id"], "C124BB");
+        assert_eq!(a.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(a.details["sat_les"]["les"], 104);
+        assert_eq!(a.details["status_bits"], 0x12);
+        assert_eq!(a.details["lcn"], 0x21);
+        assert_eq!(a.details["frame_length"], 0x28);
+        assert_eq!(a.details["duration"], 0x0A);
+        assert_eq!(a.details["downlink_mhz"], 1531.5);
+        assert_eq!(a.details["uplink_mhz"], 1636.64);
+        assert_eq!(a.details["frame_offset"], 0x03);
+        assert_eq!(a.details["packet_descriptor1"], 0xAA);
+    }
+
+    #[test]
+    fn parse_stations_decodes_record_layout() {
+        // STDC-2. Record layout per inmarsatc getStations: 6 bytes each
+        // [sat/les, servicesStart, iss(16-bit), downlink word(16-bit)].
+        // Station 0: sat/les 0x44 (AOR-E les 104), servicesStart 0x01,
+        // iss 0x4020 (SafetyNet+AeroC), downlink word 8400 -> 1531.5 MHz.
+        let recs = [0x44, 0x01, 0x40, 0x20, 0x20, 0xD0];
+        let v = parse_stations(&recs, 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["sat_les"]["region"], "AOR-E");
+        assert_eq!(v[0]["sat_les"]["les"], 104);
+        assert_eq!(v[0]["services_start"], 0x01);
+        assert_eq!(v[0]["services"], json!(["SafetyNet", "AeroC"]));
+        assert_eq!(v[0]["downlink_mhz"], 1531.5);
+        // Short slice → stops early without panicking.
+        assert_eq!(parse_stations(&recs[..4], 2).len(), 0);
+    }
+
+    #[test]
+    fn les_list_fields_and_stations() {
+        // STDC-2. 0xAB layout per inmarsatc decode_AB: body[1] list len,
+        // body[2] stationStart, body[3] stationCount, 6-byte records from
+        // body[4]. Two stations: AOR-E les 104 and POR les 202.
+        let mut parser = PacketParser::new();
+        let mut body = vec![0xAB, 0x00, 0x05, 0x02];
+        body.extend([0x44, 0x01, 0x40, 0x20, 0x20, 0xD0]); // AOR-E les 104
+        body.extend([0x82, 0x02, 0x20, 0x00, 0x20, 0xD0]); // POR les 202
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let l = out.iter().find(|p| p.name == "les-list").expect("les-list parses");
+        assert_eq!(l.details["station_count"], 2);
+        assert_eq!(l.details["station_start"], 0x05);
+        let stations = l.details["stations"].as_array().unwrap();
+        assert_eq!(stations.len(), 2);
+        assert_eq!(stations[0]["sat_les"]["les"], 104);
+        assert_eq!(stations[1]["sat_les"]["region"], "POR");
+        assert_eq!(stations[1]["sat_les"]["les"], 202);
+    }
+
+    #[test]
+    fn login_ack_fields_and_station_list() {
+        // STDC-2. 0x92 layout per inmarsatc decode_92: body[1] ackLen,
+        // body[2..5] LES id, body[5..7] downlink word, body[7] start;
+        // when ackLen > 7, body[8] = count and records follow at body[9].
+        let mut parser = PacketParser::new();
+        let mut body = vec![0x92, 0x00, 0x12, 0x34, 0x56, 0x20, 0xD0, 0x77, 0x01];
+        body.extend([0x44, 0x01, 0x40, 0x20, 0x20, 0xD0]); // one station
+        body[1] = (body.len() + 2 - 2) as u8; // ackLen (= total-2) > 7
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let la = out.iter().find(|p| p.name == "login-ack").expect("login-ack parses");
+        assert_eq!(la.details["les"], "123456");
+        assert_eq!(la.details["downlink_mhz"], 1531.5);
+        assert_eq!(la.details["station_start"], 0x77);
+        assert_eq!(la.details["station_count"], 1);
+        assert_eq!(la.details["stations"][0]["sat_les"]["les"], 104);
+    }
+
+    #[test]
     fn individual_poll_fields() {
         let mut parser = PacketParser::new();
         // Medium format: b[1] = total length - 2.
@@ -801,6 +1170,98 @@ mod tests {
         let out = parser.parse_frame(&padded);
         let p = out.iter().find(|p| p.name == "individual-poll").expect("poll parses");
         assert_eq!(p.details["mes_id"], "C124BB");
+    }
+
+    #[test]
+    fn individual_poll_short_message_text() {
+        // STDC-2. 0xA3 short-message layout per inmarsatc decode_A3:
+        // mes_id body[2..5], sat/les body[5]; when the packet is long
+        // enough (packetLength >= 38) an IA5 message runs from body[13].
+        let mut parser = PacketParser::new();
+        // body[0..13] header (mes_id C1 24 BB at [2..5], sat/les 0x44 at
+        // [5]); message text fills body[13..]; total length lands at 40.
+        let mut body = vec![0xA3, 0x00, 0xC1, 0x24, 0xBB, 0x44, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(b"POLL ACK SHORT MESSAGE OK");
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        // Total packet length (incl. checksum) exceeds the inmarsatc
+        // short-message threshold (38), so the message is surfaced.
+        assert!(body.len() + 2 >= 38);
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let p = out.iter().find(|p| p.name == "individual-poll").expect("poll parses");
+        assert_eq!(p.details["mes_id"], "C124BB");
+        assert_eq!(p.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(p.text.as_deref(), Some("POLL ACK SHORT MESSAGE OK"));
+    }
+
+    #[test]
+    fn individual_poll_short_packet_has_no_text() {
+        // A short 0xA3 (below the inmarsatc length threshold) carries no
+        // short message — only the routing fields.
+        let mut parser = PacketParser::new();
+        let poll = build_packet(&[0xA3, 8, 0xC1, 0x24, 0xBB, 0x44, 0x01, 0x03]);
+        let mut frame = poll;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let p = out.iter().find(|p| p.name == "individual-poll").unwrap();
+        assert_eq!(p.text, None);
+        assert_eq!(p.details["mes_id"], "C124BB");
+    }
+
+    #[test]
+    fn confirmation_short_message_text() {
+        // STDC-2. 0xA8 layout per inmarsatc decode_A8: mes_id body[2..5],
+        // sat/les body[5], shortMessageLength body[9]; when > 2 the IA5
+        // message runs from body[11] up to the checksum.
+        let mut parser = PacketParser::new();
+        let msg = b"CONFIRMED";
+        // Header is body[0..11] (mes_id [2..5], sat/les [5], unknown1
+        // [6..9], shortMessageLength [9], unknown2 [10]); message at [11].
+        let mut body = vec![0xA8, 0x00, 0x12, 0x34, 0x56, 0x44, 0, 0, 0, msg.len() as u8, 0];
+        body.extend_from_slice(msg);
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let c = out.iter().find(|p| p.name == "confirmation").expect("confirmation parses");
+        assert_eq!(c.details["mes_id"], "123456");
+        assert_eq!(c.details["sat_les"]["les"], 104);
+        assert_eq!(c.details["short_message_len"], msg.len());
+        assert_eq!(c.text.as_deref(), Some("CONFIRMED"));
+    }
+
+    #[test]
+    fn confirmation_no_message_when_len_small() {
+        // shortMessageLength <= 2 → no short message surfaced.
+        let mut parser = PacketParser::new();
+        let mut body = vec![0xA8, 0x00, 0x12, 0x34, 0x56, 0x44, 0, 0, 0, 0x01, 0, 0];
+        body[1] = (body.len() + 2 - 2) as u8;
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let c = out.iter().find(|p| p.name == "confirmation").unwrap();
+        assert_eq!(c.text, None);
+        assert_eq!(c.details["short_message_len"], 1);
+    }
+
+    #[test]
+    fn ack_request_routing_fields() {
+        // STDC-2. 0x08 layout per inmarsatc decode_08: sat/les body[1],
+        // lcn body[2], uplink channel word body[3..5]. 0x08 is a short
+        // descriptor (length = (0x08 & 0x0F) + 1 = 9), so the body is
+        // 7 bytes + the 2-byte checksum build_packet appends.
+        let mut parser = PacketParser::new();
+        // sat/les 0x44 (AOR-E les 104), lcn 0x21, uplink word 0x2748.
+        let pkt = build_packet(&[0x08, 0x44, 0x21, 0x27, 0x48, 0x00, 0x00]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let a = out.iter().find(|p| p.name == "ack-request").expect("ack-request parses");
+        assert_eq!(a.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(a.details["sat_les"]["les"], 104);
+        assert_eq!(a.details["lcn"], 0x21);
+        assert_eq!(a.details["uplink_mhz"], 1636.64);
     }
 
     #[test]
@@ -872,6 +1333,69 @@ mod tests {
     }
 
     #[test]
+    fn channel_type_names_match_inmarsatc() {
+        // STDC-2. Names per inmarsatc decode_7D channelType (the C++
+        // switch's missing breaks are a bug; the per-value names are used).
+        assert_eq!(channel_type_name(1), "NCS");
+        assert_eq!(channel_type_name(2), "LES TDM");
+        assert_eq!(channel_type_name(3), "Joint NCS and TDM");
+        assert_eq!(channel_type_name(4), "ST-BY NCS");
+        assert_eq!(channel_type_name(0), "Reserved");
+        assert_eq!(channel_type_name(7), "Reserved");
+    }
+
+    #[test]
+    fn bulletin_status_flags_match_inmarsatc() {
+        // STDC-2. Bit→name per inmarsatc decode_7D status byte.
+        // 0xE8 = 1110_1000 → Bauds600, Operational, InService, LinksOpen.
+        let s = bulletin_status(0xE8);
+        assert_eq!(s["bauds_600"], true);
+        assert_eq!(s["operational"], true);
+        assert_eq!(s["in_service"], true);
+        assert_eq!(s["clear"], false);
+        assert_eq!(s["links_open"], true);
+        let z = bulletin_status(0x00);
+        assert_eq!(z["bauds_600"], false);
+        assert_eq!(z["links_open"], false);
+    }
+
+    #[test]
+    fn bulletin_board_full_fields() {
+        // STDC-2. Full 0x7D field map per inmarsatc decode_7D:
+        //   body[1]=networkVersion 1
+        //   body[2..4]=frameNumber 5987 (0x1763)
+        //   body[4]=0x08 -> signallingChannel = 0x08>>2 = 2
+        //   body[5]=0x30 -> count = (3)*2 = 6
+        //   body[6]=0x28 -> channelType = 1 (NCS), local = 2
+        //   body[7]=0x44 -> AOR-E les 104
+        //   body[8]=0x60 -> Operational + InService
+        //   body[9..11]=0x4000 -> SafetyNet
+        //   body[11]=0x05 -> randomInterval
+        let mut parser = PacketParser::new();
+        let bb = build_packet(&[
+            0x7D, 0x01, 0x17, 0x63, 0x08, 0x30, 0x28, 0x44, 0x60, 0x40, 0x00, 0x05,
+        ]);
+        let mut frame = bb;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let b = out.iter().find(|p| p.name == "bulletin-board").unwrap();
+        assert_eq!(b.details["frame_number"], 5987);
+        assert_eq!(b.details["utc_time"], "14:22:07");
+        assert_eq!(b.details["signalling_channel"], 2);
+        assert_eq!(b.details["count"], 6);
+        assert_eq!(b.details["channel_type"], 1);
+        assert_eq!(b.details["channel_type_name"], "NCS");
+        assert_eq!(b.details["local"], 2);
+        assert_eq!(b.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(b.details["sat_les"]["les"], 104);
+        assert_eq!(b.details["status"]["operational"], true);
+        assert_eq!(b.details["status"]["in_service"], true);
+        assert_eq!(b.details["status"]["clear"], false);
+        assert_eq!(b.details["services"], json!(["SafetyNet"]));
+        assert_eq!(b.details["random_interval"], 5);
+    }
+
+    #[test]
     fn egc_service_long_names_match_inmarsatc() {
         // Verbatim from inmarsatc getServiceCodeAndAddressName (oracle).
         assert_eq!(
@@ -924,6 +1448,80 @@ mod tests {
         let out = p.parse_frame(&frame);
         let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
         assert_eq!(sc.details["uplink_mhz"], 1636.64);
+    }
+
+    #[test]
+    fn services_short_bits_match_inmarsatc() {
+        // STDC-2. Oracle: inmarsatc getServices_short bit→name mapping.
+        // 0xB4 = 1011_0100 → bits 0x80,0x20,0x10,0x04.
+        assert_eq!(
+            services_short(0xB4),
+            vec!["MaritimeDistressAlerting", "InmarsatC", "StoreFwd", "FullDuplex"]
+        );
+        // All bits set → all eight names in MSB→LSB order.
+        assert_eq!(
+            services_short(0xFF),
+            vec![
+                "MaritimeDistressAlerting",
+                "SafetyNet",
+                "InmarsatC",
+                "StoreFwd",
+                "HalfDuplex",
+                "FullDuplex",
+                "ClosedNetwork",
+                "FleetNet",
+            ]
+        );
+        assert!(services_short(0x00).is_empty());
+    }
+
+    #[test]
+    fn services_full_bits_match_inmarsatc() {
+        // STDC-2. Oracle: inmarsatc getServices 16-bit bit→name mapping.
+        // The high byte matches services_short; check a low-byte bit too.
+        // 0x4020 = SafetyNet (0x4000) + AeroC (0x0020).
+        assert_eq!(services_full(0x4020), vec!["SafetyNet", "AeroC"]);
+        // LowPowerCMES is the least significant bit.
+        assert_eq!(services_full(0x0001), vec!["LowPowerCMES"]);
+        // High byte alone resolves identically to services_short.
+        assert_eq!(services_full(0xB400)[..], services_short(0xB4)[..]);
+        assert!(services_full(0x0000).is_empty());
+    }
+
+    #[test]
+    fn tdm_slots_unpacks_two_bit_codes() {
+        // STDC-2. Oracle: inmarsatc decode_6C — 4 two-bit slots per byte,
+        // MSB→LSB. The off-air 0x6C TDM bytes are 02 00 08 00 08 00 02.
+        let slots = tdm_slots(&[0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        assert_eq!(slots.len(), 28);
+        // 0x02 = 0000_0010 → slots 0,0,0,2.
+        assert_eq!(&slots[0..4], &[0, 0, 0, 2]);
+        // 0x08 = 0000_1000 → slots 0,0,2,0 (third byte starts at index 8).
+        assert_eq!(&slots[8..12], &[0, 0, 2, 0]);
+        // Last byte 0x02 → 0,0,0,2.
+        assert_eq!(&slots[24..28], &[0, 0, 0, 2]);
+        // A byte with every bit set yields four code-3 slots.
+        assert_eq!(tdm_slots(&[0xFF])[0..4], [3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn signalling_channel_surfaces_services_and_tdm_slots() {
+        let mut p = PacketParser::new();
+        // Off-air 0x6C body: services 0xB4, uplink word 0x2748, then the
+        // seven TDM-slot bytes.
+        let pkt = build_packet(&[0x6C, 0xB4, 0x27, 0x48, 0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = p.parse_frame(&frame);
+        let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
+        assert_eq!(
+            sc.details["services"],
+            json!(["MaritimeDistressAlerting", "InmarsatC", "StoreFwd", "FullDuplex"])
+        );
+        // 28 TDM slots; slot 3 = code 2, the rest of the first byte = 0.
+        assert_eq!(sc.details["tdm_slots"].as_array().unwrap().len(), 28);
+        assert_eq!(sc.details["tdm_slots"][3], 2);
+        assert_eq!(sc.details["tdm_slots"][0], 0);
     }
 
     #[test]

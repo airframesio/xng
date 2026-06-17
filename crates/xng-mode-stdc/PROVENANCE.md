@@ -34,6 +34,34 @@ ISO 8473 style) follow the cross-verified tables in docs/notes/STDC.md.
 - **ITA2 / Baudot (presentation 6)**: oracle is the ITU-T ITA2 standard
   alphabet (universal, deterministic); one 5-bit code per on-air byte
   with LTRS/FIGS shift. No open decoder (inmarsatc/SatDump) does this.
+- **C-channel descriptor field depth (STDC-2)**: the per-descriptor byte
+  maps are typed verbatim from inmarsatc's `decode_*` functions (facts
+  only; re-derived, not ported) —
+  `decode_6C` (0x6C: 8-bit services byte + uplink word + 28 two-bit
+  TDM-slot codes), `decode_83` (0x83: sat/LES, status_bits, frame_length,
+  duration, down/up-link words, frame_offset, packetDescriptor1),
+  `decode_92` (0x92 login-ack: LES id, downlink word, station list),
+  `decode_AB` (0xAB les-list: station list), `getStations` (6-byte
+  station record: sat/LES, servicesStart, 16-bit services, downlink
+  word), `decode_A3` / `decode_A8` (0xA3/0xA8 IA5 short-message text),
+  `decode_08` (0x08 ack-request: sat/LES, LCN, uplink word), and the
+  deepened `decode_7D` fields (signalling-channel, count, channel-type
+  name, local, NCS sat/LES, status flags, 16-bit services, random
+  interval). The services bit→name tables are verbatim from inmarsatc
+  `getServices_short` / `getServices`. Two documented deviations from the
+  C++ source, both transcription bugs in inmarsatc fixed here: its
+  `getStations` downlink formula reads the same byte twice (the field is
+  the two-byte word), and its `decode_7D` channelType `switch` omits the
+  `break`s (so its name always falls through to "Reserved"; the intended
+  per-value names are used). Channel frequencies reuse the already
+  off-air-validated uplink/downlink formulas. Validation: the real
+  off-air sigidwiki frame decodes the deepened 0x6C (services 0xB4 +
+  28-slot array) and the full 0x7D (channel type 1 = NCS, sat/LES = AOR-E
+  NCS station les 144, status operational/in-service, services incl.
+  SafetyNet/InmarsatC) self-consistently; the descriptor field maps that
+  have no public real-byte sample are pinned by spec-derived packets
+  built to the exact inmarsatc byte layout (clearly spec-derived, not
+  encode→decode loopbacks).
 - **Geographic area-address (STDC-1)**: C2 → shape + documented C3 field
   layout decoded per the IMO International SafetyNET Manual (2019),
   Annex 4 part A §5.2–5.3, cross-checked against inmarsat-sniffer's C2
