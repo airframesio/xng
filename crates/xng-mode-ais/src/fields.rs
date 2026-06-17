@@ -58,6 +58,21 @@ fn heading(bits: &[u8], s: usize) -> Option<u64> {
     }
 }
 
+/// Class-A Rate of Turn (ITU-R M.1371, signed 8-bit ROTais): the magnitude
+/// is `(raw / 4.733)²` deg/min, carrying the sign of `raw`; `-128` (0x80) is
+/// "not available". Reported to 0.1 deg/min. (±127 encode "turning faster
+/// than 5°/30 s with no turn indicator"; the formula yields ~720 there.)
+fn rot_deg_min(bits: &[u8], s: usize) -> Option<f64> {
+    match i(bits, s, 8)? {
+        -128 => None,
+        raw => {
+            let m = (raw as f64 / 4.733).powi(2);
+            let signed = if raw < 0 { -m } else { m };
+            Some((signed * 10.0).round() / 10.0)
+        }
+    }
+}
+
 fn data_hex(bits: &[u8], s: usize) -> String {
     bits[s..]
         .chunks(8)
@@ -112,13 +127,29 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
         1..=3 => {
             let status = u(bits, 38, 4)? as usize;
             put("nav_status", json!(NAV_STATUS[status]));
+            if let Some(rot) = rot_deg_min(bits, 42) {
+                put("rot_deg_min", json!(rot));
+            }
             put("sog_kt", json!(sog(bits, 50)));
+            put("position_accuracy", json!(u(bits, 60, 1)? == 1));
             if let Some((lat, lon)) = position(bits, 61) {
                 put("lat", json!(lat));
                 put("lon", json!(lon));
             }
             put("cog_deg", json!(cog(bits, 116)));
             put("heading_deg", json!(heading(bits, 128)));
+            if let Some(ts) = u(bits, 137, 6) {
+                if ts < 60 {
+                    put("timestamp_sec", json!(ts));
+                }
+            }
+            // Maneuver indicator: 0 = not available, 1 = no special, 2 = special.
+            if let Some(m) = u(bits, 143, 2) {
+                if m != 0 {
+                    put("maneuver", json!(m));
+                }
+            }
+            put("raim", json!(u(bits, 148, 1)? == 1));
         }
         // Base station report.
         4 => {
@@ -420,6 +451,23 @@ mod tests {
         assert_eq!(d["sog_kt"], 0.0);
         assert_eq!(d["cog_deg"], 51.0);
         assert_eq!(d["heading_deg"], 181);
+        // AIS-3 added fields (hand-decoded from the same vector):
+        assert_eq!(d["rot_deg_min"], 0.0); // not turning
+        assert_eq!(d["position_accuracy"], false);
+        assert_eq!(d["timestamp_sec"], 15);
+        assert_eq!(d["raim"], false);
+        assert!(d.get("maneuver").is_none()); // 0 = not available
+    }
+
+    #[test]
+    fn rot_decode_helper() {
+        // 8-bit signed ROTais → deg/min. raw 0 → 0; 18 → (18/4.733)² = 14.5;
+        // -128 (0x80) → not available.
+        let mk = |raw: i8| (0..8).map(|k| ((raw as u8 >> (7 - k)) & 1)).collect::<Vec<u8>>();
+        assert_eq!(rot_deg_min(&mk(0), 0), Some(0.0));
+        assert_eq!(rot_deg_min(&mk(18), 0), Some(14.5));
+        assert_eq!(rot_deg_min(&mk(-18), 0), Some(-14.5));
+        assert_eq!(rot_deg_min(&mk(-128), 0), None);
     }
 
     #[test]
