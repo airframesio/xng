@@ -225,6 +225,51 @@ fn h1_position_report_decimal_minutes() {
     assert!(close3(p.longitude, -123.29), "lon {}", p.longitude);
 }
 
+// --- ACARS-2.5: H1 #CFB maintenance family classification ---
+// Reference strings are the real documented examples from airframes'
+// acars-message-documentation research/H1/CFB.md and CFB/CFB.01.md. The
+// #CFB preamble is H1 sublabel "CF", so sublabel extraction must still
+// yield "CF" while the #CFB family is classified into the app object.
+
+#[test]
+fn h1_cfb_flr_realtime_failure() {
+    use xng_acars::cfb::CfbKind;
+    // research/H1/CFB.md: "#CFBFLR/FR19121418400034433406TCAS (1SG)".
+    let d = decode("H1", "#CFBFLR/FR19121418400034433406TCAS (1SG)", true);
+    assert_eq!(d.sublabel.as_deref(), Some("CF"));
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!("expected CFB: {:?}", d.app) };
+    assert_eq!(c.subtype, "FLR");
+    assert_eq!(c.kind, CfbKind::RealtimeFailure);
+    assert_eq!(c.description, "Realtime failure");
+}
+
+#[test]
+fn h1_cfb_apm_report() {
+    use xng_acars::cfb::CfbKind;
+    // research/H1/CFB.md ACMF snapshot.
+    let d = decode("H1", "#CFBAPM_REPORT_A_20200805180631S.CSV", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!("expected CFB") };
+    assert_eq!(c.subtype, "APM_REPORT");
+    assert_eq!(c.kind, CfbKind::ApmReport);
+}
+
+#[test]
+fn h1_cfb_wrn_and_mpf_and_dotted() {
+    use xng_acars::cfb::CfbKind;
+    let d = decode("H1", "#CFBWRN/WN19121418390034000006NAV TCAS FAULT", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    assert_eq!(c.kind, CfbKind::Warning);
+
+    let d = decode("H1", "#CFBMPF/               /AN.N660AW/FIAAL652", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    assert_eq!(c.kind, CfbKind::MaintenancePlanning);
+
+    // research/H1/CFB/CFB.01.md dotted form.
+    let d = decode("H1", "#CFB.1/FLR/FR1602082254 27513406ADR1 X2,ADR3X,ADR2X", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    assert_eq!(c.kind, CfbKind::FailureRecord);
+}
+
 #[test]
 fn label_4j_position_report() {
     // Label_4J_POS.test.ts: .../PSN39277W077359,... → 39.462 / -77.598.

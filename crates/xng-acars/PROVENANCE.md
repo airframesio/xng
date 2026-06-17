@@ -105,6 +105,20 @@ Unlike acarsdec's raw `memcpy`s we bounds-check every slice and validate
 airport codes (4 alphanumerics) and times (HHMM range), dropping
 misaligned fields rather than emitting junk.
 
+## H1 #CFB maintenance family (2026-06)
+
+`cfb.rs`: classifies the H1 `#CFB` ("Crew Flight Bag") Boeing/Airbus
+maintenance-telemetry family into its documented sub-types (`APM_REPORT`,
+`ATA`, `AL`, `FDE`, `ECT`, `FLR`, `LIGHTS`, `MIL`, `MPF`, `PAGE`, `WRN`,
+and the `.01`/`.1` failure-record form). The sub-type set and the
+descriptions come from airframes' acars-message-documentation
+`research/H1/CFB.md` acronym table (`CFB` = Crew Flight Bag, `APM` =
+Aircraft Performance Monitoring, `FDE` = Flight Deck Effect, `FLR` =
+Realtime Failure, `MPF` = Maintenance Planning Function, `WRN` = Warning,
+`MIL` = Engine Spool Vibration Units) and `research/H1/CFB/CFB.01.md`;
+sub-types without an acronym-table entry are described from the documented
+example content. Tested against the real documented example strings.
+
 ## Free-text position reports (2026-06)
 
 `position.rs`: extracts latitude/longitude from the free-text position

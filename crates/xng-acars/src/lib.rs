@@ -12,6 +12,7 @@ pub mod adsc;
 pub mod arinc622;
 pub mod cpdlc;
 pub mod block;
+pub mod cfb;
 pub mod media_adv;
 pub mod miam;
 pub mod ohma;
@@ -56,6 +57,8 @@ pub enum AcarsApp {
     MediaAdvisory(media_adv::MediaAdvisory),
     /// `Q`-series link-test / squitter / OOOI-event label classification.
     QSeries(qseries::QSeries),
+    /// H1 `#CFB` ("Crew Flight Bag") maintenance-telemetry family.
+    Cfb(cfb::Cfb),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -95,7 +98,11 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
 
     out.app = match label {
         "A6" | "AA" | "B6" | "BA" => arinc622::parse(body, downlink),
+        // H1 carries ARINC 622, OHMA, or the #CFB maintenance family; #CFB
+        // is recognized from the original text (the `#CFB` preamble is the
+        // H1 `CF` sublabel, already stripped from `body`).
         "H1" => arinc622::parse(body, downlink)
+            .or_else(|| cfb::classify(text).map(AcarsApp::Cfb))
             .or_else(|| ohma::parse(body).map(|message| AcarsApp::Ohma { message })),
         "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
@@ -125,6 +132,11 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
             m.time
         )),
         AcarsApp::QSeries(q) => Some(format!("{} {}", q.label, q.description)),
+        AcarsApp::Cfb(c) => Some(if c.subtype.is_empty() {
+            format!("CFB {}", c.description)
+        } else {
+            format!("CFB {} ({})", c.subtype, c.description)
+        }),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(
                 "MIAM v{} {}{}{}",
