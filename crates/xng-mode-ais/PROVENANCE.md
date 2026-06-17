@@ -33,9 +33,72 @@ and emitted values are anchored to the **pyais** (MIT) decode oracle:
 `tests/test_decode.py::test_msg_type_8_inland`, `_inland_2`,
 `_dac_200_fid_23`, `_dac_200_fid_24`, `_dac_200_fid_40` (pyais 3.1.0). No
 pyais code was copied; the vectors and asserted values are the reference.
-Unrecognised DAC/FID (e.g. DAC=1 IMO Circ.289, which pyais does not decode)
-fall back to the existing `data_hex` field — no unverified subtypes are
-fabricated.
+Unrecognised DAC/FID fall back to the existing `data_hex` field — no
+unverified subtypes are fabricated.
+
+## ASM (DAC/FID binary) dispatch — DAC=1 IMO SN.1/Circ.289 (2026-06)
+
+DAC=1 is the IMO international application-identifier space. **pyais has no
+DAC=1 decoder**, so there is no OSS decode oracle for these; every field
+layout is **spec-derived** from IMO SN.1/Circ.289 ("Guidance on the use of
+AIS application-specific messages", 2 June 2010) and the legacy layouts in
+IMO SN/Circ.236 retained by ITU-R M.1371-5 Annex 5 / Annex 8. The governing
+circular section is cited in a code comment on every FID arm of
+`fields::dac1_decode`. FIDs decoded:
+
+- **FID 31** — meteorological & hydrological data (Circ.289; supersedes
+  FID 11). lon 25 / lat 24 (1/1000 min, raw/60000°) FIRST, position-accuracy
+  flag, UTC day/hour/minute, average + gust wind speed (kt) and direction
+  (deg), air temp (0.1 °C), humidity (%), dew point (0.1 °C), air pressure
+  (hPa, offset +799), tendency, visibility (0.1 NM + ">" flag), water level
+  (0.01 m, offset −10 m), trend, surface current (0.1 kt) + direction. N/A
+  sentinels (127/360/−1024/511/4001/255) honoured.
+- **FID 11** — legacy met/hydro (SN/Circ.236 Annex 4). Same physical fields
+  but **latitude precedes longitude** and the position is 1/1000 min in a
+  24/25-bit pair; water level is 0.1 m in a 9-bit field. The lat-before-lon
+  order is the key divergence from FID 31 and is regression-tested.
+- **FID 16** — number of persons on board (13-bit count, 0 = N/A).
+- **FID 17** — VTS-generated/synthetic targets: repeating 122-bit records
+  (id-type 2, target id 42, spare 4, lat 24, lon 25, COG 9, timestamp 6,
+  SOG 10); id-type 0 carries a 30-bit MMSI in the high bits of the 42-bit id.
+- **FID 21** — weather observation report from ship: variant flag, location
+  name (6-bit ASCII), position, UTC. The WMO-coded weather block is deferred.
+- **FID 22/23** — area notice (broadcast/addressed): header (message
+  linkage, notice description, valid-from month/day/hour/minute, duration
+  minutes) + sub-area shape count. Per-shape geometry deferred.
+- **FID 24** — extended ship static & voyage: message linkage, air draught
+  (0.1 m), last/next/second-next port UN/LOCODEs. Cargo table deferred.
+- **FID 25** — dangerous cargo indication: linkage, amount unit, amount,
+  cargo-code count. Per-item IMDG/IGC codes deferred.
+- **FID 26** — environmental / sensor report: site position + UTC header +
+  sensor-report count. Per-sensor type-specific blocks deferred.
+- **FID 27/28** — route information (broadcast/addressed): linkage, sender
+  class, route type, valid-from time, duration, waypoint count, and the
+  waypoint list at the core 1/10000-min (raw/600000°) resolution.
+- **FID 29/30** — text description (broadcast/addressed): linkage + 6-bit
+  ASCII free text.
+- **FID 32** — tidal window: header (linkage, month, day) + repeating 88-bit
+  window records (lon/lat 1/1000 min, from/to UTC hour:minute, current
+  direction deg, current speed 0.1 kt).
+
+VERIFICATION (no OSS oracle): each FID has a unit test whose **expected
+values are the documented physical quantities** from the cited circular
+section. The test fixtures are built by an *independent* MSB-first bit
+packer (`build_t8_dac1` / `pack` / `pack_i` / `pack_str` in the test module)
+that takes `(value, width)` pairs in document order — it shares no code with
+the decoder, which reads by `(offset, width)`. A wrong offset or width in
+the decoder mismatches the packer, so this is not a self-encode/self-decode
+loopback of the decode logic. FID 11's lat-before-lon ordering is the same
+physical position as FID 31's lon-first test, so a decoder that copied FID
+31's layout into FID 11 would fail.
+
+DEFERRED (recorded honestly, fall through to `data_hex` for the unparsed
+remainder or simply omitted): FID 21 WMO weather block; FID 22/23 sub-area
+shape geometry (circle/rectangle/sector/polyline/polygon/text records); FID
+24 cargo amounts table; FID 25 per-item cargo codes; FID 26 per-sensor
+type-specific report blocks; FID 19 (marine-traffic-signal) and FID 18/20
+(clearance/berthing) are not decoded. These need worked examples with known
+ground-truth values to ground safely and were skipped rather than guessed.
 
 ## Distress device classification (2026-06)
 
