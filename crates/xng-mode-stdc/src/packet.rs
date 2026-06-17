@@ -65,9 +65,86 @@ fn round4(mhz: f64) -> f64 {
     (mhz * 1e4).round() / 1e4
 }
 
+/// Ocean-region long name from the 2-bit region field (sat/LES byte
+/// bits 7-6). Names verbatim from inmarsatc `getSatName`.
+pub fn ocean_region_long(region: u8) -> &'static str {
+    match region {
+        0 => "Atlantic Ocean Region West (AOR-W)",
+        1 => "Atlantic Ocean Region East (AOR-E)",
+        2 => "Pacific Ocean Region (POR)",
+        3 => "Indian Ocean Region (IOR)",
+        _ => "Unknown",
+    }
+}
+
+/// LES/NCS operator name from the display LES code (region×100 + id).
+/// Table verbatim from inmarsatc `getLesName`; the operator depends on
+/// *both* region and id (e.g. id 2 is Stratos Burum-2 in the Atlantic
+/// but Stratos Auckland in the Pacific), so the full code is the key.
+pub fn les_name(les_code: u16) -> Option<&'static str> {
+    Some(match les_code {
+        1 => "Vizada-Telenor, USA",
+        2 => "Stratos Global (Burum-2), Netherlands",
+        3 => "KDDI Japan",
+        4 => "Vizada-Telenor, Norway",
+        12 => "Stratos Global (Burum), Netherlands",
+        21 => "Vizada (FT), France",
+        44 => "NCS",
+        101 => "Vizada-Telenor, USA",
+        102 => "Stratos Global (Burum-2), Netherlands",
+        103 => "KDDI Japan",
+        104 => "Vizada-Telenor, Norway",
+        105 => "Telecom, Italia",
+        110 => "Turk Telecom, Turkey",
+        112 => "Stratos Global (Burum), Netherlands",
+        114 => "Embratel, Brazil",
+        116 => "Telekomunikacja Polska, Poland",
+        117 => "Morsviazsputnik, Russia",
+        120 => "OTESTAT, Greece",
+        121 => "Vizada (FT), France",
+        127 => "Bezeq, Israel",
+        144 => "NCS",
+        201 => "Vizada-Telenor, USA",
+        202 => "Stratos Global (Aukland), New Zealand",
+        203 => "KDDI Japan",
+        204 => "Vizada-Telenor, Norway",
+        210 => "Singapore Telecom, Singapore",
+        211 => "Beijing MCN, China",
+        212 => "Stratos Global (Burum), Netherlands",
+        217 => "Morsviazsputnik, Russia",
+        221 => "Vizada (FT), France",
+        244 => "NCS",
+        301 => "Vizada-Telenor, USA",
+        302 => "Stratos Global (Burum-2), Netherlands",
+        303 => "KDDI Japan",
+        304 => "Vizada-Telenor, Norway",
+        305 => "OTESTAT, Greece",
+        306 => "VSNL, India",
+        310 => "Turk Telecom, Turkey",
+        311 => "Beijing MCN, China",
+        312 => "Stratos Global (Burum), Netherlands",
+        316 => "Telekomunikacja Polska, Poland",
+        317 => "Morsviazsputnik, Russia",
+        321 => "Vizada (FT), France",
+        327 => "Bezeq, Israel",
+        328 => "Singapore Telecom, Singapore",
+        330 => "VISHIPEL, Vietnam",
+        335 => "Telecom, Italia",
+        344 => "NCS",
+        _ => return None,
+    })
+}
+
 fn sat_les(b: u8) -> serde_json::Value {
-    let region = ["AOR-W", "AOR-E", "POR", "IOR"][(b >> 6) as usize];
-    json!({ "region": region, "les": (b >> 6) as u16 * 100 + (b & 0x3F) as u16 })
+    let region = (b >> 6) & 0x3;
+    let region_short = ["AOR-W", "AOR-E", "POR", "IOR"][region as usize];
+    let les_code = region as u16 * 100 + (b & 0x3F) as u16;
+    json!({
+        "region": region_short,
+        "region_long": ocean_region_long(region),
+        "les": les_code,
+        "les_name": les_name(les_code),
+    })
 }
 
 /// IA5 text: one character per byte, top bit masked.
@@ -732,6 +809,41 @@ mod tests {
         let out = p.parse_frame(&frame);
         let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
         assert_eq!(sc.details["uplink_mhz"], 1636.64);
+    }
+
+    #[test]
+    fn les_names_match_inmarsatc_oracle() {
+        // STDC-4: names verbatim from inmarsatc getLesName. The operator
+        // resolves on the full region×100+id code, not the id alone:
+        // id 2 differs between Atlantic and Pacific oceans.
+        assert_eq!(les_name(2), Some("Stratos Global (Burum-2), Netherlands"));
+        assert_eq!(les_name(202), Some("Stratos Global (Aukland), New Zealand"));
+        assert_eq!(les_name(44), Some("NCS"));
+        assert_eq!(les_name(344), Some("NCS"));
+        assert_eq!(les_name(104), Some("Vizada-Telenor, Norway"));
+        assert_eq!(les_name(121), Some("Vizada (FT), France"));
+        // Unknown code → None (kept raw upstream).
+        assert_eq!(les_name(999), None);
+    }
+
+    #[test]
+    fn ocean_region_long_names_match_inmarsatc() {
+        assert_eq!(ocean_region_long(0), "Atlantic Ocean Region West (AOR-W)");
+        assert_eq!(ocean_region_long(1), "Atlantic Ocean Region East (AOR-E)");
+        assert_eq!(ocean_region_long(2), "Pacific Ocean Region (POR)");
+        assert_eq!(ocean_region_long(3), "Indian Ocean Region (IOR)");
+    }
+
+    #[test]
+    fn sat_les_resolves_region_and_operator() {
+        // Off-air 0x81 announcement carries sat/LES byte 0x44:
+        // region 1 (AOR-E, the documented capture region) + id 4 →
+        // code 104 → Vizada-Telenor, Norway.
+        let v = sat_les(0x44);
+        assert_eq!(v["region"], "AOR-E");
+        assert_eq!(v["region_long"], "Atlantic Ocean Region East (AOR-E)");
+        assert_eq!(v["les"], 104);
+        assert_eq!(v["les_name"], "Vizada-Telenor, Norway");
     }
 
     #[test]
