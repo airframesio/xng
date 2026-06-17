@@ -268,6 +268,17 @@ pub fn decode(data: &[u8]) -> Option<Value> {
         }
         _ => {}
     }
+
+    // Surface the raw L3 body bytes. iridium-toolkit always prints the
+    // message payload as hex (the trailing-bytes line in ReassembleIDAPP),
+    // so messages with no typed sub-field decode (CP-DATA/Setup/Paging/RR
+    // bodies/…) still carry their content rather than dropping it. The typed
+    // fields above are the decoded view; `body_hex` is the verbatim L3 body.
+    if !body.is_empty() {
+        let body_hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+        obj.insert("body_hex".into(), json!(body_hex));
+    }
+
     Some(out)
 }
 
@@ -327,6 +338,23 @@ mod tests {
     #[test]
     fn rr_does_not_steal_sbd_hello() {
         assert!(decode(&[0x06, 0x00, 0x00, 0x00, 0x00]).is_none());
+    }
+
+    /// Every GSM message must carry its raw L3 body as hex (the toolkit's
+    /// trailing-bytes line). A type with no typed sub-field decode (here SMS
+    /// CP-DATA, PD 0x09) previously dropped its payload entirely.
+    #[test]
+    fn body_bytes_are_surfaced_as_hex() {
+        // CP-DATA (0x0901) with a 5-byte body. The toolkit prints the body as
+        // "01 02 03 de ad" (concatenated: 010203dead).
+        let v = decode(&[0x09, 0x01, 0x01, 0x02, 0x03, 0xde, 0xad]).expect("SMS decodes");
+        assert_eq!(v["protocol"], "SMS");
+        assert_eq!(v["message"], "CP-DATA");
+        assert_eq!(v["body_hex"], "010203dead");
+        // A field-parsed message keeps both the decoded view and the raw body.
+        let v = decode(&[0x05, 0x18, 0x02]).expect("decodes");
+        assert_eq!(v["requested"], "IMEI");
+        assert_eq!(v["body_hex"], "02");
     }
 
     /// GMM (PD 0x08) and SS (PD 0x0b) per IDA-GSM.txt are labelled too.
