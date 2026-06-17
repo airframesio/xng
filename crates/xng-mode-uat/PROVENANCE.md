@@ -75,16 +75,49 @@ and the Target State element are ported faithfully from `uat_message.cc` but
 are **not** covered by a pinned vector — no fabricated or loopback test was
 added for them.
 
-## Scope and the demod TODO
+## IQ demodulator (wideband front-end)
 
-This crate is the verified decode layer only. The full receive chain still
-needs an **IQ demodulator** (978 kbit/s binary-FSK / CPFSK, sync-word
-correlation against the 36-bit downlink `0xEACDDA4E2` and uplink
-`0x153225B1D` sync words, soft-bit deinterleave for the uplink), which is a
-documented follow-up. The decode layer here takes corrected payload bytes (or
-raw with-parity frames via `decode_frame`) and is independent of how those
-bits were recovered.
+`demod.rs` adds the UAT receive front-end and `lib.rs` exposes the wideband
+channel decoder (`UatChannelDecoder`, mirroring the ADS-B interface:
+`new(input_rate)` with offset 0, `process(&[Complex<f32>]) -> Vec<UatFrame>`,
+`level_dbfs()`, and `to_message`). The chain:
 
-This crate is intentionally **not** wired into the bin / `xng_types::Mode`
-enum / runtime / CLI; that shared-file integration is a deliberate separate
-step.
+- **DDC** — `xng_dsp::Ddc` conditions the 978-centered capture (offset 0) to
+  `CHANNEL_RATE = 2 × 1.041667 MHz` (~2 samples/bit) with a ±625 kHz passband
+  (covers the h≈0.6 CPFSK ±312.5 kHz deviation). An exact-rate capture skips
+  the DDC.
+- **Discriminator** — per-sample `arg(x·conj(prev))` with a slow DC tracker
+  for carrier offset (the same primitive used by `xng-mode-ais`'s GFSK demod;
+  there is no shared FSK primitive, so the pattern is reproduced locally).
+- **Sync hunt** — the buffered discriminator stream is searched at sample
+  resolution over a half-sample timing grid for the 36-bit sync words
+  (downlink `0xEACDDA4E2`, uplink `0x153225B1D`; ≤4 bit errors tolerated).
+  The half-sample grid is what makes 2-samples/bit robust to arbitrary burst
+  arrival phase.
+- **Slice + RS** — at a sync hit the symbol period is known, so message bits
+  are integrate-and-dumped at the matched phase, packed MSB-first, and handed
+  to the existing `decode_frame` (the RS-FEC decode core is unchanged). A
+  downlink burst offers both the long (48 B) block and its short (30 B)
+  prefix; the RS gate validates the correct one. Soft-bit uplink deinterleave
+  is still a possible refinement, but the hard-decision interleave handled by
+  `fec::correct_uplink` already recovers clean uplinks.
+
+### Demod validation — self-generated modulate→demod path
+
+`modulate.rs` CPFSK-modulates a **known** with-parity frame into IQ, and the
+`*_synth_iq` tests in `tests/vectors.rs` run that IQ through
+`UatChannelDecoder` and assert the recovered decode equals the
+dump978-pinned known-good fields (short type-0 and long type-1 N5130E). This
+modulate→demod loop is **self-generated** — there is no public UAT IQ oracle
+vector — but the **decode core remains oracle-anchored** by the dump978 JSON
+vectors above; the synthetic tests validate only the new front-end (CPFSK
+discriminator + sync correlation + bit slicing), including a through-DDC run
+at 8 MS/s and an additive-noise run. They are clearly suffixed `_synth_iq`.
+
+## Scope
+
+The decode layer here also still takes corrected payload bytes (or raw
+with-parity frames via `decode_frame`) directly, independent of how the bits
+were recovered. The shared-file integration (bin / runtime / CLI wiring) is a
+deliberate separate step; the `xng_types::Mode::Uat` and `MessageBody::Uat`
+variants this crate now emits were added in the wiring stage-1 commit.
