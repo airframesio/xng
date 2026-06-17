@@ -96,6 +96,49 @@ fn oooi_fields_surface_in_message_body() {
 }
 
 #[test]
+fn free_text_position_surfaces_in_message_body() {
+    // ACARS-2.2: a real documented label-20 POS report (Label_20_POS
+    // test data: 38.160 / -77.075) flows through the RF path and the
+    // lat/lon appear in the message body's `app` JSON.
+    let spec = FrameSpec {
+        mode: '2',
+        tail: "N471XG",
+        ack: None,
+        label: "20",
+        block_id: '3',
+        msg_num: Some("M01A"),
+        flight: Some("XG0042"),
+        text: "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544",
+        etb: false,
+    };
+    let mut iq = vec![Complex::new(0.0, 0.0); 500];
+    iq.extend(burst_iq(&spec, 24_000.0, 0.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 500]);
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(1024) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0].crc_ok);
+
+    let source = Provenance {
+        station: xng_types::StationIdentity::new("XX-TEST-ACARS"),
+        app: xng_types::AppInfo::xng(),
+        sdr: None,
+        channel: None,
+    };
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, source);
+    let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
+    let app = core.app.as_ref().expect("position should populate app JSON");
+    let lat = app["position"]["latitude"].as_f64().unwrap();
+    let lon = app["position"]["longitude"].as_f64().unwrap();
+    assert!((lat - 38.160).abs() < 1e-3, "lat {lat}");
+    assert!((lon + 77.075).abs() < 1e-3, "lon {lon}");
+}
+
+#[test]
 fn decodes_two_channels_from_wideband_capture() {
     // Two simultaneous ACARS bursts on different channels of one 2.4 MS/s
     // capture (the acarsdec-replacement scenario).

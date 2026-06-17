@@ -105,6 +105,20 @@ Unlike acarsdec's raw `memcpy`s we bounds-check every slice and validate
 airport codes (4 alphanumerics) and times (HHMM range), dropping
 misaligned fields rather than emitting junk.
 
+## Free-text position reports (2026-06)
+
+`position.rs`: extracts latitude/longitude from the free-text position
+reports on labels `20`/POS, `4J` and `H1` POS. Clean-room port of the
+coordinate decoders in airframes' own acars-decoder-typescript
+(`utils/coordinate_utils.ts`, `utils/arinc_702_helper.ts`,
+`plugins/Label_20_POS.ts`; facts only). Two packed conventions are
+handled: label `20`/POS scaled-decimal (`38160` → 38.160°) and `H1`
+POS / `4J` `PS`/`POS` degrees-plus-tenths-of-a-minute (`43312` →
+43° 31.2′ → 43.52°), plus the legacy `4J` literal-decimal-point form
+(`N5043.5E01121.8`). Verified against the real example strings and the
+expected lat/lon in airframes' acars-decoder-typescript test suite and
+acars-message-documentation (`research/20/POS.md`, `H1/POS.md`, `4J.md`).
+
 ## MIAM file-transfer reassembly (2026-06)
 
 File transfers spanning multiple label-MA messages reassemble per the

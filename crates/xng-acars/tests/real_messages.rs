@@ -193,3 +193,47 @@ fn non_oooi_label_has_no_oooi() {
     );
     assert!(d.oooi.is_none());
 }
+
+// --- ACARS-2.2: free-text position reports → lat/lon ---
+// Reference strings + expected lat/lon are the real documented examples
+// from airframes' acars-decoder-typescript test suite and
+// acars-message-documentation (research/20/POS.md, H1/POS.md, 4J.md).
+
+fn close3(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-3
+}
+
+#[test]
+fn label_20_position_report() {
+    // Label_20_POS.test.ts: POSN38160W077075... → 38.160 / -77.075.
+    let d = decode("20", "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544", true);
+    let p = d.position.expect("20/POS carries a position");
+    assert!(close3(p.latitude, 38.160), "lat {}", p.latitude);
+    assert!(close3(p.longitude, -77.075), "lon {}", p.longitude);
+}
+
+#[test]
+fn h1_position_report_decimal_minutes() {
+    // Label_H1_POS.test.ts variant 1: POSN43312W123174 → 43.52 / -123.29.
+    let d = decode(
+        "H1",
+        "POSN43312W123174,EASON,215754,370,EBINY,220601,ELENN,M48,02216,185/TS215754,0921227A40",
+        true,
+    );
+    let p = d.position.expect("H1 POS carries a position");
+    assert!(close3(p.latitude, 43.52), "lat {}", p.latitude);
+    assert!(close3(p.longitude, -123.29), "lon {}", p.longitude);
+}
+
+#[test]
+fn label_4j_position_report() {
+    // Label_4J_POS.test.ts: .../PSN39277W077359,... → 39.462 / -77.598.
+    let d = decode(
+        "4J",
+        "POS/ID91459S,BANKR31,/DC03032024,142813/MR64,0/ET31539/PSN39277W077359,142800,240,N39300W077110,031430,N38560W077150,M28,27619,MT370/CG311,160,350/FB732/VR329071",
+        true,
+    );
+    let p = d.position.expect("4J carries a position");
+    assert!(close3(p.latitude, 39.462), "lat {}", p.latitude);
+    assert!(close3(p.longitude, -77.598), "lon {}", p.longitude);
+}

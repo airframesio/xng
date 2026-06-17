@@ -79,32 +79,34 @@ impl AcarsChannelDecoder {
     }
 }
 
-/// Combine the structured application decode and any OOOI fields into the
+/// Combine the structured application decode with any flat text-extracted
+/// fields (OOOI gate/wheels times + airports, free-text position) into the
 /// single `app` JSON value carried by the message body. Returns `None` when
-/// there is neither. OOOI fields are flattened to the top level (matching
-/// acarsdec's flat JSON), alongside the `app` object when both are present.
-fn build_app_value(
-    app: Option<&xng_acars::AcarsApp>,
-    oooi: Option<&xng_acars::oooi::Oooi>,
-) -> Option<serde_json::Value> {
-    let app_val = app.map(|a| serde_json::to_value(a).unwrap_or_default());
-    let oooi_val = oooi.and_then(|o| serde_json::to_value(o).ok());
+/// there is nothing decoded. Flat fields appear at the top level (matching
+/// acarsdec's flat JSON); the structured app object is nested under `app`
+/// when both are present.
+fn build_app_value(appdec: &xng_acars::AppDecode) -> Option<serde_json::Value> {
+    let mut flat = serde_json::Map::new();
 
-    match (app_val, oooi_val) {
-        (None, None) => None,
-        (Some(a), None) => Some(a),
-        (None, Some(o)) => Some(o),
-        (Some(a), Some(serde_json::Value::Object(oooi_map))) => {
-            // Merge OOOI fields, then nest the structured app object so both
-            // are visible without collision.
-            let mut obj = serde_json::Map::new();
-            for (k, v) in oooi_map {
-                obj.insert(k, v);
-            }
-            obj.insert("app".to_string(), a);
-            Some(serde_json::Value::Object(obj))
+    if let Some(serde_json::Value::Object(oooi_map)) =
+        appdec.oooi.as_ref().and_then(|o| serde_json::to_value(o).ok())
+    {
+        flat.extend(oooi_map);
+    }
+    if let Some(pos) = appdec.position.as_ref().and_then(|p| serde_json::to_value(p).ok()) {
+        flat.insert("position".to_string(), pos);
+    }
+
+    let app_val = appdec.app.as_ref().map(|a| serde_json::to_value(a).unwrap_or_default());
+
+    match (flat.is_empty(), app_val) {
+        (true, None) => None,
+        (true, Some(a)) => Some(a),
+        (false, None) => Some(serde_json::Value::Object(flat)),
+        (false, Some(a)) => {
+            flat.insert("app".to_string(), a);
+            Some(serde_json::Value::Object(flat))
         }
-        (Some(a), Some(_)) => Some(a),
     }
 }
 
@@ -133,7 +135,7 @@ pub fn to_message(
             // structured field). OOOI fields are merged at the top of the
             // object so they serialize like acarsdec's flat JSON
             // (depa/dsta/eta/gtout/gtin/wloff/wlin).
-            let app = build_app_value(appdec.app.as_ref(), appdec.oooi.as_ref());
+            let app = build_app_value(&appdec);
             MessageBody::Acars(AcarsCore {
                 mode: f.mode,
                 tail: f.tail.clone(),

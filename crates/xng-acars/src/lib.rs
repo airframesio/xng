@@ -16,6 +16,7 @@ pub mod media_adv;
 pub mod miam;
 pub mod ohma;
 pub mod oooi;
+pub mod position;
 pub mod qseries;
 pub mod reasm;
 pub mod sublabel;
@@ -70,6 +71,10 @@ pub struct AppDecode {
     /// so the fields appear at the top level like acarsdec's JSON.
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub oooi: Option<oooi::Oooi>,
+    /// Latitude/longitude extracted from a free-text position report
+    /// (labels `20`/POS, `4J`, `H1` POS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<position::Position>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<AcarsApp>,
 }
@@ -100,6 +105,8 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
     // OOOI fields can be embedded in many labels' text (Q-series and several
     // airline-application labels); run the extractor on the original text.
     out.oooi = oooi::decode(label, text);
+    // Free-text position reports (labels 20/POS, 4J, H1 POS) → lat/lon.
+    out.position = position::decode(label, text);
     out
 }
 
