@@ -127,6 +127,22 @@ descrambler (`dl2`) for off-air scrambler alignment; our loopback is
 self-consistent without it, and the alignment question is flagged for
 when an off-air C-channel capture is available.
 
+P-channel SU classifier (`su::parse_p_su`): structured (non-user-data)
+P-channel SUs are classified into JSON values surfaced as
+`MessageBody::Aero { kind, details }`. SU type table is JAERO `AEROTypeP`
+(`aerol.h`); per-type field layouts are JAERO's `aerol.cpp` handlers.
+
+- AERO-1.1 — log-on/log-off control (0x10–0x17, JAERO `AEROTypeP`):
+  0x10 log_on_request, 0x11 log_on_confirm, 0x12 log_off_request,
+  0x13 log_on_reject, 0x14 log_on_interrogation,
+  0x15 log_on/log_off_acknowledge, 0x16 log_on_prompt,
+  0x17 data_channel_reassignment. AES id = octets 2–4, GES id = octet 5
+  (JAERO `SendLogOnOff`). Surfaced as the AES↔GES session handshake with
+  an inferred direction (AES-initiated request/log-off vs GES-issued
+  confirm/reject/interrogation/prompt/reassignment; acknowledge either
+  way). JAERO only *names* these types; xng emits structured session
+  events.
+
 Channel/mode tagging (AERO-8.1): each `AeroEvent` carries the physical
 channel it came from. The L-band P-channel decoder (`AeroChannelDecoder`)
 tags `Mode::AeroL`; the C-band feeder R/T burst decoder

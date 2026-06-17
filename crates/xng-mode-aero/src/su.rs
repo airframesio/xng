@@ -351,6 +351,79 @@ pub fn parse_c_assignment(su: &[u8]) -> Option<serde_json::Value> {
     }))
 }
 
+/// AES id (24-bit Inmarsat terminal address) from SU bytes 2–4 and GES id
+/// (octet 5), as JAERO reads them in `SendLogOnOff` / `SendCAssignment`
+/// (`AESID = su[2]<<16 | su[3]<<8 | su[4]`, `GESID = su[5]`; 1-based JAERO
+/// octets, i.e. our `su[1..=4]`).
+fn aes_ges(su: &[u8]) -> (String, u8) {
+    (
+        format!("{:06X}", u32::from_be_bytes([0, su[1], su[2], su[3]])),
+        su[4],
+    )
+}
+
+/// P-channel system log-on/log-off control SUs (0x10–0x17): the AES↔GES
+/// session-management handshake. JAERO (`AEROTypeP`) names these eight
+/// types; the AES id (octets 2–4) and GES id (octet 5) are the common
+/// addressing fields (read exactly as `SendLogOnOff`). We surface a
+/// structured session event keyed by the JAERO type name and the
+/// originating direction.
+///
+/// Types (JAERO `aerol.h`): 0x10 log_on_request, 0x11 log_on_confirm,
+/// 0x12 log_off_request, 0x13 log_on_reject, 0x14 log_on_interrogation,
+/// 0x15 log_on/log_off_acknowledge, 0x16 log_on_prompt, 0x17
+/// data_channel_reassignment.
+pub fn parse_log_control(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || !(0x10..=0x17).contains(&su[0]) {
+        return None;
+    }
+    let (event, direction) = match su[0] {
+        // Aircraft (AES) initiates the log-on / log-off request.
+        0x10 => ("log-on-request", "aes-to-ges"),
+        0x12 => ("log-off-request", "aes-to-ges"),
+        // Ground station (GES) responses / interrogations / prompts.
+        0x11 => ("log-on-confirm", "ges-to-aes"),
+        0x13 => ("log-on-reject", "ges-to-aes"),
+        0x14 => ("log-on-interrogation", "ges-to-aes"),
+        0x16 => ("log-on-prompt", "ges-to-aes"),
+        0x17 => ("data-channel-reassignment", "ges-to-aes"),
+        // Acknowledge can flow either way; leave direction unspecified.
+        0x15 => ("log-on-log-off-acknowledge", "either"),
+        _ => return None,
+    };
+    let (aes_id, ges_id) = aes_ges(su);
+    Some(serde_json::json!({
+        "su_type": "log-control",
+        "su_type_hex": format!("0x{:02X}", su[0]),
+        "event": event,
+        "direction": direction,
+        "aes_id": aes_id,
+        "ges_id": ges_id,
+    }))
+}
+
+/// Classify one CRC-valid 12-byte P-channel SU into a structured value,
+/// when its type carries non-user-data control information we decode.
+/// Returns `None` for user-data ISU/SSU (0x71/0xC0|seq) and fill (0x01),
+/// which are handled by the reassembler, and for types we only frame but
+/// don't yet interpret. The `kind` field in each result is the message
+/// `MessageBody::Aero` kind tag. (Type table: JAERO `AEROTypeP`.)
+pub fn parse_p_su(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN {
+        return None;
+    }
+    match su[0] {
+        0x31..=0x34 => parse_c_assignment(su),
+        0x10..=0x17 => parse_log_control(su),
+        _ => None,
+    }
+}
+
+/// `MessageBody::Aero` kind tag for a structured P-SU value.
+pub fn p_su_kind(v: &serde_json::Value) -> String {
+    v["su_type"].as_str().unwrap_or("aero-su").to_owned()
+}
+
 pub fn fill_su() -> Vec<u8> {
     su_with_crc(vec![0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0])
 }
@@ -382,6 +455,47 @@ mod tests {
         assert_eq!(a["transmit_spotbeam"], false);
         // non-assignment types pass through
         assert!(parse_c_assignment(&[0x71; 12]).is_none());
+    }
+
+    /// AERO-1.1: log-on/log-off control SUs (0x10–0x17).
+    /// Oracle = JAERO `aerol.h` AEROTypeP names + `aerol.cpp` SendLogOnOff
+    /// field layout (AESID = octets 2–4 → our su[1..4]; GESID = octet 5 →
+    /// su[4]).
+    #[test]
+    fn log_control_classifies_all_eight_types() {
+        // JAERO AEROTypeP enumerators for the log-on/log-off block.
+        let expect = [
+            (0x10u8, "log-on-request", "aes-to-ges"),
+            (0x11, "log-on-confirm", "ges-to-aes"),
+            (0x12, "log-off-request", "aes-to-ges"),
+            (0x13, "log-on-reject", "ges-to-aes"),
+            (0x14, "log-on-interrogation", "ges-to-aes"),
+            (0x15, "log-on-log-off-acknowledge", "either"),
+            (0x16, "log-on-prompt", "ges-to-aes"),
+            (0x17, "data-channel-reassignment", "ges-to-aes"),
+        ];
+        for (ty, event, direction) in expect {
+            // AES 0xABCDEF, GES 0x2A in JAERO's SendLogOnOff octet layout.
+            let mut su10 = vec![0u8; 10];
+            su10[0] = ty;
+            su10[1..4].copy_from_slice(&[0xAB, 0xCD, 0xEF]);
+            su10[4] = 0x2A;
+            let su = su_with_crc(su10);
+            let v = parse_log_control(&su).expect("log-control SU parses");
+            assert_eq!(v["su_type"], "log-control");
+            assert_eq!(v["su_type_hex"], format!("0x{ty:02X}"));
+            assert_eq!(v["event"], event, "type 0x{ty:02X}");
+            assert_eq!(v["direction"], direction, "type 0x{ty:02X}");
+            assert_eq!(v["aes_id"], "ABCDEF");
+            assert_eq!(v["ges_id"], 0x2A);
+            // parse_p_su dispatches to the same handler.
+            assert_eq!(parse_p_su(&su).unwrap()["event"], event);
+        }
+        // Out-of-range / non-log types are not classified as log-control.
+        assert!(parse_log_control(&[0x01; 12]).is_none()); // fill
+        assert!(parse_log_control(&[0x18; 12]).is_none()); // reserved_18
+        assert!(parse_log_control(&[0x0F; 12]).is_none()); // below range
+        assert!(parse_log_control(&[0x71; 12]).is_none()); // user-data ISU
     }
 
     #[test]
