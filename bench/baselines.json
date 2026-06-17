@@ -4,5 +4,7 @@
   "ais_offair": 65,
   "vdl2_offair": 42,
   "hfdl_offair": 34,
+  "sonde_offair": 110,
+  "navtex_offair": 25,
   "adsb_quiet_max": 4
 }

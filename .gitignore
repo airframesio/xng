@@ -5,6 +5,8 @@ bench/data/ais_96k.cs16
 bench/data/vdl2_105k_conj.s16
 bench/data/hfdl_48k.cs16
 bench/data/adsb_quiet_24m.cu8
+bench/data/sonde_96k.cf32
+bench/data/navtex_62500.cs16
 .gstack/
 
 # Claude Code session worktrees/artifacts
