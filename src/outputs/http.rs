@@ -113,6 +113,7 @@ fn update(d: &mut Dash, m: &Message) {
             track_deg,
             squawk,
             adsb_status,
+            comm_b,
             ..
         } => {
             let e = d.aircraft.entry(icao.clone()).or_insert_with(|| json!({}));
@@ -150,6 +151,10 @@ fn update(d: &mut Dash, m: &Message) {
                 ("adsb_version", adsb_status.as_ref().and_then(|s| s.get("version").cloned())),
                 ("nacp", adsb_status.as_ref().and_then(|s| s.get("nac_p").cloned())),
                 ("sil", adsb_status.as_ref().and_then(|s| s.get("sil").cloned())),
+                // TC29 target-state selected altitude; BDS 4,4 wind/temp.
+                ("sel_alt", adsb_status.as_ref().and_then(|s| s.get("selected_altitude").cloned())),
+                ("wind_kt", comm_b.as_ref().and_then(|s| s.get("wind_speed").cloned())),
+                ("oat_c", comm_b.as_ref().and_then(|s| s.get("static_air_temperature").cloned())),
             ] {
                 if let Some(v) = v {
                     o.insert(k.into(), v);
@@ -163,6 +168,12 @@ fn update(d: &mut Dash, m: &Message) {
                 .filter(|e| *e != "none")
             {
                 o.insert("emergency".into(), json!(em));
+            }
+            // ACAS resolution advisory (BDS 3,0 or TC28) — sticky map alert.
+            if comm_b.as_ref().and_then(|s| s.get("issued_ra")).and_then(|v| v.as_bool()) == Some(true)
+                || adsb_status.as_ref().and_then(|s| s.get("acas_ra")).and_then(|v| v.as_bool()) == Some(true)
+            {
+                o.insert("acas_ra".into(), json!(true));
             }
         }
         MessageBody::Ais { mmsi: Some(mmsi), details: Some(det), msg_type, .. } => {

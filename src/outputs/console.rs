@@ -102,6 +102,13 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                         if let Some(v) = d.get("sog_kt").and_then(|v| v.as_f64()) {
                             s.push_str(&format!(" sog={v}kt"));
                         }
+                        // Application-specific message (DAC/FID binary, e.g. Inland AIS).
+                        if let (Some(dac), Some(fid)) = (
+                            d.get("dac").and_then(|v| v.as_u64()),
+                            d.get("fid").and_then(|v| v.as_u64()),
+                        ) {
+                            s.push_str(&format!(" asm={dac}/{fid}"));
+                        }
                     }
                     s.push_str(&format!(" {}", nmea.first().map(String::as_str).unwrap_or("")));
                     s
@@ -156,6 +163,21 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                         if let Some(h) = cb.get("magnetic_heading").and_then(|v| v.as_f64()) {
                             s.push_str(&format!(" hdg={h:.0}"));
                         }
+                        // BDS 3,0 ACAS resolution advisory (safety-critical).
+                        if cb.get("issued_ra").and_then(|v| v.as_bool()) == Some(true) {
+                            s.push_str(" ACAS-RA");
+                            if cb.get("sense_reversal").and_then(|v| v.as_bool()) == Some(true) {
+                                s.push_str("(rev)");
+                            }
+                        }
+                        // BDS 4,4 meteorological routine air report.
+                        if let Some(ws) = cb.get("wind_speed").and_then(|v| v.as_f64()) {
+                            let wd = cb.get("wind_direction").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                            s.push_str(&format!(" wind={wd:.0}°/{ws:.0}kt"));
+                        }
+                        if let Some(t) = cb.get("static_air_temperature").and_then(|v| v.as_f64()) {
+                            s.push_str(&format!(" oat={t:.0}°C"));
+                        }
                     }
                     if let Some(st) = adsb_status {
                         if let Some(em) = st.get("emergency").and_then(|v| v.as_str()) {
@@ -168,6 +190,38 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                         }
                         if let Some(n) = st.get("nac_p").and_then(|v| v.as_u64()) {
                             s.push_str(&format!(" nacp={n}"));
+                        }
+                        // TC29 target state: selected alt/heading + autopilot modes.
+                        if st.get("subtype").and_then(|v| v.as_str()) == Some("target_state") {
+                            if let Some(a) = st.get("selected_altitude").and_then(|v| v.as_f64()) {
+                                s.push_str(&format!(" sel_alt={a:.0}ft"));
+                                if let Some(src) = st.get("selected_altitude_source").and_then(|v| v.as_str()) {
+                                    s.push_str(&format!("({src})"));
+                                }
+                            }
+                            if let Some(h) = st.get("selected_heading").and_then(|v| v.as_f64()) {
+                                s.push_str(&format!(" sel_hdg={h:.0}"));
+                            }
+                            let modes: Vec<&str> = [
+                                ("autopilot", "AP"),
+                                ("vnav_mode", "VNAV"),
+                                ("approach_mode", "APP"),
+                                ("lnav_mode", "LNAV"),
+                            ]
+                            .iter()
+                            .filter(|(k, _)| st.get(*k).and_then(|v| v.as_bool()) == Some(true))
+                            .map(|(_, l)| *l)
+                            .collect();
+                            if !modes.is_empty() {
+                                s.push_str(&format!(" [{}]", modes.join("/")));
+                            }
+                        }
+                        // TC28 ACAS RA broadcast / DF18 TIS-B·ADS-R source tag.
+                        if st.get("acas_ra").and_then(|v| v.as_bool()) == Some(true) {
+                            s.push_str(" ACAS-RA");
+                        }
+                        if let Some(src) = st.get("source").and_then(|v| v.as_str()) {
+                            s.push_str(&format!(" src={src}"));
                         }
                     }
                     s
