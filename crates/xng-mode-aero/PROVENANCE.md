@@ -182,6 +182,29 @@ P-channel SUs are classified into JSON values surfaced as
     surfaced as a named `short-lsdu` event carrying the LSDU octet length
     (3 for 0x74, 4 for 0x76).
 
+R-channel control-SU classifier (`su::parse_r_su`, AERO-3): a 19-byte
+R-channel SU is a *control* SU when JAERO's user-data flag is clear
+(`infofield[1] & 0x08 == 0`, our su[1] bit 3); otherwise it is user data
+routed to the ISU/SSU reassembler (`RIsuReassembler`, which now also
+enforces the same flag, and whose encoder `build_r_sus` sets it). For a
+control SU the message type is the **third** byte (`infofield[2]` = su[2]
+— the same byte the user-data path uses for the AES high octet, so AES/GES
+do not apply). Types are JAERO's `AEROTypeR` enum (`aerol.h`), surfaced as
+named events: 0x20 general access-request (telephone), 0x23 abbreviated
+access-request (telephone), 0x22 access-request (data, R/T channel),
+0x61 request-for-acknowledgement, 0x62 acknowledgement, 0x12
+log-on/log-off control, 0x30 call-progress, 0x15 log-on/log-off
+acknowledgement, 0x17 log-control ready-for-reassignment, 0x60
+telephony-acknowledge. JAERO only *names* these; xng emits the named
+event. R-burst control SUs surface as `AeroEvent`s tagged `Mode::AeroC`
+at the burst bit rate.
+
+R-channel SEQINDICATOR → (k, n) (previously flagged for verification) is
+now confirmed against JAERO's `RISUData::update` switch (`aerol.cpp`):
+1→(1,1), 2→(1,2), 3→(2,2), 4→(1,3), 5→(2,3), 6→(3,3); JAERO's SUindex is
+0-based so our 1-based k = SUindex+1. Pinned by
+`seq_indicator_matches_jaero_switch`.
+
 Channel/mode tagging (AERO-8.1): each `AeroEvent` carries the physical
 channel it came from. The L-band P-channel decoder (`AeroChannelDecoder`)
 tags `Mode::AeroL`; the C-band feeder R/T burst decoder

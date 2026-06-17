@@ -284,6 +284,13 @@ impl AeroBurstDecoder {
                             mode: Mode::AeroC,
                         });
                     }
+                    // Named control/signalling SUs (R access-request /
+                    // call-progress / telephony-ack / RQA / ACK, or T-burst
+                    // P-style control SUs) carry the burst's bit rate and
+                    // the AeroC channel tag (AERO-3 / AERO-8.2).
+                    for a in result.su_events {
+                        out.push(su_event_msg(a, rate, Mode::AeroC));
+                    }
                     break; // one rate decoded this burst
                 }
             }

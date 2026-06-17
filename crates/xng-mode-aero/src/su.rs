@@ -181,9 +181,10 @@ pub fn r_su_crc_ok(su: &[u8]) -> bool {
         && HDLC_FCS.checksum(&su[..17]) == u16::from_le_bytes([su[17], su[18]])
 }
 
-/// SEQINDICATOR nibble → (index k, total n), k and n 1-based.
-/// NOTE: mapping order is flagged in PROVENANCE.md for verification
-/// against real captures.
+/// SEQINDICATOR nibble → (index k, total n), k and n 1-based. Verified
+/// against JAERO `RISUData::update` / the R-channel switch in `aerol.cpp`
+/// (1→(1,1), 2→(1,2), 3→(2,2), 4→(1,3), 5→(2,3), 6→(3,3); JAERO's SUindex
+/// is 0-based so k = SUindex+1). See `seq_indicator_matches_jaero_switch`.
 fn seq_indicator(v: u8) -> Option<(u8, u8)> {
     match v {
         1 => Some((1, 1)),
@@ -206,6 +207,54 @@ fn seq_indicator_for(k: u8, n: u8) -> u8 {
         (3, 3) => 6,
         _ => 0,
     }
+}
+
+/// Classify a 19-byte R-channel SU into a named control event when it is
+/// not user data. JAERO (`aerol.cpp`, R-channel branch) reads the message
+/// type from the **third** byte (`infofield[2]` = su[2]); a set user-data
+/// flag (`infofield[1] & 0x08`) overrides any type byte and routes the SU
+/// to the ISU/SSU reassembler instead. The named control types are JAERO's
+/// `AEROTypeR` enum (`aerol.h`):
+/// 0x20 general access-request (telephone), 0x23 abbreviated access-request
+/// (telephone), 0x22 access-request (data, R/T channel), 0x61 request-for-
+/// acknowledgement, 0x62 acknowledgement, 0x12 log-on/log-off control,
+/// 0x30 call-progress, 0x15 log-on/log-off acknowledgement, 0x17 log-control
+/// ready-for-reassignment, 0x60 telephony-acknowledge.
+///
+/// Returns `None` for user-data SUs (handled by [`RIsuReassembler`]) and
+/// for an unrecognized control byte. JAERO only *names* these control
+/// types — for a control SU the type occupies the same byte (su[2]) the
+/// user-data path uses for the AES high octet, so the AES/GES fields do
+/// not apply; we surface just the named control event, matching JAERO.
+pub fn parse_r_su(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < R_SU_LEN {
+        return None;
+    }
+    // User-data flag (JAERO `infofield[1] & 0x08`) → not a control SU.
+    if su[1] & 0x08 != 0 {
+        return None;
+    }
+    let (su_type, kind) = match su[2] {
+        0x20 => ("r-access-request", "general-telephone"),
+        0x23 => ("r-access-request", "abbreviated-telephone"),
+        0x22 => ("r-access-request", "data"),
+        0x61 => ("r-request-for-acknowledgement", ""),
+        0x62 => ("r-acknowledgement", ""),
+        0x12 => ("r-log-on-off-control", ""),
+        0x30 => ("r-call-progress", ""),
+        0x15 => ("r-log-on-off-acknowledgement", ""),
+        0x17 => ("r-log-control-ready-for-reassignment", ""),
+        0x60 => ("r-telephony-acknowledge", ""),
+        _ => return None,
+    };
+    let mut v = serde_json::json!({
+        "su_type": su_type,
+        "su_type_hex": format!("0x{:02X}", su[2]),
+    });
+    if !kind.is_empty() {
+        v["request_kind"] = serde_json::json!(kind);
+    }
+    Some(v)
 }
 
 struct PendingRIsu {
@@ -232,6 +281,12 @@ impl RIsuReassembler {
     /// Feed one CRC-valid 19-byte R SU.
     pub fn push(&mut self, su: &[u8]) -> Option<AeroUserData> {
         debug_assert_eq!(su.len(), R_SU_LEN);
+        // JAERO routes an R SU to the ISU/SSU reassembler only when the
+        // user-data flag (`infofield[1] & 0x08`) is set; otherwise the SU
+        // is a control type (classified by [`parse_r_su`]).
+        if su[1] & 0x08 == 0 {
+            return None;
+        }
         let (k, n) = seq_indicator(su[0] >> 4)?;
         let sutype = su[0] & 0x0F;
         if sutype == 15 || sutype == 0 {
@@ -306,7 +361,9 @@ pub fn build_r_sus(aes_id: u32, ges_id: u8, qno: u8, refno: u8, data: &[u8]) -> 
             let sutype = if k == n { chunk.len() as u8 } else { 11 };
             let mut su = vec![
                 (seq_indicator_for(k, n) << 4) | (sutype & 0x0F),
-                (qno << 4) | (refno & 0x07),
+                // byte1: QNO (high nibble), user-data flag (bit 3, JAERO
+                // `infofield[1] & 0x08`), REFNO (low 3 bits).
+                (qno << 4) | 0x08 | (refno & 0x07),
                 aes[1],
                 aes[2],
                 aes[3],
@@ -1059,6 +1116,85 @@ mod tests {
         assert_eq!(v["lsdu_octets"], 4);
 
         assert!(parse_lsdu(&[0x71; 12]).is_none());
+    }
+
+    /// AERO-3: R-channel named control set. JAERO (`aerol.cpp` R-channel
+    /// branch) reads the message type from the third byte (`infofield[2]` =
+    /// su[2]) and routes to user-data only when `infofield[1] & 0x08` is
+    /// set. The named types are JAERO's `AEROTypeR` enum (`aerol.h`).
+    #[test]
+    fn r_control_set_classifies_aerotype_r() {
+        let expect = [
+            (0x20u8, "r-access-request", Some("general-telephone")),
+            (0x23, "r-access-request", Some("abbreviated-telephone")),
+            (0x22, "r-access-request", Some("data")),
+            (0x61, "r-request-for-acknowledgement", None),
+            (0x62, "r-acknowledgement", None),
+            (0x12, "r-log-on-off-control", None),
+            (0x30, "r-call-progress", None),
+            (0x15, "r-log-on-off-acknowledgement", None),
+            (0x17, "r-log-control-ready-for-reassignment", None),
+            (0x60, "r-telephony-acknowledge", None),
+        ];
+        for (ty, su_type, kind) in expect {
+            // Control SU: user-data flag (su[1] bit 3) clear, type at su[2].
+            let mut su = vec![0u8; R_SU_LEN];
+            su[1] = 0x00; // user-data flag clear
+            su[2] = ty;
+            let crc = HDLC_FCS.checksum(&su[..17]);
+            su[17] = (crc & 0xFF) as u8;
+            su[18] = (crc >> 8) as u8;
+            assert!(r_su_crc_ok(&su));
+            let v = parse_r_su(&su).unwrap_or_else(|| panic!("R type 0x{ty:02X} classifies"));
+            assert_eq!(v["su_type"], su_type, "type 0x{ty:02X}");
+            assert_eq!(v["su_type_hex"], format!("0x{ty:02X}"));
+            match kind {
+                Some(k) => assert_eq!(v["request_kind"], k, "type 0x{ty:02X}"),
+                None => assert!(v.get("request_kind").is_none(), "type 0x{ty:02X}"),
+            }
+        }
+
+        // User-data flag set → not a control SU (handled by reassembler).
+        let mut su = vec![0u8; R_SU_LEN];
+        su[1] = 0x08; // user-data flag
+        su[2] = 0x20; // would otherwise be access-request
+        let crc = HDLC_FCS.checksum(&su[..17]);
+        su[17] = (crc & 0xFF) as u8;
+        su[18] = (crc >> 8) as u8;
+        assert!(parse_r_su(&su).is_none());
+
+        // Unrecognized control byte → None.
+        let mut su = vec![0u8; R_SU_LEN];
+        su[2] = 0xAA;
+        let crc = HDLC_FCS.checksum(&su[..17]);
+        su[17] = (crc & 0xFF) as u8;
+        su[18] = (crc >> 8) as u8;
+        assert!(parse_r_su(&su).is_none());
+
+        // Wrong length → None.
+        assert!(parse_r_su(&[0u8; 12]).is_none());
+    }
+
+    /// AERO-3 verify: SEQINDICATOR nibble → (SUindex, SUtotal) must match
+    /// JAERO's `RISUData::update` switch exactly (`aerol.cpp` lines 59-87:
+    /// 1→(1,1), 2→(1,2), 3→(2,2), 4→(1,3), 5→(2,3), 6→(3,3); k,n 1-based).
+    #[test]
+    fn seq_indicator_matches_jaero_switch() {
+        // (SEQINDICATOR, SUindex 0-based in JAERO, SUtotal in JAERO).
+        let jaero = [(1u8, 0u8, 1u8), (2, 0, 2), (3, 1, 2), (4, 0, 3), (5, 1, 3), (6, 2, 3)];
+        for (ind, su_index, su_total) in jaero {
+            let (k, n) = seq_indicator(ind).unwrap_or_else(|| panic!("SEQINDICATOR {ind}"));
+            // Our k is 1-based; JAERO's SUindex is 0-based → k = SUindex+1.
+            assert_eq!(k, su_index + 1, "SEQINDICATOR {ind} index");
+            assert_eq!(n, su_total, "SEQINDICATOR {ind} total");
+            // Round-trip the encoder against the same table.
+            assert_eq!(seq_indicator_for(k, n), ind, "SEQINDICATOR {ind} encode");
+        }
+        // 0 and 7..=15 are not valid SEQINDICATOR values in JAERO's switch.
+        assert!(seq_indicator(0).is_none());
+        for v in 7..=15 {
+            assert!(seq_indicator(v).is_none(), "SEQINDICATOR {v}");
+        }
     }
 
     #[test]
