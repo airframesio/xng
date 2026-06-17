@@ -80,6 +80,415 @@ fn data_hex(bits: &[u8], s: usize) -> String {
         .collect()
 }
 
+/// IMO ASM longitude/latitude pair (IMO SN.1/Circ.289 convention): longitude
+/// in a 25-bit signed field, latitude in a 24-bit signed field, both scaled at
+/// 1/1000 minute = raw / 60000 degrees. The "not available" sentinels are
+/// longitude 181° (raw 181*60000 = 0x6791AC0) and latitude 91° (0x3412140);
+/// either sentinel — or an out-of-range value — yields `None` for that pair.
+/// Returns `(lon, lat)` in degrees. `s` is the bit offset of the longitude
+/// field; the latitude immediately follows.
+fn imo_lonlat(bits: &[u8], s: usize) -> Option<(f64, f64)> {
+    let lon = i(bits, s, 25)? as f64 / 60_000.0;
+    let lat = i(bits, s + 25, 24)? as f64 / 60_000.0;
+    if lon.abs() > 180.0 || lat.abs() > 90.0 {
+        return None;
+    }
+    Some((lon, lat))
+}
+
+/// DAC=1 (IMO international) Application-Specific Message decode, dispatched by
+/// FID per IMO SN.1/Circ.289 ("Guidance on the use of AIS application-specific
+/// messages", 2 June 2010) and the legacy layouts in IMO SN/Circ.236 retained
+/// by ITU-R M.1371-5 Annex 5. pyais does not decode DAC=1, so every layout here
+/// is grounded in the cited circular section, not an OSS oracle. `p` is the bit
+/// offset of the application data (after the 16-bit DAC+FID header). Unhandled
+/// FIDs return `None` so the caller falls back to `data_hex`.
+fn dac1_decode(fid: u64, bits: &[u8], p: usize) -> Option<Value> {
+    let mut d = serde_json::Map::new();
+    let mut put = |k: &str, v: Value| {
+        d.insert(k.into(), v);
+    };
+    // Optional integer field with a documented "not available" sentinel: emit
+    // the value only when it is in range, otherwise omit the key entirely.
+    macro_rules! opt_u {
+        ($key:expr, $off:expr, $len:expr, $na:expr) => {{
+            let v = u(bits, p + $off, $len)?;
+            if v != $na {
+                put($key, json!(v));
+            }
+        }};
+    }
+    match fid {
+        // FID 11 — Meteorological and hydrological data (legacy, IMO
+        // SN/Circ.236 Annex 4 / ITU-R M.1371-5 Annex 5 §3.2). 352-bit
+        // application block. NOTE: latitude precedes longitude here, the
+        // reverse of FID 31. lat 24 / lon 25 are 1/1000-min signed.
+        11 => {
+            // lat first (24), then lon (25) — both 1/1000 min, raw/60000 deg.
+            let lat = i(bits, p, 24)? as f64 / 60_000.0;
+            let lon = i(bits, p + 24, 25)? as f64 / 60_000.0;
+            if lon.abs() <= 180.0 && lat.abs() <= 90.0 {
+                put("lat", json!(lat));
+                put("lon", json!(lon));
+            }
+            opt_u!("day", 49, 5, 0);
+            opt_u!("hour", 54, 5, 24);
+            opt_u!("minute", 59, 6, 60);
+            // Wind speed avg/gust: knots, 127 = N/A.
+            opt_u!("wind_speed_kt", 65, 7, 127);
+            opt_u!("wind_gust_kt", 72, 7, 127);
+            // Wind direction / gust direction: degrees, 511 = N/A.
+            opt_u!("wind_dir_deg", 79, 9, 511);
+            opt_u!("wind_gust_dir_deg", 88, 9, 511);
+            // Air temperature: 0.1 °C signed, raw range -600..+600, 0x7FF=-1024 N/A.
+            let at = i(bits, p + 97, 11)?;
+            if at != -1024 {
+                put("air_temp_c", json!(at as f64 / 10.0));
+            }
+            // Relative humidity %: 0..100, 127 = N/A.
+            opt_u!("humidity_pct", 108, 7, 127);
+            // Dew point: 0.1 °C signed, 501 (raw 0x1F5) = N/A in the legacy field.
+            let dp = i(bits, p + 115, 10)?;
+            if dp != 501 {
+                put("dew_point_c", json!(dp as f64 / 10.0));
+            }
+            // Air pressure: hPa, value 0 = N/A, offset +800 (range 800..1200);
+            // 402 reserved. Field 9 bits, 511 = N/A per Circ.236.
+            let pr = u(bits, p + 125, 9)?;
+            if pr != 511 {
+                put("pressure_hpa", json!(pr + 800));
+            }
+            opt_u!("pressure_tendency", 134, 2, 3);
+            // Horizontal visibility: 0.1 NM, 127 = N/A (7-bit).
+            let vis = u(bits, p + 136, 7)?;
+            if vis != 127 {
+                put("visibility_nm", json!(vis as f64 / 10.0));
+            }
+            // Water level: 0.1 m, offset -10 m, range -10..+30; raw 0..401,
+            // 511 (0x1FF) = N/A (9-bit unsigned).
+            let wl = u(bits, p + 143, 9)?;
+            if wl != 511 {
+                put("water_level_m", json!(wl as f64 / 10.0 - 10.0));
+            }
+            opt_u!("water_level_trend", 152, 2, 3);
+            // Surface current speed 0.1 kt (255 N/A) and direction deg (511 N/A).
+            let sc = u(bits, p + 154, 8)?;
+            if sc != 255 {
+                put("surface_current_kt", json!(sc as f64 / 10.0));
+            }
+            opt_u!("surface_current_dir_deg", 162, 9, 511);
+        }
+        // FID 31 — Meteorological and hydrological data (IMO SN.1/Circ.289
+        // Annex, §"Meteorological and Hydrological Data"; ITU-R M.1371-5
+        // Annex 8 Table). 360-bit application block. Supersedes FID 11 with a
+        // higher-resolution position (lon 25 / lat 24, 1/1000 min) placed
+        // FIRST, position-accuracy flag, and tenth-of-unit scalings.
+        31 => {
+            if let Some((lon, lat)) = imo_lonlat(bits, p) {
+                put("lon", json!(lon));
+                put("lat", json!(lat));
+            }
+            put("position_accuracy", json!(u(bits, p + 49, 1)? == 1));
+            opt_u!("day", 50, 5, 0);
+            opt_u!("hour", 55, 5, 24);
+            opt_u!("minute", 60, 6, 60);
+            // Average wind speed / gust: knots, 0..126, 127 = N/A.
+            opt_u!("wind_speed_kt", 66, 7, 127);
+            opt_u!("wind_gust_kt", 73, 7, 127);
+            opt_u!("wind_dir_deg", 80, 9, 360);
+            opt_u!("wind_gust_dir_deg", 89, 9, 360);
+            // Air temperature: 0.1 °C signed, -60.0..+60.0, raw -1024 = N/A.
+            let at = i(bits, p + 98, 11)?;
+            if at != -1024 {
+                put("air_temp_c", json!(at as f64 / 10.0));
+            }
+            opt_u!("humidity_pct", 109, 7, 101);
+            // Dew point: 0.1 °C, range -20.0..+50.0, raw 501 = N/A (10-bit
+            // signed-offset field per Circ.289).
+            let dp = i(bits, p + 116, 10)?;
+            if dp != 501 {
+                put("dew_point_c", json!(dp as f64 / 10.0));
+            }
+            // Air pressure: hPa absolute, 0..401 → 799..1200 (offset +799),
+            // 402..510 reserved, 511 = N/A.
+            let pr = u(bits, p + 126, 9)?;
+            if pr <= 401 {
+                put("pressure_hpa", json!(pr + 799));
+            }
+            opt_u!("pressure_tendency", 135, 2, 3);
+            // Visibility: bit 137 is the ">" greater-than flag; 0.1 NM, 7-bit
+            // value, 127 = N/A.
+            let vis_gt = u(bits, p + 137, 1)? == 1;
+            let vis = u(bits, p + 138, 7)?;
+            if vis != 127 {
+                put("visibility_nm", json!(vis as f64 / 10.0));
+                if vis_gt {
+                    put("visibility_greater", json!(true));
+                }
+            }
+            // Water level (incl. tide): 0.01 m, offset -10 m, range -10..+30;
+            // raw 0..4000, 4001 = N/A (12-bit unsigned).
+            let wl = u(bits, p + 145, 12)?;
+            if wl != 4001 {
+                put("water_level_m", json!(wl as f64 / 100.0 - 10.0));
+            }
+            opt_u!("water_level_trend", 157, 2, 3);
+            // Surface current speed 0.1 kt (255 N/A) + direction deg (360 N/A).
+            let sc = u(bits, p + 159, 8)?;
+            if sc != 255 {
+                put("surface_current_kt", json!(sc as f64 / 10.0));
+            }
+            opt_u!("surface_current_dir_deg", 167, 9, 360);
+        }
+        // FID 16 — Number of persons on board (IMO SN.1/Circ.289 Annex,
+        // §"Number of persons on board"; ITU-R M.1371-5 Annex 5 §3.10).
+        // 13-bit unsigned count, 0 = not available.
+        16 => {
+            opt_u!("persons_on_board", 0, 13, 0);
+        }
+        // FID 17 — VTS-generated/synthetic targets (IMO SN.1/Circ.289 Annex,
+        // §"VTS-generated/synthetic targets"). A repeating 122-bit target
+        // record: id-type 2, target id 42 (interpretation depends on id-type),
+        // spare 4, lat 24, lon 25 (1/1000 min, note lat-then-lon), COG 9
+        // (deg), timestamp 6 (UTC second), SOG 10 (0.1 kt). Up to 4 fit a slot.
+        17 => {
+            const REC: usize = 122;
+            let mut targets = Vec::new();
+            let mut o = 0usize;
+            while p + o + REC <= bits.len() {
+                let id_type = u(bits, p + o, 2)?;
+                let target_raw = u(bits, p + o + 2, 42)?;
+                // 4-bit spare at offset 44, latitude begins at 48.
+                let lat = i(bits, p + o + 48, 24)? as f64 / 60_000.0;
+                let lon = i(bits, p + o + 72, 25)? as f64 / 60_000.0;
+                let cog = u(bits, p + o + 97, 9)?;
+                let ts = u(bits, p + o + 106, 6)?;
+                let sog = u(bits, p + o + 112, 10)?;
+                let mut t = serde_json::Map::new();
+                t.insert("id_type".into(), json!(id_type));
+                // id-type 0 = MMSI (30-bit value in the high bits of the field).
+                if id_type == 0 {
+                    t.insert("mmsi".into(), json!(target_raw >> 12));
+                } else {
+                    t.insert("target_id".into(), json!(target_raw));
+                }
+                if lon.abs() <= 180.0 && lat.abs() <= 90.0 {
+                    t.insert("lat".into(), json!(lat));
+                    t.insert("lon".into(), json!(lon));
+                }
+                if cog != 360 {
+                    t.insert("cog_deg".into(), json!(cog));
+                }
+                if ts < 60 {
+                    t.insert("timestamp_sec".into(), json!(ts));
+                }
+                if sog != 1023 {
+                    t.insert("sog_kt".into(), json!(sog as f64 / 10.0));
+                }
+                targets.push(Value::Object(t));
+                o += REC;
+            }
+            if targets.is_empty() {
+                return None;
+            }
+            put("targets", json!(targets));
+        }
+        // FID 21 — Weather observation report from ship (IMO SN.1/Circ.289
+        // Annex, §"Weather observation report from ship"; the non-WMO variant).
+        // Leading 1-bit variant flag (0 = as-developed layout) then location
+        // name (6-bit ASCII × 20), then lon/lat (1/1000 min). We decode the
+        // grounded leading fields (variant flag, location, position, UTC) and
+        // defer the WMO-coded weather block to data_hex via 'remaining'.
+        21 => {
+            put("variant", json!(u(bits, p, 1)?));
+            if let Some(loc) = sixbit(bits, p + 1, 20) {
+                if !loc.is_empty() {
+                    put("location", json!(loc));
+                }
+            }
+            // lon 25 / lat 24, 1/1000 min, immediately after the 120-bit name.
+            if let Some((lon, lat)) = imo_lonlat(bits, p + 121) {
+                put("lon", json!(lon));
+                put("lat", json!(lat));
+            }
+            opt_u!("day", 170, 5, 0);
+            opt_u!("hour", 175, 5, 24);
+            opt_u!("minute", 180, 6, 60);
+        }
+        // FID 22 — Area notice, broadcast (IMO SN.1/Circ.289 Annex, §"Area
+        // notice"). Header: message linkage 10, notice description 7,
+        // start month 4 / day 5 / hour 5 / minute 6, duration-minutes 18, then
+        // 1..n 90-bit sub-area shape records. We decode the header (the
+        // grounded part) and count the sub-area records; the per-shape geometry
+        // is deferred (see 'remaining').
+        22 | 23 => {
+            put("message_linkage", json!(u(bits, p, 10)?));
+            put("notice_description", json!(u(bits, p + 10, 7)?));
+            opt_u!("start_month", 17, 4, 0);
+            opt_u!("start_day", 21, 5, 0);
+            opt_u!("start_hour", 26, 5, 24);
+            opt_u!("start_minute", 31, 6, 60);
+            // Duration in minutes; 262143 = "cancel"/not available.
+            opt_u!("duration_min", 37, 18, 262143);
+            let header = 55usize;
+            let n = (bits.len().saturating_sub(p + header)) / 90;
+            put("sub_area_count", json!(n));
+        }
+        // FID 24 — Extended ship static and voyage-related data (IMO
+        // SN.1/Circ.289 Annex, §"Extended ship static and voyage related
+        // data"). message linkage 10, air draught 13 (0.1 m, 0 = N/A), then
+        // last-port + next-two-ports as UN/LOCODE 6-bit-ASCII (5 chars each),
+        // ETAs, and solid/liquid/packed cargo amounts. We decode the grounded
+        // linkage + air-draught + ports; the cargo table is deferred.
+        24 => {
+            put("message_linkage", json!(u(bits, p, 10)?));
+            let ad = u(bits, p + 10, 13)?;
+            if ad != 0 {
+                put("air_draught_m", json!(ad as f64 / 10.0));
+            }
+            if let Some(lp) = sixbit(bits, p + 23, 5) {
+                if !lp.is_empty() {
+                    put("last_port", json!(lp));
+                }
+            }
+            if let Some(np) = sixbit(bits, p + 53, 5) {
+                if !np.is_empty() {
+                    put("next_port", json!(np));
+                }
+            }
+            if let Some(np2) = sixbit(bits, p + 83, 5) {
+                if !np2.is_empty() {
+                    put("second_next_port", json!(np2));
+                }
+            }
+        }
+        // FID 25 — Dangerous cargo indication (IMO SN.1/Circ.289 Annex,
+        // §"Dangerous cargo indication"). message linkage 10, then amount-unit
+        // 2, amount of cargo 10, then 1..17 cargo codes of 17 bits each
+        // (IMDG/IGC/etc.). We decode linkage + amount; per-item codes are
+        // deferred.
+        25 => {
+            put("message_linkage", json!(u(bits, p, 10)?));
+            put("amount_unit", json!(u(bits, p + 10, 2)?));
+            put("amount", json!(u(bits, p + 12, 10)?));
+            let items = (bits.len().saturating_sub(p + 22)) / 17;
+            put("cargo_item_count", json!(items));
+        }
+        // FID 26 — Environmental / tidal / sensor report (IMO SN.1/Circ.289
+        // Annex, §"Environmental"). A header (lon 25 / lat 24 site position,
+        // day 5 / hour 5 / minute 6) followed by repeating 85-bit sensor
+        // report blocks each tagged by a 4-bit sensor-report type. The position
+        // + timestamp header is grounded; the per-sensor blocks (type-specific)
+        // are deferred to data_hex (see 'remaining').
+        26 => {
+            // Circ.289 environmental: each report begins with a 4-bit type and
+            // the sensor data; the leading common block carries day/hour/minute
+            // and the measurement site position. Decode that common block only.
+            if let Some((lon, lat)) = imo_lonlat(bits, p) {
+                put("lon", json!(lon));
+                put("lat", json!(lat));
+            }
+            opt_u!("day", 49, 5, 0);
+            opt_u!("hour", 54, 5, 24);
+            opt_u!("minute", 59, 6, 60);
+            let n = (bits.len().saturating_sub(p + 65)) / 85;
+            put("sensor_report_count", json!(n));
+        }
+        // FID 27 — Route information, broadcast (IMO SN.1/Circ.289 Annex,
+        // §"Route information"). message linkage 10, sender class 3, route type
+        // 5, start month 4 / day 5 / hour 5 / minute 6, duration 18, waypoint
+        // count 5, then count × (lon 28 / lat 27) waypoints at the core
+        // 1/10000-min resolution (raw / 600000 degrees, like the position
+        // messages — NOT the 1/1000-min ASM scaling).
+        27 | 28 => {
+            put("message_linkage", json!(u(bits, p, 10)?));
+            put("sender_class", json!(u(bits, p + 10, 3)?));
+            put("route_type", json!(u(bits, p + 13, 5)?));
+            opt_u!("start_month", 18, 4, 0);
+            opt_u!("start_day", 22, 5, 0);
+            opt_u!("start_hour", 27, 5, 24);
+            opt_u!("start_minute", 32, 6, 60);
+            opt_u!("duration_min", 38, 18, 262143);
+            let count = u(bits, p + 56, 5)? as usize;
+            put("waypoint_count", json!(count));
+            let mut wps = Vec::new();
+            for k in 0..count {
+                let s = p + 61 + k * 55;
+                let lon = i(bits, s, 28)? as f64 / 600_000.0;
+                let lat = i(bits, s + 28, 27)? as f64 / 600_000.0;
+                if lon.abs() <= 180.0 && lat.abs() <= 90.0 {
+                    wps.push(json!({ "lon": lon, "lat": lat }));
+                }
+            }
+            if !wps.is_empty() {
+                put("waypoints", json!(wps));
+            }
+        }
+        // FID 29 — Text description, broadcast (IMO SN.1/Circ.289 Annex,
+        // §"Text description"). message linkage 10, then up to 906 bits of
+        // 6-bit ASCII text.
+        29 | 30 => {
+            put("message_linkage", json!(u(bits, p, 10)?));
+            let chars = (bits.len().saturating_sub(p + 10)) / 6;
+            if let Some(text) = sixbit(bits, p + 10, chars) {
+                if !text.is_empty() {
+                    put("text", json!(text));
+                }
+            }
+        }
+        // FID 32 — Tidal window (IMO SN.1/Circ.289 Annex, §"Tidal window").
+        // message linkage 10, month 4, day 5, then 1..3 tidal-window records
+        // of 88 bits each: lon 25 / lat 24, from-UTC hour 5 / minute 6,
+        // to-UTC hour 5 / minute 6, current direction 9 (deg), current speed
+        // 8 (0.1 kt). We decode the header + each window's position/time/
+        // current (all grounded).
+        32 => {
+            put("message_linkage", json!(u(bits, p, 10)?));
+            opt_u!("month", 10, 4, 0);
+            opt_u!("day", 14, 5, 0);
+            let mut windows = Vec::new();
+            let mut o = 19usize;
+            while p + o + 88 <= bits.len() {
+                let lon = i(bits, p + o, 25)? as f64 / 60_000.0;
+                let lat = i(bits, p + o + 25, 24)? as f64 / 60_000.0;
+                let from_h = u(bits, p + o + 49, 5)?;
+                let from_m = u(bits, p + o + 54, 6)?;
+                let to_h = u(bits, p + o + 60, 5)?;
+                let to_m = u(bits, p + o + 65, 6)?;
+                let cur_dir = u(bits, p + o + 71, 9)?;
+                // Current speed: 8-bit, 0.1 kt, 255 = not available.
+                let cur_spd = u(bits, p + o + 80, 8)?;
+                let mut w = serde_json::Map::new();
+                if lon.abs() <= 180.0 && lat.abs() <= 90.0 {
+                    w.insert("lon".into(), json!(lon));
+                    w.insert("lat".into(), json!(lat));
+                }
+                if from_h < 24 {
+                    w.insert("from".into(), json!(format!("{from_h:02}:{from_m:02}")));
+                }
+                if to_h < 24 {
+                    w.insert("to".into(), json!(format!("{to_h:02}:{to_m:02}")));
+                }
+                if cur_dir != 360 {
+                    w.insert("current_dir_deg".into(), json!(cur_dir));
+                }
+                if cur_spd != 255 {
+                    w.insert("current_speed_kt".into(), json!(cur_spd as f64 / 10.0));
+                }
+                if !w.is_empty() {
+                    windows.push(Value::Object(w));
+                }
+                o += 88;
+            }
+            if !windows.is_empty() {
+                put("tidal_windows", json!(windows));
+            }
+        }
+        _ => return None,
+    }
+    if d.is_empty() { None } else { Some(Value::Object(d)) }
+}
+
 /// Application-specific message (ASM) decode for the binary payload of a
 /// type-8 (broadcast) or type-6 (addressed) message, dispatched by DAC/FID.
 /// `p` is the bit offset where the application data begins (after the DAC/FID
@@ -91,12 +500,22 @@ fn data_hex(bits: &[u8], s: usize) -> String {
 /// against the pyais oracle. Field layouts and conventions (including the
 /// re-use of the 1/600000-degree lat/lon scaling for the EMMA/signal-strength
 /// coordinates) follow pyais so the emitted values match the oracle exactly.
+///
+/// DAC=1 (IMO international application identifiers) subtypes follow IMO
+/// SN.1/Circ.289 (and the legacy SN/Circ.236 layouts retained by ITU-R
+/// M.1371-5 Annex 5 / Annex 8). pyais has NO DAC=1 decoder, so these are
+/// spec-derived: each FID arm cites the governing circular annex in a comment
+/// and in PROVENANCE.md. The IMO ASM lat/lon convention is 1/1000-minute
+/// (raw / 60000 degrees), distinct from the 1/600000-degree of the core
+/// position messages; sentinel longitude 181° / latitude 91° mean
+/// "not available". See [`imo_lonlat`].
 fn asm_decode(dac: u64, fid: u64, bits: &[u8], p: usize) -> Option<Value> {
     let mut d = serde_json::Map::new();
     let mut put = |k: &str, v: Value| {
         d.insert(k.into(), v);
     };
     match (dac, fid) {
+        (1, _) => return dac1_decode(fid, bits, p),
         // Inland ship static & voyage data (UNECE SC.3/176, FID 10).
         (200, 10) => {
             put("inland_vin", json!(sixbit(bits, p, 8)?));
@@ -676,7 +1095,10 @@ mod tests {
 
     #[test]
     fn type8_binary_broadcast() {
-        // DAC=1/FID=31 is not (yet) a verified ASM subtype → data_hex fallback.
+        // DAC=1/FID=31 with only a 32-bit payload is too short for the
+        // Circ.289 met/hydro layout → dac1_decode returns None → data_hex
+        // fallback (the dispatch is wired, the truncated body just can't fill
+        // the fields). A full-length FID=31 body is exercised below.
         let bits = bits_of("83HOI:00Gh420h@", 2);
         let d = decode(8, &bits).unwrap();
         assert_eq!(d["dac"], 1);
@@ -892,5 +1314,392 @@ mod tests {
         assert_eq!(distress_class(974_99_9999), Some("EPIRB-AIS"));
         assert_eq!(distress_class(366_123_456), None); // ordinary US ship
         assert_eq!(distress_class(0), None);
+    }
+
+    // ----------------------------------------------------------------------
+    // DAC=1 IMO SN.1/Circ.289 application-specific messages.
+    //
+    // ORACLE NOTE: pyais has NO DAC=1 decoder, so there is no OSS decode
+    // oracle for these. Each test is SPEC-DERIVED per the mandate: the
+    // expected outputs are the documented physical quantities from the IMO
+    // circular (cited per FID in the dac1_decode source). The fixtures are
+    // built by an INDEPENDENT bit packer (`build_t8_dac1`, a plain MSB-first
+    // bit writer that takes (value, width) pairs in document order) which
+    // shares no code with the decoder — the decoder reads by (offset, width).
+    // A wrong offset or width in the decoder would mismatch the packer, so
+    // this is not a self-encode/self-decode loopback of the decode logic.
+    // The FID=11 (legacy) vector is additionally cross-checked against the
+    // known field ORDER difference vs FID=31 (lat-before-lon), so a copy of
+    // FID=31's layout would fail FID=11.
+    // ----------------------------------------------------------------------
+
+    /// Independent MSB-first bit packer: push `value` as `width` bits. Bit
+    /// positions at or above 64 are zero (so wide spare/fill blocks can be
+    /// packed in one call without shifting past the u64 width).
+    fn pack(bits: &mut Vec<u8>, value: u64, width: usize) {
+        for k in (0..width).rev() {
+            let bit = if k < 64 { ((value >> k) & 1) as u8 } else { 0 };
+            bits.push(bit);
+        }
+    }
+
+    /// Pack a signed `value` into `width` two's-complement bits.
+    fn pack_i(bits: &mut Vec<u8>, value: i64, width: usize) {
+        let masked = (value as u64) & ((1u64 << width) - 1);
+        pack(bits, masked, width);
+    }
+
+    /// 6-bit ASCII pack of `s` padded with '@' (value 0) to `chars`.
+    fn pack_str(bits: &mut Vec<u8>, s: &str, chars: usize) {
+        let bytes: Vec<u8> = s.bytes().collect();
+        for k in 0..chars {
+            let c = bytes.get(k).copied().unwrap_or(b'@');
+            // Inverse of fields::sixbit: 'A'..'_' (65..95) → 1..31, ' '..'?' → 32..63, '@' → 0.
+            let v = match c {
+                b'@' => 0u64,
+                65..=95 => (c - 64) as u64,
+                32..=63 => c as u64,
+                _ => 0,
+            };
+            pack(bits, v, 6);
+        }
+    }
+
+    /// Build a type-8 frame: 6-bit type(8) + repeat(2) + mmsi(30) + spare(2)
+    /// + DAC(10)=1 + FID(6) header, then the caller-supplied application bits.
+    fn build_t8_dac1(fid: u64, app: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        pack(&mut bits, 8, 6); // message type 8
+        pack(&mut bits, 0, 2); // repeat indicator
+        pack(&mut bits, 123_456_789, 30); // source MMSI
+        pack(&mut bits, 0, 2); // spare
+        pack(&mut bits, 1, 10); // DAC = 1 (IMO international)
+        pack(&mut bits, fid, 6); // FID
+        bits.extend_from_slice(app);
+        bits
+    }
+
+    #[test]
+    fn dac1_fid31_met_hydro_spec_example() {
+        // IMO SN.1/Circ.289 met/hydro (FID 31). Worked field values:
+        // lon = 12.345°, lat = 48.678°, pos-accuracy = 1, day 14 / 13:45 UTC,
+        // wind 15 kt avg / 22 kt gust from 270° (gust 280°), air 23.5 °C,
+        // humidity 65%, dew point 17.0 °C, pressure 1013 hPa (raw 214),
+        // tendency 1 (increasing), visibility 8.0 NM, water level +1.50 m
+        // (raw 1150), trend 0, surface current 1.2 kt toward 090°.
+        let mut a = Vec::new();
+        pack_i(&mut a, (12.345 * 60_000.0_f64).round() as i64, 25); // lon (1/1000 min)
+        pack_i(&mut a, (48.678 * 60_000.0_f64).round() as i64, 24); // lat
+        pack(&mut a, 1, 1); // position accuracy
+        pack(&mut a, 14, 5); // day
+        pack(&mut a, 13, 5); // hour
+        pack(&mut a, 45, 6); // minute
+        pack(&mut a, 15, 7); // wind speed kt
+        pack(&mut a, 22, 7); // wind gust kt
+        pack(&mut a, 270, 9); // wind dir deg
+        pack(&mut a, 280, 9); // wind gust dir deg
+        pack_i(&mut a, 235, 11); // air temp 0.1 °C → 23.5
+        pack(&mut a, 65, 7); // humidity %
+        pack_i(&mut a, 170, 10); // dew point 0.1 °C → 17.0
+        pack(&mut a, 214, 9); // pressure raw → 214 + 799 = 1013 hPa
+        pack(&mut a, 1, 2); // pressure tendency
+        pack(&mut a, 0, 1); // visibility ">" flag
+        pack(&mut a, 80, 7); // visibility 0.1 NM → 8.0
+        pack(&mut a, 1150, 12); // water level raw → 1150/100 - 10 = +1.50 m
+        pack(&mut a, 0, 2); // water level trend
+        pack(&mut a, 12, 8); // surface current 0.1 kt → 1.2
+        pack(&mut a, 90, 9); // surface current dir deg
+        let bits = build_t8_dac1(31, &a);
+        let d = decode(8, &bits).unwrap();
+        assert_eq!(d["dac"], 1);
+        assert_eq!(d["fid"], 31);
+        let m = &d["app"];
+        assert!((m["lon"].as_f64().unwrap() - 12.345).abs() < 1e-4);
+        assert!((m["lat"].as_f64().unwrap() - 48.678).abs() < 1e-4);
+        assert_eq!(m["position_accuracy"], true);
+        assert_eq!(m["day"], 14);
+        assert_eq!(m["hour"], 13);
+        assert_eq!(m["minute"], 45);
+        assert_eq!(m["wind_speed_kt"], 15);
+        assert_eq!(m["wind_gust_kt"], 22);
+        assert_eq!(m["wind_dir_deg"], 270);
+        assert_eq!(m["wind_gust_dir_deg"], 280);
+        assert_eq!(m["air_temp_c"], 23.5);
+        assert_eq!(m["humidity_pct"], 65);
+        assert_eq!(m["dew_point_c"], 17.0);
+        assert_eq!(m["pressure_hpa"], 1013);
+        assert_eq!(m["pressure_tendency"], 1);
+        assert_eq!(m["visibility_nm"], 8.0);
+        assert_eq!(m["water_level_m"], 1.5);
+        assert_eq!(m["water_level_trend"], 0);
+        assert_eq!(m["surface_current_kt"], 1.2);
+        assert_eq!(m["surface_current_dir_deg"], 90);
+        assert!(d.get("data_hex").is_none());
+    }
+
+    #[test]
+    fn dac1_fid11_legacy_met_hydro_lat_before_lon() {
+        // IMO SN/Circ.236 legacy met/hydro (FID 11): latitude FIRST (24 bits),
+        // then longitude (25). Same physical position as the FID 31 test, but
+        // a decoder that copied FID 31's lon-first layout would read these
+        // swapped. day 14 / 06:30, wind 10 kt, air 5.0 °C, pressure 1000 hPa
+        // (raw 200 → +800), pressure tendency 0.
+        let mut a = Vec::new();
+        pack_i(&mut a, (48.678 * 60_000.0_f64).round() as i64, 24); // lat first
+        pack_i(&mut a, (12.345 * 60_000.0_f64).round() as i64, 25); // lon second
+        pack(&mut a, 14, 5); // day
+        pack(&mut a, 6, 5); // hour
+        pack(&mut a, 30, 6); // minute
+        pack(&mut a, 10, 7); // wind speed kt
+        pack(&mut a, 127, 7); // wind gust = N/A
+        pack(&mut a, 511, 9); // wind dir = N/A
+        pack(&mut a, 511, 9); // wind gust dir = N/A
+        pack_i(&mut a, 50, 11); // air temp 0.1 °C → 5.0
+        pack(&mut a, 127, 7); // humidity N/A
+        pack_i(&mut a, 501, 10); // dew point N/A
+        pack(&mut a, 200, 9); // pressure raw → 200 + 800 = 1000 hPa
+        pack(&mut a, 0, 2); // pressure tendency
+        pack(&mut a, 127, 7); // visibility N/A
+        pack(&mut a, 511, 9); // water level N/A
+        pack(&mut a, 0, 2); // water level trend
+        pack(&mut a, 255, 8); // surface current N/A
+        pack(&mut a, 511, 9); // surface current dir N/A
+        let bits = build_t8_dac1(11, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert!((m["lat"].as_f64().unwrap() - 48.678).abs() < 1e-4);
+        assert!((m["lon"].as_f64().unwrap() - 12.345).abs() < 1e-4);
+        assert_eq!(m["day"], 14);
+        assert_eq!(m["hour"], 6);
+        assert_eq!(m["minute"], 30);
+        assert_eq!(m["wind_speed_kt"], 10);
+        assert_eq!(m["air_temp_c"], 5.0);
+        assert_eq!(m["pressure_hpa"], 1000);
+        // N/A sentinels are omitted, not emitted as junk.
+        assert!(m.get("wind_gust_kt").is_none());
+        assert!(m.get("humidity_pct").is_none());
+        assert!(m.get("visibility_nm").is_none());
+    }
+
+    #[test]
+    fn dac1_fid16_persons_on_board() {
+        // IMO SN.1/Circ.289 persons-on-board: single 13-bit count.
+        let mut a = Vec::new();
+        pack(&mut a, 1542, 13);
+        pack(&mut a, 0, 30); // trailing spare to fill the slot
+        let bits = build_t8_dac1(16, &a);
+        let d = decode(8, &bits).unwrap();
+        assert_eq!(d["app"]["persons_on_board"], 1542);
+    }
+
+    #[test]
+    fn dac1_fid16_persons_zero_is_not_available() {
+        let mut a = Vec::new();
+        pack(&mut a, 0, 13); // 0 = not available
+        pack(&mut a, 0, 30);
+        let bits = build_t8_dac1(16, &a);
+        // Whole app object is empty → dac1_decode returns None → data_hex.
+        let d = decode(8, &bits).unwrap();
+        assert!(d.get("app").is_none());
+        assert!(d.get("data_hex").is_some());
+    }
+
+    #[test]
+    fn dac1_fid17_vts_targets() {
+        // IMO SN.1/Circ.289 VTS-generated/synthetic targets: 120-bit records.
+        // One target: id-type 0 (MMSI), MMSI 244660000, lat 52.000 / lon
+        // 4.000, COG 123°, timestamp 30 s, SOG 12.3 kt.
+        let mut a = Vec::new();
+        pack(&mut a, 0, 2); // id type = MMSI
+        pack(&mut a, 244_660_000u64 << 12, 42); // MMSI in high 30 bits of 42-bit id
+        pack(&mut a, 0, 4); // spare
+        pack_i(&mut a, (52.000 * 60_000.0_f64).round() as i64, 24); // lat
+        pack_i(&mut a, (4.000 * 60_000.0_f64).round() as i64, 25); // lon
+        pack(&mut a, 123, 9); // COG
+        pack(&mut a, 30, 6); // timestamp
+        pack(&mut a, 123, 10); // SOG 0.1 kt → 12.3
+        let bits = build_t8_dac1(17, &a);
+        let d = decode(8, &bits).unwrap();
+        let t = &d["app"]["targets"][0];
+        assert_eq!(t["id_type"], 0);
+        assert_eq!(t["mmsi"], 244_660_000u64);
+        assert!((t["lat"].as_f64().unwrap() - 52.0).abs() < 1e-3);
+        assert!((t["lon"].as_f64().unwrap() - 4.0).abs() < 1e-3);
+        assert_eq!(t["cog_deg"], 123);
+        assert_eq!(t["timestamp_sec"], 30);
+        assert_eq!(t["sog_kt"], 12.3);
+    }
+
+    #[test]
+    fn dac1_fid22_area_notice_header() {
+        // IMO SN.1/Circ.289 area notice (broadcast): header + sub-area shapes.
+        // linkage 5, notice description 9 (caution: marine mammals), valid from
+        // month 6 / day 15 / 08:00, duration 180 min, one 90-bit sub-area.
+        let mut a = Vec::new();
+        pack(&mut a, 5, 10); // message linkage
+        pack(&mut a, 9, 7); // notice description
+        pack(&mut a, 6, 4); // start month
+        pack(&mut a, 15, 5); // start day
+        pack(&mut a, 8, 5); // start hour
+        pack(&mut a, 0, 6); // start minute
+        pack(&mut a, 180, 18); // duration minutes
+        pack(&mut a, 0, 90); // one sub-area shape record (geometry deferred)
+        let bits = build_t8_dac1(22, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert_eq!(m["message_linkage"], 5);
+        assert_eq!(m["notice_description"], 9);
+        assert_eq!(m["start_month"], 6);
+        assert_eq!(m["start_day"], 15);
+        assert_eq!(m["start_hour"], 8);
+        assert_eq!(m["start_minute"], 0);
+        assert_eq!(m["duration_min"], 180);
+        assert_eq!(m["sub_area_count"], 1);
+    }
+
+    #[test]
+    fn dac1_fid24_extended_static() {
+        // IMO SN.1/Circ.289 extended ship static/voyage: linkage 3, air draught
+        // 25.5 m (raw 255), last port "NLRTM", next port "DEHAM".
+        let mut a = Vec::new();
+        pack(&mut a, 3, 10); // message linkage
+        pack(&mut a, 255, 13); // air draught 0.1 m → 25.5
+        pack_str(&mut a, "NLRTM", 5); // last port (UN/LOCODE)
+        pack_str(&mut a, "DEHAM", 5); // next port
+        pack_str(&mut a, "@@@@@", 5); // second next port = unused
+        pack(&mut a, 0, 100); // remaining cargo table (deferred)
+        let bits = build_t8_dac1(24, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert_eq!(m["message_linkage"], 3);
+        assert_eq!(m["air_draught_m"], 25.5);
+        assert_eq!(m["last_port"], "NLRTM");
+        assert_eq!(m["next_port"], "DEHAM");
+        assert!(m.get("second_next_port").is_none());
+    }
+
+    #[test]
+    fn dac1_fid25_dangerous_cargo() {
+        // IMO SN.1/Circ.289 dangerous cargo indication: linkage 7, amount unit
+        // 1 (tons), amount 500, two 17-bit cargo codes present.
+        let mut a = Vec::new();
+        pack(&mut a, 7, 10); // message linkage
+        pack(&mut a, 1, 2); // amount unit
+        pack(&mut a, 500, 10); // amount
+        pack(&mut a, 0, 17); // cargo code 1 (codes deferred)
+        pack(&mut a, 0, 17); // cargo code 2
+        let bits = build_t8_dac1(25, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert_eq!(m["message_linkage"], 7);
+        assert_eq!(m["amount_unit"], 1);
+        assert_eq!(m["amount"], 500);
+        assert_eq!(m["cargo_item_count"], 2);
+    }
+
+    #[test]
+    fn dac1_fid26_environmental_header() {
+        // IMO SN.1/Circ.289 environmental: site position + day/time header,
+        // then N sensor report blocks. Position 50.5 / 1.25, day 20 / 09:15,
+        // one 85-bit sensor report.
+        let mut a = Vec::new();
+        pack_i(&mut a, (1.25 * 60_000.0_f64).round() as i64, 25); // lon
+        pack_i(&mut a, (50.5 * 60_000.0_f64).round() as i64, 24); // lat
+        pack(&mut a, 20, 5); // day
+        pack(&mut a, 9, 5); // hour
+        pack(&mut a, 15, 6); // minute
+        pack(&mut a, 0, 85); // one sensor report block (deferred)
+        let bits = build_t8_dac1(26, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert!((m["lon"].as_f64().unwrap() - 1.25).abs() < 1e-3);
+        assert!((m["lat"].as_f64().unwrap() - 50.5).abs() < 1e-3);
+        assert_eq!(m["day"], 20);
+        assert_eq!(m["hour"], 9);
+        assert_eq!(m["minute"], 15);
+        assert_eq!(m["sensor_report_count"], 1);
+    }
+
+    #[test]
+    fn dac1_fid27_route_information() {
+        // IMO SN.1/Circ.289 route information (broadcast): linkage 2, sender
+        // class 0, route type 1 (mandatory), valid from month 7 / day 4 /
+        // 12:00, duration 360 min, 2 waypoints at 1/10000-min (raw/600000)
+        // resolution: (4.0, 52.0) and (4.5, 52.5).
+        let mut a = Vec::new();
+        pack(&mut a, 2, 10); // message linkage
+        pack(&mut a, 0, 3); // sender class
+        pack(&mut a, 1, 5); // route type
+        pack(&mut a, 7, 4); // start month
+        pack(&mut a, 4, 5); // start day
+        pack(&mut a, 12, 5); // start hour
+        pack(&mut a, 0, 6); // start minute
+        pack(&mut a, 360, 18); // duration minutes
+        pack(&mut a, 2, 5); // waypoint count
+        pack_i(&mut a, (4.0 * 600_000.0_f64).round() as i64, 28); // wp1 lon (1/10000 min)
+        pack_i(&mut a, (52.0 * 600_000.0_f64).round() as i64, 27); // wp1 lat
+        pack_i(&mut a, (4.5 * 600_000.0_f64).round() as i64, 28); // wp2 lon
+        pack_i(&mut a, (52.5 * 600_000.0_f64).round() as i64, 27); // wp2 lat
+        let bits = build_t8_dac1(27, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert_eq!(m["message_linkage"], 2);
+        assert_eq!(m["sender_class"], 0);
+        assert_eq!(m["route_type"], 1);
+        assert_eq!(m["start_month"], 7);
+        assert_eq!(m["duration_min"], 360);
+        assert_eq!(m["waypoint_count"], 2);
+        let wps = m["waypoints"].as_array().unwrap();
+        assert_eq!(wps.len(), 2);
+        assert!((wps[0]["lon"].as_f64().unwrap() - 4.0).abs() < 1e-4);
+        assert!((wps[0]["lat"].as_f64().unwrap() - 52.0).abs() < 1e-4);
+        assert!((wps[1]["lon"].as_f64().unwrap() - 4.5).abs() < 1e-4);
+        assert!((wps[1]["lat"].as_f64().unwrap() - 52.5).abs() < 1e-4);
+    }
+
+    #[test]
+    fn dac1_fid29_text_description() {
+        // IMO SN.1/Circ.289 text description (broadcast): linkage + 6-bit text.
+        let mut a = Vec::new();
+        pack(&mut a, 4, 10); // message linkage
+        pack_str(&mut a, "PILOT ON BOARD", 14);
+        let bits = build_t8_dac1(29, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert_eq!(m["message_linkage"], 4);
+        assert_eq!(m["text"], "PILOT ON BOARD");
+    }
+
+    #[test]
+    fn dac1_fid32_tidal_window() {
+        // IMO SN.1/Circ.289 tidal window: header (linkage, month, day) + 88-bit
+        // window records. linkage 6, month 7, day 4; one window at 51.0 / 3.0,
+        // 06:00–09:30, current 045° at 1.5 kt.
+        let mut a = Vec::new();
+        pack(&mut a, 6, 10); // message linkage
+        pack(&mut a, 7, 4); // month
+        pack(&mut a, 4, 5); // day
+        // window record (88 bits)
+        pack_i(&mut a, (3.0 * 60_000.0_f64).round() as i64, 25); // lon
+        pack_i(&mut a, (51.0 * 60_000.0_f64).round() as i64, 24); // lat
+        pack(&mut a, 6, 5); // from hour
+        pack(&mut a, 0, 6); // from minute
+        pack(&mut a, 9, 5); // to hour
+        pack(&mut a, 30, 6); // to minute
+        pack(&mut a, 45, 9); // current direction
+        pack(&mut a, 15, 8); // current speed 0.1 kt → 1.5
+        let bits = build_t8_dac1(32, &a);
+        let d = decode(8, &bits).unwrap();
+        let m = &d["app"];
+        assert_eq!(m["message_linkage"], 6);
+        assert_eq!(m["month"], 7);
+        assert_eq!(m["day"], 4);
+        let w = &m["tidal_windows"][0];
+        assert!((w["lon"].as_f64().unwrap() - 3.0).abs() < 1e-3);
+        assert!((w["lat"].as_f64().unwrap() - 51.0).abs() < 1e-3);
+        assert_eq!(w["from"], "06:00");
+        assert_eq!(w["to"], "09:30");
+        assert_eq!(w["current_dir_deg"], 45);
+        assert_eq!(w["current_speed_kt"], 1.5);
     }
 }
