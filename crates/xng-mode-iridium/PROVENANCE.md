@@ -45,6 +45,19 @@ iridiumtk/reassembler/{ida,sbd}.py. The ACARS payload is a standard
 SOH-prefixed parity ACARS block, parsed by xng-acars and emitted as a
 first-class ACARS message.
 
+Broadcast-time (`iri_time` / `tmsi_expiry`) conversion follows
+iridium-toolkit `util.fmt_iritime` (90 ms ticks, the two ERA2-window
+leap seconds 2015-06-30 / 2016-12-31) but extends it for the network's
+periodic **re-epoch** (L-Band Frame Number reset), which the stock
+toolkit does not handle: the counter restarts near zero at each re-epoch
+(ERA1 2007-03-08, ERA2 2014-05-11, ERA3 2025-02-14, ERA4 2026-01-14
+18:08 UTC per the MetOcean technical bulletin / 2026 security analysis),
+so `ira::iri_time_unix` selects the era in force at the frame's
+wall-clock receive time. Without this, every post-2025 frame decoded
+~11 years into the past. The ERA2 path remains bit-identical to
+`fmt_iritime` (pinned in `ira::time_tests` against toolkit-generated
+values and in the off-air `tmsi_expiry` oracle).
+
 ## Validation
 
 - **Oracle-validated against iridium-toolkit**: a generated ring-alert
