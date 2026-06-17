@@ -511,6 +511,8 @@ function syncIridium(s) {
 }
 
 const markers = new Map(); // key -> {marker, trail}
+// Map glyphs for the position-bearing beacon modes (radiosonde / ADS-L / SARSAT / DSC).
+const BEACON_EMOJI = { sonde: '🎈', 'ads-l': '🛩', sarsat: '🆘', dsc: '🆘' };
 let state = null; // latest /api/state snapshot
 let fitted = false;
 let paused = false;
@@ -792,6 +794,20 @@ function render() {
     const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog, v.shiptype), label, popup, v.trail, sm.color);
     if (p) pts.push(p);
   }
+  for (const b of (s.beacons || [])) {
+    const label = escapeHtml(String(b.id || b.mode || ''));
+    const popup = entityPopup('', label, [
+      ['mode', escapeHtml(String(b.mode || ''))],
+      ['id', escapeHtml(String(b.id || ''))],
+      ['altitude', b.alt != null ? escapeHtml(String(b.alt)) : null],
+      ['msgs', b.msgs],
+      ['seen', `${fmtAge(s.now - b.seen)} ago`],
+    ]);
+    const emoji = BEACON_EMOJI[b.mode] || '📡';
+    const icon = L.divIcon({ className: 'beacon-ic', html: emoji, iconSize: [16, 16] });
+    const p = upsert('b' + b.mode + ':' + b.id, b.lat, b.lon, icon, `${emoji} ${label}`, popup, b.trail, '#e0af68');
+    if (p) pts.push(p);
+  }
   markers.forEach((e, k) => {
     if (!e.alive) {
       map.removeLayer(e.marker);
@@ -852,6 +868,16 @@ function render() {
       color: '#bb9af7', name: `🛰 ${escapeHtml(nm)}`, seen: sat.seen,
       sv: { id: nm, flight: '', icao: '', reg: '', type: 'satellite', alt: sat.alt, kt: undefined, msgs: undefined, seen: sat.seen || 0 },
       cols: ['', '', '', 'satellite', sat.alt != null ? Math.round(sat.alt) + 'km' : '', '', ''],
+    });
+  }
+  for (const b of (s.beacons || [])) {
+    const emoji = BEACON_EMOJI[b.mode] || '📡';
+    const ids = String(b.id || '');
+    ents.push({
+      k: 'b' + b.mode + ':' + b.id, id: ids, lat: b.lat ?? null, lon: b.lon ?? null, srcs: [], expandable: false,
+      color: '#e0af68', name: `${emoji} ${escapeHtml(ids)}`, seen: b.seen,
+      sv: { id: ids, flight: '', icao: '', reg: '', type: b.mode || '', alt: b.alt, kt: undefined, msgs: b.msgs, seen: b.seen || 0 },
+      cols: ['', '', '', escapeHtml(String(b.mode || '')), b.alt ?? '', '', b.msgs ?? ''],
     });
   }
   // Sort by the active column (numeric columns numerically); blanks sort last.

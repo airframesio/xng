@@ -52,6 +52,9 @@ struct Dash {
     /// trackers, SATCOM modems), surfaced as entities so the activity is
     /// visible even though most carry no aircraft ACARS payload.
     iridium_terminals: HashMap<String, Value>,
+    /// Position-bearing non-aircraft/vessel beacons (radiosondes, ADS-L
+    /// conspicuity, COSPAS-SARSAT distress, DSC distress), keyed by "mode:id".
+    beacons: HashMap<String, Value>,
     /// Reconstructed 48-beam pattern, projected under tracked satellites.
     beams: crate::beam::BeamReconstructor,
     /// Last unix-secs the beam pattern was persisted.
@@ -500,6 +503,81 @@ fn update(d: &mut Dash, m: &Message) {
                 }
             }
         }
+        // UAT 978 MHz ADS-B downlink: a real aircraft — route through the same
+        // aircraft merge so it lands on the map AND coalesces with 1090 ADS-B
+        // by ICAO. (FIS-B uplink "fisb" carries weather, not an entity.)
+        MessageBody::Uat { kind, details } if kind == "adsb" => {
+            let icao = details.get("address").and_then(Value::as_str).map(|s| s.to_uppercase());
+            let flight = details
+                .get("callsign")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty());
+            let mut c = serde_json::Map::new();
+            if let Some(a) = details.get("geometric_altitude").or_else(|| details.get("altitude")) {
+                c.insert("alt".into(), a.clone());
+            }
+            if let Some(v) = details.get("ground_speed") {
+                c.insert("spd".into(), v.clone());
+            }
+            if let Some(v) = details.get("true_track") {
+                c.insert("trk".into(), v.clone());
+            }
+            let pos = match (
+                details.get("lat").and_then(Value::as_f64),
+                details.get("lon").and_then(Value::as_f64),
+            ) {
+                (Some(la), Some(lo)) => Some((la, lo)),
+                _ => None,
+            };
+            if let Some((la, lo)) = pos {
+                c.insert("lat".into(), json!(la));
+                c.insert("lon".into(), json!(lo));
+            }
+            if icao.is_some() || flight.is_some() {
+                merge_aircraft(d, "uat", AcIds { icao, flight, reg: None }, c, pos);
+            }
+        }
+        // Position-bearing beacons (radiosonde / ADS-L / COSPAS-SARSAT / DSC):
+        // surface them on the map as their own layer (was silently dropped).
+        MessageBody::Sonde { details, .. }
+        | MessageBody::AdsL { details, .. }
+        | MessageBody::Sarsat { details, .. }
+        | MessageBody::Dsc { details, .. } => {
+            let lat = details
+                .get("lat")
+                .or_else(|| details.get("latitude"))
+                .and_then(Value::as_f64);
+            let lon = details
+                .get("lon")
+                .or_else(|| details.get("longitude"))
+                .and_then(Value::as_f64);
+            if let (Some(lat), Some(lon)) = (lat, lon) {
+                let id = ["serial", "address", "hex_id", "beacon_id", "from", "mmsi"]
+                    .iter()
+                    .find_map(|k| {
+                        details.get(*k).map(|v| {
+                            v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string())
+                        })
+                    })
+                    .unwrap_or_else(|| "?".into());
+                let e = d.beacons.entry(format!("{mode}:{id}")).or_insert_with(|| json!({}));
+                let o = e.as_object_mut().unwrap();
+                o.insert("mode".into(), json!(mode));
+                o.insert("id".into(), json!(id));
+                o.insert("lat".into(), json!(lat));
+                o.insert("lon".into(), json!(lon));
+                if let Some(a) =
+                    details.get("alt_m").or_else(|| details.get("altitude")).or_else(|| details.get("alt"))
+                {
+                    o.insert("alt".into(), a.clone());
+                }
+                o.insert("seen".into(), json!(now_s()));
+                let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+                o.insert("msgs".into(), json!(msgs + 1));
+                push_trail(o, lat, lon);
+            }
+        }
         _ => {}
     }
     }
@@ -540,6 +618,7 @@ fn snapshot(d: &mut Dash) -> String {
     d.iridium_rings.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
     d.iridium_devices.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
     d.iridium_terminals.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    d.beacons.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     // Persist the accumulated beam pattern occasionally so it survives
     // restarts and keeps refining across sessions.
     if now_s().saturating_sub(d.beams_saved) > 120 {
@@ -553,6 +632,7 @@ fn snapshot(d: &mut Dash) -> String {
         "sessions": d.sessions,
         "aircraft": d.aircraft.values().collect::<Vec<_>>(),
         "vessels": d.vessels.values().collect::<Vec<_>>(),
+        "beacons": d.beacons.values().collect::<Vec<_>>(),
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
         "iridium_devices": d.iridium_devices.values().collect::<Vec<_>>(),
@@ -812,5 +892,64 @@ mod tests {
         assert!(srcs.contains_key("acars") && srcs.contains_key("vdl2"), "two source rows");
         assert_eq!(srcs["acars"]["msgs"], 1);
         assert_eq!(srcs["vdl2"]["msgs"], 1);
+    }
+
+    fn msg(mode: Mode, body: MessageBody) -> Message {
+        Message {
+            mode,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 978_000_000,
+            signal: Default::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
+            body,
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn uat_surfaces_as_aircraft_and_merges_with_adsb_by_icao() {
+        let mut d = Dash::default();
+        // ADS-B (1090) by ICAO, then UAT (978) for the same aircraft (lowercase
+        // address) → one merged aircraft with two sources, plotted on the map.
+        update(&mut d, &msg(Mode::Adsb, MessageBody::ModeS {
+            df: 17, icao: Some("AC82EC".into()), callsign: None, altitude_ft: Some(35000),
+            squawk: None, lat: Some(40.0), lon: Some(-120.0), speed_kt: None, speed_type: None,
+            track_deg: None, vertical_rate_fpm: None, comm_b: None, adsb_status: None,
+        }));
+        update(&mut d, &msg(Mode::Uat, MessageBody::Uat {
+            kind: "adsb".into(),
+            details: json!({"address": "ac82ec", "callsign": "N5130E", "lat": 40.01, "lon": -120.01, "geometric_altitude": 34000, "ground_speed": 120}),
+        }));
+        assert_eq!(d.aircraft.len(), 1, "UAT coalesces with ADS-B by ICAO");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let ac = &snap["aircraft"][0];
+        assert_eq!(ac["icao"], "AC82EC");
+        assert!(ac["lat"].is_number(), "has a map position");
+        let srcs = ac["sources"].as_object().unwrap();
+        assert!(srcs.contains_key("adsb") && srcs.contains_key("uat"), "two sources");
+    }
+
+    #[test]
+    fn sonde_creates_a_map_beacon() {
+        let mut d = Dash::default();
+        update(&mut d, &msg(Mode::Sonde, MessageBody::Sonde {
+            kind: "rs41".into(),
+            details: json!({"serial": "R1234567", "lat": -34.72, "lon": 138.69, "alt_m": 12000.0}),
+        }));
+        assert_eq!(d.beacons.len(), 1, "radiosonde becomes a beacon entity");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let b = &snap["beacons"][0];
+        assert_eq!(b["mode"], "sonde");
+        assert_eq!(b["id"], "R1234567");
+        assert!(b["lat"].is_number() && b["lon"].is_number());
+        // A beacon with no position (e.g. a DSC routine call) creates nothing.
+        update(&mut d, &msg(Mode::Dsc, MessageBody::Dsc { kind: "individual".into(), details: json!({"from": 1234}) }));
+        assert_eq!(d.beacons.len(), 1, "no-position message plots no beacon");
     }
 }
