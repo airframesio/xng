@@ -15,6 +15,7 @@ pub mod block;
 pub mod media_adv;
 pub mod miam;
 pub mod ohma;
+pub mod qseries;
 pub mod reasm;
 pub mod sublabel;
 
@@ -51,6 +52,8 @@ pub enum AcarsApp {
     },
     /// Media advisory (label SA): datalink availability report.
     MediaAdvisory(media_adv::MediaAdvisory),
+    /// `Q`-series link-test / squitter / OOOI-event label classification.
+    QSeries(qseries::QSeries),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -84,7 +87,7 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
             .or_else(|| ohma::parse(body).map(|message| AcarsApp::Ohma { message })),
         "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
-        _ => None,
+        _ => qseries::classify(label).map(AcarsApp::QSeries),
     };
     out
 }
@@ -103,6 +106,7 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
             if m.established { "established" } else { "lost" },
             m.time
         )),
+        AcarsApp::QSeries(q) => Some(format!("{} {}", q.label, q.description)),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(
                 "MIAM v{} {}{}{}",

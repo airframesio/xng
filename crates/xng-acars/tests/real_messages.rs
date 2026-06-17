@@ -116,3 +116,44 @@ fn h1_sublabel_then_plain_text() {
     assert_eq!(d.mfi.as_deref(), Some("M1"));
     assert!(d.app.is_none());
 }
+
+// --- ACARS-1.1: Q-series link-test / squitter classification ---
+// Reference strings are the real documented examples from airframes'
+// acars-message-documentation (research/Q0.md, Q2.md, QF.md, QQ.md) and the
+// descriptions from airframes' own acars-decoder-typescript plugins.
+
+#[test]
+fn q0_link_test_classified() {
+    use xng_acars::qseries::QKind;
+    // research/Q0.md: "ACARS Link Test", messages are always empty.
+    let d = decode("Q0", "", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series: {:?}", d.app) };
+    assert_eq!(q.kind, QKind::LinkTest);
+    assert_eq!(q.description, "ACARS Link Test");
+}
+
+#[test]
+fn q2_eta_report_classified() {
+    use xng_acars::qseries::QKind;
+    // research/Q2.md example: "   2002  99/DS KJFK" — ETA Report.
+    let d = decode("Q2", "   2002  99/DS KJFK", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    assert_eq!(q.kind, QKind::EtaReport);
+    assert_eq!(q.description, "ETA Report");
+}
+
+#[test]
+fn qf_off_destination_report_classified() {
+    // research/QF.md example: "EWR2210ATL" — OFF Destination Report.
+    let d = decode("QF", "EWR2210ATL", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    assert_eq!(q.description, "OFF Destination Report");
+}
+
+#[test]
+fn qq_off_report_classified() {
+    // research/QQ.md example: "KEWRKSWF20041942" — OFF Report.
+    let d = decode("QQ", "KEWRKSWF20041942", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    assert_eq!(q.description, "OFF Report");
+}

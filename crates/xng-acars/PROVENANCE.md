@@ -70,6 +70,18 @@ lat/lon, place-bearing pairs, place-bearing-distance (NM 0.1 / KM), or
 airway designators. trackDetail legs and the trailing
 routeInformationAdditional stay undecoded (reported as present).
 
+## Q-series classification (2026-06)
+
+`qseries.rs`: classifies the ARINC 620 `Q`-series link-test / squitter /
+OOOI-event downlink labels (`Q0`–`Q7`, `QA`–`QX`). Descriptions are taken
+from airframes' own published references (not invented): the
+acars-message-documentation repo (`Q0` "ACARS Link Test", `Q2` "ETA
+Report", `QF` "OFF Destination Report", `QQ` "OFF Report") and the
+acars-decoder-typescript plugin descriptions (`QP` "OUT Report", `QR` "ON
+Report", `QS` "IN Report"). The remaining OOOI-bearing `Q` labels are named
+from the gate/wheels event each carries per f00b4r0/acarsdec `label.c`
+(`QA` gate-out, `QB` wheels-off, `QC` wheels-on, `QD` gate-in, ...).
+
 ## MIAM file-transfer reassembly (2026-06)
 
 File transfers spanning multiple label-MA messages reassemble per the
