@@ -126,3 +126,12 @@ Note: JAERO additionally delays decoded bits by 2714−6 before the
 descrambler (`dl2`) for off-air scrambler alignment; our loopback is
 self-consistent without it, and the alignment question is flagged for
 when an off-air C-channel capture is available.
+
+Channel/mode tagging (AERO-8.1): each `AeroEvent` carries the physical
+channel it came from. The L-band P-channel decoder (`AeroChannelDecoder`)
+tags `Mode::AeroL`; the C-band feeder R/T burst decoder
+(`AeroBurstDecoder`) tags `Mode::AeroC`. `to_message` propagates
+`event.mode` instead of hard-coding `AeroL`, so C-band feeder bursts no
+longer mislabel as `aero-l`. (JAERO models these as distinct physical
+channels — `AeroL::ChannelType {PChannel, RChannel, TChannel}` on L-band
+vs the C-band feeder bursts handled by the burst demodulators.)
