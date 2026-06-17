@@ -151,6 +151,48 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// UAT 978 MHz frame — `kind` = "adsb" (downlink state vector) or
+    /// "fisb" (uplink weather product); `details` carries the decoded fields.
+    Uat {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// COSPAS-SARSAT 406 MHz distress beacon (ELT/EPIRB/PLB); `kind` = beacon
+    /// protocol class, `details` = decoded beacon fields (ID, position, …).
+    Sarsat {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// Digital Selective Calling message; `kind` = call format
+    /// (distress/all-ships/individual/area), `details` = decoded fields.
+    Dsc {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// NAVTEX message; `kind` = B2 subject indicator, `details` = station /
+    /// serial / text.
+    Navtex {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// Radiosonde telemetry frame (RS41); `kind` = sonde type, `details` =
+    /// status / PTU / GPS fields.
+    Sonde {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// ADS-L electronic-conspicuity frame; `kind` = message type, `details` =
+    /// iConspicuity fields (position, track, …).
+    AdsL {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// ATCS rail data-radio packet; `kind` = Spec-200 packet type, `details` =
+    /// address/header fields.
+    Atcs {
+        kind: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 

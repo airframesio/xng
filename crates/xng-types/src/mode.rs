@@ -25,6 +25,20 @@ pub enum Mode {
     Adsb,
     /// Iridium (wave 2).
     Iridium,
+    /// UAT 978 MHz — ADS-B downlink + FIS-B uplink (DO-282B).
+    Uat,
+    /// COSPAS-SARSAT 406 MHz distress beacons (ELT/EPIRB/PLB, C/S T.001).
+    Sarsat,
+    /// Digital Selective Calling (GMDSS, ITU-R M.493).
+    Dsc,
+    /// NAVTEX maritime safety broadcasts (SITOR-B / CCIR 476).
+    Navtex,
+    /// Radiosondes (Vaisala RS41 GFSK telemetry).
+    Sonde,
+    /// ADS-L light/drone electronic conspicuity (EASA SRD860).
+    AdsL,
+    /// ATCS — Advanced Train Control System rail data radio (AAR Spec-200).
+    Atcs,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -41,6 +55,13 @@ impl Mode {
             Mode::Ais => "ais",
             Mode::Adsb => "adsb",
             Mode::Iridium => "iridium",
+            Mode::Uat => "uat",
+            Mode::Sarsat => "sarsat",
+            Mode::Dsc => "dsc",
+            Mode::Navtex => "navtex",
+            Mode::Sonde => "sonde",
+            Mode::AdsL => "ads-l",
+            Mode::Atcs => "atcs",
             Mode::Extern => "extern",
         }
     }
@@ -57,6 +78,13 @@ impl Mode {
             Mode::AeroC,
             Mode::Hfdl,
             Mode::Iridium,
+            Mode::Uat,
+            Mode::Sarsat,
+            Mode::Dsc,
+            Mode::Navtex,
+            Mode::Sonde,
+            Mode::AdsL,
+            Mode::Atcs,
         ]
     }
 }
@@ -81,6 +109,13 @@ impl std::str::FromStr for Mode {
             "ais" => Ok(Mode::Ais),
             "adsb" | "ads-b" | "1090" | "modes" => Ok(Mode::Adsb),
             "iridium" | "irdm" => Ok(Mode::Iridium),
+            "uat" | "uat978" | "978" => Ok(Mode::Uat),
+            "sarsat" | "cospas-sarsat" | "cospas" | "406" => Ok(Mode::Sarsat),
+            "dsc" => Ok(Mode::Dsc),
+            "navtex" => Ok(Mode::Navtex),
+            "sonde" | "radiosonde" | "rs41" => Ok(Mode::Sonde),
+            "ads-l" | "adsl" | "ads-k" => Ok(Mode::AdsL),
+            "atcs" => Ok(Mode::Atcs),
             other => Err(format!("unknown mode: {other}")),
         }
     }
