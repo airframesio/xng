@@ -66,6 +66,20 @@ wall-clock receive time. Without this, every post-2025 frame decoded
 `fmt_iritime` (pinned in `ira::time_tests` against toolkit-generated
 values and in the off-air `tmsi_expiry` oracle).
 
+GSM layer-3 message labelling (`gsm.rs`, IRID-3) extends the
+CC/MM/SMS transaction-identifier map with the Radio Resource (RR, PD
+0x06), GPRS-MM (0x08) and SS (0x0b) protocol discriminators.
+iridium-toolkit only forwards the raw L2 bytes over GSMTAP for
+Wireshark to dissect (`-m lap`), so the on-air RR subset is taken from
+the toolkit's `IDA-GSM.txt` (06.05 SI-5bis, 06.07 SI-2quater, 06.3a
+Immediate-Assignment-reject, 06.3b Additional-Assignment, 08.05 GMM
+Detach, 0b.3b Register) and the Immediate-Assignment / Paging /
+System-Information families are the standard GSM 04.08 / 3GPP TS 44.018
+§10.4 message-type values. The 0x0600 opcode is left to the SBD/ACARS
+transport path (it is the Register/SBD-uplink type, not RR). The LCW
+link-control layer is already exposed as structured JSON
+(`lib::lcw_descriptor`) on duplex traffic / U3 frames.
+
 ## Validation
 
 - **Oracle-validated against iridium-toolkit**: a generated ring-alert
