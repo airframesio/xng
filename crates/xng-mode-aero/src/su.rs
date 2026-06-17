@@ -181,9 +181,10 @@ pub fn r_su_crc_ok(su: &[u8]) -> bool {
         && HDLC_FCS.checksum(&su[..17]) == u16::from_le_bytes([su[17], su[18]])
 }
 
-/// SEQINDICATOR nibble → (index k, total n), k and n 1-based.
-/// NOTE: mapping order is flagged in PROVENANCE.md for verification
-/// against real captures.
+/// SEQINDICATOR nibble → (index k, total n), k and n 1-based. Verified
+/// against JAERO `RISUData::update` / the R-channel switch in `aerol.cpp`
+/// (1→(1,1), 2→(1,2), 3→(2,2), 4→(1,3), 5→(2,3), 6→(3,3); JAERO's SUindex
+/// is 0-based so k = SUindex+1). See `seq_indicator_matches_jaero_switch`.
 fn seq_indicator(v: u8) -> Option<(u8, u8)> {
     match v {
         1 => Some((1, 1)),
@@ -206,6 +207,54 @@ fn seq_indicator_for(k: u8, n: u8) -> u8 {
         (3, 3) => 6,
         _ => 0,
     }
+}
+
+/// Classify a 19-byte R-channel SU into a named control event when it is
+/// not user data. JAERO (`aerol.cpp`, R-channel branch) reads the message
+/// type from the **third** byte (`infofield[2]` = su[2]); a set user-data
+/// flag (`infofield[1] & 0x08`) overrides any type byte and routes the SU
+/// to the ISU/SSU reassembler instead. The named control types are JAERO's
+/// `AEROTypeR` enum (`aerol.h`):
+/// 0x20 general access-request (telephone), 0x23 abbreviated access-request
+/// (telephone), 0x22 access-request (data, R/T channel), 0x61 request-for-
+/// acknowledgement, 0x62 acknowledgement, 0x12 log-on/log-off control,
+/// 0x30 call-progress, 0x15 log-on/log-off acknowledgement, 0x17 log-control
+/// ready-for-reassignment, 0x60 telephony-acknowledge.
+///
+/// Returns `None` for user-data SUs (handled by [`RIsuReassembler`]) and
+/// for an unrecognized control byte. JAERO only *names* these control
+/// types — for a control SU the type occupies the same byte (su[2]) the
+/// user-data path uses for the AES high octet, so the AES/GES fields do
+/// not apply; we surface just the named control event, matching JAERO.
+pub fn parse_r_su(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < R_SU_LEN {
+        return None;
+    }
+    // User-data flag (JAERO `infofield[1] & 0x08`) → not a control SU.
+    if su[1] & 0x08 != 0 {
+        return None;
+    }
+    let (su_type, kind) = match su[2] {
+        0x20 => ("r-access-request", "general-telephone"),
+        0x23 => ("r-access-request", "abbreviated-telephone"),
+        0x22 => ("r-access-request", "data"),
+        0x61 => ("r-request-for-acknowledgement", ""),
+        0x62 => ("r-acknowledgement", ""),
+        0x12 => ("r-log-on-off-control", ""),
+        0x30 => ("r-call-progress", ""),
+        0x15 => ("r-log-on-off-acknowledgement", ""),
+        0x17 => ("r-log-control-ready-for-reassignment", ""),
+        0x60 => ("r-telephony-acknowledge", ""),
+        _ => return None,
+    };
+    let mut v = serde_json::json!({
+        "su_type": su_type,
+        "su_type_hex": format!("0x{:02X}", su[2]),
+    });
+    if !kind.is_empty() {
+        v["request_kind"] = serde_json::json!(kind);
+    }
+    Some(v)
 }
 
 struct PendingRIsu {
@@ -232,6 +281,12 @@ impl RIsuReassembler {
     /// Feed one CRC-valid 19-byte R SU.
     pub fn push(&mut self, su: &[u8]) -> Option<AeroUserData> {
         debug_assert_eq!(su.len(), R_SU_LEN);
+        // JAERO routes an R SU to the ISU/SSU reassembler only when the
+        // user-data flag (`infofield[1] & 0x08`) is set; otherwise the SU
+        // is a control type (classified by [`parse_r_su`]).
+        if su[1] & 0x08 == 0 {
+            return None;
+        }
         let (k, n) = seq_indicator(su[0] >> 4)?;
         let sutype = su[0] & 0x0F;
         if sutype == 15 || sutype == 0 {
@@ -306,7 +361,9 @@ pub fn build_r_sus(aes_id: u32, ges_id: u8, qno: u8, refno: u8, data: &[u8]) -> 
             let sutype = if k == n { chunk.len() as u8 } else { 11 };
             let mut su = vec![
                 (seq_indicator_for(k, n) << 4) | (sutype & 0x0F),
-                (qno << 4) | (refno & 0x07),
+                // byte1: QNO (high nibble), user-data flag (bit 3, JAERO
+                // `infofield[1] & 0x08`), REFNO (low 3 bits).
+                (qno << 4) | 0x08 | (refno & 0x07),
                 aes[1],
                 aes[2],
                 aes[3],
@@ -421,8 +478,117 @@ pub fn parse_p_su(su: &[u8]) -> Option<serde_json::Value> {
         0x07 => parse_beam_support(su),
         0x0A => parse_broadcast_index(su),
         0x0C => parse_satellite_id(su),
+        0x28 => parse_eirp_table(su),
+        0x40 => parse_pr_control_isu(su),
+        0x41 => parse_t_control_isu(su),
+        0x61 => parse_rqa(su),
+        0x62 => parse_rack_tack(su),
+        0x74 | 0x76 => parse_lsdu(su),
         _ => None,
     }
+}
+
+/// JAERO's P/R-channel-control bit-rate code → bps map (`aerol.cpp`
+/// `P_R_channel_control_ISU` handler, byte8 high nibble). Code 8 is
+/// reserved (JAERO falls through to default −1).
+fn control_isu_bitrate(code: u8) -> Option<u32> {
+    match code {
+        0 => Some(600),
+        1 => Some(1200),
+        2 => Some(2400),
+        3 => Some(4800),
+        4 => Some(6000),
+        5 => Some(5250),
+        6 => Some(10500),
+        7 => Some(8400),
+        9 => Some(21000),
+        _ => None, // JAERO bitrate = -1
+    }
+}
+
+/// Data EIRP-table broadcast, complete sequence (P-channel type 0x28).
+/// JAERO (`AEROTypeP::Data_EIRP_table_broadcast_complete_sequence`) names
+/// this type and decodes no further fields; we surface the named event.
+pub fn parse_eirp_table(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x28 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "eirp-table-broadcast" }))
+}
+
+/// P/R-channel control ISU (P-channel type 0x40): the GES advertises a
+/// Pd (packet-data) carrier — its frequency, bit rate, and whether it is
+/// a spot-beam carrier. JAERO (`aerol.cpp` `P_R_channel_control_ISU`):
+/// - GES   = octet 5                                   [byte5 = su[4]]
+/// - bitrate code = (byte8 >> 4) & 0x0F → bps table    [byte8 = su[7]]
+/// - channel = ((byte9 & 0x7F) << 8) | byte10          [byte9/10 = su[8]/su[9]]
+/// - freq = channel × 0.0025 + 1510.0 MHz; spot beam = byte9 bit 7.
+/// (byteN = our su[N-1], JAERO's 1-based octet indexing.)
+pub fn parse_pr_control_isu(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x40 {
+        return None;
+    }
+    let ges_id = su[4];
+    let bitrate_code = (su[7] >> 4) & 0x0F;
+    let channel = (((su[8] & 0x7F) as u32) << 8) | su[9] as u32;
+    let freq = channel as f64 * 0.0025 + 1510.0;
+    let mut v = serde_json::json!({
+        "su_type": "pr-channel-control-isu",
+        "ges_id": ges_id,
+        "pd_mhz": freq,
+        "spotbeam": su[8] & 0x80 != 0,
+    });
+    // JAERO maps the bit-rate code through a table; reserved codes (8 and
+    // ≥10) become −1 there — we omit the field rather than emit a bogus rate.
+    if let Some(br) = control_isu_bitrate(bitrate_code) {
+        v["bit_rate"] = serde_json::json!(br);
+    }
+    Some(v)
+}
+
+/// T-channel control ISU (P-channel type 0x41): JAERO names this type and
+/// decodes no further fields; we surface the named event.
+pub fn parse_t_control_isu(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x41 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "t-channel-control-isu" }))
+}
+
+/// Request for acknowledgement, RQA (P-channel type 0x61): JAERO names
+/// this type (`Request_for_acknowledgement_RQA_P_channel`) and decodes no
+/// further fields; we surface the named event.
+pub fn parse_rqa(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x61 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "request-for-acknowledgement" }))
+}
+
+/// Acknowledge, RACK/TACK (P-channel type 0x62): JAERO names this type
+/// (`Acknowledge_RACK_TACK_P_channel`) and decodes no further fields; we
+/// surface the named event.
+pub fn parse_rack_tack(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x62 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "acknowledge" }))
+}
+
+/// Short LSDU user-data ISU (P-channel types 0x74/0x76): JAERO names the
+/// 3-octet (0x74) and 4-octet (0x76) LSDU RLS P-channel user-data types
+/// and decodes no further fields (they are not run through the ISU/SSU
+/// reassembler), so we surface the named event with the LSDU length.
+pub fn parse_lsdu(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN {
+        return None;
+    }
+    let octets = match su[0] {
+        0x74 => 3,
+        0x76 => 4,
+        _ => return None,
+    };
+    Some(serde_json::json!({ "su_type": "short-lsdu", "lsdu_octets": octets }))
 }
 
 /// `MessageBody::Aero` kind tag for a structured P-SU value.
@@ -846,6 +1012,189 @@ mod tests {
 
         assert!(parse_beam_support(&[0x0A; 12]).is_none());
         assert!(parse_broadcast_index(&[0x07; 12]).is_none());
+    }
+
+    /// AERO-1.4: P/R-channel control ISU 0x40. Field layout from JAERO
+    /// `aerol.cpp` `P_R_channel_control_ISU`: GES = octet 5 (su[4]),
+    /// bit-rate code = (byte8>>4)&0x0F mapped through JAERO's table,
+    /// channel = ((byte9&0x7F)<<8)|byte10 → ×0.0025+1510.0 MHz, spot-beam =
+    /// byte9 bit 7. byteN = su[N-1].
+    #[test]
+    fn pr_control_isu_decodes_jaero_layout() {
+        // GES 0x2A, bit-rate code 1 → 1200 bps, channel 0x0123 (no spot
+        // beam). byte8 = su[7] high nibble = code; byte9/10 = su[8]/su[9].
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x40;
+        su10[4] = 0x2A; // GES (octet 5)
+        su10[7] = 0x10; // byte8: bit-rate code 1 in high nibble
+        su10[8] = 0x01; // byte9 high (no spot-beam bit)
+        su10[9] = 0x23; // byte10
+        let su = su_with_crc(su10);
+        let v = parse_pr_control_isu(&su).unwrap();
+        assert_eq!(v["su_type"], "pr-channel-control-isu");
+        assert_eq!(v["ges_id"], 0x2A);
+        assert_eq!(v["bit_rate"], 1200);
+        assert_eq!(v["pd_mhz"], 0x0123 as f64 * 0.0025 + 1510.0);
+        assert_eq!(v["spotbeam"], false);
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "pr-channel-control-isu");
+
+        // Spot-beam carrier, bit-rate code 6 → 10500 bps.
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x40;
+        su10[4] = 0x11;
+        su10[7] = 0x60; // bit-rate code 6
+        su10[8] = 0x80 | 0x02; // spot beam + channel high
+        su10[9] = 0x00; // channel 0x0200
+        let su = su_with_crc(su10);
+        let v = parse_pr_control_isu(&su).unwrap();
+        assert_eq!(v["bit_rate"], 10500);
+        assert_eq!(v["spotbeam"], true);
+        assert_eq!(v["pd_mhz"], 0x0200 as f64 * 0.0025 + 1510.0);
+
+        // Reserved bit-rate code 8 → JAERO −1; we omit the field.
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x40;
+        su10[7] = 0x80; // code 8 (reserved)
+        let su = su_with_crc(su10);
+        let v = parse_pr_control_isu(&su).unwrap();
+        assert!(v.get("bit_rate").is_none());
+
+        // Whole JAERO bit-rate code table.
+        assert_eq!(control_isu_bitrate(0), Some(600));
+        assert_eq!(control_isu_bitrate(1), Some(1200));
+        assert_eq!(control_isu_bitrate(2), Some(2400));
+        assert_eq!(control_isu_bitrate(3), Some(4800));
+        assert_eq!(control_isu_bitrate(4), Some(6000));
+        assert_eq!(control_isu_bitrate(5), Some(5250));
+        assert_eq!(control_isu_bitrate(6), Some(10500));
+        assert_eq!(control_isu_bitrate(7), Some(8400));
+        assert_eq!(control_isu_bitrate(8), None);
+        assert_eq!(control_isu_bitrate(9), Some(21000));
+        assert_eq!(control_isu_bitrate(10), None);
+
+        assert!(parse_pr_control_isu(&[0x41; 12]).is_none());
+    }
+
+    /// AERO-1.4: the named-only P-channel control/user-data types JAERO
+    /// enumerates in `AEROTypeP` but decodes no further fields — EIRP-table
+    /// 0x28, T-channel-control-ISU 0x41, RQA 0x61, RACK/TACK 0x62, and the
+    /// short 3-/4-octet LSDU user-data types 0x74/0x76. We surface each as
+    /// its named event (LSDU also carries its octet length).
+    #[test]
+    fn named_only_control_types() {
+        let named = [
+            (0x28u8, "eirp-table-broadcast"),
+            (0x41, "t-channel-control-isu"),
+            (0x61, "request-for-acknowledgement"),
+            (0x62, "acknowledge"),
+        ];
+        for (ty, name) in named {
+            let mut su10 = vec![0u8; 10];
+            su10[0] = ty;
+            let su = su_with_crc(su10);
+            assert_eq!(parse_p_su(&su).unwrap()["su_type"], name, "type 0x{ty:02X}");
+        }
+        // Each handler rejects other types.
+        assert!(parse_eirp_table(&[0x41; 12]).is_none());
+        assert!(parse_t_control_isu(&[0x28; 12]).is_none());
+        assert!(parse_rqa(&[0x62; 12]).is_none());
+        assert!(parse_rack_tack(&[0x61; 12]).is_none());
+
+        // Short LSDU 0x74 (3 octets) / 0x76 (4 octets).
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x74;
+        let su = su_with_crc(su10);
+        let v = parse_p_su(&su).unwrap();
+        assert_eq!(v["su_type"], "short-lsdu");
+        assert_eq!(v["lsdu_octets"], 3);
+
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x76;
+        let su = su_with_crc(su10);
+        let v = parse_p_su(&su).unwrap();
+        assert_eq!(v["su_type"], "short-lsdu");
+        assert_eq!(v["lsdu_octets"], 4);
+
+        assert!(parse_lsdu(&[0x71; 12]).is_none());
+    }
+
+    /// AERO-3: R-channel named control set. JAERO (`aerol.cpp` R-channel
+    /// branch) reads the message type from the third byte (`infofield[2]` =
+    /// su[2]) and routes to user-data only when `infofield[1] & 0x08` is
+    /// set. The named types are JAERO's `AEROTypeR` enum (`aerol.h`).
+    #[test]
+    fn r_control_set_classifies_aerotype_r() {
+        let expect = [
+            (0x20u8, "r-access-request", Some("general-telephone")),
+            (0x23, "r-access-request", Some("abbreviated-telephone")),
+            (0x22, "r-access-request", Some("data")),
+            (0x61, "r-request-for-acknowledgement", None),
+            (0x62, "r-acknowledgement", None),
+            (0x12, "r-log-on-off-control", None),
+            (0x30, "r-call-progress", None),
+            (0x15, "r-log-on-off-acknowledgement", None),
+            (0x17, "r-log-control-ready-for-reassignment", None),
+            (0x60, "r-telephony-acknowledge", None),
+        ];
+        for (ty, su_type, kind) in expect {
+            // Control SU: user-data flag (su[1] bit 3) clear, type at su[2].
+            let mut su = vec![0u8; R_SU_LEN];
+            su[1] = 0x00; // user-data flag clear
+            su[2] = ty;
+            let crc = HDLC_FCS.checksum(&su[..17]);
+            su[17] = (crc & 0xFF) as u8;
+            su[18] = (crc >> 8) as u8;
+            assert!(r_su_crc_ok(&su));
+            let v = parse_r_su(&su).unwrap_or_else(|| panic!("R type 0x{ty:02X} classifies"));
+            assert_eq!(v["su_type"], su_type, "type 0x{ty:02X}");
+            assert_eq!(v["su_type_hex"], format!("0x{ty:02X}"));
+            match kind {
+                Some(k) => assert_eq!(v["request_kind"], k, "type 0x{ty:02X}"),
+                None => assert!(v.get("request_kind").is_none(), "type 0x{ty:02X}"),
+            }
+        }
+
+        // User-data flag set → not a control SU (handled by reassembler).
+        let mut su = vec![0u8; R_SU_LEN];
+        su[1] = 0x08; // user-data flag
+        su[2] = 0x20; // would otherwise be access-request
+        let crc = HDLC_FCS.checksum(&su[..17]);
+        su[17] = (crc & 0xFF) as u8;
+        su[18] = (crc >> 8) as u8;
+        assert!(parse_r_su(&su).is_none());
+
+        // Unrecognized control byte → None.
+        let mut su = vec![0u8; R_SU_LEN];
+        su[2] = 0xAA;
+        let crc = HDLC_FCS.checksum(&su[..17]);
+        su[17] = (crc & 0xFF) as u8;
+        su[18] = (crc >> 8) as u8;
+        assert!(parse_r_su(&su).is_none());
+
+        // Wrong length → None.
+        assert!(parse_r_su(&[0u8; 12]).is_none());
+    }
+
+    /// AERO-3 verify: SEQINDICATOR nibble → (SUindex, SUtotal) must match
+    /// JAERO's `RISUData::update` switch exactly (`aerol.cpp` lines 59-87:
+    /// 1→(1,1), 2→(1,2), 3→(2,2), 4→(1,3), 5→(2,3), 6→(3,3); k,n 1-based).
+    #[test]
+    fn seq_indicator_matches_jaero_switch() {
+        // (SEQINDICATOR, SUindex 0-based in JAERO, SUtotal in JAERO).
+        let jaero = [(1u8, 0u8, 1u8), (2, 0, 2), (3, 1, 2), (4, 0, 3), (5, 1, 3), (6, 2, 3)];
+        for (ind, su_index, su_total) in jaero {
+            let (k, n) = seq_indicator(ind).unwrap_or_else(|| panic!("SEQINDICATOR {ind}"));
+            // Our k is 1-based; JAERO's SUindex is 0-based → k = SUindex+1.
+            assert_eq!(k, su_index + 1, "SEQINDICATOR {ind} index");
+            assert_eq!(n, su_total, "SEQINDICATOR {ind} total");
+            // Round-trip the encoder against the same table.
+            assert_eq!(seq_indicator_for(k, n), ind, "SEQINDICATOR {ind} encode");
+        }
+        // 0 and 7..=15 are not valid SEQINDICATOR values in JAERO's switch.
+        assert!(seq_indicator(0).is_none());
+        for v in 7..=15 {
+            assert!(seq_indicator(v).is_none(), "SEQINDICATOR {v}");
+        }
     }
 
     #[test]

@@ -45,6 +45,11 @@ pub struct BurstResult {
     /// Completed user-data units (T bursts feed the P-style reassembler,
     /// R bursts the R-channel reassembler).
     pub users: Vec<su::AeroUserData>,
+    /// Named control/signalling SUs decoded from this burst (R-channel
+    /// access-request / call-progress / telephony-ack / RQA / ACK etc.,
+    /// or T-burst P-style control SUs) — see [`su::parse_r_su`] /
+    /// [`su::parse_p_su`].
+    pub su_events: Vec<serde_json::Value>,
     pub is_t: bool,
 }
 
@@ -101,26 +106,34 @@ impl BurstPacketizer {
         // T burst: 6-byte header (AES 3 + GES 1 + CRC 2)?
         if bytes.len() >= 6 && HDLC_FCS.checksum(&bytes[..4]) == u16::from_le_bytes([bytes[4], bytes[5]]) {
             let mut users = Vec::new();
+            let mut su_events = Vec::new();
             let mut p = 6;
             while p + su::SU_LEN <= bytes.len() {
                 let su_bytes = &bytes[p..p + su::SU_LEN];
                 if !su::su_crc_ok(su_bytes) {
                     break;
                 }
+                if let Some(a) = su::parse_p_su(su_bytes) {
+                    su_events.push(a);
+                }
                 if let Some(u) = self.t_reasm.push(su_bytes) {
                     users.push(u);
                 }
                 p += su::SU_LEN;
             }
-            return Some(BurstResult { users, is_t: true });
+            return Some(BurstResult { users, su_events, is_t: true });
         }
 
         // R burst: one 19-byte SU.
         if bytes.len() >= su::R_SU_LEN {
             let su_bytes = &bytes[..su::R_SU_LEN];
             if su::r_su_crc_ok(su_bytes) {
+                let mut su_events = Vec::new();
+                if let Some(a) = su::parse_r_su(su_bytes) {
+                    su_events.push(a);
+                }
                 let users = self.r_reasm.push(su_bytes).into_iter().collect();
-                return Some(BurstResult { users, is_t: false });
+                return Some(BurstResult { users, su_events, is_t: false });
             }
         }
         None

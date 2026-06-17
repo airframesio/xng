@@ -164,6 +164,46 @@ P-channel SUs are classified into JSON values surfaced as
   - 0x07 GES_beam_support and 0x0A broadcast_index: named by JAERO with no
     further field decode; surfaced as named events (raw bytes carried).
   byteN above = our su[N-1] (JAERO's 1-based octet indexing).
+- AERO-1.4 — remaining P-channel control/user-data types JAERO enumerates
+  in `AEROTypeP` (`aerol.h`); only 0x40 carries fields JAERO decodes:
+  - 0x40 P_R_channel_control_ISU: GES = octet 5 (su[4]); bit-rate code =
+    (byte8>>4)&0x0F (su[7]) mapped through JAERO's table
+    {0→600, 1→1200, 2→2400, 3→4800, 4→6000, 5→5250, 6→10500, 7→8400,
+    9→21000; 8 and ≥10 reserved → JAERO −1, field omitted}; Pd channel =
+    ((byte9&0x7F)<<8)|byte10 (su[8]/su[9]) → ×0.0025+1510.0 MHz; spot-beam =
+    byte9 bit 7. Surfaced as the Pd-carrier advert (`pd_mhz`, `bit_rate`,
+    `spotbeam`, `ges_id`). (JAERO `aerol.cpp` `P_R_channel_control_ISU`.)
+  - 0x28 Data_EIRP_table_broadcast_complete_sequence, 0x41
+    T_channel_control_ISU, 0x61 Request_for_acknowledgement (RQA), 0x62
+    Acknowledge (RACK/TACK): JAERO names these and decodes no further
+    fields; surfaced as named events.
+  - 0x74/0x76 User_data_3-/4-octet_LSDU_RLS_P_channel: short LSDU user-data
+    types JAERO names but does not run through the ISU/SSU reassembler;
+    surfaced as a named `short-lsdu` event carrying the LSDU octet length
+    (3 for 0x74, 4 for 0x76).
+
+R-channel control-SU classifier (`su::parse_r_su`, AERO-3): a 19-byte
+R-channel SU is a *control* SU when JAERO's user-data flag is clear
+(`infofield[1] & 0x08 == 0`, our su[1] bit 3); otherwise it is user data
+routed to the ISU/SSU reassembler (`RIsuReassembler`, which now also
+enforces the same flag, and whose encoder `build_r_sus` sets it). For a
+control SU the message type is the **third** byte (`infofield[2]` = su[2]
+— the same byte the user-data path uses for the AES high octet, so AES/GES
+do not apply). Types are JAERO's `AEROTypeR` enum (`aerol.h`), surfaced as
+named events: 0x20 general access-request (telephone), 0x23 abbreviated
+access-request (telephone), 0x22 access-request (data, R/T channel),
+0x61 request-for-acknowledgement, 0x62 acknowledgement, 0x12
+log-on/log-off control, 0x30 call-progress, 0x15 log-on/log-off
+acknowledgement, 0x17 log-control ready-for-reassignment, 0x60
+telephony-acknowledge. JAERO only *names* these; xng emits the named
+event. R-burst control SUs surface as `AeroEvent`s tagged `Mode::AeroC`
+at the burst bit rate.
+
+R-channel SEQINDICATOR → (k, n) (previously flagged for verification) is
+now confirmed against JAERO's `RISUData::update` switch (`aerol.cpp`):
+1→(1,1), 2→(1,2), 3→(2,2), 4→(1,3), 5→(2,3), 6→(3,3); JAERO's SUindex is
+0-based so our 1-based k = SUindex+1. Pinned by
+`seq_indicator_matches_jaero_switch`.
 
 Channel/mode tagging (AERO-8.1): each `AeroEvent` carries the physical
 channel it came from. The L-band P-channel decoder (`AeroChannelDecoder`)
@@ -173,3 +213,30 @@ tags `Mode::AeroL`; the C-band feeder R/T burst decoder
 longer mislabel as `aero-l`. (JAERO models these as distinct physical
 channels — `AeroL::ChannelType {PChannel, RChannel, TChannel}` on L-band
 vs the C-band feeder bursts handled by the burst demodulators.)
+
+Typed SU classifier + bit_rate/channel tag (AERO-8.2): the typed SU
+classifier is shared across all three logical channels — `parse_p_su`
+runs on P-channel SUs (`AeroChannelDecoder`) and on the P-style SUs
+carried inside T bursts (`BurstPacketizer`), while `parse_r_su`
+classifies the R-channel control set; the user-data ISU/SSU layer is the
+same `Reassembler`/`RIsuReassembler` for P/R/T. Each `AeroEvent` now also
+carries an `AeroChannel` (P/R/T): the P-channel decoder emits
+`PChannel`; a C-band feeder burst emits `TChannel` for a reserved/TDMA T
+burst (6-byte AES/GES header + P-style SUs) or `RChannel` for a
+random-access R burst (single 19-byte SU) — mirroring JAERO's
+`RTChannelDeleaveFECScram` OK_T_Packet / OK_R_Packet split. `to_message`
+injects `channel` (p-/r-/t-channel) and `line_bit_rate` (the physical
+frame/burst rate) into the `MessageBody::Aero` details; `line_bit_rate`
+is kept distinct from any decoded protocol `bit_rate` field (e.g. the Pd
+carrier rate in a 0x40 P/R-control ISU) so the two never clobber.
+
+Deliberately out of scope here (noted, not done):
+- C-channel descrambler `dl2` alignment — a demod/DSP off-air scrambler
+  offset (`2714−6` bit delay before descramble) that JAERO applies; it is
+  invisible to matched loopback and has no public C-channel capture to
+  verify against, so it is left flagged (see the C-channel note above)
+  rather than guessed.
+- `docs/notes/AERO.md` — a repo-level doc outside this crate; left to the
+  shared-docs owner.
+- 10.5k A-QPSK aero-c burst path (AERO-8.3) and C-channel AMBE→WAV
+  (feature-flagged audio) — separate big-bet/DSP tasks.

@@ -100,12 +100,16 @@ fn log_on_confirm_decodes_end_to_end() {
         bit_rate: 600,
         su_event: Some(v.clone()),
         mode: Mode::AeroL,
+        channel: xng_mode_aero::AeroChannel::PChannel,
     };
     let msg = to_message(&event, 1_545_000_000, -50.0, prov());
     match msg.body {
         MessageBody::Aero { kind, details } => {
             assert_eq!(kind, "log-control");
             assert_eq!(details["event"], "log-on-confirm");
+            // AERO-8.2: channel + line rate injected into the details.
+            assert_eq!(details["channel"], "p-channel");
+            assert_eq!(details["line_bit_rate"], 600);
         }
         other => panic!("expected MessageBody::Aero, got {other:?}"),
     }
@@ -148,6 +152,67 @@ fn t_channel_assignment_decodes_end_to_end() {
         .expect("t-channel-assignment decoded through the full chain");
     assert_eq!(v["aes_id"], "123456");
     assert_eq!(v["ges_id"], 0x07);
+}
+
+#[test]
+fn pr_control_isu_decodes_end_to_end() {
+    // AERO-1.4: 0x40 P/R-channel control ISU through the full chain.
+    // GES 0x2A, bit-rate code 1 → 1200 bps, Pd channel 0x0123.
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x40;
+    su10[4] = 0x2A; // GES (octet 5)
+    su10[7] = 0x10; // byte8 high nibble = bit-rate code 1
+    su10[8] = 0x01; // byte9 (channel high, no spot beam)
+    su10[9] = 0x23; // byte10 (channel low)
+    let events = decode_su10(su10);
+    let v = events
+        .iter()
+        .find(|v| v["su_type"] == "pr-channel-control-isu")
+        .expect("pr-channel-control-isu decoded through the full chain");
+    assert_eq!(v["ges_id"], 0x2A);
+    assert_eq!(v["bit_rate"], 1200);
+    assert_eq!(v["pd_mhz"], 0x0123 as f64 * 0.0025 + 1510.0);
+    assert_eq!(v["spotbeam"], false);
+
+    // And it lands in MessageBody::Aero with the SU type as the kind.
+    let event = xng_mode_aero::AeroEvent {
+        user: su::AeroUserData {
+            aes_id: String::new(),
+            ges_id: 0x2A,
+            qno: 0,
+            refno: 0,
+            data: Vec::new(),
+        },
+        acars: None,
+        bit_rate: 600,
+        su_event: Some(v.clone()),
+        mode: Mode::AeroL,
+        channel: xng_mode_aero::AeroChannel::PChannel,
+    };
+    let msg = to_message(&event, 1_545_000_000, -50.0, prov());
+    match msg.body {
+        MessageBody::Aero { kind, details } => {
+            assert_eq!(kind, "pr-channel-control-isu");
+            // Decoded protocol bit_rate (Pd carrier) is preserved;
+            // the physical line rate is surfaced separately (AERO-8.2).
+            assert_eq!(details["bit_rate"], 1200);
+            assert_eq!(details["line_bit_rate"], 600);
+            assert_eq!(details["channel"], "p-channel");
+        }
+        other => panic!("expected MessageBody::Aero, got {other:?}"),
+    }
+}
+
+#[test]
+fn eirp_table_decodes_end_to_end() {
+    // AERO-1.4: 0x28 EIRP-table broadcast through the full chain.
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x28;
+    let events = decode_su10(su10);
+    assert!(
+        events.iter().any(|v| v["su_type"] == "eirp-table-broadcast"),
+        "eirp-table-broadcast decoded through the full chain"
+    );
 }
 
 #[test]
