@@ -147,6 +147,39 @@ POS / `4J` `PS`/`POS` degrees-plus-tenths-of-a-minute (`43312` →
 expected lat/lon in airframes' acars-decoder-typescript test suite and
 acars-message-documentation (`research/20/POS.md`, `H1/POS.md`, `4J.md`).
 
+## FANS-1/A additional argument readers (2026-06, ACARS-3.1)
+
+`cpdlc/mod.rs`: further element-argument readers for the shapes that
+previously fell to the bracketed template. PER constraints, CHOICE order
+and value scaling are taken from the libacars asn1c tables (MIT, as
+before) and the libacars text formatters (`asn1-format-cpdlc-text.c`):
+DistanceOffset (CHOICE Nm 1..128 / Km 1..256, integer units), Distance
+(CHOICE Nm 0..9999 tenths / Km 1..1024), Frequency (CHOICE hf
+2850..28000 kHz / vhf 117000..138000 kHz / uhf 225000..399975 kHz both
+rendered in MHz / 12-char NumericString satchannel), BeaconCode
+(SEQUENCE OF SIZE(4) of octal digit 0..7), ProcedureName (SEQUENCE type
+0..2 + IA5 1..6 + optional transition), Altimeter (CHOICE english
+2200..3200 inHg×0.01 / metric 7500..12500 hPa×0.1), ATISCode (IA5
+SIZE 1), RemainingFuel (HH:MM) + RemainingSouls (1..1024),
+ErrorInformation (ENUM 0..16, labels from FANSErrorInformation.c),
+VersionNumber (0..15), ICAOfacilitydesignation (IA5 SIZE 4), Tp4table /
+ToFrom (ENUM 0..1), ICAOUnitName (facility-id CHOICE designation/name +
+function ENUM 0..7) and ICAOUnitNameFrequency, plus the FANSPosition
+`placeBearingDistance` CHOICE alternative (fixName + optional lat/lon +
+degrees + distance). Composite elements (DistanceOffsetDirection,
+PositionICAOunitnameFrequency, TimeDistanceToFromPosition, ...) compose
+these readers.
+
+Verification: each new shape is pinned to a spec-derived UPER body whose
+EXPECTED decode was independently confirmed by running the same body,
+wrapped in a valid ARINC-622 envelope, through the installed libacars
+reference decoder (`decode_acars_apps`) — not an encode→decode loopback.
+The headline case is a real off-air message from libacars'
+`examples/decode_acars_apps.c` (`/AKLCDYA.AT1.9M-MTB...`, uM118 CONTACT
+AUCKLAND control 123.900 MHz). FANSPositionReport (the deep position-report
+SEQUENCE) and RouteClearance trackDetail remain undecoded (reported as
+the bracketed template).
+
 ## MIAM file-transfer reassembly (2026-06)
 
 File transfers spanning multiple label-MA messages reassemble per the

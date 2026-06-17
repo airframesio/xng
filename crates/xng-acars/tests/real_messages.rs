@@ -304,3 +304,32 @@ fn label_4j_poswx_met_fields() {
     assert_eq!(m.true_airspeed_kt, Some(490));
     assert_eq!(m.altitude_ft, Some(27000));
 }
+
+
+// --- ACARS-3.1: real off-air CPDLC argument decode ---
+// `/AKLCDYA.AT1.9M-MTB...` is one of the real off-air FANS-1/A messages
+// embedded in libacars' own `examples/decode_acars_apps.c` (MIT). Running
+// it through the libacars reference decoder yields:
+//   AT [position] CONTACT [icaounitname] [frequency]
+//     Fix: LUNBI / Facility Name: AUCKLAND / function: control
+//     VHF: 123.900 MHz
+// xng must reproduce the same argument decode (position + ICAO unit name +
+// frequency), exercising the new ACARS-3.1 readers on real traffic.
+#[test]
+fn aklcdya_real_cpdlc_contact_with_unit_and_frequency() {
+    let app = xng_acars::arinc622::parse(
+        "/AKLCDYA.AT1.9M-MTB215B659D84995674293583561CB9906744E9AF40F9EB",
+        false,
+    )
+    .expect("parses ARINC-622 envelope");
+    let AcarsApp::Cpdlc { envelope, message, .. } = app else {
+        panic!("expected CPDLC: {app:?}");
+    };
+    assert!(envelope.crc_ok, "real off-air message must pass CRC");
+    let m = message.expect("CPDLC body decodes");
+    assert_eq!(m.msg_id, 2);
+    assert_eq!(m.timestamp.as_deref(), Some("22:54:22"));
+    assert_eq!(m.element, "uM118PositionICAOunitnameFrequency");
+    assert_eq!(m.args, vec!["LUNBI", "AUCKLAND control", "123.900 MHz"]);
+    assert_eq!(m.text, "AT LUNBI CONTACT AUCKLAND control 123.900 MHz");
+}
