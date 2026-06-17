@@ -321,6 +321,9 @@ fn decode_extended_squitter(me: &[u8], f: &mut AdsbFrame) {
         }
         // Aircraft status (emergency/priority + ACAS RA broadcast).
         28 => f.adsb_status = decode::aircraft_status(me),
+        // Target state and status (MCP/FCU selected alt/heading, QNH,
+        // autopilot/VNAV/approach/LNAV flags).
+        29 => f.adsb_status = decode::target_state(me),
         // Operational status: ADS-B version + NACp/SIL/NIC-supp/GVA.
         31 => f.adsb_status = decode::operational_status(me),
         _ => {}

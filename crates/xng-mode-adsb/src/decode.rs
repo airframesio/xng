@@ -261,6 +261,71 @@ pub fn aircraft_status(me: &[u8]) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(o))
 }
 
+/// Decode a TC 29 Target State and Status ME field (7 bytes) into the
+/// DO-260B selected-state / nav-mode layer: selected altitude (+ source),
+/// barometric pressure setting, selected heading, NACp, NICbaro, SIL, and
+/// the autopilot/VNAV/altitude-hold/approach/LNAV/TCAS mode flags. The
+/// five autopilot/nav flags are gated by the "mode status" bit (when 0
+/// the modes are unknown and omitted); TCAS-operational is always valid.
+/// Returns `None` for a non-TC29 field.
+///
+/// ME-relative, 0-indexed bit positions (per DO-260B §2.2.3.2.7.1, cross-
+/// checked against pyModeS `bds62`): subtype 5–6, selected-altitude source
+/// 8, selected altitude 9–19 ((raw−1)·32 ft), baro pressure 20–28
+/// (800+(raw−1)·0.8 mbar), heading status 29, selected heading 30–38
+/// (raw·360/512°), NACp 39–42, NICbaro 43, SIL 44–45, mode status 46,
+/// autopilot 47, VNAV 48, altitude-hold 49, approach 51, TCAS-operational
+/// 52, LNAV 53.
+pub fn target_state(me: &[u8]) -> Option<serde_json::Value> {
+    let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+    let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+    if field(0, 5) != 29 {
+        return None;
+    }
+    let mut o = serde_json::Map::new();
+    o.insert("subtype".into(), serde_json::json!("target_state"));
+    o.insert("ts_subtype".into(), serde_json::json!(field(5, 2)));
+
+    let alt_raw = field(9, 11);
+    if alt_raw != 0 {
+        o.insert("selected_altitude".into(), serde_json::json!((alt_raw - 1) * 32));
+        o.insert(
+            "selected_altitude_source".into(),
+            serde_json::json!(if bit(8) == 1 { "FMS" } else { "MCP/FCU" }),
+        );
+    }
+
+    let baro_raw = field(20, 9);
+    if baro_raw != 0 {
+        o.insert(
+            "baro_pressure_setting".into(),
+            serde_json::json!(800.0 + (baro_raw - 1) as f64 * 0.8),
+        );
+    }
+
+    if bit(29) == 1 {
+        o.insert(
+            "selected_heading".into(),
+            serde_json::json!(field(30, 9) as f64 * 360.0 / 512.0),
+        );
+    }
+
+    o.insert("nac_p".into(), serde_json::json!(field(39, 4)));
+    o.insert("nic_baro".into(), serde_json::json!(bit(43)));
+    o.insert("sil".into(), serde_json::json!(field(44, 2)));
+
+    if bit(46) == 1 {
+        o.insert("autopilot".into(), serde_json::json!(bit(47) == 1));
+        o.insert("vnav_mode".into(), serde_json::json!(bit(48) == 1));
+        o.insert("altitude_hold_mode".into(), serde_json::json!(bit(49) == 1));
+        o.insert("approach_mode".into(), serde_json::json!(bit(51) == 1));
+        o.insert("lnav_mode".into(), serde_json::json!(bit(53) == 1));
+    }
+    o.insert("tcas_operational".into(), serde_json::json!(bit(52) == 1));
+
+    Some(serde_json::Value::Object(o))
+}
+
 /// Emergency/priority status code (TC28 subtype 1) → label.
 fn emergency_label(state: u32) -> &'static str {
     match state {
@@ -711,6 +776,47 @@ mod opstatus_tests {
             .map(|i| u8::from_str_radix(&frame[i..i + 2], 16).unwrap())
             .collect();
         bytes[4..11].to_vec()
+    }
+
+    #[test]
+    fn target_state_matches_pymodes_bds62() {
+        // Oracle: pyModeS test_bds62 golden frame (DO-260B compliant).
+        // pyModeS decode() → selected_altitude 16992 source MCP/FCU,
+        // baro 1012.8, heading ~66.8, autopilot/vnav/lnav/tcas True,
+        // alt-hold/approach False.
+        let v = target_state(&me_hex("8DA05629EA21485CBF3F8CADAEEB")).unwrap();
+        assert_eq!(v["subtype"], "target_state");
+        assert_eq!(v["ts_subtype"], 1);
+        assert_eq!(v["selected_altitude"], 16992);
+        assert_eq!(v["selected_altitude_source"], "MCP/FCU");
+        assert!((v["baro_pressure_setting"].as_f64().unwrap() - 1012.8).abs() < 0.01);
+        assert!((v["selected_heading"].as_f64().unwrap() - 66.796875).abs() < 0.01);
+        assert_eq!(v["autopilot"], true);
+        assert_eq!(v["vnav_mode"], true);
+        assert_eq!(v["altitude_hold_mode"], false);
+        assert_eq!(v["approach_mode"], false);
+        assert_eq!(v["lnav_mode"], true);
+        assert_eq!(v["tcas_operational"], true);
+        // NACp/NICbaro/SIL present and in range.
+        assert_eq!(v["nac_p"], 9);
+        assert_eq!(v["nic_baro"], 1);
+        assert_eq!(v["sil"], 3);
+    }
+
+    #[test]
+    fn target_state_selected_heading_high_bit() {
+        // Oracle: pyModeS regression vector — heading sign/high bit set
+        // → 246.796875°.
+        let v = target_state(&me_hex("8DA05629EA21485EBF3F8CADAEEB")).unwrap();
+        assert!((v["selected_heading"].as_f64().unwrap() - 246.796875).abs() < 0.01);
+    }
+
+    #[test]
+    fn target_state_rejects_wrong_typecode() {
+        assert!(target_state(&me_hex("8DA05629EA21485CBF3F8CADAEEB")).is_some());
+        // TC=31 (operational status) must not parse as target state.
+        let payload: u64 = 31u64 << 51;
+        assert!(target_state(&me_of(payload)).is_none());
     }
 
     #[test]

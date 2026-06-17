@@ -40,3 +40,20 @@ fields: TC31 subtype (ME 5–7), ADS-B version (40–42), NIC-supplement-A
 decoder and its `test_bds65` synthetic vector (facts/positions only — no
 code ported); the synthetic-vector construction is reproduced in
 `decode.rs` unit tests. Emitted under `adsb_status` on the Mode S message.
+
+## Target state and status (2026-06)
+
+TC 29 (Target State and Status — BDS 6,2) ME-field bit layout is the
+published DO-260B §2.2.3.2.7.1 single-format Target State and Status
+message: subtype (ME 5–6), selected-altitude source (8), selected
+altitude (9–19, (raw−1)·32 ft), barometric pressure setting (20–28,
+800+(raw−1)·0.8 mbar), heading status (29), selected heading (30–38,
+raw·360/512°), NACp (39–42), NICbaro (43), SIL (44–45), mode status (46)
+gating autopilot (47) / VNAV (48) / altitude-hold (49) / approach (51) /
+LNAV (53), and TCAS-operational (52). Bit positions and the field
+formulas were cross-checked against the pyModeS `bds62` decoder and its
+`test_bds62` golden vector (`8DA05629EA21485CBF3F8CADAEEB` → selected
+altitude 16992 ft MCP/FCU, QNH 1012.8 mbar, heading 66.8°, AP/VNAV/LNAV
+engaged) — facts/positions only, no code ported; that real vector and its
+expected values are vendored as the `decode.rs` unit test. Emitted under
+`adsb_status` with `subtype: "target_state"`.
