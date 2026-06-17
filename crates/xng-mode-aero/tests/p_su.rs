@@ -110,3 +110,42 @@ fn log_on_confirm_decodes_end_to_end() {
         other => panic!("expected MessageBody::Aero, got {other:?}"),
     }
 }
+
+#[test]
+fn call_announcement_decodes_end_to_end() {
+    // AERO-1.2: 0x21 Call_announcement, AES 0xA1B2C3, GES 0x44,
+    // rx channel 4000, tx channel 2000.
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x21;
+    su10[1..4].copy_from_slice(&[0xA1, 0xB2, 0xC3]);
+    su10[4] = 0x44;
+    su10[6] = (4000u16 >> 8) as u8;
+    su10[7] = (4000u16 & 0xFF) as u8;
+    su10[8] = (2000u16 >> 8) as u8;
+    su10[9] = (2000u16 & 0xFF) as u8;
+    let events = decode_su10(su10);
+    let v = events
+        .iter()
+        .find(|v| v["su_type"] == "call-announcement")
+        .expect("call-announcement decoded through the full chain");
+    assert_eq!(v["aes_id"], "A1B2C3");
+    assert_eq!(v["ges_id"], 0x44);
+    assert_eq!(v["receive_mhz"], 4000.0 * 0.0025 + 1510.0);
+    assert_eq!(v["transmit_mhz"], 2000.0 * 0.0025 + 1611.5);
+}
+
+#[test]
+fn t_channel_assignment_decodes_end_to_end() {
+    // AERO-1.2: 0x51 T_channel_assignment, AES 0x123456, GES 0x07.
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x51;
+    su10[1..4].copy_from_slice(&[0x12, 0x34, 0x56]);
+    su10[4] = 0x07;
+    let events = decode_su10(su10);
+    let v = events
+        .iter()
+        .find(|v| v["su_type"] == "t-channel-assignment")
+        .expect("t-channel-assignment decoded through the full chain");
+    assert_eq!(v["aes_id"], "123456");
+    assert_eq!(v["ges_id"], 0x07);
+}

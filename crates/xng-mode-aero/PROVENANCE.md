@@ -142,6 +142,13 @@ P-channel SUs are classified into JSON values surfaced as
   confirm/reject/interrogation/prompt/reassignment; acknowledge either
   way). JAERO only *names* these types; xng emits structured session
   events.
+- AERO-1.2 — Call_announcement (0x21) and T_channel_assignment (0x51):
+  0x21 carries an incoming-call channel-pair announcement; JAERO routes
+  it through `SendCAssignment`, reusing the C-channel-assignment octet
+  layout (AES 2–4, GES 5, rx octets 7/8 → ×0.0025 +1510.0 MHz, tx octets
+  9/10 → ×0.0025 +1611.5 MHz, spot-beam flags in the high octets). 0x51
+  is the reservation T-channel assignment; JAERO names it and decodes no
+  further fields, so xng surfaces the named event with AES/GES only.
 
 Channel/mode tagging (AERO-8.1): each `AeroEvent` carries the physical
 channel it came from. The L-band P-channel decoder (`AeroChannelDecoder`)

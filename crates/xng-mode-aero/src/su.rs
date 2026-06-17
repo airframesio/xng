@@ -337,17 +337,17 @@ pub fn parse_c_assignment(su: &[u8]) -> Option<serde_json::Value> {
         0x33 => "other-safety",
         _ => "non-safety",
     };
-    let rx_chan = (((su[6] & 0x7F) as u32) << 8) | su[7] as u32;
-    let tx_chan = (((su[8] & 0x7F) as u32) << 8) | su[9] as u32;
+    let (aes_id, ges_id) = aes_ges(su);
+    let (rx_mhz, rx_spot, tx_mhz, tx_spot) = assignment_freqs(su);
     Some(serde_json::json!({
         "su_type": "c-channel-assignment",
         "service": service,
-        "aes_id": format!("{:06X}", u32::from_be_bytes([0, su[1], su[2], su[3]])),
-        "ges_id": su[4],
-        "receive_mhz": rx_chan as f64 * 0.0025 + 1510.0,
-        "transmit_mhz": tx_chan as f64 * 0.0025 + 1611.5,
-        "receive_spotbeam": su[6] & 0x80 != 0,
-        "transmit_spotbeam": su[8] & 0x80 != 0,
+        "aes_id": aes_id,
+        "ges_id": ges_id,
+        "receive_mhz": rx_mhz,
+        "transmit_mhz": tx_mhz,
+        "receive_spotbeam": rx_spot,
+        "transmit_spotbeam": tx_spot,
     }))
 }
 
@@ -415,6 +415,8 @@ pub fn parse_p_su(su: &[u8]) -> Option<serde_json::Value> {
     match su[0] {
         0x31..=0x34 => parse_c_assignment(su),
         0x10..=0x17 => parse_log_control(su),
+        0x21 => parse_call_announcement(su),
+        0x51 => parse_t_channel_assignment(su),
         _ => None,
     }
 }
@@ -422,6 +424,62 @@ pub fn parse_p_su(su: &[u8]) -> Option<serde_json::Value> {
 /// `MessageBody::Aero` kind tag for a structured P-SU value.
 pub fn p_su_kind(v: &serde_json::Value) -> String {
     v["su_type"].as_str().unwrap_or("aero-su").to_owned()
+}
+
+/// Receive/transmit channel frequencies (MHz) for an assignment-style SU,
+/// from octets 7/8 (rx) and 9/10 (tx) — our `su[6..=9]`. The high bit of
+/// each high octet flags a spot beam; the low 15 bits index 2.5 kHz steps
+/// from 1510.0 MHz (receive, AES→GES Pd/voice) and 1611.5 MHz (transmit,
+/// GES→AES). (JAERO `SendCAssignment` / `CreateCAssignmentItem`.)
+fn assignment_freqs(su: &[u8]) -> (f64, bool, f64, bool) {
+    let rx_chan = (((su[6] & 0x7F) as u32) << 8) | su[7] as u32;
+    let tx_chan = (((su[8] & 0x7F) as u32) << 8) | su[9] as u32;
+    (
+        rx_chan as f64 * 0.0025 + 1510.0,
+        su[6] & 0x80 != 0,
+        tx_chan as f64 * 0.0025 + 1611.5,
+        su[8] & 0x80 != 0,
+    )
+}
+
+/// Call_announcement SU (P-channel type 0x21): the GES announces an
+/// incoming call to an aircraft, naming the receive/transmit channel pair
+/// it should use. JAERO routes this through `SendCAssignment`, i.e. it
+/// reuses the C-channel-assignment octet layout (AES octets 2–4, GES
+/// octet 5, rx octets 7/8, tx octets 9/10, spot-beam flags in the high
+/// octets).
+pub fn parse_call_announcement(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x21 {
+        return None;
+    }
+    let (aes_id, ges_id) = aes_ges(su);
+    let (rx_mhz, rx_spot, tx_mhz, tx_spot) = assignment_freqs(su);
+    Some(serde_json::json!({
+        "su_type": "call-announcement",
+        "aes_id": aes_id,
+        "ges_id": ges_id,
+        "receive_mhz": rx_mhz,
+        "transmit_mhz": tx_mhz,
+        "receive_spotbeam": rx_spot,
+        "transmit_spotbeam": tx_spot,
+    }))
+}
+
+/// T_channel_assignment SU (P-channel type 0x51): the GES assigns a
+/// reservation (TDMA) T channel to an aircraft for burst data return.
+/// JAERO names this type but decodes no further fields beyond the common
+/// AES/GES addressing, so we surface just the named assignment event with
+/// AES (octets 2–4) and GES (octet 5).
+pub fn parse_t_channel_assignment(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x51 {
+        return None;
+    }
+    let (aes_id, ges_id) = aes_ges(su);
+    Some(serde_json::json!({
+        "su_type": "t-channel-assignment",
+        "aes_id": aes_id,
+        "ges_id": ges_id,
+    }))
 }
 
 pub fn fill_su() -> Vec<u8> {
@@ -496,6 +554,53 @@ mod tests {
         assert!(parse_log_control(&[0x18; 12]).is_none()); // reserved_18
         assert!(parse_log_control(&[0x0F; 12]).is_none()); // below range
         assert!(parse_log_control(&[0x71; 12]).is_none()); // user-data ISU
+    }
+
+    /// AERO-1.2: Call_announcement 0x21 reuses JAERO's SendCAssignment
+    /// octet layout — rx from octets 7/8 (+1510.0), tx from 9/10
+    /// (+1611.5), spot-beam in the high octets. Same arithmetic as the
+    /// verified C-assignment path.
+    #[test]
+    fn call_announcement_parses_channel_pair() {
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x21;
+        su10[1..4].copy_from_slice(&[0xAB, 0xCD, 0xEF]);
+        su10[4] = 0x44;
+        // rx channel 4000 (spot beam), tx channel 2000 (global).
+        su10[6] = 0x80 | ((4000u16 >> 8) as u8);
+        su10[7] = (4000u16 & 0xFF) as u8;
+        su10[8] = (2000u16 >> 8) as u8;
+        su10[9] = (2000u16 & 0xFF) as u8;
+        let su = su_with_crc(su10);
+        let v = parse_call_announcement(&su).unwrap();
+        assert_eq!(v["su_type"], "call-announcement");
+        assert_eq!(v["aes_id"], "ABCDEF");
+        assert_eq!(v["ges_id"], 0x44);
+        assert_eq!(v["receive_mhz"], 4000.0 * 0.0025 + 1510.0); // 1520.0
+        assert_eq!(v["transmit_mhz"], 2000.0 * 0.0025 + 1611.5); // 1616.5
+        assert_eq!(v["receive_spotbeam"], true);
+        assert_eq!(v["transmit_spotbeam"], false);
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "call-announcement");
+        // Other types are not call announcements.
+        assert!(parse_call_announcement(&[0x32; 12]).is_none());
+    }
+
+    /// AERO-1.2: T_channel_assignment 0x51. JAERO names this type and
+    /// decodes no further fields than the common AES/GES addressing, so we
+    /// surface exactly that.
+    #[test]
+    fn t_channel_assignment_named_with_addressing() {
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x51;
+        su10[1..4].copy_from_slice(&[0x12, 0x34, 0x56]);
+        su10[4] = 0x07;
+        let su = su_with_crc(su10);
+        let v = parse_t_channel_assignment(&su).unwrap();
+        assert_eq!(v["su_type"], "t-channel-assignment");
+        assert_eq!(v["aes_id"], "123456");
+        assert_eq!(v["ges_id"], 0x07);
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "t-channel-assignment");
+        assert!(parse_t_channel_assignment(&[0x21; 12]).is_none());
     }
 
     #[test]
