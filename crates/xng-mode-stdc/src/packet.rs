@@ -402,9 +402,9 @@ const PRIORITY: [&str; 4] = ["routine", "safety", "urgency", "distress"];
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AreaShape {
     /// C2 = 04 / 34 — rectangular area, C3 = D1D2 La D3D4D5 Lo D6D7 D8D9D10
-    /// (SW-corner lat/lon in degrees + N and E extent in degrees).
+    /// (SW-corner lat/lon in degrees + N and E extent).
     Rectangular,
-    /// C2 = 14 / 24 / 44 — circular area, C3 = D1D2 N/S D3D4 E/W M1M2M3
+    /// C2 = 14 / 24 / 44 — circular area, C3 = D1D2 La D3D4D5 Lo R1R2R3
     /// (centre lat/lon in degrees + radius in nautical miles).
     Circular,
     /// C2 = 31 — NAVAREA / METAREA number (C3 = two digits X1X2, 01–21).
@@ -420,11 +420,13 @@ pub enum AreaShape {
 /// shape and the documented C3 address-code layout. Oracle: IMO
 /// International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3 and the
 /// C-code table in §8 (cross-checked against inmarsat-sniffer's
-/// service-name table). Returns None for non-geographic service codes.
+/// service-name table). The C3 format string is the MSI-provider digit
+/// layout (the manual's worked examples: rectangular `60N010W30025`,
+/// circular `56N034W035`). Returns None for non-geographic service codes.
 pub fn area_shape(c2: u8) -> Option<(AreaShape, &'static str)> {
     Some(match c2 {
         0x04 | 0x34 => (AreaShape::Rectangular, "D1D2La D3D4D5Lo D6D7 D8D9D10"),
-        0x14 | 0x24 | 0x44 => (AreaShape::Circular, "D1D2 N/S D3D4 E/W M1M2M3"),
+        0x14 | 0x24 | 0x44 => (AreaShape::Circular, "D1D2La D3D4D5Lo R1R2R3"),
         0x31 => (AreaShape::NavMetArea, "X1X2"),
         0x13 | 0x73 => (AreaShape::Coastal, "X1X2 B1 B2"),
         0x00 => (AreaShape::AllShips, "00"),
@@ -432,18 +434,77 @@ pub fn area_shape(c2: u8) -> Option<(AreaShape, &'static str)> {
     })
 }
 
-/// Build the structured `area` object for an EGC address. `address` is
-/// the on-air address field including the leading C2-repeat byte
-/// (address[0]); the geographic payload is address[1..].
+/// NAVAREA / METAREA coordinator (issuing authority) for area number 1–21.
+/// Table verbatim from Scytale-C `ReturnNavMetAreaCoordinator` (facts only;
+/// re-typed). Scytale-C's cited bibliography is the IMO/USCG SafetyNET
+/// manual and weather.gmdss.org/navareas.html.
+pub fn nav_met_area_coordinator(area: u8) -> Option<&'static str> {
+    Some(match area {
+        1 => "United Kingdom",
+        2 => "France",
+        3 => "Spain",
+        4 => "United States of America (East)",
+        5 => "Brazil",
+        6 => "Argentina",
+        7 => "South Africa",
+        8 => "India",
+        9 => "Pakistan",
+        10 => "Australia",
+        11 => "Japan",
+        12 => "United States of America (West)",
+        13 => "Russian Federation",
+        14 => "New Zealand",
+        15 => "Chile",
+        16 => "Peru",
+        17 | 18 => "Canada",
+        19 => "Norway",
+        20 | 21 => "Russian Federation",
+        _ => return None,
+    })
+}
+
+/// Render a NAVAREA/METAREA number (1–21) as its Roman numeral, the form
+/// used in MSI broadcasts (e.g. "NAVAREA XII"). Supports 1–39, which
+/// covers all defined areas with margin.
+fn area_roman(n: u8) -> String {
+    const TENS: [&str; 4] = ["", "X", "XX", "XXX"];
+    const ONES: [&str; 10] = [
+        "", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX",
+    ];
+    if n == 0 || n >= 40 {
+        return n.to_string();
+    }
+    format!("{}{}", TENS[(n / 10) as usize], ONES[(n % 10) as usize])
+}
+
+/// Decode the on-air binary C3 address code into machine-readable geometry.
 ///
-/// The C2 code classifies the shape and the documented C3 field layout
-/// (oracle: IMO SafetyNET Manual, above). The on-air *binary packing* of
-/// the C3 coordinate digits is not documented in any primary source and
-/// is not decoded by any open decoder (inmarsatc, SatDump, sdrangel and
-/// inmarsat-sniffer all carry the EGC address as raw bytes only), so the
-/// coordinate values are deliberately left for a future verified-against-
-/// real-capture decode rather than guessed here — the raw payload bytes
-/// are surfaced typed so a map layer can consume them once decoded.
+/// `payload` is the C3 address field with the leading C2-repeat byte
+/// already stripped (`address[1..]`).
+///
+/// Oracle for the on-air **binary packing**: Scytale-C
+/// `PacketDecoderGeoUtils.cs` (`ReturnRectangularArea` / `ReturnCircularArea`
+/// / `ReturnNavArea`), whose cited bibliography is the IMO/USCG
+/// International SafetyNET Manual. Scytale-C is the upstream origin of the
+/// inmarsatc reference this crate already cross-verifies against; it is the
+/// only open decoder that decodes the C3 binary at all (inmarsatc, SatDump,
+/// sdrangel and inmarsat-sniffer carry the EGC address as raw bytes only —
+/// each marks the area decode "TODO" / `lat = NaN`). Facts only; re-derived.
+///
+/// On-air byte layout (the C2-repeat byte already removed):
+///   Rectangular (04/34): [0] bit7 N(0)/S(1) | bits6-0 SW-corner lat°,
+///     [1] SW-corner lon°, [2] bit7 E(0)/W(1) | bits6-0 north extent (NM),
+///     [3] east extent (NM).
+///   Circular (14/24/44): [0] bit7 N/S | bits6-0 centre lat°, [1] centre
+///     lon°, [2] bit7 E/W | bits6-0 radius hi, [3] radius lo (15-bit NM).
+///   NAVAREA/METAREA (31) and Coastal (13/73): [0] area number (1–21).
+///
+/// Note on units: the manual's *MSI-provider* C3 string states rectangular
+/// extent in degrees (worked example `60N010W30025` = 30°/25°), but the
+/// LES re-encodes the on-air binary field as nautical miles (Scytale-C); the
+/// circular radius is nautical miles in both. Both the raw on-air integer
+/// (`*_extent_nm` / `radius_nm`) and the derived corner/centre degrees are
+/// surfaced so a map layer can plot without re-deriving the packing.
 fn egc_area(service: u8, address: &[u8]) -> Option<serde_json::Value> {
     let (shape, c3_format) = area_shape(service)?;
     let shape_name = match shape {
@@ -456,12 +517,109 @@ fn egc_area(service: u8, address: &[u8]) -> Option<serde_json::Value> {
     // address[0] repeats the C2 service code; the geographic payload (the
     // C3 address code) is the remaining bytes.
     let payload: &[u8] = address.get(1..).unwrap_or(&[]);
-    Some(json!({
+    let mut area = json!({
         "shape": shape_name,
         "c2": service,
         "c3_format": c3_format,
         "address_payload_hex": hex(payload),
+    });
+    let obj = area.as_object_mut().expect("json object");
+    match shape {
+        AreaShape::Rectangular => {
+            if let Some(geom) = rectangular_geom(payload) {
+                obj.insert("geometry".to_string(), geom);
+            }
+        }
+        AreaShape::Circular => {
+            if let Some(geom) = circular_geom(payload) {
+                obj.insert("geometry".to_string(), geom);
+            }
+        }
+        AreaShape::NavMetArea | AreaShape::Coastal => {
+            if let Some(geom) = nav_met_geom(shape, payload) {
+                obj.insert("geometry".to_string(), geom);
+            }
+        }
+        AreaShape::AllShips => {}
+    }
+    Some(area)
+}
+
+/// Decode the rectangular-area C3 binary (4 payload bytes) into SW-corner
+/// lat/lon degrees + north/east extent in NM. Layout per Scytale-C
+/// `ReturnRectangularArea` (oracle above).
+fn rectangular_geom(p: &[u8]) -> Option<serde_json::Value> {
+    if p.len() < 4 {
+        return None;
+    }
+    let lat = (p[0] & 0x7F) as i32 * if p[0] & 0x80 != 0 { -1 } else { 1 };
+    let lon = p[1] as i32 * if p[2] & 0x80 != 0 { -1 } else { 1 };
+    let north_nm = (p[2] & 0x7F) as i32;
+    let east_nm = p[3] as i32;
+    Some(json!({
+        "sw_corner": { "lat_deg": lat, "lon_deg": lon },
+        "north_extent_nm": north_nm,
+        "east_extent_nm": east_nm,
+        "lat_hemisphere": if p[0] & 0x80 != 0 { "S" } else { "N" },
+        "lon_hemisphere": if p[2] & 0x80 != 0 { "W" } else { "E" },
     }))
+}
+
+/// Decode the circular-area C3 binary (4 payload bytes) into centre lat/lon
+/// degrees + radius in NM (15-bit). Layout per Scytale-C
+/// `ReturnCircularArea` (oracle above).
+fn circular_geom(p: &[u8]) -> Option<serde_json::Value> {
+    if p.len() < 4 {
+        return None;
+    }
+    let lat = (p[0] & 0x7F) as i32 * if p[0] & 0x80 != 0 { -1 } else { 1 };
+    let lon = p[1] as i32 * if p[2] & 0x80 != 0 { -1 } else { 1 };
+    let radius_nm = ((p[2] & 0x7F) as i32) << 8 | p[3] as i32;
+    Some(json!({
+        "center": { "lat_deg": lat, "lon_deg": lon },
+        "radius_nm": radius_nm,
+        "lat_hemisphere": if p[0] & 0x80 != 0 { "S" } else { "N" },
+        "lon_hemisphere": if p[2] & 0x80 != 0 { "W" } else { "E" },
+    }))
+}
+
+/// Decode the NAVAREA/METAREA (31) or coastal (13/73) C3 binary: the first
+/// payload byte is the area number (1–21). Layout per Scytale-C
+/// `ReturnNavArea` / `ReturnCoastalArea` (oracle above).
+fn nav_met_geom(shape: AreaShape, p: &[u8]) -> Option<serde_json::Value> {
+    let n = *p.first()?;
+    let mut obj = json!({
+        "area_number": n,
+        "area_roman": area_roman(n),
+        "coordinator": nav_met_area_coordinator(n),
+    });
+    if shape == AreaShape::Coastal {
+        // Coastal: X1X2 area number, then B1 = coastal-area letter (A–Z),
+        // B2 = subject indicator (A/L navigational, B/E meteorological).
+        // Per IMO SafetyNET Manual Annex 4 part A §5.3 / part B §3.3.
+        let m = obj.as_object_mut().unwrap();
+        if let Some(&b1) = p.get(1) {
+            let c = b1 & 0x7F;
+            if c.is_ascii_uppercase() {
+                m.insert("coastal_area".to_string(), json!((c as char).to_string()));
+            }
+        }
+        if let Some(&b2) = p.get(2) {
+            let c = (b2 & 0x7F) as char;
+            let subj = match c {
+                'A' => Some("navigational-warnings"),
+                'L' => Some("other-navigational-warnings"),
+                'B' => Some("meteorological-warnings"),
+                'E' => Some("meteorological-forecasts"),
+                _ => None,
+            };
+            if let Some(s) = subj {
+                m.insert("subject_indicator".to_string(), json!(c.to_string()));
+                m.insert("subject".to_string(), json!(s));
+            }
+        }
+    }
+    Some(obj)
 }
 
 /// Parsed EGC packet header + payload, pre-assembly.
@@ -1037,6 +1195,22 @@ mod tests {
         build_packet(&body)
     }
 
+    /// Build a medium-format EGC packet with an explicit on-air address
+    /// field (the full address including the leading C2-repeat byte), used
+    /// to exercise the C3 geometry decode end-to-end. IA5 presentation.
+    #[allow(clippy::too_many_arguments)]
+    fn egc_packet_with_address(desc: u8, service: u8, prio: u8, seq: u16, pkt_no: u8, address: &[u8], text: &[u8]) -> Vec<u8> {
+        assert_eq!(address.len(), egc_addr_len(service));
+        let mut body = vec![desc, 0u8, service, (prio << 5) | 1];
+        body.extend(seq.to_be_bytes());
+        body.push(pkt_no);
+        body.push(0u8); // presentation 0 = IA5
+        body.extend_from_slice(address);
+        body.extend(text);
+        body[1] = (body.len() + 2 - 2) as u8; // medium length = total-2
+        build_packet(&body)
+    }
+
     #[test]
     fn lcn_message_assembled_on_channel_clear() {
         let mut parser = PacketParser::new();
@@ -1570,7 +1744,7 @@ mod tests {
         assert_eq!(area_shape(0x34).map(|x| x.0), Some(AreaShape::Rectangular));
         assert_eq!(
             area_shape(0x24),
-            Some((AreaShape::Circular, "D1D2 N/S D3D4 E/W M1M2M3"))
+            Some((AreaShape::Circular, "D1D2La D3D4D5Lo R1R2R3"))
         );
         assert_eq!(area_shape(0x14).map(|x| x.0), Some(AreaShape::Circular));
         assert_eq!(area_shape(0x44).map(|x| x.0), Some(AreaShape::Circular));
@@ -1601,6 +1775,127 @@ mod tests {
         assert!(egc_area(0x02, &[0x02, 0, 0, 0, 0]).is_none());
     }
 
+    // ---- STDC-1.1 / STDC-1.2: C3 binary area-geometry decode ----
+    // Oracle for the on-air binary packing: Scytale-C
+    // PacketDecoderGeoUtils.cs (ReturnRectangularArea / ReturnCircularArea /
+    // ReturnNavArea), whose cited bibliography is the IMO/USCG International
+    // SafetyNET Manual. Cross-checked against the SafetyNET Manual 2019
+    // Annex 4 worked examples (which give the MSI-provider digit string):
+    //   rectangular "60N010W30025", circular "56N034W035", and the manual
+    //   body example "14N 66W 300". No other open decoder (inmarsatc,
+    //   SatDump, sdrangel, inmarsat-sniffer) decodes the C3 binary at all.
+
+    #[test]
+    fn rectangular_geometry_matches_manual_worked_example() {
+        // SafetyNET Manual 2019, Annex 4 part A §5.3 example: a rectangle
+        // whose SW corner is 60°N 010°W, extending 30° north and 25° east,
+        // is coded as the C3 string "60N010W30025". Per the Scytale-C
+        // on-air binary layout (C2-repeat byte stripped):
+        //   [0] N(0)<<7 | 60       = 0x3C
+        //   [1] lon 010            = 0x0A
+        //   [2] W(1)<<7 | north 30 = 0x9E
+        //   [3] east 25            = 0x19
+        let p = [0x3C, 0x0A, 0x9E, 0x19];
+        let g = rectangular_geom(&p).unwrap();
+        assert_eq!(g["sw_corner"]["lat_deg"], 60);
+        assert_eq!(g["sw_corner"]["lon_deg"], -10);
+        assert_eq!(g["lat_hemisphere"], "N");
+        assert_eq!(g["lon_hemisphere"], "W");
+        assert_eq!(g["north_extent_nm"], 30);
+        assert_eq!(g["east_extent_nm"], 25);
+    }
+
+    #[test]
+    fn circular_geometry_matches_manual_worked_examples() {
+        // SafetyNET Manual 2019, Annex 4 part B §3.3 example: a circle
+        // centred at 56°N 034°W with radius 35 nm, coded "56N034W035".
+        //   [0] N(0)<<7 | 56     = 0x38
+        //   [1] lon 034          = 0x22
+        //   [2] W(1)<<7 | rad-hi = 0x80
+        //   [3] rad-lo 35        = 0x23
+        let p = [0x38, 0x22, 0x80, 0x23];
+        let g = circular_geom(&p).unwrap();
+        assert_eq!(g["center"]["lat_deg"], 56);
+        assert_eq!(g["center"]["lon_deg"], -34);
+        assert_eq!(g["lat_hemisphere"], "N");
+        assert_eq!(g["lon_hemisphere"], "W");
+        assert_eq!(g["radius_nm"], 35);
+
+        // Manual body example (§10.2): "14N 66W 300" — centre 14°N 66°W,
+        // radius 300 nm. 300 = 0x12C spans the 15-bit field across bytes:
+        //   [2] W(1)<<7 | (300>>8 = 1) = 0x81, [3] 300&0xFF = 0x2C.
+        let p2 = [0x0E, 0x42, 0x81, 0x2C];
+        let g2 = circular_geom(&p2).unwrap();
+        assert_eq!(g2["center"]["lat_deg"], 14);
+        assert_eq!(g2["center"]["lon_deg"], -66);
+        assert_eq!(g2["radius_nm"], 300);
+    }
+
+    #[test]
+    fn navarea_geometry_decodes_number_and_coordinator() {
+        // NAVAREA/METAREA (C2 = 31): payload[0] is the area number. Oracle:
+        // Scytale-C ReturnNavArea + ReturnNavMetAreaCoordinator.
+        let g = nav_met_geom(AreaShape::NavMetArea, &[12]).unwrap();
+        assert_eq!(g["area_number"], 12);
+        assert_eq!(g["area_roman"], "XII");
+        assert_eq!(g["coordinator"], "United States of America (West)");
+        // NAVAREA XXI → Russian Federation.
+        let g21 = nav_met_geom(AreaShape::NavMetArea, &[21]).unwrap();
+        assert_eq!(g21["area_roman"], "XXI");
+        assert_eq!(g21["coordinator"], "Russian Federation");
+        // NAVAREA I → United Kingdom.
+        let g1 = nav_met_geom(AreaShape::NavMetArea, &[1]).unwrap();
+        assert_eq!(g1["area_roman"], "I");
+        assert_eq!(g1["coordinator"], "United Kingdom");
+    }
+
+    #[test]
+    fn coastal_geometry_decodes_area_letter_and_subject() {
+        // Coastal (C2 = 13): X1X2 area number, B1 coastal-area letter A–Z,
+        // B2 subject indicator. Per IMO SafetyNET Manual Annex 4 §5.3/§3.3:
+        // B2 = A navigational warnings, L other-nav, B met-warnings,
+        // E met-forecasts. Area 2 (France), coastal area "C", subject "A".
+        let g = nav_met_geom(AreaShape::Coastal, b"\x02CA").unwrap();
+        assert_eq!(g["area_number"], 2);
+        assert_eq!(g["area_roman"], "II");
+        assert_eq!(g["coordinator"], "France");
+        assert_eq!(g["coastal_area"], "C");
+        assert_eq!(g["subject_indicator"], "A");
+        assert_eq!(g["subject"], "navigational-warnings");
+        // Subject "E" = meteorological forecasts.
+        let gm = nav_met_geom(AreaShape::Coastal, b"\x0bBE").unwrap();
+        assert_eq!(gm["coordinator"], "Japan");
+        assert_eq!(gm["coastal_area"], "B");
+        assert_eq!(gm["subject"], "meteorological-forecasts");
+    }
+
+    #[test]
+    fn area_roman_renders_navarea_numbers() {
+        assert_eq!(area_roman(1), "I");
+        assert_eq!(area_roman(4), "IV");
+        assert_eq!(area_roman(9), "IX");
+        assert_eq!(area_roman(12), "XII");
+        assert_eq!(area_roman(17), "XVII");
+        assert_eq!(area_roman(21), "XXI");
+    }
+
+    #[test]
+    fn southern_eastern_hemispheres_decode_signs() {
+        // Centre 38°S 164°E radius 999 nm (a worked-example style southern,
+        // eastern circle). The S/E hemisphere bits are clear-of-sign on lon
+        // and set on lat: verifies both negative-lat and positive-lon paths.
+        //   [0] S(1)<<7 | 38   = 0xA6
+        //   [1] lon 164        = 0xA4
+        //   [2] E(0)<<7 | rh(3)= 0x03  (999 = 0x3E7)
+        //   [3] rl 0xE7
+        let g = circular_geom(&[0xA6, 0xA4, 0x03, 0xE7]).unwrap();
+        assert_eq!(g["center"]["lat_deg"], -38);
+        assert_eq!(g["center"]["lon_deg"], 164);
+        assert_eq!(g["lat_hemisphere"], "S");
+        assert_eq!(g["lon_hemisphere"], "E");
+        assert_eq!(g["radius_nm"], 999);
+    }
+
     #[test]
     fn egc_message_carries_structured_area() {
         let mut p = PacketParser::new();
@@ -1610,6 +1905,26 @@ mod tests {
         let e = &p.parse_frame(&frame)[0];
         assert_eq!(e.details["area"]["shape"], "circular");
         assert_eq!(e.details["area"]["c2"], 0x14);
+    }
+
+    #[test]
+    fn egc_message_carries_decoded_circular_geometry_end_to_end() {
+        // Full EGC assembly path surfaces the decoded geometry in `details`.
+        // Build a circular (C2 = 0x14) packet whose 6-byte C3 address (after
+        // the C2-repeat byte) encodes the manual's "14N 66W 300" circle.
+        let mut p = PacketParser::new();
+        // address = [C2-repeat, p0, p1, p2, p3, pad, pad]; 7 bytes total.
+        let address: [u8; 7] = [0x14, 0x0E, 0x42, 0x81, 0x2C, 0x00, 0x00];
+        let frame = egc_packet_with_address(0xB0, 0x14, 3, 1, 1, &address, b"DISTRESS RELAY");
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(e.name, "egc-message");
+        assert_eq!(e.details["area"]["shape"], "circular");
+        let geom = &e.details["area"]["geometry"];
+        assert_eq!(geom["center"]["lat_deg"], 14);
+        assert_eq!(geom["center"]["lon_deg"], -66);
+        assert_eq!(geom["radius_nm"], 300);
+        assert_eq!(geom["lat_hemisphere"], "N");
+        assert_eq!(geom["lon_hemisphere"], "W");
     }
 
     #[test]

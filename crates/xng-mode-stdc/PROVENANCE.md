@@ -62,15 +62,44 @@ ISO 8473 style) follow the cross-verified tables in docs/notes/STDC.md.
   have no public real-byte sample are pinned by spec-derived packets
   built to the exact inmarsatc byte layout (clearly spec-derived, not
   encode→decode loopbacks).
-- **Geographic area-address (STDC-1)**: C2 → shape + documented C3 field
-  layout decoded per the IMO International SafetyNET Manual (2019),
-  Annex 4 part A §5.2–5.3, cross-checked against inmarsat-sniffer's C2
-  service-name table. Only the manual-verifiable classification + typed
-  raw payload bytes are surfaced. The on-air *binary packing* of the C3
-  coordinate digits is undocumented in every accessible primary source
-  and decoded by no open decoder (inmarsatc, SatDump, sdrangel and
-  inmarsat-sniffer all carry the EGC address as raw bytes only), so
-  lat/lon/radius extraction is deliberately deferred rather than guessed.
+- **Geographic area-address classification (STDC-1)**: C2 → shape +
+  documented C3 field layout per the IMO International SafetyNET Manual
+  (2019), Annex 4 part A §5.2–5.3 / part B §3.3, cross-checked against
+  inmarsat-sniffer's C2 service-name table.
+- **Geographic area-address geometry decode (STDC-1.1 / STDC-1.2)**: the
+  on-air *binary packing* of the C3 address code is decoded into
+  machine-readable geometry (numeric degrees / nautical miles) and
+  surfaced in the existing JSON `details["area"]["geometry"]`. Oracle for
+  the binary packing is **Scytale-C** `PacketDecoderGeoUtils.cs`
+  (`ReturnRectangularArea` / `ReturnCircularArea` / `ReturnNavArea`),
+  whose own cited bibliography is the IMO/USCG International SafetyNET
+  Manual; Scytale-C is the upstream origin of the inmarsatc reference this
+  crate already cross-verifies against (facts only; re-derived in Rust).
+  On-air layout (C2-repeat byte stripped):
+    · Rectangular (04/34): `[0]` bit7 N(0)/S(1) + bits6-0 SW-corner lat°,
+      `[1]` SW-corner lon°, `[2]` bit7 E(0)/W(1) + bits6-0 north extent
+      (NM), `[3]` east extent (NM).
+    · Circular (14/24/44): `[0]` bit7 N/S + bits6-0 centre lat°, `[1]`
+      centre lon°, `[2]` bit7 E/W + bits6-0 radius hi, `[3]` radius lo
+      (15-bit NM).
+    · NAVAREA/METAREA (31) and Coastal (13/73): `[0]` area number (1–21),
+      and for Coastal `[1]` coastal-area letter A–Z, `[2]` subject
+      indicator (A/L nav, B/E met) per Manual Annex 4 §5.3/§3.3.
+  This is the only known open decode of the C3 binary — inmarsatc,
+  SatDump, sdrangel and inmarsat-sniffer all carry the EGC address as raw
+  bytes (each marks the area decode "TODO" / `lat = NaN`). Verified
+  against the SafetyNET Manual's published worked examples, which give the
+  MSI-provider digit string the binary re-encodes to: rectangular
+  `60N010W30025` (SW 60°N 010°W, 30 N, 25 E), circular `56N034W035`
+  (centre 56°N 034°W, r 35 nm), and the manual body example `14N 66W 300`
+  (centre 14°N 66°W, r 300 nm) — each round-trips bit-exact through the
+  Scytale-C layout, pinned as inline test vectors. The NAVAREA/METAREA
+  coordinator table is verbatim from Scytale-C
+  `ReturnNavMetAreaCoordinator`. Unit note: the manual's MSI-provider
+  rectangular C3 *string* states extent in degrees, but the LES re-encodes
+  the on-air binary field as nautical miles (Scytale-C); the raw on-air
+  integer (`*_extent_nm` / `radius_nm`) and the corner/centre degrees are
+  both surfaced so a map layer plots without re-deriving the packing.
 
 Demodulator: textbook coherent BPSK — square-law FFT coarse frequency
 estimation, decision-directed Costas loop, Gardner timing — written
