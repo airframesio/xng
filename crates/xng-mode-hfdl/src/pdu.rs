@@ -133,11 +133,30 @@ pub struct HfdlEvent {
 
 pub struct PduParser {
     systable: crate::systable::SystableAssembler,
+    ac_cache: crate::ac_cache::AcCache,
 }
 
 impl PduParser {
     pub fn new() -> Self {
-        Self { systable: crate::systable::SystableAssembler::new() }
+        Self {
+            systable: crate::systable::SystableAssembler::new(),
+            ac_cache: crate::ac_cache::AcCache::new(),
+        }
+    }
+
+    /// Construct a parser with a custom aircraft-ID→ICAO cache TTL
+    /// (dumphfdl `--aircraft-cache-ttl`; default 3600 s).
+    pub fn with_ac_cache_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            systable: crate::systable::SystableAssembler::new(),
+            ac_cache: crate::ac_cache::AcCache::with_ttl(ttl),
+        }
+    }
+
+    /// Resolve a channel-local downlink aircraft ID to its cached ICAO,
+    /// if a logon-confirm has been heard within the cache TTL.
+    pub fn resolve_icao(&self, ac_id: u8) -> Option<&str> {
+        self.ac_cache.lookup(ac_id)
     }
 
     /// Parse one decoded burst payload (one SPDU or MPDU + padding).
@@ -240,8 +259,28 @@ impl PduParser {
             let rev = |x: u8| x.reverse_bits();
             format!("{:02X}{:02X}{:02X}", rev(b[0]), rev(b[1]), rev(b[2]))
         };
+        // For downlink LPDUs, augment `who` with the ICAO resolved from
+        // the channel-local aircraft-ID cache (HFDL-3), mirroring dumphfdl
+        // which back-fills the ICAO from its ac_cache for non-logon
+        // downlinks. Logon LPDUs in this same burst are processed first
+        // and have already updated the cache by the time data follows.
+        let resolved = |this: &Self, who: &serde_json::Value| -> serde_json::Value {
+            if who.get("dir").and_then(|d| d.as_str()) == Some("downlink") {
+                if let Some(ac_id) = who.get("aircraft_id").and_then(|v| v.as_u64()) {
+                    if let Some(found) = this.ac_cache.lookup(ac_id as u8) {
+                        let mut w = who.clone();
+                        w["icao"] = serde_json::Value::String(found.to_string());
+                        return w;
+                    }
+                }
+            }
+            who.clone()
+        };
         match body[0] {
-            0x0D | 0x1D => self.parse_hfnpdu(&body[1..], who, bps, out),
+            0x0D | 0x1D => {
+                let who = resolved(self, who);
+                self.parse_hfnpdu(&body[1..], &who, bps, out);
+            }
             0x8F | 0xBF if body.len() >= 4 => out.push(HfdlEvent {
                 kind: "logon-request".into(),
                 details: json!({ "icao": icao(&body[1..4]), "who": who }),
@@ -254,36 +293,53 @@ impl PduParser {
                 acars: None,
                 raw: l.to_vec(),
             }),
-            0x9F | 0x5F if body.len() >= 5 => out.push(HfdlEvent {
-                kind: "logon-confirm".into(),
-                details: json!({ "icao": icao(&body[1..4]), "assigned_id": body[4], "who": who }),
-                acars: None,
-                raw: l.to_vec(),
-            }),
-            0x3F if body.len() >= 5 => out.push(HfdlEvent {
-                kind: "logoff-request".into(),
-                details: json!({
-                    "icao": icao(&body[1..4]),
-                    "reason": body[4],
-                    "reason_text": logoff_reason(body[4]),
-                    "who": who,
-                }),
-                acars: None,
-                raw: l.to_vec(),
-            }),
-            0x2F if body.len() >= 5 => out.push(HfdlEvent {
+            0x9F | 0x5F if body.len() >= 5 => {
+                // Logon (resume) confirm: bind the assigned channel-local
+                // aircraft ID to this ICAO in the cache (HFDL-3).
+                let icao_str = icao(&body[1..4]);
+                self.ac_cache.insert(body[4], &icao_str);
+                out.push(HfdlEvent {
+                    kind: "logon-confirm".into(),
+                    details: json!({ "icao": icao_str, "assigned_id": body[4], "who": who }),
+                    acars: None,
+                    raw: l.to_vec(),
+                });
+            }
+            0x3F if body.len() >= 5 => {
+                // Logoff: the aircraft has left this channel — drop its
+                // cached ID→ICAO mapping (HFDL-3).
+                let icao_str = icao(&body[1..4]);
+                self.ac_cache.remove_by_icao(&icao_str);
+                out.push(HfdlEvent {
+                    kind: "logoff-request".into(),
+                    details: json!({
+                        "icao": icao_str,
+                        "reason": body[4],
+                        "reason_text": logoff_reason(body[4]),
+                        "who": who,
+                    }),
+                    acars: None,
+                    raw: l.to_vec(),
+                });
+            }
+            0x2F if body.len() >= 5 => {
                 // Logon denied: ICAO + reason, same layout as logoff
                 // (dumphfdl lpdu.c LOGON_DENIED → logoff_request_parse).
-                kind: "logon-denied".into(),
-                details: json!({
-                    "icao": icao(&body[1..4]),
-                    "reason": body[4],
-                    "reason_text": logon_denied_reason(body[4]),
-                    "who": who,
-                }),
-                acars: None,
-                raw: l.to_vec(),
-            }),
+                // Drop any cached mapping for this ICAO (HFDL-3).
+                let icao_str = icao(&body[1..4]);
+                self.ac_cache.remove_by_icao(&icao_str);
+                out.push(HfdlEvent {
+                    kind: "logon-denied".into(),
+                    details: json!({
+                        "icao": icao_str,
+                        "reason": body[4],
+                        "reason_text": logon_denied_reason(body[4]),
+                        "who": who,
+                    }),
+                    acars: None,
+                    raw: l.to_vec(),
+                });
+            }
             t => out.push(HfdlEvent {
                 kind: "lpdu".into(),
                 details: json!({ "type": t, "type_name": lpdu_type_name(t), "who": who }),
@@ -532,6 +588,28 @@ pub fn build_mpdu_downlink(gs_id: u8, aircraft_id: u8, lpdus: &[Vec<u8>]) -> Vec
         p.extend_from_slice(l);
     }
     p
+}
+
+/// Uplink MPDU from one GS to a single aircraft, wrapping LPDUs.
+pub fn build_mpdu_uplink(gs_id: u8, aircraft_id: u8, lpdus: &[Vec<u8>]) -> Vec<u8> {
+    // bit1=0 (uplink); n_ac field ((p[0]>>4)&0x7) = 0 -> one aircraft.
+    let mut p = vec![0b0000_0001, gs_id & 0x7F, aircraft_id, (lpdus.len() as u8) << 4];
+    for l in lpdus {
+        p.push((l.len() - 1) as u8);
+    }
+    let mut p = with_fcs(p);
+    for l in lpdus {
+        p.extend_from_slice(l);
+    }
+    p
+}
+
+/// Logon-confirm LPDU (uplink GS→AC): binds `assigned_id` to `icao`.
+pub fn build_lpdu_logon_confirm(icao: u32, assigned_id: u8) -> Vec<u8> {
+    let rev = |x: u8| x.reverse_bits();
+    let b = icao.to_be_bytes();
+    let body = vec![0x9F, rev(b[1]), rev(b[2]), rev(b[3]), assigned_id];
+    with_fcs(body)
 }
 
 #[cfg(test)]
@@ -808,5 +886,67 @@ mod tests {
         assert_eq!(e.details["icao"], "04C11B");
         assert_eq!(e.details["reason"], 4);
         assert_eq!(e.details["reason_text"], "Invalid aircraft ID");
+    }
+
+    // ── HFDL-3 aircraft-ID → ICAO cache ─────────────────────────────────
+    //
+    // dumphfdl (lpdu.c + ac_cache.c) records the ICAO from each
+    // logon-confirm under its assigned channel-local aircraft ID, then
+    // back-fills the ICAO on subsequent downlinks bearing that ID.
+    #[test]
+    fn cache_resolves_downlink_icao_after_logon_confirm() {
+        let mut parser = PduParser::new();
+
+        // Uplink logon-confirm: GS assigns aircraft ID 0x42 to ICAO 040087.
+        let confirm = build_mpdu_uplink(4, 0xFF, &[build_lpdu_logon_confirm(0x040087, 0x42)]);
+        let ev = parser.parse(&confirm, 300);
+        let c = ev.iter().find(|e| e.kind == "logon-confirm").expect("logon-confirm");
+        assert_eq!(c.details["icao"], "040087", "confirm carries the ICAO");
+        assert_eq!(c.details["assigned_id"], 0x42);
+        assert_eq!(parser.resolve_icao(0x42), Some("040087"));
+
+        // Downlink performance-data from aircraft 0x42 must now carry the
+        // resolved ICAO even though the wire frame only had the ac_id.
+        let mut perf = vec![0u8; 47];
+        perf[0] = 0xFF;
+        perf[1] = 0xD1;
+        perf[2..8].copy_from_slice(b"UAL042");
+        let dl = build_mpdu_downlink(4, 0x42, &[build_lpdu_hfnpdu(&perf)]);
+        let ev = parser.parse(&dl, 300);
+        let p = ev.iter().find(|e| e.kind == "performance-data").expect("perf-data");
+        assert_eq!(p.details["who"]["aircraft_id"], 0x42);
+        assert_eq!(p.details["who"]["icao"], "040087", "ICAO back-filled from cache");
+    }
+
+    #[test]
+    fn cache_evicts_on_logoff() {
+        let mut parser = PduParser::new();
+        let confirm = build_mpdu_uplink(4, 0xFF, &[build_lpdu_logon_confirm(0x04C11B, 0x55)]);
+        parser.parse(&confirm, 300);
+        assert_eq!(parser.resolve_icao(0x55), Some("04C11B"));
+
+        // Logoff for the same ICAO clears the mapping.
+        let rev = |x: u8| x.reverse_bits();
+        let logoff = build_mpdu_downlink(
+            4,
+            0x55,
+            &[with_fcs(vec![0x3F, rev(0x04), rev(0xC1), rev(0x1B), 0x06])],
+        );
+        parser.parse(&logoff, 300);
+        assert_eq!(parser.resolve_icao(0x55), None, "logoff evicts the cache entry");
+
+        // A later downlink from 0x55 no longer resolves an ICAO.
+        let dl = build_mpdu_downlink(4, 0x55, &[build_lpdu_acars(b"\x01x")]);
+        let ev = parser.parse(&dl, 300);
+        assert!(ev.iter().all(|e| e.details["who"].get("icao").is_none()));
+    }
+
+    #[test]
+    fn cache_ttl_expiry_drops_resolution() {
+        let mut parser = PduParser::with_ac_cache_ttl(std::time::Duration::from_millis(0));
+        let confirm = build_mpdu_uplink(4, 0xFF, &[build_lpdu_logon_confirm(0x040087, 0x42)]);
+        parser.parse(&confirm, 300);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        assert_eq!(parser.resolve_icao(0x42), None, "entry expires past TTL");
     }
 }

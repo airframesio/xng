@@ -1,5 +1,6 @@
 //! Native HFDL decode core (see PROVENANCE.md and docs/notes/HFDL.md).
 
+pub mod ac_cache;
 pub mod demod;
 pub mod fec;
 pub mod modulate;
