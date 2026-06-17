@@ -741,6 +741,22 @@ impl PacketParser {
                 ("login-ack", None, details)
             }
             0x92 => ("login-ack", None, json!({})),
+            0xA8 if body.len() >= 11 => {
+                // Per inmarsatc decode_A8: mes_id body[2..5], sat/les
+                // body[5], shortMessageLength body[9]; when that length
+                // is > 2 a short IA5 message runs from body[11] up to the
+                // checksum (body.len() == packetLength).
+                let sm_len = body[9];
+                let mut text = None;
+                if sm_len > 2 && body.len() >= 13 {
+                    text = Some(ia5(&body[11..body.len() - 2]));
+                }
+                ("confirmation", text, json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "sat_les": sat_les(body[5]),
+                    "short_message_len": sm_len,
+                }))
+            }
             0xA8 => ("confirmation", None, json!({})),
             0xAB if body.len() >= 4 => {
                 // Per inmarsatc decode_AB: body[1] = lesListLength,
@@ -779,10 +795,20 @@ impl PacketParser {
             0x91 => ("distress-alert-ack", None, json!({})),
             0x9A => ("enhanced-data-report-ack", None, json!({})),
             0xA0 => ("distress-test-request", None, json!({})),
-            0xA3 if body.len() >= 8 => ("individual-poll", None, json!({
-                "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
-                "sat_les": sat_les(body[5]),
-            })),
+            0xA3 if body.len() >= 8 => {
+                // Per inmarsatc decode_A3: mes_id body[2..5], sat/les
+                // body[5]. When the packet is long enough (inmarsatc:
+                // packetLength >= 38) it carries a short IA5 message from
+                // body[13] up to the checksum. body.len() == packetLength.
+                let mut text = None;
+                if body.len() >= 38 && body.len() >= 15 {
+                    text = Some(ia5(&body[13..body.len() - 2]));
+                }
+                ("individual-poll", text, json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "sat_les": sat_les(body[5]),
+                }))
+            }
             0xAC => ("request-status", None, json!({})),
             0xAD => ("test-result", None, json!({})),
             _ => ("unknown", None, json!({ "hex": hex(body) })),
@@ -1078,6 +1104,79 @@ mod tests {
         let out = parser.parse_frame(&padded);
         let p = out.iter().find(|p| p.name == "individual-poll").expect("poll parses");
         assert_eq!(p.details["mes_id"], "C124BB");
+    }
+
+    #[test]
+    fn individual_poll_short_message_text() {
+        // STDC-2. 0xA3 short-message layout per inmarsatc decode_A3:
+        // mes_id body[2..5], sat/les body[5]; when the packet is long
+        // enough (packetLength >= 38) an IA5 message runs from body[13].
+        let mut parser = PacketParser::new();
+        // body[0..13] header (mes_id C1 24 BB at [2..5], sat/les 0x44 at
+        // [5]); message text fills body[13..]; total length lands at 40.
+        let mut body = vec![0xA3, 0x00, 0xC1, 0x24, 0xBB, 0x44, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(b"POLL ACK SHORT MESSAGE OK");
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        // Total packet length (incl. checksum) exceeds the inmarsatc
+        // short-message threshold (38), so the message is surfaced.
+        assert!(body.len() + 2 >= 38);
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let p = out.iter().find(|p| p.name == "individual-poll").expect("poll parses");
+        assert_eq!(p.details["mes_id"], "C124BB");
+        assert_eq!(p.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(p.text.as_deref(), Some("POLL ACK SHORT MESSAGE OK"));
+    }
+
+    #[test]
+    fn individual_poll_short_packet_has_no_text() {
+        // A short 0xA3 (below the inmarsatc length threshold) carries no
+        // short message — only the routing fields.
+        let mut parser = PacketParser::new();
+        let poll = build_packet(&[0xA3, 8, 0xC1, 0x24, 0xBB, 0x44, 0x01, 0x03]);
+        let mut frame = poll;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let p = out.iter().find(|p| p.name == "individual-poll").unwrap();
+        assert_eq!(p.text, None);
+        assert_eq!(p.details["mes_id"], "C124BB");
+    }
+
+    #[test]
+    fn confirmation_short_message_text() {
+        // STDC-2. 0xA8 layout per inmarsatc decode_A8: mes_id body[2..5],
+        // sat/les body[5], shortMessageLength body[9]; when > 2 the IA5
+        // message runs from body[11] up to the checksum.
+        let mut parser = PacketParser::new();
+        let msg = b"CONFIRMED";
+        // Header is body[0..11] (mes_id [2..5], sat/les [5], unknown1
+        // [6..9], shortMessageLength [9], unknown2 [10]); message at [11].
+        let mut body = vec![0xA8, 0x00, 0x12, 0x34, 0x56, 0x44, 0, 0, 0, msg.len() as u8, 0];
+        body.extend_from_slice(msg);
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let c = out.iter().find(|p| p.name == "confirmation").expect("confirmation parses");
+        assert_eq!(c.details["mes_id"], "123456");
+        assert_eq!(c.details["sat_les"]["les"], 104);
+        assert_eq!(c.details["short_message_len"], msg.len());
+        assert_eq!(c.text.as_deref(), Some("CONFIRMED"));
+    }
+
+    #[test]
+    fn confirmation_no_message_when_len_small() {
+        // shortMessageLength <= 2 → no short message surfaced.
+        let mut parser = PacketParser::new();
+        let mut body = vec![0xA8, 0x00, 0x12, 0x34, 0x56, 0x44, 0, 0, 0, 0x01, 0, 0];
+        body[1] = (body.len() + 2 - 2) as u8;
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let c = out.iter().find(|p| p.name == "confirmation").unwrap();
+        assert_eq!(c.text, None);
+        assert_eq!(c.details["short_message_len"], 1);
     }
 
     #[test]
