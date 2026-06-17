@@ -194,7 +194,20 @@ impl PduParser {
                 "utc_sync": p[1] >> 7 == 1,
                 "frame_index": (p[2] as u16) | ((p[3] as u16 & 0x0F) << 8),
                 "frame_offset": p[3] >> 4,
+                // First-octet squitter flags (dumphfdl spdu.c spdu_parse,
+                // facts only): bit1 rls_in_use, bits2-3 squitter version,
+                // bit5 iso8208_supported, bits6-7 change_note.
+                "spdu_version": (p[0] >> 2) & 0x3,
+                "rls_in_use": p[0] & 0x02 != 0,
+                "iso8208_supported": p[0] & 0x20 != 0,
                 "change_note": (p[0] >> 6) & 0x3,
+                // 47-octet TDMA reservation / per-slot assignment region
+                // (dumphfdl reads buf[4..52) as opaque — it sits between the
+                // frame index/offset header at buf[3] and min_priority at
+                // buf[52]; no public spec gives its per-slot subfield layout,
+                // so it is surfaced raw rather than fabricated). HFDL-6.
+                "slot_assignment_hex":
+                    p[4..52].iter().map(|b| format!("{b:02x}")).collect::<String>(),
                 "min_priority": p[52] & 0x0F,
                 "systable_version": (p[53] as u16) | ((p[54] as u16 & 0x0F) << 8),
                 "freqs_in_use": freq_bitmap(p[54], p[55], p[56]),
@@ -647,6 +660,73 @@ mod tests {
         assert_eq!(ev[0].details["gs_id"], 7);
         assert_eq!(ev[0].details["frame_index"], 1234);
         assert_eq!(ev[0].details["systable_version"], 52);
+    }
+
+    // ── HFDL-6 (crate-local): SPDU first-octet flags + assignment region ──
+    //
+    // Bit positions pinned to dumphfdl 1.7.0 spdu.c spdu_parse() (the GPL
+    // oracle is read for facts only):
+    //   rls_in_use        = buf[0] & 2          (bit 1)
+    //   version           = (buf[0] >> 2) & 3   (bits 2-3)
+    //   iso8208_supported = buf[0] & 0x20       (bit 5)
+    //   change_note       = (buf[0] & 0xC0) >> 6 (bits 6-7)
+    // The reservation/per-slot assignment region is the opaque span
+    // buf[4..52) that dumphfdl skips (header ends at buf[3]; min_priority is
+    // at buf[52]) — surfaced raw, never invented.
+    #[test]
+    fn spdu_first_octet_flags_match_oracle_bits() {
+        // Construct a squitter whose first octet exercises every flag, then
+        // assert the parser extracts the exact oracle bit-fields. byte0 bits:
+        // b0=0 (SPDU), b1=1 (rls), b2-3=10b=2 (version), b5=1 (iso),
+        // b6-7=11b=3 (change_note "Ground station down").
+        let mut p = vec![0u8; 64];
+        p[0] = 0b1110_1010; // b7..b0
+        p[1] = 7 | 0x80; // gs 7, utc_sync
+        let s = with_fcs(p);
+        let ev = PduParser::new().parse(&s, 300);
+        assert_eq!(ev.len(), 1);
+        let d = &ev[0].details;
+        assert_eq!(d["rls_in_use"], true, "bit1 rls_in_use");
+        assert_eq!(d["spdu_version"], 2, "bits2-3 squitter version");
+        assert_eq!(d["iso8208_supported"], true, "bit5 iso8208_supported");
+        assert_eq!(d["change_note"], 3, "bits6-7 change_note");
+
+        // All flags clear except the SPDU type bit pattern.
+        let mut p = vec![0u8; 64];
+        p[0] = 0b0000_0000;
+        p[1] = 4 | 0x80;
+        let s = with_fcs(p);
+        let ev = PduParser::new().parse(&s, 300);
+        let d = &ev[0].details;
+        assert_eq!(d["rls_in_use"], false);
+        assert_eq!(d["spdu_version"], 0);
+        assert_eq!(d["iso8208_supported"], false);
+        assert_eq!(d["change_note"], 0);
+    }
+
+    #[test]
+    fn spdu_slot_assignment_region_is_surfaced_raw() {
+        // The 48-octet span buf[4..52) (the TDMA reservation / per-slot
+        // assignment map dumphfdl leaves opaque) must be surfaced verbatim
+        // as hex, and must not collide with the header (buf[0..4]) or the
+        // min_priority field (buf[52]).
+        let mut p = vec![0u8; 64];
+        p[0] = 0b0000_0000;
+        p[1] = 4 | 0x80;
+        // Stamp a recognizable pattern across the assignment region only.
+        for (i, b) in p.iter_mut().enumerate().take(52).skip(4) {
+            *b = (i as u8).wrapping_mul(3).wrapping_add(1);
+        }
+        p[52] = 0x0A; // min_priority sentinel just past the region
+        let s = with_fcs(p.clone());
+        let ev = PduParser::new().parse(&s, 300);
+        let d = &ev[0].details;
+        let expect: String =
+            p[4..52].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(d["slot_assignment_hex"], expect);
+        // 48 octets -> 96 hex chars; boundary is exactly buf[4..52).
+        assert_eq!(d["slot_assignment_hex"].as_str().unwrap().len(), 96);
+        assert_eq!(d["min_priority"], 0x0A, "region does not consume buf[52]");
     }
 
     #[test]
