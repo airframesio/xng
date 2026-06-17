@@ -180,6 +180,24 @@ AUCKLAND control 123.900 MHz). FANSPositionReport (the deep position-report
 SEQUENCE) and RouteClearance trackDetail remain undecoded (reported as
 the bracketed template).
 
+## Raw MIN / 4th-char downlink rule (2026-06, ACARS-1.2)
+
+`min.rs`: splits the downlink Message Identifier Number the way libacars
+(`acars.c`) and acarsdec do — the 3-character message number (`msg_num`)
+plus the 4th character (`msg_num_seq`), the per-message sequence
+character. The block-id class follows libacars' `IS_DOWNLINK_BLK(bid) =
+(bid >= '0' && bid <= '9')`, and the reassembly sequence index is
+`msg_num_seq - 'A'` (`acars.c` `.seq_num = down ? msg->msg_num_seq - 'A'
+: ...`, `.seq_num_first = 0`). The 4th-character edge cases are handled
+explicitly: only `'A'..='Z'` yields a sequence index; other 4th bytes
+(digits, punctuation, the `'.'` libacars substitutes for embedded NULs)
+leave the index unset rather than producing a bogus value. `block.rs`
+surfaces the split on `AcarsBlock::min` (a crate-local field — the shared
+`AcarsCore::msg_num` keeps the combined 4-character value for
+back-compat), and `reasm.rs` now derives its downlink sequence from the
+same `min::split_downlink` helper. Verified against the libacars `acars.c`
+field layout (`msg_num[4]` + `msg_num_seq`).
+
 ## MIAM file-transfer reassembly (2026-06)
 
 File transfers spanning multiple label-MA messages reassemble per the

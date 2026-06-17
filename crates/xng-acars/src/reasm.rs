@@ -81,12 +81,13 @@ impl Reassembler {
         let downlink = ('0'..='9').contains(&block_id);
         let (seq, msg_num, wrap) = if downlink {
             // Downlink message number "M01A": 3-char id + sequence char.
+            // The split and the 4th-character sequence rule are the shared
+            // libacars-faithful logic in `min` (handles the edge cases
+            // where the 4th char is not a valid sequence letter).
             let Some(num) = core.msg_num.as_deref() else { return Reasm::Skipped };
-            if num.len() < 4 {
-                return Reasm::Skipped;
-            }
-            let seq = num.as_bytes()[3] as i32 - 'A' as i32;
-            (seq, num[..3].to_owned(), i32::MAX)
+            let Some(m) = crate::min::split_downlink(num) else { return Reasm::Skipped };
+            let Some(seq) = m.seq else { return Reasm::Skipped };
+            (seq as i32, m.msg_num, i32::MAX)
         } else {
             // Empty-text uplink ACKs use out-of-sequence block ids (X,Y,Z).
             if core.text.is_empty() {

@@ -16,6 +16,7 @@ pub mod cfb;
 pub mod media_adv;
 pub mod met;
 pub mod miam;
+pub mod min;
 pub mod ohma;
 pub mod oooi;
 pub mod position;
