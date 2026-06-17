@@ -1,0 +1,14 @@
+[package]
+name = "xng-mode-dsc"
+description = "Native Digital Selective Calling (DSC, ITU-R M.493 / CCIR 493) decode core for xng: 10-bit symbol decode, DX/RX time diversity, message/frame parsing to structured JSON"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+xng-dsp = { workspace = true }
+xng-types = { workspace = true }
