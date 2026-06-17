@@ -536,15 +536,25 @@ window.toggleTerminals = () => {
   render();
 };
 window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
-// Aircraft expand: clicking a multi-source aircraft opens per-source rows.
-// Keyed by the stable master id so the open state survives poll re-renders.
+// Clicking an entity opens its per-source breakdown (one row per contributing
+// source). Keyed by the stable master id so the open state survives poll
+// re-renders. Entities table sort state — default: most recently seen first.
 const acExpanded = new Set();
-// ONE delegated click handler for the entities table. Rows carry their identity
-// in escaped data-* attributes (read back via dataset, never re-parsed as
-// HTML/JS), so attacker-controlled fields (ACARS tail/flight, AIS name) can't
-// break out of an inline handler — XSS-safe. Attached once; survives the
-// innerHTML re-render because it lives on the persistent container element.
+let sortCol = 'seen', sortDir = 'desc';
+// ONE delegated click handler for the entities table (rows AND sortable column
+// headers). Rows carry their identity in escaped data-* attributes (read back
+// via dataset, never re-parsed as HTML/JS), so attacker-controlled fields
+// (ACARS tail/flight, AIS name) can't break out of an inline handler — XSS-safe.
+// Attached once; survives the innerHTML re-render (it lives on the container).
 document.getElementById('entities').addEventListener('click', e => {
+  const th = e.target.closest('th[data-col]');
+  if (th) {
+    const col = th.dataset.col;
+    if (sortCol === col) { sortDir = sortDir === 'asc' ? 'desc' : 'asc'; }
+    else { sortCol = col; sortDir = (col === 'seen' || col === 'msgs' || col === 'alt' || col === 'kt') ? 'desc' : 'asc'; }
+    render();
+    return;
+  }
   const tr = e.target.closest('tr');
   if (!tr || !tr.dataset) return;
   if (tr.dataset.act === 'term') { window.toggleTerminals(); return; }
@@ -811,55 +821,79 @@ function render() {
     })
     .join('');
 
-  const rows = [];
-  for (const a of [...s.aircraft].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
+  // One unified, sortable entity list (aircraft + vessels + satellites). Each
+  // row carries its column values for sorting plus the precomposed trailing
+  // cells (the first/name cell is built per-row so it can carry the icon,
+  // colour and expand caret).
+  const ents = [];
+  for (const a of s.aircraft) {
     const id = a.id || a.icao || a.reg || a.flight || '';
-    const k = 'a' + id;
     const srcs = a.sources ? Object.values(a.sources) : [];
-    const expandable = srcs.length > 1;
-    const open = acExpanded.has(id);
-    const caret = expandable ? (open ? '▾ ' : '▸ ') : '';
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}" ` +
-      `data-id="${escapeHtml(id)}" data-lat="${a.lat ?? ''}" data-lon="${a.lon ?? ''}" data-exp="${expandable ? 1 : 0}">` +
-      `<td style="color:${altColor(a.alt)}">${caret}✈ ${escapeHtml(a.flight || a.reg || a.icao || id)}</td>` +
-      `<td>${escapeHtml(a.flight || '')}</td><td>${escapeHtml(a.icao || '')}</td>` +
-      `<td>${escapeHtml(a.reg || '')}</td><td>${escapeHtml(a.actype || '')}</td>` +
-      `<td>${a.alt ?? ''}</td><td>${a.spd ?? ''}</td><td>${a.msgs ?? ''}</td>` +
-      `<td class="age">${fmtAge(s.now - a.seen)}</td></tr>`);
+    ents.push({
+      k: 'a' + id, id, lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
+      color: altColor(a.alt), name: `✈ ${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
+      sv: { id, flight: a.flight || '', icao: a.icao || '', reg: a.reg || '', type: a.actype || '', alt: a.alt, kt: a.spd, msgs: a.msgs || 0, seen: a.seen || 0 },
+      cols: [escapeHtml(a.flight || ''), escapeHtml(a.icao || ''), escapeHtml(a.reg || ''), escapeHtml(a.actype || ''), a.alt ?? '', a.spd ?? '', a.msgs ?? ''],
+    });
+  }
+  for (const v of s.vessels) {
+    const m = shipMeta(v.shiptype);
+    ents.push({
+      k: 'v' + v.mmsi, id: String(v.mmsi), lat: v.lat ?? null, lon: v.lon ?? null, srcs: [], expandable: false,
+      color: m.color, name: `⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}`, seen: v.seen,
+      sv: { id: v.name || String(v.mmsi), flight: '', icao: '', reg: v.country || '', type: m.label || '', alt: undefined, kt: v.sog, msgs: undefined, seen: v.seen || 0 },
+      cols: ['', '', escapeHtml(v.country || ''), escapeHtml(m.label || ''), '', v.sog ?? '', ''],
+    });
+  }
+  for (const sat of (s.iridium_sats || [])) {
+    const nm = sat.name || ('Iridium ' + sat.sat);
+    ents.push({
+      k: 's' + sat.sat, id: nm, lat: sat.lat ?? null, lon: sat.lon ?? null, srcs: [], expandable: false,
+      color: '#bb9af7', name: `🛰 ${escapeHtml(nm)}`, seen: sat.seen,
+      sv: { id: nm, flight: '', icao: '', reg: '', type: 'satellite', alt: sat.alt, kt: undefined, msgs: undefined, seen: sat.seen || 0 },
+      cols: ['', '', '', 'satellite', sat.alt != null ? Math.round(sat.alt) + 'km' : '', '', ''],
+    });
+  }
+  // Sort by the active column (numeric columns numerically); blanks sort last.
+  const numCol = sortCol === 'alt' || sortCol === 'kt' || sortCol === 'msgs' || sortCol === 'seen';
+  const dirMul = sortDir === 'asc' ? 1 : -1;
+  ents.sort((x, y) => {
+    let xv = x.sv[sortCol], yv = y.sv[sortCol];
+    if (numCol) {
+      const xn = (xv == null || xv === '') ? null : +xv, yn = (yv == null || yv === '') ? null : +yv;
+      if (xn == null && yn == null) return 0;
+      if (xn == null) return 1;
+      if (yn == null) return -1;
+      return (xn - yn) * dirMul;
+    }
+    xv = (xv ?? '').toString().toLowerCase(); yv = (yv ?? '').toString().toLowerCase();
+    if (xv === yv) return 0;
+    if (xv === '') return 1;
+    if (yv === '') return -1;
+    return (xv < yv ? -1 : 1) * dirMul;
+  });
+
+  const rows = [];
+  for (const e of ents) {
+    const open = e.expandable && acExpanded.has(e.id);
+    const caret = e.expandable ? (open ? '▾ ' : '▸ ') : '';
+    rows.push(`<tr class="row${selected === e.k ? ' sel' : ''}" data-k="${escapeHtml(e.k)}" ` +
+      `data-id="${escapeHtml(e.id)}" data-lat="${e.lat ?? ''}" data-lon="${e.lon ?? ''}" data-exp="${e.expandable ? 1 : 0}">` +
+      `<td style="color:${e.color}">${caret}${e.name}</td>` +
+      e.cols.map(c => `<td>${c}</td>`).join('') +
+      `<td class="age">${fmtAge(s.now - e.seen)}</td></tr>`);
     if (open) {
-      for (const sr of [...srcs].sort((x, y) => (x.source||'').localeCompare(y.source||''))) {
+      for (const sr of [...e.srcs].sort((p, q) => (p.source || '').localeCompare(q.source || ''))) {
         rows.push(`<tr class="row srcrow">` +
           `<td style="padding-left:20px;color:#7aa2f7">↳ ${escapeHtml(sr.source || '')}</td>` +
           `<td>${escapeHtml(sr.flight || '')}</td><td>${escapeHtml(sr.icao || '')}</td>` +
-          `<td>${escapeHtml(sr.reg || '')}</td><td></td>` +
+          `<td>${escapeHtml(sr.reg || '')}</td><td>${escapeHtml(sr.type || sr.actype || '')}</td>` +
           `<td>${sr.alt ?? ''}</td><td>${sr.spd ?? ''}</td><td>${sr.msgs ?? ''}</td>` +
-          `<td class="age">${fmtAge(s.now - sr.seen)}</td></tr>`);
+          `<td class="age">${sr.seen ? fmtAge(s.now - sr.seen) : ''}</td></tr>`);
       }
     }
   }
-  for (const v of [...s.vessels].sort((x, y) => (y.mmsi||0) - (x.mmsi||0))) {
-    const k = 'v' + v.mmsi;
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}" ` +
-      `data-lat="${v.lat ?? ''}" data-lon="${v.lon ?? ''}">` +
-      `<td style="color:${shipMeta(v.shiptype).color}">⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
-      `<td></td><td></td>` +
-      `<td>${escapeHtml(v.country || '')}</td><td>${escapeHtml(shipMeta(v.shiptype).label || '')}</td>` +
-      `<td></td><td>${v.sog ?? ''}</td><td></td>` +
-      `<td class="age">${fmtAge(s.now - v.seen)}</td></tr>`);
-  }
-  // Iridium satellites (broadcasting overhead) and SBD terminals (identifiable
-  // transmitters on the short-burst-data channel) are entities too.
-  for (const sat of [...(s.iridium_sats || [])].sort((x, y) => (x.sat||0) - (y.sat||0))) {
-    const k = 's' + sat.sat;
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}" ` +
-      `data-lat="${sat.lat ?? ''}" data-lon="${sat.lon ?? ''}">` +
-      `<td style="color:#bb9af7">🛰 ${escapeHtml(sat.name || ('Iridium ' + sat.sat))}</td>` +
-      `<td></td><td></td><td></td><td>satellite</td>` +
-      `<td>${sat.alt != null ? Math.round(sat.alt) + 'km' : ''}</td><td></td><td></td>` +
-      `<td class="age">${fmtAge(s.now - sat.seen)}</td></tr>`);
-  }
-  // SBD terminals are interesting but not immediately useful, so they're
-  // collapsed behind a toggle row (state persisted, hidden by default).
+  // SBD terminals stay behind their collapse toggle (not sorted into the list).
   const terms = s.iridium_terminals || [];
   if (terms.length) {
     const showTerm = localStorage.getItem('xng.terminals') === '1';
@@ -876,8 +910,15 @@ function render() {
       }
     }
   }
+  // Sortable headers with an active-column indicator (click via the delegated
+  // listener above).
+  const COLS = ['id', 'flight', 'icao', 'reg', 'type', 'alt', 'kt', 'msgs', 'seen'];
+  const hdr = COLS.map(c => {
+    const ind = sortCol === c ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+    return `<th data-col="${c}" class="sortable">${c}${ind}</th>`;
+  }).join('');
   document.getElementById('entities').innerHTML = rows.length
-    ? `<table><tr><th>id</th><th>flight</th><th>icao</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th><th>seen</th></tr>${rows.join('')}</table>`
+    ? `<table><tr>${hdr}</tr>${rows.join('')}</table>`
     : '';
 
   // Pause freezes only which log items are listed: capture the live list
