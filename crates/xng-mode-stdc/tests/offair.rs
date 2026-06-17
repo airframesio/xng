@@ -36,5 +36,7 @@ fn decodes_real_egc_frame() {
         .expect("bulletin board present");
     assert!(bb.checksum_ok);
     assert_eq!(bb.details["frame_number"], 5987);
+    // STDC-7: frame number → UTC-of-day (5987 × 8.64 = 51727 s → 14:22:07).
+    assert_eq!(bb.details["utc_time"], "14:22:07");
     assert!(packets.iter().any(|p| p.name == "announcement" && p.checksum_ok));
 }

@@ -102,6 +102,45 @@ fn egc_service_name(service: u8) -> &'static str {
     }
 }
 
+/// Canonical operator-friendly EGC service-code long name. Names follow
+/// inmarsatc `getServiceCodeAndAddressName` (IMO SafetyNET manual).
+pub fn egc_service_long_name(service: u8) -> Option<&'static str> {
+    Some(match service {
+        0x00 => "System, All ships (general call)",
+        0x02 => "FleetNET, Group Call",
+        0x04 => "SafetyNET, Navigational, Meteorological or Piracy Warning to a Rectangular Area",
+        0x11 => "System, Inmarsat System Message",
+        0x13 => "SafetyNET, Navigational, Meteorological or Piracy Coastal Warning",
+        0x14 => "SafetyNET, Shore-to-Ship Distress Alert to Circular Area",
+        0x23 => "System, EGC System Message",
+        0x24 => "SafetyNET, Navigational, Meteorological or Piracy Warning to a Circular Area",
+        0x31 => "SafetyNET, NAVAREA/METAREA Warning, MET Forecast or Piracy Warning to NAVAREA/METAREA",
+        0x33 => "System, Download Group Identity",
+        0x34 => "SafetyNET, SAR Coordination to a Rectangular Area",
+        0x44 => "SafetyNET, SAR Coordination to a Circular Area",
+        0x72 => "FleetNET, Chart Correction Service",
+        0x73 => "SafetyNET, Chart Correction Service for Fixed Areas",
+        _ => return None,
+    })
+}
+
+/// STD-C TDM frame number (0..9999) → UTC time-of-day. The frame counter
+/// resets at UTC midnight and one frame is exactly 8.64 s, so the whole
+/// day is 86400 / 8.64 = 10000 frames. seconds_of_day = frame × 8.64,
+/// formatted floored to whole-second "HH:MM:SS". Per docs/notes/STDC.md.
+pub fn frame_to_utc_hms(frame_number: u16) -> Option<String> {
+    if frame_number > 9999 {
+        return None;
+    }
+    let sod = (frame_number as f64 * 8.64).floor() as u32;
+    Some(format!(
+        "{:02}:{:02}:{:02}",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    ))
+}
+
 const PRIORITY: [&str; 4] = ["routine", "safety", "urgency", "distress"];
 
 /// Parsed EGC packet header + payload, pre-assembly.
@@ -255,15 +294,19 @@ impl PacketParser {
         let desc = pkt[0];
         let body = &pkt[..pkt.len()];
         let (name, text, details): (&'static str, Option<String>, serde_json::Value) = match desc {
-            0x7D if body.len() >= 4 => (
-                "bulletin-board",
-                None,
-                json!({
-                    "network_version": body.get(1),
-                    "frame_number": u16::from_be_bytes([body[2], body[3]]),
-                    "channel_type": body.get(6).map(|b| b >> 5),
-                }),
-            ),
+            0x7D if body.len() >= 4 => {
+                let frame_number = u16::from_be_bytes([body[2], body[3]]);
+                (
+                    "bulletin-board",
+                    None,
+                    json!({
+                        "network_version": body.get(1),
+                        "frame_number": frame_number,
+                        "utc_time": frame_to_utc_hms(frame_number),
+                        "channel_type": body.get(6).map(|b| b >> 5),
+                    }),
+                )
+            }
             0x27 if body.len() >= 8 => {
                 // The clear terminates the logical channel: emit any
                 // message-data assembled on that LCN.
@@ -443,6 +486,7 @@ impl PacketParser {
         let (text, extra) = decode_payload(done.presentation, &payload);
         let mut details = json!({
             "service": egc_service_name(done.service),
+            "service_long": egc_service_long_name(done.service),
             "service_code": done.service,
             "priority": PRIORITY[done.priority as usize],
             "msg_seq": done.msg_seq,
@@ -579,6 +623,60 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].name, "bulletin-board");
         assert_eq!(events[1].details["priority"], "distress");
+    }
+
+    #[test]
+    fn frame_to_utc_matches_offair_oracle() {
+        // The vendored off-air capture (tests/offair.rs) carries TDM frame
+        // number 5987. 5987 × 8.64 = 51727.68 s → 14:22:07 UTC-of-day.
+        assert_eq!(frame_to_utc_hms(5987).as_deref(), Some("14:22:07"));
+        // Frame 0 = UTC midnight; the day is exactly 10000 frames.
+        assert_eq!(frame_to_utc_hms(0).as_deref(), Some("00:00:00"));
+        // 9999 is the last valid frame before the next midnight reset.
+        // 9999 × 8.64 = 86391.36 s → 23:59:51.
+        assert_eq!(frame_to_utc_hms(9999).as_deref(), Some("23:59:51"));
+        assert_eq!(frame_to_utc_hms(10000), None);
+        // One-hour boundary: 3600 / 8.64 = 416.66… frames.
+        assert_eq!(frame_to_utc_hms(417).as_deref(), Some("01:00:02"));
+    }
+
+    #[test]
+    fn bulletin_board_surfaces_utc_time() {
+        let mut p = PacketParser::new();
+        // 0x7D short, frame number 5987 = 0x1763 at body[2..4].
+        let bb = build_packet(&[0x7D, 1, 0x17, 0x63, 0, 0, 1, 0x10, 0, 0, 0, 0]);
+        let mut frame = bb;
+        frame.resize(640, 0);
+        let out = p.parse_frame(&frame);
+        let b = out.iter().find(|p| p.name == "bulletin-board").unwrap();
+        assert_eq!(b.details["frame_number"], 5987);
+        assert_eq!(b.details["utc_time"], "14:22:07");
+    }
+
+    #[test]
+    fn egc_service_long_names_match_inmarsatc() {
+        // Verbatim from inmarsatc getServiceCodeAndAddressName (oracle).
+        assert_eq!(
+            egc_service_long_name(0x31),
+            Some("SafetyNET, NAVAREA/METAREA Warning, MET Forecast or Piracy Warning to NAVAREA/METAREA")
+        );
+        assert_eq!(
+            egc_service_long_name(0x14),
+            Some("SafetyNET, Shore-to-Ship Distress Alert to Circular Area")
+        );
+        assert_eq!(egc_service_long_name(0x00), Some("System, All ships (general call)"));
+        assert_eq!(egc_service_long_name(0x99), None);
+    }
+
+    #[test]
+    fn egc_message_carries_service_long_name() {
+        let mut p = PacketParser::new();
+        let frame = egc_packet(0xB0, 0x31, false, 1, 777, 1, b"NAVAREA XII WARNING TEST");
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(
+            e.details["service_long"],
+            "SafetyNET, NAVAREA/METAREA Warning, MET Forecast or Piracy Warning to NAVAREA/METAREA"
+        );
     }
 
     #[test]
