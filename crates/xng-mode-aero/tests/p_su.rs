@@ -149,3 +149,26 @@ fn t_channel_assignment_decodes_end_to_end() {
     assert_eq!(v["aes_id"], "123456");
     assert_eq!(v["ges_id"], 0x07);
 }
+
+#[test]
+fn satellite_id_decodes_end_to_end() {
+    // AERO-1.3: 0x0C satellite_identification through the full chain.
+    // satid 5, seqno 10, 150.0°E, Psmc1 channel 0x0200.
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x0C;
+    su10[2] = 40; // seqno 10, satid_hi 0
+    su10[3] = 0x50; // satid_lo 5
+    su10[5] = 100; // 150.0°E
+    su10[6] = 0x02;
+    su10[7] = 0x00; // Psmc1 channel 0x0200
+    let events = decode_su10(su10);
+    let v = events
+        .iter()
+        .find(|v| v["su_type"] == "satellite-id")
+        .expect("satellite-id decoded through the full chain");
+    assert_eq!(v["satellite_id"], 5);
+    assert_eq!(v["seq"], 10);
+    assert_eq!(v["longitude_deg"], 150.0);
+    assert_eq!(v["longitude_dir"], "E");
+    assert_eq!(v["psmc1_mhz"], 0x0200 as f64 * 0.0025 + 1510.0);
+}

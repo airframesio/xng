@@ -417,6 +417,10 @@ pub fn parse_p_su(su: &[u8]) -> Option<serde_json::Value> {
         0x10..=0x17 => parse_log_control(su),
         0x21 => parse_call_announcement(su),
         0x51 => parse_t_channel_assignment(su),
+        0x05 => parse_smc_channels(su),
+        0x07 => parse_beam_support(su),
+        0x0A => parse_broadcast_index(su),
+        0x0C => parse_satellite_id(su),
         _ => None,
     }
 }
@@ -480,6 +484,122 @@ pub fn parse_t_channel_assignment(su: &[u8]) -> Option<serde_json::Value> {
         "aes_id": aes_id,
         "ges_id": ges_id,
     }))
+}
+
+/// AES system-table broadcast: satellite_identification (P-channel type
+/// 0x0C). The GES broadcasts which satellite serves this beam, its orbital
+/// longitude, and the Psmc (P-channel) carrier frequencies. JAERO
+/// (`aerol.cpp`):
+/// - seqno  = (byte3 >> 2) & 0x3F                  [byte3 = su[2]]
+/// - satid  = ((byte3 << 4) & 0x30) | ((byte4 >> 4) & 0x0F)   [byte4 = su[3]]
+/// - longitude = byte6 × 1.5 degrees (>180 ⇒ west)  [byte6 = su[5]]
+/// - Psmc1 = (((byte7&0x7F)<<8 | byte8) × 0.0025) + 1510.0 MHz, spot-beam
+///   in byte7 bit 7                                 [byte7/8 = su[6]/su[7]]
+/// - Psmc2 likewise from byte9/byte10 (omitted when its channel is 0).
+pub fn parse_satellite_id(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x0C {
+        return None;
+    }
+    let byte3 = su[2] as u16;
+    let byte4 = su[3] as u16;
+    let seqno = (byte3 >> 2) & 0x3F;
+    let satid = ((byte3 << 4) & 0x30) | ((byte4 >> 4) & 0x0F);
+    let longitude = su[5] as f64 * 1.5;
+    let (lon_value, lon_dir) = if longitude > 180.0 {
+        (360.0 - longitude, "W")
+    } else {
+        (longitude, "E")
+    };
+    let channel1 = (((su[6] & 0x7F) as u32) << 8) | su[7] as u32;
+    let channel2 = (((su[8] & 0x7F) as u32) << 8) | su[9] as u32;
+    let psmc1 = channel1 as f64 * 0.0025 + 1510.0;
+    let mut v = serde_json::json!({
+        "su_type": "satellite-id",
+        "seq": seqno,
+        "satellite_id": satid,
+        "longitude_deg": lon_value,
+        "longitude_dir": lon_dir,
+        "psmc1_mhz": psmc1,
+        "psmc1_spotbeam": su[6] & 0x80 != 0,
+    });
+    // JAERO only reports Psmc2 when its channel is non-zero.
+    if channel2 != 0 {
+        let psmc2 = channel2 as f64 * 0.0025 + 1510.0;
+        v["psmc2_mhz"] = serde_json::json!(psmc2);
+        v["psmc2_spotbeam"] = serde_json::json!(su[8] & 0x80 != 0);
+    }
+    Some(v)
+}
+
+/// AES system-table broadcast: GES Psmc and Rsmc channels (P-channel type
+/// 0x05). A GES broadcasts its P-channel (Psmc, AES receive) and R-channel
+/// (Rsmc, AES transmit) carrier frequencies across a sequence of SUs
+/// indexed by `lsu`. JAERO (`aerol.cpp`):
+/// - seqno = (byte3 >> 2) & 0x3F, lsu = byte3 & 0x03   [byte3 = su[2]]
+/// - ges   = byte4                                      [byte4 = su[3]]
+/// - three 16-bit channels at byte5/6, byte7/8, byte9/10 → ×0.0025 +1510.0
+/// - the Rsmc (transmit) carriers sit +101.5 MHz from the channel base:
+///   for lsu ≤ 1 the first carrier is the Psmc (RX) and carriers 2,3 are
+///   Rsmc0,Rsmc1 (TX, +101.5); for lsu ≥ 2 all three are Rsmc carriers
+///   (TX, +101.5) — Rsmc2..4 (lsu 2) / Rsmc5..7 (lsu 3).
+pub fn parse_smc_channels(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x05 {
+        return None;
+    }
+    let byte3 = su[2];
+    let seqno = (byte3 >> 2) & 0x3F;
+    let lsu = byte3 & 0x03;
+    let ges_id = su[3];
+    let ch = |hi: u8, lo: u8| -> u32 { ((hi as u32) << 8) | lo as u32 };
+    let mut f1 = ch(su[4], su[5]) as f64 * 0.0025 + 1510.0;
+    let mut f2 = ch(su[6], su[7]) as f64 * 0.0025 + 1510.0;
+    let mut f3 = ch(su[8], su[9]) as f64 * 0.0025 + 1510.0;
+    let names: [&str; 3] = if lsu <= 1 {
+        // Psmc (RX) + two Rsmc (TX, +101.5).
+        f2 += 101.5;
+        f3 += 101.5;
+        ["psmc_rx", "rsmc0_tx", "rsmc1_tx"]
+    } else {
+        // All three are Rsmc (TX, +101.5).
+        f1 += 101.5;
+        f2 += 101.5;
+        f3 += 101.5;
+        if lsu == 2 {
+            ["rsmc2_tx", "rsmc3_tx", "rsmc4_tx"]
+        } else {
+            ["rsmc5_tx", "rsmc6_tx", "rsmc7_tx"]
+        }
+    };
+    Some(serde_json::json!({
+        "su_type": "smc-channels",
+        "seq": seqno,
+        "lsu": lsu,
+        "ges_id": ges_id,
+        "channels": [
+            { "name": names[0], "mhz": f1 },
+            { "name": names[1], "mhz": f2 },
+            { "name": names[2], "mhz": f3 },
+        ],
+    }))
+}
+
+/// AES system-table broadcast: GES beam support (P-channel type 0x07).
+/// JAERO names this type (`AEROTypeP`) but decodes no further fields; we
+/// surface the named broadcast (the raw SU bytes carry the beam list).
+pub fn parse_beam_support(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x07 {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "ges-beam-support" }))
+}
+
+/// AES system-table broadcast: index (P-channel type 0x0A). JAERO names
+/// this type but decodes no further fields; we surface the named broadcast.
+pub fn parse_broadcast_index(su: &[u8]) -> Option<serde_json::Value> {
+    if su.len() < SU_LEN || su[0] != 0x0A {
+        return None;
+    }
+    Some(serde_json::json!({ "su_type": "broadcast-index" }))
 }
 
 pub fn fill_su() -> Vec<u8> {
@@ -601,6 +721,131 @@ mod tests {
         assert_eq!(v["ges_id"], 0x07);
         assert_eq!(parse_p_su(&su).unwrap()["su_type"], "t-channel-assignment");
         assert!(parse_t_channel_assignment(&[0x21; 12]).is_none());
+    }
+
+    /// AERO-1.3: satellite_identification 0x0C. Field layout from JAERO
+    /// `aerol.cpp` (seqno, satid split across byte3/byte4, longitude =
+    /// byte6×1.5°, Psmc1/2 from byte7/8 and byte9/10). Two cases pin the
+    /// satid bit-split and the east/west longitude rule.
+    #[test]
+    fn satellite_id_decodes_jaero_layout() {
+        // satid = 20 (needs the high 2 bits), seqno = 10, longitude byte
+        // 200 → 300.0° → 60.0°W, Psmc1 channel 0x0123 (global),
+        // Psmc2 channel 0x0456 (spot beam).
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x0C;
+        // byte3 (su[2]): seqno<<2 | satid_hi(=(20>>4)&3=1) = 40|1 = 0x29.
+        su10[2] = 0x29;
+        // byte4 (su[3]): satid_lo(=20&0xF=4) << 4 = 0x40.
+        su10[3] = 0x40;
+        // byte6 (su[5]): longitude index 200 → 300.0° → 60.0°W.
+        su10[5] = 200;
+        // byte7/8 (su[6]/su[7]): Psmc1 channel 0x0123 (no spot beam).
+        su10[6] = 0x01;
+        su10[7] = 0x23;
+        // byte9/10 (su[8]/su[9]): Psmc2 channel 0x0456 + spot beam bit.
+        su10[8] = 0x80 | 0x04;
+        su10[9] = 0x56;
+        let su = su_with_crc(su10);
+        let v = parse_satellite_id(&su).unwrap();
+        assert_eq!(v["su_type"], "satellite-id");
+        assert_eq!(v["seq"], 10);
+        assert_eq!(v["satellite_id"], 20);
+        assert_eq!(v["longitude_deg"], 60.0); // 360 - 300
+        assert_eq!(v["longitude_dir"], "W");
+        assert_eq!(v["psmc1_mhz"], 0x0123 as f64 * 0.0025 + 1510.0);
+        assert_eq!(v["psmc1_spotbeam"], false);
+        assert_eq!(v["psmc2_mhz"], 0x0456 as f64 * 0.0025 + 1510.0);
+        assert_eq!(v["psmc2_spotbeam"], true);
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "satellite-id");
+
+        // East longitude, satid in low nibble only, no Psmc2 (channel 0).
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x0C;
+        su10[2] = 40; // seqno 10, satid_hi 0
+        su10[3] = 0x50; // satid_lo 5
+        su10[5] = 100; // 150.0°E
+        su10[6] = 0x02;
+        su10[7] = 0x00; // Psmc1 channel 0x0200
+        // su[8]/su[9] left 0 → no Psmc2 reported.
+        let su = su_with_crc(su10);
+        let v = parse_satellite_id(&su).unwrap();
+        assert_eq!(v["satellite_id"], 5);
+        assert_eq!(v["longitude_deg"], 150.0);
+        assert_eq!(v["longitude_dir"], "E");
+        assert!(v.get("psmc2_mhz").is_none());
+        assert!(parse_satellite_id(&[0x05; 12]).is_none());
+    }
+
+    /// AERO-1.3: GES Psmc/Rsmc channels 0x05. Field layout from JAERO
+    /// `aerol.cpp`: seqno/lsu from byte3, GES from byte4, three channels,
+    /// the Rsmc (TX) carriers offset +101.5 MHz. Covers lsu≤1 (Psmc+Rsmc)
+    /// and lsu≥2 (all-Rsmc) cases.
+    #[test]
+    fn smc_channels_decodes_jaero_layout() {
+        let base = |ch: u32| ch as f64 * 0.0025 + 1510.0;
+        // lsu = 0: first carrier is Psmc (RX), next two Rsmc (TX, +101.5).
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x05;
+        su10[2] = (7 << 2) | 0; // seqno 7, lsu 0
+        su10[3] = 0x2A; // GES 0x2A
+        su10[4] = 0x01;
+        su10[5] = 0x00; // ch1 0x0100
+        su10[6] = 0x02;
+        su10[7] = 0x00; // ch2 0x0200
+        su10[8] = 0x03;
+        su10[9] = 0x00; // ch3 0x0300
+        let su = su_with_crc(su10);
+        let v = parse_smc_channels(&su).unwrap();
+        assert_eq!(v["su_type"], "smc-channels");
+        assert_eq!(v["seq"], 7);
+        assert_eq!(v["lsu"], 0);
+        assert_eq!(v["ges_id"], 0x2A);
+        let ch = v["channels"].as_array().unwrap();
+        assert_eq!(ch[0]["name"], "psmc_rx");
+        assert_eq!(ch[0]["mhz"], base(0x0100));
+        assert_eq!(ch[1]["name"], "rsmc0_tx");
+        assert_eq!(ch[1]["mhz"], base(0x0200) + 101.5);
+        assert_eq!(ch[2]["name"], "rsmc1_tx");
+        assert_eq!(ch[2]["mhz"], base(0x0300) + 101.5);
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "smc-channels");
+
+        // lsu = 2: all three are Rsmc (TX, +101.5), named Rsmc2..4.
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x05;
+        su10[2] = (3 << 2) | 2; // seqno 3, lsu 2
+        su10[3] = 0x11;
+        su10[4] = 0x04;
+        su10[5] = 0x00; // ch1 0x0400
+        let su = su_with_crc(su10);
+        let v = parse_smc_channels(&su).unwrap();
+        assert_eq!(v["lsu"], 2);
+        let ch = v["channels"].as_array().unwrap();
+        assert_eq!(ch[0]["name"], "rsmc2_tx");
+        assert_eq!(ch[0]["mhz"], base(0x0400) + 101.5);
+        assert_eq!(ch[1]["name"], "rsmc3_tx");
+        assert_eq!(ch[2]["name"], "rsmc4_tx");
+        assert!(parse_smc_channels(&[0x0C; 12]).is_none());
+    }
+
+    /// AERO-1.3: 0x07 GES beam support and 0x0A broadcast index are named
+    /// by JAERO without further field decode; we surface the named events.
+    #[test]
+    fn beam_support_and_broadcast_index_named() {
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x07;
+        let su = su_with_crc(su10);
+        assert_eq!(parse_beam_support(&su).unwrap()["su_type"], "ges-beam-support");
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "ges-beam-support");
+
+        let mut su10 = vec![0u8; 10];
+        su10[0] = 0x0A;
+        let su = su_with_crc(su10);
+        assert_eq!(parse_broadcast_index(&su).unwrap()["su_type"], "broadcast-index");
+        assert_eq!(parse_p_su(&su).unwrap()["su_type"], "broadcast-index");
+
+        assert!(parse_beam_support(&[0x0A; 12]).is_none());
+        assert!(parse_broadcast_index(&[0x07; 12]).is_none());
     }
 
     #[test]

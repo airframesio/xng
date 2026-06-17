@@ -149,6 +149,21 @@ P-channel SUs are classified into JSON values surfaced as
   9/10 → ×0.0025 +1611.5 MHz, spot-beam flags in the high octets). 0x51
   is the reservation T-channel assignment; JAERO names it and decodes no
   further fields, so xng surfaces the named event with AES/GES only.
+- AERO-1.3 — AES system-table broadcast (0x05/0x07/0x0A/0x0C):
+  - 0x0C satellite_identification: seqno = (byte3>>2)&0x3F; satid =
+    ((byte3<<4)&0x30) | ((byte4>>4)&0x0F); longitude = byte6 × 1.5°
+    (>180 ⇒ 360−x west); Psmc1 = ((byte7&0x7F)<<8 | byte8)×0.0025+1510.0
+    MHz (spot-beam byte7 bit 7); Psmc2 from byte9/byte10, reported only
+    when its channel is non-zero (JAERO rule). Gives the served satellite,
+    its orbital longitude, and the P-channel carriers.
+  - 0x05 GES Psmc/Rsmc channels: seqno/lsu from byte3 (lsu = byte3&0x03);
+    GES = byte4; three 16-bit channels at byte5/6, byte7/8, byte9/10 →
+    ×0.0025+1510.0 MHz. The Rsmc (AES-transmit) carriers sit +101.5 MHz
+    from the base: lsu≤1 ⇒ {Psmc(RX), Rsmc0(TX), Rsmc1(TX)}; lsu=2 ⇒
+    {Rsmc2..4(TX)}; lsu=3 ⇒ {Rsmc5..7(TX)} (JAERO `aerol.cpp`).
+  - 0x07 GES_beam_support and 0x0A broadcast_index: named by JAERO with no
+    further field decode; surfaced as named events (raw bytes carried).
+  byteN above = our su[N-1] (JAERO's 1-based octet indexing).
 
 Channel/mode tagging (AERO-8.1): each `AeroEvent` carries the physical
 channel it came from. The L-band P-channel decoder (`AeroChannelDecoder`)
