@@ -17,6 +17,7 @@
 //! be in the parity-less BCS bytes themselves; those 16 single-bit flips
 //! are tried too.
 
+use crate::fec;
 use xng_dsp::checksum::acars_crc;
 
 const SOH: u8 = 0x01;
@@ -251,25 +252,30 @@ impl Deframer {
     }
 }
 
-/// Try to repair a frame that failed its CRC. `suspects` are indices of
-/// characters with bad parity: each is assumed to hold exactly one flipped
-/// bit, searched jointly (8 candidates per suspect) until the CRC residue
-/// is 0. With no parity suspects, the error may be in the parity-less BCS
-/// bytes — try those 16 single-bit flips. Returns the number of repaired
-/// bits, with `chars` left corrected.
+/// Try to repair a frame that failed its CRC.
+///
+/// Fast path (ACARS-4.2): a single bit error anywhere in the block —
+/// including a parity-less BCS byte — is located in O(1) via the syndrome
+/// table (`fec::correct_single_bit`), the acarsdec `syndrom.h` approach.
+/// This subsumes the old per-character / per-BCS brute-force scan for the
+/// common single-error case and works even when the flipped bit landed in a
+/// position that *didn't* break odd parity.
+///
+/// Slow path: when the syndrome is not a single-bit error, fall back to the
+/// parity-guided multi-error search. `suspects` are indices of characters
+/// with bad parity; each is assumed to hold exactly one flipped bit, searched
+/// jointly (8 candidates per suspect) until the CRC residue is 0. Returns the
+/// number of repaired bits, with `chars` left corrected.
 fn correct_errors(chars: &mut [u8], suspects: &[usize]) -> Option<u32> {
-    let n = chars.len();
+    // O(1) single-bit lookup first: covers a lone error in the body or in a
+    // parity-less BCS byte without any search.
+    if fec::correct_single_bit(chars).is_some() {
+        return Some(1);
+    }
     if suspects.is_empty() {
-        // Body is parity-clean: try a single bit error in the BCS.
-        for idx in [n - 2, n - 1] {
-            for bit in 0..8 {
-                chars[idx] ^= 1 << bit;
-                if acars_crc(chars) == 0 {
-                    return Some(1);
-                }
-                chars[idx] ^= 1 << bit;
-            }
-        }
+        // Parity-clean body and not a single-bit error: nothing the
+        // parity-guided search can localize. (The single-bit BCS case was
+        // already handled by the syndrome lookup above.)
         return None;
     }
     if suspects.len() > MAX_CORRECTABLE {
