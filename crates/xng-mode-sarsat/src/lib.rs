@@ -197,22 +197,40 @@ fn find_frame(halves: &[u8], from: usize) -> Option<(usize, Option<SarsatFrame>)
         return None;
     }
     let last_start = halves.len() - pre_len - 2;
-    for start in from..=last_start {
-        let errs = pre
-            .iter()
-            .zip(&halves[start..start + pre_len])
-            .filter(|(a, b)| a != b)
-            .count();
-        if errs > max_errs {
-            continue;
+    // Biphase-L phase polarity is ambiguous — it depends on the sign of the
+    // recovered carrier phase, so a real beacon can arrive with every
+    // half-symbol inverted (a real off-air 406 EPIRB capture locked only
+    // inverted). Correlate both polarities and pick the GLOBAL best-matching
+    // preamble at or after `from`: the true preamble (≈0 errors) always beats
+    // the spurious matches the periodic bit-sync run produces at shifted
+    // positions / the opposite polarity, so neither orientation can preempt the
+    // real one. Lowest start wins ties (canonical before inverted).
+    let mut best: Option<(usize, usize, bool)> = None; // (errs, start, inverted)
+    for invert in [false, true] {
+        let flip = invert as u8;
+        for start in from..=last_start {
+            let errs = pre
+                .iter()
+                .zip(&halves[start..start + pre_len])
+                .filter(|(a, b)| (**b ^ flip) != **a)
+                .count();
+            if errs <= max_errs && best.is_none_or(|(be, _, _)| errs < be) {
+                best = Some((errs, start, invert));
+            }
         }
-        // Sync found. Data half-symbols begin right after the preamble.
-        let data_start = start + pre_len;
-        let frame = assemble(&halves[data_start..]);
-        // Advance past this preamble regardless of decode success.
-        return Some((start + pre_len, frame));
     }
-    None
+    let (_, start, inverted) = best?;
+    // Sync found. Data half-symbols begin right after the preamble; flip them
+    // to canonical polarity when the inverted orientation matched.
+    let data_start = start + pre_len;
+    let frame = if inverted {
+        let flipped: Vec<u8> = halves[data_start..].iter().map(|h| 1 - h).collect();
+        assemble(&flipped)
+    } else {
+        assemble(&halves[data_start..])
+    };
+    // Advance past this preamble regardless of decode success.
+    Some((start + pre_len, frame))
 }
 
 /// Pair the post-sync half-symbols into data bits and run the existing decoder.
@@ -1008,5 +1026,28 @@ mod unit {
         assert!(!long_carries_position("8DA41A02C17FDFF83B4235FFFFFFFF"));
         assert!(!long_carries_position("8E8628D187874181D738F700000000"));
         assert!(long_carries_position("A3E7B10016150D364D8B3689C09437"));
+    }
+
+    /// Biphase-L polarity is ambiguous; a real off-air 406 EPIRB arrived with
+    /// every half-symbol inverted. `find_frame` must lock and decode BOTH the
+    /// canonical stream and its full inversion to the identical beacon.
+    #[test]
+    fn find_frame_recovers_both_polarities() {
+        let hex = "A3E7B10016150D364D8B3689C09437";
+        let framed = modulate::framed_bits(&modulate::message_bits_from_hex(hex));
+        let mut halves = vec![0u8; 6]; // short lead so the preamble isn't at index 0
+        for &b in &framed {
+            if b == 1 {
+                halves.extend_from_slice(&[1, 0]);
+            } else {
+                halves.extend_from_slice(&[0, 1]);
+            }
+        }
+        let frame = find_frame(&halves, 0).expect("canonical preamble").1;
+        assert_eq!(frame.expect("canonical decode").hex, hex);
+
+        let inv: Vec<u8> = halves.iter().map(|h| 1 - h).collect();
+        let frame_inv = find_frame(&inv, 0).expect("inverted preamble").1;
+        assert_eq!(frame_inv.expect("inverted decode").hex, hex, "inverted polarity must decode identically");
     }
 }
