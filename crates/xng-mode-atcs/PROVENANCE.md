@@ -109,9 +109,28 @@ in this crate.
 
 ## IQ demodulation
 
-Not implemented (documented TODO in `src/lib.rs`). There is no public ATCS
-IQ vector to verify a demodulator against, and project policy forbids
-shipping an unverifiable self-consistency loopback, so the demod is
-deferred rather than faked. The RWMON / rail.watch and ATCS Monitor
-projects describe the front end (GNU Radio FSK demod at 4800 bps), which a
-future IQ stage can follow once a captured reference vector is available.
+Implemented as `src/demod.rs` (`FskDemod`) driven through an `xng_dsp::Ddc`
+by `AtcsChannelDecoder` (`src/lib.rs`): DDC mix/decimate of the wideband
+capture down to the 24 kHz channel rate, a 2-FSK frequency discriminator at
+4800 bd with zero-crossing timing recovery and a slow carrier-offset (DC)
+tracker, then NRZI decode, feeding the existing `HdlcDeframer`. The
+discriminator + timing-recovery pattern is copied from
+`xng-mode-ais::demod::GmskDemod` (binary FSK is the BT→∞ limit of GMSK),
+retuned for ATCS's 4800 bd / ±1800 Hz deviation. The RWMON / rail.watch and
+ATCS Monitor projects describe the same front end (GNU Radio FSK demod at
+4800 bps).
+
+### SYNTHETIC validation boundary (self-generated, not an oracle)
+
+There is **no public ATCS IQ vector**. The demod is therefore validated by
+a **synthetic** modulate → demod loopback, clearly named (`*_synth_iq` in
+`tests/end_to_end.rs`) and isolated in `src/modulate.rs`. The modulator
+NRZI-encodes + 2-FSK-modulates the **same spec-derived frame** used by the
+oracle-anchored decode tests (the sigidwiki worked Spec-200 packet, wrapped
+with a genuine CRC-16/X-25 FCS), and the test asserts the recovered Spec-200
+fields equal the known-good values. The modulate → demod path is
+self-consistency, **not** an external oracle; the DECODE core (HDLC deframe
++ Spec-200 header) remains externally anchored by the spec-derived /
+CRC-catalogue tests above. A future IQ stage can be re-anchored against a
+captured reference vector once one is published, without changing the
+decode core.
