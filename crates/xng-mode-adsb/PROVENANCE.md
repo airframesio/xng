@@ -149,3 +149,31 @@ altitude 16992 ft MCP/FCU, QNH 1012.8 mbar, heading 66.8°, AP/VNAV/LNAV
 engaged) — facts/positions only, no code ported; that real vector and its
 expected values are vendored as the `decode.rs` unit test. Emitted under
 `adsb_status` with `subtype: "target_state"`.
+
+## Accuracy / integrity — NUCp / NIC / NACv / SDA (2026-06)
+
+The version-dependent ADS-B quality layer (`decode::nuc_p` / `nic_v1` /
+`nic_v2` / `nac_v_hfom_mps` / `position_quality`, plus the new `Velocity`
+NACv / VR-source / GNSS-minus-baro fields and the TC31 NIC-supplement-C /
+SDA / HRD additions). Lookup-table values and the resolution procedure
+are ICAO Annex 10 Vol IV / DO-260A/B as tabulated in pyModeS
+`uncertainty.py` (`TC_NUCp_lookup`, `TC_NICv1_lookup`, `TC_NICv2_lookup`,
+`NUCp`, `NACv`) and decoded by its `nuc_p` / `nic_v1` / `nic_v2` / `nac_v`
+functions; the velocity trailer (NACv at ME 10–12, vertical-rate source
+bit 35 = GNSS/baro, GNSS-minus-baro at ME 48–55 `(mag−1)·25 ft`, N/A at 0
+or 127) is the pyModeS `bds09` layout; the TC31 operational-status NICb/c
+supplement positions (NICa = ME 43, NICc = ME 19) follow pyModeS
+`nic_a_c`, and SDA = the low two bits of the 16-bit operational-mode field
+(ME 38–39) follows the rs1090 `bds65` `OperationalMode` layout — facts and
+table values only, no code ported. Verification (external, not loopback):
+the published pyModeS `test_adsb` NIC golden-vector set (twelve frames
+`8D3C70A3…`→0 … `8D3C4ACF…`→11, two of them supplement-sensitive) is
+vendored as the `nic_v1` unit test; the velocity NACv/VR-source/geo-baro
+asserts are pinned to `pyModeS.decoder.bds.bds09.decode_bds09` outputs
+(e.g. `8D485020…` → nac_v 0 / GNSS / geo_minus_baro 550 ft; `8d3461cf…`
+→ nac_v 1 / baro / 350 ft); the TC31 v2 op-status field positions are
+pinned to `bds65.decode_bds65` on a synthetic v2 payload. NUCp emits on
+every airborne position frame under `adsb_status.nuc_p`; NACv/VR-source/
+geo-baro fold into `adsb_status` on TC19; the version-aware NIC is exposed
+by `position_quality` for a caller that pairs a position TC with the
+aircraft's last operational-status supplement.

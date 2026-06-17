@@ -109,6 +109,14 @@ pub struct Velocity {
     pub airspeed: bool,
     /// Feet per minute, positive up.
     pub vertical_rate_fpm: Option<i32>,
+    /// NACv — Navigation Accuracy Category, velocity (ME bits 10–12).
+    pub nac_v: u8,
+    /// Vertical-rate source: `false` = GNSS (geometric), `true` =
+    /// barometric (ME bit 35; airborne velocity only).
+    pub vr_baro_source: bool,
+    /// GNSS-height minus barometric-altitude difference, feet (ME bits
+    /// 48–55; airborne velocity only). `None` when not available.
+    pub geo_minus_baro_ft: Option<i32>,
 }
 
 /// Decode a TC 19 velocity ME field (7 bytes).
@@ -150,12 +158,29 @@ pub fn velocity(me: &[u8]) -> Option<Velocity> {
         }
         _ => return None,
     };
+    let nac_v = field(10, 3) as u8;
+    let vr_baro_source = bit(35) == 1;
     let vr_raw = field(37, 9);
     let vertical_rate_fpm = (vr_raw != 0).then(|| {
         let v = (vr_raw as i32 - 1) * 64;
         if bit(36) == 1 { -v } else { v }
     });
-    Some(Velocity { speed_kt, track_deg, airspeed, vertical_rate_fpm })
+    // GNSS-minus-baro: sign bit 48, magnitude bits 49–55; 0 and 127 mean
+    // "not available" (pyModeS `bds09`).
+    let diff_mag = field(49, 7);
+    let geo_minus_baro_ft = (diff_mag != 0 && diff_mag != 127).then(|| {
+        let v = (diff_mag as i32 - 1) * 25;
+        if bit(48) == 1 { -v } else { v }
+    });
+    Some(Velocity {
+        speed_kt,
+        track_deg,
+        airspeed,
+        vertical_rate_fpm,
+        nac_v,
+        vr_baro_source,
+        geo_minus_baro_ft,
+    })
 }
 
 /// Ground speed (knots) from a TC 5–8 surface 7-bit Movement code. `None`
@@ -196,7 +221,16 @@ pub fn surface_velocity(me: &[u8]) -> Option<Velocity> {
         return None; // ground track not valid
     }
     let track_deg = field(13, 7) as f64 * 360.0 / 128.0;
-    Some(Velocity { speed_kt, track_deg, airspeed: false, vertical_rate_fpm: None })
+    // Surface velocity carries no NACv / VR-source / geo-baro fields.
+    Some(Velocity {
+        speed_kt,
+        track_deg,
+        airspeed: false,
+        vertical_rate_fpm: None,
+        nac_v: 0,
+        vr_baro_source: false,
+        geo_minus_baro_ft: None,
+    })
 }
 
 /// Decode a TC 31 Aircraft Operational Status ME field (7 bytes) into the
@@ -205,10 +239,16 @@ pub fn surface_velocity(me: &[u8]) -> Option<Velocity> {
 /// integrity. Returns `None` for a non-TC31 field.
 ///
 /// ME-relative, 0-indexed bit positions (per "The 1090 MHz Riddle" §6 and
-/// pyModeS `bds65`): subtype 5–7, version 40–42, NIC-supplement-A 43,
-/// NACp 44–47, GVA 48–49, SIL 50–51, NICbaro 52, SIL-supplement 54. NACp/
-/// SIL/NIC-supplement were introduced in version 1; the SIL supplement in
-/// version 2.
+/// pyModeS `bds65`): subtype 5–7, operational-mode 24–39 (its low two bits
+/// 38–39 are SDA, the rs1090 `bds65` layout), version 40–42,
+/// NIC-supplement-A 43 (= NICa), NACp 44–47, GVA 48–49, SIL 50–51,
+/// NICbaro 52, HRD 53, SIL-supplement 54. NIC-supplement-C is carried at
+/// ME bit 19 (pyModeS `nic_a_c`, `msgbin[51]`). NACp/SIL/NIC-supplement
+/// were introduced in version 1; SDA and the SIL supplement in version 2.
+///
+/// The emitted NIC-supplement bits (`nic_supp_a` / `nic_supp_c`) are the
+/// per-aircraft state a position decoder pairs with a TC's own type code
+/// to resolve the version-aware NIC (see [`nic_v1`] / [`nic_v2`]).
 pub fn operational_status(me: &[u8]) -> Option<serde_json::Value> {
     let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
     let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
@@ -222,14 +262,21 @@ pub fn operational_status(me: &[u8]) -> Option<serde_json::Value> {
     o.insert("version".into(), serde_json::json!(version));
     if version >= 1 {
         o.insert("nic_supp_a".into(), serde_json::json!(bit(43)));
+        // NIC-supplement-C (airborne) / -B disambiguation bit at ME 19.
+        o.insert("nic_supp_c".into(), serde_json::json!(bit(19)));
         o.insert("nac_p".into(), serde_json::json!(field(44, 4)));
         o.insert("sil".into(), serde_json::json!(field(50, 2)));
+        // HRD — heading reference (0 = true north, 1 = magnetic north).
+        o.insert("hrd".into(), serde_json::json!(bit(53)));
         if subtype == 0 {
             o.insert("gva".into(), serde_json::json!(field(48, 2)));
             o.insert("baro_alt_integrity".into(), serde_json::json!(bit(52)));
         }
         if version >= 2 {
             o.insert("sil_supplement".into(), serde_json::json!(bit(54)));
+            // SDA — system design assurance, the low 2 bits of the
+            // operational-mode field (ME 38–39).
+            o.insert("sda".into(), serde_json::json!(field(38, 2)));
         }
     }
     Some(serde_json::Value::Object(o))
@@ -435,6 +482,181 @@ pub fn squawk13(id: u32) -> String {
     format!("{a}{bq}{c}{d}")
 }
 
+// ── Accuracy / integrity (NUCp / NIC / NACv / SDA) ──────────────────
+// The version-dependent ADS-B quality layer. NUCp is the version-0
+// (DO-260) position uncertainty derived directly from the type code;
+// NIC is the version-1/2 (DO-260A/B) integrity category, which needs
+// the type code *and* the NIC-supplement bits that arrive in a separate
+// TC31 operational-status (and TC9-18 single-bit) message. NACv is the
+// velocity accuracy carried in the TC19 message itself. SDA is the
+// version-2 system-design-assurance from the TC31 operational mode.
+//
+// Lookup tables and the resolution procedure mirror pyModeS
+// `uncertainty.py` (TC_NUCp_lookup / TC_NICv1_lookup / TC_NICv2_lookup)
+// and its `nuc_p` / `nic_v1` / `nic_v2` / `nac_v` decoders — facts and
+// table values only, no code ported; validated field-exact against
+// pyModeS in the tests below (the published NIC golden-vector set).
+
+/// NUCp (Navigation Uncertainty Category — Position), ADS-B version 0,
+/// from the type code. `None` for type codes that carry no position
+/// (i.e. not 5–8, 9–18 barometric, or 20–22 GNSS). pyModeS
+/// `TC_NUCp_lookup`.
+pub fn nuc_p(tc: u8) -> Option<u8> {
+    Some(match tc {
+        5 | 9 | 20 => 9,
+        6 | 10 | 21 => 8,
+        7 | 11 => 7,
+        8 | 12 => 6,
+        13 => 5,
+        14 => 4,
+        15 => 3,
+        16 => 2,
+        17 => 1,
+        18 | 22 => 0,
+        _ => return None,
+    })
+}
+
+/// 95 % horizontal containment radius (metres) for a NUCp value, per
+/// pyModeS `uncertainty.NUCp` (`RCu`). `None` where the category gives no
+/// bound (NUCp 0).
+pub fn nuc_p_rcu_m(nuc_p: u8) -> Option<u32> {
+    Some(match nuc_p {
+        9 => 3,
+        8 => 10,
+        7 => 93,
+        6 => 185,
+        5 => 463,
+        4 => 926,
+        3 => 1852,
+        2 => 9260,
+        1 => 18520,
+        _ => return None,
+    })
+}
+
+/// NIC (Navigation Integrity Category), ADS-B version 1 (DO-260A), from
+/// the type code and the NIC supplement-A bit (the TC31
+/// operational-status supplement). pyModeS `TC_NICv1_lookup` + `nic_v1`.
+/// `None` for non-position type codes.
+pub fn nic_v1(tc: u8, nic_supp_a: u8) -> Option<u8> {
+    let s = nic_supp_a & 1;
+    Some(match tc {
+        5 | 9 | 20 => 11,
+        6 | 10 | 21 => 10,
+        7 => 9,
+        8 | 18 | 22 => 0,
+        11 => if s == 1 { 9 } else { 8 },
+        12 => 7,
+        13 => 6,
+        14 => 5,
+        15 => 4,
+        16 => if s == 1 { 3 } else { 2 },
+        17 => 1,
+        _ => return None,
+    })
+}
+
+/// NIC (Navigation Integrity Category), ADS-B version 2 (DO-260B), from
+/// the type code and the supplement bits NICa (TC31) and NICb/NICc.
+/// pyModeS `TC_NICv2_lookup` + `nic_v2`: airborne TC9-18 select on
+/// `NICa*2 + NICb`, surface TC5-8 on `NICa*2 + NICc`, GNSS TC20-22 force
+/// supplement 0. `None` for a non-position type code or an undefined
+/// (TC, supplement) combination.
+pub fn nic_v2(tc: u8, nic_a: u8, nic_bc: u8) -> Option<u8> {
+    let ns = if (20..=22).contains(&tc) { 0 } else { (nic_a & 1) * 2 + (nic_bc & 1) };
+    Some(match tc {
+        5 | 9 | 20 => 11,
+        6 | 10 | 21 => 10,
+        7 => match ns {
+            2 => 9,
+            0 => 8,
+            _ => return None,
+        },
+        8 => match ns {
+            3 => 7,
+            1 | 2 => 6,
+            0 => 0,
+            _ => return None,
+        },
+        11 => match ns {
+            3 => 9,
+            0 => 8,
+            _ => return None,
+        },
+        12 => 7,
+        13 => 6,
+        14 => 5,
+        15 => 4,
+        16 => match ns {
+            3 => 3,
+            0 => 2,
+            _ => return None,
+        },
+        17 => 1,
+        18 | 22 => 0,
+        _ => return None,
+    })
+}
+
+/// NACv 95 % horizontal velocity figure-of-merit (m/s) for a NACv code,
+/// per pyModeS `uncertainty.NACv` (`HFOMr`). `None` for NACv 0 (unknown
+/// or > 10 m/s).
+pub fn nac_v_hfom_mps(nac_v: u8) -> Option<f64> {
+    Some(match nac_v {
+        1 => 10.0,
+        2 => 3.0,
+        3 => 1.0,
+        4 => 0.3,
+        _ => return None,
+    })
+}
+
+/// Per-fix position-quality object for an airborne / surface position
+/// message (TC 5–8, 9–18, 20–22): the version-0 NUCp (and its containment
+/// radius), the in-message NIC-supplement bit (NICb at ME bit 7 for
+/// airborne barometric positions), and — when a version and the matching
+/// operational-status supplement are known — the resolved version-aware
+/// NIC. `nic_supp_a` / `nic_supp_c` come from the aircraft's last TC31
+/// operational-status; pass `None` for `version` when no status has been
+/// seen (NUCp still emits). Returns `None` for a non-position type code.
+pub fn position_quality(
+    tc: u8,
+    nic_b: u8,
+    version: Option<u8>,
+    nic_supp_a: u8,
+    nic_supp_c: u8,
+) -> Option<serde_json::Value> {
+    let nuc_p = nuc_p(tc)?;
+    let mut o = serde_json::Map::new();
+    o.insert("nuc_p".into(), serde_json::json!(nuc_p));
+    if let Some(rc) = nuc_p_rcu_m(nuc_p) {
+        o.insert("nuc_p_radius_m".into(), serde_json::json!(rc));
+    }
+    // NICb is meaningful only for airborne barometric positions (TC9-18),
+    // where it disambiguates the version-2 NIC; surface uses NICc.
+    if (9..=18).contains(&tc) {
+        o.insert("nic_b".into(), serde_json::json!(nic_b & 1));
+    }
+    if let Some(v) = version {
+        let nic = match v {
+            1 => nic_v1(tc, nic_supp_a),
+            2 => {
+                // Airborne barometric uses NICb (from this message);
+                // surface uses NICc (from operational status).
+                let bc = if (9..=18).contains(&tc) { nic_b } else { nic_supp_c };
+                nic_v2(tc, nic_supp_a, bc)
+            }
+            _ => None,
+        };
+        if let Some(nic) = nic {
+            o.insert("nic".into(), serde_json::json!(nic));
+            o.insert("nic_version".into(), serde_json::json!(v));
+        }
+    }
+    Some(serde_json::Value::Object(o))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +710,11 @@ mod tests {
         assert!((v.speed_kt - 159.20).abs() < 0.05, "{}", v.speed_kt);
         assert!((v.track_deg - 182.88).abs() < 0.05, "{}", v.track_deg);
         assert_eq!(v.vertical_rate_fpm, Some(-832));
+        // Oracle: pyModeS bds09.decode_bds09 on this frame → nac_v 0,
+        // vr_source GNSS, geo_minus_baro 550 ft.
+        assert_eq!(v.nac_v, 0);
+        assert!(!v.vr_baro_source);
+        assert_eq!(v.geo_minus_baro_ft, Some(550));
     }
 
     #[test]
@@ -496,6 +723,24 @@ mod tests {
         assert!(v.airspeed);
         assert!((v.speed_kt - 375.0).abs() < 0.5, "{}", v.speed_kt);
         assert!((v.track_deg - 243.98).abs() < 0.05, "{}", v.track_deg);
+        // Oracle: pyModeS bds09 → nac_v 0, vr_source BARO, geo diff N/A.
+        assert_eq!(v.nac_v, 0);
+        assert!(v.vr_baro_source);
+        assert_eq!(v.geo_minus_baro_ft, None);
+    }
+
+    #[test]
+    fn velocity_nacv_and_baro_source_match_pymodes() {
+        // Oracle: pyModeS bds09.decode_bds09("8d3461cf9908388930080f948ea1")
+        // → subtype 1, nac_v 1, vr_source BARO, vertical_rate +64,
+        // geo_minus_baro 350.
+        let v = velocity(&me_of("8d3461cf9908388930080f948ea1")).unwrap();
+        assert_eq!(v.nac_v, 1);
+        assert!(v.vr_baro_source);
+        assert_eq!(v.vertical_rate_fpm, Some(64));
+        assert_eq!(v.geo_minus_baro_ft, Some(350));
+        // NACv code 1 → 10 m/s horizontal figure of merit.
+        assert_eq!(nac_v_hfom_mps(v.nac_v), Some(10.0));
     }
 
     #[test]
@@ -528,6 +773,118 @@ mod tests {
         let id: u32 = (1 << 12) /*C1*/ | (1 << 8) /*C4*/ | (1 << 5) /*B1*/
             | (1 << 3) /*B2*/ | (1 << 2) /*D2*/ | (1 << 0) /*D4*/;
         assert_eq!(squawk13(id), "0356");
+    }
+
+    /// Type code of a 28-hex extended-squitter frame (ME bits 0–4).
+    fn tc_of(frame_hex: &str) -> u8 {
+        let me = me_of(frame_hex);
+        me[0] >> 3
+    }
+
+    #[test]
+    fn nuc_p_lookup_matches_pymodes() {
+        // pyModeS uncertainty.TC_NUCp_lookup (version-0 NUCp by TC).
+        assert_eq!(nuc_p(5), Some(9));
+        assert_eq!(nuc_p(9), Some(9));
+        assert_eq!(nuc_p(11), Some(7));
+        assert_eq!(nuc_p(18), Some(0));
+        assert_eq!(nuc_p(20), Some(9));
+        assert_eq!(nuc_p(22), Some(0));
+        // Non-position TCs (ident, velocity, status) have no NUCp.
+        assert_eq!(nuc_p(1), None);
+        assert_eq!(nuc_p(19), None);
+        assert_eq!(nuc_p(31), None);
+        // Containment radius (RCu): NUCp 7 → 93 m, NUCp 0 → none.
+        assert_eq!(nuc_p_rcu_m(7), Some(93));
+        assert_eq!(nuc_p_rcu_m(0), None);
+    }
+
+    #[test]
+    fn nic_v1_matches_pymodes_golden_vectors() {
+        // Oracle: the published pyModeS test_adsb NIC golden vectors
+        // (frame → expected NIC). Each frame's own TC plus the NIC
+        // supplement context the vector was captured under reproduce the
+        // exact NIC pyModeS `nic_v1` returns. (TC16 and TC11 are the two
+        // supplement-sensitive rows; both supplement values appear.)
+        // (frame, nic_supp_a, expected_nic)
+        let cases = [
+            ("8D3C70A390AB11F55B8C57F65FE6", 0u8, 0u8), // TC18
+            ("8DE1C9738A4A430B427D219C8225", 0, 1),     // TC17
+            ("8D44058880B50006B1773DC2A7E9", 0, 2),     // TC16, supp 0
+            ("8D44058881B50006B1773DC2A7E9", 1, 3),     // TC16, supp 1
+            ("8D4AB42A78000640000000FA0D0A", 0, 4),     // TC15
+            ("8D4405887099F5D9772F37F86CB6", 0, 5),     // TC14
+            ("8D4841A86841528E72D9B472DAC2", 0, 6),     // TC13
+            ("8D44057560B9760C0B840A51C89F", 0, 7),     // TC12
+            ("8D40621D58C382D690C8AC2863A7", 0, 8),     // TC11, supp 0
+            ("8F48511C598D04F12CCF82451642", 1, 9),     // TC11, supp 1
+            ("8DA4D53A50DBF8C6330F3B35458F", 0, 10),    // TC10
+            ("8D3C4ACF4859F1736F8E8ADF4D67", 0, 11),    // TC9
+        ];
+        for (frame, supp, exp) in cases {
+            let tc = tc_of(frame);
+            assert_eq!(
+                nic_v1(tc, supp),
+                Some(exp),
+                "frame {frame} tc {tc} supp {supp}"
+            );
+        }
+    }
+
+    #[test]
+    fn nic_v2_supplement_resolution_matches_pymodes() {
+        // pyModeS nic_v2 / TC_NICv2_lookup: airborne TC selects on
+        // NICa*2 + NICb. TC11 → 8 (supp 00) or 9 (supp 11); TC16 → 2
+        // (00) or 3 (11); intermediate supplements undefined.
+        assert_eq!(nic_v2(11, 0, 0), Some(8));
+        assert_eq!(nic_v2(11, 1, 1), Some(9));
+        assert_eq!(nic_v2(11, 0, 1), None); // ns=1 undefined for TC11
+        assert_eq!(nic_v2(16, 0, 0), Some(2));
+        assert_eq!(nic_v2(16, 1, 1), Some(3));
+        // GNSS TCs ignore the supplement bits (forced to 0).
+        assert_eq!(nic_v2(20, 1, 1), Some(11));
+        assert_eq!(nic_v2(21, 1, 1), Some(10));
+        assert_eq!(nic_v2(22, 1, 1), Some(0));
+        // Non-position TC → None.
+        assert_eq!(nic_v2(19, 0, 0), None);
+    }
+
+    #[test]
+    fn operational_status_emits_nic_supplement_and_sda() {
+        // Synthetic TC31 v2 airborne payload matching the pyModeS bds65
+        // field layout (verified against bds65.decode_bds65): version 2,
+        // nic_supp_a 1, nic_supp_c 1, nac_p 9, gva 2, sil 3, nic_baro 1,
+        // hrd 1, sil_supplement 1, SDA 2 (ME 38–39).
+        let mut me = [0u8; 7];
+        let set = |me: &mut [u8; 7], start: usize, len: usize, val: u32| {
+            for i in 0..len {
+                if (val >> (len - 1 - i)) & 1 == 1 {
+                    me[(start + i) / 8] |= 0x80 >> ((start + i) % 8);
+                }
+            }
+        };
+        set(&mut me, 0, 5, 31); // TC 31
+        set(&mut me, 19, 1, 1); // nic_supp_c
+        set(&mut me, 38, 2, 2); // SDA
+        set(&mut me, 40, 3, 2); // version 2
+        set(&mut me, 43, 1, 1); // nic_supp_a
+        set(&mut me, 44, 4, 9); // nac_p
+        set(&mut me, 48, 2, 2); // gva
+        set(&mut me, 50, 2, 3); // sil
+        set(&mut me, 52, 1, 1); // nic_baro
+        set(&mut me, 53, 1, 1); // hrd
+        set(&mut me, 54, 1, 1); // sil_supplement
+        let v = operational_status(&me).unwrap();
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["nic_supp_a"], 1);
+        assert_eq!(v["nic_supp_c"], 1);
+        assert_eq!(v["nac_p"], 9);
+        assert_eq!(v["sil"], 3);
+        assert_eq!(v["sil_supplement"], 1);
+        assert_eq!(v["sda"], 2);
+        assert_eq!(v["hrd"], 1);
+        assert_eq!(v["gva"], 2);
+        assert_eq!(v["baro_alt_integrity"], 1);
     }
 }
 

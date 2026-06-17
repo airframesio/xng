@@ -342,12 +342,37 @@ fn decode_extended_squitter(me: &[u8], f: &mut AdsbFrame) {
                 f.altitude_ft = Some((n as i32) * 25 - 1000);
             }
             f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false });
+            // Per-fix position quality: version-0 NUCp from the TC plus the
+            // in-message NICb supplement bit (ME bit 7). Version-aware NIC
+            // needs the aircraft's TC31 supplement, applied downstream.
+            f.adsb_status = decode::position_quality(tc, bit(7), None, 0, 0);
         }
-        19 => f.velocity = decode::velocity(me),
+        19 => {
+            f.velocity = decode::velocity(me);
+            // Fold the velocity-quality fields (NACv + figure of merit,
+            // vertical-rate source, GNSS-minus-baro altitude difference)
+            // into adsb_status — the JSON channel the crate serializes.
+            if let Some(v) = f.velocity {
+                let mut o = serde_json::Map::new();
+                o.insert("nac_v".into(), serde_json::json!(v.nac_v));
+                if let Some(hfom) = decode::nac_v_hfom_mps(v.nac_v) {
+                    o.insert("nac_v_hfom_mps".into(), serde_json::json!(hfom));
+                }
+                o.insert(
+                    "vertical_rate_source".into(),
+                    serde_json::json!(if v.vr_baro_source { "baro" } else { "gnss" }),
+                );
+                if let Some(d) = v.geo_minus_baro_ft {
+                    o.insert("geo_minus_baro_ft".into(), serde_json::json!(d));
+                }
+                f.adsb_status = Some(serde_json::Value::Object(o));
+            }
+        }
         // Airborne position with GNSS height: take the position; the
         // altitude encoding differs (HAE) and is left undecoded.
         20..=22 => {
             f.cpr = Some(Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false });
+            f.adsb_status = decode::position_quality(tc, bit(7), None, 0, 0);
         }
         // Aircraft status (emergency/priority + ACAS RA broadcast).
         28 => f.adsb_status = decode::aircraft_status(me),
