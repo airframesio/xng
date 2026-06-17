@@ -14,6 +14,7 @@ pub mod fields;
 pub mod frame;
 pub mod modulate;
 pub mod nmea;
+pub mod reassembly;
 
 use chrono::Utc;
 use num_complex::Complex;
