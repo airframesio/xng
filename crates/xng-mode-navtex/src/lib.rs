@@ -7,8 +7,12 @@
 //! sent twice with time diversity.
 //!
 //! This crate implements the message/frame decode layer; see PROVENANCE.md
-//! for the external sourcing of every protocol fact. The first layer is
-//! the CCIR 476 alphabet ([`ccir476`]); the FEC-B diversity and message
-//! framing layers build on it.
+//! for the external sourcing of every protocol fact.
+//!
+//! - [`ccir476`] — the 4-of-7 constant-ratio alphabet (LTRS/FIGS shift),
+//!   bit packing, and the constant-ratio parity check.
+//! - [`fec`] — FEC-B time-diversity recovery (DX copy preferred, RX
+//!   fallback five characters earlier) and phasing sync.
 
 pub mod ccir476;
+pub mod fec;
