@@ -36,5 +36,25 @@ fn decodes_real_egc_frame() {
         .expect("bulletin board present");
     assert!(bb.checksum_ok);
     assert_eq!(bb.details["frame_number"], 5987);
-    assert!(packets.iter().any(|p| p.name == "announcement" && p.checksum_ok));
+    // STDC-7: frame number → UTC-of-day (5987 × 8.64 = 51727 s → 14:22:07).
+    assert_eq!(bb.details["utc_time"], "14:22:07");
+    let ann = packets
+        .iter()
+        .find(|p| p.name == "announcement" && p.checksum_ok)
+        .expect("announcement present");
+    // STDC-4: the real announcement's sat/LES byte resolves to AOR-E
+    // (the documented capture region) and a named operator.
+    assert_eq!(ann.details["sat_les"]["region"], "AOR-E");
+    assert_eq!(
+        ann.details["sat_les"]["region_long"],
+        "Atlantic Ocean Region East (AOR-E)"
+    );
+    assert_eq!(ann.details["sat_les"]["les_name"], "Vizada-Telenor, Norway");
+    // STDC-3: the real 0x6C signalling-channel packet decodes its uplink
+    // channel word (0x2748) to 1636.64 MHz, inside the L-band uplink band.
+    let sc = packets
+        .iter()
+        .find(|p| p.name == "signalling-channel")
+        .expect("signalling-channel present");
+    assert_eq!(sc.details["uplink_mhz"], 1636.64);
 }
