@@ -70,6 +70,83 @@ lat/lon, place-bearing pairs, place-bearing-distance (NM 0.1 / KM), or
 airway designators. trackDetail legs and the trailing
 routeInformationAdditional stay undecoded (reported as present).
 
+## Reassembly-status names / `assstat` (2026-06)
+
+`reasm.rs`: `Reasm::assstat()` returns the reassembly-status name acarsdec
+emits in its JSON `assstat` field. The exact strings (`complete`,
+`in progress`, `skipped`, `duplicate`, `out of sequence`) are taken from
+libacars' `la_reasm_status_name_get` (reassembly.c); our `Incomplete`
+(final block with sequence holes) maps to libacars'
+`LA_REASM_FRAG_OUT_OF_SEQUENCE` → `"out of sequence"`.
+
+## Q-series classification (2026-06)
+
+`qseries.rs`: classifies the ARINC 620 `Q`-series link-test / squitter /
+OOOI-event downlink labels (`Q0`–`Q7`, `QA`–`QX`). Descriptions are taken
+from airframes' own published references (not invented): the
+acars-message-documentation repo (`Q0` "ACARS Link Test", `Q2` "ETA
+Report", `QF` "OFF Destination Report", `QQ` "OFF Report") and the
+acars-decoder-typescript plugin descriptions (`QP` "OUT Report", `QR` "ON
+Report", `QS` "IN Report"). The remaining OOOI-bearing `Q` labels are named
+from the gate/wheels event each carries per f00b4r0/acarsdec `label.c`
+(`QA` gate-out, `QB` wheels-off, `QC` wheels-on, `QD` gate-in, ...).
+
+## OOOI text extraction (2026-06)
+
+`oooi.rs`: OUT/OFF/ON/IN gate and wheels times plus departure/destination
+airports and ETA, extracted from the message text. The per-label field
+offsets and the airport/time event each label carries are a clean-room
+port of f00b4r0/acarsdec `label.c` (`DecodeLabel` + the `label_*` helpers;
+facts only, reimplemented) covering the `Q`-series (Q1/Q2/QA–QT) and the
+airline-application labels acarsdec handles (10/11/12/15/17/1G/20/21/2N/
+2Z/33/39/45/80/83/8D/8E/8S). The emitted JSON field names match acarsdec's
+`output.c` exactly (`depa`/`dsta`/`eta`/`gtout`/`gtin`/`wloff`/`wlin`).
+Unlike acarsdec's raw `memcpy`s we bounds-check every slice and validate
+airport codes (4 alphanumerics) and times (HHMM range), dropping
+misaligned fields rather than emitting junk.
+
+## Winds-aloft / met (2026-06)
+
+`met.rs`: decodes the verifiable winds-aloft met set from the free-text
+`4J` "POSWX" position-and-weather report — wind direction/speed (`/WND
+334060`), static air temperature (`/SAT -032`), true airspeed (`/TAS
+490`) and altitude/flight-level (`/ALT 270` → 27000 ft). Field meanings,
+example string and expected values are from airframes'
+acars-message-documentation `research/4J.md`; the temperature `M`/`P`
+sign convention is airframes' own (`research/H1/POS.md`,
+acars-decoder-typescript `ResultFormatter.temperature`). The WMO-BUFR
+AMDAR binary schema (NOAA `dcacar`) is intentionally out of scope: it is
+not present in any airframes documented example, so there is no real
+reference to verify a decoder against.
+
+## H1 #CFB maintenance family (2026-06)
+
+`cfb.rs`: classifies the H1 `#CFB` ("Crew Flight Bag") Boeing/Airbus
+maintenance-telemetry family into its documented sub-types (`APM_REPORT`,
+`ATA`, `AL`, `FDE`, `ECT`, `FLR`, `LIGHTS`, `MIL`, `MPF`, `PAGE`, `WRN`,
+and the `.01`/`.1` failure-record form). The sub-type set and the
+descriptions come from airframes' acars-message-documentation
+`research/H1/CFB.md` acronym table (`CFB` = Crew Flight Bag, `APM` =
+Aircraft Performance Monitoring, `FDE` = Flight Deck Effect, `FLR` =
+Realtime Failure, `MPF` = Maintenance Planning Function, `WRN` = Warning,
+`MIL` = Engine Spool Vibration Units) and `research/H1/CFB/CFB.01.md`;
+sub-types without an acronym-table entry are described from the documented
+example content. Tested against the real documented example strings.
+
+## Free-text position reports (2026-06)
+
+`position.rs`: extracts latitude/longitude from the free-text position
+reports on labels `20`/POS, `4J` and `H1` POS. Clean-room port of the
+coordinate decoders in airframes' own acars-decoder-typescript
+(`utils/coordinate_utils.ts`, `utils/arinc_702_helper.ts`,
+`plugins/Label_20_POS.ts`; facts only). Two packed conventions are
+handled: label `20`/POS scaled-decimal (`38160` → 38.160°) and `H1`
+POS / `4J` `PS`/`POS` degrees-plus-tenths-of-a-minute (`43312` →
+43° 31.2′ → 43.52°), plus the legacy `4J` literal-decimal-point form
+(`N5043.5E01121.8`). Verified against the real example strings and the
+expected lat/lon in airframes' acars-decoder-typescript test suite and
+acars-message-documentation (`research/20/POS.md`, `H1/POS.md`, `4J.md`).
+
 ## MIAM file-transfer reassembly (2026-06)
 
 File transfers spanning multiple label-MA messages reassemble per the

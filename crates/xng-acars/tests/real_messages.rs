@@ -116,3 +116,191 @@ fn h1_sublabel_then_plain_text() {
     assert_eq!(d.mfi.as_deref(), Some("M1"));
     assert!(d.app.is_none());
 }
+
+// --- ACARS-1.1: Q-series link-test / squitter classification ---
+// Reference strings are the real documented examples from airframes'
+// acars-message-documentation (research/Q0.md, Q2.md, QF.md, QQ.md) and the
+// descriptions from airframes' own acars-decoder-typescript plugins.
+
+#[test]
+fn q0_link_test_classified() {
+    use xng_acars::qseries::QKind;
+    // research/Q0.md: "ACARS Link Test", messages are always empty.
+    let d = decode("Q0", "", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series: {:?}", d.app) };
+    assert_eq!(q.kind, QKind::LinkTest);
+    assert_eq!(q.description, "ACARS Link Test");
+}
+
+#[test]
+fn q2_eta_report_classified() {
+    use xng_acars::qseries::QKind;
+    // research/Q2.md example: "   2002  99/DS KJFK" — ETA Report.
+    let d = decode("Q2", "   2002  99/DS KJFK", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    assert_eq!(q.kind, QKind::EtaReport);
+    assert_eq!(q.description, "ETA Report");
+}
+
+#[test]
+fn qf_off_destination_report_classified() {
+    // research/QF.md example: "EWR2210ATL" — OFF Destination Report.
+    let d = decode("QF", "EWR2210ATL", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    assert_eq!(q.description, "OFF Destination Report");
+}
+
+#[test]
+fn qq_off_report_classified() {
+    // research/QQ.md example: "KEWRKSWF20041942" — OFF Report.
+    let d = decode("QQ", "KEWRKSWF20041942", true);
+    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    assert_eq!(q.description, "OFF Report");
+}
+
+// --- ACARS-2.1: OOOI (OUT/OFF/ON/IN) text extraction ---
+// Offsets/semantics from f00b4r0/acarsdec label.c; reference example
+// strings (and the airports they encode) from airframes'
+// acars-message-documentation.
+
+#[test]
+fn qq_off_report_oooi_fields() {
+    // research/QQ.md: "KEWRKSWF20041942" — KEWR → KSWF, OFF 20:04.
+    let d = decode("QQ", "KEWRKSWF20041942", true);
+    let o = d.oooi.expect("QQ carries OOOI");
+    assert_eq!(o.depa.as_deref(), Some("KEWR"));
+    assert_eq!(o.dsta.as_deref(), Some("KSWF"));
+    assert_eq!(o.wloff.as_deref(), Some("2004"));
+}
+
+#[test]
+fn qq_off_report_with_status_tail() {
+    // research/QQ.md: "KEWRKDFW1829OS KDFW ..." — KEWR → KDFW, OFF 18:29.
+    let d = decode("QQ", "KEWRKDFW1829OS KDFW /FUL0306/MO 1816/APH 0000000", true);
+    let o = d.oooi.expect("QQ carries OOOI");
+    assert_eq!(o.depa.as_deref(), Some("KEWR"));
+    assert_eq!(o.dsta.as_deref(), Some("KDFW"));
+    assert_eq!(o.wloff.as_deref(), Some("1829"));
+}
+
+#[test]
+fn non_oooi_label_has_no_oooi() {
+    // ADS-C envelopes are not OOOI text; the field stays absent.
+    let d = decode(
+        "B6",
+        "/BOMASAI.ADS.VT-ANB072501A070A988CA73248F0E5DC10200000F5EE1ABC000102B885E0A19F5",
+        true,
+    );
+    assert!(d.oooi.is_none());
+}
+
+// --- ACARS-2.2: free-text position reports → lat/lon ---
+// Reference strings + expected lat/lon are the real documented examples
+// from airframes' acars-decoder-typescript test suite and
+// acars-message-documentation (research/20/POS.md, H1/POS.md, 4J.md).
+
+fn close3(a: f64, b: f64) -> bool {
+    (a - b).abs() < 1e-3
+}
+
+#[test]
+fn label_20_position_report() {
+    // Label_20_POS.test.ts: POSN38160W077075... → 38.160 / -77.075.
+    let d = decode("20", "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544", true);
+    let p = d.position.expect("20/POS carries a position");
+    assert!(close3(p.latitude, 38.160), "lat {}", p.latitude);
+    assert!(close3(p.longitude, -77.075), "lon {}", p.longitude);
+}
+
+#[test]
+fn h1_position_report_decimal_minutes() {
+    // Label_H1_POS.test.ts variant 1: POSN43312W123174 → 43.52 / -123.29.
+    let d = decode(
+        "H1",
+        "POSN43312W123174,EASON,215754,370,EBINY,220601,ELENN,M48,02216,185/TS215754,0921227A40",
+        true,
+    );
+    let p = d.position.expect("H1 POS carries a position");
+    assert!(close3(p.latitude, 43.52), "lat {}", p.latitude);
+    assert!(close3(p.longitude, -123.29), "lon {}", p.longitude);
+}
+
+// --- ACARS-2.5: H1 #CFB maintenance family classification ---
+// Reference strings are the real documented examples from airframes'
+// acars-message-documentation research/H1/CFB.md and CFB/CFB.01.md. The
+// #CFB preamble is H1 sublabel "CF", so sublabel extraction must still
+// yield "CF" while the #CFB family is classified into the app object.
+
+#[test]
+fn h1_cfb_flr_realtime_failure() {
+    use xng_acars::cfb::CfbKind;
+    // research/H1/CFB.md: "#CFBFLR/FR19121418400034433406TCAS (1SG)".
+    let d = decode("H1", "#CFBFLR/FR19121418400034433406TCAS (1SG)", true);
+    assert_eq!(d.sublabel.as_deref(), Some("CF"));
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!("expected CFB: {:?}", d.app) };
+    assert_eq!(c.subtype, "FLR");
+    assert_eq!(c.kind, CfbKind::RealtimeFailure);
+    assert_eq!(c.description, "Realtime failure");
+}
+
+#[test]
+fn h1_cfb_apm_report() {
+    use xng_acars::cfb::CfbKind;
+    // research/H1/CFB.md ACMF snapshot.
+    let d = decode("H1", "#CFBAPM_REPORT_A_20200805180631S.CSV", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!("expected CFB") };
+    assert_eq!(c.subtype, "APM_REPORT");
+    assert_eq!(c.kind, CfbKind::ApmReport);
+}
+
+#[test]
+fn h1_cfb_wrn_and_mpf_and_dotted() {
+    use xng_acars::cfb::CfbKind;
+    let d = decode("H1", "#CFBWRN/WN19121418390034000006NAV TCAS FAULT", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    assert_eq!(c.kind, CfbKind::Warning);
+
+    let d = decode("H1", "#CFBMPF/               /AN.N660AW/FIAAL652", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    assert_eq!(c.kind, CfbKind::MaintenancePlanning);
+
+    // research/H1/CFB/CFB.01.md dotted form.
+    let d = decode("H1", "#CFB.1/FLR/FR1602082254 27513406ADR1 X2,ADR3X,ADR2X", true);
+    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    assert_eq!(c.kind, CfbKind::FailureRecord);
+}
+
+#[test]
+fn label_4j_position_report() {
+    // Label_4J_POS.test.ts: .../PSN39277W077359,... → 39.462 / -77.598.
+    let d = decode(
+        "4J",
+        "POS/ID91459S,BANKR31,/DC03032024,142813/MR64,0/ET31539/PSN39277W077359,142800,240,N39300W077110,031430,N38560W077150,M28,27619,MT370/CG311,160,350/FB732/VR329071",
+        true,
+    );
+    let p = d.position.expect("4J carries a position");
+    assert!(close3(p.latitude, 39.462), "lat {}", p.latitude);
+    assert!(close3(p.longitude, -77.598), "lon {}", p.longitude);
+}
+
+// --- ACARS-2.3: winds-aloft / met from the 4J POSWX report ---
+// Reference string + values are the real documented example from
+// airframes' acars-message-documentation research/4J.md (message 880996538).
+
+#[test]
+fn label_4j_poswx_met_fields() {
+    let text = "4J01 POSWX 0318/20 ETAD/ETAD .00318S\n\
+        /POS N5043.5E01121.8/OVR 0817\n\
+        /ALT 270/TFW 1342/TAS 490/SAT -032\n\
+        /POS GOVEN /OVR 0835\n\
+        /POS DILVI\n\
+        /WND 334060/TRB /SKY DCC3";
+    let d = decode("4J", text, true);
+    let m = d.met.expect("4J POSWX carries met fields");
+    // research/4J.md: WND 334 deg / 60 kt, SAT -32, TAS 490, ALT FL270.
+    assert_eq!(m.wind_dir_deg, Some(334));
+    assert_eq!(m.wind_speed_kt, Some(60));
+    assert_eq!(m.temperature_c, Some(-32));
+    assert_eq!(m.true_airspeed_kt, Some(490));
+    assert_eq!(m.altitude_ft, Some(27000));
+}
