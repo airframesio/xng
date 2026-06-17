@@ -222,3 +222,29 @@ integer→name/layout assignments) only, not code or formatter text. Tests
 pin spec-derived TPDU vectors built octet-by-octet from the X.224 layout
 (no encode→decode loopback). Multipart COTP reassembly and native ATN-B2
 ADS-C over COTP remain the deferred big bet (VDL2-2.3).
+
+## CLNP options + ATN security label (2026-06, VDL2-2.1 partial)
+
+The full (uncompressed) CLNP (ISO/IEC 8473) decoder now walks the header's
+options part (the optional 6-octet segmentation part — data-unit id,
+segment offset, total length — is decoded and skipped when the SP flag is
+set) as standard `type|length|value` options, naming the X.233 set (QoS
+maintenance 0xC3, discard reason 0xC1, padding 0xCC, priority 0xCD,
+security 0xC5, source routing 0xC8, record route 0xCB, …). The **Security
+option (0xC5)** is decoded as the ATN Security Label (ICAO Doc 9705 §5.6 /
+Doc 9880): the leading globally-unique security-format octet (0xC0), then
+the security-registration-ID octet string, then the length-prefixed
+security-information part. Each security tag set is a
+`name-len(1)=1 | name(1) | set-len(1) | value` block parsed against the
+ATN security-tag dictionary: **traffic-type (tag 0x0F)** with its
+type/category/route-policy sub-fields, **security classification (0x03)**,
+**subnetwork type (0x05)** with subnet name + permitted-traffic-types
+bitfield, and **supported ATSC classes (0x06/0x07)** as an A..H class
+bitfield. The CLNP option codes/names, the security-label structure, the
+security-tag codes, and the traffic-type/ATSC-class/subnet/security-class
+dictionaries were cross-checked against ISO/IEC 8473 (X.233) and ICAO Doc
+9705 and against dumpvdl2's `src/clnp.c` and `src/atn.c` — protocol facts
+(the integer→name/structure assignments) only, not code or formatter text.
+Tests pin spec-derived security-label examples built octet-by-octet (no
+loopback). Multipart CLNP reassembly remains the deferred big bet
+(VDL2-2.1 reassembly part).

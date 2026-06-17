@@ -755,6 +755,220 @@ fn parse_facilities(b: &[u8]) -> Vec<Value> {
     out
 }
 
+/// CLNP option-part parameter name (ISO/IEC 8473 / X.233 §7.5).
+fn clnp_option_name(t: u8) -> Option<&'static str> {
+    Some(match t {
+        0x05 => "lref",
+        0xC1 => "discard_reason",
+        0xC3 => "qos_maintenance",
+        0xC4 => "prefix_scope_control",
+        0xC5 => "security",
+        0xC6 => "radius_scope_control",
+        0xC8 => "source_routing",
+        0xCB => "record_route",
+        0xCC => "padding",
+        0xCD => "priority",
+        _ => return None,
+    })
+}
+
+/// ATN traffic-type / ATSC-class names (ICAO Doc 9705 §5.6, Tables 5.6-x).
+fn atn_traffic_type_name(bit: u8) -> Option<&'static str> {
+    Some(match bit {
+        1 => "ATS",
+        2 => "AOC",
+        4 => "ATN Administrative",
+        8 => "General Comms",
+        16 => "ATN System Mgmt",
+        _ => return None,
+    })
+}
+
+fn atsc_class_name(bit: u8) -> Option<&'static str> {
+    Some(match bit {
+        1 => "A",
+        2 => "B",
+        4 => "C",
+        8 => "D",
+        16 => "E",
+        32 => "F",
+        64 => "G",
+        128 => "H",
+        _ => return None,
+    })
+}
+
+/// Expand a single-octet bitfield into the set of named bits that are set,
+/// using the provided bit→name lookup.
+fn bitfield_names(byte: u8, namer: fn(u8) -> Option<&'static str>) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for i in 0..8 {
+        let bit = 1u8 << i;
+        if byte & bit != 0 {
+            if let Some(name) = namer(bit) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn atn_subnet_name(s: u8) -> Option<&'static str> {
+    Some(match s {
+        1 => "Mode S",
+        2 => "VDL",
+        3 => "AMSS",
+        4 => "Gatelink",
+        5 => "HF",
+        _ => return None,
+    })
+}
+
+fn atn_security_class_name(c: u8) -> Option<&'static str> {
+    Some(match c {
+        1 => "unclassified",
+        2 => "restricted",
+        3 => "confidential",
+        4 => "secret",
+        5 => "top secret",
+        _ => return None,
+    })
+}
+
+/// Decode one ATN security tag (ICAO Doc 9705 §5.6). `name` is the tag-set
+/// name octet, `v` the tag-set value.
+fn parse_atn_security_tag(name: u8, v: &[u8]) -> Value {
+    let mut out = json!({ "tag_set": name });
+    match name {
+        // Security classification: single octet class id.
+        0x03 if v.len() == 1 => {
+            out["kind"] = json!("security_classification");
+            out["class_id"] = json!(v[0]);
+            if let Some(n) = atn_security_class_name(v[0]) {
+                out["class_name"] = json!(n);
+            }
+        }
+        // Subnetwork type: subnet id + permitted-traffic-types bitfield.
+        0x05 if v.len() == 2 => {
+            out["kind"] = json!("subnet_type");
+            out["subnet_id"] = json!(v[0]);
+            if let Some(n) = atn_subnet_name(v[0]) {
+                out["subnet_name"] = json!(n);
+            }
+            out["permitted_traffic_types"] =
+                json!(bitfield_names(v[1], atn_traffic_type_name));
+        }
+        // Supported ATSC classes: typecode 6 or 7, single bitfield octet.
+        0x06 | 0x07 if v.len() == 1 => {
+            out["kind"] = json!("supported_atsc_classes");
+            out["classes"] = json!(bitfield_names(v[0], atsc_class_name));
+        }
+        // Traffic type / routing policy.
+        0x0F if !v.is_empty() => {
+            out["kind"] = json!("traffic_type");
+            // High 3 bits select type/category, low 5 are the route policy.
+            let (type_name, category) = match v[0] >> 5 {
+                0 => ("ATN operational", "ATSC"),
+                1 if v[0] == 0x30 => ("ATN administrative", "none"),
+                1 => ("ATN operational", "AOC"),
+                3 => ("ATN system management", "none"),
+                _ => ("unknown", "unknown"),
+            };
+            out["traffic_type"] = json!(type_name);
+            out["category"] = json!(category);
+            out["route_policy"] = json!(v[0] & 0x1F);
+        }
+        _ => {
+            out["value_hex"] = json!(v.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        }
+    }
+    out
+}
+
+/// Parse the ATN security label (ICAO Doc 9705 §5.6): security-registration
+/// ID (length-prefixed octet string), then optional security information —
+/// a sequence of tag sets, each `name-len(1)=1 | name(1) | set-len(1) | tags`.
+/// `b` is the security label (after the leading 0xC0 security-format octet).
+fn parse_atn_security_label(b: &[u8]) -> Value {
+    let mut out = json!({});
+    let mut pos = 0usize;
+    let Some(&srid_len) = b.first() else {
+        return out;
+    };
+    let srid_len = srid_len as usize;
+    pos += 1;
+    if pos + srid_len > b.len() {
+        return out;
+    }
+    out["reg_id"] = json!(b[pos..pos + srid_len].iter().map(|x| format!("{x:02x}")).collect::<String>());
+    pos += srid_len;
+    // Security info part (optional): length octet, then tag sets.
+    let Some(&sinfo_len) = b.get(pos) else {
+        return out;
+    };
+    let sinfo_len = sinfo_len as usize;
+    pos += 1;
+    let end = (pos + sinfo_len).min(b.len());
+    let mut tags = Vec::new();
+    while pos + 3 <= end {
+        // In ATN every tag-set name length is 1.
+        if b[pos] != 1 {
+            break;
+        }
+        let name = b[pos + 1];
+        let set_len = b[pos + 2] as usize;
+        pos += 3;
+        if pos + set_len > end {
+            break;
+        }
+        tags.push(parse_atn_security_tag(name, &b[pos..pos + set_len]));
+        pos += set_len;
+    }
+    if !tags.is_empty() {
+        out["sec_info"] = json!(tags);
+    }
+    out
+}
+
+/// Parse the CLNP options part (ISO/IEC 8473 §7.5): a sequence of
+/// `type(1) | length(1) | value` options. The Security option (0xC5) is
+/// expanded as the ATN Security Label per ICAO Doc 9705.
+fn parse_clnp_options(b: &[u8]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 2 <= b.len() {
+        let t = b[pos];
+        let len = b[pos + 1] as usize;
+        pos += 2;
+        if pos + len > b.len() {
+            break;
+        }
+        let v = &b[pos..pos + len];
+        let mut o = json!({ "code": format!("{t:#04x}") });
+        if let Some(name) = clnp_option_name(t) {
+            o["name"] = json!(name);
+        }
+        match t {
+            // Priority: single octet.
+            0xCD if len == 1 => o["priority"] = json!(v[0]),
+            // Discard reason: single octet code (ER PDU option).
+            0xC1 if len == 1 => o["reason"] = json!(v[0]),
+            // Security: ATN globally-unique format (0xC0) then security label.
+            0xC5 if !v.is_empty() && v[0] == 0xC0 => {
+                o["security_format"] = json!("globally-unique");
+                o["security_label"] = parse_atn_security_label(&v[1..]);
+            }
+            _ => {
+                o["value_hex"] =
+                    json!(v.iter().map(|x| format!("{x:02x}")).collect::<String>());
+            }
+        }
+        out.push(o);
+        pos += len;
+    }
+    out
+}
+
 /// Full (uncompressed) CLNP header per ISO 8473.
 fn parse_clnp(b: &[u8]) -> Option<Value> {
     if b.len() < 9 || b[0] != 0x81 {
@@ -790,7 +1004,6 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
     };
     let dst = read_addr(&mut pos)?;
     let src = read_addr(&mut pos)?;
-    let payload = &b[hdr_len..];
     let mut out = json!({
         "protocol": "CLNP",
         "type": type_name,
@@ -800,6 +1013,24 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
         "dst_nsap": dst,
         "src_nsap": src,
     });
+    // Flags bit 7 (SP) signals a 6-octet segmentation part before options
+    // (ISO/IEC 8473 §7.5): data-unit id, segment offset, total length.
+    if flags & 0x80 != 0 {
+        if pos + 6 <= b.len() {
+            out["pdu_id"] = json!(u16::from_be_bytes([b[pos], b[pos + 1]]));
+            out["segment_offset"] = json!(u16::from_be_bytes([b[pos + 2], b[pos + 3]]));
+            out["total_len"] = json!(u16::from_be_bytes([b[pos + 4], b[pos + 5]]));
+        }
+        pos += 6;
+    }
+    // Options part runs from here up to the header length indicator.
+    if pos < hdr_len && hdr_len <= b.len() {
+        let opts = parse_clnp_options(&b[pos..hdr_len]);
+        if !opts.is_empty() {
+            out["options"] = json!(opts);
+        }
+    }
+    let payload = &b[hdr_len..];
     if let Some(cotp) = parse_cotp(payload) {
         out["cotp"] = cotp;
     }
@@ -1553,6 +1784,102 @@ mod tests {
         assert_eq!(v["tpdu"], "RJ");
         assert_eq!(v["credit"], 2);
         assert_eq!(v["tpdu_seq"], 6);
+    }
+
+    // --- CLNP options + ATN security label (ISO/IEC 8473 / ICAO Doc 9705) ---
+    // The CLNP option codes, the ATN security-label structure, the security
+    // tag-set codes and the traffic-type/ATSC-class/subnet/security-class
+    // dictionaries are cross-checked against ISO/IEC 8473 (X.233) and ICAO
+    // Doc 9705 and against dumpvdl2's src/clnp.c / src/atn.c (protocol facts
+    // only). Vectors are spec-derived, built octet-by-octet (no loopback).
+
+    /// Build a length-prefixed ATN security tag set: `1 | name | len | value`.
+    fn sec_tagset(name: u8, value: &[u8]) -> Vec<u8> {
+        let mut v = vec![1u8, name, value.len() as u8];
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// Build a CLNP Security option (0xC5) carrying an ATN security label.
+    fn clnp_security_option(srid: &[u8], tagsets: &[u8]) -> Vec<u8> {
+        // label = srid_len | srid | sinfo_len | tagsets
+        let mut label = vec![srid.len() as u8];
+        label.extend_from_slice(srid);
+        label.push(tagsets.len() as u8);
+        label.extend_from_slice(tagsets);
+        // option value = security-format (0xC0 = globally unique) + label
+        let mut val = vec![0xC0u8];
+        val.extend_from_slice(&label);
+        let mut opt = vec![0xC5u8, val.len() as u8];
+        opt.extend_from_slice(&val);
+        opt
+    }
+
+    /// Build a CLNP DT PDU with the given option bytes and no payload.
+    fn clnp_with_options(opts: &[u8]) -> Vec<u8> {
+        // fixed(9) + dst(1+2) + src(1+2) = 15, plus options.
+        let hdr_len = 15 + opts.len();
+        let mut b = vec![0x81, hdr_len as u8, 1, 0x3F, 0x1C, 0x00, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[2, 0x47, 0x01]); // dst NSAP
+        b.extend_from_slice(&[2, 0x47, 0x02]); // src NSAP
+        b.extend_from_slice(opts);
+        b
+    }
+
+    #[test]
+    fn clnp_security_label_traffic_type_and_class() {
+        // Two tag sets: traffic-type (0x0F) value 0x00 → ATN operational /
+        // ATSC / route-policy 0; security-classification (0x03) value 2 →
+        // restricted. SRID = 47 00 27.
+        let mut tagsets = sec_tagset(0x0F, &[0x00]);
+        tagsets.extend(sec_tagset(0x03, &[0x02]));
+        let opt = clnp_security_option(&[0x47, 0x00, 0x27], &tagsets);
+        let v = parse_network(&clnp_with_options(&opt)).unwrap();
+        assert_eq!(v["protocol"], "CLNP");
+        let opts = v["options"].as_array().unwrap();
+        assert_eq!(opts[0]["name"], "security");
+        assert_eq!(opts[0]["security_format"], "globally-unique");
+        let label = &opts[0]["security_label"];
+        assert_eq!(label["reg_id"], "470027");
+        let info = label["sec_info"].as_array().unwrap();
+        assert_eq!(info[0]["kind"], "traffic_type");
+        assert_eq!(info[0]["traffic_type"], "ATN operational");
+        assert_eq!(info[0]["category"], "ATSC");
+        assert_eq!(info[0]["route_policy"], 0);
+        assert_eq!(info[1]["kind"], "security_classification");
+        assert_eq!(info[1]["class_id"], 2);
+        assert_eq!(info[1]["class_name"], "restricted");
+    }
+
+    #[test]
+    fn clnp_security_label_subnet_and_atsc_classes() {
+        // Subnet-type (0x05): subnet 2 (VDL), permitted ATS+AOC (0x03);
+        // supported ATSC classes (0x06): A+B+C (0x07).
+        let mut tagsets = sec_tagset(0x05, &[0x02, 0x03]);
+        tagsets.extend(sec_tagset(0x06, &[0x07]));
+        let opt = clnp_security_option(&[0xAB], &tagsets);
+        let v = parse_network(&clnp_with_options(&opt)).unwrap();
+        let info = &v["options"][0]["security_label"]["sec_info"];
+        assert_eq!(info[0]["kind"], "subnet_type");
+        assert_eq!(info[0]["subnet_id"], 2);
+        assert_eq!(info[0]["subnet_name"], "VDL");
+        assert_eq!(info[0]["permitted_traffic_types"][0], "ATS");
+        assert_eq!(info[0]["permitted_traffic_types"][1], "AOC");
+        assert_eq!(info[1]["kind"], "supported_atsc_classes");
+        assert_eq!(info[1]["classes"][0], "A");
+        assert_eq!(info[1]["classes"][1], "B");
+        assert_eq!(info[1]["classes"][2], "C");
+    }
+
+    #[test]
+    fn clnp_priority_option_decodes() {
+        // Priority option (0xCD) value 6, plus a padding option (0xCC).
+        let opts = [0xCD, 0x01, 0x06, 0xCC, 0x02, 0x00, 0x00];
+        let v = parse_network(&clnp_with_options(&opts)).unwrap();
+        let opts = v["options"].as_array().unwrap();
+        assert_eq!(opts[0]["name"], "priority");
+        assert_eq!(opts[0]["priority"], 6);
+        assert_eq!(opts[1]["name"], "padding");
     }
 
     #[test]
