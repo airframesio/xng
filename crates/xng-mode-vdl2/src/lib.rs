@@ -53,6 +53,7 @@ pub struct Vdl2ChannelDecoder {
     rs: ReedSolomon,
     channel_buf: Vec<Complex<f32>>,
     x25: atn::X25Reassembler,
+    clnp: atn::ClnpReassembler,
     samples_seen: u64,
     input_rate: f64,
 }
@@ -99,6 +100,7 @@ impl Vdl2ChannelDecoder {
             rs: interleave::vdl2_rs(),
             channel_buf: Vec::new(),
             x25: atn::X25Reassembler::new(),
+            clnp: atn::ClnpReassembler::new(),
             samples_seen: 0,
             input_rate,
         })
@@ -137,7 +139,7 @@ impl Vdl2ChannelDecoder {
                 let atn = if acars.is_none()
                     && matches!(frame.control, avlc::Control::Info { .. })
                 {
-                    decode_atn(&frame.info, &mut self.x25, now)
+                    decode_atn(&frame.info, &mut self.x25, &mut self.clnp, now)
                 } else {
                     None
                 };
@@ -156,6 +158,7 @@ impl Vdl2ChannelDecoder {
 fn decode_atn(
     info: &[u8],
     x25: &mut atn::X25Reassembler,
+    clnp: &mut atn::ClnpReassembler,
     now: f64,
 ) -> Option<serde_json::Value> {
     if let Some(pkt) = atn::parse_x25(info) {
@@ -163,7 +166,7 @@ fn decode_atn(
         v["layer"] = serde_json::json!("x25");
         if pkt.kind == "data" {
             if let Some(full) = x25.push(&pkt, now) {
-                if let Some(net) = atn::parse_network(&full) {
+                if let Some(net) = decode_network(&full, clnp, now) {
                     v["network"] = net;
                 }
             } else {
@@ -171,13 +174,40 @@ fn decode_atn(
             }
         } else if !pkt.payload.is_empty() {
             // Call user data names the network protocol.
-            if let Some(net) = atn::parse_network(&pkt.payload) {
+            if let Some(net) = decode_network(&pkt.payload, clnp, now) {
                 v["network"] = net;
             }
         }
         return Some(v);
     }
-    atn::parse_network(info)
+    decode_network(info, clnp, now)
+}
+
+/// Parse an ATN network-layer payload, reassembling segmented CLNP data
+/// units (ISO/IEC 8473 §6.7) before the full CLNP/COTP walk. A CLNP segment
+/// that does not complete a data unit is reported as `reassembling` (its own
+/// per-fragment CLNP header is still surfaced for visibility).
+fn decode_network(
+    b: &[u8],
+    clnp: &mut atn::ClnpReassembler,
+    now: f64,
+) -> Option<serde_json::Value> {
+    // Only CLNP (NLPID 0x81) is segmentable here; other protocols pass
+    // straight through.
+    if b.first() == Some(&0x81) {
+        match clnp.push(b, now) {
+            Some(full) => atn::parse_network(&full),
+            None => {
+                // Incomplete data unit: surface this fragment's header plus a
+                // reassembling marker.
+                let mut v = atn::parse_network(b)?;
+                v["reassembling"] = serde_json::json!(true);
+                Some(v)
+            }
+        }
+    } else {
+        atn::parse_network(b)
+    }
 }
 
 /// Convert a decoded frame into the normalized message model.

@@ -373,6 +373,174 @@ impl Default for X25Reassembler {
     }
 }
 
+/// The segmentation fields of a CLNP derived PDU (ISO/IEC 8473 §6.7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClnpSegment {
+    /// Data-unit identifier (groups the derived PDUs of one initial PDU).
+    pub pdu_id: u16,
+    /// Offset of this segment's data within the reassembled data unit.
+    pub offset: u16,
+    /// Total length (header + complete data) of the initial PDU.
+    pub total_len: u16,
+    /// More-segments flag: another segment follows.
+    pub more: bool,
+    /// Header length (octets) — the data part begins here.
+    pub hdr_len: usize,
+}
+
+/// Extract the segmentation part from a raw CLNP PDU (ISO/IEC 8473 §6.7).
+/// Returns `None` when the PDU is not a segmentation-permitted CLNP PDU or
+/// is too short to carry the 6-octet segmentation part. The data part of
+/// the PDU is `b[hdr_len..]`.
+pub fn clnp_segment(b: &[u8]) -> Option<ClnpSegment> {
+    if b.len() < 9 || b[0] != 0x81 {
+        return None;
+    }
+    let hdr_len = b[1] as usize;
+    let flags = b[4];
+    // SP (segmentation permitted) must be set for the segmentation part to
+    // be present.
+    if flags & 0x80 == 0 || hdr_len < 9 || hdr_len > b.len() {
+        return None;
+    }
+    let more = flags & 0x40 != 0;
+    // Walk past the two NSAP address fields to reach the segmentation part.
+    let mut pos = 9usize;
+    for _ in 0..2 {
+        let len = *b.get(pos)? as usize;
+        pos += 1 + len;
+    }
+    if pos + 6 > b.len() {
+        return None;
+    }
+    Some(ClnpSegment {
+        pdu_id: u16::from_be_bytes([b[pos], b[pos + 1]]),
+        offset: u16::from_be_bytes([b[pos + 2], b[pos + 3]]),
+        total_len: u16::from_be_bytes([b[pos + 4], b[pos + 5]]),
+        more,
+        hdr_len,
+    })
+}
+
+/// Reassembles segmented CLNP data units (ISO/IEC 8473 §6.7). Derived PDUs
+/// of one initial PDU share a data-unit identifier; each carries a fragment
+/// of the data part at `segment offset`, and the initial PDU's `total
+/// length` (header + complete data) bounds the reassembled data. The first
+/// segment's header (initial-PDU header, but with offset 0) is preserved so
+/// a complete CLNP PDU can be reconstructed for downstream (COTP) parsing.
+pub struct ClnpReassembler {
+    /// Keyed by (src_nsap, dst_nsap, pdu_id): the assembled data buffer, the
+    /// expected data length (total_len − hdr_len), the first segment's full
+    /// header bytes, and the last-seen timestamp.
+    pending: HashMap<(Vec<u8>, Vec<u8>, u16), ClnpPending>,
+}
+
+struct ClnpPending {
+    data: Vec<u8>,
+    /// Bytes of `data` actually filled (tracked because segments can arrive
+    /// out of order, leaving holes).
+    filled: usize,
+    data_len: Option<usize>,
+    header: Option<Vec<u8>>,
+    last: f64,
+}
+
+const CLNP_TIMEOUT_SECS: f64 = 60.0;
+
+impl ClnpReassembler {
+    pub fn new() -> Self {
+        Self { pending: HashMap::new() }
+    }
+
+    /// Push one raw CLNP PDU. Returns the reassembled, de-segmented CLNP PDU
+    /// (a complete single PDU: first-segment header with SP cleared of the
+    /// more-segments flag, followed by the full data part) when the data
+    /// unit completes. Unsegmented PDUs pass straight through.
+    pub fn push(&mut self, b: &[u8], now: f64) -> Option<Vec<u8>> {
+        let seg = match clnp_segment(b) {
+            Some(s) => s,
+            // Not a segmentation-permitted PDU: nothing to reassemble.
+            None => return Some(b.to_vec()),
+        };
+        // A lone, complete PDU (offset 0, no more segments) needs no work.
+        if seg.offset == 0 && !seg.more {
+            return Some(b.to_vec());
+        }
+        self.pending.retain(|_, p| now - p.last < CLNP_TIMEOUT_SECS);
+
+        // Address fields key the data unit alongside the data-unit id.
+        let (dst, src) = clnp_addresses(b)?;
+        let key = (src, dst, seg.pdu_id);
+        let data = &b[seg.hdr_len..];
+        let data_len = (seg.total_len as usize).checked_sub(seg.hdr_len)?;
+        let offset = seg.offset as usize;
+
+        let entry = self.pending.entry(key.clone()).or_insert_with(|| ClnpPending {
+            data: Vec::new(),
+            filled: 0,
+            data_len: None,
+            header: None,
+            last: now,
+        });
+        entry.last = now;
+        if entry.data_len.is_none() {
+            entry.data_len = Some(data_len);
+        }
+        let total = entry.data_len.unwrap_or(data_len);
+        if total > 0 && entry.data.len() < total {
+            entry.data.resize(total, 0);
+        }
+        // Place this fragment's data at its offset.
+        if offset + data.len() <= entry.data.len() {
+            entry.data[offset..offset + data.len()].copy_from_slice(data);
+            entry.filled += data.len();
+        }
+        // Capture the first segment's header (offset 0) to rebuild the PDU.
+        if offset == 0 {
+            entry.header = Some(b[..seg.hdr_len].to_vec());
+        }
+
+        // Complete when every byte of the data unit is filled.
+        if entry.filled >= total && entry.header.is_some() {
+            let ClnpPending { data, header, .. } = self.pending.remove(&key)?;
+            let mut hdr = header?;
+            // Clear the more-segments flag in the reconstructed PDU so it is
+            // treated as a complete data unit downstream.
+            if hdr.len() > 4 {
+                hdr[4] &= !0x40;
+            }
+            let mut full = hdr;
+            full.extend_from_slice(&data);
+            return Some(full);
+        }
+        None
+    }
+}
+
+impl Default for ClnpReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read the (dst, src) NSAP addresses of a raw CLNP PDU as octet vectors.
+fn clnp_addresses(b: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut pos = 9usize;
+    let read = |pos: &mut usize| -> Option<Vec<u8>> {
+        let len = *b.get(*pos)? as usize;
+        *pos += 1;
+        if *pos + len > b.len() || len > 20 {
+            return None;
+        }
+        let v = b[*pos..*pos + len].to_vec();
+        *pos += len;
+        Some(v)
+    };
+    let dst = read(&mut pos)?;
+    let src = read(&mut pos)?;
+    Some((dst, src))
+}
+
 /// Decode an ATN network-layer payload (after X.25 reassembly): full
 /// CLNP, or labels for the compressed forms and ES-IS/IDRP.
 pub fn parse_network(b: &[u8]) -> Option<Value> {
@@ -1080,13 +1248,26 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
         "dst_nsap": dst,
         "src_nsap": src,
     });
-    // Flags bit 7 (SP) signals a 6-octet segmentation part before options
-    // (ISO/IEC 8473 §7.5): data-unit id, segment offset, total length.
-    if flags & 0x80 != 0 {
+    // Flags (ISO/IEC 8473 §6.6): bit 8 SP (segmentation permitted),
+    // bit 7 MS (more segments), bit 6 E/R (error report). When SP is set a
+    // 6-octet segmentation part precedes the options part (§6.7): data-unit
+    // identifier, segment offset, total length.
+    let sp = flags & 0x80 != 0;
+    let more_segments = flags & 0x40 != 0;
+    let mut segment_offset = 0u16;
+    if sp {
+        out["error_report"] = json!(flags & 0x20 != 0);
+        out["more_segments"] = json!(more_segments);
         if pos + 6 <= b.len() {
+            segment_offset = u16::from_be_bytes([b[pos + 2], b[pos + 3]]);
             out["pdu_id"] = json!(u16::from_be_bytes([b[pos], b[pos + 1]]));
-            out["segment_offset"] = json!(u16::from_be_bytes([b[pos + 2], b[pos + 3]]));
+            out["segment_offset"] = json!(segment_offset);
             out["total_len"] = json!(u16::from_be_bytes([b[pos + 4], b[pos + 5]]));
+            // A PDU is segmented when more segments follow or this fragment
+            // does not start at offset 0.
+            if more_segments || segment_offset != 0 {
+                out["segmented"] = json!(true);
+            }
         }
         pos += 6;
     }
@@ -1097,9 +1278,15 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
             out["options"] = json!(opts);
         }
     }
+    // COTP rides in the data part — but only the *complete* data unit is a
+    // valid TPDU. A non-initial fragment (offset != 0) or a fragment with
+    // more segments to follow holds a partial byte stream; parsing it as a
+    // TPDU would be wrong, so it is left for the reassembler.
     let payload = &b[hdr_len..];
-    if let Some(cotp) = parse_cotp(payload) {
-        out["cotp"] = cotp;
+    if !(more_segments || segment_offset != 0) {
+        if let Some(cotp) = parse_cotp(payload) {
+            out["cotp"] = cotp;
+        }
     }
     Some(out)
 }
@@ -2013,5 +2200,122 @@ mod tests {
         assert_eq!(params[1]["name"], "inactivity_timer_ms");
         assert_eq!(params[1]["value"], 30000);
         assert_eq!(v["user_data_len"], 1);
+    }
+
+    // --- CLNP segmentation + multipart reassembly (ISO/IEC 8473 §6.6/6.7) ---
+    // The flags byte (SP 0x80 / MS 0x40 / E-R 0x20 / type), the 6-octet
+    // segmentation part layout (data-unit id, segment offset, total length),
+    // and the reassembly-by-offset rule are taken from ISO/IEC 8473 (X.233)
+    // as profiled by ICAO Doc 9705. Vectors are built octet-by-octet from the
+    // header layout (no encode→decode loopback).
+
+    /// Build one CLNP DT derived PDU (SP set) carrying `data` at
+    /// `seg_offset`, with the given more-segments flag and total length.
+    /// dst NSAP = 47 01, src NSAP = 47 02. Header = 9 fixed + 3 + 3 + 6 = 21.
+    fn clnp_segment_pdu(
+        pdu_id: u16,
+        seg_offset: u16,
+        total_len: u16,
+        more: bool,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let hdr_len = 21u8;
+        let mut flags = 0x1C | 0x80; // DT type + SP
+        if more {
+            flags |= 0x40; // MS
+        }
+        let seg_len = hdr_len as u16 + data.len() as u16;
+        let mut b = vec![
+            0x81,
+            hdr_len,
+            0x01,
+            0x3F,
+            flags,
+            (seg_len >> 8) as u8,
+            seg_len as u8,
+            0x00,
+            0x00, // checksum (0 = unused)
+        ];
+        b.extend_from_slice(&[2, 0x47, 0x01]); // dst NSAP
+        b.extend_from_slice(&[2, 0x47, 0x02]); // src NSAP
+        // segmentation part: pdu_id, segment offset, total length.
+        b.extend_from_slice(&pdu_id.to_be_bytes());
+        b.extend_from_slice(&seg_offset.to_be_bytes());
+        b.extend_from_slice(&total_len.to_be_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    #[test]
+    fn clnp_segment_fields_parse() {
+        // A single segmented DT exposes the segmentation fields + flags.
+        let pdu = clnp_segment_pdu(0x1234, 0, 100, true, &[0xAA, 0xBB]);
+        let v = parse_network(&pdu).unwrap();
+        assert_eq!(v["protocol"], "CLNP");
+        assert_eq!(v["type"], "DT");
+        assert_eq!(v["more_segments"], true);
+        assert_eq!(v["error_report"], false);
+        assert_eq!(v["segmented"], true);
+        assert_eq!(v["pdu_id"], 0x1234);
+        assert_eq!(v["segment_offset"], 0);
+        assert_eq!(v["total_len"], 100);
+        // A non-initial fragment must NOT be parsed as a COTP TPDU.
+        let frag2 = clnp_segment_pdu(0x1234, 2, 100, false, &[0xCC]);
+        let v2 = parse_network(&frag2).unwrap();
+        assert!(v2.get("cotp").is_none());
+        assert_eq!(v2["segment_offset"], 2);
+    }
+
+    #[test]
+    fn clnp_reassembles_two_segments_into_cotp() {
+        // Two DT segments of one data unit reassemble into a complete COTP DT.
+        // Complete data part: a COTP DT (LI=4, code 0xF0, dst_ref=1,
+        // EOT|seq=0x80, then "HI"). Total data = 7 octets; header = 21;
+        // total length = 28. Segment 1: offset 0, data[0..4], MS=1.
+        // Segment 2: offset 4, data[4..7], MS=0.
+        let cotp: [u8; 7] = [0x04, 0xF0, 0x00, 0x01, 0x80, b'H', b'I'];
+        let total_len = 21 + cotp.len() as u16; // header + full data
+        let seg1 = clnp_segment_pdu(0x55AA, 0, total_len, true, &cotp[0..4]);
+        let seg2 = clnp_segment_pdu(0x55AA, 4, total_len, false, &cotp[4..7]);
+
+        let mut r = ClnpReassembler::new();
+        // First segment: not yet complete.
+        assert_eq!(r.push(&seg1, 0.0), None);
+        // Second segment: completes the data unit; returns a full CLNP PDU.
+        let full = r.push(&seg2, 1.0).expect("reassembled PDU");
+        // The reconstructed PDU has the more-segments flag cleared.
+        assert_eq!(full[4] & 0x40, 0);
+        let v = parse_network(&full).unwrap();
+        assert_eq!(v["protocol"], "CLNP");
+        assert_eq!(v["cotp"]["tpdu"], "DT");
+        assert_eq!(v["cotp"]["dst_ref"], 1);
+        assert_eq!(v["cotp"]["eot"], true);
+        assert_eq!(v["cotp"]["user_data_len"], 2);
+    }
+
+    #[test]
+    fn clnp_reassembles_out_of_order() {
+        // The same two segments arriving in reverse order still reassemble.
+        let payload: Vec<u8> = (0..10u8).collect();
+        let total_len = 21 + payload.len() as u16;
+        let seg1 = clnp_segment_pdu(0x0001, 0, total_len, true, &payload[0..6]);
+        let seg2 = clnp_segment_pdu(0x0001, 6, total_len, false, &payload[6..10]);
+        let mut r = ClnpReassembler::new();
+        // Last segment first.
+        assert_eq!(r.push(&seg2, 0.0), None);
+        let full = r.push(&seg1, 1.0).expect("reassembled");
+        // Data part (after the 21-octet header) equals the original payload.
+        assert_eq!(&full[21..], &payload[..]);
+    }
+
+    #[test]
+    fn clnp_unsegmented_passes_through() {
+        // A plain (unsegmented) CLNP DT passes straight through the
+        // reassembler unchanged.
+        let mut b = vec![0x81, 15, 1, 0x3F, 0x1C, 0x00, 0x14, 0x00, 0x00];
+        b.extend_from_slice(&[2, 0x47, 0x01]);
+        b.extend_from_slice(&[2, 0x47, 0x02]);
+        let mut r = ClnpReassembler::new();
+        assert_eq!(r.push(&b, 0.0), Some(b.clone()));
     }
 }

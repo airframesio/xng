@@ -199,6 +199,57 @@ values render into the module's phraseology templates ("CLIMB TO
 FL360"). Elements whose argument type is not yet supported stop the
 walk explicitly (sizes unknown), matching the staged FANS approach.
 
+## ATN-B1 CPDLC argument coverage extension (2026-06, VDL2-1.1)
+
+The CPDLC argument-type walk was extended from ~22 supported types to ~63
+so the element walk no longer stops at the first previously-unsupported
+argument. Added readers (all from the vendored Doc 9880 ASN.1 module
+`docs/asn1/atn-cpdlc.asn`, unaligned PER per ITU-T X.691):
+
+- **Frequency** CHOICE (HF kHz / VHF·0.005 MHz / UHF·0.025 MHz / 12-digit
+  SAT NumericString) and the UnitNameFrequency, PositionUnitNameFrequency,
+  TimeUnitNameFrequency compounds (UnitName = facilityDesignation +
+  optional facilityName + facilityFunction enum).
+- **Altimeter** CHOICE (english in·0.01 / metric hPa·0.1), and the
+  FacilityDesignation, Facility (noFacility | designation),
+  FacilityDesignationAltimeter, FacilityDesignationATISCode compounds.
+- **Code** (4×octal squawk), **ATISCode** (single IA5 char), **FreeText**
+  (IA5 1..256), **VersionNumber** (INTEGER 0..15).
+- The ENUMERATED arguments **TrafficType**, **ClearanceType**,
+  **ErrorInformation**, **ToFrom**, **SpeedType**, **FacilityFunction**
+  (each with its X.691 extension bit when the module marks `...`).
+- **ProcedureName** / **PositionProcedureName**, **RunwayRVR** (Runway +
+  RVR CHOICE feet/meters), **VerticalRate** CHOICE (english·10 fpm /
+  metric·10 m/min), **RemainingFuelPersonsOnBoard** (Time + INTEGER
+  1..1024).
+- The level/speed/time/position compound shapes whose layouts were
+  previously unknown: LevelSpeedSpeed, PositionSpeedSpeed, TimeSpeed,
+  SpeedTime, TimeSpeedSpeed, PositionLevelLevel, PositionLevelSpeed,
+  PositionTimeTime, PositionTimeLevel, TimePositionLevel,
+  TimePositionLevelSpeed, SpeedTypeSpeedTypeSpeedType and
+  SpeedTypeSpeedTypeSpeedTypeSpeed.
+- The distance/direction offset family DistanceSpecifiedDirection,
+  PositionDistanceSpecifiedDirection, TimeDistanceSpecifiedDirection,
+  DistanceSpecifiedDirectionTime; the to/from reports ToFromPosition,
+  TimeToFromPosition, TimeDistanceToFromPosition.
+- **HoldClearance** (position/level/degrees/direction + optional LegType
+  CHOICE distance/time) and **DepartureClearance** (the mandatory flight
+  id + clearance-limit position head is decoded; the deeply-nested
+  FlightInformation / FurtherInstructions optional tail is flagged
+  present-but-undecoded since it is last in the SEQUENCE).
+- **PositionReport** (the 3 mandatory fields position/time/level are
+  decoded; the 19 OPTIONAL meteorology/waypoint fields stop the walk
+  explicitly when any are present, since their sizes are then unknown).
+
+Oracle: each new decode is verified by a unit test whose vector is the
+unaligned-PER encoding hand-assembled bit-by-bit from the type's ASN.1
+definition, with the expected rendering derived from the module's
+resolution/unit constraint comments (no encode→decode loopback).
+Deliberately deferred (recorded as undecoded-but-flagged, not faked): the
+full DepartureClearance optional tail and the full PositionReport optional
+fields — both need a captured PDU to pin the nested SEQUENCE-OF/CHOICE
+walks unambiguously.
+
 ## COTP TPDU completion (2026-06, VDL2-2.2 partial)
 
 The COTP (ISO/IEC 8073 / ITU-T X.224) decoder was extended from 5 TPDU
@@ -246,8 +297,35 @@ dictionaries were cross-checked against ISO/IEC 8473 (X.233) and ICAO Doc
 9705 and against dumpvdl2's `src/clnp.c` and `src/atn.c` — protocol facts
 (the integer→name/structure assignments) only, not code or formatter text.
 Tests pin spec-derived security-label examples built octet-by-octet (no
-loopback). Multipart CLNP reassembly remains the deferred big bet
-(VDL2-2.1 reassembly part).
+loopback).
+
+## Multipart CLNP reassembly (2026-06, VDL2-2.1 reassembly part)
+
+The CLNP (ISO/IEC 8473) decoder now exposes the full flags byte (§6.6):
+the **more-segments (MS, 0x40)** and error-report (E/R, 0x20) flags
+alongside the existing SP (0x80) flag, and marks a PDU `segmented` when MS
+is set or its segment offset is non-zero. A non-initial fragment (offset
+≠ 0) or a fragment with more segments to follow is no longer parsed as a
+COTP TPDU — its data part is a partial byte stream, so COTP parsing waits
+for the reassembled data unit.
+
+A new `ClnpReassembler` performs §6.7 reassembly: derived PDUs of one
+initial PDU share a data-unit identifier; each carries a fragment of the
+data part at its *segment offset*, and the initial PDU's *total length*
+(header + complete data) bounds the data unit. Fragments are placed by
+offset (so out-of-order arrival reassembles correctly), the first
+segment's header is preserved, and on completion a single de-segmented
+CLNP PDU is reconstructed (more-segments flag cleared) and handed to the
+normal CLNP/COTP walk. Reassembly is keyed by (src NSAP, dst NSAP,
+data-unit id) with a 60 s timeout (mirroring the X.25 M-bit reassembler),
+and is wired into the decode pipeline (`Vdl2ChannelDecoder` →
+`decode_network`) after X.25 M-bit reassembly. The flags-byte bit
+assignments, the segmentation-part layout (data-unit id, segment offset,
+total length) and the reassembly-by-offset rule are from ISO/IEC 8473
+(X.233) as profiled by ICAO Doc 9705. Tests pin spec-derived two-segment
+vectors (in-order, out-of-order, unsegmented pass-through, and a complete
+COTP DT recovered across two segments), built octet-by-octet from the
+header layout (no loopback).
 
 ## X.25 SNDCF field (2026-06, VDL2-4 follow-up)
 
