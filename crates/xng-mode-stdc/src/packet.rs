@@ -197,6 +197,34 @@ pub fn services_full(iss: u16) -> Vec<&'static str> {
         .collect()
 }
 
+/// Bulletin-board (0x7D) channel-type name. Values per inmarsatc
+/// decode_7D's channelType switch (the C++ switch omits `break`s, so its
+/// channelTypeName always falls through to "Reserved" — a bug; the
+/// intended per-value names are used here).
+pub fn channel_type_name(channel_type: u8) -> &'static str {
+    match channel_type {
+        1 => "NCS",
+        2 => "LES TDM",
+        3 => "Joint NCS and TDM",
+        4 => "ST-BY NCS",
+        _ => "Reserved",
+    }
+}
+
+/// Decode the bulletin-board (0x7D) status byte into its named boolean
+/// flags. Bit→name mapping verbatim from inmarsatc decode_7D's `status`
+/// string (Bauds600 0x80, Operational 0x40, InService 0x20, Clear 0x10,
+/// LinksOpen 0x08).
+pub fn bulletin_status(status_b: u8) -> serde_json::Value {
+    json!({
+        "bauds_600": status_b & 0x80 != 0,
+        "operational": status_b & 0x40 != 0,
+        "in_service": status_b & 0x20 != 0,
+        "clear": status_b & 0x10 != 0,
+        "links_open": status_b & 0x08 != 0,
+    })
+}
+
 /// Decode a station list (LES directory) of `count` 6-byte records
 /// starting at `recs`. Record layout per inmarsatc `getStations`:
 ///   [0]    sat/LES byte (region in bits 7-6, LES id in bits 5-0)
@@ -590,17 +618,44 @@ impl PacketParser {
         let body = &pkt[..pkt.len()];
         let (name, text, details): (&'static str, Option<String>, serde_json::Value) = match desc {
             0x7D if body.len() >= 4 => {
+                // Per inmarsatc decode_7D: networkVersion body[1],
+                // frameNumber body[2..4], signallingChannel body[4]>>2,
+                // count (body[5]>>4)*2, channelType body[6]>>5, local
+                // body[6]>>2&7, sat/les body[7], status byte body[8],
+                // 16-bit services body[9..11], randomInterval body[11].
                 let frame_number = u16::from_be_bytes([body[2], body[3]]);
-                (
-                    "bulletin-board",
-                    None,
-                    json!({
-                        "network_version": body.get(1),
-                        "frame_number": frame_number,
-                        "utc_time": frame_to_utc_hms(frame_number),
-                        "channel_type": body.get(6).map(|b| b >> 5),
-                    }),
-                )
+                let mut details = json!({
+                    "network_version": body.get(1),
+                    "frame_number": frame_number,
+                    "utc_time": frame_to_utc_hms(frame_number),
+                    "channel_type": body.get(6).map(|b| b >> 5),
+                });
+                if let Some(obj) = details.as_object_mut() {
+                    if let Some(&b) = body.get(4) {
+                        obj.insert("signalling_channel".to_string(), json!(b >> 2));
+                    }
+                    if let Some(&b) = body.get(5) {
+                        obj.insert("count".to_string(), json!((b >> 4 & 0x0F) * 2));
+                    }
+                    if let Some(&b) = body.get(6) {
+                        obj.insert("channel_type_name".to_string(), json!(channel_type_name(b >> 5)));
+                        obj.insert("local".to_string(), json!(b >> 2 & 0x07));
+                    }
+                    if let Some(&b) = body.get(7) {
+                        obj.insert("sat_les".to_string(), sat_les(b));
+                    }
+                    if let Some(&s) = body.get(8) {
+                        obj.insert("status".to_string(), bulletin_status(s));
+                    }
+                    if body.len() >= 11 {
+                        let iss = u16::from_be_bytes([body[9], body[10]]);
+                        obj.insert("services".to_string(), json!(services_full(iss)));
+                    }
+                    if let Some(&ri) = body.get(11) {
+                        obj.insert("random_interval".to_string(), json!(ri));
+                    }
+                }
+                ("bulletin-board", None, details)
             }
             0x27 if body.len() >= 8 => {
                 // The clear terminates the logical channel: emit any
@@ -1275,6 +1330,69 @@ mod tests {
         let b = out.iter().find(|p| p.name == "bulletin-board").unwrap();
         assert_eq!(b.details["frame_number"], 5987);
         assert_eq!(b.details["utc_time"], "14:22:07");
+    }
+
+    #[test]
+    fn channel_type_names_match_inmarsatc() {
+        // STDC-2. Names per inmarsatc decode_7D channelType (the C++
+        // switch's missing breaks are a bug; the per-value names are used).
+        assert_eq!(channel_type_name(1), "NCS");
+        assert_eq!(channel_type_name(2), "LES TDM");
+        assert_eq!(channel_type_name(3), "Joint NCS and TDM");
+        assert_eq!(channel_type_name(4), "ST-BY NCS");
+        assert_eq!(channel_type_name(0), "Reserved");
+        assert_eq!(channel_type_name(7), "Reserved");
+    }
+
+    #[test]
+    fn bulletin_status_flags_match_inmarsatc() {
+        // STDC-2. Bit→name per inmarsatc decode_7D status byte.
+        // 0xE8 = 1110_1000 → Bauds600, Operational, InService, LinksOpen.
+        let s = bulletin_status(0xE8);
+        assert_eq!(s["bauds_600"], true);
+        assert_eq!(s["operational"], true);
+        assert_eq!(s["in_service"], true);
+        assert_eq!(s["clear"], false);
+        assert_eq!(s["links_open"], true);
+        let z = bulletin_status(0x00);
+        assert_eq!(z["bauds_600"], false);
+        assert_eq!(z["links_open"], false);
+    }
+
+    #[test]
+    fn bulletin_board_full_fields() {
+        // STDC-2. Full 0x7D field map per inmarsatc decode_7D:
+        //   body[1]=networkVersion 1
+        //   body[2..4]=frameNumber 5987 (0x1763)
+        //   body[4]=0x08 -> signallingChannel = 0x08>>2 = 2
+        //   body[5]=0x30 -> count = (3)*2 = 6
+        //   body[6]=0x28 -> channelType = 1 (NCS), local = 2
+        //   body[7]=0x44 -> AOR-E les 104
+        //   body[8]=0x60 -> Operational + InService
+        //   body[9..11]=0x4000 -> SafetyNet
+        //   body[11]=0x05 -> randomInterval
+        let mut parser = PacketParser::new();
+        let bb = build_packet(&[
+            0x7D, 0x01, 0x17, 0x63, 0x08, 0x30, 0x28, 0x44, 0x60, 0x40, 0x00, 0x05,
+        ]);
+        let mut frame = bb;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let b = out.iter().find(|p| p.name == "bulletin-board").unwrap();
+        assert_eq!(b.details["frame_number"], 5987);
+        assert_eq!(b.details["utc_time"], "14:22:07");
+        assert_eq!(b.details["signalling_channel"], 2);
+        assert_eq!(b.details["count"], 6);
+        assert_eq!(b.details["channel_type"], 1);
+        assert_eq!(b.details["channel_type_name"], "NCS");
+        assert_eq!(b.details["local"], 2);
+        assert_eq!(b.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(b.details["sat_les"]["les"], 104);
+        assert_eq!(b.details["status"]["operational"], true);
+        assert_eq!(b.details["status"]["in_service"], true);
+        assert_eq!(b.details["status"]["clear"], false);
+        assert_eq!(b.details["services"], json!(["SafetyNet"]));
+        assert_eq!(b.details["random_interval"], 5);
     }
 
     #[test]
