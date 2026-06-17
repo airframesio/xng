@@ -239,6 +239,73 @@ pub fn frame_to_utc_hms(frame_number: u16) -> Option<String> {
 
 const PRIORITY: [&str; 4] = ["routine", "safety", "urgency", "distress"];
 
+/// Geographic addressing shape for a SafetyNET C2 service code, per the
+/// IMO International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AreaShape {
+    /// C2 = 04 / 34 — rectangular area, C3 = D1D2 La D3D4D5 Lo D6D7 D8D9D10
+    /// (SW-corner lat/lon in degrees + N and E extent in degrees).
+    Rectangular,
+    /// C2 = 14 / 24 / 44 — circular area, C3 = D1D2 N/S D3D4 E/W M1M2M3
+    /// (centre lat/lon in degrees + radius in nautical miles).
+    Circular,
+    /// C2 = 31 — NAVAREA / METAREA number (C3 = two digits X1X2, 01–21).
+    NavMetArea,
+    /// C2 = 13 / 73 — coastal warning area, C3 = X1X2 B1 B2 (NAVAREA
+    /// number + coastal-area letter A–Z + subject indicator A/L).
+    Coastal,
+    /// C2 = 00 — all ships (no geographic addressing).
+    AllShips,
+}
+
+/// Classify a SafetyNET C2 service code into its geographic addressing
+/// shape and the documented C3 address-code layout. Oracle: IMO
+/// International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3 and the
+/// C-code table in §8 (cross-checked against inmarsat-sniffer's
+/// service-name table). Returns None for non-geographic service codes.
+pub fn area_shape(c2: u8) -> Option<(AreaShape, &'static str)> {
+    Some(match c2 {
+        0x04 | 0x34 => (AreaShape::Rectangular, "D1D2La D3D4D5Lo D6D7 D8D9D10"),
+        0x14 | 0x24 | 0x44 => (AreaShape::Circular, "D1D2 N/S D3D4 E/W M1M2M3"),
+        0x31 => (AreaShape::NavMetArea, "X1X2"),
+        0x13 | 0x73 => (AreaShape::Coastal, "X1X2 B1 B2"),
+        0x00 => (AreaShape::AllShips, "00"),
+        _ => return None,
+    })
+}
+
+/// Build the structured `area` object for an EGC address. `address` is
+/// the on-air address field including the leading C2-repeat byte
+/// (address[0]); the geographic payload is address[1..].
+///
+/// The C2 code classifies the shape and the documented C3 field layout
+/// (oracle: IMO SafetyNET Manual, above). The on-air *binary packing* of
+/// the C3 coordinate digits is not documented in any primary source and
+/// is not decoded by any open decoder (inmarsatc, SatDump, sdrangel and
+/// inmarsat-sniffer all carry the EGC address as raw bytes only), so the
+/// coordinate values are deliberately left for a future verified-against-
+/// real-capture decode rather than guessed here — the raw payload bytes
+/// are surfaced typed so a map layer can consume them once decoded.
+fn egc_area(service: u8, address: &[u8]) -> Option<serde_json::Value> {
+    let (shape, c3_format) = area_shape(service)?;
+    let shape_name = match shape {
+        AreaShape::Rectangular => "rectangular",
+        AreaShape::Circular => "circular",
+        AreaShape::NavMetArea => "navarea-metarea",
+        AreaShape::Coastal => "coastal",
+        AreaShape::AllShips => "all-ships",
+    };
+    // address[0] repeats the C2 service code; the geographic payload (the
+    // C3 address code) is the remaining bytes.
+    let payload: &[u8] = address.get(1..).unwrap_or(&[]);
+    Some(json!({
+        "shape": shape_name,
+        "c2": service,
+        "c3_format": c3_format,
+        "address_payload_hex": hex(payload),
+    }))
+}
+
 /// Parsed EGC packet header + payload, pre-assembly.
 #[derive(Debug, Clone)]
 pub struct EgcPart {
@@ -596,6 +663,11 @@ impl PacketParser {
             "address_hex": hex(&done.address),
             "parts": done.parts.len(),
         });
+        if let Some(area) = egc_area(done.service, &done.address) {
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("area".to_string(), area);
+            }
+        }
         if let (Some(obj), Some(eobj)) = (details.as_object_mut(), extra.as_object()) {
             for (k, v) in eobj {
                 obj.insert(k.clone(), v.clone());
@@ -844,6 +916,59 @@ mod tests {
         assert_eq!(v["region_long"], "Atlantic Ocean Region East (AOR-E)");
         assert_eq!(v["les"], 104);
         assert_eq!(v["les_name"], "Vizada-Telenor, Norway");
+    }
+
+    #[test]
+    fn area_shape_classification_matches_imo_manual() {
+        // STDC-1: C2 → geographic shape + documented C3 layout. Oracle:
+        // IMO International SafetyNET Manual (2019) Annex 4 part A §5.2-5.3.
+        assert_eq!(
+            area_shape(0x04),
+            Some((AreaShape::Rectangular, "D1D2La D3D4D5Lo D6D7 D8D9D10"))
+        );
+        assert_eq!(area_shape(0x34).map(|x| x.0), Some(AreaShape::Rectangular));
+        assert_eq!(
+            area_shape(0x24),
+            Some((AreaShape::Circular, "D1D2 N/S D3D4 E/W M1M2M3"))
+        );
+        assert_eq!(area_shape(0x14).map(|x| x.0), Some(AreaShape::Circular));
+        assert_eq!(area_shape(0x44).map(|x| x.0), Some(AreaShape::Circular));
+        assert_eq!(area_shape(0x31), Some((AreaShape::NavMetArea, "X1X2")));
+        assert_eq!(area_shape(0x13), Some((AreaShape::Coastal, "X1X2 B1 B2")));
+        assert_eq!(area_shape(0x73).map(|x| x.0), Some(AreaShape::Coastal));
+        // Non-geographic codes have no area shape.
+        assert_eq!(area_shape(0x02), None);
+        assert_eq!(area_shape(0x11), None);
+    }
+
+    #[test]
+    fn egc_area_structures_address_by_shape() {
+        // Rectangular service: 7-byte address, byte[0] = C2 repeat (0x04),
+        // remaining 6 bytes carry the C3 rectangular area code.
+        let addr = [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let area = egc_area(0x04, &addr).unwrap();
+        assert_eq!(area["shape"], "rectangular");
+        assert_eq!(area["c2"], 0x04);
+        assert_eq!(area["c3_format"], "D1D2La D3D4D5Lo D6D7 D8D9D10");
+        // Payload is address[1..] — the C2-repeat byte is stripped.
+        assert_eq!(area["address_payload_hex"], "112233445566");
+        // NAVAREA service: 4-byte address.
+        let nav = egc_area(0x31, &[0x31, 0x0C, 0x00, 0x00]).unwrap();
+        assert_eq!(nav["shape"], "navarea-metarea");
+        assert_eq!(nav["c3_format"], "X1X2");
+        // Non-geographic service yields no area object.
+        assert!(egc_area(0x02, &[0x02, 0, 0, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn egc_message_carries_structured_area() {
+        let mut p = PacketParser::new();
+        // Circular distress alert (C2 = 0x14) — egc_packet writes 0xAB as
+        // the address bytes; address[0] is the C2-repeat slot.
+        let frame = egc_packet(0xB0, 0x14, false, 3, 1, 1, b"TEST");
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(e.details["area"]["shape"], "circular");
+        assert_eq!(e.details["area"]["c2"], 0x14);
     }
 
     #[test]
