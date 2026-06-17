@@ -79,10 +79,47 @@ carried in each frame. Calibrated-value reconstruction (the `get_T` /
 `get_RH` / `get_P` polynomials in `rs41mod.c`, which consume the assembled
 calibration table) is a documented follow-up, not silently faked.
 
-## GFSK demodulator — TODO
+## GFSK demodulator front-end (`demod.rs`, `framer.rs`, `lib.rs`)
 
-The RS41 air interface is GFSK at 4800 baud, one frame per second. The
-IQ→bits demodulator (and the bit→byte / Manchester-free framing and sync
-search) is **not** implemented here; this crate decodes from a post-FEC (or
-pre-FEC, RS-correctable) frame buffer. The demod is a documented TODO and a
-deliberate non-goal of the verified decode layer.
+The RS41 air interface is GFSK at 4800 baud (modulation index ≈ 1,
+Gaussian-shaped, BT ≈ 0.5), NRZ data (the bit value maps straight to the FSK
+tone — no NRZI / Manchester layer), one frame per second. The channelized
+front-end is wired through `SondeChannelDecoder`:
+
+- `xng_dsp::Ddc` mixes the channel to baseband and decimates the capture-rate
+  IQ to `CHANNEL_RATE` (48 kHz, 10 samples/symbol).
+- `demod::GfskDemod` is a per-sample frequency discriminator + slow DC tracker
+  (residual carrier offset) + per-symbol integrate-and-dump with zero-crossing
+  timing recovery, hard-slicing to NRZ bits. This reuses the structure of the
+  sibling `xng-mode-ais` `GmskDemod` (GMSK and GFSK share the discriminator +
+  integrate-and-dump path), per the workspace channelized-decoder contract.
+- `framer::Framer` slides a 64-bit correlator over the bit stream for the
+  on-air whitened sync header `10 B6 CA 11 22 96 12 F8` (polarity-agnostic:
+  matches the pattern and its inverse), then packs the following bytes
+  LSB-first into the on-air whitened frame.
+- The recovered on-air frame's 8-byte header is de-whitened in place, then
+  handed to the existing `decode_on_air` (de-whiten body + interleaved
+  RS(255,231) + sub-block parse) — the decode core is **not** rewritten.
+
+### Validation — SYNTHETIC IQ (self-generated modulate→demod)
+
+There is no captured RS41 IQ vector vendored here, so the demod is validated
+end to end on **self-generated** IQ (user-approved where no oracle IQ exists).
+`modulate.rs` GFSK-modulates a *known oracle frame* (the published K1930293
+standard frame, the same vector `frame_decode.rs` decodes at the byte level)
+into IQ; `tests/demod_synth.rs` (`*_synth_iq`) runs that IQ through
+`SondeChannelDecoder::process` and asserts the recovered frame's decoded
+fields equal the published oracle values (serial, frame#, battery, GPS
+week/TOW, ECEF→lat/lon/alt, satellite count) and that the recovered
+de-whitened wire bytes equal the oracle frame. Coverage includes the
+direct-channel-rate path, the DDC mix+decimate path (offset carrier, 240 kS/s
+capture), and the `to_message` → `MessageBody::Sonde` emission.
+
+This modulate→demod path is self-consistent **by construction**; the DECODE
+core (whitening / RS / sub-block parse) stays oracle-anchored by its existing
+byte-level tests against the rs1729/RS published frames.
+
+## Calibrated PTU — still a documented scope boundary
+
+The raw-PTU vs calibrated-value boundary above is unchanged: a single-frame
+decoder emits the raw 24-bit channels + that frame's calibration sub-frame.
