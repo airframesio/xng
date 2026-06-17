@@ -1,0 +1,12 @@
+[package]
+name = "xng-mode-sarsat"
+description = "COSPAS-SARSAT 406 MHz distress beacon (C/S T.001 First-Generation Beacon) message decoder for xng: frame sync, protocol classification, BCH(21,15)/BCH(12,7) FEC, beacon ID + position"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
