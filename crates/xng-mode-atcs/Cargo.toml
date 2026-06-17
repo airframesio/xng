@@ -10,4 +10,7 @@ authors.workspace = true
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
+num-complex.workspace = true
 xng-dsp.workspace = true
+xng-types.workspace = true
