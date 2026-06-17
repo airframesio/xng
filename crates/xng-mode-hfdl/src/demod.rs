@@ -22,6 +22,9 @@ const PREAMBLE_SYMS: usize = 127 + 127 + 127 + 15 + 135;
 pub struct Burst {
     pub bps: u32,
     pub payload: Vec<u8>,
+    /// Coded symbols corrected by the Viterbi decoder (HFDL-5): Hamming
+    /// distance from the received hard decisions to the chosen codeword.
+    pub fec_corrected: u32,
 }
 
 enum State {
@@ -419,11 +422,22 @@ impl HfdlDemod {
             deleaved
         };
         let bits = self.viterbi.decode(&vit_in);
+        // FEC-corrected-bit count (HFDL-5): re-encode the decoded bits and
+        // count how many received coded symbols disagree with the chosen
+        // codeword — i.e. the Hamming distance from the received hard
+        // decisions to the nearest valid convolutional codeword, which is
+        // exactly the number of channel symbols the Viterbi corrected.
+        let recoded = self.viterbi.encode(&bits);
+        let fec_corrected = recoded
+            .iter()
+            .zip(vit_in.iter())
+            .filter(|(&c, &y)| (c == 1) != (y > 0.0))
+            .count() as u32;
         let payload: Vec<u8> = bits
             .chunks(8)
             .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | (v << i)))
             .collect();
-        Some(Burst { bps: s.bps, payload })
+        Some(Burst { bps: s.bps, payload, fec_corrected })
     }
 
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Burst> {

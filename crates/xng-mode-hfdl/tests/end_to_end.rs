@@ -77,6 +77,49 @@ fn decodes_acars_at_1800bps() {
 }
 
 #[test]
+fn fec_corrected_is_zero_on_a_clean_burst() {
+    // HFDL-5: a noise-free burst carries a valid convolutional codeword,
+    // so the Viterbi has nothing to correct. The corrected-symbol count is
+    // measured as the Hamming distance to the nearest codeword (the FEC's
+    // own definition), which must be exactly 0 here. A constant placeholder
+    // would fail this, and so would a non-zero count on perfect input.
+    let s = &SETTINGS[1]; // 600 bps, rate-1/2
+    let syms = burst_symbols(&acars_mpdu(), s);
+    let mut iq = vec![Complex::new(0.0, 0.0); 3000];
+    iq.extend(modulate(&syms, CHANNEL_RATE, 1440.0, 0.5)); // no CFO, no noise
+    iq.extend(vec![Complex::new(0.0, 0.0); 3000]);
+    let mut dec = HfdlChannelDecoder::new(CHANNEL_RATE, 0.0).unwrap();
+    let mut events = Vec::new();
+    for chunk in iq.chunks(8192) {
+        events.extend(dec.process(chunk));
+    }
+    let e = events
+        .iter()
+        .find(|e| e.kind == "acars" && e.acars.as_ref().unwrap().crc_ok)
+        .expect("clean ACARS decodes");
+    assert_eq!(
+        e.fec_corrected,
+        Some(0),
+        "a clean burst is already a valid codeword: zero corrections"
+    );
+}
+
+#[test]
+fn fec_corrected_is_populated_under_noise() {
+    // The field must always be set on demod-path events (was hardwired to
+    // None before HFDL-5) and stay within the coded-symbol budget.
+    let s = &SETTINGS[1];
+    let events = run(1, &acars_mpdu(), -35.0, 0.0);
+    let e = events.iter().find(|e| e.kind == "acars").expect("ACARS decodes");
+    let n = e.fec_corrected.expect("fec_corrected populated on demod path");
+    assert!(
+        (n as usize) <= s.chips(),
+        "corrected count {n} exceeds coded-symbol budget {}",
+        s.chips()
+    );
+}
+
+#[test]
 fn decodes_from_wideband_capture() {
     // 240 kHz capture slice; HFDL channel at +30 kHz with 25 Hz CFO.
     let s = &SETTINGS[3];
