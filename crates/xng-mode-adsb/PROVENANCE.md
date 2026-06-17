@@ -203,3 +203,37 @@ dump1090/pyModeS ladder. Barometric altitude continues to populate
 `adsb_status.geometric_altitude_ft` (it is HAE, not barometric). The
 vertical-rate source bit and the GNSS-minus-baro difference (the rest of
 ADSB-2) were delivered with the velocity trailer in ADSB-1.5 above.
+
+## DF coverage — DF19 / DF24-27 / FS-DR-UM (ADSB-4, 2026-06)
+
+Three downlink-format extensions:
+
+- **FS/DR/UM surveillance header** (`decode::flight_status` /
+  `surveillance_status`) for DF4/5/20/21: flight status (frame bits 5–7 →
+  alert / SPI / on-ground flags + text), downlink request (DR, bits 8–12),
+  utility message (UM, bits 13–18). Layout and the FS code table are ICAO
+  Annex 10 Vol IV §3.1.2.6.5 as decoded by pyModeS `surv`
+  (`_FLIGHT_STATUS_TEXT`) and rs1090 (`FlightStatus`). Verified against
+  pyModeS `decode()` on CRC-valid address-overlaid replies (`2218A190…`
+  → FS 2 / DR 3 / UM 5; `2C085234…` → FS 4 / DR 1 / UM 2). Emitted under
+  `adsb_status` on DF4/5/20/21 (DF0/16 carry no FS header and are left
+  unchanged).
+- **DF19 Extended Squitter, Military Application**
+  (`decode::military_es`): clean-PI parity with the address in the AA
+  field (identical framing to DF17/18, same two-sighting confirmation).
+  The Application Field AF (frame bits 5–7) is surfaced; AF=0 carries an
+  ADS-B-formatted ME whose type code is exposed. Layout per ICAO Annex 10
+  Vol IV §3.1.2.8.8 / rs1090 `ExtendedSquitterMilitary`. Verified on a
+  CRC-clean AF=0 DF19 frame (`98ABCDEF…` → source military, AF 0, ME
+  TC 4). Emitted under `adsb_status`.
+- **DF24-27 Comm-D Extended Length Message** (`decode::comm_d`):
+  address-overlaid parity (accepted only for a cache-confirmed ICAO, as
+  for DF20/21), always 112-bit. Decodes the ELM control bit KE (frame
+  bit 3: downlink-tx / uplink-ack), the 4-bit D-segment number ND (bits
+  4–7), and the 80-bit message segment MD (bytes 1–10). Layout is ICAO
+  Annex 10 Vol IV §3.1.2.7.3 (the rs1090 `CommDExtended` field order);
+  no public single-message oracle exists for Comm-D, so the test vector
+  is a **spec-derived** CRC-valid frame (`C5112233…` → DF24, KE 0, ND 5,
+  MD 11..AA, address-overlaid 40621D) with its address recovery and field
+  positions pinned, clearly documented as spec-derived (not a loopback).
+  Emitted under `comm_b` (the Comm-D message channel).

@@ -139,6 +139,20 @@ impl FrameValidator {
                 }
                 icao
             }
+            // DF19 military extended squitter: clean PI parity with the
+            // address in the AA field, exactly like DF17/18. Gate on the
+            // same two-sighting confirmation. (Single-bit repair is left
+            // to the ES path; military AF≠0 sub-formats are non-public.)
+            19 => {
+                if syndrome != 0 {
+                    return None;
+                }
+                let icao = u32::from_be_bytes([0, bytes[1], bytes[2], bytes[3]]);
+                if !self.confirm(icao, &bytes, level_dbfs, pos) {
+                    return None;
+                }
+                icao
+            }
             // All-call reply: PI overlaid with the interrogator code
             // only. DF11 carries no payload worth emitting on first
             // sight; it counts as a confirmation sighting.
@@ -152,9 +166,18 @@ impl FrameValidator {
                 }
                 icao
             }
-            // Address-overlaid parity: accept only known aircraft.
+            // Address-overlaid parity: accept only known aircraft. DF24–27
+            // (Comm-D ELM) share the address-overlaid parity convention;
+            // they are always 112-bit, so require the long frame.
             0 | 4 | 5 | 16 | 20 | 21 => {
                 if !self.icao_cache.contains_key(&syndrome) {
+                    return None;
+                }
+                self.learn(syndrome);
+                syndrome
+            }
+            24..=27 => {
+                if bytes.len() != 14 || !self.icao_cache.contains_key(&syndrome) {
                     return None;
                 }
                 self.learn(syndrome);
@@ -184,21 +207,37 @@ impl FrameValidator {
                     tag_df18_source(&mut f);
                 }
             }
+            // DF19 military extended squitter: tag the source and, for
+            // AF=0, the embedded ME type code.
+            19 => {
+                f.adsb_status = Some(decode::military_es(&bytes));
+            }
             // Surveillance altitude reply: 13-bit AC field (bits 20–32).
+            // DF4/20 carry the FS/DR/UM surveillance header; DF0/16 do not.
             0 | 4 | 16 | 20 => {
                 let ac = ((bytes[2] as u32 & 0x1F) << 8) | bytes[3] as u32;
                 f.altitude_ft = decode::altitude13(ac);
+                if df == 4 || df == 20 {
+                    f.adsb_status = Some(decode::surveillance_status(&bytes));
+                }
                 if df == 20 && bytes.len() == 14 {
                     f.comm_b = decode::bds_infer(&bytes[4..11]);
                 }
             }
-            // Surveillance identity reply: 13-bit ID field → squawk.
+            // Surveillance identity reply: 13-bit ID field → squawk, with
+            // the FS/DR/UM surveillance header (DF5/21).
             5 | 21 => {
                 let id = ((bytes[2] as u32 & 0x1F) << 8) | bytes[3] as u32;
                 f.squawk = Some(decode::squawk13(id));
+                f.adsb_status = Some(decode::surveillance_status(&bytes));
                 if df == 21 && bytes.len() == 14 {
                     f.comm_b = decode::bds_infer(&bytes[4..11]);
                 }
+            }
+            // Comm-D Extended Length Message (DF24–27): the ELM control
+            // bit, D-segment number, and 80-bit message segment.
+            24..=27 => {
+                f.comm_b = decode::comm_d(&bytes);
             }
             _ => {}
         }
@@ -263,6 +302,8 @@ impl FrameValidator {
             if df == 18 {
                 tag_df18_source(&mut f);
             }
+        } else if df == 19 {
+            f.adsb_status = Some(decode::military_es(bytes));
         }
         Some(f)
     }
@@ -479,6 +520,77 @@ mod tests {
         assert_eq!(st["nac_v"], 0);
         assert_eq!(st["vertical_rate_source"], "gnss");
         assert_eq!(st["geo_minus_baro_ft"], 550);
+    }
+
+    /// Hex → variable-length frame bytes.
+    fn hex_frame(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn df4_surveillance_status_emitted_for_known_icao() {
+        // CRC-valid DF4 reply address-overlaid with 40621D (pyModeS
+        // decode() → FS 2 / DR 3 / UM 5). Accepted once that ICAO is
+        // confirmed from squitters; FS/DR/UM land in adsb_status.
+        let mut v = FrameValidator::new();
+        // POS_FRAME confirms ICAO 40621D.
+        confirmed(&mut v, &POS_FRAME);
+        let f = v.validate(&hex_frame("2218A190EAA749"), -20.0, 0).expect("DF4 accepted");
+        assert_eq!(f.df, 4);
+        assert_eq!(f.icao, 0x40621D);
+        let st = f.adsb_status.expect("surveillance status present");
+        assert_eq!(st["flight_status"], 2);
+        assert_eq!(st["alert"], true);
+        assert_eq!(st["downlink_request"], 3);
+        assert_eq!(st["utility_message"], 5);
+    }
+
+    #[test]
+    fn df19_military_es_decodes_with_confirmation() {
+        // CRC-clean DF19 (clean PI parity, AA = ABCDEF), AF=0 with a TC=4
+        // ME. Two-sighting confirmation, then the military source tag and
+        // embedded ME type code are surfaced.
+        let mut v = FrameValidator::new();
+        let frame = hex_frame("98ABCDEF202CC371C32CE0FC7172");
+        assert!(v.validate(&frame, -20.0, 0).is_none(), "first held");
+        let f = v.validate(&frame, -20.0, 1).expect("confirmed");
+        assert_eq!(f.df, 19);
+        assert_eq!(f.icao, 0xABCDEF);
+        let st = f.adsb_status.expect("military tag present");
+        assert_eq!(st["source"], "military");
+        assert_eq!(st["af"], 0);
+        assert_eq!(st["me_type_code"], 4);
+        // The held first frame was released with the same decode.
+        assert_eq!(v.released.len(), 1);
+        assert_eq!(v.released[0].1.adsb_status.as_ref().unwrap()["source"], "military");
+    }
+
+    #[test]
+    fn df24_comm_d_elm_decoded_for_known_icao() {
+        // CRC-valid DF24 Comm-D ELM address-overlaid with 40621D (KE=0,
+        // ND=5, MD 11..AA). Accepted once 40621D is confirmed.
+        let mut v = FrameValidator::new();
+        confirmed(&mut v, &POS_FRAME);
+        let f = v
+            .validate(&hex_frame("C5112233445566778899AA622DA2"), -20.0, 0)
+            .expect("DF24 accepted");
+        assert_eq!(f.df, 24);
+        assert_eq!(f.icao, 0x40621D);
+        let cd = f.comm_b.expect("comm-d present");
+        assert_eq!(cd["ke"], 0);
+        assert_eq!(cd["segment_number"], 5);
+        assert_eq!(cd["comm_d_segment"], "112233445566778899aa");
+    }
+
+    #[test]
+    fn df24_rejected_for_unknown_icao() {
+        // Without a confirmed ICAO the Comm-D ELM has no verifiable
+        // address and must be dropped (address-overlaid parity).
+        let mut v = FrameValidator::new();
+        assert!(v.validate(&hex_frame("C5112233445566778899AA622DA2"), -20.0, 0).is_none());
     }
 
     #[test]

@@ -406,6 +406,99 @@ pub fn df18_cf_class(cf: u8) -> (&'static str, &'static str, &'static str) {
     }
 }
 
+/// Flight-status (FS) decode for the surveillance / Comm-B replies
+/// (DF4/5/20/21, frame bits 5–7). Returns `(alert, spi, on_ground, text)`
+/// per the ICAO Annex 10 Vol IV FS table as tabulated by readsb / pyModeS
+/// (`surv._FLIGHT_STATUS_TEXT`) and rs1090 (`FlightStatus`): 0 airborne /
+/// 1 on-ground (no alert, no SPI); 2 airborne / 3 on-ground (alert);
+/// 4 alert + SPI; 5 SPI (airborne or ground, no alert); 6/7 reserved. For
+/// codes 4–7 the air/ground state is not encoded (`on_ground` = false).
+pub fn flight_status(fs: u32) -> (bool, bool, bool, &'static str) {
+    match fs {
+        0 => (false, false, false, "no alert, no SPI, airborne"),
+        1 => (false, false, true, "no alert, no SPI, on ground"),
+        2 => (true, false, false, "alert, no SPI, airborne"),
+        3 => (true, false, true, "alert, no SPI, on ground"),
+        4 => (true, true, false, "alert, SPI, airborne or on ground"),
+        5 => (false, true, false, "no alert, SPI, airborne or on ground"),
+        _ => (false, false, false, "reserved"),
+    }
+}
+
+/// Surveillance-status object for a DF4/5/20/21 reply: the flight-status
+/// flags (alert / SPI / on-ground) plus the Downlink-Request (DR, frame
+/// bits 8–12) and Utility-Message (UM, frame bits 13–18) fields. Layout
+/// per ICAO Annex 10 Vol IV §3.1.2.6.5 as decoded by pyModeS `surv` and
+/// rs1090. `frame` is the whole 56/112-bit reply; only its first three
+/// bytes are read.
+pub fn surveillance_status(frame: &[u8]) -> serde_json::Value {
+    let bit = |i: usize| ((frame[i / 8] >> (7 - i % 8)) & 1) as u32;
+    let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+    let fs = field(5, 3);
+    let (alert, spi, on_ground, text) = flight_status(fs);
+    serde_json::json!({
+        "flight_status": fs,
+        "flight_status_text": text,
+        "alert": alert,
+        "spi": spi,
+        "on_ground": on_ground,
+        "downlink_request": field(8, 5),
+        "utility_message": field(13, 6),
+    })
+}
+
+/// Comm-D Extended Length Message (DF 24–27, frame top two bits = 0b11).
+/// Layout per ICAO Annex 10 Vol IV §3.1.2.7.3 as decoded by rs1090
+/// (`CommDExtended`): a spare bit (frame bit 2), the ELM control bit KE
+/// (bit 3: 0 = downlink-ELM transmission, 1 = uplink-ELM acknowledgement),
+/// the 4-bit D-segment number ND (bits 4–7), and the 80-bit (10-byte)
+/// Comm-D message segment MD (frame bytes 1–10). The 24-bit address/parity
+/// is overlaid (handled by the caller's ICAO cache). `frame` is the full
+/// 14-byte reply.
+pub fn comm_d(frame: &[u8]) -> Option<serde_json::Value> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let ke = (frame[0] >> 4) & 1; // frame bit 3
+    let nd = (frame[0] & 0x0F) as u32; // ND = bits 4–7
+    let md: Vec<u8> = frame[1..11].to_vec();
+    Some(serde_json::json!({
+        "elm_control": if ke == 1 { "uplink_ack" } else { "downlink_tx" },
+        "ke": ke,
+        "segment_number": nd,
+        "comm_d_segment": hex_bytes(&md),
+    }))
+}
+
+/// Lowercase hex string of a byte slice (for the Comm-D MD segment).
+fn hex_bytes(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push(char::from_digit((x >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((x & 0xF) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// DF19 Extended Squitter, Military Application (ICAO Annex 10 Vol IV
+/// §3.1.2.8.8). The Application Field AF (frame bits 5–7) selects the
+/// (largely reserved / non-public) sub-format; AF = 0 carries an
+/// ADS-B-formatted ME field. Returns the AF value and, for AF = 0, the
+/// embedded ME type code so downstream sees the same extended-squitter
+/// payload it would for DF17/18. `frame` is the full 14-byte reply.
+pub fn military_es(frame: &[u8]) -> serde_json::Value {
+    let af = (frame[0] & 0x07) as u32;
+    let mut o = serde_json::Map::new();
+    o.insert("source".into(), serde_json::json!("military"));
+    o.insert("af".into(), serde_json::json!(af));
+    if af == 0 && frame.len() >= 11 {
+        // AF=0: an ADS-B-formatted ME field at bytes 4..11.
+        let tc = frame[4] >> 3;
+        o.insert("me_type_code".into(), serde_json::json!(tc));
+    }
+    serde_json::Value::Object(o)
+}
+
 /// 13-bit Mode S altitude field (AC, DF0/4/16/20): M-bit metric flag,
 /// Q-bit 25 ft, else 100 ft Gillham. The Gillham branch routes through the
 /// dump1090-verified Mode A/C ladder ([`crate::mode_ac::gillham_ac13_ft`]),
@@ -447,7 +540,7 @@ pub fn altitude12(ac12: u32) -> Option<i32> {
 /// integer count of metres, converted to feet. pyModeS `bds05`
 /// (`int(ac * 3.28084)`). `None` for a zero field (not available).
 pub fn gnss_height_ft(ac12: u32) -> Option<i32> {
-    (ac12 != 0).then(|| (ac12 as f64 * 3.28084) as i32)
+    (ac12 != 0).then_some((ac12 as f64 * 3.28084) as i32)
 }
 
 /// 13-bit identity field (DF5/21) → 4-digit squawk. Bit order (MSB
@@ -777,6 +870,74 @@ mod tests {
         assert_eq!(gnss_height_ft(3000), Some(9842));
         assert_eq!(gnss_height_ft(1000), Some(3280));
         assert_eq!(gnss_height_ft(0), None);
+    }
+
+    /// Full 14- or 7-byte frame from a hex string.
+    fn frame_of(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn flight_status_table_matches_pymodes_rs1090() {
+        // pyModeS surv._FLIGHT_STATUS_TEXT / rs1090 FlightStatus.
+        assert_eq!(flight_status(0), (false, false, false, "no alert, no SPI, airborne"));
+        assert_eq!(flight_status(1), (false, false, true, "no alert, no SPI, on ground"));
+        assert_eq!(flight_status(2), (true, false, false, "alert, no SPI, airborne"));
+        assert_eq!(flight_status(3), (true, false, true, "alert, no SPI, on ground"));
+        assert_eq!(flight_status(4).0, true); // alert
+        assert_eq!(flight_status(4).1, true); // SPI
+        assert_eq!(flight_status(5).1, true); // SPI only
+        assert_eq!(flight_status(5).0, false);
+        assert_eq!(flight_status(6).3, "reserved");
+        assert_eq!(flight_status(7).3, "reserved");
+    }
+
+    #[test]
+    fn surveillance_status_matches_pymodes_surv() {
+        // Oracle: pyModeS decode() on CRC-valid address-overlaid replies
+        // (ICAO 40621D). DF4 2218A190EAA749 → FS 2 / DR 3 / UM 5; DF5
+        // 2C085234201FDB → FS 4 / DR 1 / UM 2.
+        let s = surveillance_status(&frame_of("2218A190EAA749"));
+        assert_eq!(s["flight_status"], 2);
+        assert_eq!(s["alert"], true);
+        assert_eq!(s["spi"], false);
+        assert_eq!(s["on_ground"], false);
+        assert_eq!(s["downlink_request"], 3);
+        assert_eq!(s["utility_message"], 5);
+        let s2 = surveillance_status(&frame_of("2C085234201FDB"));
+        assert_eq!(s2["flight_status"], 4);
+        assert_eq!(s2["alert"], true);
+        assert_eq!(s2["spi"], true);
+        assert_eq!(s2["downlink_request"], 1);
+        assert_eq!(s2["utility_message"], 2);
+    }
+
+    #[test]
+    fn comm_d_decodes_elm_segment() {
+        // Spec-derived (ICAO Annex 10 Vol IV §3.1.2.7.3 / rs1090
+        // CommDExtended layout): DF24, KE=0 (downlink), ND=5, MD bytes
+        // 11..AA. CRC-valid with address-overlaid parity (ICAO 40621D).
+        let v = comm_d(&frame_of("C5112233445566778899AA622DA2")).unwrap();
+        assert_eq!(v["ke"], 0);
+        assert_eq!(v["elm_control"], "downlink_tx");
+        assert_eq!(v["segment_number"], 5);
+        assert_eq!(v["comm_d_segment"], "112233445566778899aa");
+    }
+
+    #[test]
+    fn military_es_tags_source_and_me_typecode() {
+        // DF19 AF=0 carries an ADS-B-formatted ME (here TC=4).
+        let v = military_es(&frame_of("98ABCDEF202CC371C32CE0FC7172"));
+        assert_eq!(v["source"], "military");
+        assert_eq!(v["af"], 0);
+        assert_eq!(v["me_type_code"], 4);
+        // AF≠0: source/af only, no ME type code (non-public sub-format).
+        let v2 = military_es(&frame_of("9AABCDEF00000000000000000000"));
+        assert_eq!(v2["af"], 2);
+        assert!(v2.get("me_type_code").is_none());
     }
 
     #[test]
