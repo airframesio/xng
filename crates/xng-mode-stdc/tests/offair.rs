@@ -39,4 +39,11 @@ fn decodes_real_egc_frame() {
     // STDC-7: frame number → UTC-of-day (5987 × 8.64 = 51727 s → 14:22:07).
     assert_eq!(bb.details["utc_time"], "14:22:07");
     assert!(packets.iter().any(|p| p.name == "announcement" && p.checksum_ok));
+    // STDC-3: the real 0x6C signalling-channel packet decodes its uplink
+    // channel word (0x2748) to 1636.64 MHz, inside the L-band uplink band.
+    let sc = packets
+        .iter()
+        .find(|p| p.name == "signalling-channel")
+        .expect("signalling-channel present");
+    assert_eq!(sc.details["uplink_mhz"], 1636.64);
 }

@@ -46,6 +46,25 @@ pub struct StdcPacket {
     pub raw: Vec<u8>,
 }
 
+/// L-band uplink (ship→LES) centre frequency in MHz from a 16-bit
+/// channel-number word. Per docs/notes/STDC.md (matches inmarsatc
+/// `uplinkChannelMhz`): MHz = (word − 6000) × 0.0025 + 1626.5.
+pub fn uplink_mhz(channel_word: u16) -> f64 {
+    (channel_word as f64 - 6000.0) * 0.0025 + 1626.5
+}
+
+/// L-band downlink (LES→ship) centre frequency in MHz from a 16-bit
+/// channel-number word. Per docs/notes/STDC.md (matches inmarsatc
+/// `downlinkChannelMhz`): MHz = (word − 8000) × 0.0025 + 1530.5.
+pub fn downlink_mhz(channel_word: u16) -> f64 {
+    (channel_word as f64 - 8000.0) * 0.0025 + 1530.5
+}
+
+/// Round a channel frequency to 4 decimals (0.1 kHz) for stable JSON.
+fn round4(mhz: f64) -> f64 {
+    (mhz * 1e4).round() / 1e4
+}
+
 fn sat_les(b: u8) -> serde_json::Value {
     let region = ["AOR-W", "AOR-E", "POR", "IOR"][(b >> 6) as usize];
     json!({ "region": region, "les": (b >> 6) as u16 * 100 + (b & 0x3F) as u16 })
@@ -392,6 +411,13 @@ impl PacketParser {
             0xA8 => ("confirmation", None, json!({})),
             0xAB => ("les-list", None, json!({})),
             0x08 => ("ack-request", None, json!({})),
+            0x6C if body.len() >= 4 => {
+                // body[2..4] = uplink channel-number word (inmarsatc 6C).
+                let word = u16::from_be_bytes([body[2], body[3]]);
+                ("signalling-channel", None, json!({
+                    "uplink_mhz": round4(uplink_mhz(word)),
+                }))
+            }
             0x6C => ("signalling-channel", None, json!({})),
             0x2A => ("inbound-message-ack", None, json!({})),
             0x91 => ("distress-alert-ack", None, json!({})),
@@ -677,6 +703,35 @@ mod tests {
             e.details["service_long"],
             "SafetyNET, NAVAREA/METAREA Warning, MET Forecast or Piracy Warning to NAVAREA/METAREA"
         );
+    }
+
+    #[test]
+    fn channel_frequency_formula_matches_oracle() {
+        // STDC-3: formula constants verified against inmarsatc
+        // uplinkChannelMhz/downlinkChannelMhz (docs/notes/STDC.md).
+        // Word 6000 → band edge 1626.5; word 8000 → band edge 1530.5.
+        assert!((uplink_mhz(6000) - 1626.5).abs() < 1e-9);
+        assert!((downlink_mhz(8000) - 1530.5).abs() < 1e-9);
+        // The off-air 0x6C packet carries uplink word 0x2748 = 10056,
+        // which lands at 1636.64 MHz — inside the Inmarsat-C L-band
+        // uplink range 1626.5–1646.5 MHz.
+        let f = uplink_mhz(0x2748);
+        assert!((f - 1636.64).abs() < 1e-6, "got {f}");
+        assert!((1626.5..=1646.5).contains(&f));
+        // A representative downlink word stays in the 1530.5–1545 band.
+        assert!((1530.5..=1545.0).contains(&downlink_mhz(8400)));
+    }
+
+    #[test]
+    fn signalling_channel_surfaces_uplink_mhz() {
+        let mut p = PacketParser::new();
+        // Reproduce the off-air 0x6C body bytes (uplink word 0x2748).
+        let pkt = build_packet(&[0x6C, 0xB4, 0x27, 0x48, 0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = p.parse_frame(&frame);
+        let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
+        assert_eq!(sc.details["uplink_mhz"], 1636.64);
     }
 
     #[test]
