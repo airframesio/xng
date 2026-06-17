@@ -338,12 +338,27 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     if let Some(p) = g("pages").and_then(|v| v.as_array()) {
                         s.push_str(&format!(" pages={}", p.len()));
                     }
+                    // Recovered plaintext credentials (PPP-PAP / HTTP Basic-Auth).
+                    if let Some(creds) = g("credentials").and_then(|v| v.as_array()).filter(|a| !a.is_empty()) {
+                        if let Some(u) = creds[0].get("username").and_then(|v| v.as_str()) {
+                            s.push_str(&format!(" creds={u}/****"));
+                        }
+                    }
                     s
                 }
                 MessageBody::Aero { kind, details } => {
                     let mut s = format!("AERO {kind}");
                     if let Some(svc) = details.get("service").and_then(|v| v.as_str()) {
                         s.push_str(&format!(" {svc}"));
+                    }
+                    if let Some(ev) = details.get("event").and_then(|v| v.as_str()) {
+                        s.push_str(&format!(" {ev}"));
+                    }
+                    if let Some(sat) = details.get("satellite_id").and_then(|v| v.as_u64()) {
+                        s.push_str(&format!(" sat={sat}"));
+                        if let Some(lon) = details.get("longitude_deg").and_then(|v| v.as_f64()) {
+                            s.push_str(&format!("@{lon:.1}°"));
+                        }
                     }
                     if let (Some(aes), Some(ges)) = (
                         details.get("aes_id").and_then(|v| v.as_str()),
@@ -381,6 +396,9 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     if let Some(nr) = details.pointer("/control/nr").and_then(|v| v.as_u64()) {
                         s.push_str(&format!(" nr={nr}"));
                     }
+                    if details.get("frmr").is_some() {
+                        s.push_str(" FRMR");
+                    }
                     if let Some(p) = details.get("protocol").and_then(|v| v.as_str()) {
                         s.push_str(&format!(" [{p}]"));
                     }
@@ -403,7 +421,7 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                 }
                 MessageBody::Hfdl { kind, details } => {
                     let mut s = format!("HFDL {kind}");
-                    for key in ["gs_id", "flight", "icao", "frame_index"] {
+                    for key in ["gs_id", "flight", "icao", "frame_index", "flight_leg", "freq_search_cnt", "reason_text"] {
                         if let Some(v) = details.get(key) {
                             s.push_str(&format!(" {key}={v}"));
                         }
@@ -424,6 +442,15 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     if !pri.is_empty() {
                         s.push_str(&format!(" [{pri}]"));
+                    }
+                    if let Some(u) = details.get("utc_time").and_then(|v| v.as_str()) {
+                        s.push_str(&format!(" {u}"));
+                    }
+                    if let Some(les) = details.get("les_name").and_then(|v| v.as_str()) {
+                        s.push_str(&format!(" LES={les}"));
+                    }
+                    if let Some(shape) = details.pointer("/area/shape").and_then(|v| v.as_str()) {
+                        s.push_str(&format!(" area={shape}"));
                     }
                     if let Some(t) = text {
                         s.push_str(&format!(" | {}", t.replace('\n', "·")));

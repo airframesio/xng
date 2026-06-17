@@ -731,6 +731,13 @@ function render() {
         ['speed', a.spd != null ? `${a.spd} kt` : null],
         ['track', a.trk != null ? `${a.trk}&deg;` : null],
         ['squawk', a.squawk && escapeHtml(String(a.squawk))],
+        ['sel alt', a.sel_alt != null ? `${a.sel_alt} ft` : null],
+        ['ADS-B', a.adsb_version != null ? `v${a.adsb_version}` : null],
+        ['NACp/SIL', (a.nacp != null || a.sil != null) ? `${a.nacp ?? '-'} / ${a.sil ?? '-'}` : null],
+        ['wind/OAT', (a.wind_kt != null || a.oat_c != null)
+          ? `${a.wind_kt != null ? a.wind_kt + ' kt' : ''}${a.wind_kt != null && a.oat_c != null ? ', ' : ''}${a.oat_c != null ? a.oat_c + '&deg;C' : ''}` : null],
+        ['ACAS RA', a.acas_ra ? 'ACTIVE' : null],
+        ['EMERGENCY', a.emergency ? escapeHtml(String(a.emergency)) : null],
         ['msgs', a.msgs],
         ['seen', `${fmtAge(s.now - a.seen)} ago`],
       ]);
@@ -747,6 +754,7 @@ function render() {
       ['speed', v.sog != null ? `${v.sog} kt` : null],
       ['course', v.cog != null ? `${v.cog}&deg;` : null],
       ['type', v.type != null ? `msg ${v.type}` : null],
+      ['DISTRESS', v.distress && escapeHtml(String(v.distress))],
       ['seen', `${fmtAge(s.now - v.seen)} ago`],
     ]);
     const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog, v.shiptype), label, popup, v.trail, sm.color);
