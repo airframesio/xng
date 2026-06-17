@@ -67,7 +67,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
 | Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD (multi-packet Layer-B reassembly for long messages)**, **pager messages (IMS) with multi-part reassembly**, **voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction**, **IP-channel frames (IIP ARQ / IIQ / IIR)**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle; on a shared 300 s off-air capture xng decodes **758 CRC-OK IDA frames vs gr-iridium's 573 (132 %)** — see [Benchmarks](#benchmarks) |
 | AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
-| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), single-bit CRC repair, per-aircraft tracking, **SBS + Beast outputs**; any rate ≥ 2 MS/s including **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
+| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), **operational status** (ADS-B version + NACp/SIL/NIC-supplement/GVA accuracy) and **emergency/priority status**, single-bit CRC repair, per-aircraft tracking, **SBS + Beast outputs**; any rate ≥ 2 MS/s including **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
 
 All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
@@ -335,6 +335,16 @@ mode = "vdl2"
 A full example config and a hardened systemd unit live in
 [`contrib/`](contrib/). Sessions can also replay IQ files (`file =`
 instead of `sdr =`) — useful for regression runs over recorded nights.
+
+Airframes feeding is per-decoder. `feed-airframes = true` keeps the
+classic behavior (ACARS to `feed.airframes.io:5550`); an optional
+`[outputs.airframes]` block adds finer control — set a per-mode station id
+(or `auto-suffix = true` to derive `…-ACARS` / `-VDL2` / `-HFDL` / `-AIS`
+from a base id, each routed to that mode's own Airframes ingest in its
+native format), disable feeding for one decoder with `feed = false` on its
+`[[session]]`, or override a decoder's id with `airframes-station-id`.
+The multiplexed **asf-2.0** feed carries every mode separately under the
+canonical station id and is independent of this per-port path.
 
 `xng status` prints a live per-session table for a running station
 (querying its dashboard endpoint, default `127.0.0.1:8080`, or
