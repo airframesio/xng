@@ -149,3 +149,117 @@ altitude 16992 ft MCP/FCU, QNH 1012.8 mbar, heading 66.8°, AP/VNAV/LNAV
 engaged) — facts/positions only, no code ported; that real vector and its
 expected values are vendored as the `decode.rs` unit test. Emitted under
 `adsb_status` with `subtype: "target_state"`.
+
+## Accuracy / integrity — NUCp / NIC / NACv / SDA (2026-06)
+
+The version-dependent ADS-B quality layer (`decode::nuc_p` / `nic_v1` /
+`nic_v2` / `nac_v_hfom_mps` / `position_quality`, plus the new `Velocity`
+NACv / VR-source / GNSS-minus-baro fields and the TC31 NIC-supplement-C /
+SDA / HRD additions). Lookup-table values and the resolution procedure
+are ICAO Annex 10 Vol IV / DO-260A/B as tabulated in pyModeS
+`uncertainty.py` (`TC_NUCp_lookup`, `TC_NICv1_lookup`, `TC_NICv2_lookup`,
+`NUCp`, `NACv`) and decoded by its `nuc_p` / `nic_v1` / `nic_v2` / `nac_v`
+functions; the velocity trailer (NACv at ME 10–12, vertical-rate source
+bit 35 = GNSS/baro, GNSS-minus-baro at ME 48–55 `(mag−1)·25 ft`, N/A at 0
+or 127) is the pyModeS `bds09` layout; the TC31 operational-status NICb/c
+supplement positions (NICa = ME 43, NICc = ME 19) follow pyModeS
+`nic_a_c`, and SDA = the low two bits of the 16-bit operational-mode field
+(ME 38–39) follows the rs1090 `bds65` `OperationalMode` layout — facts and
+table values only, no code ported. Verification (external, not loopback):
+the published pyModeS `test_adsb` NIC golden-vector set (twelve frames
+`8D3C70A3…`→0 … `8D3C4ACF…`→11, two of them supplement-sensitive) is
+vendored as the `nic_v1` unit test; the velocity NACv/VR-source/geo-baro
+asserts are pinned to `pyModeS.decoder.bds.bds09.decode_bds09` outputs
+(e.g. `8D485020…` → nac_v 0 / GNSS / geo_minus_baro 550 ft; `8d3461cf…`
+→ nac_v 1 / baro / 350 ft); the TC31 v2 op-status field positions are
+pinned to `bds65.decode_bds65` on a synthetic v2 payload. NUCp emits on
+every airborne position frame under `adsb_status.nuc_p`; NACv/VR-source/
+geo-baro fold into `adsb_status` on TC19; the version-aware NIC is exposed
+by `position_quality` for a caller that pairs a position TC with the
+aircraft's last operational-status supplement.
+
+## Q=0 Gillham + geometric altitude (ADSB-2, 2026-06)
+
+The airborne-position altitude path was completed: TC 9–18 Q=0 (100-ft
+Gillham) altitude (previously left `None`, only Q=1 25-ft was decoded) and
+TC 20–22 geometric (GNSS) altitude. The Gillham branch of `altitude13`
+(and the new `altitude12`, the M-bit-removed 12-bit ADS-B field) now
+routes through `mode_ac::gillham_ac13_ft`, a port of the documented
+dump1090 `decodeID13Field` → `internalModeAToModeC` ladder
+(`decodeAC13Field` / `decodeAC12Field` Gillham branches). This both
+*corrects a latent off-by-100-ft bug* in the old `gillham`/`gray_reorder`
+helpers (a divergent n100 convention) and adds the ADS-B path — the new
+ladder matches dump1090 AND pyModeS `_altcode.altcode_to_altitude`
+byte-for-byte across all 4096 AC codes (exhaustively cross-checked).
+`gnss_height_ft` follows pyModeS `bds05` (`int(metres·3.28084)`).
+Verification (external, not loopback): `altitude12`/`altitude13` Gillham
+asserts use AC fields whose pyModeS `decode()` altitude was confirmed on
+CRC-valid DF17 frames (`8D40621D582482B5…` → 5000 ft Q=0, plus 4800/5800);
+Q=1 asserts reuse the published pyModeS `test_adsb` altitude vectors
+(38000, −325, 1000 ft); `gnss_height_ft` is pinned to a pyModeS-decoded
+TC20 frame (3000 m → 9842 ft); `mode_ac::gillham_ac13_ft` is pinned to the
+dump1090/pyModeS ladder. Barometric altitude continues to populate
+`altitude_ft`; geometric altitude is surfaced under
+`adsb_status.geometric_altitude_ft` (it is HAE, not barometric). The
+vertical-rate source bit and the GNSS-minus-baro difference (the rest of
+ADSB-2) were delivered with the velocity trailer in ADSB-1.5 above.
+
+## DF coverage — DF19 / DF24-27 / FS-DR-UM (ADSB-4, 2026-06)
+
+Three downlink-format extensions:
+
+- **FS/DR/UM surveillance header** (`decode::flight_status` /
+  `surveillance_status`) for DF4/5/20/21: flight status (frame bits 5–7 →
+  alert / SPI / on-ground flags + text), downlink request (DR, bits 8–12),
+  utility message (UM, bits 13–18). Layout and the FS code table are ICAO
+  Annex 10 Vol IV §3.1.2.6.5 as decoded by pyModeS `surv`
+  (`_FLIGHT_STATUS_TEXT`) and rs1090 (`FlightStatus`). Verified against
+  pyModeS `decode()` on CRC-valid address-overlaid replies (`2218A190…`
+  → FS 2 / DR 3 / UM 5; `2C085234…` → FS 4 / DR 1 / UM 2). Emitted under
+  `adsb_status` on DF4/5/20/21 (DF0/16 carry no FS header and are left
+  unchanged).
+- **DF19 Extended Squitter, Military Application**
+  (`decode::military_es`): clean-PI parity with the address in the AA
+  field (identical framing to DF17/18, same two-sighting confirmation).
+  The Application Field AF (frame bits 5–7) is surfaced; AF=0 carries an
+  ADS-B-formatted ME whose type code is exposed. Layout per ICAO Annex 10
+  Vol IV §3.1.2.8.8 / rs1090 `ExtendedSquitterMilitary`. Verified on a
+  CRC-clean AF=0 DF19 frame (`98ABCDEF…` → source military, AF 0, ME
+  TC 4). Emitted under `adsb_status`.
+- **DF24-27 Comm-D Extended Length Message** (`decode::comm_d`):
+  address-overlaid parity (accepted only for a cache-confirmed ICAO, as
+  for DF20/21), always 112-bit. Decodes the ELM control bit KE (frame
+  bit 3: downlink-tx / uplink-ack), the 4-bit D-segment number ND (bits
+  4–7), and the 80-bit message segment MD (bytes 1–10). Layout is ICAO
+  Annex 10 Vol IV §3.1.2.7.3 (the rs1090 `CommDExtended` field order);
+  no public single-message oracle exists for Comm-D, so the test vector
+  is a **spec-derived** CRC-valid frame (`C5112233…` → DF24, KE 0, ND 5,
+  MD 11..AA, address-overlaid 40621D) with its address recovery and field
+  positions pinned, clearly documented as spec-derived (not a loopback).
+  Emitted under `comm_b` (the Comm-D message channel).
+
+## rs1090-style density / penalty BDS scoring (ADSB-3.4, 2026-06)
+
+The Comm-B EHS disambiguation in `bds_infer` was upgraded from the brittle
+"exactly one register validates" rule to the rs1090 density + cross-field
+penalty score (`decode::bds_density_score` / `bds_penalty` / `bds_score`).
+The mechanism and all distribution parameters are ported (facts and
+numeric constants only — no code) from rs1090's
+`crates/rs1090/src/decode/bds/density.rs` and `penalty.rs`: each candidate
+register's score is the *mean* of its per-field log-densities under
+Gaussian / Laplace distributions (xoolive calibrated these on a month of
+EUROCONTROL CAT 048 ground truth so that p99 of legitimate scores ≈ −2.0),
+summed with a within-record cross-field penalty (BDS 5,0 `−|TAS−GS|/100`
+and a flat −2.0 for a roll/track-rate turn-sign mismatch; BDS 6,0 a flat
+−3.0 when the IAS/Mach ratio leaves the `[250, 800]` kt atmospheric band).
+A candidate scoring below `DENSITY_THRESHOLD` (−3.0) is rejected; among the
+survivors the highest score wins (stable, EHS-first on ties). This both
+preserves the previous single-match outcomes (regression-tested on the
+BDS 4,0 / 5,0 / 6,0 golden frames) and recovers ambiguous frames the
+exactly-one rule discarded. Format-ID registers (1,0 / 1,7 / 2,0 / 3,0)
+keep their fast-path precedence; the meteorological registers (4,4 / 4,5)
+remain a scored last-resort fallback only when the EHS set is empty.
+Verification (external, not loopback): the scoring helpers are pinned to
+rs1090's own unit-test values — `cruise_bds50_passes` (mean ≈ −0.090),
+`slow_bds60_fails` (mean below −3.0), `density_at_centre_is_zero`, and the
+penalty relations (|TAS−GS|/100, turn-sign −2.0, IAS/Mach −3.0).

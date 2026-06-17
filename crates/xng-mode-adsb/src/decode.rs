@@ -109,6 +109,14 @@ pub struct Velocity {
     pub airspeed: bool,
     /// Feet per minute, positive up.
     pub vertical_rate_fpm: Option<i32>,
+    /// NACv — Navigation Accuracy Category, velocity (ME bits 10–12).
+    pub nac_v: u8,
+    /// Vertical-rate source: `false` = GNSS (geometric), `true` =
+    /// barometric (ME bit 35; airborne velocity only).
+    pub vr_baro_source: bool,
+    /// GNSS-height minus barometric-altitude difference, feet (ME bits
+    /// 48–55; airborne velocity only). `None` when not available.
+    pub geo_minus_baro_ft: Option<i32>,
 }
 
 /// Decode a TC 19 velocity ME field (7 bytes).
@@ -150,12 +158,29 @@ pub fn velocity(me: &[u8]) -> Option<Velocity> {
         }
         _ => return None,
     };
+    let nac_v = field(10, 3) as u8;
+    let vr_baro_source = bit(35) == 1;
     let vr_raw = field(37, 9);
     let vertical_rate_fpm = (vr_raw != 0).then(|| {
         let v = (vr_raw as i32 - 1) * 64;
         if bit(36) == 1 { -v } else { v }
     });
-    Some(Velocity { speed_kt, track_deg, airspeed, vertical_rate_fpm })
+    // GNSS-minus-baro: sign bit 48, magnitude bits 49–55; 0 and 127 mean
+    // "not available" (pyModeS `bds09`).
+    let diff_mag = field(49, 7);
+    let geo_minus_baro_ft = (diff_mag != 0 && diff_mag != 127).then(|| {
+        let v = (diff_mag as i32 - 1) * 25;
+        if bit(48) == 1 { -v } else { v }
+    });
+    Some(Velocity {
+        speed_kt,
+        track_deg,
+        airspeed,
+        vertical_rate_fpm,
+        nac_v,
+        vr_baro_source,
+        geo_minus_baro_ft,
+    })
 }
 
 /// Ground speed (knots) from a TC 5–8 surface 7-bit Movement code. `None`
@@ -196,7 +221,16 @@ pub fn surface_velocity(me: &[u8]) -> Option<Velocity> {
         return None; // ground track not valid
     }
     let track_deg = field(13, 7) as f64 * 360.0 / 128.0;
-    Some(Velocity { speed_kt, track_deg, airspeed: false, vertical_rate_fpm: None })
+    // Surface velocity carries no NACv / VR-source / geo-baro fields.
+    Some(Velocity {
+        speed_kt,
+        track_deg,
+        airspeed: false,
+        vertical_rate_fpm: None,
+        nac_v: 0,
+        vr_baro_source: false,
+        geo_minus_baro_ft: None,
+    })
 }
 
 /// Decode a TC 31 Aircraft Operational Status ME field (7 bytes) into the
@@ -205,10 +239,16 @@ pub fn surface_velocity(me: &[u8]) -> Option<Velocity> {
 /// integrity. Returns `None` for a non-TC31 field.
 ///
 /// ME-relative, 0-indexed bit positions (per "The 1090 MHz Riddle" §6 and
-/// pyModeS `bds65`): subtype 5–7, version 40–42, NIC-supplement-A 43,
-/// NACp 44–47, GVA 48–49, SIL 50–51, NICbaro 52, SIL-supplement 54. NACp/
-/// SIL/NIC-supplement were introduced in version 1; the SIL supplement in
-/// version 2.
+/// pyModeS `bds65`): subtype 5–7, operational-mode 24–39 (its low two bits
+/// 38–39 are SDA, the rs1090 `bds65` layout), version 40–42,
+/// NIC-supplement-A 43 (= NICa), NACp 44–47, GVA 48–49, SIL 50–51,
+/// NICbaro 52, HRD 53, SIL-supplement 54. NIC-supplement-C is carried at
+/// ME bit 19 (pyModeS `nic_a_c`, `msgbin[51]`). NACp/SIL/NIC-supplement
+/// were introduced in version 1; SDA and the SIL supplement in version 2.
+///
+/// The emitted NIC-supplement bits (`nic_supp_a` / `nic_supp_c`) are the
+/// per-aircraft state a position decoder pairs with a TC's own type code
+/// to resolve the version-aware NIC (see [`nic_v1`] / [`nic_v2`]).
 pub fn operational_status(me: &[u8]) -> Option<serde_json::Value> {
     let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
     let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
@@ -222,14 +262,21 @@ pub fn operational_status(me: &[u8]) -> Option<serde_json::Value> {
     o.insert("version".into(), serde_json::json!(version));
     if version >= 1 {
         o.insert("nic_supp_a".into(), serde_json::json!(bit(43)));
+        // NIC-supplement-C (airborne) / -B disambiguation bit at ME 19.
+        o.insert("nic_supp_c".into(), serde_json::json!(bit(19)));
         o.insert("nac_p".into(), serde_json::json!(field(44, 4)));
         o.insert("sil".into(), serde_json::json!(field(50, 2)));
+        // HRD — heading reference (0 = true north, 1 = magnetic north).
+        o.insert("hrd".into(), serde_json::json!(bit(53)));
         if subtype == 0 {
             o.insert("gva".into(), serde_json::json!(field(48, 2)));
             o.insert("baro_alt_integrity".into(), serde_json::json!(bit(52)));
         }
         if version >= 2 {
             o.insert("sil_supplement".into(), serde_json::json!(bit(54)));
+            // SDA — system design assurance, the low 2 bits of the
+            // operational-mode field (ME 38–39).
+            o.insert("sda".into(), serde_json::json!(field(38, 2)));
         }
     }
     Some(serde_json::Value::Object(o))
@@ -359,8 +406,104 @@ pub fn df18_cf_class(cf: u8) -> (&'static str, &'static str, &'static str) {
     }
 }
 
+/// Flight-status (FS) decode for the surveillance / Comm-B replies
+/// (DF4/5/20/21, frame bits 5–7). Returns `(alert, spi, on_ground, text)`
+/// per the ICAO Annex 10 Vol IV FS table as tabulated by readsb / pyModeS
+/// (`surv._FLIGHT_STATUS_TEXT`) and rs1090 (`FlightStatus`): 0 airborne /
+/// 1 on-ground (no alert, no SPI); 2 airborne / 3 on-ground (alert);
+/// 4 alert + SPI; 5 SPI (airborne or ground, no alert); 6/7 reserved. For
+/// codes 4–7 the air/ground state is not encoded (`on_ground` = false).
+pub fn flight_status(fs: u32) -> (bool, bool, bool, &'static str) {
+    match fs {
+        0 => (false, false, false, "no alert, no SPI, airborne"),
+        1 => (false, false, true, "no alert, no SPI, on ground"),
+        2 => (true, false, false, "alert, no SPI, airborne"),
+        3 => (true, false, true, "alert, no SPI, on ground"),
+        4 => (true, true, false, "alert, SPI, airborne or on ground"),
+        5 => (false, true, false, "no alert, SPI, airborne or on ground"),
+        _ => (false, false, false, "reserved"),
+    }
+}
+
+/// Surveillance-status object for a DF4/5/20/21 reply: the flight-status
+/// flags (alert / SPI / on-ground) plus the Downlink-Request (DR, frame
+/// bits 8–12) and Utility-Message (UM, frame bits 13–18) fields. Layout
+/// per ICAO Annex 10 Vol IV §3.1.2.6.5 as decoded by pyModeS `surv` and
+/// rs1090. `frame` is the whole 56/112-bit reply; only its first three
+/// bytes are read.
+pub fn surveillance_status(frame: &[u8]) -> serde_json::Value {
+    let bit = |i: usize| ((frame[i / 8] >> (7 - i % 8)) & 1) as u32;
+    let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+    let fs = field(5, 3);
+    let (alert, spi, on_ground, text) = flight_status(fs);
+    serde_json::json!({
+        "flight_status": fs,
+        "flight_status_text": text,
+        "alert": alert,
+        "spi": spi,
+        "on_ground": on_ground,
+        "downlink_request": field(8, 5),
+        "utility_message": field(13, 6),
+    })
+}
+
+/// Comm-D Extended Length Message (DF 24–27, frame top two bits = 0b11).
+/// Layout per ICAO Annex 10 Vol IV §3.1.2.7.3 as decoded by rs1090
+/// (`CommDExtended`): a spare bit (frame bit 2), the ELM control bit KE
+/// (bit 3: 0 = downlink-ELM transmission, 1 = uplink-ELM acknowledgement),
+/// the 4-bit D-segment number ND (bits 4–7), and the 80-bit (10-byte)
+/// Comm-D message segment MD (frame bytes 1–10). The 24-bit address/parity
+/// is overlaid (handled by the caller's ICAO cache). `frame` is the full
+/// 14-byte reply.
+pub fn comm_d(frame: &[u8]) -> Option<serde_json::Value> {
+    if frame.len() < 14 {
+        return None;
+    }
+    let ke = (frame[0] >> 4) & 1; // frame bit 3
+    let nd = (frame[0] & 0x0F) as u32; // ND = bits 4–7
+    let md: Vec<u8> = frame[1..11].to_vec();
+    Some(serde_json::json!({
+        "elm_control": if ke == 1 { "uplink_ack" } else { "downlink_tx" },
+        "ke": ke,
+        "segment_number": nd,
+        "comm_d_segment": hex_bytes(&md),
+    }))
+}
+
+/// Lowercase hex string of a byte slice (for the Comm-D MD segment).
+fn hex_bytes(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for &x in b {
+        s.push(char::from_digit((x >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((x & 0xF) as u32, 16).unwrap());
+    }
+    s
+}
+
+/// DF19 Extended Squitter, Military Application (ICAO Annex 10 Vol IV
+/// §3.1.2.8.8). The Application Field AF (frame bits 5–7) selects the
+/// (largely reserved / non-public) sub-format; AF = 0 carries an
+/// ADS-B-formatted ME field. Returns the AF value and, for AF = 0, the
+/// embedded ME type code so downstream sees the same extended-squitter
+/// payload it would for DF17/18. `frame` is the full 14-byte reply.
+pub fn military_es(frame: &[u8]) -> serde_json::Value {
+    let af = (frame[0] & 0x07) as u32;
+    let mut o = serde_json::Map::new();
+    o.insert("source".into(), serde_json::json!("military"));
+    o.insert("af".into(), serde_json::json!(af));
+    if af == 0 && frame.len() >= 11 {
+        // AF=0: an ADS-B-formatted ME field at bytes 4..11.
+        let tc = frame[4] >> 3;
+        o.insert("me_type_code".into(), serde_json::json!(tc));
+    }
+    serde_json::Value::Object(o)
+}
+
 /// 13-bit Mode S altitude field (AC, DF0/4/16/20): M-bit metric flag,
-/// Q-bit 25 ft, else 100 ft Gillham.
+/// Q-bit 25 ft, else 100 ft Gillham. The Gillham branch routes through the
+/// dump1090-verified Mode A/C ladder ([`crate::mode_ac::gillham_ac13_ft`]),
+/// which matches both dump1090 (`decodeAC13Field`) and pyModeS
+/// (`_altcode.altcode_to_altitude`) exactly across all 4096 codes.
 pub fn altitude13(ac: u32) -> Option<i32> {
     if ac == 0 {
         return None;
@@ -374,52 +517,30 @@ pub fn altitude13(ac: u32) -> Option<i32> {
         let n = ((ac & 0x1F80) >> 2) | ((ac & 0x20) >> 1) | (ac & 0x0F);
         return Some(n as i32 * 25 - 1000);
     }
-    gillham(gray_reorder(ac))
+    crate::mode_ac::gillham_ac13_ft(ac)
 }
 
-/// Reorder the interleaved AC bits (C1 A1 C2 A2 C4 A4 [M] B1 [Q] B2 D2
-/// B4 D4) into Gillham D2 D4 A1 A2 A4 B1 B2 B4 C1 C2 C4.
-fn gray_reorder(ac: u32) -> u32 {
-    let b = |k: u32| (ac >> k) & 1; // k = bit from LSB
-    // AC bits, MSB-first positions: C1=12 A1=11 C2=10 A2=9 C4=8 A4=7
-    // M=6 B1=5 Q=4 B2=3 D2=2 B4=1 D4=0
-    let (c1, a1, c2, a2, c4, a4) = (b(12), b(11), b(10), b(9), b(8), b(7));
-    let (b1, b2, d2, b4, d4) = (b(5), b(3), b(2), b(1), b(0));
-    (d2 << 10)
-        | (d4 << 9)
-        | (a1 << 8)
-        | (a2 << 7)
-        | (a4 << 6)
-        | (b1 << 5)
-        | (b2 << 4)
-        | (b4 << 3)
-        | (c1 << 2)
-        | (c2 << 1)
-        | c4
+/// 12-bit ADS-B airborne-position altitude field (TC 9–18): a 13-bit AC
+/// field with the M bit removed (always 0). Q=1 → 25 ft linear; Q=0 →
+/// 100 ft Gillham. Reinserts a zero M bit at position 6 and delegates to
+/// [`altitude13`] — the dump1090 `decodeAC12Field` procedure, which both
+/// dump1090 and pyModeS `bds05` follow. `None` for a zero field or an
+/// invalid Gillham code.
+pub fn altitude12(ac12: u32) -> Option<i32> {
+    if ac12 == 0 {
+        return None;
+    }
+    // Insert a zero M bit at position 6: top 6 bits shift up by one, low 6
+    // bits stay (dump1090 `decodeAC12Field` Gillham branch).
+    let ac13 = ((ac12 & 0x0FC0) << 1) | (ac12 & 0x003F);
+    altitude13(ac13)
 }
 
-/// Gillham (Gray-coded) altitude: 500 ft Gray ladder + reflected 100 ft
-/// subdivision. Input: D2 D4 A1 A2 A4 B1 B2 B4 | C1 C2 C4.
-fn gillham(g: u32) -> Option<i32> {
-    let mut n500 = g >> 3;
-    // Gray → binary.
-    let mut mask = n500 >> 1;
-    while mask != 0 {
-        n500 ^= mask;
-        mask >>= 1;
-    }
-    let mut n100 = match g & 7 {
-        0b001 => 0,
-        0b011 => 1,
-        0b010 => 2,
-        0b110 => 3,
-        0b100 => 4,
-        _ => return None, // 0, 5, 7 invalid
-    };
-    if n500 % 2 == 1 {
-        n100 = 4 - n100; // odd 500 ft rungs count back down
-    }
-    Some(n500 as i32 * 500 + n100 * 100 - 1300)
+/// 12-bit GNSS-height field (TC 20–22 geometric altitude): an unsigned
+/// integer count of metres, converted to feet. pyModeS `bds05`
+/// (`int(ac * 3.28084)`). `None` for a zero field (not available).
+pub fn gnss_height_ft(ac12: u32) -> Option<i32> {
+    (ac12 != 0).then_some((ac12 as f64 * 3.28084) as i32)
 }
 
 /// 13-bit identity field (DF5/21) → 4-digit squawk. Bit order (MSB
@@ -433,6 +554,181 @@ pub fn squawk13(id: u32) -> String {
     let c = (c4 << 2) | (c2 << 1) | c1;
     let d = (d4 << 2) | (d2 << 1) | d1;
     format!("{a}{bq}{c}{d}")
+}
+
+// ── Accuracy / integrity (NUCp / NIC / NACv / SDA) ──────────────────
+// The version-dependent ADS-B quality layer. NUCp is the version-0
+// (DO-260) position uncertainty derived directly from the type code;
+// NIC is the version-1/2 (DO-260A/B) integrity category, which needs
+// the type code *and* the NIC-supplement bits that arrive in a separate
+// TC31 operational-status (and TC9-18 single-bit) message. NACv is the
+// velocity accuracy carried in the TC19 message itself. SDA is the
+// version-2 system-design-assurance from the TC31 operational mode.
+//
+// Lookup tables and the resolution procedure mirror pyModeS
+// `uncertainty.py` (TC_NUCp_lookup / TC_NICv1_lookup / TC_NICv2_lookup)
+// and its `nuc_p` / `nic_v1` / `nic_v2` / `nac_v` decoders — facts and
+// table values only, no code ported; validated field-exact against
+// pyModeS in the tests below (the published NIC golden-vector set).
+
+/// NUCp (Navigation Uncertainty Category — Position), ADS-B version 0,
+/// from the type code. `None` for type codes that carry no position
+/// (i.e. not 5–8, 9–18 barometric, or 20–22 GNSS). pyModeS
+/// `TC_NUCp_lookup`.
+pub fn nuc_p(tc: u8) -> Option<u8> {
+    Some(match tc {
+        5 | 9 | 20 => 9,
+        6 | 10 | 21 => 8,
+        7 | 11 => 7,
+        8 | 12 => 6,
+        13 => 5,
+        14 => 4,
+        15 => 3,
+        16 => 2,
+        17 => 1,
+        18 | 22 => 0,
+        _ => return None,
+    })
+}
+
+/// 95 % horizontal containment radius (metres) for a NUCp value, per
+/// pyModeS `uncertainty.NUCp` (`RCu`). `None` where the category gives no
+/// bound (NUCp 0).
+pub fn nuc_p_rcu_m(nuc_p: u8) -> Option<u32> {
+    Some(match nuc_p {
+        9 => 3,
+        8 => 10,
+        7 => 93,
+        6 => 185,
+        5 => 463,
+        4 => 926,
+        3 => 1852,
+        2 => 9260,
+        1 => 18520,
+        _ => return None,
+    })
+}
+
+/// NIC (Navigation Integrity Category), ADS-B version 1 (DO-260A), from
+/// the type code and the NIC supplement-A bit (the TC31
+/// operational-status supplement). pyModeS `TC_NICv1_lookup` + `nic_v1`.
+/// `None` for non-position type codes.
+pub fn nic_v1(tc: u8, nic_supp_a: u8) -> Option<u8> {
+    let s = nic_supp_a & 1;
+    Some(match tc {
+        5 | 9 | 20 => 11,
+        6 | 10 | 21 => 10,
+        7 => 9,
+        8 | 18 | 22 => 0,
+        11 => if s == 1 { 9 } else { 8 },
+        12 => 7,
+        13 => 6,
+        14 => 5,
+        15 => 4,
+        16 => if s == 1 { 3 } else { 2 },
+        17 => 1,
+        _ => return None,
+    })
+}
+
+/// NIC (Navigation Integrity Category), ADS-B version 2 (DO-260B), from
+/// the type code and the supplement bits NICa (TC31) and NICb/NICc.
+/// pyModeS `TC_NICv2_lookup` + `nic_v2`: airborne TC9-18 select on
+/// `NICa*2 + NICb`, surface TC5-8 on `NICa*2 + NICc`, GNSS TC20-22 force
+/// supplement 0. `None` for a non-position type code or an undefined
+/// (TC, supplement) combination.
+pub fn nic_v2(tc: u8, nic_a: u8, nic_bc: u8) -> Option<u8> {
+    let ns = if (20..=22).contains(&tc) { 0 } else { (nic_a & 1) * 2 + (nic_bc & 1) };
+    Some(match tc {
+        5 | 9 | 20 => 11,
+        6 | 10 | 21 => 10,
+        7 => match ns {
+            2 => 9,
+            0 => 8,
+            _ => return None,
+        },
+        8 => match ns {
+            3 => 7,
+            1 | 2 => 6,
+            0 => 0,
+            _ => return None,
+        },
+        11 => match ns {
+            3 => 9,
+            0 => 8,
+            _ => return None,
+        },
+        12 => 7,
+        13 => 6,
+        14 => 5,
+        15 => 4,
+        16 => match ns {
+            3 => 3,
+            0 => 2,
+            _ => return None,
+        },
+        17 => 1,
+        18 | 22 => 0,
+        _ => return None,
+    })
+}
+
+/// NACv 95 % horizontal velocity figure-of-merit (m/s) for a NACv code,
+/// per pyModeS `uncertainty.NACv` (`HFOMr`). `None` for NACv 0 (unknown
+/// or > 10 m/s).
+pub fn nac_v_hfom_mps(nac_v: u8) -> Option<f64> {
+    Some(match nac_v {
+        1 => 10.0,
+        2 => 3.0,
+        3 => 1.0,
+        4 => 0.3,
+        _ => return None,
+    })
+}
+
+/// Per-fix position-quality object for an airborne / surface position
+/// message (TC 5–8, 9–18, 20–22): the version-0 NUCp (and its containment
+/// radius), the in-message NIC-supplement bit (NICb at ME bit 7 for
+/// airborne barometric positions), and — when a version and the matching
+/// operational-status supplement are known — the resolved version-aware
+/// NIC. `nic_supp_a` / `nic_supp_c` come from the aircraft's last TC31
+/// operational-status; pass `None` for `version` when no status has been
+/// seen (NUCp still emits). Returns `None` for a non-position type code.
+pub fn position_quality(
+    tc: u8,
+    nic_b: u8,
+    version: Option<u8>,
+    nic_supp_a: u8,
+    nic_supp_c: u8,
+) -> Option<serde_json::Value> {
+    let nuc_p = nuc_p(tc)?;
+    let mut o = serde_json::Map::new();
+    o.insert("nuc_p".into(), serde_json::json!(nuc_p));
+    if let Some(rc) = nuc_p_rcu_m(nuc_p) {
+        o.insert("nuc_p_radius_m".into(), serde_json::json!(rc));
+    }
+    // NICb is meaningful only for airborne barometric positions (TC9-18),
+    // where it disambiguates the version-2 NIC; surface uses NICc.
+    if (9..=18).contains(&tc) {
+        o.insert("nic_b".into(), serde_json::json!(nic_b & 1));
+    }
+    if let Some(v) = version {
+        let nic = match v {
+            1 => nic_v1(tc, nic_supp_a),
+            2 => {
+                // Airborne barometric uses NICb (from this message);
+                // surface uses NICc (from operational status).
+                let bc = if (9..=18).contains(&tc) { nic_b } else { nic_supp_c };
+                nic_v2(tc, nic_supp_a, bc)
+            }
+            _ => None,
+        };
+        if let Some(nic) = nic {
+            o.insert("nic".into(), serde_json::json!(nic));
+            o.insert("nic_version".into(), serde_json::json!(v));
+        }
+    }
+    Some(serde_json::Value::Object(o))
 }
 
 #[cfg(test)]
@@ -488,6 +784,11 @@ mod tests {
         assert!((v.speed_kt - 159.20).abs() < 0.05, "{}", v.speed_kt);
         assert!((v.track_deg - 182.88).abs() < 0.05, "{}", v.track_deg);
         assert_eq!(v.vertical_rate_fpm, Some(-832));
+        // Oracle: pyModeS bds09.decode_bds09 on this frame → nac_v 0,
+        // vr_source GNSS, geo_minus_baro 550 ft.
+        assert_eq!(v.nac_v, 0);
+        assert!(!v.vr_baro_source);
+        assert_eq!(v.geo_minus_baro_ft, Some(550));
     }
 
     #[test]
@@ -496,6 +797,24 @@ mod tests {
         assert!(v.airspeed);
         assert!((v.speed_kt - 375.0).abs() < 0.5, "{}", v.speed_kt);
         assert!((v.track_deg - 243.98).abs() < 0.05, "{}", v.track_deg);
+        // Oracle: pyModeS bds09 → nac_v 0, vr_source BARO, geo diff N/A.
+        assert_eq!(v.nac_v, 0);
+        assert!(v.vr_baro_source);
+        assert_eq!(v.geo_minus_baro_ft, None);
+    }
+
+    #[test]
+    fn velocity_nacv_and_baro_source_match_pymodes() {
+        // Oracle: pyModeS bds09.decode_bds09("8d3461cf9908388930080f948ea1")
+        // → subtype 1, nac_v 1, vr_source BARO, vertical_rate +64,
+        // geo_minus_baro 350.
+        let v = velocity(&me_of("8d3461cf9908388930080f948ea1")).unwrap();
+        assert_eq!(v.nac_v, 1);
+        assert!(v.vr_baro_source);
+        assert_eq!(v.vertical_rate_fpm, Some(64));
+        assert_eq!(v.geo_minus_baro_ft, Some(350));
+        // NACv code 1 → 10 m/s horizontal figure of merit.
+        assert_eq!(nac_v_hfom_mps(v.nac_v), Some(10.0));
     }
 
     #[test]
@@ -509,15 +828,116 @@ mod tests {
     }
 
     #[test]
-    fn gillham_altitude_examples() {
-        // Published Gillham example: C1 A1 C2 A2 C4 A4 B1 B2 D2 B4 D4 for
-        // 1300 ft is all-zeros except C1+C4? Use the identity: 0 ft case.
-        // Validate via inverse property on a few rungs instead.
-        for alt in [-1000i32, 0, 1100, 5000, 12_400] {
-            // encode: find g such that gillham(g)==alt by brute force
-            let found = (0..2048u32).find(|&g| gillham(g) == Some(alt));
-            assert!(found.is_some(), "no Gillham code decodes to {alt}");
+    fn altitude13_gillham_matches_dump1090_pymodes() {
+        // Oracle: the dump1090 `decodeAC13Field` Gillham branch
+        // (`modeAToModeC(decodeID13Field(ac))`), which matches pyModeS
+        // `_altcode.altcode_to_altitude` byte-for-byte. AC13 fields are
+        // built by re-inserting the M=0 bit into the verified AC12 Gillham
+        // samples (ac12 << shifting per dump1090 decodeAC12Field):
+        // ac12 0x248 → 5000 ft, 0x0C8 → 4800 ft, 0x0C2 → 5800 ft.
+        for (ac12, exp) in [(0x248u32, 5000i32), (0x0C8, 4800), (0x0C2, 5800)] {
+            let ac13 = ((ac12 & 0x0FC0) << 1) | (ac12 & 0x003F);
+            assert_eq!(altitude13(ac13), Some(exp), "ac12 {ac12:#05x}");
         }
+    }
+
+    #[test]
+    fn altitude12_q1_and_q0_match_pymodes() {
+        // Q=1 (25-ft linear) path, from the pyModeS test_adsb altitude
+        // vectors (the 12-bit ME altitude field of each frame):
+        //   8D40621D58C382… → 38000 ft;  8d484fde5803b647… → -325 ft.
+        let ac_of = |frame: &str| -> u32 {
+            let me = me_of(frame);
+            let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+            (8..20).fold(0u32, |v, i| (v << 1) | bit(i))
+        };
+        assert_eq!(altitude12(ac_of("8D40621D58C382D690C8AC2863A7")), Some(38000));
+        assert_eq!(altitude12(ac_of("8d484fde5803b647ecec4fcdd74f")), Some(-325));
+        assert_eq!(altitude12(ac_of("8d346355580b064116e70a269f97")), Some(1000));
+        // Q=0 (Gillham) path, from CRC-valid pyModeS-verified frames built
+        // around the verified AC12 Gillham samples.
+        assert_eq!(altitude12(ac_of("8D40621D582482B504C5C9D9B414")), Some(5000));
+        assert_eq!(altitude12(ac_of("8D40621D580C82B504C5C92B2279")), Some(4800));
+        assert_eq!(altitude12(ac_of("8D40621D580C22B504C5C930E8B0")), Some(5800));
+        // Zero field → not available.
+        assert_eq!(altitude12(0), None);
+    }
+
+    #[test]
+    fn gnss_height_matches_pymodes() {
+        // pyModeS bds05 GNSS-height conversion: int(ac * 3.28084).
+        // TC20 frame with ac12 = 3000 m → 9842 ft (pyModeS decode()).
+        assert_eq!(gnss_height_ft(3000), Some(9842));
+        assert_eq!(gnss_height_ft(1000), Some(3280));
+        assert_eq!(gnss_height_ft(0), None);
+    }
+
+    /// Full 14- or 7-byte frame from a hex string.
+    fn frame_of(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn flight_status_table_matches_pymodes_rs1090() {
+        // pyModeS surv._FLIGHT_STATUS_TEXT / rs1090 FlightStatus.
+        assert_eq!(flight_status(0), (false, false, false, "no alert, no SPI, airborne"));
+        assert_eq!(flight_status(1), (false, false, true, "no alert, no SPI, on ground"));
+        assert_eq!(flight_status(2), (true, false, false, "alert, no SPI, airborne"));
+        assert_eq!(flight_status(3), (true, false, true, "alert, no SPI, on ground"));
+        assert_eq!(flight_status(4).0, true); // alert
+        assert_eq!(flight_status(4).1, true); // SPI
+        assert_eq!(flight_status(5).1, true); // SPI only
+        assert_eq!(flight_status(5).0, false);
+        assert_eq!(flight_status(6).3, "reserved");
+        assert_eq!(flight_status(7).3, "reserved");
+    }
+
+    #[test]
+    fn surveillance_status_matches_pymodes_surv() {
+        // Oracle: pyModeS decode() on CRC-valid address-overlaid replies
+        // (ICAO 40621D). DF4 2218A190EAA749 → FS 2 / DR 3 / UM 5; DF5
+        // 2C085234201FDB → FS 4 / DR 1 / UM 2.
+        let s = surveillance_status(&frame_of("2218A190EAA749"));
+        assert_eq!(s["flight_status"], 2);
+        assert_eq!(s["alert"], true);
+        assert_eq!(s["spi"], false);
+        assert_eq!(s["on_ground"], false);
+        assert_eq!(s["downlink_request"], 3);
+        assert_eq!(s["utility_message"], 5);
+        let s2 = surveillance_status(&frame_of("2C085234201FDB"));
+        assert_eq!(s2["flight_status"], 4);
+        assert_eq!(s2["alert"], true);
+        assert_eq!(s2["spi"], true);
+        assert_eq!(s2["downlink_request"], 1);
+        assert_eq!(s2["utility_message"], 2);
+    }
+
+    #[test]
+    fn comm_d_decodes_elm_segment() {
+        // Spec-derived (ICAO Annex 10 Vol IV §3.1.2.7.3 / rs1090
+        // CommDExtended layout): DF24, KE=0 (downlink), ND=5, MD bytes
+        // 11..AA. CRC-valid with address-overlaid parity (ICAO 40621D).
+        let v = comm_d(&frame_of("C5112233445566778899AA622DA2")).unwrap();
+        assert_eq!(v["ke"], 0);
+        assert_eq!(v["elm_control"], "downlink_tx");
+        assert_eq!(v["segment_number"], 5);
+        assert_eq!(v["comm_d_segment"], "112233445566778899aa");
+    }
+
+    #[test]
+    fn military_es_tags_source_and_me_typecode() {
+        // DF19 AF=0 carries an ADS-B-formatted ME (here TC=4).
+        let v = military_es(&frame_of("98ABCDEF202CC371C32CE0FC7172"));
+        assert_eq!(v["source"], "military");
+        assert_eq!(v["af"], 0);
+        assert_eq!(v["me_type_code"], 4);
+        // AF≠0: source/af only, no ME type code (non-public sub-format).
+        let v2 = military_es(&frame_of("9AABCDEF00000000000000000000"));
+        assert_eq!(v2["af"], 2);
+        assert!(v2.get("me_type_code").is_none());
     }
 
     #[test]
@@ -528,6 +948,118 @@ mod tests {
         let id: u32 = (1 << 12) /*C1*/ | (1 << 8) /*C4*/ | (1 << 5) /*B1*/
             | (1 << 3) /*B2*/ | (1 << 2) /*D2*/ | (1 << 0) /*D4*/;
         assert_eq!(squawk13(id), "0356");
+    }
+
+    /// Type code of a 28-hex extended-squitter frame (ME bits 0–4).
+    fn tc_of(frame_hex: &str) -> u8 {
+        let me = me_of(frame_hex);
+        me[0] >> 3
+    }
+
+    #[test]
+    fn nuc_p_lookup_matches_pymodes() {
+        // pyModeS uncertainty.TC_NUCp_lookup (version-0 NUCp by TC).
+        assert_eq!(nuc_p(5), Some(9));
+        assert_eq!(nuc_p(9), Some(9));
+        assert_eq!(nuc_p(11), Some(7));
+        assert_eq!(nuc_p(18), Some(0));
+        assert_eq!(nuc_p(20), Some(9));
+        assert_eq!(nuc_p(22), Some(0));
+        // Non-position TCs (ident, velocity, status) have no NUCp.
+        assert_eq!(nuc_p(1), None);
+        assert_eq!(nuc_p(19), None);
+        assert_eq!(nuc_p(31), None);
+        // Containment radius (RCu): NUCp 7 → 93 m, NUCp 0 → none.
+        assert_eq!(nuc_p_rcu_m(7), Some(93));
+        assert_eq!(nuc_p_rcu_m(0), None);
+    }
+
+    #[test]
+    fn nic_v1_matches_pymodes_golden_vectors() {
+        // Oracle: the published pyModeS test_adsb NIC golden vectors
+        // (frame → expected NIC). Each frame's own TC plus the NIC
+        // supplement context the vector was captured under reproduce the
+        // exact NIC pyModeS `nic_v1` returns. (TC16 and TC11 are the two
+        // supplement-sensitive rows; both supplement values appear.)
+        // (frame, nic_supp_a, expected_nic)
+        let cases = [
+            ("8D3C70A390AB11F55B8C57F65FE6", 0u8, 0u8), // TC18
+            ("8DE1C9738A4A430B427D219C8225", 0, 1),     // TC17
+            ("8D44058880B50006B1773DC2A7E9", 0, 2),     // TC16, supp 0
+            ("8D44058881B50006B1773DC2A7E9", 1, 3),     // TC16, supp 1
+            ("8D4AB42A78000640000000FA0D0A", 0, 4),     // TC15
+            ("8D4405887099F5D9772F37F86CB6", 0, 5),     // TC14
+            ("8D4841A86841528E72D9B472DAC2", 0, 6),     // TC13
+            ("8D44057560B9760C0B840A51C89F", 0, 7),     // TC12
+            ("8D40621D58C382D690C8AC2863A7", 0, 8),     // TC11, supp 0
+            ("8F48511C598D04F12CCF82451642", 1, 9),     // TC11, supp 1
+            ("8DA4D53A50DBF8C6330F3B35458F", 0, 10),    // TC10
+            ("8D3C4ACF4859F1736F8E8ADF4D67", 0, 11),    // TC9
+        ];
+        for (frame, supp, exp) in cases {
+            let tc = tc_of(frame);
+            assert_eq!(
+                nic_v1(tc, supp),
+                Some(exp),
+                "frame {frame} tc {tc} supp {supp}"
+            );
+        }
+    }
+
+    #[test]
+    fn nic_v2_supplement_resolution_matches_pymodes() {
+        // pyModeS nic_v2 / TC_NICv2_lookup: airborne TC selects on
+        // NICa*2 + NICb. TC11 → 8 (supp 00) or 9 (supp 11); TC16 → 2
+        // (00) or 3 (11); intermediate supplements undefined.
+        assert_eq!(nic_v2(11, 0, 0), Some(8));
+        assert_eq!(nic_v2(11, 1, 1), Some(9));
+        assert_eq!(nic_v2(11, 0, 1), None); // ns=1 undefined for TC11
+        assert_eq!(nic_v2(16, 0, 0), Some(2));
+        assert_eq!(nic_v2(16, 1, 1), Some(3));
+        // GNSS TCs ignore the supplement bits (forced to 0).
+        assert_eq!(nic_v2(20, 1, 1), Some(11));
+        assert_eq!(nic_v2(21, 1, 1), Some(10));
+        assert_eq!(nic_v2(22, 1, 1), Some(0));
+        // Non-position TC → None.
+        assert_eq!(nic_v2(19, 0, 0), None);
+    }
+
+    #[test]
+    fn operational_status_emits_nic_supplement_and_sda() {
+        // Synthetic TC31 v2 airborne payload matching the pyModeS bds65
+        // field layout (verified against bds65.decode_bds65): version 2,
+        // nic_supp_a 1, nic_supp_c 1, nac_p 9, gva 2, sil 3, nic_baro 1,
+        // hrd 1, sil_supplement 1, SDA 2 (ME 38–39).
+        let mut me = [0u8; 7];
+        let set = |me: &mut [u8; 7], start: usize, len: usize, val: u32| {
+            for i in 0..len {
+                if (val >> (len - 1 - i)) & 1 == 1 {
+                    me[(start + i) / 8] |= 0x80 >> ((start + i) % 8);
+                }
+            }
+        };
+        set(&mut me, 0, 5, 31); // TC 31
+        set(&mut me, 19, 1, 1); // nic_supp_c
+        set(&mut me, 38, 2, 2); // SDA
+        set(&mut me, 40, 3, 2); // version 2
+        set(&mut me, 43, 1, 1); // nic_supp_a
+        set(&mut me, 44, 4, 9); // nac_p
+        set(&mut me, 48, 2, 2); // gva
+        set(&mut me, 50, 2, 3); // sil
+        set(&mut me, 52, 1, 1); // nic_baro
+        set(&mut me, 53, 1, 1); // hrd
+        set(&mut me, 54, 1, 1); // sil_supplement
+        let v = operational_status(&me).unwrap();
+        assert_eq!(v["version"], 2);
+        assert_eq!(v["nic_supp_a"], 1);
+        assert_eq!(v["nic_supp_c"], 1);
+        assert_eq!(v["nac_p"], 9);
+        assert_eq!(v["sil"], 3);
+        assert_eq!(v["sil_supplement"], 1);
+        assert_eq!(v["sda"], 2);
+        assert_eq!(v["hrd"], 1);
+        assert_eq!(v["gva"], 2);
+        assert_eq!(v["baro_alt_integrity"], 1);
     }
 }
 
@@ -956,37 +1488,203 @@ pub fn bds45(mb: &[u8]) -> Option<serde_json::Value> {
     Some(serde_json::Value::Object(o))
 }
 
-/// Infer the BDS register of a DF20/21 MB field, mirroring the phased
-/// precedence of pyModeS `_infer.py`:
+// ── rs1090-style density / penalty BDS scoring ──────────────────────
+// A soft, statistics-based replacement for the brittle "exactly one
+// validates" EHS rule, ported (parameters and formulas, not code) from
+// rs1090's `decode::bds::density` / `penalty` modules. Each candidate's
+// score is the *mean* of its per-field log-densities under Gaussian /
+// Laplace distributions (calibrated by xoolive on a month of EUROCONTROL
+// CAT 048 ground truth) plus a within-record cross-field penalty
+// (|TAS−GS|, roll·track-rate turn-sign, IAS/Mach ratio). A candidate is
+// rejected when the combined score falls below DENSITY_THRESHOLD (−3.0).
+// This recovers ambiguous frames the exactly-one rule discards: when two
+// EHS registers structurally validate, the higher-scoring one wins.
+
+/// Mean log-density rejection threshold (rs1090 `DENSITY_THRESHOLD`).
+pub const DENSITY_THRESHOLD: f64 = -3.0;
+
+/// Un-normalised Gaussian log-density (rs1090 `density::gauss`); the shared
+/// normalising constant is dropped — it only shifts the threshold.
+fn gauss_ld(value: f64, mu: f64, sigma: f64) -> f64 {
+    let z = (value - mu) / sigma;
+    -0.5 * z * z
+}
+
+/// Un-normalised Laplace log-density (rs1090 `density::laplace`).
+fn laplace_ld(value: f64, median: f64, b: f64) -> f64 {
+    if b <= 0.0 {
+        return 0.0;
+    }
+    -(value - median).abs() / b
+}
+
+/// Read a numeric field from a decoded BDS JSON object as `f64`.
+fn jf(v: &serde_json::Value, key: &str) -> Option<f64> {
+    v.get(key).and_then(serde_json::Value::as_f64)
+}
+
+/// Mean per-field log-density of a decoded BDS candidate (rs1090
+/// `density::density_score`). `None` when the register exposes no scored
+/// field (then it is accepted unconditionally). Distribution parameters
+/// are the rs1090 CAT-048-calibrated values; xng's field names are mapped
+/// onto rs1090's scored fields.
+pub fn bds_density_score(v: &serde_json::Value) -> Option<f64> {
+    let bds = v.get("bds").and_then(|b| b.as_str())?;
+    let mut total = 0.0;
+    let mut count = 0u32;
+    let mut add = |ld: f64| {
+        total += ld;
+        count += 1;
+    };
+    match bds {
+        "4,0" => {
+            if let Some(x) = jf(v, "baro_pressure_setting") {
+                add(laplace_ld(x, 1013.2, 5.4));
+            }
+            if let Some(x) = jf(v, "selected_altitude_mcp") {
+                add(gauss_ld(x, 24688.0, 10844.0));
+            }
+            if let Some(x) = jf(v, "selected_altitude_fms") {
+                add(gauss_ld(x, 24688.0, 10844.0));
+            }
+        }
+        "5,0" => {
+            if let Some(x) = jf(v, "roll") {
+                add(laplace_ld(x, 0.0, 10.0));
+            }
+            if let Some(x) = jf(v, "track_rate") {
+                add(laplace_ld(x, 0.0, 0.70));
+            }
+            if let Some(x) = jf(v, "true_airspeed") {
+                add(gauss_ld(x, 413.0, 120.0));
+            }
+            if let Some(x) = jf(v, "groundspeed") {
+                add(gauss_ld(x, 418.0, 129.0));
+            }
+        }
+        "6,0" => {
+            if let Some(x) = jf(v, "indicated_airspeed") {
+                add(gauss_ld(x, 272.0, 55.0));
+            }
+            if let Some(x) = jf(v, "mach") {
+                add(gauss_ld(x, 0.69, 0.21));
+            }
+            if let Some(x) = jf(v, "inertial_vertical_rate") {
+                add(gauss_ld(x, -298.0, 1669.0));
+            }
+        }
+        "4,4" => {
+            if let Some(x) = jf(v, "static_air_temperature") {
+                add(laplace_ld(x, -21.0, 9.90));
+            }
+            if let Some(x) = jf(v, "wind_speed") {
+                add(gauss_ld(x, 52.0, 29.0));
+            }
+            if let Some(x) = jf(v, "static_pressure") {
+                add(laplace_ld(x, 393.0, 290.0));
+            }
+        }
+        "4,5" => {
+            if let Some(x) = jf(v, "static_air_temperature") {
+                add(gauss_ld(x, -14.2, 16.4));
+            }
+            if let Some(x) = jf(v, "static_pressure") {
+                add(laplace_ld(x, 393.0, 290.0));
+            }
+        }
+        _ => {}
+    }
+    (count > 0).then(|| total / f64::from(count))
+}
+
+/// Within-record cross-field penalty (rs1090 `penalty::penalty`), always
+/// ≤ 0: BDS 5,0 `−|TAS−GS|/100` and a flat −2.0 when roll and track-rate
+/// disagree in sign during a real turn; BDS 6,0 a flat −3.0 when the
+/// IAS/Mach ratio leaves the atmospheric `[250, 800]` kt band.
+pub fn bds_penalty(v: &serde_json::Value) -> f64 {
+    let bds = v.get("bds").and_then(|b| b.as_str()).unwrap_or("");
+    let mut p = 0.0;
+    match bds {
+        "5,0" => {
+            if let (Some(tas), Some(gs)) = (jf(v, "true_airspeed"), jf(v, "groundspeed")) {
+                p -= (tas - gs).abs() / 100.0;
+            }
+            if let (Some(roll), Some(rate)) = (jf(v, "roll"), jf(v, "track_rate")) {
+                if roll.abs() > 5.0 && rate.abs() > 0.3 && (roll > 0.0) != (rate > 0.0) {
+                    p -= 2.0;
+                }
+            }
+        }
+        "6,0" => {
+            if let (Some(ias), Some(mach)) =
+                (jf(v, "indicated_airspeed"), jf(v, "mach"))
+            {
+                if mach > 0.0 {
+                    let ratio = ias / mach;
+                    if !(250.0..=800.0).contains(&ratio) {
+                        p -= 3.0;
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    p
+}
+
+/// Combined rs1090 score: mean log-density + cross-field penalty. A
+/// candidate with no scored field scores 0.0 (always accepted by the
+/// density gate); the penalty still applies where relevant.
+pub fn bds_score(v: &serde_json::Value) -> f64 {
+    bds_density_score(v).unwrap_or(0.0) + bds_penalty(v)
+}
+
+/// Among a candidate set, drop those below [`DENSITY_THRESHOLD`] and
+/// return the highest-scoring survivor (stable on ties — earlier
+/// candidates win, preserving the EHS-first ordering).
+fn best_scored(candidates: Vec<serde_json::Value>) -> Option<serde_json::Value> {
+    candidates
+        .into_iter()
+        .filter(|v| bds_score(v) >= DENSITY_THRESHOLD)
+        .map(|v| {
+            let s = bds_score(&v);
+            (v, s)
+        })
+        .reduce(|best, cur| if cur.1 > best.1 { cur } else { best })
+        .map(|(v, _)| v)
+}
+
+/// Infer the BDS register of a DF20/21 MB field. Format-ID registers take
+/// precedence; the heuristic / meteorological registers are then
+/// disambiguated by the rs1090 density+penalty score rather than the old
+/// brittle "exactly one validates" rule:
 ///
-/// 1. Format-ID fast path (BDS 1,0 / 1,7 / 2,0 / 3,0): these carry an
-///    explicit identifier byte (or, for 1,7, a strict capability-map
-///    pattern) and are mutually exclusive, so the first that validates
-///    wins outright — the heuristic registers are not even consulted.
-/// 2. Heuristic set (EHS: BDS 4,0 / 5,0 / 6,0): only when no format-ID
-///    register matched, accept only if exactly one validates (xng's
-///    original exactly-one rule, preserved unchanged).
-/// 3. Meteorological fallback (BDS 4,4 MRAR / 4,5 MHR): only when the
-///    heuristic set is empty — these collide with EHS, so pyModeS hides
-///    them behind `include_meteo`; here they are a last resort that never
-///    perturbs ELS/EHS decoding.
+/// 1. Format-ID fast path (BDS 1,0 / 1,7 / 2,0 / 3,0): explicit-identifier
+///    registers, mutually exclusive, first match wins outright.
+/// 2. Heuristic EHS set (BDS 4,0 / 5,0 / 6,0): every register that
+///    structurally validates is scored with [`bds_score`]; candidates
+///    below [`DENSITY_THRESHOLD`] are dropped and the highest remaining
+///    score wins. A lone survivor wins regardless. This preserves the old
+///    single-match behaviour AND recovers ambiguous frames the exactly-one
+///    rule used to discard (the cruise-typical register outscores the
+///    coincidental match).
+/// 3. Meteorological fallback (BDS 4,4 MRAR / 4,5 MHR): only when the EHS
+///    set is empty — these collide with EHS, so (mirroring pyModeS's
+///    `include_meteo` separation) they are a last resort that never
+///    perturbs ELS/EHS decoding. The same score gate applies.
 pub fn bds_infer(mb: &[u8]) -> Option<serde_json::Value> {
     // Phase 1 — format-ID fast path, first match wins.
     if let Some(v) = [bds10(mb), bds17(mb), bds20(mb), bds30(mb)].into_iter().flatten().next() {
         return Some(v);
     }
-    // Phase 2 — heuristic EHS set, exactly one must validate.
+    // Phase 2 — heuristic EHS set, density+penalty scored.
     let ehs: Vec<serde_json::Value> =
         [bds40(mb), bds50(mb), bds60(mb)].into_iter().flatten().collect();
-    if ehs.len() == 1 {
-        return Some(ehs.into_iter().next().unwrap());
-    }
     if !ehs.is_empty() {
-        return None; // ambiguous within the EHS set
+        return best_scored(ehs);
     }
-    // Phase 3 — meteorological fallback, exactly one must validate.
-    let met: Vec<serde_json::Value> = [bds44(mb), bds45(mb)].into_iter().flatten().collect();
-    (met.len() == 1).then(|| met.into_iter().next().unwrap())
+    // Phase 3 — meteorological fallback, scored (EHS set empty).
+    best_scored([bds44(mb), bds45(mb)].into_iter().flatten().collect())
 }
 
 #[cfg(test)]
@@ -1333,6 +2031,94 @@ mod bds_tests {
         assert_eq!(v["bds"], "4,4");
         let v = bds_infer(&mb_of("A00004190001FB80000000000000")).unwrap();
         assert_eq!(v["bds"], "4,5");
+    }
+
+    // ── rs1090 density / penalty scoring ────────────────────────────
+    // Oracle: rs1090 `decode::bds::density` / `penalty` modules — the
+    // distribution parameters and the hand-computed scores in their unit
+    // tests (`cruise_bds50_passes`, `slow_bds60_fails`, the penalty
+    // cases). Values are reproduced here, not loop-backed.
+
+    #[test]
+    fn density_score_cruise_bds50_passes() {
+        // rs1090 cruise_bds50_passes: TAS 460, GS 470, roll −2°,
+        // track_rate 0 → mean log-density ≈ −0.090, well above −3.0.
+        let v = serde_json::json!({
+            "bds": "5,0", "roll": -2.0, "track_rate": 0.0,
+            "true_airspeed": 460, "groundspeed": 470,
+        });
+        let s = bds_density_score(&v).unwrap();
+        assert!((s - (-0.090)).abs() < 0.02, "mean ld = {s}");
+        assert!(s > DENSITY_THRESHOLD);
+    }
+
+    #[test]
+    fn density_score_slow_bds60_fails() {
+        // rs1090 slow_bds60_fails: IAS 50 kt, Mach 0.05 → mean ≈ −5.2,
+        // below the −3.0 rejection threshold.
+        let v = serde_json::json!({
+            "bds": "6,0", "indicated_airspeed": 50, "mach": 0.05,
+        });
+        let s = bds_density_score(&v).unwrap();
+        assert!(s < DENSITY_THRESHOLD, "mean ld = {s}");
+    }
+
+    #[test]
+    fn density_at_centre_is_zero() {
+        // rs1090 density_at_centre_is_zero: log-density peaks (=0) at the
+        // distribution centre; degenerate Laplace (b≤0) returns 0.
+        assert_eq!(gauss_ld(1.0, 1.0, 2.0), 0.0);
+        assert_eq!(laplace_ld(1013.2, 1013.2, 5.4), 0.0);
+        assert_eq!(laplace_ld(1.0, 0.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn penalty_bds50_tas_gs_and_turn_sign() {
+        // |TAS−GS|/100 penalty: a 200 kt mismatch → −2.0.
+        let v = serde_json::json!({
+            "bds": "5,0", "true_airspeed": 600, "groundspeed": 400,
+            "roll": 0.0, "track_rate": 0.0,
+        });
+        assert!((bds_penalty(&v) - (-2.0)).abs() < 1e-9);
+        // Roll +10° but track_rate −1°/s during a turn → extra −2.0 flat,
+        // on top of a small |TAS−GS| term.
+        let v = serde_json::json!({
+            "bds": "5,0", "true_airspeed": 410, "groundspeed": 420,
+            "roll": 10.0, "track_rate": -1.0,
+        });
+        let p = bds_penalty(&v);
+        assert!((p - (-0.1 - 2.0)).abs() < 1e-9, "penalty {p}");
+        // Cruise BDS50 (small |TAS−GS|, no turn) → near-zero penalty.
+        let v = serde_json::json!({
+            "bds": "5,0", "true_airspeed": 460, "groundspeed": 470,
+            "roll": -2.0, "track_rate": 0.0,
+        });
+        assert!(bds_penalty(&v) > -1.0);
+    }
+
+    #[test]
+    fn penalty_bds60_ias_mach_ratio() {
+        // IAS/Mach ratio outside [250, 800] → flat −3.0 (rs1090 penalty).
+        // IAS 50 / Mach 0.05 = 1000 → out of band → −3.0.
+        let v = serde_json::json!({
+            "bds": "6,0", "indicated_airspeed": 50, "mach": 0.05,
+        });
+        assert!((bds_penalty(&v) - (-3.0)).abs() < 1e-9);
+        // A normal 272 kt / 0.69 ≈ 394 → in band → no penalty.
+        let v = serde_json::json!({
+            "bds": "6,0", "indicated_airspeed": 272, "mach": 0.69,
+        });
+        assert_eq!(bds_penalty(&v), 0.0);
+    }
+
+    #[test]
+    fn bds_infer_scoring_recovers_real_ehs_frames() {
+        // The existing golden EHS frames still resolve to their register
+        // through the scored path (regression guard that scoring did not
+        // change the single-validating-register outcome).
+        assert_eq!(bds_infer(&mb_of("A000029C85E42F313000007047D3")).unwrap()["bds"], "4,0");
+        assert_eq!(bds_infer(&mb_of("A000139381951536E024D4CCF6B5")).unwrap()["bds"], "5,0");
+        assert_eq!(bds_infer(&mb_of("A00004128F39F91A7E27C46ADC21")).unwrap()["bds"], "6,0");
     }
 }
 

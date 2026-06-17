@@ -87,6 +87,39 @@ fn mode_a_to_mode_c(mode_a: u16) -> Option<i32> {
     Some((five_hundreds * 5 + hundreds) as i32 - 13)
 }
 
+/// Reorder a 13-bit Mode S AC field (C1 A1 C2 A2 C4 A4 M B1 Q B2 D2 B4
+/// D4, MSB first) into the 16-bit "Mode A" pulse word used by
+/// [`mode_a_to_mode_c`]. Port of the documented dump1090 `decodeID13Field`
+/// bit-shuffle (the X/M and Q/D1 positions are carried through; for a
+/// Gillham altitude they are zero). Protocol facts only — see
+/// PROVENANCE.md.
+fn ac13_to_mode_a(ac: u32) -> u16 {
+    let mut h: u16 = 0;
+    if ac & 0x1000 != 0 { h |= 0x0010; } // C1
+    if ac & 0x0800 != 0 { h |= 0x1000; } // A1
+    if ac & 0x0400 != 0 { h |= 0x0020; } // C2
+    if ac & 0x0200 != 0 { h |= 0x2000; } // A2
+    if ac & 0x0100 != 0 { h |= 0x0040; } // C4
+    if ac & 0x0080 != 0 { h |= 0x4000; } // A4
+    if ac & 0x0020 != 0 { h |= 0x0100; } // B1
+    if ac & 0x0010 != 0 { h |= 0x0001; } // D1/Q
+    if ac & 0x0008 != 0 { h |= 0x0200; } // B2
+    if ac & 0x0004 != 0 { h |= 0x0002; } // D2
+    if ac & 0x0002 != 0 { h |= 0x0400; } // B4
+    if ac & 0x0001 != 0 { h |= 0x0004; } // D4
+    h
+}
+
+/// Decode a 13-bit Mode S AC altitude field's Q=0 (Gillham, 100-ft)
+/// encoding to feet via the dump1090-verified Mode A/C ladder. Returns
+/// `None` for an invalid Gillham code. The caller is responsible for
+/// having already established Q=0 (this routes the field through
+/// `decodeID13Field` → `internalModeAToModeC` exactly as dump1090's
+/// `decodeAC13Field` / `decodeAC12Field` Gillham branches do).
+pub fn gillham_ac13_ft(ac13: u32) -> Option<i32> {
+    mode_a_to_mode_c(ac13_to_mode_a(ac13)).map(|c| c * 100)
+}
+
 /// A decoded Mode A/C reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeAc {
@@ -163,6 +196,22 @@ mod tests {
         assert_eq!(decode(0x7600).squawk_str(), "7600"); // radio failure
         assert_eq!(decode(0x1200).squawk_str(), "1200"); // VFR
         assert_eq!(decode(0x0356).squawk_str(), "0356");
+    }
+
+    #[test]
+    fn gillham_ac13_matches_dump1090_pymodes() {
+        // Oracle: dump1090 `decodeAC13Field` Gillham branch and pyModeS
+        // `_altcode.altcode_to_altitude` (verified identical across all
+        // 4096 codes). AC13 fields here are the M=0-reinserted forms of
+        // the verified AC12 Gillham samples:
+        // ac12 0x248 → ac13 0x488 → 5000 ft.
+        assert_eq!(gillham_ac13_ft(0x488), Some(5000));
+        // ac12 0x0C8 → ac13 0x188 → 4800 ft.
+        assert_eq!(gillham_ac13_ft(0x188), Some(4800));
+        // ac12 0x0C2 → ac13 0x182 → 5800 ft.
+        assert_eq!(gillham_ac13_ft(0x182), Some(5800));
+        // Invalid Gillham code (C-group zero) → None.
+        assert_eq!(gillham_ac13_ft(0x000), None);
     }
 
     #[test]
