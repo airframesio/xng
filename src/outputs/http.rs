@@ -34,6 +34,10 @@ const RING_EXPIRE_S: u64 = 300;
 #[derive(Default)]
 struct Dash {
     aircraft: HashMap<String, Value>,
+    /// Identifier-token → master aircraft id, so one aircraft heard via
+    /// several sources (ADS-B icao, ACARS tail/flight, …) coalesces into one
+    /// entity. Tokens are namespaced: `ic:<HEX>`, `rg:<reg>`, `fl:<flight>`.
+    ac_index: HashMap<String, String>,
     vessels: HashMap<u32, Value>,
     /// Iridium satellite positions, keyed by satellite id.
     iridium_sats: HashMap<u64, Value>,
@@ -87,6 +91,139 @@ fn now_s() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Per-message aircraft identifiers. ICAO (uppercased) is the primary merge
+/// key, then registration (tail), then flight number.
+struct AcIds {
+    icao: Option<String>,
+    flight: Option<String>,
+    reg: Option<String>,
+}
+
+/// Upsert an aircraft entity, coalescing across sources by ICAO > reg > flight.
+/// `contrib` = the display fields this message contributes (latest-wins on the
+/// merged master, recorded verbatim on the per-source row). `source` = the
+/// carrier/mode label. `pos` (if any) extends the shared position trail.
+fn merge_aircraft(
+    d: &mut Dash,
+    source: &str,
+    ids: AcIds,
+    contrib: serde_json::Map<String, Value>,
+    pos: Option<(f64, f64)>,
+) {
+    let mut tokens: Vec<String> = Vec::new();
+    if let Some(i) = &ids.icao {
+        tokens.push(format!("ic:{i}"));
+    }
+    if let Some(r) = &ids.reg {
+        tokens.push(format!("rg:{r}"));
+    }
+    if let Some(f) = &ids.flight {
+        tokens.push(format!("fl:{f}"));
+    }
+    if tokens.is_empty() {
+        return;
+    }
+
+    // Resolve (merging if a linking message joined separate entities).
+    let mut masters: Vec<String> =
+        tokens.iter().filter_map(|t| d.ac_index.get(t).cloned()).collect();
+    masters.sort();
+    masters.dedup();
+    let master_id = match masters.len() {
+        0 => ids.icao.clone().or_else(|| ids.reg.clone()).or_else(|| ids.flight.clone()).unwrap(),
+        1 => masters.remove(0),
+        _ => {
+            // Prefer the ICAO-keyed survivor; fold the rest in, repoint index.
+            let survivor = ids
+                .icao
+                .as_ref()
+                .filter(|i| masters.iter().any(|m| m == *i))
+                .cloned()
+                .unwrap_or_else(|| masters[0].clone());
+            for mid in masters.iter().filter(|m| **m != survivor) {
+                if let Some(other) = d.aircraft.remove(mid) {
+                    fold_entity(&mut d.aircraft, &survivor, other);
+                }
+            }
+            for v in d.ac_index.values_mut() {
+                if masters.contains(v) {
+                    *v = survivor.clone();
+                }
+            }
+            survivor
+        }
+    };
+    for t in &tokens {
+        d.ac_index.insert(t.clone(), master_id.clone());
+    }
+
+    let e = d.aircraft.entry(master_id.clone()).or_insert_with(|| json!({}));
+    let o = e.as_object_mut().unwrap();
+    o.insert("id".into(), json!(master_id));
+    if let Some(i) = &ids.icao {
+        o.insert("icao".into(), json!(i));
+    }
+    if let Some(f) = &ids.flight {
+        o.insert("flight".into(), json!(f));
+    }
+    if let Some(r) = &ids.reg {
+        o.insert("reg".into(), json!(r));
+    }
+    o.insert("seen".into(), json!(now_s()));
+    let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+    o.insert("msgs".into(), json!(msgs + 1));
+    for (k, v) in &contrib {
+        o.insert(k.clone(), v.clone());
+    }
+    if let Some((la, lo)) = pos {
+        push_trail(o, la, lo);
+    }
+
+    // Per-source contribution: what THIS source provided + its own counts.
+    let smap = o.entry("sources").or_insert_with(|| json!({})).as_object_mut().unwrap();
+    let so = smap.entry(source.to_string()).or_insert_with(|| json!({})).as_object_mut().unwrap();
+    so.insert("source".into(), json!(source));
+    if let Some(i) = &ids.icao {
+        so.insert("icao".into(), json!(i));
+    }
+    if let Some(f) = &ids.flight {
+        so.insert("flight".into(), json!(f));
+    }
+    if let Some(r) = &ids.reg {
+        so.insert("reg".into(), json!(r));
+    }
+    for (k, v) in &contrib {
+        so.insert(k.clone(), v.clone());
+    }
+    let sm = so.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+    so.insert("msgs".into(), json!(sm + 1));
+    so.insert("seen".into(), json!(now_s()));
+}
+
+/// Fold a merged-away aircraft into the survivor: sum msgs, merge source rows,
+/// adopt fields the survivor lacks (never clobbering its own identity).
+fn fold_entity(aircraft: &mut HashMap<String, Value>, survivor: &str, other: Value) {
+    let Some(s) = aircraft.get_mut(survivor).and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    let Some(oo) = other.as_object() else { return };
+    let add = oo.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+    let cur = s.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+    s.insert("msgs".into(), json!(cur + add));
+    if let Some(osrc) = oo.get("sources").and_then(Value::as_object) {
+        let smap = s.entry("sources").or_insert_with(|| json!({})).as_object_mut().unwrap();
+        for (k, v) in osrc {
+            smap.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    for (k, v) in oo {
+        if k == "msgs" || k == "sources" || k == "id" {
+            continue;
+        }
+        s.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+}
+
 /// Iridium link-layer housekeeping that carries no user content and arrives at
 /// tens of thousands of frames per session — excluded from the web log feed so
 /// content frames stay visible (still counted in the per-mode totals).
@@ -102,6 +239,10 @@ fn update(d: &mut Dash, m: &Message) {
     *d.totals.entry(mode.clone()).or_insert(0) += 1;
     d.last_seen.insert(mode.clone(), now_s());
 
+    // Only clean (CRC-valid) frames compose map/table entities. Corrupt frames
+    // still count toward totals and reach the message log, but must never plant
+    // junk aircraft/vessel/satellite entities (was a live dashboard bug).
+    if m.decode.crc_ok {
     match &m.body {
         MessageBody::ModeS {
             icao: Some(icao),
@@ -116,32 +257,23 @@ fn update(d: &mut Dash, m: &Message) {
             comm_b,
             ..
         } => {
-            let e = d.aircraft.entry(icao.clone()).or_insert_with(|| json!({}));
-            let o = e.as_object_mut().unwrap();
-            o.insert("icao".into(), json!(icao));
-            o.insert("seen".into(), json!(now_s()));
-            if !o.contains_key("country") {
-                if let Ok(hex) = u32::from_str_radix(icao, 16) {
-                    if let Some(c) = crate::outputs::dbinfo::icao_country(hex) {
-                        o.insert("country".into(), json!(c));
+            let icao_uc = icao.to_uppercase();
+            let mut c = serde_json::Map::new();
+            let mut reg: Option<String> = None;
+            if let Ok(hex) = u32::from_str_radix(icao, 16) {
+                if let Some(co) = crate::outputs::dbinfo::icao_country(hex) {
+                    c.insert("country".into(), json!(co));
+                }
+                if let Some((r, t)) = crate::outputs::dbinfo::AircraftDb::lookup(hex) {
+                    if !r.is_empty() {
+                        reg = Some(r.to_string());
                     }
-                    if let Some((reg, typ)) = crate::outputs::dbinfo::AircraftDb::lookup(hex) {
-                        if !reg.is_empty() {
-                            o.insert("reg".into(), json!(reg));
-                        }
-                        if !typ.is_empty() {
-                            o.insert("actype".into(), json!(typ));
-                        }
+                    if !t.is_empty() {
+                        c.insert("actype".into(), json!(t));
                     }
                 }
             }
-            let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
-            o.insert("msgs".into(), json!(msgs + 1));
-            if let (Some(la), Some(lo_)) = (lat, lon) {
-                push_trail(o, *la, *lo_);
-            }
             for (k, v) in [
-                ("callsign", callsign.as_ref().map(|c| json!(c.trim()))),
                 ("alt", altitude_ft.map(|v| json!(v))),
                 ("lat", lat.map(|v| json!(v))),
                 ("lon", lon.map(|v| json!(v))),
@@ -157,24 +289,29 @@ fn update(d: &mut Dash, m: &Message) {
                 ("oat_c", comm_b.as_ref().and_then(|s| s.get("static_air_temperature").cloned())),
             ] {
                 if let Some(v) = v {
-                    o.insert(k.into(), v);
+                    c.insert(k.into(), v);
                 }
             }
-            // Surface a non-"none" emergency as a sticky flag for the map.
+            // Sticky map flags: non-"none" emergency, ACAS RA (BDS 3,0 / TC28).
             if let Some(em) = adsb_status
                 .as_ref()
                 .and_then(|s| s.get("emergency"))
                 .and_then(|v| v.as_str())
                 .filter(|e| *e != "none")
             {
-                o.insert("emergency".into(), json!(em));
+                c.insert("emergency".into(), json!(em));
             }
-            // ACAS resolution advisory (BDS 3,0 or TC28) — sticky map alert.
             if comm_b.as_ref().and_then(|s| s.get("issued_ra")).and_then(|v| v.as_bool()) == Some(true)
                 || adsb_status.as_ref().and_then(|s| s.get("acas_ra")).and_then(|v| v.as_bool()) == Some(true)
             {
-                o.insert("acas_ra".into(), json!(true));
+                c.insert("acas_ra".into(), json!(true));
             }
+            let flight = callsign.as_ref().map(|x| x.trim().to_uppercase()).filter(|s| !s.is_empty());
+            let pos = match (lat, lon) {
+                (Some(la), Some(lo)) => Some((*la, *lo)),
+                _ => None,
+            };
+            merge_aircraft(d, "adsb", AcIds { icao: Some(icao_uc), flight, reg }, c, pos);
         }
         MessageBody::Ais { mmsi: Some(mmsi), details: Some(det), msg_type, .. } => {
             let e = d.vessels.entry(*mmsi).or_insert_with(|| json!({}));
@@ -220,40 +357,32 @@ fn update(d: &mut Dash, m: &Message) {
         // shows in the table even without a position. A position appears only
         // if the application layer carries one (ADS-C report).
         MessageBody::Acars(a) => {
-            let id = a
-                .tail
-                .clone()
-                .or_else(|| a.flight.clone())
-                .unwrap_or_else(|| "ACARS".into());
-            let e = d.aircraft.entry(id.clone()).or_insert_with(|| json!({}));
-            let o = e.as_object_mut().unwrap();
-            o.insert("icao".into(), json!(id)); // displayed id (tail/flight, not hex)
-            o.insert("seen".into(), json!(now_s()));
-            if let Some(reg) = &a.tail {
-                o.insert("reg".into(), json!(reg));
-            }
-            if let Some(flight) = &a.flight {
-                o.insert("callsign".into(), json!(flight.trim()));
-            }
-            let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
-            o.insert("msgs".into(), json!(msgs + 1));
-            // ADS-C position report from the application layer, if present.
-            if let Some(app) = &a.app {
-                if app.get("app").and_then(|v| v.as_str()) == Some("adsc") {
-                    for t in app.get("tags").and_then(Value::as_array).into_iter().flatten() {
-                        if let (Some(lat), Some(lon)) = (
-                            t.get("lat").and_then(Value::as_f64),
-                            t.get("lon").and_then(Value::as_f64),
-                        ) {
-                            push_trail(o, lat, lon);
-                            o.insert("lat".into(), json!(lat));
-                            o.insert("lon".into(), json!(lon));
-                            if let Some(alt) = t.get("alt_ft").and_then(Value::as_i64) {
-                                o.insert("alt".into(), json!(alt));
+            let reg = a.tail.clone().filter(|s| !s.is_empty());
+            let flight = a.flight.as_ref().map(|f| f.trim().to_uppercase()).filter(|s| !s.is_empty());
+            if reg.is_some() || flight.is_some() {
+                let mut c = serde_json::Map::new();
+                let mut pos = None;
+                // ADS-C position report from the application layer, if present.
+                if let Some(app) = &a.app {
+                    if app.get("app").and_then(|v| v.as_str()) == Some("adsc") {
+                        for t in app.get("tags").and_then(Value::as_array).into_iter().flatten() {
+                            if let (Some(lat), Some(lon)) = (
+                                t.get("lat").and_then(Value::as_f64),
+                                t.get("lon").and_then(Value::as_f64),
+                            ) {
+                                pos = Some((lat, lon));
+                                c.insert("lat".into(), json!(lat));
+                                c.insert("lon".into(), json!(lon));
+                                if let Some(alt) = t.get("alt_ft").and_then(Value::as_i64) {
+                                    c.insert("alt".into(), json!(alt));
+                                }
                             }
                         }
                     }
                 }
+                // Source = the carrier mode (acars/vdl2/hfdl/aero-l/iridium), so
+                // one aircraft on several carriers shows multiple source rows.
+                merge_aircraft(d, &mode, AcIds { icao: None, flight, reg }, c, pos);
             }
         }
         // Iridium ring alerts carry the broadcasting satellite's geocentric
@@ -359,6 +488,7 @@ fn update(d: &mut Dash, m: &Message) {
         }
         _ => {}
     }
+    }
 
     // Message stream entry: a one-line summary, plus the full decoded message
     // for the click-to-expand detail view. The high-rate Iridium link layer
@@ -386,6 +516,9 @@ fn update(d: &mut Dash, m: &Message) {
 fn snapshot(d: &mut Dash) -> String {
     let cutoff = now_s().saturating_sub(EXPIRE_S);
     d.aircraft.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    // Drop identifier-index entries whose master aircraft has expired.
+    let live: std::collections::HashSet<String> = d.aircraft.keys().cloned().collect();
+    d.ac_index.retain(|_, mid| live.contains(mid));
     d.vessels.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     let sat_cut = now_s().saturating_sub(SAT_EXPIRE_S);
     let ring_cut = now_s().saturating_sub(RING_EXPIRE_S);
@@ -474,7 +607,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xng_types::{AppInfo, Mode, Provenance, StationIdentity};
+    use xng_types::{AppInfo, DecodeQuality, Mode, Provenance, StationIdentity};
 
     fn ring_alert(sat: u64, alt_km: f64) -> Message {
         Message {
@@ -482,7 +615,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             frequency_hz: 1_626_270_000,
             signal: Default::default(),
-            decode: Default::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
             body: MessageBody::Iridium {
                 kind: "ring-alert".into(),
                 details: json!({
@@ -521,7 +654,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             frequency_hz: 1_622_000_000,
             signal: Default::default(),
-            decode: Default::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
             body: MessageBody::Iridium {
                 kind: "mt-position".into(),
                 details: json!({
@@ -558,7 +691,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             frequency_hz: 1_622_000_000,
             signal: Default::default(),
-            decode: Default::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
             body: MessageBody::Iridium { kind: kind.into(), details },
             raw: None,
             source: Provenance {
@@ -604,7 +737,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             frequency_hz: 131_550_000,
             signal: Default::default(),
-            decode: Default::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
             body: MessageBody::Acars(xng_types::AcarsCore {
                 tail: Some(tail.into()),
                 flight: Some(flight.into()),
@@ -630,8 +763,40 @@ mod tests {
         assert_eq!(d.aircraft.len(), 1, "ACARS surfaces an aircraft entity");
         let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
         let ac = &snap["aircraft"][0];
+        assert_eq!(ac["id"], "N12345"); // keyed by tail (no ICAO from ACARS)
         assert_eq!(ac["reg"], "N12345");
-        assert_eq!(ac["callsign"], "UA123");
+        assert_eq!(ac["flight"], "UA123");
         assert_eq!(ac["msgs"], 2);
+    }
+
+    #[test]
+    fn crc_failed_message_creates_no_aircraft() {
+        let mut d = Dash::default();
+        let mut m = acars("N99999", "XX999");
+        m.decode.crc_ok = false;
+        update(&mut d, &m);
+        // The bug fix: a corrupt frame must not plant a junk entity...
+        assert_eq!(d.aircraft.len(), 0);
+        // ...but it still counts toward the per-mode total.
+        assert_eq!(*d.totals.get("acars").unwrap(), 1);
+    }
+
+    #[test]
+    fn aircraft_merges_across_carrier_sources() {
+        let mut d = Dash::default();
+        // Same tail heard via VHF ACARS and over VDL2 → one entity, two sources.
+        update(&mut d, &acars("N12345", "UA100"));
+        let mut via_vdl2 = acars("N12345", "UA100");
+        via_vdl2.mode = Mode::Vdl2;
+        update(&mut d, &via_vdl2);
+        assert_eq!(d.aircraft.len(), 1, "carriers coalesce by tail");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let ac = &snap["aircraft"][0];
+        assert_eq!(ac["reg"], "N12345");
+        assert_eq!(ac["msgs"], 2, "total across sources");
+        let srcs = ac["sources"].as_object().unwrap();
+        assert!(srcs.contains_key("acars") && srcs.contains_key("vdl2"), "two source rows");
+        assert_eq!(srcs["acars"]["msgs"], 1);
+        assert_eq!(srcs["vdl2"]["msgs"], 1);
     }
 }

@@ -536,6 +536,13 @@ window.toggleTerminals = () => {
   render();
 };
 window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
+// Aircraft expand: clicking a multi-source aircraft opens per-source rows.
+// Keyed by the stable master id so the open state survives poll re-renders.
+const acExpanded = new Set();
+window.acClick = (id, lat, lon, key, expandable) => {
+  if (expandable) { acExpanded.has(id) ? acExpanded.delete(id) : acExpanded.add(id); }
+  selectEntity(key, lat, lon);
+};
 document.getElementById('pause').onclick = function () {
   paused = !paused;
   this.classList.toggle('on', paused);
@@ -791,19 +798,37 @@ function render() {
 
   const rows = [];
   for (const a of [...s.aircraft].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
-    const k = 'a' + a.icao;
+    const id = a.id || a.icao || a.reg || a.flight || '';
+    const k = 'a' + id;
+    const srcs = a.sources ? Object.values(a.sources) : [];
+    const expandable = srcs.length > 1;
+    const open = acExpanded.has(id);
+    const caret = expandable ? (open ? '▾ ' : '▸ ') : '';
+    const idJs = String(id).replace(/'/g, '');
     rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-      `onclick="selectEntity('${k}',${a.lat ?? 'null'},${a.lon ?? 'null'})">` +
-      `<td style="color:${altColor(a.alt)}">✈ ${escapeHtml(a.callsign || a.icao)}</td>` +
+      `onclick="acClick('${idJs}',${a.lat ?? 'null'},${a.lon ?? 'null'},'${k}',${expandable})">` +
+      `<td style="color:${altColor(a.alt)}">${caret}✈ ${escapeHtml(a.flight || a.reg || a.icao || id)}</td>` +
+      `<td>${escapeHtml(a.flight || '')}</td><td>${escapeHtml(a.icao || '')}</td>` +
       `<td>${escapeHtml(a.reg || '')}</td><td>${escapeHtml(a.actype || '')}</td>` +
       `<td>${a.alt ?? ''}</td><td>${a.spd ?? ''}</td><td>${a.msgs ?? ''}</td>` +
       `<td class="age">${fmtAge(s.now - a.seen)}</td></tr>`);
+    if (open) {
+      for (const sr of [...srcs].sort((x, y) => (x.source||'').localeCompare(y.source||''))) {
+        rows.push(`<tr class="row srcrow">` +
+          `<td style="padding-left:20px;color:#7aa2f7">↳ ${escapeHtml(sr.source || '')}</td>` +
+          `<td>${escapeHtml(sr.flight || '')}</td><td>${escapeHtml(sr.icao || '')}</td>` +
+          `<td>${escapeHtml(sr.reg || '')}</td><td></td>` +
+          `<td>${sr.alt ?? ''}</td><td>${sr.spd ?? ''}</td><td>${sr.msgs ?? ''}</td>` +
+          `<td class="age">${fmtAge(s.now - sr.seen)}</td></tr>`);
+      }
+    }
   }
   for (const v of [...s.vessels].sort((x, y) => (y.mmsi||0) - (x.mmsi||0))) {
     const k = 'v' + v.mmsi;
     rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
       `onclick="selectEntity('${k}',${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
       `<td style="color:${shipMeta(v.shiptype).color}">⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
+      `<td></td><td></td>` +
       `<td>${escapeHtml(v.country || '')}</td><td>${escapeHtml(shipMeta(v.shiptype).label || '')}</td>` +
       `<td></td><td>${v.sog ?? ''}</td><td></td>` +
       `<td class="age">${fmtAge(s.now - v.seen)}</td></tr>`);
@@ -815,7 +840,7 @@ function render() {
     rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
       `onclick="selectEntity('${k}',${sat.lat ?? 'null'},${sat.lon ?? 'null'})">` +
       `<td style="color:#bb9af7">🛰 ${escapeHtml(sat.name || ('Iridium ' + sat.sat))}</td>` +
-      `<td></td><td>satellite</td>` +
+      `<td></td><td></td><td></td><td>satellite</td>` +
       `<td>${sat.alt != null ? Math.round(sat.alt) + 'km' : ''}</td><td></td><td></td>` +
       `<td class="age">${fmtAge(s.now - sat.seen)}</td></tr>`);
   }
@@ -825,21 +850,21 @@ function render() {
   if (terms.length) {
     const showTerm = localStorage.getItem('xng.terminals') === '1';
     rows.push(`<tr class="row" onclick="toggleTerminals()">` +
-      `<td colspan="7" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
+      `<td colspan="9" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
     if (showTerm) {
       for (const t of [...terms].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
         const k = 't' + t.imei;
         rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
           `onclick="selectEntity('${k}',null,null)">` +
           `<td style="color:#e0af68">📟 ${escapeHtml(t.imei)}</td>` +
-          `<td></td><td>SBD${t.text ? ' · ' + escapeHtml(String(t.text).trim().slice(0, 20)) : ''}</td>` +
+          `<td></td><td></td><td></td><td>SBD${t.text ? ' · ' + escapeHtml(String(t.text).trim().slice(0, 20)) : ''}</td>` +
           `<td></td><td></td><td>${t.msgs ?? ''}</td>` +
           `<td class="age">${fmtAge(s.now - t.seen)}</td></tr>`);
       }
     }
   }
   document.getElementById('entities').innerHTML = rows.length
-    ? `<table><tr><th>id</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th><th>seen</th></tr>${rows.join('')}</table>`
+    ? `<table><tr><th>id</th><th>flight</th><th>icao</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th><th>seen</th></tr>${rows.join('')}</table>`
     : '';
 
   // Pause freezes only which log items are listed: capture the live list
