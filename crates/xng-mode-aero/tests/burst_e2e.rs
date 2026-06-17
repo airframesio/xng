@@ -90,6 +90,8 @@ fn decodes_t_burst_with_acars() {
     }
     let e = events.iter().find(|e| e.acars.is_some()).expect("ACARS from T burst");
     assert_eq!(e.bit_rate, 1200);
+    // AERO-8.2: a reserved/TDMA T burst is tagged as the T channel.
+    assert_eq!(e.channel, xng_mode_aero::AeroChannel::TChannel);
     let b = e.acars.as_ref().unwrap();
     assert!(b.crc_ok);
     assert_eq!(b.core.tail.as_deref(), Some("VT-ANB"));
@@ -138,6 +140,8 @@ fn decodes_r_burst() {
     assert_eq!(events[0].user.data, payload);
     assert_eq!(events[0].user.aes_id, "123456");
     assert_eq!(events[0].bit_rate, 600);
+    // AERO-8.2: a random-access return burst is tagged as the R channel.
+    assert_eq!(events[0].channel, xng_mode_aero::AeroChannel::RChannel);
 }
 
 /// AERO-3: an R-channel control SU (call-progress 0x30) decodes through the
@@ -189,5 +193,29 @@ fn decodes_r_control_su() {
         .expect("R control SU surfaces a named event");
     assert_eq!(e.mode, Mode::AeroC);
     assert_eq!(e.bit_rate, 600);
+    assert_eq!(e.channel, xng_mode_aero::AeroChannel::RChannel);
     assert_eq!(e.su_event.as_ref().unwrap()["su_type_hex"], "0x30");
+
+    // AERO-8.2: the channel tag + physical line rate land in the message.
+    use xng_types::{AppInfo, MessageBody, Provenance, StationIdentity};
+    let msg = xng_mode_aero::to_message(
+        e,
+        3_686_000_000,
+        -50.0,
+        Provenance {
+            station: StationIdentity::new("TEST-AERO-C"),
+            app: AppInfo::xng(),
+            sdr: None,
+            channel: None,
+        },
+    );
+    assert_eq!(msg.mode, Mode::AeroC);
+    match msg.body {
+        MessageBody::Aero { kind, details } => {
+            assert_eq!(kind, "r-call-progress");
+            assert_eq!(details["channel"], "r-channel");
+            assert_eq!(details["line_bit_rate"], 600);
+        }
+        other => panic!("expected MessageBody::Aero, got {other:?}"),
+    }
 }

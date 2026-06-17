@@ -213,3 +213,30 @@ tags `Mode::AeroL`; the C-band feeder R/T burst decoder
 longer mislabel as `aero-l`. (JAERO models these as distinct physical
 channels — `AeroL::ChannelType {PChannel, RChannel, TChannel}` on L-band
 vs the C-band feeder bursts handled by the burst demodulators.)
+
+Typed SU classifier + bit_rate/channel tag (AERO-8.2): the typed SU
+classifier is shared across all three logical channels — `parse_p_su`
+runs on P-channel SUs (`AeroChannelDecoder`) and on the P-style SUs
+carried inside T bursts (`BurstPacketizer`), while `parse_r_su`
+classifies the R-channel control set; the user-data ISU/SSU layer is the
+same `Reassembler`/`RIsuReassembler` for P/R/T. Each `AeroEvent` now also
+carries an `AeroChannel` (P/R/T): the P-channel decoder emits
+`PChannel`; a C-band feeder burst emits `TChannel` for a reserved/TDMA T
+burst (6-byte AES/GES header + P-style SUs) or `RChannel` for a
+random-access R burst (single 19-byte SU) — mirroring JAERO's
+`RTChannelDeleaveFECScram` OK_T_Packet / OK_R_Packet split. `to_message`
+injects `channel` (p-/r-/t-channel) and `line_bit_rate` (the physical
+frame/burst rate) into the `MessageBody::Aero` details; `line_bit_rate`
+is kept distinct from any decoded protocol `bit_rate` field (e.g. the Pd
+carrier rate in a 0x40 P/R-control ISU) so the two never clobber.
+
+Deliberately out of scope here (noted, not done):
+- C-channel descrambler `dl2` alignment — a demod/DSP off-air scrambler
+  offset (`2714−6` bit delay before descramble) that JAERO applies; it is
+  invisible to matched loopback and has no public C-channel capture to
+  verify against, so it is left flagged (see the C-channel note above)
+  rather than guessed.
+- `docs/notes/AERO.md` — a repo-level doc outside this crate; left to the
+  shared-docs owner.
+- 10.5k A-QPSK aero-c burst path (AERO-8.3) and C-channel AMBE→WAV
+  (feature-flagged audio) — separate big-bet/DSP tasks.

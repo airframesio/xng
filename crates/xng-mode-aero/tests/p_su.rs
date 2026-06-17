@@ -100,12 +100,16 @@ fn log_on_confirm_decodes_end_to_end() {
         bit_rate: 600,
         su_event: Some(v.clone()),
         mode: Mode::AeroL,
+        channel: xng_mode_aero::AeroChannel::PChannel,
     };
     let msg = to_message(&event, 1_545_000_000, -50.0, prov());
     match msg.body {
         MessageBody::Aero { kind, details } => {
             assert_eq!(kind, "log-control");
             assert_eq!(details["event"], "log-on-confirm");
+            // AERO-8.2: channel + line rate injected into the details.
+            assert_eq!(details["channel"], "p-channel");
+            assert_eq!(details["line_bit_rate"], 600);
         }
         other => panic!("expected MessageBody::Aero, got {other:?}"),
     }
@@ -183,12 +187,17 @@ fn pr_control_isu_decodes_end_to_end() {
         bit_rate: 600,
         su_event: Some(v.clone()),
         mode: Mode::AeroL,
+        channel: xng_mode_aero::AeroChannel::PChannel,
     };
     let msg = to_message(&event, 1_545_000_000, -50.0, prov());
     match msg.body {
         MessageBody::Aero { kind, details } => {
             assert_eq!(kind, "pr-channel-control-isu");
+            // Decoded protocol bit_rate (Pd carrier) is preserved;
+            // the physical line rate is surfaced separately (AERO-8.2).
             assert_eq!(details["bit_rate"], 1200);
+            assert_eq!(details["line_bit_rate"], 600);
+            assert_eq!(details["channel"], "p-channel");
         }
         other => panic!("expected MessageBody::Aero, got {other:?}"),
     }

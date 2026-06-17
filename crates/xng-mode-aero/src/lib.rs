@@ -17,12 +17,38 @@ pub mod su;
 
 use chrono::Utc;
 use num_complex::Complex;
+use serde::Serialize;
 use xng_dsp::Ddc;
 use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality};
 
 pub const CHANNEL_RATE: f64 = 24_000.0;
 /// One-sided passband: MSK at ≤1200 bps occupies well under ±2 kHz.
 pub const CHANNEL_PASSBAND_HZ: f64 = 2_500.0;
+
+/// Which logical Inmarsat-Aero channel an event came from. JAERO models
+/// these as distinct physical channels (`AeroL::ChannelType {PChannel,
+/// RChannel, TChannel}`): P is the GES→AES TDM forward channel (L-band,
+/// `AeroChannelDecoder`); R is the AES→GES random-access return channel
+/// and T the AES→GES reserved/TDMA return channel (both reach the GES via
+/// the C-band feeder bursts, `AeroBurstDecoder`). (AERO-8.2.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AeroChannel {
+    PChannel,
+    RChannel,
+    TChannel,
+}
+
+impl AeroChannel {
+    /// The channel tag emitted into `MessageBody::Aero` details.
+    pub fn tag(self) -> &'static str {
+        match self {
+            AeroChannel::PChannel => "p-channel",
+            AeroChannel::RChannel => "r-channel",
+            AeroChannel::TChannel => "t-channel",
+        }
+    }
+}
 
 /// A decoded Aero event: reassembled user data, ACARS when parseable.
 pub struct AeroEvent {
@@ -39,6 +65,10 @@ pub struct AeroEvent {
     /// per-event so [`to_message`] tags the message with the correct mode
     /// instead of hard-coding one (AERO-8.1).
     pub mode: Mode,
+    /// Logical Aero channel (P/R/T) — surfaced alongside `bit_rate` in the
+    /// emitted message so consumers can distinguish forward (P) from the
+    /// random-access (R) and reserved (T) return channels (AERO-8.2).
+    pub channel: AeroChannel,
 }
 
 /// One demod + framing chain at a fixed bit rate.
@@ -188,10 +218,11 @@ impl AeroChannelDecoder {
                     bit_rate: chain.rate,
                     su_event: None,
                     mode: Mode::AeroL,
+                    channel: AeroChannel::PChannel,
                 });
             }
             for a in chain.framer.su_events.drain(..) {
-                out.push(su_event_msg(a, chain.rate, Mode::AeroL));
+                out.push(su_event_msg(a, chain.rate, Mode::AeroL, AeroChannel::PChannel));
             }
         }
 
@@ -219,10 +250,11 @@ impl AeroChannelDecoder {
                     bit_rate: oqpsk::BIT_RATE,
                     su_event: None,
                     mode: Mode::AeroL,
+                    channel: AeroChannel::PChannel,
                 });
             }
             for a in hr.framer.su_events.drain(..) {
-                out.push(su_event_msg(a, oqpsk::BIT_RATE, Mode::AeroL));
+                out.push(su_event_msg(a, oqpsk::BIT_RATE, Mode::AeroL, AeroChannel::PChannel));
             }
         }
         out
@@ -274,6 +306,13 @@ impl AeroBurstDecoder {
             for (i, &rate) in [600u32, 1200].iter().enumerate() {
                 let bits = burst::demod_burst(&b, CHANNEL_RATE, rate as f64);
                 if let Some(result) = self.packetizers[i].process(&bits) {
+                    // The C-band feeder burst is either a reserved/TDMA T
+                    // burst or a random-access R burst (AERO-8.2).
+                    let aero_channel = if result.is_t {
+                        AeroChannel::TChannel
+                    } else {
+                        AeroChannel::RChannel
+                    };
                     for user in result.users {
                         let acars = su::parse_acars(&user.data);
                         out.push(AeroEvent {
@@ -282,14 +321,15 @@ impl AeroBurstDecoder {
                             bit_rate: rate,
                             su_event: None,
                             mode: Mode::AeroC,
+                            channel: aero_channel,
                         });
                     }
                     // Named control/signalling SUs (R access-request /
                     // call-progress / telephony-ack / RQA / ACK, or T-burst
                     // P-style control SUs) carry the burst's bit rate and
-                    // the AeroC channel tag (AERO-3 / AERO-8.2).
+                    // the resolved channel tag (AERO-3 / AERO-8.2).
                     for a in result.su_events {
-                        out.push(su_event_msg(a, rate, Mode::AeroC));
+                        out.push(su_event_msg(a, rate, Mode::AeroC, aero_channel));
                     }
                     break; // one rate decoded this burst
                 }
@@ -361,7 +401,7 @@ impl CChannelDecoder {
     }
 }
 
-fn su_event_msg(a: serde_json::Value, bit_rate: u32, mode: Mode) -> AeroEvent {
+fn su_event_msg(a: serde_json::Value, bit_rate: u32, mode: Mode, channel: AeroChannel) -> AeroEvent {
     let user = su::AeroUserData {
         aes_id: a["aes_id"].as_str().unwrap_or("").to_owned(),
         ges_id: a["ges_id"].as_u64().unwrap_or(0) as u8,
@@ -369,18 +409,27 @@ fn su_event_msg(a: serde_json::Value, bit_rate: u32, mode: Mode) -> AeroEvent {
         refno: 0,
         data: Vec::new(),
     };
-    AeroEvent { user, acars: None, bit_rate, su_event: Some(a), mode }
+    AeroEvent { user, acars: None, bit_rate, su_event: Some(a), mode, channel }
 }
 
 /// Convert a decoded event into the normalized message model.
 pub fn to_message(e: &AeroEvent, frequency_hz: u64, level_dbfs: f32, source: Provenance) -> Message {
     let (body, crc_ok, errors) = match (&e.acars, &e.su_event) {
         (Some(b), _) => (MessageBody::Acars(b.core.clone()), b.crc_ok, Some(b.parity_errors)),
-        (None, Some(a)) => (
-            MessageBody::Aero { kind: su::p_su_kind(a), details: a.clone() },
-            true,
-            None,
-        ),
+        (None, Some(a)) => {
+            // Enrich the structured-SU details with the channel tag and the
+            // physical line/burst bit rate so consumers can distinguish
+            // P/R/T and the line rate without re-deriving them (AERO-8.2).
+            // The line rate uses a distinct key (`line_bit_rate`) so it does
+            // not clobber a decoded protocol `bit_rate` field (e.g. the Pd
+            // carrier rate in a P/R-control ISU 0x40).
+            let mut details = a.clone();
+            if let serde_json::Value::Object(map) = &mut details {
+                map.insert("channel".into(), serde_json::json!(e.channel.tag()));
+                map.insert("line_bit_rate".into(), serde_json::json!(e.bit_rate));
+            }
+            (MessageBody::Aero { kind: su::p_su_kind(a), details }, true, None)
+        }
         (None, None) => (MessageBody::Undecoded, true, None),
     };
     Message {
