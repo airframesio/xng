@@ -70,6 +70,15 @@ lat/lon, place-bearing pairs, place-bearing-distance (NM 0.1 / KM), or
 airway designators. trackDetail legs and the trailing
 routeInformationAdditional stay undecoded (reported as present).
 
+## Reassembly-status names / `assstat` (2026-06)
+
+`reasm.rs`: `Reasm::assstat()` returns the reassembly-status name acarsdec
+emits in its JSON `assstat` field. The exact strings (`complete`,
+`in progress`, `skipped`, `duplicate`, `out of sequence`) are taken from
+libacars' `la_reasm_status_name_get` (reassembly.c); our `Incomplete`
+(final block with sequence holes) maps to libacars'
+`LA_REASM_FRAG_OUT_OF_SEQUENCE` → `"out of sequence"`.
+
 ## Q-series classification (2026-06)
 
 `qseries.rs`: classifies the ARINC 620 `Q`-series link-test / squitter /
