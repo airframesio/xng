@@ -178,7 +178,12 @@ impl FrameValidator {
             level_dbfs,
         };
         match df {
-            17 | 18 => decode_extended_squitter(&bytes[4..11], &mut f),
+            17 | 18 => {
+                decode_extended_squitter(&bytes[4..11], &mut f);
+                if df == 18 {
+                    tag_df18_source(&mut f);
+                }
+            }
             // Surveillance altitude reply: 13-bit AC field (bits 20–32).
             0 | 4 | 16 | 20 => {
                 let ac = ((bytes[2] as u32 & 0x1F) << 8) | bytes[3] as u32;
@@ -255,6 +260,9 @@ impl FrameValidator {
         };
         if df == 17 || df == 18 {
             decode_extended_squitter(&bytes[4..11], &mut f);
+            if df == 18 {
+                tag_df18_source(&mut f);
+            }
         }
         Some(f)
     }
@@ -278,6 +286,28 @@ impl Default for FrameValidator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Tag a DF18 frame with its CF-derived ADS-B source classification
+/// (non-transponder ADS-B / TIS-B / ADS-R). The CF field is frame bits
+/// 5–7 (the low 3 bits of the first byte). The source/cf tag is folded
+/// into `adsb_status` — merged into an existing TC28/29/31 status object
+/// when one is present, otherwise emitted as a standalone object — so the
+/// TIS-B/ADS-R provenance reaches the JSON/asf-2.0 output the crate
+/// already serializes from `adsb_status`.
+fn tag_df18_source(f: &mut AdsbFrame) {
+    let cf = f.bytes[0] & 0x07;
+    let (source, addr_type, detail) = decode::df18_cf_class(cf);
+    let obj = match f.adsb_status.take() {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let mut obj = obj;
+    obj.insert("cf".into(), serde_json::json!(cf));
+    obj.insert("source".into(), serde_json::json!(source));
+    obj.insert("source_addr_type".into(), serde_json::json!(addr_type));
+    obj.insert("source_detail".into(), serde_json::json!(detail));
+    f.adsb_status = Some(serde_json::Value::Object(obj));
 }
 
 /// Decode the 7-byte ME field of an extended squitter into the frame.
@@ -397,6 +427,66 @@ mod tests {
         // A different aircraft doesn't confirm it.
         assert!(v.validate(&POS_FRAME, -20.0, 500).is_none());
         assert!(v.released.is_empty());
+    }
+
+    /// Build a CRC-clean DF18 frame from a chosen CF, ICAO, and 7-byte ME
+    /// (DF18 uses the same clean-PI parity as DF17 with II=0).
+    fn df18_frame(cf: u8, icao: u32, me: [u8; 7]) -> [u8; 14] {
+        let mut b = [0u8; 14];
+        b[0] = (18 << 3) | (cf & 0x07);
+        b[1] = (icao >> 16) as u8;
+        b[2] = (icao >> 8) as u8;
+        b[3] = icao as u8;
+        b[4..11].copy_from_slice(&me);
+        let crc = mode_s_crc(&b[..11]).to_be_bytes();
+        b[11] = crc[1];
+        b[12] = crc[2];
+        b[13] = crc[3];
+        b
+    }
+
+    #[test]
+    fn df18_cf_tags_tisb_and_adsr_source() {
+        let mut v = FrameValidator::new();
+        // CF=6 (ADS-R) carrying a TC19 velocity ME (so adsb_status is not
+        // otherwise populated). Two-sighting confirmation as usual.
+        let me = [0x99, 0x09, 0x94, 0x09, 0x94, 0x08, 0x38];
+        let frame = df18_frame(6, 0xABCDEF, me);
+        assert!(v.validate(&frame, -20.0, 0).is_none(), "first held");
+        let f = v.validate(&frame, -20.0, 1).expect("confirmed");
+        assert_eq!(f.df, 18);
+        let st = f.adsb_status.expect("source tag present");
+        assert_eq!(st["cf"], 6);
+        assert_eq!(st["source"], "ADS-R");
+        assert_eq!(st["source_addr_type"], "adsr_icao");
+
+        // CF=2 (fine TIS-B) on a different aircraft.
+        let frame2 = df18_frame(2, 0x112233, me);
+        assert!(v.validate(&frame2, -20.0, 2).is_none());
+        let f2 = v.validate(&frame2, -20.0, 3).expect("confirmed");
+        let st2 = f2.adsb_status.expect("source tag present");
+        assert_eq!(st2["cf"], 2);
+        assert_eq!(st2["source"], "TIS-B");
+    }
+
+    #[test]
+    fn df18_cf_source_merges_with_tc_status() {
+        // A DF18 carrying a TC28 emergency status (subtype 1) must keep
+        // both the emergency fields and the CF source tag in adsb_status.
+        let mut v = FrameValidator::new();
+        // TC28 (= 28 << 3 = 0xE0) subtype 1, emergency state 5 at ME
+        // bits 8-10 (the top 3 bits of ME byte 1 → 0xA0).
+        let me = [0xE0 | 1, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let frame = df18_frame(0, 0x445566, me);
+        assert!(v.validate(&frame, -20.0, 0).is_none());
+        let f = v.validate(&frame, -20.0, 1).expect("confirmed");
+        let st = f.adsb_status.expect("status present");
+        // CF=0 source tag.
+        assert_eq!(st["source"], "ADS-B");
+        assert_eq!(st["cf"], 0);
+        // TC28 emergency fields preserved alongside.
+        assert_eq!(st["emergency_state"], 5);
+        assert_eq!(st["emergency"], "unlawful interference");
     }
 
     #[test]

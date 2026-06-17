@@ -67,6 +67,21 @@ exactly-one-validates set: `bds_infer` tries them only as a fallback when
 the ELS/EHS set is unambiguously empty, leaving existing decoding
 unperturbed. Emitted under `comm_b`.
 
+## DF18 CF-field source classification (2026-06)
+
+The DF18 Control Field (frame bits 5–7) classification — CF=0 ADS-B
+non-transponder, CF=1 ADS-B anonymous/non-ICAO, CF=2 fine TIS-B, CF=3
+coarse TIS-B, CF=5 fine TIS-B non-ICAO, CF=6 ADS-R rebroadcast, CF=4/7
+unknown format — follows DO-260B §2.2.3.2.1.2 as implemented identically
+by the de-facto reference decoders readsb (`wiedehopf/readsb` mode_s.c)
+and dump1090-fa (`flightaware/dump1090` mode_s.c): the source/addrtype
+mapping in their DF18 CF switch was used as the external reference (facts
+only, no code ported). The mapping is pinned by a `decode.rs` unit test
+asserting each CF's source/addr-type against that reference. Surfaced by
+folding `cf` / `source` / `source_addr_type` / `source_detail` into the
+frame's `adsb_status` (merged with any TC28/29/31 status already present),
+which the crate serializes to JSON/asf-2.0.
+
 ## Operational status / aircraft status (2026-06)
 
 TC 31 (Aircraft Operational Status — BDS 6,5) and TC 28 (Aircraft Status)

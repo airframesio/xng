@@ -340,6 +340,25 @@ fn emergency_label(state: u32) -> &'static str {
     }
 }
 
+/// Classify a DF18 CF (Control Field, frame bits 5–7) into the ADS-B
+/// source / address-type it denotes, per DO-260B §2.2.3.2.1.2 as
+/// implemented identically by readsb and dump1090-fa (`mode_s.c`, the
+/// DF18 CF switch): CF=0 ADS-B non-transponder (ICAO addr), CF=1 ADS-B
+/// anonymous/non-ICAO addr, CF=2 fine TIS-B, CF=3 coarse TIS-B, CF=5 fine
+/// TIS-B with non-ICAO addr, CF=6 ADS-R rebroadcast; CF=4/7 unknown
+/// format. Returns `(source, addr_type, description)`.
+pub fn df18_cf_class(cf: u8) -> (&'static str, &'static str, &'static str) {
+    match cf {
+        0 => ("ADS-B", "icao_nt", "ADS-B non-transponder device (ICAO address)"),
+        1 => ("ADS-B", "non_icao", "ADS-B with anonymous / non-ICAO address"),
+        2 => ("TIS-B", "tisb_icao", "fine TIS-B (ICAO address)"),
+        3 => ("TIS-B", "tisb_icao", "coarse TIS-B airborne position/velocity"),
+        5 => ("TIS-B", "tisb_non_icao", "fine TIS-B with non-ICAO address"),
+        6 => ("ADS-R", "adsr_icao", "ADS-R rebroadcast from an alternate data link"),
+        _ => ("unknown", "unknown", "reserved / unknown CF format"),
+    }
+}
+
 /// 13-bit Mode S altitude field (AC, DF0/4/16/20): M-bit metric flag,
 /// Q-bit 25 ft, else 100 ft Gillham.
 pub fn altitude13(ac: u32) -> Option<i32> {
@@ -1248,6 +1267,25 @@ mod opstatus_tests {
             .map(|i| u8::from_str_radix(&frame[i..i + 2], 16).unwrap())
             .collect();
         bytes[4..11].to_vec()
+    }
+
+    #[test]
+    fn df18_cf_classification_matches_readsb_dump1090() {
+        // Reference: the DF18 CF switch in readsb / dump1090-fa mode_s.c
+        // (identical mapping). source / addr_type / format-known.
+        assert_eq!(df18_cf_class(0).0, "ADS-B");
+        assert_eq!(df18_cf_class(0).1, "icao_nt");
+        assert_eq!(df18_cf_class(1).0, "ADS-B");
+        assert_eq!(df18_cf_class(1).1, "non_icao");
+        assert_eq!(df18_cf_class(2).0, "TIS-B"); // fine TIS-B
+        assert_eq!(df18_cf_class(3).0, "TIS-B"); // coarse TIS-B
+        assert_eq!(df18_cf_class(5).0, "TIS-B"); // fine TIS-B non-ICAO
+        assert_eq!(df18_cf_class(5).1, "tisb_non_icao");
+        assert_eq!(df18_cf_class(6).0, "ADS-R"); // rebroadcast
+        assert_eq!(df18_cf_class(6).1, "adsr_icao");
+        // CF=4 and CF=7 are not assigned a format by either decoder.
+        assert_eq!(df18_cf_class(4).0, "unknown");
+        assert_eq!(df18_cf_class(7).0, "unknown");
     }
 
     #[test]
