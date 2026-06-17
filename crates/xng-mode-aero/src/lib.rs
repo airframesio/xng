@@ -13,6 +13,7 @@ pub mod demod;
 pub mod oqpsk;
 pub mod frame;
 pub mod modulate;
+pub mod satellite;
 pub mod su;
 
 use chrono::Utc;
@@ -69,6 +70,14 @@ pub struct AeroEvent {
     /// emitted message so consumers can distinguish forward (P) from the
     /// random-access (R) and reserved (T) return channels (AERO-8.2).
     pub channel: AeroChannel,
+    /// Parsed 16-bit P-channel frame header of the frame that carried this
+    /// event, when available (AERO-4). Only the L-band P-channel framer
+    /// (`AeroChannelDecoder`) sets this; burst/C-band paths leave it `None`.
+    pub frame_header: Option<frame::FrameHeader>,
+    /// Resolved satellite/beam annotation for this event, when a system-
+    /// table broadcast has been observed on the channel (AERO-2). Already a
+    /// JSON object ready to merge into the message `details`.
+    pub satellite: Option<serde_json::Value>,
 }
 
 /// One demod + framing chain at a fixed bit rate.
@@ -90,6 +99,13 @@ struct Framer {
     /// per chunk (assignments, log-on/log-off control, call announcements,
     /// system-table broadcasts — see [`su::parse_p_su`]).
     su_events: Vec<serde_json::Value>,
+    /// Parsed header of the most recently assembled frame (AERO-4). Latched
+    /// so events surfaced from this frame carry it.
+    last_header: Option<frame::FrameHeader>,
+    /// Self-configuring satellite/beam resolver, fed every structured SU it
+    /// sees (AERO-2). Latches the most recent satellite from the system-
+    /// table broadcasts.
+    resolver: satellite::SatelliteResolver,
 }
 
 impl Framer {
@@ -100,6 +116,8 @@ impl Framer {
             collecting: None,
             reasm: su::Reassembler::new(),
             su_events: Vec::new(),
+            last_header: None,
+            resolver: satellite::SatelliteResolver::new(),
         }
     }
 
@@ -107,11 +125,19 @@ impl Framer {
         if let Some(buf) = &mut self.collecting {
             buf.push(soft);
             if buf.len() == frame::HEADER_BITS + frame::CODED_BITS {
+                // Parse the 16-bit frame header (AERO-4) before the coded
+                // payload, then decode the SUs.
+                self.last_header =
+                    Some(frame::FrameHeader::from_soft_bits(&buf[..frame::HEADER_BITS]));
                 let coded = &buf[frame::HEADER_BITS..];
                 let bytes = self.decoder.decode(coded);
                 for su_bytes in bytes.chunks_exact(su::SU_LEN) {
                     if su::su_crc_ok(su_bytes) {
                         if let Some(a) = su::parse_p_su(su_bytes) {
+                            // Feed the resolver every structured SU so the
+                            // system-table broadcasts (0x0C/0x07/0x05)
+                            // keep the satellite/beam state current (AERO-2).
+                            self.resolver.observe(&a);
                             self.su_events.push(a);
                         }
                         if let Some(u) = self.reasm.push(su_bytes) {
@@ -210,6 +236,11 @@ impl AeroChannelDecoder {
             for &(soft, hard) in &chain.bits {
                 chain.framer.push(soft, hard, &mut users);
             }
+            // The frame header (AERO-4) and resolved satellite (AERO-2) are
+            // latched in the framer; tag every event from this chain with
+            // the current state.
+            let frame_header = chain.framer.last_header;
+            let satellite = chain.framer.resolver.details();
             for user in users {
                 let acars = su::parse_acars(&user.data);
                 out.push(AeroEvent {
@@ -219,10 +250,15 @@ impl AeroChannelDecoder {
                     su_event: None,
                     mode: Mode::AeroL,
                     channel: AeroChannel::PChannel,
+                    frame_header,
+                    satellite: satellite.clone(),
                 });
             }
             for a in chain.framer.su_events.drain(..) {
-                out.push(su_event_msg(a, chain.rate, Mode::AeroL, AeroChannel::PChannel));
+                let mut e = su_event_msg(a, chain.rate, Mode::AeroL, AeroChannel::PChannel);
+                e.frame_header = frame_header;
+                e.satellite = satellite.clone();
+                out.push(e);
             }
         }
 
@@ -242,6 +278,8 @@ impl AeroChannelDecoder {
             for &(soft, hard) in &hr.bits {
                 hr.framer.push(soft, hard, &mut hr_users);
             }
+            let frame_header = hr.framer.last_header;
+            let satellite = hr.framer.resolver.details();
             for user in hr_users {
                 let acars = su::parse_acars(&user.data);
                 out.push(AeroEvent {
@@ -251,10 +289,15 @@ impl AeroChannelDecoder {
                     su_event: None,
                     mode: Mode::AeroL,
                     channel: AeroChannel::PChannel,
+                    frame_header,
+                    satellite: satellite.clone(),
                 });
             }
             for a in hr.framer.su_events.drain(..) {
-                out.push(su_event_msg(a, oqpsk::BIT_RATE, Mode::AeroL, AeroChannel::PChannel));
+                let mut e = su_event_msg(a, oqpsk::BIT_RATE, Mode::AeroL, AeroChannel::PChannel);
+                e.frame_header = frame_header;
+                e.satellite = satellite.clone();
+                out.push(e);
             }
         }
         out
@@ -272,6 +315,9 @@ pub struct AeroBurstDecoder {
     packetizers: [burst::BurstPacketizer; 2],
     channel_buf: Vec<Complex<f32>>,
     level: f32,
+    /// Self-configuring satellite/beam resolver (AERO-2): T-burst P-style
+    /// SUs can carry system-table broadcasts, so resolve from them too.
+    resolver: satellite::SatelliteResolver,
 }
 
 impl AeroBurstDecoder {
@@ -288,6 +334,7 @@ impl AeroBurstDecoder {
             packetizers: [burst::BurstPacketizer::new(), burst::BurstPacketizer::new()],
             channel_buf: Vec::new(),
             level: 0.0,
+            resolver: satellite::SatelliteResolver::new(),
         })
     }
 
@@ -313,6 +360,12 @@ impl AeroBurstDecoder {
                     } else {
                         AeroChannel::RChannel
                     };
+                    // T-burst P-style SUs can carry system-table broadcasts;
+                    // feed them to the resolver before emitting (AERO-2).
+                    for a in &result.su_events {
+                        self.resolver.observe(a);
+                    }
+                    let satellite = self.resolver.details();
                     for user in result.users {
                         let acars = su::parse_acars(&user.data);
                         out.push(AeroEvent {
@@ -322,6 +375,8 @@ impl AeroBurstDecoder {
                             su_event: None,
                             mode: Mode::AeroC,
                             channel: aero_channel,
+                            frame_header: None,
+                            satellite: satellite.clone(),
                         });
                     }
                     // Named control/signalling SUs (R access-request /
@@ -329,7 +384,9 @@ impl AeroBurstDecoder {
                     // P-style control SUs) carry the burst's bit rate and
                     // the resolved channel tag (AERO-3 / AERO-8.2).
                     for a in result.su_events {
-                        out.push(su_event_msg(a, rate, Mode::AeroC, aero_channel));
+                        let mut e = su_event_msg(a, rate, Mode::AeroC, aero_channel);
+                        e.satellite = satellite.clone();
+                        out.push(e);
                     }
                     break; // one rate decoded this burst
                 }
@@ -409,7 +466,34 @@ fn su_event_msg(a: serde_json::Value, bit_rate: u32, mode: Mode, channel: AeroCh
         refno: 0,
         data: Vec::new(),
     };
-    AeroEvent { user, acars: None, bit_rate, su_event: Some(a), mode, channel }
+    AeroEvent {
+        user,
+        acars: None,
+        bit_rate,
+        su_event: Some(a),
+        mode,
+        channel,
+        frame_header: None,
+        satellite: None,
+    }
+}
+
+/// Merge the AERO-2 resolved-satellite annotation and the AERO-4 parsed
+/// frame header into a `details` object (in place). Existing keys are never
+/// overwritten. The resolved-satellite block (`resolved_satellite`, `beam`,
+/// …) and the frame header (`frame_header`) land as nested objects.
+fn enrich_details(details: &mut serde_json::Value, e: &AeroEvent) {
+    if let serde_json::Value::Object(map) = details {
+        // `satellite` is already an object: { resolved_satellite, beam, … }.
+        if let Some(serde_json::Value::Object(sat_map)) = &e.satellite {
+            for (k, v) in sat_map {
+                map.entry(k.clone()).or_insert(v.clone());
+            }
+        }
+        if let Some(h) = e.frame_header {
+            map.entry("frame_header".to_string()).or_insert(h.to_json());
+        }
+    }
 }
 
 /// Convert a decoded event into the normalized message model.
@@ -428,7 +512,17 @@ pub fn to_message(e: &AeroEvent, frequency_hz: u64, level_dbfs: f32, source: Pro
                 map.insert("channel".into(), serde_json::json!(e.channel.tag()));
                 map.insert("line_bit_rate".into(), serde_json::json!(e.bit_rate));
             }
+            enrich_details(&mut details, e);
             (MessageBody::Aero { kind: su::p_su_kind(a), details }, true, None)
+        }
+        // No structured SU but we have a resolved satellite and/or a parsed
+        // frame header — surface them on their own Aero body so the AERO-2
+        // satellite tag and AERO-4 header reach `details` even for an event
+        // that is otherwise just reassembled user data (e.g. ACARS-less).
+        (None, None) if e.satellite.is_some() || e.frame_header.is_some() => {
+            let mut details = serde_json::json!({});
+            enrich_details(&mut details, e);
+            (MessageBody::Aero { kind: "aero-frame".to_owned(), details }, true, None)
         }
         (None, None) => (MessageBody::Undecoded, true, None),
     };

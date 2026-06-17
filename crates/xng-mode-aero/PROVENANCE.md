@@ -230,7 +230,64 @@ frame/burst rate) into the `MessageBody::Aero` details; `line_bit_rate`
 is kept distinct from any decoded protocol `bit_rate` field (e.g. the Pd
 carrier rate in a 0x40 P/R-control ISU) so the two never clobber.
 
+P-channel 16-bit frame header (`frame::FrameHeader`, AERO-4): the 16 bits
+following the 32-bit UW, parsed MSB-first into four JAERO nibbles.
+- Oracle: JAERO `aerol.cpp` `AeroL::Decode` assembles the 16 header bits
+  into `frameinfo` and splits it as `formatid=(frameinfo>>12)&0xF`,
+  `supfrmaker=(frameinfo>>8)&0xF` (superframe marker),
+  `framecounter1=(frameinfo>>4)&0xF`, `framecounter2=frameinfo&0xF`. We
+  parse the same four fields (`format_id`, `superframe`, `frame_counter1`,
+  `frame_counter2`) and surface them in the message `details` as a nested
+  `frame_header` object. The framer parses the header off the 16 soft bits
+  it already collected after the UW (low rate) / out of the skip region
+  (10.5k OQPSK, where the header is the first 16 of the 16+178 skip bits).
+- The superframe-lock / AFC-DCD state machine that *consumes* the header
+  (JAERO's `FreqOffsetEstimateSlot`) stays a documented follow-up; this
+  task only parses and exposes the fields. The `FrameEncoder` round-trips
+  through `FrameHeader::to_u16` so the wire word and the decoder's parse
+  share one definition (`frame_header_roundtrips_through_encoder`).
+
+Satellite/beam resolution (`satellite::SatelliteResolver`, AERO-2): the
+L-band analogue of the HFDL system table (`xng-mode-hfdl::systable`) — a
+self-configuring resolver that learns the serving satellite purely from
+the AES system-table broadcast SUs (0x0C / 0x07 / 0x05) decoded in AERO-1.3
+and tags every message with the resolved satellite + beam.
+- Authoritative source is the 0x0C `satellite_identification` broadcast:
+  JAERO (`aerol.cpp`,
+  `AES_system_table_broadcast_satellite_identification_COMPLETE`) decodes
+  `satid`, the orbital `longitude` (`byte6*1.5°`, `>180 ⇒ W`), and the
+  Psmc carriers, and only *displays* `"SATELLITE ID = %1 (Long %3)…"` — it
+  has **no satellite-name table** — so the resolved identity is the numeric
+  `satellite_id` plus its measured `longitude_deg`/`longitude_dir`, taken
+  verbatim from the broadcast.
+- Beam (global vs spot) is read from the Psmc spot-beam flag JAERO carries
+  in the high bit of the carrier's high octet (the `psmc1_spotbeam` field
+  the 0x0C handler surfaces). 0x07 `GES_beam_support` (named-only in JAERO)
+  sets a `ges_beam_support` presence flag.
+- Ocean-region naming is a *nominal best-effort* hint (JAERO does not name
+  regions): nearest classic Inmarsat region centre by orbital longitude,
+  using the published Inmarsat-3 operational slots — AOR-W ≈ 54°W (F5
+  documented at 54°W), POR ≈ 178°E (F3 documented at 178°E), AOR-E ≈ 15.5°W
+  and IOR ≈ 64°E (classic region centres). Classified within a ±35°
+  tolerance; a satellite far from every slot is left unclassified rather
+  than guessed. The measured longitude (from the broadcast) is the ground
+  truth; the region is secondary. Surfaced as `resolved_satellite`
+  (`satellite_id`, `longitude_deg`, `longitude_dir`, optional `region`) and
+  `beam` in the message `details`. The resolver is fed every structured SU
+  on the P-channel framer, the 10.5k OQPSK framer, and the C-band burst
+  decoder (T-burst P-style SUs can carry system-table broadcasts).
+
 Deliberately out of scope here (noted, not done):
+- AERO-4 superframe-lock / AFC-DCD state machine (JAERO's
+  `FreqOffsetEstimateSlot`): the header is now parsed and exposed, but the
+  state machine that locks the superframe and drives the channel AFC/DCD
+  from `superframe`/`frame_counter` is left as the documented follow-up the
+  task scopes out.
+- AERO-2 satellite **name** mapping: JAERO has no satid→name table, and
+  Inmarsat publishes no public stable satid→satellite registry, so the
+  resolved identity stays numeric (satid) + measured longitude. The ocean
+  region is a nominal longitude hint only; a precise satid→spacecraft map
+  would need an external registry we cannot ground.
 - C-channel descrambler `dl2` alignment — a demod/DSP off-air scrambler
   offset (`2714−6` bit delay before descramble) that JAERO applies; it is
   invisible to matched loopback and has no public C-channel capture to

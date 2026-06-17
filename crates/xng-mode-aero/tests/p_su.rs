@@ -70,6 +70,87 @@ fn decode_su10(su10: Vec<u8>) -> Vec<serde_json::Value> {
     events
 }
 
+/// Like `decode_su10` but returns the full decoded `Message`s (through
+/// `to_message`), so the AERO-2 resolved-satellite tag and AERO-4 frame
+/// header injected into `details` can be asserted end-to-end.
+fn decode_su10_messages(su10: Vec<u8>) -> Vec<xng_types::Message> {
+    let su = su::su_with_crc(su10);
+    let mut frame_bytes = Vec::with_capacity(72);
+    frame_bytes.extend_from_slice(&su);
+    for _ in 0..5 {
+        frame_bytes.extend_from_slice(&su::fill_su());
+    }
+
+    let mut enc = FrameEncoder::new(600);
+    let mut bits: Vec<u8> = (0..160).map(|i| (i % 2) as u8).collect();
+    for f in 0..2u8 {
+        bits.extend(enc.encode(&frame_bytes, f));
+    }
+    bits.extend((0..64).map(|i| (i % 2) as u8));
+
+    let mut iq = modulate(&bits, 600.0, CHANNEL_RATE, 30.0, 0.5);
+    let mut noise = Noise(0x1234_5678_9abc_def0);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.02, noise.next() * 0.02);
+    }
+    let mut dec = AeroChannelDecoder::new(CHANNEL_RATE, 0.0).unwrap();
+    let mut msgs = Vec::new();
+    for chunk in iq.chunks(4096) {
+        for e in dec.process(chunk) {
+            msgs.push(to_message(&e, 1_545_000_000, -50.0, prov()));
+        }
+    }
+    msgs
+}
+
+/// AERO-2 + AERO-4 end-to-end: a 0x0C satellite_identification SU, sent
+/// through the full frame/Viterbi/scrambler chain, resolves the satellite
+/// AND the events carry the parsed 16-bit frame header in `details`.
+/// Oracle: JAERO 0x0C field layout + JAERO frame-header nibble split
+/// (`aerol.cpp`). The encoder writes format id 1, superframe 0.
+#[test]
+fn satellite_resolution_and_frame_header_end_to_end() {
+    // satid 20, longitude index 200 → 300° → 60.0°W (classic AOR-W slot),
+    // Psmc1 channel 0x0123 global (beam = global).
+    let mut su10 = vec![0u8; 10];
+    su10[0] = 0x0C;
+    su10[2] = 0x29; // seqno 10, satid_hi 1
+    su10[3] = 0x40; // satid_lo 4 → satid 20
+    su10[5] = 200; // 60.0°W
+    su10[6] = 0x01;
+    su10[7] = 0x23; // Psmc1 channel 0x0123, no spot beam
+    let msgs = decode_su10_messages(su10);
+
+    // The satellite-id Aero message itself carries the resolved satellite,
+    // the beam, and the parsed frame header in its details.
+    let m = msgs
+        .iter()
+        .find_map(|m| match &m.body {
+            xng_types::MessageBody::Aero { kind, details } if kind == "satellite-id" => {
+                Some(details.clone())
+            }
+            _ => None,
+        })
+        .expect("satellite-id Aero message decoded end-to-end");
+
+    // AERO-2: resolved satellite + beam.
+    assert_eq!(m["resolved_satellite"]["satellite_id"], 20);
+    assert_eq!(m["resolved_satellite"]["longitude_deg"], 60.0);
+    assert_eq!(m["resolved_satellite"]["longitude_dir"], "W");
+    assert_eq!(m["resolved_satellite"]["region"], "AOR-W");
+    assert_eq!(m["beam"], "global");
+
+    // AERO-4: parsed 16-bit frame header. The encoder writes format id 1,
+    // superframe 0 (JAERO nibble split: formatid bits 15..12).
+    assert_eq!(m["frame_header"]["format_id"], 1);
+    assert_eq!(m["frame_header"]["superframe"], 0);
+    // frame_counter1/2 are the running frame counter the encoder wrote
+    // (0 or 1 for the two frames); both nibbles are equal per the encoder.
+    let fc1 = m["frame_header"]["frame_counter1"].as_u64().unwrap();
+    assert_eq!(fc1, m["frame_header"]["frame_counter2"].as_u64().unwrap());
+    assert!(fc1 <= 1);
+}
+
 #[test]
 fn log_on_confirm_decodes_end_to_end() {
     // 0x11 = Log_on_confirm (GES → AES), AES 0xC0FFEE, GES 0x05.
@@ -101,6 +182,8 @@ fn log_on_confirm_decodes_end_to_end() {
         su_event: Some(v.clone()),
         mode: Mode::AeroL,
         channel: xng_mode_aero::AeroChannel::PChannel,
+        frame_header: None,
+        satellite: None,
     };
     let msg = to_message(&event, 1_545_000_000, -50.0, prov());
     match msg.body {
@@ -188,6 +271,8 @@ fn pr_control_isu_decodes_end_to_end() {
         su_event: Some(v.clone()),
         mode: Mode::AeroL,
         channel: xng_mode_aero::AeroChannel::PChannel,
+        frame_header: None,
+        satellite: None,
     };
     let msg = to_message(&event, 1_545_000_000, -50.0, prov());
     match msg.body {

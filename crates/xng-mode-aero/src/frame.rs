@@ -9,6 +9,81 @@ use xng_dsp::viterbi::Viterbi;
 pub const UW: u32 = 0xE15A_E893;
 pub const HEADER_BITS: usize = 16;
 pub const CODED_BITS: usize = 1152;
+
+/// Parsed 16-bit P-channel frame header (AERO-4).
+///
+/// Oracle: JAERO `aerol.cpp` `AeroL::Decode` reads the 16 bits that follow
+/// the unique word, MSB-first, into `frameinfo` and splits it into four
+/// 4-bit nibbles:
+///
+/// ```text
+/// formatid       = (frameinfo >> 12) & 0x000F;   // bits 15..12
+/// supfrmaker     = (frameinfo >>  8) & 0x000F;   // bits 11..8  (superframe marker)
+/// framecounter1  = (frameinfo >>  4) & 0x000F;   // bits  7..4
+/// framecounter2  = (frameinfo >>  0) & 0x000F;   // bits  3..0
+/// ```
+///
+/// The format id selects the frame's content/format, the superframe marker
+/// labels a frame's position in the superframe, and the two frame counters
+/// track frame sequencing — the fields a superframe-lock / AFC-DCD state
+/// machine consumes. (The state machine itself is a documented follow-up;
+/// here we parse and expose the header so a consumer can implement it.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    /// Frame format id (JAERO `formatid`, bits 15..12).
+    pub format_id: u8,
+    /// Superframe marker (JAERO `supfrmaker`, bits 11..8).
+    pub superframe: u8,
+    /// First frame counter nibble (JAERO `framecounter1`, bits 7..4).
+    pub frame_counter1: u8,
+    /// Second frame counter nibble (JAERO `framecounter2`, bits 3..0).
+    pub frame_counter2: u8,
+}
+
+impl FrameHeader {
+    /// Split a 16-bit header word (already assembled MSB-first) into its
+    /// four JAERO nibbles. Exactly mirrors JAERO's `frameinfo` shifts.
+    pub fn from_u16(frameinfo: u16) -> Self {
+        Self {
+            format_id: ((frameinfo >> 12) & 0x0F) as u8,
+            superframe: ((frameinfo >> 8) & 0x0F) as u8,
+            frame_counter1: ((frameinfo >> 4) & 0x0F) as u8,
+            frame_counter2: (frameinfo & 0x0F) as u8,
+        }
+    }
+
+    /// Assemble the 16-bit header word from its nibbles (transmit side /
+    /// round-trip testing).
+    pub fn to_u16(self) -> u16 {
+        ((self.format_id as u16 & 0x0F) << 12)
+            | ((self.superframe as u16 & 0x0F) << 8)
+            | ((self.frame_counter1 as u16 & 0x0F) << 4)
+            | (self.frame_counter2 as u16 & 0x0F)
+    }
+
+    /// Parse the 16 header bits collected after the UW. Each element is a
+    /// soft value; the sign is the demodulated bit (>= 0 ⇒ 1). Bits arrive
+    /// MSB-first (the order JAERO shifts them into `frameinfo`).
+    pub fn from_soft_bits(bits: &[f32]) -> Self {
+        debug_assert_eq!(bits.len(), HEADER_BITS);
+        let mut frameinfo: u16 = 0;
+        for &b in bits.iter().take(HEADER_BITS) {
+            frameinfo = (frameinfo << 1) | u16::from(b >= 0.0);
+        }
+        Self::from_u16(frameinfo)
+    }
+
+    /// Surface the parsed header fields as a JSON object for the message
+    /// `details` channel.
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "format_id": self.format_id,
+            "superframe": self.superframe,
+            "frame_counter1": self.frame_counter1,
+            "frame_counter2": self.frame_counter2,
+        })
+    }
+}
 pub const FRAME_BITS: usize = 32 + HEADER_BITS + CODED_BITS; // 1200
 /// Decoded bits per frame (rate 1/2).
 pub const DECODED_BITS: usize = CODED_BITS / 2; // 576 = 72 bytes = 6 SUs
@@ -150,8 +225,16 @@ impl FrameEncoder {
         for i in (0..32).rev() {
             out.push(((UW >> i) & 1) as u8);
         }
-        // Header: format id 1, superframe 0, two frame counters.
-        let header: u16 = (1 << 12) | ((frame_counter as u16 & 0xF) << 4) | (frame_counter as u16 & 0xF);
+        // Header: format id 1, superframe 0, both frame counters = the
+        // running frame counter. Assembled via `FrameHeader` so the wire
+        // word and the decoder's parse share one definition (AERO-4).
+        let header = FrameHeader {
+            format_id: 1,
+            superframe: 0,
+            frame_counter1: frame_counter & 0x0F,
+            frame_counter2: frame_counter & 0x0F,
+        }
+        .to_u16();
         for i in (0..16).rev() {
             out.push(((header >> i) & 1) as u8);
         }
@@ -188,6 +271,64 @@ mod tests {
                 let out = dec.decode(&soft);
                 assert_eq!(&out, bytes, "rate={rate} frame={f}");
             }
+        }
+    }
+
+    /// AERO-4: the 16-bit P-channel frame header splits into JAERO's four
+    /// nibbles. Oracle = JAERO `aerol.cpp` `AeroL::Decode`:
+    /// formatid=(frameinfo>>12)&0xF, supfrmaker=(frameinfo>>8)&0xF,
+    /// framecounter1=(frameinfo>>4)&0xF, framecounter2=frameinfo&0xF.
+    #[test]
+    fn frame_header_splits_jaero_nibbles() {
+        // frameinfo = 0x1234 → formatid 1, superframe 2, fc1 3, fc2 4.
+        let h = FrameHeader::from_u16(0x1234);
+        assert_eq!(h.format_id, 0x1);
+        assert_eq!(h.superframe, 0x2);
+        assert_eq!(h.frame_counter1, 0x3);
+        assert_eq!(h.frame_counter2, 0x4);
+        // Round-trips back to the same 16-bit word.
+        assert_eq!(h.to_u16(), 0x1234);
+
+        // All-ones nibbles (each field is a full 4 bits).
+        let h = FrameHeader::from_u16(0xFFFF);
+        assert_eq!(
+            (h.format_id, h.superframe, h.frame_counter1, h.frame_counter2),
+            (0xF, 0xF, 0xF, 0xF)
+        );
+
+        // Parse from MSB-first soft bits, exactly as collected after the UW.
+        // frameinfo 0xABCD = 1010 1011 1100 1101.
+        let word = 0xABCDu16;
+        let bits: Vec<f32> =
+            (0..16).rev().map(|i| if (word >> i) & 1 == 1 { 0.9 } else { -0.9 }).collect();
+        let h = FrameHeader::from_soft_bits(&bits);
+        assert_eq!(h.format_id, 0xA);
+        assert_eq!(h.superframe, 0xB);
+        assert_eq!(h.frame_counter1, 0xC);
+        assert_eq!(h.frame_counter2, 0xD);
+        assert_eq!(h.to_json()["format_id"], 0xA);
+        assert_eq!(h.to_json()["superframe"], 0xB);
+        assert_eq!(h.to_json()["frame_counter1"], 0xC);
+        assert_eq!(h.to_json()["frame_counter2"], 0xD);
+    }
+
+    /// AERO-4: the header the encoder writes is recovered by parsing the
+    /// 16 header bits the framer collects after the UW. The encoder writes
+    /// format id 1, superframe 0, both frame counters = the running counter.
+    #[test]
+    fn frame_header_roundtrips_through_encoder() {
+        let mut enc = FrameEncoder::new(600);
+        for fc in [0u8, 3, 9, 15] {
+            let bytes = vec![0u8; frame_bytes_for(600)];
+            let frame = enc.encode(&bytes, fc);
+            // Bits 32..48 are the 16 header bits (after the 32-bit UW).
+            let header_soft: Vec<f32> =
+                frame[32..48].iter().map(|&b| if b == 1 { 1.0 } else { -1.0 }).collect();
+            let h = FrameHeader::from_soft_bits(&header_soft);
+            assert_eq!(h.format_id, 1, "fc={fc}");
+            assert_eq!(h.superframe, 0, "fc={fc}");
+            assert_eq!(h.frame_counter1, fc & 0x0F, "fc={fc}");
+            assert_eq!(h.frame_counter2, fc & 0x0F, "fc={fc}");
         }
     }
 

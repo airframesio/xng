@@ -427,6 +427,10 @@ pub struct HrFramer {
     /// Structured (non-user-data) P-channel SUs decoded this push, drained
     /// per chunk (see [`su::parse_p_su`]).
     pub su_events: Vec<serde_json::Value>,
+    /// Parsed header of the most recently assembled frame (AERO-4).
+    pub last_header: Option<frame::FrameHeader>,
+    /// Self-configuring satellite/beam resolver (AERO-2).
+    pub resolver: crate::satellite::SatelliteResolver,
 }
 
 /// Check a 64-bit window: even-position bits = one rail's 32-bit UW,
@@ -459,6 +463,8 @@ impl HrFramer {
             collecting: None,
             reasm: su::Reassembler::new(),
             su_events: Vec::new(),
+            last_header: None,
+            resolver: crate::satellite::SatelliteResolver::new(),
         }
     }
 
@@ -467,11 +473,16 @@ impl HrFramer {
             let k = buf.len();
             buf.push(soft * inv[k % 2]);
             if buf.len() == HR_SKIP_BITS + HR_CODED_BITS {
+                // First 16 bits of the skip region are the frame header
+                // (AERO-4); the remainder is the 178-bit dummy.
+                self.last_header =
+                    Some(frame::FrameHeader::from_soft_bits(&buf[..frame::HEADER_BITS]));
                 let coded = &buf[HR_SKIP_BITS..];
                 let bytes = self.decoder.decode(coded);
                 for su_bytes in bytes.chunks_exact(su::SU_LEN) {
                     if su::su_crc_ok(su_bytes) {
                         if let Some(a) = su::parse_p_su(su_bytes) {
+                            self.resolver.observe(&a);
                             self.su_events.push(a);
                         }
                         if let Some(u) = self.reasm.push(su_bytes) {
