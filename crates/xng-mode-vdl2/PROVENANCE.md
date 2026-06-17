@@ -198,3 +198,74 @@ compounds) implemented from the same vendored Doc 9880 module; decoded
 values render into the module's phraseology templates ("CLIMB TO
 FL360"). Elements whose argument type is not yet supported stop the
 walk explicitly (sizes unknown), matching the staged FANS approach.
+
+## COTP TPDU completion (2026-06, VDL2-2.2 partial)
+
+The COTP (ISO/IEC 8073 / ITU-T X.224) decoder was extended from 5 TPDU
+types to all 10: it now decodes DC, ED, AK, EA and RJ in addition to the
+existing CR/CC/DR/DT/ER. Each TPDU's full fixed header is parsed
+(destination/source references, CR/CC protocol class + options, DR
+disconnect reason, ER reject cause, DT/ED end-of-TPDU flag, and the TPDU
+sequence numbers and flow-control credit for the data-flow TPDUs), in
+both the normal (7-bit sequence) and extended (31-bit sequence) formats —
+the extended format being signalled by an odd length-indicator per X.224.
+The variable part is parsed as `type|length|value` parameters including
+the **ATN checksum (0x08)** profiled by ICAO Doc 9705, the **TPDU-size
+(0xC0, decoded to bytes as 2^value)**, priority (0x87), inactivity timer
+(0xF2) and the rest of the X.224 parameter set; the DR disconnect-reason
+and ER reject-cause dictionaries are applied to text. The TPDU code
+values (CR 0xE0 … ER 0x70), the header octet layouts and variable-part
+offsets, the parameter-code/name table, and the reason/cause dictionaries
+were cross-checked against the ISO/IEC 8073 framing as profiled by ICAO
+Doc 9705 and against dumpvdl2's `src/cotp.{c,h}` — protocol facts (the
+integer→name/layout assignments) only, not code or formatter text. Tests
+pin spec-derived TPDU vectors built octet-by-octet from the X.224 layout
+(no encode→decode loopback). Multipart COTP reassembly and native ATN-B2
+ADS-C over COTP remain the deferred big bet (VDL2-2.3).
+
+## CLNP options + ATN security label (2026-06, VDL2-2.1 partial)
+
+The full (uncompressed) CLNP (ISO/IEC 8473) decoder now walks the header's
+options part (the optional 6-octet segmentation part — data-unit id,
+segment offset, total length — is decoded and skipped when the SP flag is
+set) as standard `type|length|value` options, naming the X.233 set (QoS
+maintenance 0xC3, discard reason 0xC1, padding 0xCC, priority 0xCD,
+security 0xC5, source routing 0xC8, record route 0xCB, …). The **Security
+option (0xC5)** is decoded as the ATN Security Label (ICAO Doc 9705 §5.6 /
+Doc 9880): the leading globally-unique security-format octet (0xC0), then
+the security-registration-ID octet string, then the length-prefixed
+security-information part. Each security tag set is a
+`name-len(1)=1 | name(1) | set-len(1) | value` block parsed against the
+ATN security-tag dictionary: **traffic-type (tag 0x0F)** with its
+type/category/route-policy sub-fields, **security classification (0x03)**,
+**subnetwork type (0x05)** with subnet name + permitted-traffic-types
+bitfield, and **supported ATSC classes (0x06/0x07)** as an A..H class
+bitfield. The CLNP option codes/names, the security-label structure, the
+security-tag codes, and the traffic-type/ATSC-class/subnet/security-class
+dictionaries were cross-checked against ISO/IEC 8473 (X.233) and ICAO Doc
+9705 and against dumpvdl2's `src/clnp.c` and `src/atn.c` — protocol facts
+(the integer→name/structure assignments) only, not code or formatter text.
+Tests pin spec-derived security-label examples built octet-by-octet (no
+loopback). Multipart CLNP reassembly remains the deferred big bet
+(VDL2-2.1 reassembly part).
+
+## X.25 SNDCF field (2026-06, VDL2-4 follow-up)
+
+The X.25 (ISO/IEC 8208) Call-Request / Call-Accept decoder now decodes the
+SNDCF (Subnetwork Dependent Convergence Function) field that the ATN
+profile (ICAO Doc 9705 §5.7) places between the facility block and the call
+user data. On a Call-Request the field is `id(0xC1) | length | version(=1) |
+… | compression-bitfield` (the compression byte is the 4th octet of the
+SNDCF value, length ≥ 4); on a Call-Accept it is a single compression
+octet. The compression-support bitfield is decoded against the ATN
+algorithm set (ACA 0x40, DEFLATE 0x20, LREF 0x02, LREF-CAN 0x01) plus the
+M/I (maintenance/initialisation) bit 0x10. Previously the SNDCF field was
+swallowed into the call user data, so the compression negotiation was
+invisible and the network-protocol identifier in the CUD was offset by the
+SNDCF length. The SNDCF identifier/version constants and the
+compression-algorithm bitfield were cross-checked against ISO/IEC 8208 /
+ICAO Doc 9705 and against dumpvdl2's `src/x25.{c,h}` (`X25_SNDCF_ID`,
+`X25_SNDCF_VERSION`, `x25_comp_algos`) — protocol facts only, not code or
+formatter text. Tests pin spec-derived Call-Request / Call-Accept SNDCF
+vectors and verify the CUD is no longer offset (no loopback). General X.25
+facility naming remains numeric (out of scope, as before).

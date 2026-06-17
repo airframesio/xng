@@ -38,6 +38,9 @@ pub struct X25Packet {
     /// Negotiated facilities on call packets.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub facilities: Vec<Value>,
+    /// SNDCF compression negotiation on call packets (ICAO Doc 9705 §5.7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sndcf: Option<Value>,
     /// Payload (data packets: user data; call packets: CUD).
     #[serde(skip)]
     pub payload: Vec<u8>,
@@ -227,6 +230,7 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
         diagnostic: None,
         diagnostic_text: None,
         facilities: Vec::new(),
+        sndcf: None,
         payload: Vec::new(),
     };
     if t & 0x01 == 0 {
@@ -240,9 +244,11 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
     }
     match t {
         0x0B | 0x0F => {
-            pkt.kind = if t == 0x0B { "call-request" } else { "call-accepted" };
+            let is_request = t == 0x0B;
+            pkt.kind = if is_request { "call-request" } else { "call-accepted" };
             // Address block: BCD digit counts (called, calling), then the
-            // digits, facilities length + facilities, then CUD.
+            // digits, facilities length + facilities, then the SNDCF field
+            // (ATN profile, ICAO Doc 9705 §5.7) and finally any CUD.
             if b.len() > 3 {
                 let called_len = (b[3] & 0x0F) as usize;
                 let calling_len = (b[3] >> 4) as usize;
@@ -250,13 +256,26 @@ pub fn parse_x25(b: &[u8]) -> Option<X25Packet> {
                 let fac_pos = 4 + addr_octets;
                 if b.len() > fac_pos {
                     let fac_len = b[fac_pos] as usize;
-                    let cud_pos = fac_pos + 1 + fac_len;
-                    if fac_len > 0 && fac_pos + 1 + fac_len <= b.len() {
+                    let mut pos = fac_pos + 1 + fac_len;
+                    if fac_len > 0 && pos <= b.len() {
                         pkt.facilities =
                             parse_facilities(&b[fac_pos + 1..fac_pos + 1 + fac_len]);
                     }
-                    if b.len() > cud_pos {
-                        pkt.payload = b[cud_pos..].to_vec();
+                    // SNDCF: on a Call-Request the field is identifier 0xC1,
+                    // length, then a value whose 4th octet (after version 1)
+                    // is the compression-support bitfield; on a Call-Accept
+                    // a single compression octet follows the facilities.
+                    if is_request {
+                        if let Some((sndcf, consumed)) = parse_sndcf_field(&b[pos.min(b.len())..]) {
+                            pkt.sndcf = Some(sndcf);
+                            pos += consumed;
+                        }
+                    } else if pos < b.len() {
+                        pkt.sndcf = Some(decode_x25_compression(b[pos]));
+                        pos += 1;
+                    }
+                    if pos < b.len() {
+                        pkt.payload = b[pos..].to_vec();
                     }
                 }
             }
@@ -721,6 +740,54 @@ fn parse_idrp_update(b: &[u8]) -> Option<Value> {
     Some(out)
 }
 
+/// Decode an X.25 SNDCF compression-support octet into the ATN algorithm
+/// set (ICAO Doc 9705 §5.7): ACA 0x40, DEFLATE 0x20, LREF 0x02,
+/// LREF-CAN 0x01, plus the M/I (maintenance/initialisation) bit 0x10.
+fn decode_x25_compression(byte: u8) -> Value {
+    let mut algos = Vec::new();
+    if byte & 0x40 != 0 {
+        algos.push("ACA");
+    }
+    if byte & 0x20 != 0 {
+        algos.push("DEFLATE");
+    }
+    if byte & 0x02 != 0 {
+        algos.push("LREF");
+    }
+    if byte & 0x01 != 0 {
+        algos.push("LREF-CAN");
+    }
+    json!({
+        "compression_options": byte,
+        "compression_algos": algos,
+        "maintenance": byte & 0x10 != 0,
+    })
+}
+
+/// Parse the X.25 Call-Request SNDCF field (ATN profile, ICAO Doc 9705
+/// §5.7 / ISO 8208): identifier 0xC1, length octet, then the value whose
+/// first octet is the SNDCF version (must be 1) and whose 4th octet is the
+/// compression-support bitfield. Returns the decoded value and the number
+/// of octets consumed (`2 + length`). Returns None when the identifier,
+/// version or length do not match (so the caller leaves the bytes as CUD).
+fn parse_sndcf_field(b: &[u8]) -> Option<(Value, usize)> {
+    if b.len() < 2 || b[0] != 0xC1 {
+        return None;
+    }
+    let len = b[1] as usize;
+    // ATN SNDCF value is at least 4 octets (version + 3) and version == 1.
+    if len < 4 || 2 + len > b.len() {
+        return None;
+    }
+    let val = &b[2..2 + len];
+    if val[0] != 0x01 {
+        return None;
+    }
+    let mut out = decode_x25_compression(val[3]);
+    out["version"] = json!(val[0]);
+    Some((out, 2 + len))
+}
+
 /// X.25 facilities: TLVs with class-coded lengths (bits 7-8 of the
 /// code: 1/2/3 parameter bytes, or variable with a length byte).
 /// Codes are reported numerically — naming is deferred until the ITU
@@ -751,6 +818,220 @@ fn parse_facilities(b: &[u8]) -> Vec<Value> {
             "params": b[pos..pos + plen].iter().map(|x| format!("{x:02x}")).collect::<String>(),
         }));
         pos += plen;
+    }
+    out
+}
+
+/// CLNP option-part parameter name (ISO/IEC 8473 / X.233 §7.5).
+fn clnp_option_name(t: u8) -> Option<&'static str> {
+    Some(match t {
+        0x05 => "lref",
+        0xC1 => "discard_reason",
+        0xC3 => "qos_maintenance",
+        0xC4 => "prefix_scope_control",
+        0xC5 => "security",
+        0xC6 => "radius_scope_control",
+        0xC8 => "source_routing",
+        0xCB => "record_route",
+        0xCC => "padding",
+        0xCD => "priority",
+        _ => return None,
+    })
+}
+
+/// ATN traffic-type / ATSC-class names (ICAO Doc 9705 §5.6, Tables 5.6-x).
+fn atn_traffic_type_name(bit: u8) -> Option<&'static str> {
+    Some(match bit {
+        1 => "ATS",
+        2 => "AOC",
+        4 => "ATN Administrative",
+        8 => "General Comms",
+        16 => "ATN System Mgmt",
+        _ => return None,
+    })
+}
+
+fn atsc_class_name(bit: u8) -> Option<&'static str> {
+    Some(match bit {
+        1 => "A",
+        2 => "B",
+        4 => "C",
+        8 => "D",
+        16 => "E",
+        32 => "F",
+        64 => "G",
+        128 => "H",
+        _ => return None,
+    })
+}
+
+/// Expand a single-octet bitfield into the set of named bits that are set,
+/// using the provided bit→name lookup.
+fn bitfield_names(byte: u8, namer: fn(u8) -> Option<&'static str>) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for i in 0..8 {
+        let bit = 1u8 << i;
+        if byte & bit != 0 {
+            if let Some(name) = namer(bit) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn atn_subnet_name(s: u8) -> Option<&'static str> {
+    Some(match s {
+        1 => "Mode S",
+        2 => "VDL",
+        3 => "AMSS",
+        4 => "Gatelink",
+        5 => "HF",
+        _ => return None,
+    })
+}
+
+fn atn_security_class_name(c: u8) -> Option<&'static str> {
+    Some(match c {
+        1 => "unclassified",
+        2 => "restricted",
+        3 => "confidential",
+        4 => "secret",
+        5 => "top secret",
+        _ => return None,
+    })
+}
+
+/// Decode one ATN security tag (ICAO Doc 9705 §5.6). `name` is the tag-set
+/// name octet, `v` the tag-set value.
+fn parse_atn_security_tag(name: u8, v: &[u8]) -> Value {
+    let mut out = json!({ "tag_set": name });
+    match name {
+        // Security classification: single octet class id.
+        0x03 if v.len() == 1 => {
+            out["kind"] = json!("security_classification");
+            out["class_id"] = json!(v[0]);
+            if let Some(n) = atn_security_class_name(v[0]) {
+                out["class_name"] = json!(n);
+            }
+        }
+        // Subnetwork type: subnet id + permitted-traffic-types bitfield.
+        0x05 if v.len() == 2 => {
+            out["kind"] = json!("subnet_type");
+            out["subnet_id"] = json!(v[0]);
+            if let Some(n) = atn_subnet_name(v[0]) {
+                out["subnet_name"] = json!(n);
+            }
+            out["permitted_traffic_types"] =
+                json!(bitfield_names(v[1], atn_traffic_type_name));
+        }
+        // Supported ATSC classes: typecode 6 or 7, single bitfield octet.
+        0x06 | 0x07 if v.len() == 1 => {
+            out["kind"] = json!("supported_atsc_classes");
+            out["classes"] = json!(bitfield_names(v[0], atsc_class_name));
+        }
+        // Traffic type / routing policy.
+        0x0F if !v.is_empty() => {
+            out["kind"] = json!("traffic_type");
+            // High 3 bits select type/category, low 5 are the route policy.
+            let (type_name, category) = match v[0] >> 5 {
+                0 => ("ATN operational", "ATSC"),
+                1 if v[0] == 0x30 => ("ATN administrative", "none"),
+                1 => ("ATN operational", "AOC"),
+                3 => ("ATN system management", "none"),
+                _ => ("unknown", "unknown"),
+            };
+            out["traffic_type"] = json!(type_name);
+            out["category"] = json!(category);
+            out["route_policy"] = json!(v[0] & 0x1F);
+        }
+        _ => {
+            out["value_hex"] = json!(v.iter().map(|x| format!("{x:02x}")).collect::<String>());
+        }
+    }
+    out
+}
+
+/// Parse the ATN security label (ICAO Doc 9705 §5.6): security-registration
+/// ID (length-prefixed octet string), then optional security information —
+/// a sequence of tag sets, each `name-len(1)=1 | name(1) | set-len(1) | tags`.
+/// `b` is the security label (after the leading 0xC0 security-format octet).
+fn parse_atn_security_label(b: &[u8]) -> Value {
+    let mut out = json!({});
+    let mut pos = 0usize;
+    let Some(&srid_len) = b.first() else {
+        return out;
+    };
+    let srid_len = srid_len as usize;
+    pos += 1;
+    if pos + srid_len > b.len() {
+        return out;
+    }
+    out["reg_id"] = json!(b[pos..pos + srid_len].iter().map(|x| format!("{x:02x}")).collect::<String>());
+    pos += srid_len;
+    // Security info part (optional): length octet, then tag sets.
+    let Some(&sinfo_len) = b.get(pos) else {
+        return out;
+    };
+    let sinfo_len = sinfo_len as usize;
+    pos += 1;
+    let end = (pos + sinfo_len).min(b.len());
+    let mut tags = Vec::new();
+    while pos + 3 <= end {
+        // In ATN every tag-set name length is 1.
+        if b[pos] != 1 {
+            break;
+        }
+        let name = b[pos + 1];
+        let set_len = b[pos + 2] as usize;
+        pos += 3;
+        if pos + set_len > end {
+            break;
+        }
+        tags.push(parse_atn_security_tag(name, &b[pos..pos + set_len]));
+        pos += set_len;
+    }
+    if !tags.is_empty() {
+        out["sec_info"] = json!(tags);
+    }
+    out
+}
+
+/// Parse the CLNP options part (ISO/IEC 8473 §7.5): a sequence of
+/// `type(1) | length(1) | value` options. The Security option (0xC5) is
+/// expanded as the ATN Security Label per ICAO Doc 9705.
+fn parse_clnp_options(b: &[u8]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 2 <= b.len() {
+        let t = b[pos];
+        let len = b[pos + 1] as usize;
+        pos += 2;
+        if pos + len > b.len() {
+            break;
+        }
+        let v = &b[pos..pos + len];
+        let mut o = json!({ "code": format!("{t:#04x}") });
+        if let Some(name) = clnp_option_name(t) {
+            o["name"] = json!(name);
+        }
+        match t {
+            // Priority: single octet.
+            0xCD if len == 1 => o["priority"] = json!(v[0]),
+            // Discard reason: single octet code (ER PDU option).
+            0xC1 if len == 1 => o["reason"] = json!(v[0]),
+            // Security: ATN globally-unique format (0xC0) then security label.
+            0xC5 if !v.is_empty() && v[0] == 0xC0 => {
+                o["security_format"] = json!("globally-unique");
+                o["security_label"] = parse_atn_security_label(&v[1..]);
+            }
+            _ => {
+                o["value_hex"] =
+                    json!(v.iter().map(|x| format!("{x:02x}")).collect::<String>());
+            }
+        }
+        out.push(o);
+        pos += len;
     }
     out
 }
@@ -790,7 +1071,6 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
     };
     let dst = read_addr(&mut pos)?;
     let src = read_addr(&mut pos)?;
-    let payload = &b[hdr_len..];
     let mut out = json!({
         "protocol": "CLNP",
         "type": type_name,
@@ -800,30 +1080,321 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
         "dst_nsap": dst,
         "src_nsap": src,
     });
+    // Flags bit 7 (SP) signals a 6-octet segmentation part before options
+    // (ISO/IEC 8473 §7.5): data-unit id, segment offset, total length.
+    if flags & 0x80 != 0 {
+        if pos + 6 <= b.len() {
+            out["pdu_id"] = json!(u16::from_be_bytes([b[pos], b[pos + 1]]));
+            out["segment_offset"] = json!(u16::from_be_bytes([b[pos + 2], b[pos + 3]]));
+            out["total_len"] = json!(u16::from_be_bytes([b[pos + 4], b[pos + 5]]));
+        }
+        pos += 6;
+    }
+    // Options part runs from here up to the header length indicator.
+    if pos < hdr_len && hdr_len <= b.len() {
+        let opts = parse_clnp_options(&b[pos..hdr_len]);
+        if !opts.is_empty() {
+            out["options"] = json!(opts);
+        }
+    }
+    let payload = &b[hdr_len..];
     if let Some(cotp) = parse_cotp(payload) {
         out["cotp"] = cotp;
     }
     Some(out)
 }
 
-/// COTP TPDU identification per ISO 8073.
+/// COTP (ISO/IEC 8073 / ITU-T X.224) DR disconnect-reason name.
+fn cotp_dr_reason(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0 => "Reason not specified",
+        1 => "TSAP congestion",
+        2 => "Session entity not attached to TSAP",
+        3 => "Unknown address",
+        128 => "Normal disconnect",
+        129 => "Remote transport entity congestion",
+        130 => "Connection negotiation failed",
+        131 => "Duplicate source reference",
+        132 => "Mismatched references",
+        133 => "Protocol error",
+        135 => "Reference overflow",
+        136 => "Connection request refused",
+        138 => "Header or parameter length invalid",
+        _ => return None,
+    })
+}
+
+/// COTP ER (Error TPDU) reject-cause name (ISO/IEC 8073).
+fn cotp_er_reject_cause(c: u8) -> Option<&'static str> {
+    Some(match c {
+        0 => "Reason not specified",
+        1 => "Invalid parameter code",
+        2 => "Invalid TPDU type",
+        3 => "Invalid parameter value",
+        _ => return None,
+    })
+}
+
+/// COTP variable-part parameter name (ISO/IEC 8073 plus the ATN checksum
+/// 0x08 profiled by ICAO Doc 9705). Only the parameters that occur on
+/// ATN connections are named; others are reported by code.
+fn cotp_param_name(t: u8) -> Option<&'static str> {
+    Some(match t {
+        0x08 => "atn_checksum",
+        0x85 => "ack_time_ms",
+        0x86 => "residual_error_rate",
+        0x87 => "priority",
+        0x88 => "transit_delay",
+        0x89 => "throughput",
+        0x8A => "subseq_num",
+        0x8B => "reassignment_time_sec",
+        0x8C => "flow_control",
+        0x8F => "sack",
+        0xC0 => "tpdu_size",
+        0xC1 => "calling_transport_selector",
+        0xC2 => "called_responding_transport_selector",
+        0xC3 => "checksum",
+        0xC4 => "version",
+        0xC5 => "protection_params",
+        0xC6 => "additional_options",
+        0xC7 => "additional_proto_classes",
+        0xE0 => "additional_info",
+        0xF0 => "preferred_max_tpdu_size",
+        0xF2 => "inactivity_timer_ms",
+        _ => return None,
+    })
+}
+
+/// Parse the COTP variable part: a sequence of `type(1) | length(1) | value`
+/// parameters (ISO/IEC 8073). `b` is the variable-part slice only.
+/// The TPDU-size (0xC0) parameter decodes to bytes via `1 << value`
+/// (ISO/IEC 8073 §13.3.4: values 0x07..0x0D), and the ATN checksum (0x08)
+/// is surfaced as a named octet string.
+fn parse_cotp_params(b: &[u8]) -> Vec<Value> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 2 <= b.len() {
+        let t = b[pos];
+        let len = b[pos + 1] as usize;
+        pos += 2;
+        if pos + len > b.len() {
+            break;
+        }
+        let val = &b[pos..pos + len];
+        let mut p = json!({ "code": format!("{t:#04x}") });
+        if let Some(name) = cotp_param_name(t) {
+            p["name"] = json!(name);
+        }
+        match t {
+            // TPDU size: 2^value bytes (valid value range 0x07..0x0D).
+            0xC0 if len == 1 && (0x07..=0x0D).contains(&val[0]) => {
+                p["tpdu_size"] = json!(1u32 << val[0]);
+            }
+            // Ack time / priority / subseq / reassignment: u16.
+            0x85 | 0x87 | 0x8A | 0x8B if len == 2 => {
+                p["value"] = json!(u16::from_be_bytes([val[0], val[1]]));
+            }
+            // Version: u8.
+            0xC4 if len == 1 => p["value"] = json!(val[0]),
+            // Inactivity timer: u32 ms.
+            0xF2 if len == 4 => {
+                p["value"] = json!(u32::from_be_bytes([val[0], val[1], val[2], val[3]]));
+            }
+            _ => {
+                p["value_hex"] =
+                    json!(val.iter().map(|x| format!("{x:02x}")).collect::<String>());
+            }
+        }
+        out.push(p);
+        pos += len;
+    }
+    out
+}
+
+/// COTP TPDU decode per ISO/IEC 8073 / ITU-T X.224, all ten TPDU types,
+/// including the variable part (TPDU-size, ATN checksum 0x08, credit,
+/// EOT and extended sequence numbers). `b` is the COTP TPDU starting with
+/// the length-indicator (LI) octet; the header occupies `b[0..=li]` and
+/// user data (DT/ED) follows at `b[li + 1..]`.
 fn parse_cotp(b: &[u8]) -> Option<Value> {
     let li = *b.first()? as usize;
+    if li == 0 || li == 0xFF || b.len() < 2 + 2 {
+        // Need at least LI + code + dst_ref (X.224 minimum header).
+        return None;
+    }
     let code = *b.get(1)?;
-    let (name, refs) = match code & 0xF0 {
-        0xE0 => ("CR", true),
-        0xD0 => ("CC", true),
-        0x80 => ("DR", true),
-        0xF0 => ("DT", false),
-        0x70 => ("ER", false),
+    // dst_ref occupies b[2..4] for every COTP TPDU.
+    let dst_ref = if b.len() >= 4 {
+        Some(u16::from_be_bytes([b[2], b[3]]))
+    } else {
+        None
+    };
+    // Classify by the high nibble; CR/CC/AK/RJ carry credit in the low
+    // nibble (normal format), DT carries the ROA bit in bit 0.
+    let high = code & 0xF0;
+    let (name, base_code, credit_nibble): (&str, u8, Option<u8>) = match high {
+        0xE0 => ("CR", 0xE0, Some(code & 0x0F)),
+        0xD0 => ("CC", 0xD0, Some(code & 0x0F)),
+        0x80 => ("DR", 0x80, None),
+        0xC0 => ("DC", 0xC0, None),
+        0xF0 => ("DT", 0xF0, None),
+        0x10 => ("ED", 0x10, None),
+        0x60 => ("AK", 0x60, Some(code & 0x0F)),
+        0x20 => ("EA", 0x20, None),
+        0x50 => ("RJ", 0x50, Some(code & 0x0F)),
+        0x70 => ("ER", 0x70, None),
         _ => return None,
     };
     let mut out = json!({ "tpdu": name });
-    if refs && b.len() >= 6 {
-        out["dst_ref"] = json!(u16::from_be_bytes([b[2], b[3]]));
-        out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+    out["dst_ref"] = json!(dst_ref?);
+
+    // Variable-part offset measured from the LI octet (i.e. into `b`);
+    // the variable part is b[var_off..=li]. Per X.224 the extended format
+    // (32-bit sequence numbers) is signalled by an odd LI for DT/ED/AK/EA/RJ.
+    let extended = matches!(name, "DT" | "ED" | "AK" | "EA" | "RJ") && (li & 1 == 1);
+    let var_off: usize;
+    match name {
+        "CR" | "CC" => {
+            // code, dst_ref(2), src_ref(2), class/options(1).
+            if b.len() < 7 {
+                return None;
+            }
+            out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+            out["class"] = json!(b[6] >> 4);
+            out["options"] = json!(b[6] & 0x0F);
+            var_off = 7;
+        }
+        "DR" => {
+            // code, dst_ref(2), src_ref(2), reason(1).
+            if b.len() < 7 {
+                return None;
+            }
+            out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+            let reason = b[6];
+            out["reason"] = json!(reason);
+            if let Some(t) = cotp_dr_reason(reason) {
+                out["reason_text"] = json!(t);
+            }
+            var_off = 7;
+        }
+        "DC" => {
+            // code, dst_ref(2), src_ref(2).
+            if b.len() < 6 {
+                return None;
+            }
+            out["src_ref"] = json!(u16::from_be_bytes([b[4], b[5]]));
+            var_off = 6;
+        }
+        "ER" => {
+            // code, dst_ref(2), reject-cause(1).
+            if b.len() < 5 {
+                return None;
+            }
+            let cause = b[4];
+            out["reject_cause"] = json!(cause);
+            if let Some(t) = cotp_er_reject_cause(cause) {
+                out["reject_cause_text"] = json!(t);
+            }
+            var_off = 5;
+        }
+        "DT" | "ED" => {
+            // ROA bit is bit 0 of the code for DT.
+            if base_code == 0xF0 {
+                out["roa"] = json!(code & 1 == 1);
+            }
+            if extended {
+                // code, dst_ref(2), EOT|seq(4).
+                if b.len() < 8 {
+                    return None;
+                }
+                out["eot"] = json!(b[4] & 0x80 != 0);
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                var_off = 8;
+            } else {
+                // code, dst_ref(2), EOT|seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["eot"] = json!(b[4] & 0x80 != 0);
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        "AK" => {
+            if extended {
+                // code, dst_ref(2), seq(4), credit(2).
+                if b.len() < 10 {
+                    return None;
+                }
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                out["credit"] = json!(u16::from_be_bytes([b[8], b[9]]));
+                var_off = 10;
+            } else {
+                // code(credit low nibble), dst_ref(2), seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["credit"] = json!(credit_nibble.unwrap_or(0));
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        "EA" => {
+            if extended {
+                // code, dst_ref(2), seq(4).
+                if b.len() < 8 {
+                    return None;
+                }
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                var_off = 8;
+            } else {
+                // code, dst_ref(2), seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        "RJ" => {
+            if extended {
+                // code, dst_ref(2), seq(4), credit(2).
+                if b.len() < 10 {
+                    return None;
+                }
+                out["tpdu_seq"] =
+                    json!(u32::from_be_bytes([b[4], b[5], b[6], b[7]]) & 0x7FFF_FFFF);
+                out["credit"] = json!(u16::from_be_bytes([b[8], b[9]]));
+                var_off = 10;
+            } else {
+                // code(credit low nibble), dst_ref(2), seq(1).
+                if b.len() < 5 {
+                    return None;
+                }
+                out["credit"] = json!(credit_nibble.unwrap_or(0));
+                out["tpdu_seq"] = json!((b[4] & 0x7F) as u32);
+                var_off = 5;
+            }
+        }
+        _ => return None,
     }
-    if name == "DT" && b.len() > li + 1 {
+    if extended {
+        out["extended"] = json!(true);
+    }
+
+    // Variable part: b[var_off..=li] (header runs through index `li`).
+    let hdr_end = li + 1; // one past the last header octet
+    if var_off > 0 && hdr_end > var_off && hdr_end <= b.len() {
+        let params = parse_cotp_params(&b[var_off..hdr_end]);
+        if !params.is_empty() {
+            out["params"] = json!(params);
+        }
+    }
+
+    if matches!(name, "DT" | "ED") && b.len() > li + 1 {
         let user = &b[li + 1..];
         out["user_data_len"] = json!(user.len());
         // ATN-B1 applications ride here (via the ULCS null encoding):
@@ -1048,6 +1619,49 @@ mod tests {
     }
 
     #[test]
+    fn x25_call_request_sndcf_compression() {
+        // Call-Request (0x0B): no addresses, one fast-select facility, then
+        // the SNDCF field (id 0xC1, len 4, version 1, .., compression 0x70 =
+        // ACA + DEFLATE + M/I bit), then CUD = 0x81 (CLNP). The SNDCF field
+        // sits between facilities and CUD per ICAO Doc 9705 §5.7.
+        let pkt = [
+            0x10, 0x01, 0x0B, 0x00, // GFI/LCN, call-request, no addresses
+            0x02, 0x01, 0x80, // facility length 2, fast-select facility
+            0xC1, 0x04, 0x01, 0x00, 0x00, 0x70, // SNDCF: version 1, comp 0x70
+            0x81, // CUD: CLNP NLPID
+        ];
+        let p = parse_x25(&pkt).unwrap();
+        assert_eq!(p.kind, "call-request");
+        let s = p.sndcf.as_ref().unwrap();
+        assert_eq!(s["version"], 1);
+        assert_eq!(s["compression_options"], 0x70);
+        assert_eq!(s["compression_algos"][0], "ACA");
+        assert_eq!(s["compression_algos"][1], "DEFLATE");
+        assert_eq!(s["maintenance"], true);
+        // CUD (the network-protocol identifier) is no longer swallowed.
+        assert_eq!(p.payload, vec![0x81]);
+        // A non-SNDCF byte sequence is left as CUD (identifier mismatch).
+        let no_sndcf = [0x10, 0x01, 0x0B, 0x00, 0x00, 0x81, 0x01];
+        let p = parse_x25(&no_sndcf).unwrap();
+        assert!(p.sndcf.is_none());
+        assert_eq!(p.payload, vec![0x81, 0x01]);
+    }
+
+    #[test]
+    fn x25_call_accept_single_compression_octet() {
+        // Call-Accepted (0x0F): no addresses, no facilities, then a single
+        // compression octet 0x02 (LREF only), then CUD.
+        let pkt = [0x10, 0x01, 0x0F, 0x00, 0x00, 0x02, 0xAA];
+        let p = parse_x25(&pkt).unwrap();
+        assert_eq!(p.kind, "call-accepted");
+        let s = p.sndcf.as_ref().unwrap();
+        assert_eq!(s["compression_options"], 0x02);
+        assert_eq!(s["compression_algos"][0], "LREF");
+        assert_eq!(s["maintenance"], false);
+        assert_eq!(p.payload, vec![0xAA]);
+    }
+
+    #[test]
     fn x25_supervisory_parse() {
         let rr = [0x10, 0x01, 0b101_00001];
         let p = parse_x25(&rr).unwrap();
@@ -1119,13 +1733,19 @@ mod tests {
         let mut b = vec![0x81, 15, 1, 0x3F, 0x1C, 0x00, 0x14, 0x00, 0x00];
         b.extend_from_slice(&[2, 0x47, 0x01]); // dst NSAP
         b.extend_from_slice(&[2, 0x47, 0x02]); // src NSAP
-        b.extend_from_slice(&[0x02, 0xF0, 0x80, b'H', b'I']); // COTP DT
+        // COTP DT, normal format: LI=4, code 0xF0, dst_ref=1, EOT|seq=0x80,
+        // then user data "HI" (ISO/IEC 8073 §13.7).
+        b.extend_from_slice(&[0x04, 0xF0, 0x00, 0x01, 0x80, b'H', b'I']);
         let v = parse_network(&b).unwrap();
         assert_eq!(v["protocol"], "CLNP");
         assert_eq!(v["type"], "DT");
         assert_eq!(v["dst_nsap"], "4701");
         assert_eq!(v["src_nsap"], "4702");
         assert_eq!(v["cotp"]["tpdu"], "DT");
+        assert_eq!(v["cotp"]["dst_ref"], 1);
+        assert_eq!(v["cotp"]["eot"], true);
+        assert_eq!(v["cotp"]["tpdu_seq"], 0);
+        assert_eq!(v["cotp"]["user_data_len"], 2);
     }
 
     #[test]
@@ -1134,5 +1754,264 @@ mod tests {
         assert_eq!(v["protocol"], "ES-IS");
         let v = parse_network(&[0x05, 0, 0]).unwrap();
         assert_eq!(v["protocol"], "clnp-compressed?");
+    }
+
+    // --- COTP (ISO/IEC 8073 / ITU-T X.224) TPDU coverage ---
+    // The TPDU code values, header layouts, variable-part parameter codes
+    // (incl. the ATN checksum 0x08), DR disconnect-reason and ER reject-cause
+    // dictionaries are cross-checked against the ISO/IEC 8073 framing as
+    // profiled by ICAO Doc 9705 and against dumpvdl2's src/cotp.{c,h}
+    // (protocol facts only — no code or formatter text was copied).
+
+    #[test]
+    fn cotp_cr_with_tpdu_size_and_atn_checksum() {
+        // CR (0xE0 | credit 0): code, dst_ref(2), src_ref(2), class|opt(1),
+        // then variable part: TPDU-size 0xC0 len 1 value 0x0A (=1024),
+        // ATN checksum 0x08 len 2. LI counts every header octet after LI.
+        // header after LI: code(1)+dstref(2)+srcref(2)+class(1)
+        //                  + [C0 01 0A] + [08 02 12 34] = 6 + 3 + 4 = 13.
+        let b = [
+            0x0D, 0xE0, 0x00, 0x05, 0x12, 0x34, 0x40, // CR, dst 5, src 0x1234, class 4
+            0xC0, 0x01, 0x0A, // TPDU size 2^10
+            0x08, 0x02, 0x12, 0x34, // ATN checksum
+        ];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "CR");
+        assert_eq!(v["dst_ref"], 5);
+        assert_eq!(v["src_ref"], 0x1234);
+        assert_eq!(v["class"], 4);
+        let params = v["params"].as_array().unwrap();
+        assert_eq!(params[0]["name"], "tpdu_size");
+        assert_eq!(params[0]["tpdu_size"], 1024);
+        assert_eq!(params[1]["name"], "atn_checksum");
+        assert_eq!(params[1]["value_hex"], "1234");
+    }
+
+    #[test]
+    fn cotp_cc_decodes_class_and_refs() {
+        // CC (0xD0): same fixed layout as CR. LI=6 (no variable part).
+        let b = [0x06, 0xD0, 0x12, 0x34, 0x00, 0x07, 0x40];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "CC");
+        assert_eq!(v["dst_ref"], 0x1234);
+        assert_eq!(v["src_ref"], 7);
+        assert_eq!(v["class"], 4);
+        assert_eq!(v["options"], 0);
+    }
+
+    #[test]
+    fn cotp_dr_disconnect_reason_named() {
+        // DR (0x80): code, dst_ref(2), src_ref(2), reason(1)=128 "Normal".
+        let b = [0x06, 0x80, 0x00, 0x09, 0x12, 0x34, 128];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DR");
+        assert_eq!(v["dst_ref"], 9);
+        assert_eq!(v["src_ref"], 0x1234);
+        assert_eq!(v["reason"], 128);
+        assert_eq!(v["reason_text"], "Normal disconnect");
+    }
+
+    #[test]
+    fn cotp_dc_decodes_refs() {
+        // DC (0xC0): code, dst_ref(2), src_ref(2). LI=5.
+        let b = [0x05, 0xC0, 0x00, 0x09, 0x12, 0x34];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DC");
+        assert_eq!(v["dst_ref"], 9);
+        assert_eq!(v["src_ref"], 0x1234);
+    }
+
+    #[test]
+    fn cotp_er_reject_cause_named() {
+        // ER (0x70): code, dst_ref(2), reject-cause(1)=2 "Invalid TPDU type".
+        let b = [0x04, 0x70, 0x00, 0x09, 0x02];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "ER");
+        assert_eq!(v["dst_ref"], 9);
+        assert_eq!(v["reject_cause"], 2);
+        assert_eq!(v["reject_cause_text"], "Invalid TPDU type");
+    }
+
+    #[test]
+    fn cotp_ed_normal_format() {
+        // ED (0x10): like DT, EOT|seq(1). LI=4, normal format, user data.
+        let b = [0x04, 0x10, 0x00, 0x03, 0x85, 0xAB, 0xCD];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "ED");
+        assert_eq!(v["dst_ref"], 3);
+        assert_eq!(v["eot"], true);
+        assert_eq!(v["tpdu_seq"], 5);
+        assert_eq!(v["user_data_len"], 2);
+    }
+
+    #[test]
+    fn cotp_dt_extended_seq() {
+        // DT extended format: odd LI (=7) → 32-bit EOT|seq at b[4..8].
+        // code, dst_ref(2), EOT(1)|seq(31). EOT set, seq=0x000000AA.
+        let b = [0x07, 0xF0, 0x00, 0x02, 0x80, 0x00, 0x00, 0xAA, b'X'];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DT");
+        assert_eq!(v["extended"], true);
+        assert_eq!(v["eot"], true);
+        assert_eq!(v["tpdu_seq"], 0xAA);
+        assert_eq!(v["user_data_len"], 1);
+        assert_eq!(v["roa"], false);
+    }
+
+    #[test]
+    fn cotp_ak_normal_credit_in_nibble() {
+        // AK (0x60 | credit): normal format, code(credit low nibble),
+        // dst_ref(2), seq(1). LI=4 (even). credit=5, seq=3.
+        let b = [0x04, 0x65, 0x00, 0x01, 0x03];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "AK");
+        assert_eq!(v["dst_ref"], 1);
+        assert_eq!(v["credit"], 5);
+        assert_eq!(v["tpdu_seq"], 3);
+    }
+
+    #[test]
+    fn cotp_ak_extended_credit_field() {
+        // AK extended: odd LI (=9) → code, dst_ref(2), seq(4), credit(2).
+        let b = [0x09, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00, 0x0A];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "AK");
+        assert_eq!(v["extended"], true);
+        assert_eq!(v["tpdu_seq"], 7);
+        assert_eq!(v["credit"], 10);
+    }
+
+    #[test]
+    fn cotp_ea_and_rj() {
+        // EA (0x20) normal: code, dst_ref(2), seq(1). LI=4.
+        let ea = [0x04, 0x20, 0x00, 0x02, 0x09];
+        let v = parse_cotp(&ea).unwrap();
+        assert_eq!(v["tpdu"], "EA");
+        assert_eq!(v["tpdu_seq"], 9);
+        // RJ (0x50 | credit) normal: code, dst_ref(2), seq(1). credit=2.
+        let rj = [0x04, 0x52, 0x00, 0x02, 0x06];
+        let v = parse_cotp(&rj).unwrap();
+        assert_eq!(v["tpdu"], "RJ");
+        assert_eq!(v["credit"], 2);
+        assert_eq!(v["tpdu_seq"], 6);
+    }
+
+    // --- CLNP options + ATN security label (ISO/IEC 8473 / ICAO Doc 9705) ---
+    // The CLNP option codes, the ATN security-label structure, the security
+    // tag-set codes and the traffic-type/ATSC-class/subnet/security-class
+    // dictionaries are cross-checked against ISO/IEC 8473 (X.233) and ICAO
+    // Doc 9705 and against dumpvdl2's src/clnp.c / src/atn.c (protocol facts
+    // only). Vectors are spec-derived, built octet-by-octet (no loopback).
+
+    /// Build a length-prefixed ATN security tag set: `1 | name | len | value`.
+    fn sec_tagset(name: u8, value: &[u8]) -> Vec<u8> {
+        let mut v = vec![1u8, name, value.len() as u8];
+        v.extend_from_slice(value);
+        v
+    }
+
+    /// Build a CLNP Security option (0xC5) carrying an ATN security label.
+    fn clnp_security_option(srid: &[u8], tagsets: &[u8]) -> Vec<u8> {
+        // label = srid_len | srid | sinfo_len | tagsets
+        let mut label = vec![srid.len() as u8];
+        label.extend_from_slice(srid);
+        label.push(tagsets.len() as u8);
+        label.extend_from_slice(tagsets);
+        // option value = security-format (0xC0 = globally unique) + label
+        let mut val = vec![0xC0u8];
+        val.extend_from_slice(&label);
+        let mut opt = vec![0xC5u8, val.len() as u8];
+        opt.extend_from_slice(&val);
+        opt
+    }
+
+    /// Build a CLNP DT PDU with the given option bytes and no payload.
+    fn clnp_with_options(opts: &[u8]) -> Vec<u8> {
+        // fixed(9) + dst(1+2) + src(1+2) = 15, plus options.
+        let hdr_len = 15 + opts.len();
+        let mut b = vec![0x81, hdr_len as u8, 1, 0x3F, 0x1C, 0x00, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[2, 0x47, 0x01]); // dst NSAP
+        b.extend_from_slice(&[2, 0x47, 0x02]); // src NSAP
+        b.extend_from_slice(opts);
+        b
+    }
+
+    #[test]
+    fn clnp_security_label_traffic_type_and_class() {
+        // Two tag sets: traffic-type (0x0F) value 0x00 → ATN operational /
+        // ATSC / route-policy 0; security-classification (0x03) value 2 →
+        // restricted. SRID = 47 00 27.
+        let mut tagsets = sec_tagset(0x0F, &[0x00]);
+        tagsets.extend(sec_tagset(0x03, &[0x02]));
+        let opt = clnp_security_option(&[0x47, 0x00, 0x27], &tagsets);
+        let v = parse_network(&clnp_with_options(&opt)).unwrap();
+        assert_eq!(v["protocol"], "CLNP");
+        let opts = v["options"].as_array().unwrap();
+        assert_eq!(opts[0]["name"], "security");
+        assert_eq!(opts[0]["security_format"], "globally-unique");
+        let label = &opts[0]["security_label"];
+        assert_eq!(label["reg_id"], "470027");
+        let info = label["sec_info"].as_array().unwrap();
+        assert_eq!(info[0]["kind"], "traffic_type");
+        assert_eq!(info[0]["traffic_type"], "ATN operational");
+        assert_eq!(info[0]["category"], "ATSC");
+        assert_eq!(info[0]["route_policy"], 0);
+        assert_eq!(info[1]["kind"], "security_classification");
+        assert_eq!(info[1]["class_id"], 2);
+        assert_eq!(info[1]["class_name"], "restricted");
+    }
+
+    #[test]
+    fn clnp_security_label_subnet_and_atsc_classes() {
+        // Subnet-type (0x05): subnet 2 (VDL), permitted ATS+AOC (0x03);
+        // supported ATSC classes (0x06): A+B+C (0x07).
+        let mut tagsets = sec_tagset(0x05, &[0x02, 0x03]);
+        tagsets.extend(sec_tagset(0x06, &[0x07]));
+        let opt = clnp_security_option(&[0xAB], &tagsets);
+        let v = parse_network(&clnp_with_options(&opt)).unwrap();
+        let info = &v["options"][0]["security_label"]["sec_info"];
+        assert_eq!(info[0]["kind"], "subnet_type");
+        assert_eq!(info[0]["subnet_id"], 2);
+        assert_eq!(info[0]["subnet_name"], "VDL");
+        assert_eq!(info[0]["permitted_traffic_types"][0], "ATS");
+        assert_eq!(info[0]["permitted_traffic_types"][1], "AOC");
+        assert_eq!(info[1]["kind"], "supported_atsc_classes");
+        assert_eq!(info[1]["classes"][0], "A");
+        assert_eq!(info[1]["classes"][1], "B");
+        assert_eq!(info[1]["classes"][2], "C");
+    }
+
+    #[test]
+    fn clnp_priority_option_decodes() {
+        // Priority option (0xCD) value 6, plus a padding option (0xCC).
+        let opts = [0xCD, 0x01, 0x06, 0xCC, 0x02, 0x00, 0x00];
+        let v = parse_network(&clnp_with_options(&opts)).unwrap();
+        let opts = v["options"].as_array().unwrap();
+        assert_eq!(opts[0]["name"], "priority");
+        assert_eq!(opts[0]["priority"], 6);
+        assert_eq!(opts[1]["name"], "padding");
+    }
+
+    #[test]
+    fn cotp_dt_with_inactivity_and_priority_params() {
+        // DT extended with variable part: priority 0x87 (u16) and inactivity
+        // timer 0xF2 (u32 ms). LI = 7 (extended fixed) + 4 (priority) + 6
+        // (inactivity) = 17 (odd → extended).
+        let b = [
+            0x11, 0xF0, 0x00, 0x02, 0x00, 0x00, 0x00, 0x01, // ext DT, seq 1
+            0x87, 0x02, 0x00, 0x06, // priority = 6
+            0xF2, 0x04, 0x00, 0x00, 0x75, 0x30, // inactivity 30000 ms
+            0x42, // user data
+        ];
+        let v = parse_cotp(&b).unwrap();
+        assert_eq!(v["tpdu"], "DT");
+        assert_eq!(v["extended"], true);
+        assert_eq!(v["tpdu_seq"], 1);
+        let params = v["params"].as_array().unwrap();
+        assert_eq!(params[0]["name"], "priority");
+        assert_eq!(params[0]["value"], 6);
+        assert_eq!(params[1]["name"], "inactivity_timer_ms");
+        assert_eq!(params[1]["value"], 30000);
+        assert_eq!(v["user_data_len"], 1);
     }
 }
