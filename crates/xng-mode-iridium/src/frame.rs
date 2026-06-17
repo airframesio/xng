@@ -198,8 +198,17 @@ pub enum FrameKind {
     Bc,
     /// Messaging header seen (payload not parsed in v1).
     Ms,
-    /// Time-Location ("TL", satellite ranging broadcast). 96-bit header
+    /// Time-Location ("TL"/ISY, satellite ranging broadcast). 96-bit header
     /// `11` + 94 zeros; the payload is descrambled, not BCH-coded.
+    ///
+    /// IRID-1 (ISY "10" vs "11" clarification): the only sync/time-location
+    /// header pattern the reference (iridium-toolkit `header_time_location`)
+    /// and iridium-sniffer recognize is the `11`-prefixed downlink form, which
+    /// is what this classifier keys on. There is no distinct typed `10`-prefix
+    /// frame in either oracle; the `10` vs `11` note in the research log refers
+    /// to the leading two header bits, and `11` is the verified marker. (The
+    /// uplink/downlink direction is carried by the access code, not these two
+    /// bits.)
     Itl,
     /// LCW-bearing duplex frame (DA/voice/IP/sync by frame type).
     Lw,

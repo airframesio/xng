@@ -21,8 +21,26 @@ pub struct MsFrame {
     pub frame: u8,
     /// Group: "A" (acquisition) or "0".."3".
     pub group: String,
+    /// Acquisition-group ("A") header fields, present only when the frame is
+    /// an acquisition message (toolkit `IridiumMSMessage` group-A path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acq: Option<MsAcq>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<MsBody>,
+}
+
+/// Acquisition-group ("AQ") header carried by group-"A" messaging frames
+/// (IRID-1). Toolkit `IridiumMSMessage`: `unknown1`/`secondary` live in the
+/// header block (bits 19/20); the two-block pre-message header carries a
+/// 12-bit counter `ctr1`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MsAcq {
+    /// Header bit 19 (toolkit `unknown1`).
+    pub unknown1: u8,
+    /// Header bit 20 (toolkit `secondary`: something like a secondary SV).
+    pub secondary: u8,
+    /// 12-bit counter from the first pre-message block (toolkit `ctr1`).
+    pub ctr1: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -79,11 +97,17 @@ pub fn parse(blocks: &[Vec<u8>]) -> Option<MsFrame> {
     let mut blocks: Vec<&Vec<u8>> = blocks.iter().take(2 * bch_blocks).collect();
     blocks.remove(0);
 
-    // Acquisition group: 2 (or 4 when present) block-header blocks.
+    // Acquisition group ("AQ"): the header block carries unknown1/secondary in
+    // bits 19/20, and a 2-block pre-message header whose first block starts
+    // with a 12-bit counter (toolkit `ctr1`). Capture those, then drain the
+    // 2 (or 4 when present) block-header blocks.
+    let mut acq: Option<MsAcq> = None;
     if group == "A" {
         if blocks.len() < 2 {
             return None;
         }
+        let ctr1 = int(&blocks[0][..12]) as u16;
+        acq = Some(MsAcq { unknown1: h[19], secondary: h[20], ctr1 });
         let n = if blocks.len() >= 4 { 4 } else { 2 };
         blocks.drain(..n);
     }
@@ -93,7 +117,7 @@ pub fn parse(blocks: &[Vec<u8>]) -> Option<MsFrame> {
             blocks.pop();
         }
     }
-    let mut out = MsFrame { block, frame, group, body: None };
+    let mut out = MsFrame { block, frame, group, acq, body: None };
     if blocks.is_empty() {
         return Some(out);
     }
@@ -318,6 +342,62 @@ mod tests {
         };
         assert_eq!(text, "CALL OPS +14155550100");
         assert_eq!(ctr_max, 0);
+    }
+
+    /// IRID-1: acquisition-group ("AQ") header extraction. Layout pinned
+    /// against iridium-toolkit `IridiumMSMessage` group-"A" path:
+    ///   header bit[0]=ms_type=1 (group A), bits[19]=unknown1, [20]=secondary;
+    ///   the two-block pre-message header's first block bits[0:12] = ctr1.
+    /// (Verified with the toolkit slicing in the IRID-1 derivation: a header
+    /// with ms_type 1 + unknown1 1 + secondary 1 and ctr1=0xABC parses to
+    /// exactly those values.)
+    #[test]
+    fn acquisition_group_header_decodes() {
+        // Header block (21 bits): ms_type=1, zero1=0000, block=2, frame=7,
+        // bch_blocks=3, unknown1=1, secondary=1.
+        let mut h = Vec::new();
+        h.push(1); // ms_type == 1 -> group A
+        push_int(&mut h, 0, 4); // zero1
+        push_int(&mut h, 2, 4); // block
+        push_int(&mut h, 7, 6); // frame
+        push_int(&mut h, 3, 4); // bch_blocks (>=2)
+        h.push(1); // unknown1
+        h.push(1); // secondary
+        assert_eq!(h.len(), 21);
+
+        // First pre-message block: 12-bit ctr1 = 0xABC, then padding.
+        let mut pre0 = Vec::new();
+        push_int(&mut pre0, 0xABC, 12);
+        pre0.resize(21, 0);
+
+        // parse() takes 2*bch_blocks = 6 blocks: header + (>=4 -> 4 pre) ...
+        // give it 6 blocks so the group-A path drains 4 pre-blocks.
+        let blocks: Vec<Vec<u8>> = vec![
+            h,
+            pre0,
+            vec![0u8; 21],
+            vec![1u8; 21],
+            vec![1u8; 21],
+            vec![1u8; 21],
+        ];
+        let f = parse(&blocks).expect("acquisition frame parses");
+        assert_eq!(f.group, "A");
+        let acq = f.acq.expect("acq header present for group A");
+        assert_eq!(acq.unknown1, 1);
+        assert_eq!(acq.secondary, 1);
+        assert_eq!(acq.ctr1, 0xABC);
+        assert_eq!(f.block, 2);
+        assert_eq!(f.frame, 7);
+    }
+
+    /// Non-acquisition (group "1") frames must NOT carry an acq header — the
+    /// field is exclusive to the acquisition path.
+    #[test]
+    fn non_acquisition_frame_has_no_acq() {
+        let blocks = build_ascii_frame(1234567, "HELLO");
+        let f = parse(&blocks).expect("frame");
+        assert_eq!(f.group, "1");
+        assert!(f.acq.is_none());
     }
 
     #[test]

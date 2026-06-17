@@ -18,6 +18,14 @@ file and the crate documentation provide. Ported structures (from
 - IRA field layout (sat/beam/x/y/z/interval/timeslot/EPI/sub-band +
   42-bit pages terminated by an all-ones page) and the geocentric
   position conversion.
+- MS messaging frame layout incl. the acquisition group ("AQ", group
+  "A" / ms_type==1) header: `unknown1`/`secondary` (header bits 19/20)
+  and the 12-bit pre-message counter `ctr1`, per toolkit
+  `IridiumMSMessage`. IRID-1 note: the toolkit/sniffer have no distinct
+  `IridiumNXTMessage` or a `10`-prefixed sync type — only the `11`-prefix
+  Time-Location (ISY) header is a real typed frame, so NXT is left out
+  (no reference to verify against) and the acquisition path exposes the
+  group-A fields rather than discarding them.
 
 PHY facts (no code) from **gr-iridium** and **iridium-sniffer**
 (https://github.com/alphafox02/iridium-sniffer, both GPL-3): 25 000
