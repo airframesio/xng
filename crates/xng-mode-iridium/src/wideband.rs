@@ -140,6 +140,9 @@ pub struct WidebandBurst {
     pub offset_hz: f64,
     pub bits: Vec<u8>,
     pub alt_bits: Option<Vec<u8>>,
+    /// Per-bit reliabilities for `bits`, present only on the IRID-5 max-effort
+    /// soft-decode path (`XNG_IRIDIUM_MAX_EFFORT`); parallel to `bits`.
+    pub soft: Option<Vec<f32>>,
 }
 
 impl IridiumWideband {
@@ -546,7 +549,12 @@ impl IridiumWideband {
         };
         bursts
             .into_iter()
-            .map(|b| WidebandBurst { offset_hz: f_off + b.cfo_hz, bits: b.bits, alt_bits: None })
+            .map(|b| WidebandBurst {
+                offset_hz: f_off + b.cfo_hz,
+                bits: b.bits,
+                alt_bits: None,
+                soft: b.soft,
+            })
             .collect()
     }
 }

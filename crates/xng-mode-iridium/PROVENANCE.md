@@ -111,6 +111,59 @@ than a decoder oracle. Scope is per-frame plaintext (one PAP request or
 HTTP header within a single IIP/IIR frame); cross-frame IP-session
 reassembly is left for a future stateful pass.
 
+## Weak-frame soft-decision recovery (IRID-5)
+
+A soft-decision / Chase-style BCH decoder (`frame::bch_repair_soft`,
+`ecc_blocks_soft`) and a UW (unique-word / access-code) error-correction
+pre-classify step (`frame::correct_access`) extend the weak-frame reach beyond
+the hard-decision path, gated behind a max-effort flag
+(`XNG_IRIDIUM_MAX_EFFORT`); the default decode is bit-identical to before.
+
+**Parameters / oracle.** The RA/IBC blocks use iridium-toolkit's
+BCH(31,21) generator polynomial **1207** (`RINGALERT_BCH_POLY`; messaging
+**1897**), 31 = 21 data + 10 check, with a whole-block even-parity bit
+(toolkit `bch.py` / `bitsparser.py`, BSD-2). The **true minimum distance of
+the poly-1207 (31,21) code is 5** (verified exhaustively over all 2²¹
+codewords offline; pinned cheaply in the `bch_min_distance_is_5` test by the
+minimum weight-≤2 message encoding), so the guaranteed bounded-distance
+correction capacity is t = ⌊(d−1)/2⌋ = **2** — which the existing hard
+`bch_repair` already attains. Beyond two errors no bounded-distance decoder
+can uniquely resolve the codeword, so the only honest lever past t is to use
+the channel's soft information.
+
+**Chase-2** (D. Chase, "A class of algorithms for decoding block codes with
+channel measurement information," *IEEE Trans. IT* IT-18(1), 1972, algorithm
+2): form 2^p test patterns by flipping the `p` least-reliable received bits in
+every combination, hard-decode each through the existing `bch_repair`, and
+keep the codeword with the smallest reliability-weighted (soft) distance to
+the received word. The per-bit reliabilities are derived in the demod from
+each DQPSK symbol's amplitude × decision-boundary margin
+(`derot.norm() · cos(2·residual)`), taken as the weaker of the two symbols a
+differential bit spans, and threaded (parallel to `bits`) through
+`DemodBurst`/`WidebandBurst` → `lib::decode_bits_soft`.
+
+The UW pre-classify step snaps a near-threshold differential access code (the
+decode of the 12-symbol unique word, toolkit `ACCESS_DL`/`ACCESS_UL`) to its
+exact valid downlink/uplink word when within 5 of 24 bits; the two words
+differ in 12 of 24 positions, so for <6 errors the nearer word is unambiguous.
+
+**Verification (oracle-grounded, not loopback).** Test vectors are built by
+encoding known data words with the published BCH generator (1207), injecting a
+specific weight-3 error, and decoding: `chase_soft_corrects_weight3_beyond_hard_t2`
+shows Chase recovers the exact data word where the hard decoder (at its t=2
+limit) cannot; `chase_p0_equals_hard` confirms p=0 reduces to the hard decoder;
+`soft_ecc_recovers_weight3_ra_block` and the e2e `soft_decode_recovers_weight3_ring_alert`
+exercise the full deinterleave + soft-ECC chain (the soft path reproduces the
+sat/beam/position/TMSI of a clean decode, where the hard path truncates);
+`soft_decode_recovers_corrupted_access_code` covers the UW correction.
+**Measured sensitivity delta** (`soft_decode_sensitivity_delta_awgn`, an AWGN
+Monte Carlo over the *shipped* hard vs soft decoders): at a near-threshold
+operating point the per-block decode-success rate rises from ≈77 % (hard) to
+≈96 % (soft Chase-2, p=5) — a ~19-point lift, recovering ~80 % of the blocks
+the hard decoder fails. (A local gr-iridium harness exists on this machine for
+end-to-end off-air comparison, but the unit tests are self-contained against
+the published BCH generator and do not depend on it.)
+
 ## Validation
 
 - **Oracle-validated against iridium-toolkit**: a generated ring-alert

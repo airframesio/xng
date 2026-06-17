@@ -249,3 +249,98 @@ fn rejects_all_zero_ring_alert() {
     let zero = vec![0u8; 96];
     assert!(xng_mode_iridium::ira::parse_ra(&zero, 0, &[]).is_none());
 }
+
+/// IRID-5 end-to-end: a ring-alert burst whose first BCH header block carries
+/// a weight-3 error fails hard-decision decode (the hard t=2 BCH truncates the
+/// frame at block 0, dropping the satellite/position fields) but is recovered
+/// in full by the soft-decision (Chase-2) path when the three error positions
+/// are the least-reliable bits — the AWGN-typical near-threshold case.
+///
+/// Oracle-grounded: the codeword is produced by the published BCH(31,21)
+/// generator (poly 1207), and the soft path is verified to reproduce the
+/// exact sat/beam/position fields a clean decode yields — not a loopback of
+/// the soft decoder against itself.
+#[test]
+fn soft_decode_recovers_weight3_ring_alert() {
+    let payload = ira_payload(73, 21, -1100, 640, 1480, &[0xCAFEF00D]);
+    let bits = ira_bits(&payload);
+
+    // The clean decode is the oracle for the field values.
+    let clean = decode_bits(&bits).expect("clean RA decodes");
+    assert_eq!(clean.kind, "ring-alert");
+
+    // Locate the transmitted positions of header block 0 (the 3-way
+    // interleaved triple) via a tag stream, then inject a weight-3 error there.
+    let tag = frame::interleave3(&vec![1u8; 32], &vec![0u8; 32], &vec![0u8; 32]);
+    // tag is the 96-bit header region; offset by the 24-bit access code.
+    let block0_positions: Vec<usize> = tag
+        .iter()
+        .enumerate()
+        .filter(|(_, &v)| v == 1)
+        .map(|(i, _)| 24 + i)
+        .collect();
+    let err_positions = [
+        block0_positions[2],
+        block0_positions[11],
+        block0_positions[19],
+    ];
+
+    let mut corrupted = bits.clone();
+    // Strong reliability everywhere; the 3 error bits are the weakest.
+    let mut rel = vec![6.0f32; bits.len()];
+    for &p in &err_positions {
+        corrupted[p] ^= 1;
+        rel[p] = 0.12;
+    }
+
+    // Hard path: block 0 has 3 errors → either no frame, or a frame missing
+    // the (truncated) satellite/position fields. It must NOT reproduce them.
+    let hard = decode_bits(&corrupted);
+    let hard_ok = hard
+        .as_ref()
+        .map(|f| f.kind == "ring-alert" && f.details["sat"] == 73 && f.details["beam"] == 21)
+        .unwrap_or(false);
+    assert!(!hard_ok, "hard decode must not recover the weight-3 header block");
+
+    // Soft path: Chase-2 recovers block 0; the full frame matches the oracle.
+    let soft = xng_mode_iridium::decode_bits_soft(&corrupted, Some(&rel))
+        .expect("soft decode recovers the frame");
+    assert_eq!(soft.kind, "ring-alert");
+    assert_eq!(soft.details["sat"], 73);
+    assert_eq!(soft.details["beam"], 21);
+    assert_eq!(soft.details["ra_interval"], clean.details["ra_interval"]);
+    assert_eq!(soft.details["pages"][0]["tmsi"], "cafef00d");
+    assert_eq!(soft.details["lat"], clean.details["lat"]);
+    assert_eq!(soft.details["lon"], clean.details["lon"]);
+}
+
+/// IRID-5 UW pre-classify end-to-end: a burst whose differential access code
+/// carries 3 bit errors (so the strict prefix-match fails) still decodes on
+/// the soft path, because `frame::correct_access` snaps the access field to its
+/// exact downlink word before classification. The hard path drops it.
+#[test]
+fn soft_decode_recovers_corrupted_access_code() {
+    let payload = ira_payload(55, 9, 900, -700, 1600, &[0x1357ACE0]);
+    let bits = ira_bits(&payload);
+
+    let mut corrupted = bits.clone();
+    // Corrupt 3 of the 24 access-code bits (within correct_access's 5-bit reach).
+    for &p in &[1usize, 12, 22] {
+        corrupted[p] ^= 1;
+    }
+    // Strong reliabilities (the BCH header itself is intact here).
+    let rel = vec![6.0f32; bits.len()];
+
+    // Hard path: the access prefix no longer matches → dropped.
+    assert!(
+        decode_bits(&corrupted).is_none(),
+        "hard decode must reject a non-matching access prefix"
+    );
+
+    // Soft path: access code is UW-corrected, frame decodes with right fields.
+    let soft = xng_mode_iridium::decode_bits_soft(&corrupted, Some(&rel))
+        .expect("soft decode recovers via UW correction");
+    assert_eq!(soft.kind, "ring-alert");
+    assert_eq!(soft.details["sat"], 55);
+    assert_eq!(soft.details["beam"], 9);
+}
