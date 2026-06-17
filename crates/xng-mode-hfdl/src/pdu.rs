@@ -40,6 +40,87 @@ fn coordinate(v: u32) -> f64 {
     r as f64 * 180.0 / (1 << 19) as f64
 }
 
+/// Performance-data "last frequency change cause" code → description
+/// (dumphfdl hfnpdu.c `freq_change_code_descriptions`, facts only).
+fn freq_change_cause(code: u8) -> &'static str {
+    match code {
+        0 => "First freq. search in this flight leg",
+        1 => "Too many NACKs",
+        2 => "SPDUs no longer received",
+        3 => "HFDL disabled",
+        4 => "GS frequency change",
+        5 => "GS down / channel down",
+        6 => "Poor uplink channel quality",
+        7 => "No change",
+        _ => "unknown",
+    }
+}
+
+/// HFNPDU type byte → description (dumphfdl hfnpdu.c
+/// `hfnpdu_type_descriptions`, facts only).
+fn hfnpdu_type_name(t: u8) -> Option<&'static str> {
+    Some(match t {
+        0xD0 => "System table (partial)",
+        0xD1 => "Performance data",
+        0xD2 => "System table request",
+        0xD5 => "Frequency data",
+        0xDE => "Delayed echo",
+        0xFF => "Enveloped data",
+        _ => return None,
+    })
+}
+
+/// LPDU type byte → description (dumphfdl lpdu.c
+/// `lpdu_type_descriptions`, facts only).
+fn lpdu_type_name(t: u8) -> Option<&'static str> {
+    Some(match t {
+        0x0D => "Unnumbered data",
+        0x1D => "Unnumbered ack'ed data",
+        0x2F => "Logon denied",
+        0x3F => "Logoff request",
+        0x5F => "Logon resume confirm",
+        0x4F => "Logon resume",
+        0x8F => "Logon request (normal)",
+        0x9F => "Logon confirm",
+        0xBF => "Logon request (DLS)",
+        _ => return None,
+    })
+}
+
+/// Logoff-request reason code → text (dumphfdl `logoff_request_reason_codes`).
+fn logoff_reason(code: u8) -> &'static str {
+    match code {
+        0x01 => "Not within slot boundaries",
+        0x02 => "Downlink set in uplink slot",
+        0x03 => "RLS protocol error",
+        0x04 => "Invalid aircraft ID",
+        0x05 => "HFDL Ground Station subsystem does not support RLS",
+        0x06 => "Other",
+        _ => "Reserved",
+    }
+}
+
+/// Logon-denied reason code → text (dumphfdl `logon_denied_reason_codes`).
+fn logon_denied_reason(code: u8) -> &'static str {
+    match code {
+        0x01 => "Aircraft ID not available",
+        0x02 => "HFDL Ground Station subsystem does not support RLS",
+        _ => "Reserved",
+    }
+}
+
+/// Decode the HFNPDU UTC seconds-of-day counter (raw value is half-seconds)
+/// into {hour, min, sec}. Mirrors dumphfdl `parse_utc_time(2 * raw)`.
+fn utc_hms(raw: u16) -> (u32, u32, u32) {
+    let t = raw as u32 * 2;
+    (t / 3600, (t % 3600) / 60, t % 60)
+}
+
+/// Four per-bitrate MPDU counters {300,600,1200,1800} from a 4-byte run.
+fn mpdu_stats(b: &[u8]) -> serde_json::Value {
+    json!({ "300bps": b[3], "600bps": b[2], "1200bps": b[1], "1800bps": b[0] })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HfdlEvent {
     pub kind: String,
@@ -181,13 +262,31 @@ impl PduParser {
             }),
             0x3F if body.len() >= 5 => out.push(HfdlEvent {
                 kind: "logoff-request".into(),
-                details: json!({ "icao": icao(&body[1..4]), "reason": body[4], "who": who }),
+                details: json!({
+                    "icao": icao(&body[1..4]),
+                    "reason": body[4],
+                    "reason_text": logoff_reason(body[4]),
+                    "who": who,
+                }),
+                acars: None,
+                raw: l.to_vec(),
+            }),
+            0x2F if body.len() >= 5 => out.push(HfdlEvent {
+                // Logon denied: ICAO + reason, same layout as logoff
+                // (dumphfdl lpdu.c LOGON_DENIED → logoff_request_parse).
+                kind: "logon-denied".into(),
+                details: json!({
+                    "icao": icao(&body[1..4]),
+                    "reason": body[4],
+                    "reason_text": logon_denied_reason(body[4]),
+                    "who": who,
+                }),
                 acars: None,
                 raw: l.to_vec(),
             }),
             t => out.push(HfdlEvent {
                 kind: "lpdu".into(),
-                details: json!({ "type": t, "who": who }),
+                details: json!({ "type": t, "type_name": lpdu_type_name(t), "who": who }),
                 acars: None,
                 raw: l.to_vec(),
             }),
@@ -228,7 +327,9 @@ impl PduParser {
                     envelope(out);
                 }
             }
-            0xD1 | 0xD5 if h.len() >= 15 => {
+            0xD1 if h.len() >= 47 => {
+                // Performance data — full 47-octet record (dumphfdl
+                // hfnpdu.c performance_data_parse, facts only).
                 let flight: String =
                     h[2..8].iter().map(|&c| (c & 0x7F) as char).collect();
                 let lat = coordinate(
@@ -237,12 +338,82 @@ impl PduParser {
                 let lon = coordinate(
                     (h[10] as u32 >> 4) | (h[11] as u32) << 4 | (h[12] as u32) << 12,
                 );
+                let (hour, min, sec) = utc_hms(u16::from_le_bytes([h[13], h[14]]));
+                let freq_change_code = h[46] & 0x0F;
                 out.push(HfdlEvent {
-                    kind: if h[1] == 0xD1 { "performance-data" } else { "frequency-data" }.into(),
+                    kind: "performance-data".into(),
                     details: json!({
                         "flight": flight.trim().to_string(),
                         "lat": lat, "lon": lon,
                         "utc_s": u16::from_le_bytes([h[13], h[14]]) as u32 * 2,
+                        "utc": { "hour": hour, "min": min, "sec": sec },
+                        "version": h[15],
+                        "flight_leg": h[16],
+                        "gs_id": h[17] & 0x7F,
+                        "gs_name": gs_name(h[17] & 0x7F),
+                        "freq_id": h[18],
+                        "freq_search_cnt": {
+                            "prev_leg": u16::from_le_bytes([h[19], h[20]]),
+                            "cur_leg": u16::from_le_bytes([h[21], h[22]]),
+                        },
+                        "hfdl_disabled_duration": {
+                            "prev_leg": u16::from_le_bytes([h[23], h[24]]),
+                            "cur_leg": u16::from_le_bytes([h[25], h[26]]),
+                        },
+                        "mpdus_rx": mpdu_stats(&h[27..31]),
+                        "mpdus_rx_errs": mpdu_stats(&h[31..35]),
+                        "spdus_rx": u16::from_le_bytes([h[35], h[36]]),
+                        "spdus_rx_errs": h[37],
+                        "mpdus_tx": mpdu_stats(&h[38..42]),
+                        "mpdus_delivered": mpdu_stats(&h[42..46]),
+                        "freq_change_code": freq_change_code,
+                        "freq_change_cause": freq_change_cause(freq_change_code),
+                        "who": who,
+                    }),
+                    acars: None,
+                    raw: h.to_vec(),
+                });
+            }
+            0xD5 if h.len() >= 15 => {
+                let flight: String =
+                    h[2..8].iter().map(|&c| (c & 0x7F) as char).collect();
+                let lat = coordinate(
+                    h[8] as u32 | (h[9] as u32) << 8 | ((h[10] as u32 & 0x0F) << 16),
+                );
+                let lon = coordinate(
+                    (h[10] as u32 >> 4) | (h[11] as u32) << 4 | (h[12] as u32) << 12,
+                );
+                let (hour, min, sec) = utc_hms(u16::from_le_bytes([h[13], h[14]]));
+                // Up to 6 per-GS {gs_id, prop_freqs, tuned_freqs} records,
+                // 6 octets each, starting at offset 15 (dumphfdl
+                // frequency_data_parse, facts only).
+                let mut freq_data = Vec::new();
+                for f in 0..6usize {
+                    let pos = 15 + f * 6;
+                    if pos + 6 > h.len() {
+                        break;
+                    }
+                    let prop_freqs = h[pos + 1] as u32
+                        | (h[pos + 2] as u32) << 8
+                        | ((h[pos + 3] as u32 & 0x0F) << 16);
+                    let tuned_freqs = (h[pos + 3] as u32 >> 4)
+                        | (h[pos + 4] as u32) << 4
+                        | (h[pos + 5] as u32) << 12;
+                    freq_data.push(json!({
+                        "gs_id": h[pos] & 0x7F,
+                        "gs_name": gs_name(h[pos] & 0x7F),
+                        "prop_freqs": prop_freqs,
+                        "tuned_freqs": tuned_freqs,
+                    }));
+                }
+                out.push(HfdlEvent {
+                    kind: "frequency-data".into(),
+                    details: json!({
+                        "flight": flight.trim().to_string(),
+                        "lat": lat, "lon": lon,
+                        "utc_s": u16::from_le_bytes([h[13], h[14]]) as u32 * 2,
+                        "utc": { "hour": hour, "min": min, "sec": sec },
+                        "freq_data": freq_data,
                         "who": who,
                     }),
                     acars: None,
@@ -267,9 +438,35 @@ impl PduParser {
                     });
                 }
             }
+            0xD2 if h.len() >= 4 => {
+                // System table request: 16-bit request_data at offset 2
+                // (dumphfdl systable_request_parse, facts only).
+                out.push(HfdlEvent {
+                    kind: "systable-request".into(),
+                    details: json!({
+                        "request_data": u16::from_le_bytes([h[2], h[3]]),
+                        "who": who,
+                    }),
+                    acars: None,
+                    raw: h.to_vec(),
+                });
+            }
+            0xDE => {
+                // Delayed echo: dumphfdl carries no body for this type.
+                out.push(HfdlEvent {
+                    kind: "delayed-echo".into(),
+                    details: json!({ "who": who }),
+                    acars: None,
+                    raw: h.to_vec(),
+                });
+            }
             t => out.push(HfdlEvent {
                 kind: "hfnpdu".into(),
-                details: json!({ "type": t, "who": who }),
+                details: json!({
+                    "type": t,
+                    "type_name": hfnpdu_type_name(t),
+                    "who": who,
+                }),
                 acars: None,
                 raw: h.to_vec(),
             }),
@@ -403,5 +600,213 @@ mod tests {
         let mut mpdu = build_mpdu_downlink(3, 0xC7, &[build_lpdu_acars(b"\x01dummy")]);
         mpdu[1] ^= 0x01;
         assert!(PduParser::new().parse(&mpdu, 300).is_empty());
+    }
+
+    /// Parse an HFNPDU body (starting with the 0xFF envelope byte) by
+    /// wrapping it in an unnumbered-data LPDU and a downlink MPDU, then
+    /// return the non-systable event(s).
+    fn parse_hfnpdu_body(hfnpdu: &[u8]) -> Vec<HfdlEvent> {
+        let mpdu = build_mpdu_downlink(4, 0xC7, &[build_lpdu_hfnpdu(hfnpdu)]);
+        PduParser::new().parse(&mpdu, 300)
+    }
+
+    // ── HFDL-1.1 performance-data (0xD1) ────────────────────────────────
+    //
+    // The 47-octet field layout below is pinned to dumphfdl 1.7.0's
+    // performance_data_parse() (src/hfnpdu.c) — the GPL oracle is read for
+    // facts only; the test encodes its exact byte offsets so a regression
+    // in our parser shows up as a mismatch against the reference layout.
+    #[test]
+    fn performance_data_full_record() {
+        // dumphfdl offsets are relative to the 0xFF byte: buf[0]=0xFF,
+        // buf[1]=0xD1, flight_id at 2..8, coord at 8..13, utc at 13..15,
+        // version=15, flight_leg=16, gs_id=17&0x7F, freq_id=18, ...
+        let mut h = vec![0u8; 47];
+        h[0] = 0xFF;
+        h[1] = 0xD1;
+        h[2..8].copy_from_slice(b"UA0042");
+        // lat ~= +40 deg, lon ~= -73 deg (20-bit signed, x180/2^19).
+        let lat_raw: u32 = (40.0_f64 * (1u32 << 19) as f64 / 180.0).round() as u32 & 0xFFFFF;
+        let lon_raw: u32 =
+            ((-73.0_f64 * (1u32 << 19) as f64 / 180.0).round() as i32 as u32) & 0xFFFFF;
+        h[8] = (lat_raw & 0xFF) as u8;
+        h[9] = ((lat_raw >> 8) & 0xFF) as u8;
+        h[10] = ((lat_raw >> 16) & 0x0F) as u8 | (((lon_raw & 0x0F) as u8) << 4);
+        h[11] = ((lon_raw >> 4) & 0xFF) as u8;
+        h[12] = ((lon_raw >> 12) & 0xFF) as u8;
+        // utc raw counts half-seconds: 0x2A30 * 2 s = 21600 s = 06:00:00.
+        let utc_raw: u16 = 10800;
+        h[13] = (utc_raw & 0xFF) as u8;
+        h[14] = (utc_raw >> 8) as u8;
+        h[15] = 3; // version
+        h[16] = 7; // flight_leg
+        h[17] = 0x84; // gs_id 4 with high bit set -> masked to 4
+        h[18] = 2; // freq_id
+        h[19..21].copy_from_slice(&11u16.to_le_bytes()); // prev_leg freq_search_cnt
+        h[21..23].copy_from_slice(&5u16.to_le_bytes()); // cur_leg freq_search_cnt
+        h[23..25].copy_from_slice(&300u16.to_le_bytes()); // prev disabled dur
+        h[25..27].copy_from_slice(&60u16.to_le_bytes()); // cur disabled dur
+        // mpdus_rx: 1800=27, 1200=28, 600=29, 300=30.
+        h[27] = 18;
+        h[28] = 12;
+        h[29] = 6;
+        h[30] = 3;
+        // mpdus_rx_errs 31..35.
+        h[31] = 1;
+        h[32] = 2;
+        h[33] = 3;
+        h[34] = 4;
+        h[35..37].copy_from_slice(&1000u16.to_le_bytes()); // spdus_rx
+        h[37] = 9; // spdus_rx_errs
+        // mpdus_tx 38..42.
+        h[38] = 80;
+        h[39] = 70;
+        h[40] = 60;
+        h[41] = 50;
+        // mpdus_delivered 42..46.
+        h[42] = 8;
+        h[43] = 7;
+        h[44] = 6;
+        h[45] = 5;
+        h[46] = 0x04; // freq_change_code 4 -> "GS frequency change"
+
+        let ev = parse_hfnpdu_body(&h);
+        let e = ev.iter().find(|e| e.kind == "performance-data").expect("perf-data");
+        let d = &e.details;
+        assert_eq!(d["flight"], "UA0042");
+        assert_eq!(d["version"], 3);
+        assert_eq!(d["flight_leg"], 7);
+        assert_eq!(d["gs_id"], 4);
+        assert_eq!(d["gs_name"], "Riverhead, New York");
+        assert_eq!(d["freq_id"], 2);
+        assert_eq!(d["utc"]["hour"], 6);
+        assert_eq!(d["utc"]["min"], 0);
+        assert_eq!(d["utc"]["sec"], 0);
+        assert_eq!(d["freq_search_cnt"]["prev_leg"], 11);
+        assert_eq!(d["freq_search_cnt"]["cur_leg"], 5);
+        assert_eq!(d["hfdl_disabled_duration"]["prev_leg"], 300);
+        assert_eq!(d["hfdl_disabled_duration"]["cur_leg"], 60);
+        assert_eq!(d["mpdus_rx"]["1800bps"], 18);
+        assert_eq!(d["mpdus_rx"]["1200bps"], 12);
+        assert_eq!(d["mpdus_rx"]["600bps"], 6);
+        assert_eq!(d["mpdus_rx"]["300bps"], 3);
+        assert_eq!(d["mpdus_rx_errs"]["1800bps"], 1);
+        assert_eq!(d["mpdus_rx_errs"]["300bps"], 4);
+        assert_eq!(d["spdus_rx"], 1000);
+        assert_eq!(d["spdus_rx_errs"], 9);
+        assert_eq!(d["mpdus_tx"]["1800bps"], 80);
+        assert_eq!(d["mpdus_tx"]["300bps"], 50);
+        assert_eq!(d["mpdus_delivered"]["1800bps"], 8);
+        assert_eq!(d["mpdus_delivered"]["300bps"], 5);
+        assert_eq!(d["freq_change_code"], 4);
+        assert_eq!(d["freq_change_cause"], "GS frequency change");
+        // Coordinates within the 20-bit quantization of the packed bytes.
+        assert!((d["lat"].as_f64().unwrap() - 40.0).abs() < 0.001);
+        assert!((d["lon"].as_f64().unwrap() - (-73.0)).abs() < 0.001);
+    }
+
+    #[test]
+    fn performance_data_too_short_falls_through() {
+        // 46-byte record (one short) must NOT be parsed as perf-data; it
+        // falls through to the unnumbered-data envelope rather than panic.
+        let mut h = vec![0u8; 46];
+        h[0] = 0xFF;
+        h[1] = 0xD1;
+        let ev = parse_hfnpdu_body(&h);
+        assert!(ev.iter().all(|e| e.kind != "performance-data"));
+    }
+
+    // ── HFDL-1.2 frequency-data (0xD5) ──────────────────────────────────
+    //
+    // Layout pinned to dumphfdl 1.7.0 frequency_data_parse(): 15-octet
+    // header (flight/coord/utc) followed by up to 6 six-octet per-GS
+    // records {gs_id, prop_freqs (20-bit), tuned_freqs (20-bit)}.
+    #[test]
+    fn frequency_data_per_gs_arrays() {
+        let mut h = vec![0xFF, 0xD5];
+        h.extend_from_slice(b"DLH456"); // flight_id at 2..8
+        h.extend_from_slice(&[0u8; 7]); // coord(5) + utc(2) -> fills 8..15
+        // Two GS records.
+        let push_gs = |h: &mut Vec<u8>, gs_id: u8, prop: u32, tuned: u32| {
+            h.push(gs_id);
+            h.push((prop & 0xFF) as u8);
+            h.push(((prop >> 8) & 0xFF) as u8);
+            h.push(((prop >> 16) & 0x0F) as u8 | (((tuned & 0x0F) as u8) << 4));
+            h.push(((tuned >> 4) & 0xFF) as u8);
+            h.push(((tuned >> 12) & 0xFF) as u8);
+        };
+        push_gs(&mut h, 0x84, 0b101, 0b011); // gs_id 4 (high bit set)
+        push_gs(&mut h, 0x0A, 0xABCDE, 0x12345); // gs_id 10
+
+        let ev = parse_hfnpdu_body(&h);
+        let e = ev.iter().find(|e| e.kind == "frequency-data").expect("freq-data");
+        let fd = e.details["freq_data"].as_array().expect("freq_data array");
+        assert_eq!(fd.len(), 2);
+        assert_eq!(fd[0]["gs_id"], 4);
+        assert_eq!(fd[0]["gs_name"], "Riverhead, New York");
+        assert_eq!(fd[0]["prop_freqs"], 0b101);
+        assert_eq!(fd[0]["tuned_freqs"], 0b011);
+        assert_eq!(fd[1]["gs_id"], 10);
+        assert_eq!(fd[1]["gs_name"], "Muan, South Korea");
+        assert_eq!(fd[1]["prop_freqs"], 0xABCDE);
+        assert_eq!(fd[1]["tuned_freqs"], 0x12345);
+        assert_eq!(e.details["flight"], "DLH456");
+    }
+
+    #[test]
+    fn frequency_data_no_gs_records() {
+        // Bare 15-octet record (no per-GS data) yields an empty array.
+        let mut h = vec![0xFF, 0xD5];
+        h.extend_from_slice(b"AAL999");
+        h.extend_from_slice(&[0u8; 7]);
+        let ev = parse_hfnpdu_body(&h);
+        let e = ev.iter().find(|e| e.kind == "frequency-data").expect("freq-data");
+        assert_eq!(e.details["freq_data"].as_array().unwrap().len(), 0);
+    }
+
+    // ── HFDL-1.3 naming: 0xD2 / 0xDE / 0x2F ─────────────────────────────
+    #[test]
+    fn systable_request_named() {
+        // dumphfdl systable_request_parse: request_data = uint16 LE at off 2.
+        let h = vec![0xFF, 0xD2, 0x34, 0x12];
+        let ev = parse_hfnpdu_body(&h);
+        let e = ev.iter().find(|e| e.kind == "systable-request").expect("systable-request");
+        assert_eq!(e.details["request_data"], 0x1234);
+    }
+
+    #[test]
+    fn delayed_echo_named() {
+        let h = vec![0xFF, 0xDE, 0x00];
+        let ev = parse_hfnpdu_body(&h);
+        assert!(ev.iter().any(|e| e.kind == "delayed-echo"));
+    }
+
+    #[test]
+    fn logon_denied_named_with_reason() {
+        // 0x2F LPDU: type, ICAO (3 bytes, bit-reversed), reason, FCS.
+        // dumphfdl logon_denied_reason_codes: 0x01 = "Aircraft ID not available".
+        let rev = |x: u8| x.reverse_bits();
+        let body = vec![0x2F, rev(0x04), rev(0x00), rev(0x87), 0x01];
+        let lpdu = with_fcs(body);
+        let mpdu = build_mpdu_downlink(4, 0xC7, &[lpdu]);
+        let ev = PduParser::new().parse(&mpdu, 300);
+        let e = ev.iter().find(|e| e.kind == "logon-denied").expect("logon-denied");
+        assert_eq!(e.details["icao"], "040087");
+        assert_eq!(e.details["reason"], 1);
+        assert_eq!(e.details["reason_text"], "Aircraft ID not available");
+    }
+
+    #[test]
+    fn logoff_reason_text_named() {
+        // dumphfdl logoff_request_reason_codes: 0x04 = "Invalid aircraft ID".
+        let rev = |x: u8| x.reverse_bits();
+        let body = vec![0x3F, rev(0x04), rev(0xC1), rev(0x1B), 0x04];
+        let lpdu = with_fcs(body);
+        let mpdu = build_mpdu_downlink(4, 0xC7, &[lpdu]);
+        let ev = PduParser::new().parse(&mpdu, 300);
+        let e = ev.iter().find(|e| e.kind == "logoff-request").expect("logoff-request");
+        assert_eq!(e.details["icao"], "04C11B");
+        assert_eq!(e.details["reason"], 4);
+        assert_eq!(e.details["reason_text"], "Invalid aircraft ID");
     }
 }
