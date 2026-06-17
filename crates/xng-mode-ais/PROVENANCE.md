@@ -43,3 +43,28 @@ The `distress` tag classifies SART/MOB/EPIRB-AIS transmitters by MMSI
 prefix per the ITU-R M.1371 / MID allocation for device identities:
 970 = AIS-SART, 972 = AIS-MOB, 974 = EPIRB-AIS (standards facts only). The
 devices emit ordinary AIS messages; the prefix marks the distress class.
+
+## Multi-fragment AIVDM reassembly + per-MMSI tracking (AIS-2, 2026-06)
+
+`reassembly.rs` adds the inbound counterpart to the `nmea.rs` encoder: it
+parses AIVDM/AIVDO/BSVDM/ARVDM sentences (the interchange form every other
+AIS tool, and the AIS-Catcher HTTP feed, speaks) and joins multi-fragment
+messages (`!AIVDM,2,1,...`/`!AIVDM,2,2,...`) back into one bit string before
+field decode. Fragments are keyed on `(channel, total, seq)` and accepted in
+any order; the fill bits of the final fragment alone are trimmed.
+
+`AisTracker` aggregates per-MMSI static/identity fields across messages — the
+type-24 **Part A** (name) + **Part B** (type/vendor/callsign/dimensions or
+mothership) merge, and successive type-5 voyage records, collapse into one
+`VesselRecord`. The merge rule (a newer non-null field overwrites; absent
+fields are preserved) matches the pyais tracker `update_track`.
+
+Sentence structure, 6-bit ASCII de-armoring, fill-bit accounting, and the
+reassembly/merge semantics are anchored to the **pyais** (MIT) decode oracle
+(pyais 3.1.0): the multi-fragment vectors are taken verbatim from
+`tests/test_decode.py` (`test_msg_type_5`, `test_msg_type_8_multipart`, the
+two-fragment type-21, `test_msg_type_6_very_large`, `test_decode_out_of_order`,
+`test_byte_stream`/`test_multiline_message`), and the type-24 Part A/Part B
+pair is gpsd's canonical example (MMSI 271041815, "PROGUY"/"TC6163"). Asserted
+field values were produced by running pyais on the same sentences. No pyais
+code was copied; the vectors and decode outputs are the reference.
