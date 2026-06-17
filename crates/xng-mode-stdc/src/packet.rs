@@ -197,6 +197,36 @@ pub fn services_full(iss: u16) -> Vec<&'static str> {
         .collect()
 }
 
+/// Decode a station list (LES directory) of `count` 6-byte records
+/// starting at `recs`. Record layout per inmarsatc `getStations`:
+///   [0]    sat/LES byte (region in bits 7-6, LES id in bits 5-0)
+///   [1]    servicesStart byte
+///   [2..4] 16-bit services bitfield (`getServices`)
+///   [4..6] downlink channel-number word
+/// Returns one JSON object per station; stops early if the slice runs
+/// out. (inmarsatc's downlink formula in getStations reads byte j+4
+/// twice — a transcription slip; the field is the j+4..j+6 word, decoded
+/// here with the oracle-verified downlink formula.)
+pub fn parse_stations(recs: &[u8], count: usize) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = i * 6;
+        let r = match recs.get(off..off + 6) {
+            Some(r) => r,
+            None => break,
+        };
+        let dw = u16::from_be_bytes([r[4], r[5]]);
+        let iss = u16::from_be_bytes([r[2], r[3]]);
+        out.push(json!({
+            "sat_les": sat_les(r[0]),
+            "services_start": r[1],
+            "services": services_full(iss),
+            "downlink_mhz": round4(downlink_mhz(dw)),
+        }));
+    }
+    out
+}
+
 /// Decode the 28 TDM-slot allocation codes from a 0x6C signalling-channel
 /// descriptor. Per inmarsatc `decode_6C`: 7 bytes carry 28 two-bit slot
 /// codes, 4 per byte packed MSB→LSB (slot n at bits [7-2n .. 6-2n]).
@@ -686,8 +716,45 @@ impl PacketParser {
                 }
                 return;
             }
+            0x92 if body.len() >= 8 => {
+                // Per inmarsatc decode_92: body[1] = loginAckLength,
+                // body[2..5] = LES id (3 bytes), body[5..7] = downlink
+                // channel word, body[7] = stationStart; when
+                // loginAckLength > 7 a station list follows (count at
+                // body[8], 6-byte records from body[9]).
+                let login_ack_len = body[1];
+                let dw = u16::from_be_bytes([body[5], body[6]]);
+                let mut details = json!({
+                    "login_ack_len": login_ack_len,
+                    "les": hex(&body[2..5]),
+                    "downlink_mhz": round4(downlink_mhz(dw)),
+                    "station_start": body[7],
+                });
+                if login_ack_len > 7 && body.len() >= 9 {
+                    let count = body[8] as usize;
+                    let stations = parse_stations(&body[9..body.len() - 2], count);
+                    if let Some(obj) = details.as_object_mut() {
+                        obj.insert("station_count".to_string(), json!(body[8]));
+                        obj.insert("stations".to_string(), json!(stations));
+                    }
+                }
+                ("login-ack", None, details)
+            }
             0x92 => ("login-ack", None, json!({})),
             0xA8 => ("confirmation", None, json!({})),
+            0xAB if body.len() >= 4 => {
+                // Per inmarsatc decode_AB: body[1] = lesListLength,
+                // body[2] = stationStart, body[3] = stationCount, then
+                // 6-byte station records from body[4].
+                let count = body[3] as usize;
+                let stations = parse_stations(&body[4..body.len().saturating_sub(2)], count);
+                ("les-list", None, json!({
+                    "les_list_len": body[1],
+                    "station_start": body[2],
+                    "station_count": body[3],
+                    "stations": stations,
+                }))
+            }
             0xAB => ("les-list", None, json!({})),
             0x08 => ("ack-request", None, json!({})),
             0x6C if body.len() >= 4 => {
@@ -938,6 +1005,67 @@ mod tests {
         assert_eq!(a.details["uplink_mhz"], 1636.64);
         assert_eq!(a.details["frame_offset"], 0x03);
         assert_eq!(a.details["packet_descriptor1"], 0xAA);
+    }
+
+    #[test]
+    fn parse_stations_decodes_record_layout() {
+        // STDC-2. Record layout per inmarsatc getStations: 6 bytes each
+        // [sat/les, servicesStart, iss(16-bit), downlink word(16-bit)].
+        // Station 0: sat/les 0x44 (AOR-E les 104), servicesStart 0x01,
+        // iss 0x4020 (SafetyNet+AeroC), downlink word 8400 -> 1531.5 MHz.
+        let recs = [0x44, 0x01, 0x40, 0x20, 0x20, 0xD0];
+        let v = parse_stations(&recs, 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["sat_les"]["region"], "AOR-E");
+        assert_eq!(v[0]["sat_les"]["les"], 104);
+        assert_eq!(v[0]["services_start"], 0x01);
+        assert_eq!(v[0]["services"], json!(["SafetyNet", "AeroC"]));
+        assert_eq!(v[0]["downlink_mhz"], 1531.5);
+        // Short slice → stops early without panicking.
+        assert_eq!(parse_stations(&recs[..4], 2).len(), 0);
+    }
+
+    #[test]
+    fn les_list_fields_and_stations() {
+        // STDC-2. 0xAB layout per inmarsatc decode_AB: body[1] list len,
+        // body[2] stationStart, body[3] stationCount, 6-byte records from
+        // body[4]. Two stations: AOR-E les 104 and POR les 202.
+        let mut parser = PacketParser::new();
+        let mut body = vec![0xAB, 0x00, 0x05, 0x02];
+        body.extend([0x44, 0x01, 0x40, 0x20, 0x20, 0xD0]); // AOR-E les 104
+        body.extend([0x82, 0x02, 0x20, 0x00, 0x20, 0xD0]); // POR les 202
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let l = out.iter().find(|p| p.name == "les-list").expect("les-list parses");
+        assert_eq!(l.details["station_count"], 2);
+        assert_eq!(l.details["station_start"], 0x05);
+        let stations = l.details["stations"].as_array().unwrap();
+        assert_eq!(stations.len(), 2);
+        assert_eq!(stations[0]["sat_les"]["les"], 104);
+        assert_eq!(stations[1]["sat_les"]["region"], "POR");
+        assert_eq!(stations[1]["sat_les"]["les"], 202);
+    }
+
+    #[test]
+    fn login_ack_fields_and_station_list() {
+        // STDC-2. 0x92 layout per inmarsatc decode_92: body[1] ackLen,
+        // body[2..5] LES id, body[5..7] downlink word, body[7] start;
+        // when ackLen > 7, body[8] = count and records follow at body[9].
+        let mut parser = PacketParser::new();
+        let mut body = vec![0x92, 0x00, 0x12, 0x34, 0x56, 0x20, 0xD0, 0x77, 0x01];
+        body.extend([0x44, 0x01, 0x40, 0x20, 0x20, 0xD0]); // one station
+        body[1] = (body.len() + 2 - 2) as u8; // ackLen (= total-2) > 7
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let la = out.iter().find(|p| p.name == "login-ack").expect("login-ack parses");
+        assert_eq!(la.details["les"], "123456");
+        assert_eq!(la.details["downlink_mhz"], 1531.5);
+        assert_eq!(la.details["station_start"], 0x77);
+        assert_eq!(la.details["station_count"], 1);
+        assert_eq!(la.details["stations"][0]["sat_les"]["les"], 104);
     }
 
     #[test]
