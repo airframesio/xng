@@ -7,7 +7,8 @@ JAERO source is the structural reference *and* the off-air oracle. This
 note is the as-built state; numbers are what the code does and the tests
 assert (`cargo test -p xng-mode-aero` — 46 tests, 0 ignored).
 
-Four physical channels, four front-ends, all feeding one SU/ACARS layer:
+Three front-ends spanning the P/R/T/C channel model, all feeding one
+SU/ACARS layer:
 
 | Decoder | Channel | Modulation | Mode tag | `--mode` |
 |---|---|---|---|---|
@@ -15,9 +16,17 @@ Four physical channels, four front-ends, all feeding one SU/ACARS layer:
 | `AeroBurstDecoder` | C-band R/T feeder bursts | A-BPSK 600/1200 bps | `aero-c` | `aero-c` |
 | `CChannelDecoder` | L-band C-channel voice circuit | OQPSK 8 400 bps | `aero-l` | (call-assigned) |
 
-`Mode::AeroL` vs `Mode::AeroC` is carried per-`AeroEvent` and propagated
-by `to_message` (AERO-8.1) — before that, C-band feeder bursts
-mislabelled as `aero-l`.
+Each `AeroEvent` carries two orthogonal tags (AERO-8.1/8.2): a
+`Mode::AeroL`/`Mode::AeroC` propagated by `to_message` (before this,
+C-band feeder bursts mislabelled as `aero-l`) **and** an `AeroChannel`
+(`PChannel`/`RChannel`/`TChannel`, surfaced in `details` as
+`channel` = `p-`/`r-`/`t-channel`). A C-band feeder burst emits
+`TChannel` for a reserved/TDMA T burst (6-byte AES/GES header + P-style
+SUs) or `RChannel` for a random-access R burst (single 19-byte SU),
+mirroring JAERO's `RTChannelDeleaveFECScram` OK_T/OK_R split. The
+physical frame/burst rate rides in a distinct `line_bit_rate` key so it
+never clobbers a decoded protocol `bit_rate` (e.g. the Pd carrier rate
+in a 0x40 control ISU).
 
 ## Pipeline
 
@@ -153,11 +162,13 @@ SOH-prefixed ACARS block, extracted by `parse_acars` and parsed by
 `xng_acars::block` (ARINC 618: label, BCS, applications — ADS-C, CPDLC,
 etc.; multi-block defragmentation lives in `xng-acars`).
 
-**R-channel SUs** (`su.rs::RIsuReassembler`): 19-byte SUs (CRC over 17),
-up to 3 per message (SEQINDICATOR nibble → k-of-n), 11 user bytes each
-except the last (SUTYPE = user bytes; 0/15 = signalling, skipped). The
-k-of-n SEQINDICATOR mapping is flagged in `PROVENANCE.md` for off-air
-verification.
+**R-channel user-data SUs** (`su.rs::RIsuReassembler`): 19-byte SUs (CRC
+over 17), up to 3 per message (SEQINDICATOR nibble → k-of-n), 11 user
+bytes each except the last (SUTYPE = user bytes; 0/15 = signalling,
+skipped). The SEQINDICATOR → (k, n) mapping (1→(1,1), 2→(1,2), 3→(2,2),
+4→(1,3), 5→(2,3), 6→(3,3); JAERO's 0-based SUindex → k = SUindex+1) is now
+**verified against JAERO's `RISUData::update` switch**
+(`seq_indicator_matches_jaero_switch`).
 
 **Structured (non-user-data) P-channel SUs** (`su.rs::parse_p_su`,
 surfaced as `MessageBody::Aero { kind, details: JSON }`; type table =
@@ -194,10 +205,39 @@ JAERO `AEROTypeP`, field layouts = JAERO `aerol.cpp` handlers):
   no further field decode, surfaced as named events). byteN = our su[N-1]
   (JAERO 1-based octet indexing). These three drive the AERO-2 resolver
   (below).
+- **Remaining control / user-data types** (AERO-1.4, JAERO `AEROTypeP`).
+  Only `0x40` carries fields JAERO decodes: `0x40` P/R_channel_control_ISU
+  — the GES advertises a Pd (packet-data) carrier: GES = octet 5, bit-rate
+  code = (byte8>>4)&0xF through JAERO's table (0→600 … 6→10500, 7→8400,
+  9→21000; 8/≥10 reserved → field omitted), Pd channel =
+  ((byte9&0x7F)<<8)|byte10 → ×0.0025 + 1510.0 MHz, spot-beam = byte9 bit 7
+  (`pd_mhz`, `bit_rate`, `spotbeam`, `ges_id`). `0x28`
+  EIRP_table_broadcast, `0x41` T_channel_control_ISU, `0x61`
+  Request_for_acknowledgement (RQA), `0x62` Acknowledge (RACK/TACK):
+  JAERO names these and decodes no further fields → named events. `0x74`
+  / `0x76` short-LSDU RLS user-data: JAERO names but does not run through
+  the ISU/SSU reassembler → `short-lsdu` event carrying the LSDU octet
+  length (3 / 4).
+
+**R-channel control SUs** (`su.rs::parse_r_su`, AERO-3): a 19-byte
+R-channel SU is a *control* SU when JAERO's user-data flag is clear
+(`infofield[1] & 0x08 == 0`, our su[1] bit 3); otherwise it routes to the
+ISU/SSU reassembler (`RIsuReassembler`, which now enforces the same flag).
+For a control SU the message type is the **third** byte (su[2] — the same
+byte the user-data path uses for the AES high octet, so AES/GES do not
+apply); xng surfaces the named event only (`su_type`, `su_type_hex`,
+optional `request_kind`). Types are JAERO's `AEROTypeR`: `0x20` general
+access-request (telephone), `0x23` abbreviated access-request (telephone),
+`0x22` access-request (data, R/T channel), `0x61`
+request-for-acknowledgement, `0x62` acknowledgement, `0x12`
+log-on/log-off control, `0x30` call-progress, `0x15` log-on/log-off
+acknowledgement, `0x17` log-control ready-for-reassignment, `0x60`
+telephony-acknowledge. `parse_p_su` runs on P-channel SUs and the P-style
+SUs inside T bursts; `parse_r_su` classifies the R-channel control set.
 
 User-data ISU/SSU (`0x71`/`0xC0|seq`) and fill (`0x01`) are not
-classified (handled by the reassembler); other types are framed but not
-yet interpreted.
+classified (handled by the reassembler); types JAERO does not enumerate
+are framed but not interpreted.
 
 ## Satellite / beam resolution (`satellite::SatelliteResolver`, AERO-2)
 
@@ -272,11 +312,14 @@ P-style SUs can carry system-table broadcasts).
 - **Loopback (full chain, bit-exact)**. `end_to_end.rs` (600/1200 A-BPSK
   → waveform → decode), `hr_e2e.rs` (10.5k OQPSK incl. rail inversion and
   a 240 kHz wideband capture at +15 kHz), `cchannel_e2e.rs` (8.4k OQPSK
-  voice + SU), `burst_e2e.rs` (R/T feeder bursts), `mode_label.rs`
-  (AeroL/AeroC tagging), `p_su.rs` + `su.rs` unit tests (every P-SU type
-  and frequency-arithmetic case), `frame.rs`/`cchannel.rs` interleaver
-  and FEC roundtrips. The OQPSK demod's `locks_and_demodulates_with_cfo`
-  asserts BER < 0.001 at CFO 0/±120/−250 Hz.
+  voice + SU), `burst_e2e.rs` (T-burst ACARS, R-burst user-data, and an
+  R-burst control SU), `mode_label.rs` (AeroL/AeroC tagging),
+  `p_su.rs` + `su.rs` unit tests (every P-SU type incl. the AERO-1.4 0x40
+  control-ISU frequency arithmetic, the `parse_r_su` control set, and the
+  JAERO-verified SEQINDICATOR switch), `frame.rs`/`cchannel.rs`
+  interleaver and FEC roundtrips. The OQPSK demod's
+  `locks_and_demodulates_with_cfo` asserts BER < 0.001 at CFO
+  0/±120/−250 Hz.
 
 **AERO-4 frame header** (`frame.rs` tests): `frame_header_splits_jaero_nibbles`
 checks the four-nibble split against JAERO's `frameinfo` shifts
@@ -326,12 +369,14 @@ exact-result fixtures rather than CI count gates).
   off-air C-channel capture is available.
 - **AMBE voice not decoded** — voice frames surfaced as raw 12-byte
   chunks (proprietary codec).
-- **R-channel SEQINDICATOR k-of-n mapping** flagged for off-air
-  verification.
-- **Partially-decoded SU types**: T_channel_assignment (`0x51`),
-  GES_beam_support (`0x07`), broadcast_index (`0x0A`) are named with
-  addressing/raw bytes only — JAERO itself decodes no further fields
-  (0x07 still contributes its presence flag to the AERO-2 resolver).
+- **Named-only SU types**: many SUs are surfaced as named events with
+  addressing/raw bytes but no further field decode — because **JAERO
+  itself decodes no further fields** for them: T_channel_assignment
+  (`0x51`), GES_beam_support (`0x07`), broadcast_index (`0x0A`), EIRP-table
+  (`0x28`), T_channel_control_ISU (`0x41`), RQA (`0x61`), Acknowledge
+  (`0x62`), short-LSDU (`0x74`/`0x76`), and the whole R-channel control set
+  (`parse_r_su`). 0x07 still contributes its presence flag to the AERO-2
+  resolver. This is parity with JAERO, not a deferred gap.
 
 ## References
 

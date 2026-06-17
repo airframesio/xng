@@ -8,11 +8,14 @@ facts from ICAO Annex 10 Vol III Part I Ch. 11 (free PDF, ffac.ch) plus
 dumphfdl 1.7.0 source read **for wire layouts only — all code re-derived**
 per docs/REFERENCES.md. See PROVENANCE.md.
 
-On the sigidwiki 21931 kHz Riverhead capture xng decodes 33 events vs
-dumphfdl 1.7.0's 37 (the residual is the weakest 4–5 dB / 300 bps bursts,
-a sensitivity tail, not a convention bug; the frame-exact diff shows the
-data LPDUs match the oracle one-for-one). An 8 s slice is the CI fixture
-(`tests/offair.rs` pins the squitter field-for-field). Crate:
+On the full sigidwiki 21931 kHz Riverhead capture xng decodes 36 events
+vs dumphfdl 1.7.0's 37 (97%; the residual single frame is the weakest
+4–5 dB / 300 bps burst, a sensitivity tail, not a convention bug — the
+frame-exact diff shows the data LPDUs match the oracle one-for-one). The
+final 89%→97% step came from the decode-stage rescue (below). An 8 s
+slice is the vendored CI fixture (`tests/offair.rs` pins the squitter
+field-for-field); the full capture is fenced separately by `bench/run.sh`
+(`bench/baselines.json` floor `hfdl_offair`). Crate:
 `crates/xng-mode-hfdl/src/`.
 
 ## Pipeline
@@ -289,8 +292,9 @@ become `MessageBody::Hfdl { kind, details }` (kinds: `squitter`,
   systable version 52, utc_sync, the first-octet flags (real byte0 = 0x10
   → rls/iso clear, version 0, change_note 0) and the 48-octet
   reservation region taken verbatim from the off-air bytes, plus
-  `fec_corrected` presence. Full-capture haul: 33 events (logon confirms,
-  ACARS, performance-data downlinks with live positions).
+  `fec_corrected` presence. Full-capture haul: 36 events / 97% of
+  dumphfdl's 37 (logon confirms, ACARS, performance-data downlinks with
+  live positions) — the decode-stage rescue lifted it from 33 (89%).
 - **Field layouts** pinned to dumphfdl byte offsets in `pdu.rs` unit
   tests: performance-data and frequency-data full records, 0xD2/0xDE/
   0x2F/0x3F naming + reason tables, AC-cache resolve/evict/TTL, the
@@ -321,10 +325,11 @@ become `MessageBody::Hfdl { kind, details }` (kinds: `squitter`,
 
 ## Known limitations / intentional gaps
 
-- Residual gap vs dumphfdl on the bench capture: the weakest 4–5 dB
-  300-bps bursts (sensitivity tail). Standing falsifications: wider
-  ±2/±3-sample retry shifts gain nothing; lowering the A1 gate 0.4 →
-  0.32 is catastrophic (false anchors consume real bursts).
+- Residual gap vs dumphfdl on the bench capture: one frame (the weakest
+  4–5 dB 300-bps burst), a sensitivity tail. Standing falsifications:
+  wider ±2/±3-sample retry shifts gain nothing; lowering the A1 gate
+  0.4 → 0.32 is catastrophic (false anchors consume real bursts, dropping
+  to 19 events).
 - **`--system-table` CLI flag not wired** — the persistence API exists
   (`save`/`load` + free-function aliases) and round-trips, but loading a
   saved table into the running decoder at startup, and choosing the path,

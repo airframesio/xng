@@ -70,21 +70,23 @@ conventions — invisible to loopback testing — were caught only this way).
 | Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne + surface via `--receiver-pos`, speed-gated), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, capability 1,0/1,7, **ACAS RA 3,0**, selected-altitude 4,0, track/turn 5,0, heading/speed 6,0, **MRAR/hazard met 4,4/4,5** — pyModeS field-exact), **target state 6,2 + operational status 6,5** (ADS-B version, NACp/SIL/NIC-supp/GVA), emergency/priority status, **DF18 TIS-B/ADS-R source tagging**, single-bit CRC repair, two-sighting phantom rejection, per-aircraft tracking, Mode A/C decode kernel, **SBS + Beast outputs**; any rate ≥ 2 MS/s incl. **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
 
 
-### Decode cores (not yet wired to a runtime `--mode`)
+### Newer modes (wired to `--mode`; demod maturity varies)
 
-These modes have **tested, oracle-validated decode cores** in the workspace but
-are not yet selectable at runtime — the IQ demod front-end and the
-bin/`Mode`/CLI wiring are the remaining follow-up. Each links to its as-built notes:
+These are full runtime `--mode`s (IQ demod + decode + outputs, selectable on the
+CLI/TUI, scannable, on the dashboard). Their **decode cores** are oracle/spec
+anchored; **demod** validation ranges from live off-air to synthetic depending
+on what real IQ exists. UAT plots as aircraft (and merges with 1090 ADS-B by
+ICAO); radiosonde/ADS-L/SARSAT/DSC positions plot as map beacons.
 
-| Mode | Crate | Decodes today | Notes |
-|---|---|---|---|
-| UAT 978 MHz (DO-282B) | `xng-mode-uat` | ADS-B downlink (state vector) + FIS-B uplink (APDU framing + DLAC text products), RS-FEC | [UAT.md](docs/notes/UAT.md) |
-| COSPAS-SARSAT 406 | `xng-mode-sarsat` | First-gen beacon (C/S T.001) message + BCH detection; ELT/EPIRB/PLB ID + location protocols | [SARSAT.md](docs/notes/SARSAT.md) |
-| DSC (GMDSS, ITU-R M.493) | `xng-mode-dsc` | Distress/all-ships/individual/area calls, DX/RX time-diversity de-interleave + ECC | [DSC.md](docs/notes/DSC.md) |
-| NAVTEX (CCIR 476) | `xng-mode-navtex` | 4-of-7 character decode + FEC-B time diversity + ZCZC B1/B2 framing | [NAVTEX.md](docs/notes/NAVTEX.md) |
-| Radiosondes (RS41) | `xng-mode-sonde` | De-whitening + RS(255,231) FEC + STATUS/PTU/GPS frame parse | [SONDE.md](docs/notes/SONDE.md) |
-| ADS-L (EASA SRD860) | `xng-mode-adsl` | i-Conspicuity frame (CRC-24 + XXTEA) + variable-resolution field decode | [ADSL.md](docs/notes/ADSL.md) |
-| ATCS (rail, AAR Spec-200) | `xng-mode-atcs` | HDLC/LAPB framer + Spec-200 address/header | [ATCS.md](docs/notes/ATCS.md) |
+| Mode | `--mode` | Decodes | Demod validation | Notes |
+|---|---|---|---|---|
+| UAT 978 MHz (DO-282B) | `uat` | ADS-B downlink (state vector) + FIS-B uplink (DLAC products), RS-FEC | **live off-air** (879 CRC-OK frames, real GA aircraft) + dump978 vectors | [UAT.md](docs/notes/UAT.md) |
+| Radiosondes (RS41) | `sonde` | de-whiten + RS(255,231) + STATUS/PTU/GPS | **real off-air, CI-gated** (119/119 vs rs1729 `rs41mod`) | [SONDE.md](docs/notes/SONDE.md) |
+| NAVTEX (CCIR 476) | `navtex` | 4-of-7 + FEC-B time diversity + ZCZC framing | **real off-air, CI-gated** (decodes a real USCG message) | [NAVTEX.md](docs/notes/NAVTEX.md) |
+| COSPAS-SARSAT 406 | `sarsat` | first-gen beacon (C/S T.001) + BCH; ELT/EPIRB/PLB ID + position | oracle vectors; real EPIRB IQ vendored (full decode pending a carrier PLL) | [SARSAT.md](docs/notes/SARSAT.md) |
+| DSC (GMDSS, ITU-R M.493) | `dsc` | distress/all-ships/individual/area, DX/RX diversity + ECC | oracle vectors; demod synthetic (no public IQ) | [DSC.md](docs/notes/DSC.md) |
+| ADS-L (EASA SRD860) | `ads-l` | i-Conspicuity (CRC-24 + XXTEA) + variable-resolution fields | independent vectors; demod synthetic (no public IQ) | [ADSL.md](docs/notes/ADSL.md) |
+| ATCS (rail, AAR Spec-200) | `atcs` | HDLC/LAPB framer + Spec-200 address/header | spec-derived; demod synthetic (no public IQ) | [ATCS.md](docs/notes/ATCS.md) |
 
 All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
@@ -122,6 +124,11 @@ hypothesis](docs/notes/BENCHMARKS.md); fenced in CI by
 | Mode S @2 MS/s | dump1090-fa (`--no-fix`) | 162 | **161** | 99 % | 7 |
 | HFDL | dumphfdl | 37 | **36** | 97 % | — |
 | AIS | AIS-catcher | 53 | **48** | 91 % | 0 |
+| Radiosonde (RS41) | rs1729 `rs41mod` | 119 | **119** | **100 %** | — |
+
+CI-gated fixtures also cover NAVTEX (decodes a real USCG message through the
+narrow-passband DDC) and the false-positive ceilings; UAT is validated on a
+live 978 MHz capture (879 CRC-OK frames) but the capture is not vendored.
 
 **†** CRC-OK IDA frames over a shared 300 s off-air capture (Airspy R2,
 1622 MHz, 10 MS/s). That capture is 11 GB — too large to vendor in CI,

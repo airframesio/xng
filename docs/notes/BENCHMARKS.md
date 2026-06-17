@@ -23,6 +23,9 @@ large to vendor).
 | HFDL | 36 | dumphfdl 37 (97%) | 21931 kHz sigidwiki | floor 31 |
 | AIS | 48 | AIS-catcher 53 (91%) | 5 min, Sacramento | fixture floor |
 | Iridium IDA | 758 | gr-iridium 573 | 300 s Airspy R2 | oracle tests |
+| Radiosonde (RS41) | 119 | rs1729 `rs41mod` 119 (100%) | radiosonde_auto_rx 96 kS/s | floor 110 |
+| NAVTEX | 29 | fldigi/YaND (real USCG msg, char-identical) | SDRplay navtex.zip 62.5 kS/s | floor 25 |
+| UAT 978 | 879 CRC-OK | (live; no oracle on this capture) | live 50 s, KSMF (not vendored) | — |
 
 ## ADS-B / Mode S
 
@@ -175,6 +178,32 @@ Not CI-count-gated (the capture is 11 GB, too large to vendor); fenced
 instead by bit-exact and field-exact oracle tests. Full campaign in
 [IRIDIUM.md](IRIDIUM.md). STD-C and Aero are oracle-validated field-exact
 with no count-style comparison yet.
+
+## Radiosonde (RS41)
+
+Capture: `radiosonde_auto_rx` decoder-performance sample `rs41_96k_float.bin`
+(serial N3920808, Adelaide AU, 2019), 96 kS/s cf32, 120 s (`bench/data/sonde_96k.cf32`,
+release asset). xng `-m sonde` decodes **119 frames / 119 CRC-OK**; the rs1729/RS
+`rs41mod` reference (built from source) decodes **119** on the same file —
+**exact parity**, serial + GPS frame-by-frame identical (sub-meter). CI floor 110.
+First real off-air IQ for this mode (was synthetic + byte-oracle only).
+
+## NAVTEX
+
+Capture: SDRplay's official `navtex.zip` IQ demo (`bench/data/navtex_62500.cs16`,
+release asset), 62.5 kS/s cs16, center 516 kHz, NAVTEX at 518 kHz. xng `-m navtex`
+decodes the real US Coast Guard message **character-identical** to the
+fldigi-derived CCIR-476/FEC-B oracle (and the YaND output in the bundled
+screenshot). This exercises the narrow-passband DDC fix — at 62.5 kS/s the old
+final-stage filter buried the ±85 Hz FSK (0 frames); the fix recovers 29 frames.
+CI floor 25.
+
+## UAT (978 MHz)
+
+No public UAT IQ exists (the canonical dump978 dataset is bits, not IQ), so this
+is validated on a **live** capture: tuner on the 1090 antenna at 978 MHz for 50 s
+→ **879 CRC-OK frames**, real GA aircraft (callsign/ICAO/position/track/altitude,
+e.g. N402AA, N316ME). Not CI-gated (live capture, not vendored).
 
 ## Decode CPU (×-realtime, Apple M-series; `bench/cpu.sh`)
 

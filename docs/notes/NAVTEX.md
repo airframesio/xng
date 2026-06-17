@@ -7,38 +7,83 @@ narrow-shift (±85 Hz) FSK carrying the **CCIR 476** seven-bit
 constant-ratio code in collective B-mode (**FEC-B**): every character is
 sent twice with time diversity. Clean-room: no decoder was copied or
 ported — only protocol facts, code tables, and one published worked
-example, each cited (see `PROVENANCE.md`). This crate is the **verified
-decode layer only** — symbols → message. The IQ→symbols FSK front end is
-a documented, deliberately-unimplemented TODO (it can't be verified
-without a published IQ-plus-ground-truth pair). All tests are anchored to
-an **external** oracle, never an encode→decode self-loopback.
+example, each cited (see `PROVENANCE.md`). The **decode layer** (symbols
+→ message) is anchored to **external** oracles, never an encode→decode
+self-loopback. On top of it sits a channelized **IQ front end** (DDC +
+narrow-shift FSK demod) that turns a wideband capture into the symbol
+stream the decode core consumes.
 
-Status: **DECODE-CORE.** The crate is a standalone library (a `crates/*`
-workspace member) exposing `decode_symbols` → `NavtexMessage`. It is
-**not** wired into the runtime mode registry: there is no `Mode::Navtex`,
-no `xng_types::Message` variant, and no `--mode navtex` CLI path yet. It
-does not consume IQ — see Limitations.
+Status: **WIRED + OFF-AIR-VALIDATED.** Full runtime mode: `Mode::Navtex`,
+`MessageBody::Navtex`, `--mode navtex`, CLI/TUI/scan paths, and a
+`NavtexChannelDecoder` that owns an `xng_dsp::Ddc`. The IQ→symbol front
+end decodes a **real off-air USCG NAVTEX message** (SDRplay's official
+`navtex.zip` IQ demo) char-identical to the fldigi/YaND ground truth —
+29 frames through the built-in DDC, CI floor 25 (`bench/baselines.json`
+`navtex_offair`). The front end's modulate→demod path is additionally
+exercised synthetically; the DECODE core stays oracle-anchored.
 
 ## Pipeline
 
 ```
-(IQ → symbols)        ← TODO, demod_fsk() returns DemodNotImplemented
+wideband capture IQ
+  → Ddc                     mix by freq_offset_hz, decimate to CHANNEL_RATE (4800 S/s)
+  → demod::FskDemod         freq discriminator + DC tracker + 100 Bd timing → 1 bit/symbol
+  → demod::pack_codes       LSB-first 7-bit packing (all 7 alignments tried)
 interleaved CCIR 476 symbol stream (one 7-bit code per element)
-  → fec::find_phase        locate the first DX slot
-  → fec::recover_stream    DX/RX time-diversity per character
-  → fec::codes_to_text     LTRS/FIGS shift tracking, drop phasing/idle
-  → message::parse         ZCZC B1B2B3B4 header / body / NNNN end
-  → message::NavtexMessage (serde JSON)
+  → fec::find_phase         locate the first DX slot
+  → fec::recover_stream     DX/RX time-diversity per character
+  → fec::codes_to_text      LTRS/FIGS shift tracking, drop phasing/idle
+  → message::parse          ZCZC B1B2B3B4 header / body / NNNN end
+  → message::NavtexMessage  (serde JSON) → to_message → xng_types::Message bus form
 ```
 
-`decode_symbols(symbols, first_dx)` (in `lib.rs`) is the one entry point:
-each element of `symbols` is one packed 7-bit CCIR 476 code. If
-`first_dx` is `None` it phase-locks via `find_phase`; returns `None` only
-when the stream is too short to lock.
+Two entry points:
 
-`params` carries the on-air constants for a future front end: `BAUD =
-100.0`, `SHIFT_HZ = 85.0`, `BITS_PER_SYMBOL = 7`, and the three carrier
-frequencies (518/490/4209.5 kHz). They are informational today.
+- `NavtexChannelDecoder::new(input_rate, freq_offset_hz)` — channelized
+  IQ entry (mirrors the AIS `AisChannelDecoder` contract). `process(iq)`
+  feeds the DDC + demod, accumulates the channel's bit history (NAVTEX
+  bursts are slow and long, so bits are buffered and re-scanned), and
+  emits a `NavtexFrame` once a complete `ZCZC … NNNN` message parses.
+  Dedups by header identity + body text so a growing buffer does not
+  re-emit the same message. When `input_rate == CHANNEL_RATE` and offset
+  is 0 the DDC is skipped (IQ is already channelized).
+- `decode_symbols(symbols, first_dx)` — the verified symbol→message core
+  (in `lib.rs`): each element is one packed 7-bit CCIR 476 code. If
+  `first_dx` is `None` it phase-locks via `find_phase`; returns `None`
+  only when the stream is too short to lock.
+
+`to_message(frame, frequency_hz, level_dbfs, source)` normalizes a
+`NavtexFrame` into the bus `Message`: `mode = Mode::Navtex`, body
+`MessageBody::Navtex { kind, details }` where `kind` is the B2 subject
+letter (or `"?"`), `details` is the `NavtexMessage` JSON, `decode.crc_ok`
+= `header_ok && end_ok`, RSSI from the channel level, and the recovered
+wire symbols travel as `raw`.
+
+`params` carries the on-air constants: `BAUD = 100.0`, `SHIFT_HZ = 85.0`,
+`BITS_PER_SYMBOL = 7`, and the three carrier frequencies
+(518/490/4209.5 kHz). `CHANNEL_RATE = 4800` S/s (48 samples/bit) and
+`CHANNEL_PASSBAND_HZ = 250` (one-sided; passes both ±85 Hz tones plus a
+realistic tuning offset, rejects the 28 kHz-distant adjacent channel).
+
+## IQ front end (`demod.rs`)
+
+The narrow-shift FSK demodulator, structured after the AIS `GmskDemod`
+but for an un-shaped 100 Bd ±85 Hz binary FSK signal:
+
+- per-sample frequency discriminator `arg(x · conj(x_prev))`;
+- a **slow DC tracker** (`FREQ_ALPHA = 0.0005`) that absorbs residual
+  carrier offset (tuning error, receiver ppm) so only the FSK swing
+  remains — this is what lets a carrier sit off-center going through the
+  DDC;
+- per-bit **integrate-and-dump** with zero-crossing timing recovery
+  (`TIMING_GAIN = 0.10`) at the 100 Bd clock;
+- mark (positive discriminator) / space slicing → one bit per symbol.
+
+`pack_codes(bits, bit_phase)` packs the bit stream into 7-bit CCIR 476
+codes LSB-first (via `ccir476::pack_bits`), starting at `bit_phase`; the
+channel decoder tries all seven alignments and keeps the one whose stream
+decodes to the most fully-recovered framed message. `level_dbfs()`
+reports smoothed channel power.
 
 ## CCIR 476 character decode (`ccir476.rs`)
 
@@ -153,8 +198,10 @@ ZCZC B1 B2 B3 B4 <CR><LF> ...message text... <CR><LF> NNNN
 
 ## Validation / oracles
 
-This crate verifies against **external** references only — no
-encode→decode self-loopback. Three independent oracles back the facts:
+The decode layer verifies against **external** references only — no
+encode→decode self-loopback. Three independent oracles back the facts;
+the IQ front end adds a real off-air capture plus a synthetic
+modulate→demod path.
 
 | Layer | Fact / table | Oracle | How verified |
 |---|---|---|---|
@@ -162,15 +209,31 @@ encode→decode self-loopback. Three independent oracles back the facts:
 | FEC-B diversity | RX-first / DX-five-chars-later interleave, DX-preferred recovery, `FEC_DISTANCE = 5` | **fldigi** (`process_bytes`/`find_alpha_characters`/`fec_offset = pos − 35`) + **arachnoid.com/JNX** SITOR-B doc | `fec::decodes_nautical_example` feeds the published **NAUTICAL** interleave (DX 'N' at slot 9, RX 'N' at slot 4 — five slots apart) and asserts the output is `"NAUTICAL"` |
 | Frame layout | `ZCZC B1B2B3B4 … NNNN`, B1/B2/B3B4 fields, B2 subject table | **IMO NAVTEX Manual** (MSC.1/Circ.1403) via fldigi `ccir_message` (`detect_header`/`detect_end`/`msg_type`) | `subject_categories_match_imo_table` and header/end-marker parse tests |
 
-- **End-to-end** (`tests/end_to_end.rs`): assembles a full on-air-shaped
-  interleaved DX/RX stream for `ZCZC CA23 … NAVAREA WARNING … NNNN` from
-  (1) the oracle CCIR 476 code per char and (2) the externally-documented
-  interleave (RX at slot 2k, DX at slot 2k+5), then decodes it through the
-  crate's **independent** table and diversity logic — asserting station
-  `C`, subject `A`, number 23, body `NAVAREA WARNING`, and the JSON shape.
-  Because the stream is built from external facts and the decode path is
-  independent, this is **spec-anchored, not a private-encoder loopback**
-  (documented as such in the test header and `PROVENANCE.md`).
+- **Real off-air capture (primary front-end proof).** SDRplay's official
+  `navtex.zip` IQ demo (USCG, 2020-09-04), 62.5 kS/s cs16, capture center
+  516 kHz / NAVTEX channel 518 kHz, run through `NavtexChannelDecoder`
+  (`offset_hz = +2000`). It decodes the **real USCG message
+  char-identical to the fldigi/YaND ground truth**: **29 frames**, CI
+  floor 25 (`bench/baselines.json` `navtex_offair`, `bench/run.sh`). The
+  fixture `navtex_62500.cs16` is a CI-gated release asset (~74 MB, not
+  vendored). This capture is what proves the narrow-passband DDC + FSK
+  demod actually work on air, not just on synthetic IQ.
+- **Synthetic modulate→demod path** (`*_synth_iq` tests in
+  `tests/end_to_end.rs`, `modulate.rs`): builds the on-air 100 Bd ±85 Hz
+  FSK waveform for a known spec-derived frame and runs it through the real
+  `NavtexChannelDecoder` (DDC at a carrier offset + discriminator + timing
+  + packing + decode core), asserting the recovered station/subject/
+  serial/body. The modulator is **not** an external reference — it only
+  exercises the front end; the CCIR 476 symbol codes it carries are still
+  oracle-anchored, and the waveform parameters are the published spec.
+- **Spec-derived symbol-stream end-to-end** (`decodes_full_navtex_message`):
+  assembles a full interleaved DX/RX stream for `ZCZC CA23 … NAVAREA
+  WARNING … NNNN` from (1) the oracle CCIR 476 code per char and (2) the
+  externally-documented interleave (RX at slot 2k, DX at slot 2k+5), then
+  decodes it through the crate's **independent** table and diversity logic
+  — asserting station `C`, subject `A`, number 23, body, and JSON shape.
+  Spec-anchored, not a private-encoder loopback (documented as such in the
+  test header and `PROVENANCE.md`).
 - **FEC-B proof** (`fec_b_recovers_corrupt_dx_via_rx`): smashes **every**
   DX copy to an invalid 3-of-7 code so only the time-diverse RX copies can
   reconstruct the message — proving the diversity is actually doing the
@@ -179,34 +242,48 @@ encode→decode self-loopback. Three independent oracles back the facts:
   phasing symbols and lets `find_phase` locate the alignment.
 - **FIGS shift** (`figures_shift_in_body`): a body with digits exercises
   the LTRS↔FIGS state machine end-to-end (`LAT 50 LON 10`).
+- **Bus mapping** (`to_message_emits_navtex_body_from_synth_iq`): confirms
+  `Mode::Navtex`, `MessageBody::Navtex { kind, details }`, `crc_ok` on a
+  fully framed message, RSSI, and `raw` symbols.
 
-No public NAVTEX symbol-stream-plus-ground-truth vector was found, so the
-full-message vector is spec-derived (and documented as such); the
-NAUTICAL example is the externally-published worked case that anchors the
-diversity logic.
+The full-message symbol vector is spec-derived (no public NAVTEX
+symbol-stream-plus-ground-truth vector exists); the NAUTICAL example is
+the externally-published worked case anchoring the diversity logic; the
+SDRplay capture is the real off-air ground truth for the whole chain.
+
+## DSP dependency: narrow-passband DDC
+
+The off-air decode is only possible because of a fix in `xng-dsp`'s DDC
+(`crates/xng-dsp/src/ddc.rs`). NAVTEX's channel ratio is degenerate —
+`CHANNEL_RATE / CHANNEL_PASSBAND_HZ = 4800 / 250 ≈ 19` — and with only
+the anti-alias tap count the narrow 250 Hz cutoff fell inside the final
+filter's own transition roll-off, attenuating the signal so the demod saw
+**0 frames** through the DDC. The DDC now sizes its **final stage** so the
+transition is ≤ `passband`, keeping `[0, passband]` flat, **gated to
+`out ≥ 12·passband`** so it touches only these degenerate narrow modes
+(NAVTEX, DSC) and leaves every already-validated wider mode's filter and
+selectivity untouched.
 
 ## Known limitations / deferred
 
-- **No IQ front end.** `demod_fsk(iq, sample_rate)` is a documented
-  placeholder that returns `NavtexError::DemodNotImplemented`. The
-  intended contract (100-baud ±85 Hz FSK discriminator + bit-timing
-  recovery → one CCIR 476 code per 7 bits) is described but unbuilt: an IQ
-  demod cannot be verified without a published IQ capture paired with
-  ground-truth text, so per the crate's verification rules it is left a
-  TODO rather than shipped unverified. The decode layer above is fully
-  testable from a symbol stream and is the verified deliverable.
-- **Not wired into the runtime.** No `Mode::Navtex`, no
-  `xng_types::Message` variant, no `--mode navtex`. The crate stands alone
-  and emits its own `NavtexMessage`; integrating it requires the IQ front
-  end first.
+- **No NAVTEX-specific carrier search.** The front end relies on the DDC
+  `freq_offset_hz` plus the demod's slow DC tracker to center the FSK
+  swing; there is no automatic channel/carrier acquisition. The off-air
+  fixture works with the known +2 kHz offset.
+- **One vendored real fixture.** Off-air validation rests on the single
+  SDRplay USCG capture (a CI-gated release asset, not vendored in-tree);
+  the rest is the spec-derived end-to-end vector, the NAUTICAL example,
+  and the synthetic IQ path. No second independent off-air recording is
+  in CI yet.
 - **Single-error detection only.** The CCIR 476 constant-ratio code
   *detects* a single bit flip (population count ≠ 4) but cannot correct
   within one copy; correction comes only from the FEC-B time diversity
   (the other copy). A position lost in both copies is dropped (or rendered
   `*`).
-- **No off-air fixture in CI.** Validation is the spec-derived
-  end-to-end vector plus the published NAUTICAL example; there is no
-  vendored IQ recording (none with ground truth was found).
+- **No position output.** NAVTEX carries no fix, so a decoded message has
+  no map location — it does not appear on the dashboard "beacons" layer
+  (that is for radiosonde/ADS-L/SARSAT/DSC positions). NAVTEX surfaces as
+  a text/message record only.
 
 ## Gotchas
 
@@ -217,7 +294,15 @@ diversity logic.
    slots after its RX copy.
 4. `find_phase` excludes phasing pairs (`ALPHA`/`REP`) from its match
    score, or it would false-lock on the idle preamble.
-5. The IQ demod is intentionally a TODO — `demod_fsk` errors by design.
+5. The channel decoder tries **all seven** 7-bit packing alignments and
+   keeps the one decoding the longest framed message; do not assume a
+   fixed bit phase.
+6. `demod_fsk(iq, sample_rate, bit_phase)` asserts `sample_rate ==
+   CHANNEL_RATE` — wideband IQ must go through `NavtexChannelDecoder`
+   (which owns the DDC), not straight into the FSK demod.
+7. The DDC's narrow-passband fix (final-stage taps gated to
+   `out ≥ 12·passband`) is load-bearing for NAVTEX; without it the demod
+   sees an attenuated signal and decodes 0 frames.
 
 ## Key references
 
@@ -232,5 +317,9 @@ diversity logic.
   B-mode (FEC) definition.
 - **IMO NAVTEX Manual** (MSC.1/Circ.1403) — `ZCZC B1B2B3B4 … NNNN` frame
   layout and B2 subject-indicator categories.
+- **SDRplay** official `navtex.zip` IQ demo — the real off-air USCG
+  capture used as the front-end ground truth (`bench/data/navtex_62500.cs16`,
+  release asset).
 - `crates/xng-mode-navtex/PROVENANCE.md` — sourcing policy and per-table
   oracle notes.
+- `docs/notes/BENCHMARKS.md` — off-air decode results vs oracles.

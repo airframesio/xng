@@ -1,30 +1,45 @@
 # UAT (978 MHz, DO-282B) — implementation notes
 
-Native UAT (Universal Access Transceiver, 978 MHz, RTCA DO-282B) **decode
-core** for `xng-mode-uat`: bytes/bits → structured fields for the ADS-B
-downlink (state-vector / mode-status / target-state) and the FIS-B uplink
-(APDU framing + DLAC text weather products), plus the Reed-Solomon FEC that
-fronts both. Protocol facts are anchored to DO-282B / DO-358 / FAA AC 00-63B,
-and every test asserts against a real reference decoder's output
-(FlightAware **dump978**) rather than an encode→decode loopback. Source:
-`crates/xng-mode-uat/src/`.
+Native UAT (Universal Access Transceiver, 978 MHz, RTCA DO-282B) mode for
+`xng-mode-uat`: a wideband IQ front-end (2-ary CPFSK demod → 36-bit sync hunt
+→ bit slice) feeding a decode core (bytes/bits → structured fields) for the
+ADS-B downlink (state-vector / mode-status / target-state) and the FIS-B
+uplink (APDU framing + DLAC text weather products), plus the Reed-Solomon FEC
+that fronts both. Protocol facts are anchored to DO-282B / DO-358 /
+FAA AC 00-63B, and every **decode-core** test asserts against a real reference
+decoder's output (FlightAware **dump978**) rather than an encode→decode
+loopback. Source: `crates/xng-mode-uat/src/`.
 
-> **STATUS — this is a decode core, not a runnable mode.** There is
-> **no `--mode uat`**. The crate takes corrected payload bytes (or raw
-> with-parity frames via `decode_frame`) and is independent of how the bits
-> were recovered. The **IQ demodulator front-end** (978 kbit/s binary
-> FSK/CPFSK, sync-word correlation, soft-bit deinterleave) and the
-> **bin / `xng_types::Mode` enum / runtime / CLI wiring** are deliberate
-> follow-ups (confirmed: no `Uat` variant in `xng-types::Mode`, no `uat`
-> string in the `xng` bin). See *Limitations / deferred* and PROVENANCE.md.
+> **STATUS — runnable mode.** `--mode uat` is wired end-to-end: the
+> `xng-types::Mode::Uat` variant, the `MessageBody::Uat { kind, details }`
+> body, the `UatChannelDecoder` in `src/runtime.rs`, and CLI / TUI / scan /
+> asf-2.0 output all exist. UAT is treated as **wideband like ADS-B** — it
+> consumes the whole capture, so the runtime forces offset 0 and refuses a
+> non-zero `-c` offset ("tune -c to 978.000M and pass --channels 978").
+> **Validated on a real 50 s off-air capture** (~879 CRC-OK frames, live GA
+> aircraft) reported this session; that capture is **not** a vendored CI
+> fixture (see *Validation*). The standalone `decode_frame` entry (corrected
+> payload bytes / raw with-parity frames) still exists and remains
+> independent of how the bits were recovered.
 
-## Pipeline (decode layer only)
+## Pipeline
 
-raw with-parity frame → `fec` (Reed-Solomon correct; uplink also
-deinterleave) → corrected payload → `UatDownlink::decode` /
-`UatUplink::decode` → `UatMessage` (with the RS symbol-correction count).
+wideband IQ @ capture rate → `Ddc` to `CHANNEL_RATE` (≈2 samples/bit, bypassed
+at an exact-rate capture) → `demod::FskDemod` (CPFSK discriminator + sync hunt
++ bit slice) → candidate with-parity block(s) → `fec` (Reed-Solomon correct;
+uplink also deinterleave) → corrected payload → `UatDownlink::decode` /
+`UatUplink::decode` → `UatMessage` → `to_message` → `xng_types::Message`.
 
-`decode_frame(raw)` dispatches purely by frame length:
+`UatChannelDecoder::new(input_rate).process(&[Complex<f32>]) -> Vec<UatFrame>`
+mirrors the ADS-B wideband interface (single 978 MHz signal, offset 0,
+`level_dbfs()`). Each `UatFrame` carries the decoded `UatMessage`, the RS
+symbols corrected, the with-parity wire bytes, and the channel level at
+detection. `to_message(frame, freq, source)` maps it to a normalized
+`Message` (`Mode::Uat`, `crc_ok = true` since the frame passed RS, the
+corrected count surfaced as `fec_corrected`, `rssi_db` = the channel level,
+and `MessageBody::Uat { kind: "adsb"|"fisb", details: <decoded JSON> }`).
+
+Below the front-end, `decode_frame(raw)` dispatches purely by frame length:
 
 | Raw length | `UatFrameKind` | FEC | Decoder |
 |---|---|---|---|
@@ -33,12 +48,39 @@ deinterleave) → corrected payload → `UatDownlink::decode` /
 | 552 B | `Uplink` | 6× RS(92,72) interleaved | `UatUplink` (432-byte MDB) |
 
 Constants: `UAT_FREQUENCY_HZ` = 978 000 000 (single channel);
-`UAT_BIT_RATE` = 1.041667 Mbit/s nominal. `UatMessage` boxes both variants so
-the enum stays small.
+`UAT_BIT_RATE` = 1.041667 Mbit/s nominal; `CHANNEL_RATE` = 2 × bit rate
+(≈2.083 MS/s, ~2 samples/bit); `CHANNEL_PASSBAND_HZ` = 625 000 (one-sided,
+covers the h≈0.6 ±312.5 kHz CPFSK deviation). `UatMessage` boxes both variants
+so the enum stays small.
 
-There is **no front-end here** — no FSK demod, no sync-word hunt, no bit
-slicing. The two documented downlink sync word `0xEACDDA4E2` and uplink
-`0x153225B1D` (36-bit) live only as TODO notes in PROVENANCE.md, not in code.
+## Front-end / demod (`demod.rs`)
+
+UAT is binary continuous-phase FSK at 1.041667 Mbit/s, h ≈ 0.6 (deviation
+≈ ±312.5 kHz): a `1` is the upper tone, `0` the lower. A burst is a 36-bit
+sync word then the FEC-coded block (no further line coding — recovered bits
+are the RS codeword octets, MSB-first). `FskDemod` runs in the
+frequency-discriminator domain:
+
+- **Discriminator** — per-sample `arg(x · conj(prev))` with a slow DC tracker
+  (`FREQ_ALPHA = 0.002`) absorbing carrier offset; channel power smoothed
+  (`LEVEL_ALPHA = 0.005`) for `level_dbfs`. (Reuses the AIS GFSK discriminator
+  idea at UAT's rate; no shared FSK primitive, so the pattern is local.)
+- **Sync hunt** — the buffered discriminator stream is searched at sample
+  resolution over a half-sample timing grid for the two 36-bit sync words
+  (downlink `0xEACDDA4E2`, uplink `0x153225B1D`), ≤ 4 bit errors tolerated
+  (`SYNC_MAX_ERRORS`). The half-sample grid is what makes 2-samples/bit robust
+  to arbitrary burst arrival phase; carry-over `disc` buffer recovers bursts
+  that straddle a chunk boundary.
+- **Slice + RS gate** — at a sync hit the symbol period is known, so message
+  bits are integrate-and-dumped at the matched phase, packed MSB-first, and
+  handed to `decode_frame`. A downlink burst is sliced at the long (48 B)
+  length and *also* offered as its 30-byte short prefix; the RS gate validates
+  whichever is correct. Hard-decision uplink deinterleave (via
+  `fec::correct_uplink`) already recovers clean uplinks; soft-bit deinterleave
+  is a possible refinement, not implemented.
+
+`modulate.rs` is the inverse (CPFSK-modulate a known frame to IQ) used only to
+build the synthetic-IQ self-tests; it is not on the receive path.
 
 ## FEC (`fec.rs`)
 
@@ -227,23 +269,40 @@ an external decoder, never a self-loopback.
 | DLAC alphabet + TAB run-length + step machine | dump978 `decode_dlac` | a `METAR` word and a TAB-run sequence decode identically |
 | Product names | FAA AC 00-63B / DO-358 via dump978 `get_fisb_product_name` | table values asserted |
 
-Test vectors are real off-air UAT from dump978's published `sample-data.txt`
-(GA traffic near KPAO). Tests live in `tests/vectors.rs` (8 tests) plus unit
-tests in `bits.rs` / `dlac.rs`. There is **no vendored IQ fixture** — the
-crate has no demod to feed it, and no `tests/data/` directory exists.
+Decode-core test vectors are real off-air UAT from dump978's published
+`sample-data.txt` (GA traffic near KPAO). `tests/vectors.rs` has 14 tests:
+9 oracle-anchored decode-core / FEC tests, plus 5 demod tests suffixed
+`_synth_iq` / `to_message_emits_uat_adsb_variant` that exercise the new
+front-end. Unit tests also live in `bits.rs` / `dlac.rs`.
+
+## Validation
+
+- **Decode core + FEC** — oracle-anchored against dump978 (table above);
+  these are the strong guarantees.
+- **Front-end (in-repo, synthetic IQ)** — `modulate.rs` CPFSK-modulates the
+  two dump978-pinned known frames (short type-0, long type-1 N5130E) to IQ and
+  `UatChannelDecoder` recovers the *exact* with-parity frame and the pinned
+  decoded fields. Covered: clean at native `CHANNEL_RATE`, additive-noise
+  (deterministic xorshift, not a clean loopback), and through-DDC at 8 MS/s.
+  `to_message_emits_uat_adsb_variant` pins the `Message` mapping. There is
+  **no public UAT IQ oracle vector**, so these are self-generated — the decode
+  core stays oracle-anchored, the synthetic tests validate only the
+  discriminator + sync correlation + bit slicing.
+- **Front-end (real off-air, reported this session)** — a 50 s live 978 MHz
+  capture yielded ~879 CRC-OK frames from real GA aircraft through
+  `UatChannelDecoder`. This is a real-world result, **not** a vendored CI
+  fixture: there is no UAT IQ file in `bench/`, no `bench/baselines.json` UAT
+  entry, and no `tests/data/` directory (the CI-gated off-air fixtures are
+  sonde / navtex / sarsat, not UAT). It is not reproducible from the repo.
 
 ## Limitations / deferred
 
-- **No IQ demodulator.** The 978 kbit/s binary FSK/CPFSK front-end —
-  sync-word correlation against the 36-bit downlink `0xEACDDA4E2` / uplink
-  `0x153225B1D`, soft-bit deinterleave for the uplink — is a documented
-  follow-up (PROVENANCE.md). The decode layer is fed corrected payload bytes
-  (or raw with-parity frames) and knows nothing about the air interface.
-- **Not wired into the runtime.** No `--mode uat`; no `Uat` variant in
-  `xng_types::Mode`; no bin/CLI integration. Output is the crate's own
-  `UatMessage` / `UatDownlink` / `UatUplink` JSON, **not** an
-  `xng_types::Message`. The shared-file integration is a deliberate separate
-  step.
+- **Front-end validated only synthetically in-repo.** The CPFSK demod + sync
+  hunt + bit slicing are pinned by self-generated modulate→demod tests; the
+  one real off-air validation (~879 CRC-OK / 50 s) is not vendored or
+  CI-gated, so the repo cannot reproduce a real-IQ pass.
+- **Uplink is hard-decision only.** No soft-bit deinterleave; clean uplinks
+  recover, but the marginal-SNR uplink path is untested off-air.
 - **On-ground SV and Target State unpinned.** `sample-data.txt` carries only
   airborne GA downlinks, so the on-ground branch (ground speed,
   track-or-heading, aircraft size, GPS antenna offsets) and the Target-State
@@ -255,8 +314,15 @@ crate has no demod to feed it, and no `tests/data/` directory exists.
   APDU payload is preserved, but not interpreted (matching the scope of the
   legacy text reference). Info `frame_type` 15 (Service Status) is framed but
   not decoded.
-- **No `xng-types::Message` mapping / RSSI / CRC-ok plumbing** — those belong
-  to the runtime-wiring step that hasn't happened.
+
+## Dashboard / output
+
+- UAT downlinks (`kind: "adsb"`) plot as **aircraft** on the HTTP dashboard
+  and **merge with 1090 ADS-B by ICAO** (`src/outputs/http.rs`), so an
+  aircraft seen on both links is one track with two sources (`adsb` + `uat`).
+- The console renderer prints `UAT ADSB` / `UAT FISB` lines; asf-2.0 output
+  carries the `MessageBody::Uat { kind, details }` body
+  (`crates/xng-proto/src/lib.rs`).
 
 ## Gotchas
 
@@ -283,6 +349,6 @@ crate has no demod to feed it, and no `tests/data/` directory exists.
   test oracle: `uat_protocol.h`, `fec.cc` (FEC); `uat_message.cc` /
   `uat_message.h` (downlink); `legacy/uat_decode.c` (uplink FIS-B / DLAC /
   product table). BSD-2 / GPL-2; built and run as an oracle, not vendored.
-- Shared DSP: `xng_dsp::rs::ReedSolomon`.
-- `crates/xng-mode-uat/PROVENANCE.md` — sourcing policy, FEC notes, the demod
-  and integration TODOs.
+- Shared DSP: `xng_dsp::rs::ReedSolomon`, `xng_dsp::Ddc`.
+- `crates/xng-mode-uat/PROVENANCE.md` — sourcing policy, FEC notes, the IQ
+  front-end + synthetic-IQ validation, and the runtime-wiring scope.

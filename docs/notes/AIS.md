@@ -10,7 +10,11 @@ Result: 48 unique frames on a 5 min Sacramento capture vs AIS-catcher's 53
 (91%), **zero false decodes**. The capture is inland (mostly weak distant
 type-4 base-station reports), a sensitivity test by construction; the gap
 is 5 payloads that anchor but never pass FCS under any tested hypothesis —
-a fade tail, not a convention bug. CI-fenced by the vendored fixture.
+a fade tail, not a convention bug. CI-fenced by the off-air fixture
+(`ais_96k.cs16`, a 96 kS/s decimation of the 6 MS/s capture, a release
+asset — see [bench/README.md](../../bench/README.md)): the regression
+floor is on raw decoded frames (`ais_offair` ≥ 65; the capture yields
+71 live / 72 max), a coarser gate than the 48/53 unique-payload count.
 
 ## Pipeline
 
@@ -247,8 +251,11 @@ AIS messages; the prefix is the marker.
   consistency. Stuffing roundtrip, bad-FCS rejection, back-to-back shared
   flag, GMSK-shaped burst, and dual-channel-with-CFO from one wideband
   capture are unit-tested.
-- **Off-air:** AIS-catcher on a shared capture (`bench/`), CI-fenced by
-  the vendored fixture floor. See [BENCHMARKS.md](BENCHMARKS.md).
+- **Off-air:** AIS-catcher on a shared capture, CI-fenced by the
+  `ais_offair` frame floor (≥ 65) over the `ais_96k.cs16` release-asset
+  fixture (`bench/run.sh`; the file is fetched, not vendored). The 48/53
+  unique-payload comparison is the human-facing sensitivity number.
+  See [BENCHMARKS.md](BENCHMARKS.md).
 
 ## Known limitations / intentional gaps
 

@@ -294,9 +294,12 @@ returns acarsdec's exact `assstat` strings (`complete`/`in progress`/
 
 ## Known limitations / intentional gaps
 
-- No frame-count benchmark vs acarsdec — no vendored off-air capture; the
-  capture-able captures are too large to fence in CI. Confidence is the
-  live feed + loopback + field-exact app vectors.
+- No frame-count benchmark vs acarsdec — no vendored off-air capture (the
+  capture-able captures are too large to fence in CI, and unlike the newer
+  narrowband modes — SONDE/NAVTEX/UAT — no small representative ACARS IQ
+  fixture has been cut). Confidence is the live feed + loopback +
+  field-exact app vectors; ACARS appears in neither the count-gated nor the
+  oracle-fixture rows of [BENCHMARKS.md](BENCHMARKS.md).
 - FEC corrects a single bit error anywhere (O(1)) and small multi-error
   patterns localized by parity; a non-single-bit error in a parity-clean
   body (or >3 bad-parity suspects, or >8) is not corrected.

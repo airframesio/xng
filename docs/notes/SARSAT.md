@@ -1,31 +1,41 @@
 # COSPAS-SARSAT 406 MHz beacons — implementation notes
 
-First-Generation Beacon (FGB) **message decoder** for `xng-mode-sarsat`,
-per C/S T.001: the 112-bit short / 144-bit long 406 MHz distress message
-carried by ELTs, EPIRBs and PLBs. This crate decodes **hex/bits →
-structured fields** — message type and format, country code, protocol
-classification, the protocol-specific beacon identification, the encoded
-position, and both BCH error-correcting codes. The field layout, the two
-BCH generator polynomials, the bit offsets and the position arithmetic
-are re-derived from the externally published reference decoder
+First-Generation Beacon (FGB) decoder for `xng-mode-sarsat`, per C/S
+T.001: the 112-bit short / 144-bit long 406 MHz distress message carried
+by ELTs, EPIRBs and PLBs. The crate ships **two layers**: a **message/frame
+decoder** (`decode_hex`: hex/bits → structured fields — message type and
+format, country code, protocol classification, the protocol-specific
+beacon identification, the encoded position, and both BCH error-correcting
+codes), and an **IQ demodulator** (`SarsatChannelDecoder`: a DDC +
+biphase-L (Manchester) PSK demod that recovers a beacon from channelized
+capture IQ and feeds it to `decode_hex`). The field layout, the two BCH
+generator polynomials, the bit offsets and the position arithmetic are
+re-derived from the externally published reference decoder
 `amsa-code/fgb-decoder` (Apache-2.0); **no code was copied** (the Java
 was read to recover protocol facts). Every decode is asserted against
 that project's compliance-kit oracle vectors and C/S T.001 worked
 examples (`tests/oracle.rs`). Source: `crates/xng-mode-sarsat/src/`.
 
-**Status: decode-core only.** This is a standalone decode library. There
-is no IQ demodulator (IQ → bits), no spec-faithful modulator, and the
-crate is intentionally **not** wired into the `xng` binary, the
-`xng_types::Mode` enum, the runtime, or the CLI — there is no `--mode
-sarsat`. Second-generation beacons (C/S T.018, SGB) are out of scope.
-See PROVENANCE.md and the Limitations section below.
+**Status: decode-core is oracle-anchored and oracle-validated; the demod
+is synthetic-loopback-validated only.** The crate is wired into the `xng`
+binary as `Mode::Sarsat` — `--mode sarsat` (also `cospas`, `406`), runtime
+`ModeChannel::Sarsat`, the `scan` channel plan (406.025 / 406.028 /
+406.037 MHz), console output, the Airframes uplink (`SARSAT`), and the
+dashboard "beacons" map+table layer (🆘 glyph). The decode core is
+verified against the AMSA compliance vectors; the **IQ demod path is
+validated only by a self-generated modulate→demod loopback** (no public
+SARSAT IQ oracle). A real off-air EPIRB capture is vendored as a bench
+fixture but does **not** yet decode (0 frames; see Limitations / Real IQ).
+Second-generation beacons (C/S T.018, SGB) are out of scope. See
+PROVENANCE.md and the Limitations section below.
 
-## Pipeline
+## Message/frame decode pipeline (`decode_hex`)
 
-`decode_hex(hex)` (`lib.rs`) is the single entry point. It accepts
+`decode_hex(hex)` (`lib.rs`) is the message-layer entry point. It accepts
 **15 hex** (60 bits, short beacon ID) or **30 hex** (120 transmitted
 bits, full long message — the frame-sync prefix already removed) and
-returns a `SarsatBeacon`. There is no signal/PHY stage in this crate.
+returns a `SarsatBeacon`. There is no signal/PHY stage in this function;
+the demod front-end (below) feeds it.
 
 hex → `bits::hex_to_bits` (T.001-indexed bit string) → `message_format`
 (bit 25/26) → `classify` (protocol code) → `compute_hex_id` →
@@ -181,7 +191,53 @@ runs `calc_bch`; `transmitted_bchN` slices the parity as carried.
 always present** on a 30-hex decode; **PDF-2 is added only on a long
 message that carries position** (tail not `FFFFFFFF` / `00000000`).
 
-## Output
+## IQ demodulator (`SarsatChannelDecoder`, `demod.rs`, `modulate.rs`)
+
+`SarsatChannelDecoder` is the IQ → beacon front-end the `xng` runtime
+instantiates. FGB modulation (C/S T.001 §2) is **biphase-L (Manchester)
+phase modulation of the carrier at ±1.1 rad, 400 bps**, preceded by an
+unmodulated carrier, a 15-bit bit-sync `1` run and a 9-bit frame sync.
+The chain:
+
+1. **DDC.** Owns an optional `xng_dsp::Ddc` that mixes the capture by
+   `freq_offset_hz` and decimates to `CHANNEL_RATE = 8 kHz` (20 samples
+   per 400 bps data bit, 10 per half-symbol) with a `CHANNEL_PASSBAND_HZ
+   = 1.5 kHz` one-sided passband. At zero offset and an 8 kHz input the
+   DDC is skipped.
+2. **Carrier recovery (`BiphaseDemod`).** Because the deviation is ±1.1
+   rad (not ±π/2) the modulated carrier keeps a non-zero mean component;
+   a one-pole complex average (`CARRIER_ALPHA`) tracks that residual
+   carrier (frequency offset + phase) — the role the 160 ms unmodulated
+   carrier preamble plays in a real receiver. Each sample is derotated
+   and `arg(s·conj(carrier))` gives `±1.1·level`.
+3. **Half-symbol + timing recovery.** A zero-crossing timing loop
+   (`TIMING_GAIN`) locks to the mid-bit transition biphase-L guarantees;
+   each half-bit window integrates the residual phase and emits one
+   half-symbol (`1` = +1.1 rad, `0` = −1.1 rad).
+4. **Sync + assembly (`find_frame` / `assemble`, `lib.rs`).** The
+   accumulated half-symbol stream is correlated against the preamble
+   (15 `1`s + 9-bit frame sync `000101111`, allowing ≤6 half-symbol
+   errors). The first data bit (format flag) selects the long (30-hex,
+   120 data bits) vs short (15-hex, 60 ID bits) form; `pair_to_bit`
+   un-Manchesters each half-pair, and the assembled hex goes to
+   `decode_hex`. Decoded frames are deduped against a rolling 64-entry
+   `recent` list.
+
+**Biphase-L polarity is ambiguous** — it depends on the sign of the
+recovered carrier phase, so a real beacon can arrive with every
+half-symbol inverted (the vendored off-air EPIRB locked only inverted).
+`find_frame` correlates **both** polarities across the whole window and
+picks the global best-matching preamble (lowest-error, canonical wins
+ties), flipping the data half-symbols to canonical before assembly.
+`find_frame_recovers_both_polarities` asserts a canonical stream and its
+full inversion decode to the identical beacon.
+
+`modulate.rs` is a **self-generated test-signal source only** (biphase-L
+±1.1 rad / 400 bps; `burst_iq` prepends ~50 bit-periods of unmodulated
+carrier so the one-pole settles). It is **not** a spec-compliance encoder
+and is not used by the decode core.
+
+## Output / normalized message
 
 `decode_hex` returns `SarsatBeacon` (serde-serializable; field names
 mirror the `amsa-code/fgb-decoder` JSON so a decode can be asserted
@@ -189,13 +245,23 @@ against the published vectors): `message_type`, `format`, `hex_id`,
 `country_code`, `protocol_type`, the optional protocol-specific
 identification fields, `coarse_position` / `position`, `bch1` /
 optional `bch2`, and the optional `raw_bits` (the full T.001-indexed bit
-string, for debugging). There is no `xng_types::Message` mapping — the
-crate emits its own type, since it is not wired into the runtime.
+string, for debugging).
+
+`to_message(frame, frequency_hz, level_dbfs, source)` maps a recovered
+`SarsatFrame` to the normalized `xng_types::Message`: `mode =
+Mode::Sarsat`, `body = MessageBody::Sarsat { kind: protocol_type, details:
+<SarsatBeacon JSON> }`, `signal.rssi_db = level_dbfs`, `decode.crc_ok =
+bch1.ok && bch2.ok` (PDF-2 absent counts as ok), and `raw` = the beacon
+hex packed to wire bytes. The dashboard plots positions on the "beacons"
+map+table layer (alongside radiosonde / ADS-L / DSC), keyed by `serial` /
+`address` / `hex_id` / `beacon_id`.
 
 ## Validation / oracles
 
-**Oracle-anchored, not loopback.** The crate verifies against an
-independent external implementation, never a self-consistency round-trip.
+**Decode core: oracle-anchored, not loopback.** The message layer verifies
+against an independent external implementation, never a self-consistency
+round-trip. **Demod path: self-generated loopback** (no public SARSAT IQ
+oracle exists), kept honestly distinct from the core's oracle anchoring.
 
 - **Reference decoder oracle:** `amsa-code/fgb-decoder` (Apache-2.0, the
   Australian Maritime Safety Authority's open-source FGB decoder).
@@ -230,23 +296,45 @@ is error *detection*, not an encode→decode loopback. `serializes_to_json`
 checks the serde field names against the oracle JSON; `rejects_bad_length`
 and `hex_to_bits_lengths` cover the length guards.
 
+**Demod loopback (`tests/demod_synth.rs`, `*_synth_iq`).** Because no
+public SARSAT IQ reference vector exists, the demod is validated
+self-consistently: a known-good compliance-kit hex is modulated at the
+biphase-L ±1.1 rad / 400 bps waveform, run through the real
+`SarsatChannelDecoder::process`, and the recovered fields asserted equal
+to the oracle-known values. `decodes_known_long_beacon_synth_iq` (PLB,
+Vietnam, at the channel rate, no DDC) and `decodes_with_ddc_and_cfo_synth_iq`
+(ELT, France, out of a 48 kS/s capture with a 3.5 kHz carrier offset —
+exercises the DDC mix+decimate and the carrier loop) cover the path;
+`to_message_emits_sarsat_variant_synth_iq` checks the normalized-message
+mapping. The modulate→demod path is therefore self-generated; the decode
+core stays oracle-anchored.
+
+**Real off-air IQ.** `bench/data/sarsat_37500.cs16` is a real 406 EPIRB
+burst (sigidwiki `Epirbsignal.zip`, 37.5 kS/s cs16, ~0.5 s, vendored,
+80 KB). It is weak/drifting and currently decodes **0 frames**: the
+inverted biphase-L polarity now syncs (handled by the dual-polarity
+`find_frame`), but a clean decode of this capture also needs a
+decision-directed carrier PLL (a 2-attempt PLL was tried and reverted as
+data-limited). It is therefore vendored but **not count-gated**.
+
 There is **no count-style head-to-head benchmark** (no peer decoder run
-on bulk captures), and SARSAT is **not** in CI's count gates — it is
-fenced by the exact-result oracle fixtures above.
+on bulk captures), and SARSAT is **not** in CI's count gates — the decode
+core is fenced by the exact-result oracle fixtures above, and the only
+real IQ fixture does not yet decode.
 
 ## Known limitations / intentional gaps
 
-- **No IQ demodulator (IQ → bits).** FGB modulation is biphase-L
-  (Manchester) PSK at 400 bps with ±1.1 rad phase modulation on the
-  406.025 / 406.028 / 406.037 MHz carrier, preceded by a 160 ms
-  unmodulated carrier, a 15-bit bit-sync `1` run and a 9-bit frame sync.
-  That demod path is documented as a TODO (`src/lib.rs`) but not shipped.
-- **No modulator (bits → IQ).** Out of scope; there is no encoder, so
-  validation cannot use an encode→decode loopback (and deliberately
-  doesn't — it uses the external oracle instead).
-- **Not wired into the runtime.** No `xng_types::Mode` variant, no
-  `--mode sarsat`, no `Message` mapping. Standalone decode library;
-  runtime integration is a separate follow-up.
+- **No real off-air decode yet.** The IQ demod (`SarsatChannelDecoder`)
+  ships and is wired into the runtime, but it is validated only by a
+  self-generated modulate→demod loopback. The one vendored real EPIRB
+  capture (`bench/data/sarsat_37500.cs16`) decodes **0 frames** — the
+  inverted biphase-L polarity syncs, but this weak/drifting capture also
+  needs a decision-directed carrier PLL (follow-up; a 2-attempt PLL was
+  reverted as data-limited). So demod correctness on real captures is
+  **not yet established** — treat the demod as synthetic-validated only.
+- **Modulator is a test-signal source, not a spec encoder.**
+  `src/modulate.rs` exists only to feed the demod loopback (biphase-L
+  ±1.1 rad / 400 bps); it is not a C/S-compliance modulator.
 - **BCH is detect-only.** `BchField::ok` flags whether the transmitted
   parity matches the recomputed parity; the codes are not used to
   *correct* bit errors (no syndrome/error-locator step).
@@ -274,6 +362,10 @@ fenced by the exact-result oracle fixtures above.
    default-location pattern — the ID is position-independent by design.
 5. BCH is detection-only; failures are surfaced, not rejected (lenient
    decode, like a real beacon receiver).
+6. **Biphase-L polarity is ambiguous.** A real beacon can arrive fully
+   inverted (the vendored EPIRB locked only inverted); `find_frame`
+   correlates both polarities and flips data to canonical before assembly.
+   Don't assume a single orientation.
 
 ## Key references
 

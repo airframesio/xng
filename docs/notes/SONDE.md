@@ -1,43 +1,81 @@
 # Radiosondes — implementation notes
 
-Native Vaisala **RS41** radiosonde frame decoder (`crates/xng-mode-sonde`).
-RS41-SG / RS41-SGP is the most widely flown operational radiosonde
-worldwide. This crate takes an RS41 *frame* (de-whitened bytes) and runs the
-full byte-domain chain — data de-whitening → interleaved Reed-Solomon
-RS(255,231) FEC → `ID | LEN | DATA | CRC16` sub-block parse — emitting
-structured STATUS / GPS / PTU fields. Clean-room: every protocol fact
-(whitening mask, CRC variant, RS field/interleave, sub-block offsets, the
-ECEF→geodetic formula) is sourced from **rs1729/RS** (the de-facto open RS41
-reference) and verified in tests against that project's *published worked
-example* — two real sample frames with the per-sub-block CRC breakdown and
-an RS decoder input/output for a frame with two correctable byte errors.
-No code was copied; the algorithms are re-implemented and checked against
-the reference's *outputs*.
+Native Vaisala **RS41** radiosonde decoder (`crates/xng-mode-sonde`):
+wideband IQ → GFSK demod → bit framer → byte-domain decode (de-whitening →
+interleaved Reed-Solomon RS(255,231) FEC → `ID | LEN | DATA | CRC16`
+sub-block parse) → structured STATUS / GPS / PTU fields → `MessageBody::Sonde`.
+RS41-SG / RS41-SGP is the most widely flown operational radiosonde worldwide.
+Clean-room: every protocol fact (whitening mask, CRC variant, RS
+field/interleave, sub-block offsets, the ECEF→geodetic formula) is sourced
+from **rs1729/RS** (the de-facto open RS41 reference) and verified in tests
+against that project's *published worked example* — two real sample frames
+with the per-sub-block CRC breakdown and an RS decoder input/output for a
+frame with two correctable byte errors. No code was copied; the algorithms
+are re-implemented and checked against the reference's *outputs*.
 
-**Status: DECODE-CORE only.** This is a byte-frame decoder, not a live
-mode. There is **no `--mode` wiring**, no `xng_types::Message` mapping, no
-DSP front-end: the crate is a workspace member (compiled via the `crates/*`
-glob) but is **not** a dependency of `xng-cli` / the app, and the GFSK
-IQ→bits demodulator is a documented TODO (see Limitations). It decodes from
-a post-FEC (or pre-FEC, RS-correctable) frame buffer of the form the
-rs1729/RS sample frames take. Source: `crates/xng-mode-sonde/src/`.
+**Status: live mode, real-IQ validated.** The crate is wired to `--mode
+sonde` (runtime + scan dispatch in the `xng` binary, `src/runtime.rs` /
+`src/commands/scan.rs`), emits the normalized `MessageBody::Sonde`, and is
+plotted on the dashboard as a position-bearing **beacon** (the
+radiosonde / ADS-L / SARSAT / DSC map+table layer in `src/outputs/http.rs`).
+The full IQ→bits GFSK front-end (`demod.rs` + `framer.rs`, wired through
+`SondeChannelDecoder`) is implemented. The decode core is **oracle-anchored**
+on the rs1729/RS published frames; the demod is validated both on
+**self-generated IQ** (`tests/demod_synth.rs`) and, end to end, on a **real
+off-air capture** — the bench fixture `sonde_96k.cf32` decodes **119/119
+frames** (vs rs1729/RS `rs41mod` on the same capture; floor-gated in CI).
+Source: `crates/xng-mode-sonde/src/`.
 
 ## Pipeline
 
-de-whitened on-air bytes → `whitening::dewhiten_frame` (XOR 64-byte mask,
-header un-whitened) → `rs::Rs41Rs::correct_frame` (two interleaved
-RS(255,231) codewords, ≤12 byte errors each) → `frame::decode_frame`
-(sub-block CRC gate → STATUS / GPS-INFO / GPS-POS / PTU fields). Two entry
-points in `lib.rs`:
+wideband (or already channel-rate) IQ → `Ddc` (mix by `freq_offset_hz`,
+decimate to `CHANNEL_RATE` = 48 kHz, 10 samples/symbol) → `demod::GfskDemod`
+(frequency discriminator + slow DC/offset tracker + integrate-and-dump with
+zero-crossing timing → hard NRZ bits) → `framer::Framer` (64-bit sync
+correlation, polarity-agnostic, LSB-first byte packing → on-air whitened
+frame) → `decode_on_air` (de-whiten + RS(255,231) + sub-block parse). Driven
+by `SondeChannelDecoder::process` in `lib.rs`; `to_message` maps a
+`Decoded` to `MessageBody::Sonde`.
+
+The byte-domain decode core has two direct entry points in `lib.rs`:
 
 | Entry | Input | Does |
 |---|---|---|
-| `decode_on_air(&[u8])` | whitened stream (`10 B6 CA 11 …`) | de-whiten, then ↓ |
-| `decode_dewhitened(&[u8])` | de-whitened stream (`86 35 F4 40 …`) | RS-correct (on a copy), then `decode_frame` |
+| `decode_on_air(&[u8])` | header-de-whitened / body-whitened stream | de-whiten body, then ↓ |
+| `decode_dewhitened(&[u8])` | fully de-whitened stream (`86 35 F4 40 …`) | RS-correct (on a copy), then `decode_frame` |
 
-Both return `Decoded { rs: RsResult, frame: Rs41Frame }`. Frame length is
-320 (standard) or up to 518 (extended / aux-xdata); a frame below 320 bytes
-is rejected (`DecodeError::TooShort`).
+Both return `Decoded { rs: RsResult, frame: Rs41Frame, wire_bytes: Vec<u8> }`
+(`wire_bytes` = the de-whitened, RS-corrected frame). Frame length is 320
+(standard) or up to 518 (extended / aux-xdata); a frame below 320 bytes is
+rejected (`DecodeError::TooShort`).
+
+## GFSK demodulator front-end (`demod.rs`, `framer.rs`)
+
+The RS41 air interface is GFSK at 4800 baud (modulation index ≈ 1,
+Gaussian-shaped, BT ≈ 0.5), NRZ data (the bit value maps straight to the FSK
+tone — no NRZI / Manchester layer), one frame per second.
+
+- `demod::GfskDemod` is a per-sample frequency discriminator (arg of the
+  per-sample phase advance) + a slow DC tracker (`FREQ_ALPHA`) that absorbs
+  the residual carrier offset the DDC did not remove + per-symbol
+  integrate-and-dump with Gardner-style zero-crossing timing recovery
+  (`TIMING_GAIN`), hard-slicing to NRZ bits (positive frequency / high tone →
+  1). It reuses the AIS `GmskDemod` structure — GMSK and GFSK share the
+  discriminator + integrate-and-dump path — per the workspace
+  channelized-decoder contract. `level_dbfs()` exposes a smoothed channel
+  power estimate.
+- `framer::Framer` slides a 64-bit correlator over the bit stream for the
+  on-air whitened sync header `10 B6 CA 11 22 96 12 F8`, with a Hamming-slack
+  tolerance (`SYNC_TOL = 6`). GFSK has no inherent tone polarity, so it
+  matches both the sync pattern **and its bitwise inverse** (on an inverted
+  match every subsequent recovered bit is flipped). It then packs the
+  following `CAPTURE_LEN` (= 320) bytes LSB-first across however many
+  `process` calls it takes. Only the standard 320-byte frame is captured —
+  all decoded sub-blocks live within it, and requiring the full extended
+  length would stall on the far more common standard burst.
+- `SondeChannelDecoder` de-whitens the recovered 8-byte header in place
+  before handing the header-de-whitened / body-whitened frame to
+  `decode_on_air`; the decode core is **not** rewritten for the live path.
 
 ## Data whitening (`whitening.rs`)
 
@@ -163,29 +201,48 @@ These are external published vectors, never an encode→decode loopback.
   rebuilt from the field and matched against the degree-24 polynomial
   printed in rs41.txt (`1 7a 76 a9 … d9 90 75`); GF(2^8) log/exp roundtrip
   and inverse.
-
-No count-style head-to-head benchmark — the decoder is pinned to rs1729's
-published vectors (field-exact on two real frames, byte-exact RS output).
+- **Demod — synthetic IQ** (`tests/demod_synth.rs`, `*_synth_iq`): there is
+  no captured RS41 IQ *vendored in the crate*, so the IQ→bits→bytes front-end
+  is exercised by GFSK-modulating a *known oracle frame* (the published
+  K1930293 standard frame, the same vector `frame_decode.rs` decodes at the
+  byte level) with the crate's own `modulate.rs`, running it through
+  `SondeChannelDecoder::process`, and asserting the recovered fields equal
+  the published oracle values (serial, frame#, battery, GPS week/TOW,
+  ECEF→lat/lon/alt, SV count) and the recovered de-whitened wire bytes equal
+  the oracle frame. Coverage includes the direct channel-rate path, the DDC
+  mix+decimate path (offset carrier, 240 kS/s capture), and the `to_message`
+  → `MessageBody::Sonde` emission. This modulate→demod loop is
+  self-consistent **by construction**; the decode core stays oracle-anchored
+  by the byte-level tests above.
+- **Demod — real off-air IQ** (bench fixture, CI-gated, not in `cargo test`):
+  `bench/data/sonde_96k.cf32` is the projecthorus/radiosonde_auto_rx
+  decoder-performance sample (serial N3920808, Adelaide AU, 2019-02-10),
+  96 kS/s cf32, 120 s. Run through `xng decode --mode sonde` it yields
+  **119/119 frames**, matching what rs1729/RS `rs41mod` decodes on the same
+  capture (oracle-anchored). `bench/run.sh` floor-gates this at
+  `sonde_offair = 110` (see `bench/baselines.json`); the fixture is a release
+  asset (`bench-fixtures-v1`), not vendored. Summarized in
+  [docs/notes/BENCHMARKS.md](BENCHMARKS.md).
 
 ## Known limitations / intentional gaps
 
-- **No GFSK demodulator.** The RS41 air interface is GFSK at 4800 baud, one
-  frame per second. The IQ→bits demod (and bit→byte framing / sync search)
-  is **not** implemented; the crate decodes from a frame buffer. Documented
-  TODO and a deliberate non-goal of the verified decode layer.
-- **No `--mode` wiring / no live integration.** The crate has no
-  `xng_types::Message` mapping, is not a dependency of the CLI / app, and is
-  not in `docs/REFERENCES.md`. It is a standalone decode core only.
 - **Calibrated PTU deferred** — raw 24-bit channels + per-frame calibration
   sub-frame only; physical °C/%RH/hPa needs the 51-sub-frame table assembled
   across frames (see above).
 - **RS41 only.** Other operational sonde types — **RS92, DFM (Graw),
   M10/M20 (Meteomodem), iMet, MRZ, …** — are not implemented. Each has its
   own modulation, framing and FEC; a follow-up.
+- **Standard frame only on the live path.** The framer captures the 320-byte
+  standard frame; the extended (518-byte aux-xdata) frame's trailing bytes
+  are not captured live and not parsed beyond the standard sub-blocks (the
+  byte-level oracle test still decodes the 518-byte sample after RS
+  correction).
 - **GPS2 sub-block (0x7D) not decoded** — CRC-verified in tests, fields not
   yet broken out.
-- **Aux / xdata payload** in extended (518-byte) frames is not parsed beyond
-  the standard sub-blocks.
+- **No carrier/AGC sophistication.** The demod relies on a slow DC tracker
+  for residual carrier offset and a smoothed level estimate; there is no
+  AFC search or per-burst gain control beyond that. Validated at the
+  ~119-frame level on one real capture, not across many SDRs / SNRs.
 
 ## Gotchas
 

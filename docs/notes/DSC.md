@@ -1,7 +1,7 @@
 # Digital Selective Calling (DSC) — implementation notes
 
 Native maritime DSC (ITU-R M.493 / M.541, on the CCIR 493 10-unit
-alphabet) decode core for `xng-mode-dsc`. DSC is the calling and
+alphabet) decode mode for `xng-mode-dsc`. DSC is the calling and
 distress-alerting layer of the GMDSS, carried by FSK on MF/HF (170 Hz
 shift, 100 Bd) and VHF (1300/2100 Hz AFSK, 1200 Bd). Clean-room: protocol
 facts come from ITU-R M.493/M.541; the bit→symbol and symbol→message
@@ -9,30 +9,83 @@ layers are pinned to the published off-air unit-test vectors of the MIT
 `TAOSW.DSC_Decoder` reference decoder — no decoder code was copied (see
 PROVENANCE.md).
 
-**Status: DECODE-CORE.** The symbol layer (10-bit CCIR 493 decode +
-embedded zero-count check + DX/RX time-diversity de-interleave) and the
-message layer (format-driven field parse to a structured `DscMessage`
-→ JSON) are implemented and oracle-validated against real off-air
-sequences. The IQ→bits FSK front end (`demod.rs`) is a documented,
-typed stub — there is **no demod and no `--mode dsc`** dispatch yet, and
-DSC has no entry in `xng_types::Message` or the mode registry. The crate
-is self-contained: `decode_from_bits(&[u8])` is the intended entry point
-once a demod lands. Source: `crates/xng-mode-dsc/src/`.
+**Status: END-TO-END MF/HF, decode oracle-validated, demod synthetic-validated.**
+The symbol layer (10-bit CCIR 493 decode + embedded zero-count check +
+DX/RX time-diversity de-interleave) and the message layer (format-driven
+field parse to a structured `DscMessage` → JSON) are oracle-validated
+against real off-air sequences. The MF/HF FSK front end is now
+implemented: a `DscChannelDecoder` owns an `xng_dsp::Ddc` and a
+frequency-discriminator FSK slicer, hunts the M.493 phasing sequence, and
+feeds aligned bits into the decode core. DSC is wired to the runtime
+`--mode dsc` dispatch, to scan, to `xng_types::Mode::Dsc` /
+`MessageBody::Dsc`, and to console/airframes/HTTP outputs. The demod is
+validated **synthetically only** (modulate→demod loopback) — no recorded
+off-air DSC IQ exists to pin it. Source: `crates/xng-mode-dsc/src/`.
+
+> **No real off-air IQ validation.** Unlike SONDE (119/119 vs rs1729 on a
+> real RS41 capture), NAVTEX (a real USCG message decoded via the DDC), and
+> UAT (a live 50 s off-air capture), DSC has no usable real IQ sample: the
+> available material is SSB-audio only, not complex IQ. The IQ→bits demod
+> therefore stays synthetic-validated; the symbol→message decode core stays
+> anchored to the external off-air oracle vectors.
 
 ## Pipeline
 
-synchronised FSK bit stream → `symbol::decode_bitstream` (slice into
-10-bit CCIR 493 symbols, verify the embedded check, emit value or
-`ERASURE`) → `symbol::deinterleave_dx_rx` (split DX/RX, drop phasing,
-recover erased DX symbols from the time-shifted RX repeat) →
-`message::decode` (format specifier → per-format field parse) →
-`DscMessage` → `DscMessage::to_json`. The convenience wrapper
-`decode_from_bits` runs this whole chain with the standard diversity
-geometry (6 leading DX phasing characters; RX repeat trailing by 2).
+capture IQ → `DscChannelDecoder` (`Ddc` mix-by-`freq_offset_hz` +
+resample to `CHANNEL_RATE` = 8 kHz) → `demod::FskDemod` (frequency
+discriminator → DC tracker → integrate-and-dump with timing recovery →
+hard bits) → `demod::DscBitSync::find_phasing` (lock the 10-bit symbol
+boundary on the M.493 phasing character `125`) → `decode_from_bits`:
+`symbol::decode_bitstream` (slice into 10-bit CCIR 493 symbols, verify the
+embedded check, emit value or `ERASURE`) → `symbol::deinterleave_dx_rx`
+(split DX/RX, drop phasing, recover erased DX symbols from the time-shifted
+RX repeat) → `message::decode` (format specifier → per-format field parse)
+→ `DscMessage` → `DscMessage::to_json` / `to_message` (normalized
+`xng_types::Message`). `decode_from_bits` runs the channel chain with the
+standard diversity geometry (6 leading DX phasing characters; RX repeat
+trailing by 2).
 
-There is **no IQ stage**: `demod::demodulate_iq` always returns `None`
-and carries a placeholder `Complex32` so it compiles without an IQ
-dependency, exactly so the verified decode layers can stand alone.
+## IQ → bits front end (`demod.rs`, `lib.rs`)
+
+- **`demod::FskDemod`** — 100 Bd binary FSK, ±85 Hz shift (170 Hz full
+  shift). Per-sample frequency discriminator (`arg(x · conj(prev))`) → slow
+  discriminator-DC tracker (`FREQ_ALPHA = 0.0005`, absorbs residual carrier
+  offset without chasing the data) → per-bit integrate-and-dump with
+  zero-crossing timing recovery (`TIMING_GAIN = 0.10`) → hard bit decision
+  (positive mean frequency = upper tone = Y = 1; negative = lower tone =
+  B = 0). Straight binary FSK — no differential/NRZI step. This reuses the
+  discriminator + timing-recovery pattern of the ACARS `MskDemod` and AIS
+  `GmskDemod` (no shared FSK primitive in `xng-dsp`); no `xng-dsp` code was
+  modified for the demod itself.
+- **`demod::DscBitSync::find_phasing`** — scans every absolute bit offset
+  for a valid (zero-count-checked) `125` phasing symbol, confirmed by the
+  next DX character (two symbols on) also being a valid symbol; returns the
+  earliest such offset so it locks onto the first on-air phasing character,
+  not a chance `125` in a wrong bit phase.
+- **`DscChannelDecoder`** — owns an optional `xng_dsp::Ddc` (skipped when
+  input is already at `CHANNEL_RATE` with zero offset), accumulates a
+  rolling bit window, and on a confirmed phasing sequence decodes once at
+  least `MIN_FRAME_BITS` (460) have arrived and the frame is complete
+  (`frame_is_complete`: a recognised EOS **and** a present ECC), then
+  advances past the consumed call. Memory is bounded to `MAX_BITS_WINDOW`
+  (4096 bits). Reports `level_dbfs` from the smoothed channel power.
+
+`CHANNEL_RATE` = 8 kHz (80 samples/bit at 100 Bd, an integer multiple so
+the timing loop wraps cleanly); `CHANNEL_PASSBAND_HZ` = 500 Hz (the ±85 Hz
+shift plus the 100 Bd lobe sit well inside).
+
+### DDC narrow-passband fix (cross-cutting, this session)
+
+DSC (and NAVTEX) decoded **0 frames through the built-in DDC** until an
+`xng-dsp` fix: at a narrow `passband/rate` ratio the final decimation
+stage's anti-alias tap count left the cutoff inside the filter's own
+transition roll-off, attenuating the signal. The DDC now sizes the final
+stage so its transition ≤ passband (gated to `out ≥ 12·passband`, which
+touches only these degenerate narrow modes — DSC's ratio is ≈ 16, NAVTEX
+≈ 19), keeping `[0, passband]` flat. Every already-validated mode (HFDL,
+AIS, Aero, …) keeps its exact prior filter. This is what lets DSC decode
+through the runtime DDC at real capture rates (see
+`crates/xng-dsp/src/ddc.rs`).
 
 ## Symbol layer (`symbol.rs`)
 
@@ -134,7 +187,7 @@ at @15.
   so a partly-recovered MMSI reads e.g. `2491____0`.
 - **Position** (`extract_position`, 5 symbols → 10 digits): quadrant
   digit + lat (deg, min) + lon (deg, min). Quadrant 0/1/2/3 →
-  N/E, N/W, S/E, S/W. Rendered `"DD MMx DDD MMx"` (e.g.
+  N/E, N/W, S/E, S/W. Rendered as the string `"DD MMx DDD MMx"` (e.g.
   `45 26N 013 07E`). Any erasure → `--error--`.
 - **Geographic area** (`extract_geographic_area`, 5 symbols): quadrant +
   reference-point lat/lon + rectangle vertical/horizontal extents,
@@ -185,8 +238,25 @@ object: `symbols` (the recovered stream), `format`, `category`, optional
 `to` / `from` / `tc1` / `tc2` / `nature` / `nature_description` /
 `position` / `time` / `frequency`, `eos`, `ecc` (i32), and `status`
 (`"OK"` / `"Error"` / `"Unsupported"`). Enum variants serialize
-`snake_case`. There is **no `xng_types::Message` variant** for DSC yet —
-output is the crate-local JSON only.
+`snake_case`.
+
+`to_message` lifts a `DscMessage` into the normalized
+`xng_types::Message`: `mode = Mode::Dsc`, `body = MessageBody::Dsc { kind,
+details }` where `kind` is the format tag (`distress_alert`,
+`individual_station_call`, …) and `details` is the full `DscMessage` JSON,
+`crc_ok = (status == "OK")`, `rssi_db` from the channel level, and the raw
+symbol stream. The runtime renders DSC to the console (`DSC <KIND>` with
+category/from/to/nature/tc/freq) and reports `"DSC"` to the Airframes
+output.
+
+**Dashboard:** DSC is wired into the HTTP dashboard's **beacons**
+map+table layer alongside radiosonde / ADS-L / SARSAT (positions that
+were previously dropped). Note that the beacons code path reads numeric
+`lat`/`lon` (or `latitude`/`longitude`) from `details`, but `DscMessage`
+emits `position` only as a **formatted string** (`"45 26N 013 07E"`),
+with no numeric lat/lon field — so a DSC call currently appears in the
+beacons path but its position does not actually plot on the map until a
+numeric position is added.
 
 ## Validation / oracles
 
@@ -214,20 +284,31 @@ its published vectors and the M.493 field layout it implements.
   Format / Category / To / From / TC1 / TC2 / Nature / Position / Time /
   Frequency / EOS / ECC / status against the human-verified decode, plus
   a JSON serialize/round-trip check.
+- **Demod level — SYNTHETIC** (`tests/demod_synth.rs`): a self-generated
+  modulate→demod loopback. A KNOWN symbol stream taken from the oracle
+  vectors above is modulated as 100 Bd ±85 Hz FSK IQ by `src/modulate.rs`,
+  pushed through `DscChannelDecoder::process` (directly at `CHANNEL_RATE`
+  and via the DDC with a carrier offset), and the recovered `DscMessage`
+  is asserted equal to the known-good decode. The modulator and
+  demodulator are independent implementations of the same M.493
+  conventions, so a convention error on either side surfaces as a loopback
+  mismatch. This validates ONLY the IQ→bits demod + phasing/symbol sync —
+  there is **no recorded off-air DSC IQ vector**, so the modulate→demod
+  path is self-generated, not pinned to captured RF.
 
-Every decoded fact above is fixed by one of these external vectors; the
-fields marked `--not implemented--` / `Unsupported` are precisely those
-the oracle does not exercise.
+Every decoded fact in the message layer is fixed by one of the external
+vectors; the fields marked `--not implemented--` / `Unsupported` are
+precisely those the oracle does not exercise.
 
 ## Known limitations / intentional gaps
 
-- **No IQ demod, no `--mode dsc`.** `demod.rs` is a typed stub returning
-  `None`; the FSK front end (MF/HF 100 Bd ±85 Hz; VHF 1200 Bd
-  1300/2100 Hz; tone detection, bit-timing recovery, dot/phasing
-  acquisition to align 10-bit symbol boundaries) is unwritten. Verifying
-  a demod needs recorded IQ with an independently known decode; per the
-  project's "never commit unverified code" rule, none is committed. The
-  crate is not registered in the mode dispatch or `xng_types::Message`.
+- **Demod is synthetic-validated only.** No usable real off-air DSC IQ
+  exists (the available material is SSB-audio, not complex IQ), so the
+  MF/HF FSK front end is pinned only by the modulate→demod loopback. The
+  decode core stays anchored to the real off-air oracle vectors.
+- **VHF FFSK variant** (1200 Bd, 1300/2100 Hz over FM) is unimplemented;
+  only the MF/HF 100 Bd binary-FSK path exists. The decode core handles
+  VHF channel-pair frequency fields, but there is no VHF demod.
 - **Frequency sub-fields 3 / 4 / 8** (MF/HF working channel, 10 Hz
   multiples, VHF automated) are M.493-defined but return
   `--not implemented--` rather than a guessed value — no external vector
@@ -236,6 +317,9 @@ the oracle does not exercise.
   not decoded (the reference decoder does not decode them either); the
   format and any recoverable self-id MMSI are surfaced and the message is
   marked `Unsupported`.
+- **Position does not plot.** DSC positions are a formatted string, not
+  numeric lat/lon, so they do not yet appear on the dashboard beacons map
+  (see Output above).
 - **Per-symbol detect only.** The CCIR 493 check and ECC parity are
   detection codes; bad characters become erasures recovered (if at all)
   by DX/RX diversity — there is no symbol-level error correction beyond
@@ -255,6 +339,12 @@ the oracle does not exercise.
    `"Error"`, never `"OK"`.
 6. The 126/126/126 second-frequency marker means "absent", rendered as a
    single frequency.
+7. The DDC's narrow-passband final-stage tap fix is load-bearing for DSC:
+   without it the built-in DDC delivers an attenuated channel and decodes
+   0 frames at real capture rates.
+8. Frame completeness while streaming is gated on EOS **and** ECC both
+   present (`frame_is_complete`), to avoid reporting a call whose tail has
+   not yet been demodulated.
 
 ## Key references
 
@@ -270,4 +360,4 @@ the oracle does not exercise.
   `src/symbol.rs` and `tests/oracle_vectors.rs` (facts/vectors only, no
   code).
 - `crates/xng-mode-dsc/PROVENANCE.md` — sourcing policy and per-layer
-  oracle notes.
+  oracle notes (including the synthetic demod validation).

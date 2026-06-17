@@ -92,27 +92,47 @@ zero offset).
 
 ### Packet types decoded (descriptor → name + fields)
 
+The C-channel descriptor field depth is typed verbatim from inmarsatc's
+`decode_*` functions (facts only; re-derived — see PROVENANCE "STDC-2").
+Each descriptor surfaces only the fields actually present in the packet
+(short forms fall back to the bare name).
+
 - **0x7D bulletin-board**: network version, frame number (BE [2..3]),
-  **UTC-of-day** (frame × 8.64 s), channel-type nibble.
+  **UTC-of-day** (frame × 8.64 s), `signalling_channel`, `count`,
+  `channel_type` + `channel_type_name` (1 NCS / 2 LES TDM / 3 joint /
+  4 ST-BY NCS), `local`, NCS `sat_les`, decoded `status` flags
+  (bauds_600 / operational / in_service / clear / links_open) and the
+  16-bit `services` list.
 - **0x27 logical-channel-clear**: MES id (24-bit), sat/LES, LCN —
   terminates the LCN and flushes its assembled message.
 - **0x81 announcement**: MES id, sat/LES, LCN.
-- **0x83 logical-channel-assignment**: MES id, LCN.
+- **0x83 logical-channel-assignment**: MES id, sat/LES, status_bits,
+  LCN, frame_length, duration, downlink/uplink **MHz**, frame_offset,
+  packet_descriptor1 — enough to actually tune the message channel.
 - **0xAA message-data**: sat/LES, LCN, packet sequence — payload bytes
   buffered per logical channel for reassembly.
 - **0xB0 / 0xB1 / 0xB2 EGC** single / double-header parts (see below);
   surface only as the assembled `egc-message`.
 - **0xBD / 0xBE multiframe** start / continue — reassembled into a byte
   stream and **re-parsed recursively** through the packet walker.
-- **0x6C signalling-channel**: uplink channel-number word →
-  **uplink MHz** = (word − 6000)·0.0025 + 1626.5 (downlink helper:
-  (word − 8000)·0.0025 + 1530.5).
-- **0xA3 individual-poll**: MES id, sat/LES.
-- Flagged-only (name, no extra fields): 0x92 login-ack, 0xA8
-  confirmation, 0xAB les-list, 0x08 ack-request, 0x2A
-  inbound-message-ack, 0x91 distress-alert-ack, 0x9A
-  enhanced-data-report-ack, 0xA0 distress-test-request, 0xAC
-  request-status, 0xAD test-result. Anything else → `unknown` (hex).
+- **0x6C signalling-channel**: 8-bit `services` byte, uplink
+  channel-number word → **uplink MHz** = (word − 6000)·0.0025 + 1626.5
+  (downlink helper: (word − 8000)·0.0025 + 1530.5), and the 28-entry
+  `tdm_slots` array (4 two-bit codes per byte).
+- **0x92 login-ack**: login-ack length, LES id, downlink MHz, station
+  start, and (when the list is present) station count + a `stations`
+  directory (6-byte records: sat/LES, services, downlink MHz).
+- **0xA8 confirmation**: MES id, sat/LES, short-message length, and the
+  short IA5 message text when present.
+- **0xAB les-list**: list length, station start/count, full `stations`
+  directory (same 6-byte record layout as login-ack).
+- **0x08 ack-request**: sat/LES, LCN, uplink MHz (ship's return channel).
+- **0xA3 individual-poll**: MES id, sat/LES, and the short IA5 message
+  text when the packet is long enough (inmarsatc: packetLength ≥ 38).
+- Flagged-only (name, no extra fields): 0x2A inbound-message-ack, 0x91
+  distress-alert-ack, 0x9A enhanced-data-report-ack, 0xA0
+  distress-test-request, 0xAC request-status, 0xAD test-result.
+  Anything else → `unknown` (hex).
 
 ### EGC header (0xB0/B1/B2, common layout)
 
@@ -206,6 +226,21 @@ emitted as a `message` event. Stale channels age out after 8 frames.
   short/long names; **LES/NCS operator name** keyed on the full
   region×100+id display code (the same id maps to different operators by
   region) — both verbatim from inmarsatc `getSatName` / `getLesName`.
+- **C-channel descriptor field maps (STDC-2)**: per-descriptor byte
+  layouts typed verbatim from inmarsatc `decode_6C` / `decode_7D` /
+  `decode_83` / `decode_92` / `decode_AB` / `decode_A3` / `decode_A8` /
+  `decode_08` / `getStations`; **services bit→name** tables
+  (`services_short` 8-bit, `services_full` 16-bit) from inmarsatc
+  `getServices_short` / `getServices`; **channel-type name** and the
+  **0x7D status-byte flag names** from `decode_7D`. Two transcription
+  bugs in the inmarsatc C++ are fixed here: `getStations` reads the
+  downlink byte twice (the field is a two-byte word), and `decode_7D`'s
+  channelType `switch` omits the `break`s (so its name always falls
+  through to "Reserved"); the intended per-value names are used. Channel
+  frequencies reuse the off-air-validated uplink/downlink formulas. The
+  descriptor maps without a public real-byte sample are pinned by
+  spec-derived packets built to the exact inmarsatc byte layout (not
+  encode→decode loopbacks).
 - **EGC service long names** — verbatim from inmarsatc
   `getServiceCodeAndAddressName`.
 - **EGC C3 geometry binary packing** (STDC-1.1/1.2): oracle is
@@ -232,10 +267,14 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
 - **Off-air** (`tests/offair.rs`): the sigidwiki Inmarsat-C TDM/EGC IQ
   recording (CC BY-SA, AOR-E, TDM carrier +216 Hz). The full native
   chain decodes the real frame — UW scored 128/128 on the first frame;
-  bulletin board frame 5987 → 14:22:07, announcement LES 104 →
-  "Vizada-Telenor, Norway" (AOR-E), 0x6C → 1636.64 MHz uplink. A 14 s
-  slice is vendored as a CI fixture (`tests/data/stdc_egc_14s.i16`,
-  24 kHz I/Q, attributed).
+  bulletin board frame 5987 → 14:22:07, announcement LES → "Vizada-
+  Telenor, Norway" (AOR-E, region_long "Atlantic Ocean Region East"),
+  0x6C → 1636.64 MHz uplink. The deepened descriptors decode self-
+  consistently on the real bytes: 0x7D channel_type 1 = NCS, sat/LES =
+  AOR-E NCS station (les 144), status operational + in-service, services
+  including SafetyNet/InmarsatC; the same 0x6C carries services byte 0xB4
+  and a 28-entry TDM-slot array. A 14 s slice is vendored as a CI fixture
+  (`tests/data/stdc_egc_14s.i16`, 24 kHz I/Q, attributed).
 - **RF loopback** (`tests/end_to_end.rs`): packets → `encode_frame` →
   BPSK `modulate` → DDC → coherent decoder, with CFO and noise, both at
   48 kS/s and 2.4 MS/s wideband; asserts EGC text, priority, service and
@@ -245,13 +284,19 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
   LCN assembly, EGC single/multi-part assembly, ITA2 alphabet, area-shape
   classification, the rectangular/circular/NAVAREA/coastal C3 geometry
   decode against the manual worked examples (incl. a southern/eastern
-  hemisphere case) and end-to-end through the EGC assembly path, and every
-  field-decode table against its oracle value.
-- Oracles cross-referenced: inmarsatc (field tables + formulas), SatDump
-  (`.frm` stage goldens on the sigidwiki capture), Scytale-C (C3 geometry
-  binary packing + NAVAREA coordinator table), IMO International SafetyNET
-  Manual (2019) (EGC area addressing + worked examples), ITU-T ITA2
-  (Baudot alphabet). STD-C is oracle-validated field-exact — see
+  hemisphere case) and end-to-end through the EGC assembly path, the
+  STDC-2 helper tables against their inmarsatc oracle values
+  (`channel_type_name`, `bulletin_status`, `services_short` /
+  `services_full`, `tdm_slots` two-bit unpacking, `parse_stations` record
+  layout, `sat_les` region+operator), `frame_to_utc_hms` against the
+  off-air oracle, and every other field-decode table against its oracle.
+- Oracles cross-referenced: inmarsatc (field tables, descriptor field
+  maps, services/status/channel-type tables + formulas), SatDump (`.frm`
+  stage goldens on the sigidwiki capture), Scytale-C (C3 geometry binary
+  packing + NAVAREA coordinator table), inmarsat-sniffer (C2 service-name
+  classification cross-check), IMO International SafetyNET Manual (2019)
+  (EGC area addressing + worked examples), ITU-T ITA2 (Baudot alphabet).
+  STD-C is oracle-validated field-exact — see
   [BENCHMARKS.md](BENCHMARKS.md) (no count-style head-to-head yet).
 
 ## Known limitations / intentional gaps
@@ -265,10 +310,13 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
   area packet appears in the vendored off-air fixture, so the geometry
   path is verified against the manual's worked-example byte layouts (round-
   trip + Scytale-C) rather than against a real area-addressed capture.
-- Many control descriptors (login-ack, confirmation, les-list, the
-  ack/request/test family) are recognized and named but their inner
-  fields are not yet broken out.
-- Per-slot assignment detail beyond LCN/MES/LES routing is not parsed.
+- The remaining control descriptors (0x2A inbound-message-ack, 0x91
+  distress-alert-ack, 0x9A enhanced-data-report-ack, 0xA0
+  distress-test-request, 0xAC request-status, 0xAD test-result) are
+  recognized and named but their inner fields are not broken out — most
+  have no public real-byte sample to verify a field map against.
+- The 28-entry 0x6C `tdm_slots` array is surfaced as raw two-bit codes;
+  the per-slot allocation semantics are not interpreted further.
 - Demod cold-start timing acquisition is weak without receive-path
   filtering (see PHY).
 
@@ -295,6 +343,8 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
   `ReturnRectangularArea` / `ReturnCircularArea` / `ReturnNavArea`) +
   NAVAREA/METAREA coordinator table (`ReturnNavMetAreaCoordinator`)
   (facts only).
+- inmarsat-sniffer — C2 service-name classification cross-check (facts
+  only).
 - IMO International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3 /
   part B §3.3 — EGC geographic area addressing + worked examples
   (`60N010W30025`, `56N034W035`, `14N 66W 300`).
