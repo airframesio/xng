@@ -10,8 +10,16 @@ fn fcs_ok(span: &[u8], trailer: &[u8]) -> bool {
     trailer.len() >= 2 && HDLC_FCS.checksum(span) == u16::from_le_bytes([trailer[0], trailer[1]])
 }
 
-/// ARINC HFDL ground-station names (public station list, as used by
-/// the HFDL community and the over-the-air system table assignments).
+/// Built-in HFDL ground-station name table (HFDL-2.2), keyed by the
+/// 7-bit GS id carried in SPDUs / 0xD0 system-table records (valid range
+/// 0..=127). The roster is the published HFDL/ARINC ground-station list,
+/// verified id-for-id against dumphfdl's distributed `etc/systable.conf`
+/// (szpajder/dumphfdl, GPL — facts only): it assigns exactly ids 1..=11
+/// and 13..=17. id 12 is the only hole inside that span and every id in
+/// 18..=127 is currently unassigned in the public roster, so they return
+/// `None` rather than a fabricated name (verification mandate: skip, don't
+/// fake, anything not grounded in the roster). When the official roster
+/// adds stations, add the id→name pairs here.
 pub fn gs_name(id: u8) -> Option<&'static str> {
     Some(match id {
         1 => "San Francisco, USA",
@@ -25,11 +33,13 @@ pub fn gs_name(id: u8) -> Option<&'static str> {
         9 => "Barrow, Alaska",
         10 => "Muan, South Korea",
         11 => "Albrook, Panama",
+        // id 12: unassigned in the public roster / dumphfdl systable.conf.
         13 => "Santa Cruz, Bolivia",
         14 => "Krasnoyarsk, Russia",
         15 => "Al Muharraq, Bahrain",
         16 => "Agana, Guam",
         17 => "Canarias, Spain",
+        // ids 18..=127: unassigned in the current public roster.
         _ => return None,
     })
 }
@@ -660,6 +670,49 @@ mod tests {
         assert_eq!(ev[0].details["gs_id"], 7);
         assert_eq!(ev[0].details["frame_index"], 1234);
         assert_eq!(ev[0].details["systable_version"], 52);
+    }
+
+    // ── HFDL-2.2: built-in GS-name roster, pinned to the published list ──
+    //
+    // Oracle: dumphfdl's distributed etc/systable.conf
+    // (github.com/szpajder/dumphfdl, GPL — facts only). It assigns
+    // exactly ids 1..=11 and 13..=17 with these names; id 12 and ids
+    // 18..=127 are unassigned. The table below is transcribed from that
+    // roster and the mapping is asserted id-for-id across the full
+    // 0..=127 GS-id space.
+    #[test]
+    fn gs_name_roster_matches_published_list() {
+        const ROSTER: &[(u8, &str)] = &[
+            (1, "San Francisco, USA"),
+            (2, "Molokai, Hawaii"),
+            (3, "Reykjavik, Iceland"),
+            (4, "Riverhead, New York"),
+            (5, "Auckland, New Zealand"),
+            (6, "Hat Yai, Thailand"),
+            (7, "Shannon, Ireland"),
+            (8, "Johannesburg, South Africa"),
+            (9, "Barrow, Alaska"),
+            (10, "Muan, South Korea"),
+            (11, "Albrook, Panama"),
+            (13, "Santa Cruz, Bolivia"),
+            (14, "Krasnoyarsk, Russia"),
+            (15, "Al Muharraq, Bahrain"),
+            (16, "Agana, Guam"),
+            (17, "Canarias, Spain"),
+        ];
+        // Every assigned id resolves to its roster name.
+        for &(id, name) in ROSTER {
+            assert_eq!(gs_name(id), Some(name), "id {id}");
+        }
+        // Coverage over the full 7-bit GS-id space (0..=127): an id has a
+        // name iff it is in the published roster — no fabricated entries,
+        // no holes silently filled.
+        for id in 0u8..=127 {
+            let want = ROSTER.iter().find(|(rid, _)| *rid == id).map(|(_, n)| *n);
+            assert_eq!(gs_name(id), want, "gs id {id} must match the roster exactly");
+        }
+        // id 12 is the only hole inside the assigned 1..=17 span.
+        assert_eq!(gs_name(12), None);
     }
 
     // ── HFDL-6 (crate-local): SPDU first-octet flags + assignment region ──
