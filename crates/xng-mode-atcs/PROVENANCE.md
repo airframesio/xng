@@ -87,10 +87,11 @@ Number=2.3.2 CODELINE_INDICATION_MSG
 ```
 
 This is used as the spec-derived oracle for the address-type decode: the
-source `5125013826` has leading digit `5` (Wayside RF / field MCP) and
-railroad `512`; the destination `2125385538` has leading digit `2` (Host /
-dispatch office) and railroad `212`. These mappings are asserted in the
-address tests.
+source `5125013826` has leading digit `5` (Wayside RF / field MCP) and the
+destination `2125385538` has leading digit `2` (Host / dispatch office).
+The three digits after the type digit are the AAR railroad number, so both
+peers carry railroad `125` (they are communicating across the same
+territory). These mappings are asserted in the address tests.
 
 ## Spec-derived test vectors
 

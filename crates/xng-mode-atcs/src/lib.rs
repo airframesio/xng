@@ -12,6 +12,8 @@
 //!
 //! * [`frame`] — HDLC/LAPB deframing: flag hunt, bit destuffing, FCS
 //!   (CRC-16/X-25) check → raw frame bytes.
+//! * [`address`] — ATCS address decode: direction/type digit, AAR railroad
+//!   number, line/territory and node, from the BCD digit string.
 //!
 //! The full payload-protocol decode (the vendor codeline protocols carried
 //! inside the user data, e.g. Genisys / ARES) is intentionally **out of
@@ -31,6 +33,8 @@
 //!
 //! See PROVENANCE.md for the clean-room sourcing of every protocol fact.
 
+pub mod address;
 pub mod frame;
 
+pub use address::{AddressType, AtcsAddress};
 pub use frame::{AtcsFrame, HdlcDeframer};
