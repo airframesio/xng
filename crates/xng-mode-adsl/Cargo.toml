@@ -1,0 +1,12 @@
+[package]
+name = "xng-mode-adsl"
+description = "Native ADS-L (EASA SRD860 i-Conspicuity, 868 MHz direct-broadcast) message decoder for xng: frame deframing, XXTEA descramble, iConspicuity field decode to structured JSON"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
