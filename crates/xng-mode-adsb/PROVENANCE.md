@@ -29,6 +29,98 @@ within 10 s, local decode against a fix fresher than 180 s) mirrors the
 standard surveillance practice; SBS-1 output line format follows the de
 facto BaseStation convention as served by dump1090-family tools.
 
+## Comm-B BDS 1,0 / 1,7 — capability registers (2026-06)
+
+BDS 1,0 (Data Link Capability Report, ICAO Doc 9871 Table A-2-16 / Annex
+10 Vol IV §3.1.2.6.10.2: config flag, overlay-command, ACAS-operational,
+Mode-S subnetwork version, transponder level 5, Mode-S specific services,
+uplink/downlink ELM throughput, aircraft-ident / squitter / SIC / GICB
+capability, ACAS hybrid / RA / RTCA version, DTE status) and BDS 1,7
+(Common Usage GICB Capability Report: a 24-bit map, Table A-2-25, of the
+registers the transponder will report) MB-field layouts, validity gates
+(BDS id 0x10 + reserved-bits + OVC/subnet heuristic for 1,0; BDS-2,0-bit
+mandatory + 32 trailing-zero bits for 1,7), and the capability-map ordering
+were cross-checked against the pyModeS `bds10` / `bds17` decoders and their
+`test_bds_commb` golden frames (`A800178D10010080F50000D5893C` full field
+dict; `A0000638FA81C10000000081A92F` → [0,5 0,6 0,7 0,8 0,9 2,0 4,0 5,0 5,1
+5,2 6,0]) — facts/positions only, no code ported; those real vectors are
+vendored as `decode.rs` unit tests. `bds_infer` was restructured to the
+phased precedence of pyModeS `_infer.py`: a format-ID fast path (BDS 1,0 /
+1,7 / 2,0 / 3,0, mutually exclusive, first-match-wins) ahead of the EHS
+exactly-one heuristic set (4,0 / 5,0 / 6,0), ahead of the meteo fallback —
+which resolves the real BDS 1,7 vs 4,0 collision the old flat
+exactly-one rule could not.
+
+## Comm-B BDS 3,0 — ACAS active RA (2026-06)
+
+BDS 3,0 (ACAS active Resolution Advisory) MB-field layout is ICAO Annex 10
+Vol IV §4.3.8.4.2.4: BDS id (MB 1–8 = 0x30), ARA bits (9–15: issued /
+corrective / downward-sense / increased-rate / sense-reversal / altitude-
+crossing / positive), ARA-reserved-for-ACAS-III (16–22), RAC bits (23–26:
+no-below / -above / -left / -right), RA-terminated (27), multiple-threat
+(28), threat-type indicator (29–30) and threat-identity data (31–56:
+TTI 1 = 24-bit ICAO; TTI 2 = AC13 altitude + 7-bit range ((n−1)/10 NM) +
+6-bit bearing (6(n−1)+3°)). Validity gates (BDS id == 0x30, ARA-reserved
+< 48, TTI ≠ reserved 0b11) and field formulas were cross-checked against
+the pyModeS `bds30` decoder and its `test_bds_commb` TestBds30* synthetic
+payloads — facts/positions only, no code ported. Those bit-exact pyModeS
+payloads (every ARA/RAC/TTI shift constant) are vendored as the `decode.rs`
+unit tests; AC13 altitude reuses the existing `altitude13` decoder (proven
+identical to pyModeS `altcode_to_altitude`). Added to the `bds_infer`
+exactly-one-validates candidate set and emitted under `comm_b`.
+
+## Comm-B BDS 4,4 / 4,5 — meteorological registers (2026-06)
+
+BDS 4,4 (Meteorological Routine Air Report, ICAO Doc 9871 Table A-2-33:
+FOM, wind speed/direction, static air temperature, pressure, turbulence,
+humidity) and BDS 4,5 (Meteorological Hazard Report, Table A-2-32:
+turbulence / wind-shear / microburst / icing / wake-vortex levels +
+temperature / pressure / radio height) MB-field layouts, the sign-magnitude
+temperature convention, the status/value-consistency gates, and the BDS 1,7
+disambiguation for 4,5 were cross-checked against the pyModeS `bds44` /
+`bds45` decoders and their `test_bds_commb` TestBds44*/TestBds45* vectors
+(golden frames `A0001692185BD5CF400000DFC696` → wind 22 kt / 344.5° /
+−48.75 °C and `A00004190001FB80000000000000` → −4.5 °C, plus the multi-
+field / multi-hazard synthetic payloads) — facts/positions only, no code
+ported; those real vectors are vendored as `decode.rs` unit tests. Both are
+heuristic registers that collide with the EHS layouts, so — mirroring
+pyModeS's `include_meteo` separation — they are NOT in the strict
+exactly-one-validates set: `bds_infer` tries them only as a fallback when
+the ELS/EHS set is unambiguously empty, leaving existing decoding
+unperturbed. Emitted under `comm_b`.
+
+## Mode A/C reply decode (2026-06)
+
+The Mode A/C information-word decode (`mode_ac.rs`) — the 16-bit Mode A
+pulse word → 4-digit octal squawk (`word & 0x7777`) + SPI/Ident pulse
+(`0x0080`), and the Mode A→Mode C Gillham altitude ladder — uses the
+documented dump1090 / readsb pulse layout and `internalModeAToModeC`
+algorithm (protocol facts only). For verification the upstream dump1090 C
+function was compiled verbatim and run as an independent external oracle to
+emit (mode_a → altitude) reference pairs (e.g. 0x0020 → −1000 ft, 0x0320 →
+1000 ft, 0x4220 → 5000 ft, 0x5124 → 35000 ft, 0x5424 → 38000 ft, 0x6520 →
+10000 ft; 0x1000 / 0x0050 invalid) and squawk/SPI pairs from
+`decodeModeAMessage`; those values are vendored as the `mode_ac.rs` unit
+tests — a separate authoritative decoder, not an encode→decode loopback.
+Only the deterministic decode kernel is implemented; the RF framing-pulse
+demodulation (a distinct magnitude-domain signal path) is deferred, so this
+module is the decode side a future Mode A/C demod would feed.
+
+## DF18 CF-field source classification (2026-06)
+
+The DF18 Control Field (frame bits 5–7) classification — CF=0 ADS-B
+non-transponder, CF=1 ADS-B anonymous/non-ICAO, CF=2 fine TIS-B, CF=3
+coarse TIS-B, CF=5 fine TIS-B non-ICAO, CF=6 ADS-R rebroadcast, CF=4/7
+unknown format — follows DO-260B §2.2.3.2.1.2 as implemented identically
+by the de-facto reference decoders readsb (`wiedehopf/readsb` mode_s.c)
+and dump1090-fa (`flightaware/dump1090` mode_s.c): the source/addrtype
+mapping in their DF18 CF switch was used as the external reference (facts
+only, no code ported). The mapping is pinned by a `decode.rs` unit test
+asserting each CF's source/addr-type against that reference. Surfaced by
+folding `cf` / `source` / `source_addr_type` / `source_detail` into the
+frame's `adsb_status` (merged with any TC28/29/31 status already present),
+which the crate serializes to JSON/asf-2.0.
+
 ## Operational status / aircraft status (2026-06)
 
 TC 31 (Aircraft Operational Status — BDS 6,5) and TC 28 (Aircraft Status)
@@ -40,3 +132,20 @@ fields: TC31 subtype (ME 5–7), ADS-B version (40–42), NIC-supplement-A
 decoder and its `test_bds65` synthetic vector (facts/positions only — no
 code ported); the synthetic-vector construction is reproduced in
 `decode.rs` unit tests. Emitted under `adsb_status` on the Mode S message.
+
+## Target state and status (2026-06)
+
+TC 29 (Target State and Status — BDS 6,2) ME-field bit layout is the
+published DO-260B §2.2.3.2.7.1 single-format Target State and Status
+message: subtype (ME 5–6), selected-altitude source (8), selected
+altitude (9–19, (raw−1)·32 ft), barometric pressure setting (20–28,
+800+(raw−1)·0.8 mbar), heading status (29), selected heading (30–38,
+raw·360/512°), NACp (39–42), NICbaro (43), SIL (44–45), mode status (46)
+gating autopilot (47) / VNAV (48) / altitude-hold (49) / approach (51) /
+LNAV (53), and TCAS-operational (52). Bit positions and the field
+formulas were cross-checked against the pyModeS `bds62` decoder and its
+`test_bds62` golden vector (`8DA05629EA21485CBF3F8CADAEEB` → selected
+altitude 16992 ft MCP/FCU, QNH 1012.8 mbar, heading 66.8°, AP/VNAV/LNAV
+engaged) — facts/positions only, no code ported; that real vector and its
+expected values are vendored as the `decode.rs` unit test. Emitted under
+`adsb_status` with `subtype: "target_state"`.
