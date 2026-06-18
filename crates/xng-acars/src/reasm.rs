@@ -162,6 +162,7 @@ mod tests {
             text: text.into(),
             more_to_come: more,
             reassembled: false,
+            assstat: None,
             app: None,
         }
     }

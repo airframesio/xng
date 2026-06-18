@@ -71,6 +71,11 @@ pub struct AcarsCore {
     /// True when `text` was reassembled from multiple blocks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reassembled: bool,
+    /// Reassembly status as named by acarsdec/libacars (`complete`,
+    /// `in progress`, `skipped`, `duplicate`, `out of sequence`); `None`
+    /// when the message never passed through the reassembler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assstat: Option<String>,
     /// Decoded application layer (ADS-C, CPDLC envelope, media advisory,
     /// ...), as produced by xng-acars.
     #[serde(skip_serializing_if = "Option::is_none")]

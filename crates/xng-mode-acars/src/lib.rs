@@ -167,6 +167,7 @@ pub fn to_message(
                 text: f.text.clone(),
                 more_to_come: f.more_to_come,
                 reassembled: false,
+                assstat: None,
                 app,
             })
         },

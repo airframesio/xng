@@ -62,6 +62,11 @@ pub fn format_acarsdec_with_station(
     if !a.more_to_come {
         obj.insert("end".into(), true.into());
     }
+    // Reassembly status, as acarsdec emits it (omitted when the message never
+    // passed the reassembler).
+    if let Some(s) = &a.assstat {
+        obj.insert("assstat".into(), s.clone().into());
+    }
     Some(v)
 }
 
@@ -134,5 +139,35 @@ mod tests {
         assert_eq!(v["text"], "HELLO");
         assert_eq!(v["end"], true);
         assert_eq!(v["level"], -18.4);
+        // No reassembler verdict on this fixture → field omitted.
+        assert!(v.get("assstat").is_none(), "{v}");
+    }
+
+    #[test]
+    fn emits_assstat_when_present() {
+        let msg = Message {
+            mode: Mode::AcarsPoa,
+            timestamp: chrono::Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
+            frequency_hz: 131_550_000,
+            signal: SignalQuality::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
+            body: MessageBody::Acars(AcarsCore {
+                mode: '2',
+                label: "H1".into(),
+                text: "HELLO WORLD".into(),
+                reassembled: true,
+                assstat: Some("complete".into()),
+                ..Default::default()
+            }),
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("XX-TEST-ACARS"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        };
+        let v = format_acarsdec(&msg).unwrap();
+        assert_eq!(v["assstat"], "complete");
     }
 }

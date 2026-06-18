@@ -1193,7 +1193,11 @@ fn apply_reassembly(
             }
         }
     }
-    if let Reasm::Complete(full) = r.push(core, now) {
+    let status = r.push(core, now);
+    // Record the reassembler's verdict (libacars `assstat`) on every message
+    // that passed through it, not just completed ones (ACARS-5.1).
+    core.assstat = Some(status.assstat().to_string());
+    if let Reasm::Complete(full) = status {
         let downlink = core.block_id.is_some_and(|b| b.is_ascii_digit());
         let dec = xng_acars::decode(&core.label, &full, downlink);
         core.text = full;
@@ -1275,5 +1279,26 @@ mod tests {
         // exclude wins over include
         let both = LabelFilter { include: vec!["Q0".into()], exclude: vec!["Q0".into()] };
         assert!(!both.allows(&acars_msg("Q0")));
+    }
+
+    #[test]
+    fn reassembly_stamps_assstat() {
+        let mut r = xng_acars::reasm::Reassembler::new(660.0);
+        let mut files = xng_acars::miam::FileReassembler::new();
+
+        // A plain single block (no block_id) is "skipped" by the reassembler,
+        // but the verdict is still stamped on the message (ACARS-5.1).
+        let mut msg = acars_msg("H1");
+        msg.decode.crc_ok = true;
+        apply_reassembly(&mut msg, &mut r, &mut files);
+        let MessageBody::Acars(c) = &msg.body else { unreachable!() };
+        assert_eq!(c.assstat.as_deref(), Some("skipped"));
+
+        // A bad-CRC frame never reaches the reassembler → no verdict.
+        let mut bad = acars_msg("H1");
+        bad.decode.crc_ok = false;
+        apply_reassembly(&mut bad, &mut r, &mut files);
+        let MessageBody::Acars(c) = &bad.body else { unreachable!() };
+        assert_eq!(c.assstat, None);
     }
 }

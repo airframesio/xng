@@ -108,6 +108,7 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
             text,
             more_to_come: ch[suffix_idx] == ETB,
             reassembled: false,
+            assstat: None,
             app: appdec
                 .app
                 .map(|a| serde_json::to_value(&a).unwrap_or_default()),
