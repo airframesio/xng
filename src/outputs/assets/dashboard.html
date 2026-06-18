@@ -1174,7 +1174,10 @@ function render() {
           `<td class="msgcaret">↳</td>` + mid +
           `<td class="age">${fmtAge(s.now - (h.seen || 0))}</td></tr>`);
       }
-    } else if (open && isAll && e.srcs.length) {
+    } else if (open && e.srcs.length) {
+      // Per-source breakdown. srcs only exist on aircraft, which appear only in
+      // the All and Aircraft tabs — both share this 9-cell layout — so the rows
+      // line up in either (previously gated to All, leaving Aircraft carets dead).
       for (const sr of [...e.srcs].sort((p, q) => (p.source || '').localeCompare(q.source || ''))) {
         rows.push(`<tr class="row srcrow">` +
           `<td style="padding-left:20px;color:#7aa2f7">↳ ${escapeHtml(sr.source || '')}</td>` +
