@@ -18,6 +18,12 @@ pub struct SignalQuality {
     /// Carrier frequency offset from channel center, Hz.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freq_skew_hz: Option<f32>,
+    /// Receive time as a monotonic 12 MHz sample-clock tick (the dump1090 /
+    /// Beast MLAT counter convention), derived from the frame's absolute
+    /// sample offset rather than the wall clock — so the Beast feed is
+    /// monotonic and consistent-rate (MLAT-client-acceptable). Mode S only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_ticks_12mhz: Option<u64>,
 }
 
 /// Decode/FEC quality for a frame.

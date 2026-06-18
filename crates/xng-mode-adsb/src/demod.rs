@@ -50,6 +50,12 @@ pub struct PpmDemod {
     power_frac: Vec<Vec<f32>>,
     validator: FrameValidator,
     noise: f32,
+    /// Input sample rate (for the 12 MHz MLAT tick conversion).
+    input_rate: f64,
+    /// Absolute count of samples already drained from `power` — the stream
+    /// index of `power[0]`. A frame at buffer position `pos` is at absolute
+    /// sample `base_samples + pos`, giving a monotonic per-frame receive time.
+    base_samples: u64,
 }
 
 impl PpmDemod {
@@ -83,6 +89,8 @@ impl PpmDemod {
             power_frac: fracs.iter().map(|_| Vec::new()).collect(),
             validator: FrameValidator::new(),
             noise: 1e-6,
+            input_rate,
+            base_samples: 0,
         })
     }
 
@@ -265,6 +273,12 @@ impl PpmDemod {
         out
     }
 
+    /// Monotonic 12 MHz sample-clock tick for a frame at buffer position `pos`
+    /// (absolute sample `base_samples + pos`). Beast MLAT counter convention.
+    fn tick(&self, pos: usize) -> u64 {
+        (((self.base_samples + pos as u64) as f64 / self.input_rate) * 12_000_000.0) as u64
+    }
+
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<AdsbFrame> {
         self.power.extend(input.iter().map(|x| x.norm_sqr()));
         if self.two_phase {
@@ -337,8 +351,12 @@ impl PpmDemod {
                 }
             }
             found.sort_by_key(|(p, _)| *p);
-            out.extend(found.into_iter().map(|(_, f)| f));
+            out.extend(found.into_iter().map(|(p, mut f)| {
+                f.rx_ticks_12mhz = self.tick(p);
+                f
+            }));
             self.power.drain(..end.min(self.power.len()));
+            self.base_samples += end as u64;
             return out;
         }
 
@@ -385,7 +403,10 @@ impl PpmDemod {
             }
         }
         found.sort_by_key(|(p, _)| *p);
-        out.extend(found.into_iter().map(|(_, f)| f));
+        out.extend(found.into_iter().map(|(p, mut f)| {
+            f.rx_ticks_12mhz = self.tick(p);
+            f
+        }));
 
         // Keep the unscanned tail for the next call.
         self.power.drain(..end.min(self.power.len()));
@@ -395,6 +416,7 @@ impl PpmDemod {
                 v.drain(..n);
             }
         }
+        self.base_samples += end as u64;
         out
     }
 

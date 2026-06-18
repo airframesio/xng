@@ -273,7 +273,11 @@ pub fn to_message(
         mode: Mode::Adsb,
         timestamp: Utc::now(),
         frequency_hz,
-        signal: SignalQuality { rssi_db: Some(f.level_dbfs), ..Default::default() },
+        signal: SignalQuality {
+            rssi_db: Some(f.level_dbfs),
+            rx_ticks_12mhz: Some(f.rx_ticks_12mhz),
+            ..Default::default()
+        },
         decode: DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
         body: MessageBody::ModeS {
             df: f.df,
@@ -434,6 +438,7 @@ mod tests {
             comm_b: None,
             adsb_status: Some(serde_json::json!({ "nuc_p": 7 })),
             level_dbfs: -20.0,
+            rx_ticks_12mhz: 0,
         };
         let source = Provenance {
             station: xng_types::StationIdentity::new("XX-TEST-ADSB"),

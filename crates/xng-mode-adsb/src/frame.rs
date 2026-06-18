@@ -79,6 +79,10 @@ pub struct AdsbFrame {
     pub adsb_status: Option<serde_json::Value>,
     /// Signal level at decode time.
     pub level_dbfs: f32,
+    /// Monotonic 12 MHz sample-clock tick of this frame's arrival (set by the
+    /// demod from the frame's absolute sample offset; 0 until then). Feeds the
+    /// Beast MLAT counter. See `xng_types::SignalQuality::rx_ticks_12mhz`.
+    pub rx_ticks_12mhz: u64,
 }
 
 /// Validates candidate frames and learns ICAO addresses from squitters.
@@ -205,6 +209,7 @@ impl FrameValidator {
             comm_b: None,
             adsb_status: None,
             level_dbfs,
+            rx_ticks_12mhz: 0,
         };
         match df {
             17 | 18 => {
@@ -303,6 +308,7 @@ impl FrameValidator {
             comm_b: None,
             adsb_status: None,
             level_dbfs,
+            rx_ticks_12mhz: 0,
         };
         if df == 17 || df == 18 {
             decode_extended_squitter(&bytes[4..11], &mut f);
