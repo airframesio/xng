@@ -68,6 +68,9 @@ pub struct OutputsToml {
     pub aircraft_db: Option<PathBuf>,
     pub mqtt: Option<String>,
     pub mqtt_topic: Option<String>,
+    /// Own-ship MMSI: emit an AIVDO position report for the station's own
+    /// `receiver-pos` so chart plotters show the receiver (AIS-5c).
+    pub own_ship_mmsi: Option<u32>,
     pub asf2_grpc: Option<String>,
     pub asf2_quic: Option<String>,
     #[serde(default)]

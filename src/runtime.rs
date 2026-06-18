@@ -71,6 +71,10 @@ pub struct OutputConfig {
     /// Per-mode Airframes feed router (legacy per-port native-format push;
     /// asf-2.0 multiplexes every mode separately under the canonical ident).
     pub airframes: Option<crate::outputs::airframes::AirframesRouter>,
+    /// Own-ship MMSI: when set (with a station `receiver-pos`), an AIVDO Type 1
+    /// position report is emitted periodically so chart plotters show the
+    /// station (AIS-5c).
+    pub own_ship_mmsi: Option<u32>,
 }
 
 pub struct SessionConfig {
@@ -1198,6 +1202,31 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         });
         let output_tasks = spawn_outputs(&bus, &prepared[0].cfg.outputs, &station, &sessions_desc);
 
+        // Own-ship AIVDO beacon (AIS-5c): when an own-ship MMSI is configured
+        // and some session has a receiver-pos, inject a position report every
+        // 30 s so it reaches the NMEA sinks / map like any AIS fix. Polls the
+        // stop flag each second so it never keeps the bus open past shutdown.
+        if let (Some(mmsi), Some((lat, lon))) = (
+            prepared[0].cfg.outputs.own_ship_mmsi,
+            prepared.iter().find_map(|p| p.cfg.receiver_pos),
+        ) {
+            let (bus, stop, station) = (bus.clone(), stop.clone(), station.clone());
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut n: u64 = 0;
+                loop {
+                    tick.tick().await;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if n % 30 == 0 {
+                        bus.publish(own_ship_message(mmsi, lat, lon, &station));
+                    }
+                    n += 1;
+                }
+            });
+        }
+
         spawn_interrupt_handler(stop.clone(), "station");
 
         let mut decode_tasks = Vec::new();
@@ -1343,6 +1372,34 @@ fn dec_level_after(dec: &ModeChannel) -> f32 {
     dec.level()
 }
 
+/// Build the station's own-ship AIS message (AIS-5c): an AIVDO Type 1 position
+/// report carrying the receiver's own MMSI + location, so it flows to every
+/// output (NMEA sinks, the map, JSONL) like any other AIS fix.
+fn own_ship_message(mmsi: u32, lat: f64, lon: f64, station: &StationIdentity) -> Message {
+    Message {
+        mode: Mode::Ais,
+        timestamp: chrono::Utc::now(),
+        frequency_hz: 161_975_000,
+        signal: Default::default(),
+        decode: xng_types::DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
+        body: MessageBody::Ais {
+            nmea: vec![xng_mode_ais::own_ship_position(mmsi, lat, lon)],
+            msg_type: Some(1),
+            mmsi: Some(mmsi),
+            details: Some(serde_json::json!({
+                "mmsi": mmsi, "lat": lat, "lon": lon, "own_ship": true,
+            })),
+        },
+        raw: None,
+        source: Provenance {
+            station: station.clone(),
+            app: AppInfo::xng(),
+            sdr: None,
+            channel: None,
+        },
+    }
+}
+
 /// Build the per-channel decoders for a session config (shared between
 /// the console runtime and the TUI).
 pub(crate) fn build_decoders(
@@ -1415,6 +1472,19 @@ mod tests {
                 channel: None,
             },
         }
+    }
+
+    #[test]
+    fn own_ship_message_carries_aivdo() {
+        let m = own_ship_message(366_123_456, 37.5, -122.3, &StationIdentity::new("XX-TEST"));
+        assert_eq!(m.mode, Mode::Ais);
+        assert!(m.decode.crc_ok);
+        let MessageBody::Ais { nmea, mmsi, msg_type, .. } = &m.body else {
+            panic!("expected AIS body");
+        };
+        assert_eq!(*mmsi, Some(366_123_456));
+        assert_eq!(*msg_type, Some(1));
+        assert!(nmea[0].starts_with("!AIVDO,"), "{nmea:?}");
     }
 
     #[test]

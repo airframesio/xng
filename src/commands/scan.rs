@@ -597,6 +597,7 @@ pub(crate) fn scan_group(
             mqtt: None,
             mqtt_topic: "xng".into(),
             airframes: None,
+            own_ship_mmsi: None,
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;

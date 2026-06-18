@@ -228,6 +228,7 @@ impl OutputOpts {
                 mqtt_topic: self.mqtt_topic.clone(),
                 // Set per-session by the caller once the mode is known.
                 airframes: None,
+                own_ship_mmsi: None,
             },
             ident,
         ))
@@ -762,6 +763,7 @@ fn main() -> anyhow::Result<()> {
                         mqtt: None,
                         mqtt_topic: "xng".into(),
                         airframes: None,
+                        own_ship_mmsi: None,
                     },
                 },
             )
@@ -803,6 +805,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
         airframes: Some(commands::station::airframes_router(&st)),
+        own_ship_mmsi: st.outputs.own_ship_mmsi,
     };
 
     if let Some(p) = &st.outputs.aircraft_db {
