@@ -43,6 +43,18 @@ pub enum AprsKind {
     Object,
     Item,
     Telemetry,
+    /// Telemetry PARM. definition: the names of the 5 analog + 8 digital
+    /// channels (APRS 1.0.1 Chapter 13, p.69).
+    TelemetryParm,
+    /// Telemetry UNIT. definition: the units/labels of the 5 analog + 8 digital
+    /// channels (APRS 1.0.1 Chapter 13, p.69).
+    TelemetryUnit,
+    /// Telemetry EQNS. definition: the 3 quadratic coefficients (a,b,c) per
+    /// analog channel (APRS 1.0.1 Chapter 13, p.70).
+    TelemetryEqns,
+    /// Telemetry BITS. definition: the 8 digital bit-sense flags + project
+    /// title (APRS 1.0.1 Chapter 13, p.70).
+    TelemetryBits,
     MicE,
     Bulletin,
     Query,
@@ -59,6 +71,10 @@ impl AprsKind {
             AprsKind::Object => "object",
             AprsKind::Item => "item",
             AprsKind::Telemetry => "telemetry",
+            AprsKind::TelemetryParm => "telemetry-parm",
+            AprsKind::TelemetryUnit => "telemetry-unit",
+            AprsKind::TelemetryEqns => "telemetry-eqns",
+            AprsKind::TelemetryBits => "telemetry-bits",
             AprsKind::MicE => "mic-e",
             AprsKind::Bulletin => "bulletin",
             AprsKind::Query => "query",
@@ -564,6 +580,18 @@ fn parse_message(info: &[u8]) -> AprsPayload {
         .to_string();
     let body = String::from_utf8_lossy(&info[11..]).to_string();
 
+    // Telemetry definition messages (APRS 1.0.1 Chapter 13, p.69-70). These
+    // ride on the message data-type id (`:`) and are addressed to the callsign
+    // of the station transmitting the telemetry (p.68). The message body begins
+    // with one of four 5-char keywords — `PARM.`, `UNIT.`, `EQNS.`, `BITS.` —
+    // that name, scale and label the channels reported in the `T#` data values.
+    // They are distinct from the raw telemetry data values (handled by
+    // `parse_telemetry`). The keyword match is case-sensitive per the spec
+    // tables. The addressee (the telemetry station) is preserved on the output.
+    if let Some(def) = parse_telemetry_definition(&addressee, &body) {
+        return def;
+    }
+
     // Bulletins and announcements (APRS 1.0.1 Chapter 14, p.73): the addressee
     // is the literal "BLN" followed by a single identifier character then
     // (for general bulletins) 5 filler spaces, or (for group bulletins) a
@@ -610,6 +638,155 @@ fn parse_message(info: &[u8]) -> AprsPayload {
     AprsPayload {
         kind: AprsKind::Message,
         fields,
+    }
+}
+
+/// Detect and decode a telemetry-definition message (APRS 1.0.1 Chapter 13,
+/// p.69-70). These are ordinary APRS messages (data-type id `:`) whose text
+/// begins with one of the four 5-byte keywords that define how to interpret a
+/// station's `T#` telemetry data values:
+///
+/// - `PARM.` — Parameter Name message (p.69): channel names.
+/// - `UNIT.` — Unit/Label message (p.69): channel units / digital labels.
+/// - `EQNS.` — Equation Coefficients message (p.70): `a,b,c` per analog channel.
+/// - `BITS.` — Bit Sense / Project Name message (p.70): 8 bit-sense flags + a
+///   project title.
+///
+/// `addressee` is the callsign of the station the telemetry belongs to (p.68);
+/// it is carried through onto the decoded payload. Returns `None` when `body`
+/// is not a telemetry-definition message, so the caller falls through to the
+/// ordinary message / bulletin handling.
+fn parse_telemetry_definition(addressee: &str, body: &str) -> Option<AprsPayload> {
+    // The keyword is the first 5 bytes ("XXXX."). Match case-sensitively per the
+    // spec field tables (p.69-70), then hand the remainder to the dedicated
+    // decoder.
+    let (keyword, rest) = body.split_at(body.len().min(5));
+    match keyword {
+        "PARM." => Some(decode_telemetry_parm(addressee, rest)),
+        "UNIT." => Some(decode_telemetry_unit(addressee, rest)),
+        "EQNS." => Some(decode_telemetry_eqns(addressee, rest)),
+        "BITS." => Some(decode_telemetry_bits(addressee, rest)),
+        _ => None,
+    }
+}
+
+/// PARM. — Telemetry Parameter Name message (APRS 1.0.1 Chapter 13, p.69).
+/// The body is a comma-separated list naming up to 5 analog channels (A1-A5)
+/// then up to 8 digital channels (B1-B8). The list may stop after any field
+/// (p.69), so trailing channels are simply absent. Worked example (p.69):
+/// `:N0QBF-11 :PARM.Battery,Btemp,ATemp,Pres,Alt,Camra,Chut,Sun,10m,ATV`.
+fn decode_telemetry_parm(addressee: &str, rest: &str) -> AprsPayload {
+    let (analog, digital) = split_telemetry_labels(rest);
+    AprsPayload {
+        kind: AprsKind::TelemetryParm,
+        fields: json!({
+            "addressee": addressee,
+            "telemetry_kind": "parm",
+            "analog_names": analog,
+            "digital_names": digital,
+        }),
+    }
+}
+
+/// UNIT. — Telemetry Unit/Label message (APRS 1.0.1 Chapter 13, p.69). Same
+/// 5-analog + 8-digital comma-separated layout as PARM., but the entries are
+/// the units of the analog values and the labels of the digital channels.
+/// Worked example (p.69):
+/// `:N0QBF-11 :UNIT.v/100,deg.F,deg.F,Mbar,Kft,Click,OPEN,on,on,hi`.
+fn decode_telemetry_unit(addressee: &str, rest: &str) -> AprsPayload {
+    let (analog, digital) = split_telemetry_labels(rest);
+    AprsPayload {
+        kind: AprsKind::TelemetryUnit,
+        fields: json!({
+            "addressee": addressee,
+            "telemetry_kind": "unit",
+            "analog_units": analog,
+            "digital_labels": digital,
+        }),
+    }
+}
+
+/// Split a PARM./UNIT. comma-separated body into the first 5 fields (analog
+/// channels A1-A5) and the remaining fields (digital channels B1-B8). The spec
+/// allows the list to terminate after any field (p.69), so each group may be
+/// shorter than its maximum. Empty trailing entries are kept as empty strings
+/// because a deliberately-blank channel name/unit is meaningful (it labels a
+/// reported but unnamed channel).
+fn split_telemetry_labels(rest: &str) -> (Vec<String>, Vec<String>) {
+    if rest.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let parts: Vec<String> = rest.split(',').map(|s| s.to_string()).collect();
+    let analog: Vec<String> = parts.iter().take(5).cloned().collect();
+    let digital: Vec<String> = parts.iter().skip(5).take(8).cloned().collect();
+    (analog, digital)
+}
+
+/// EQNS. — Telemetry Equation Coefficients message (APRS 1.0.1 Chapter 13,
+/// p.70). The body is a comma-separated list of 3 coefficients (a, b, c) for
+/// each of the 5 analog channels (up to 15 values; the list may stop early).
+/// The decoded value of an analog channel is `a*v^2 + b*v + c`, where `v` is
+/// the raw received value (p.70). Worked example (p.70):
+/// `:N0QBF-11 :EQNS.0,5.2,0,0,.53,-32,3,4.39,49,-32,3,18,1,2,3` — for A1,
+/// (a,b,c) = (0, 5.2, 0), so a raw value of 199 maps to 5.2*199 = 1034.8.
+fn decode_telemetry_eqns(addressee: &str, rest: &str) -> AprsPayload {
+    // Parse each comma-separated coefficient as a float (the spec allows forms
+    // like ".53" and "-32"); group them into [a,b,c] triples per analog channel.
+    let coeffs: Vec<f64> = if rest.is_empty() {
+        Vec::new()
+    } else {
+        rest.split(',')
+            .map(|s| s.trim().parse::<f64>().unwrap_or(0.0))
+            .collect()
+    };
+    let mut equations: Vec<serde_json::Value> = Vec::new();
+    for chunk in coeffs.chunks(3) {
+        // Only emit a complete (a,b,c) triple; a trailing partial group means
+        // the list terminated mid-channel, which we drop rather than guess.
+        if chunk.len() == 3 {
+            equations.push(json!({ "a": chunk[0], "b": chunk[1], "c": chunk[2] }));
+        }
+    }
+    AprsPayload {
+        kind: AprsKind::TelemetryEqns,
+        fields: json!({
+            "addressee": addressee,
+            "telemetry_kind": "eqns",
+            "coefficients": coeffs,
+            "equations": equations,
+        }),
+    }
+}
+
+/// BITS. — Telemetry Bit Sense / Project Name message (APRS 1.0.1 Chapter 13,
+/// p.70). The body is an 8-character pattern of `1`/`0` giving the active sense
+/// of each digital channel (the sense that matches the corresponding label),
+/// optionally followed by a comma and a project title (0-23 chars). Worked
+/// example (p.70): `:N0QBF-11 :BITS.10110000,N0QBF's Big Balloon`.
+fn decode_telemetry_bits(addressee: &str, rest: &str) -> AprsPayload {
+    // The 8 bit-sense flags come first; a project title may follow after a
+    // comma. The spec shows exactly 8 bits, but tolerate a shorter run and stop
+    // at the first non-bit character (the comma before the title, or the title
+    // itself if no comma was sent).
+    let bytes = rest.as_bytes();
+    let mut bits: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() && bits.len() < 8 && (bytes[i] == b'0' || bytes[i] == b'1') {
+        bits.push(bytes[i] == b'1');
+        i += 1;
+    }
+    // The remainder is the project title, with a single leading comma separator
+    // stripped if present (p.70 example uses a comma).
+    let mut title = &rest[i..];
+    title = title.strip_prefix(',').unwrap_or(title);
+    AprsPayload {
+        kind: AprsKind::TelemetryBits,
+        fields: json!({
+            "addressee": addressee,
+            "telemetry_kind": "bits",
+            "bit_sense": bits,
+            "project_title": title,
+        }),
     }
 }
 
@@ -1270,5 +1447,165 @@ mod tests {
         assert_eq!(p.kind, AprsKind::Status);
         assert_eq!(p.fields["status"], "Net Control Center");
         assert!(p.fields.get("maidenhead").is_none());
+    }
+
+    // ----------------------------------------------------------------------
+    // Telemetry DEFINITION messages — APRS 1.0.1 Chapter 13 (p.69-70).
+    //
+    // These define how a station's `T#` telemetry data values are named,
+    // labelled, scaled and bit-sensed. They ride on the message data-type id
+    // (`:`) addressed to the telemetry station's callsign (p.68). Every worked
+    // example below is the spec's own N0QBF-11 beacon example, used as the
+    // independent oracle. The addressee in those examples is the 8-char
+    // "N0QBF-11" padded to the fixed 9-char message addressee field with one
+    // trailing space (Chapter 14 message format, p.71).
+    // ----------------------------------------------------------------------
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 13 Parameter Name message (p.69),
+    /// worked example:
+    /// `:N0QBF-11 :PARM.Battery,Btemp,ATemp,Pres,Alt,Camra,Chut,Sun,10m,ATV`
+    /// — the 5 analog channel names then the digital channel names.
+    #[test]
+    fn telemetry_parm_spec_example_p69() {
+        let p = parse(b":N0QBF-11 :PARM.Battery,Btemp,ATemp,Pres,Alt,Camra,Chut,Sun,10m,ATV");
+        assert_eq!(p.kind, AprsKind::TelemetryParm);
+        assert_eq!(p.fields["addressee"], "N0QBF-11");
+        let analog = p.fields["analog_names"].as_array().unwrap();
+        assert_eq!(analog.len(), 5);
+        assert_eq!(analog[0], "Battery");
+        assert_eq!(analog[1], "Btemp");
+        assert_eq!(analog[2], "ATemp");
+        assert_eq!(analog[3], "Pres");
+        assert_eq!(analog[4], "Alt");
+        let digital = p.fields["digital_names"].as_array().unwrap();
+        // After the 5 analog names, the remaining 5 are digital labels (the
+        // spec example stops after B5, the list "may stop at any field", p.69).
+        assert_eq!(digital.len(), 5);
+        assert_eq!(digital[0], "Camra");
+        assert_eq!(digital[1], "Chut");
+        assert_eq!(digital[2], "Sun");
+        assert_eq!(digital[3], "10m");
+        assert_eq!(digital[4], "ATV");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 13 Unit/Label message (p.69),
+    /// worked example:
+    /// `:N0QBF-11 :UNIT.v/100,deg.F,deg.F,Mbar,Kft,Click,OPEN,on,on,hi`
+    /// — the 5 analog units then the digital channel labels.
+    #[test]
+    fn telemetry_unit_spec_example_p69() {
+        let p = parse(b":N0QBF-11 :UNIT.v/100,deg.F,deg.F,Mbar,Kft,Click,OPEN,on,on,hi");
+        assert_eq!(p.kind, AprsKind::TelemetryUnit);
+        assert_eq!(p.fields["addressee"], "N0QBF-11");
+        let units = p.fields["analog_units"].as_array().unwrap();
+        assert_eq!(units.len(), 5);
+        assert_eq!(units[0], "v/100");
+        assert_eq!(units[1], "deg.F");
+        assert_eq!(units[2], "deg.F");
+        assert_eq!(units[3], "Mbar");
+        assert_eq!(units[4], "Kft");
+        let labels = p.fields["digital_labels"].as_array().unwrap();
+        assert_eq!(labels.len(), 5);
+        assert_eq!(labels[0], "Click");
+        assert_eq!(labels[1], "OPEN");
+        assert_eq!(labels[2], "on");
+        assert_eq!(labels[3], "on");
+        assert_eq!(labels[4], "hi");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 13 Equation Coefficients message
+    /// (p.70), worked example:
+    /// `:N0QBF-11 :EQNS.0,5.2,0,0,.53,-32,3,4.39,49,-32,3,18,1,2,3`
+    /// — three coefficients (a,b,c) for each of the 5 analog channels. The spec
+    /// gives the conversion `value = a*v^2 + b*v + c` and the worked A1 result
+    /// (p.70): with (a,b,c)=(0,5.2,0) a raw value v=199 yields 1034.8.
+    #[test]
+    fn telemetry_eqns_spec_example_p70() {
+        let p = parse(b":N0QBF-11 :EQNS.0,5.2,0,0,.53,-32,3,4.39,49,-32,3,18,1,2,3");
+        assert_eq!(p.kind, AprsKind::TelemetryEqns);
+        assert_eq!(p.fields["addressee"], "N0QBF-11");
+        let eqns = p.fields["equations"].as_array().unwrap();
+        assert_eq!(eqns.len(), 5);
+        // A1 = (0, 5.2, 0) per p.70.
+        assert_eq!(eqns[0]["a"].as_f64().unwrap(), 0.0);
+        assert_eq!(eqns[0]["b"].as_f64().unwrap(), 5.2);
+        assert_eq!(eqns[0]["c"].as_f64().unwrap(), 0.0);
+        // A2 = (0, .53, -32); A3 = (3, 4.39, 49); A5 = (1, 2, 3).
+        assert_eq!(eqns[1]["b"].as_f64().unwrap(), 0.53);
+        assert_eq!(eqns[1]["c"].as_f64().unwrap(), -32.0);
+        assert_eq!(eqns[2]["a"].as_f64().unwrap(), 3.0);
+        assert_eq!(eqns[2]["b"].as_f64().unwrap(), 4.39);
+        assert_eq!(eqns[2]["c"].as_f64().unwrap(), 49.0);
+        assert_eq!(eqns[4]["a"].as_f64().unwrap(), 1.0);
+        assert_eq!(eqns[4]["b"].as_f64().unwrap(), 2.0);
+        assert_eq!(eqns[4]["c"].as_f64().unwrap(), 3.0);
+
+        // Reproduce the spec's own worked conversion (p.70): A1 with raw v=199.
+        let a = eqns[0]["a"].as_f64().unwrap();
+        let b = eqns[0]["b"].as_f64().unwrap();
+        let c = eqns[0]["c"].as_f64().unwrap();
+        let v = 199.0_f64;
+        let value = a * v * v + b * v + c;
+        assert!((value - 1034.8).abs() < 1e-9, "value={value}");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 13 Bit Sense / Project Name
+    /// message (p.70), worked example:
+    /// `:N0QBF-11 :BITS.10110000,N0QBF's Big Balloon`
+    /// — the 8 digital bit-sense flags then the project title.
+    #[test]
+    fn telemetry_bits_spec_example_p70() {
+        let p = parse(b":N0QBF-11 :BITS.10110000,N0QBF's Big Balloon");
+        assert_eq!(p.kind, AprsKind::TelemetryBits);
+        assert_eq!(p.fields["addressee"], "N0QBF-11");
+        let bits = p.fields["bit_sense"].as_array().unwrap();
+        assert_eq!(bits.len(), 8);
+        // 10110000 per p.70.
+        assert_eq!(bits[0], true);
+        assert_eq!(bits[1], false);
+        assert_eq!(bits[2], true);
+        assert_eq!(bits[3], true);
+        assert_eq!(bits[4], false);
+        assert_eq!(bits[5], false);
+        assert_eq!(bits[6], false);
+        assert_eq!(bits[7], false);
+        assert_eq!(p.fields["project_title"], "N0QBF's Big Balloon");
+    }
+
+    /// The four telemetry-definition keywords are case-sensitive (the spec field
+    /// tables show them in capitals, p.69-70) and a normal message that merely
+    /// mentions one must still decode as a plain message — regression guard for
+    /// the new dispatch.
+    #[test]
+    fn telemetry_definition_does_not_swallow_normal_message() {
+        // Lower-case keyword: not a definition message.
+        let p = parse(b":N0QBF-11 :parm.is a normal word");
+        assert_eq!(p.kind, AprsKind::Message);
+        // A message whose text only mentions PARM in prose, not as the keyword.
+        let p = parse(b":WU2Z     :see PARM. list{003");
+        assert_eq!(p.kind, AprsKind::Message);
+        assert_eq!(p.fields["addressee"], "WU2Z");
+    }
+
+    /// The spec allows the PARM./UNIT. list to terminate after any field (p.69):
+    /// a definition with only the 5 analog names and no digital labels still
+    /// decodes, with an empty digital list.
+    #[test]
+    fn telemetry_parm_analog_only_p69() {
+        let p = parse(b":N0QBF-11 :PARM.Battery,Btemp,ATemp,Pres,Alt");
+        assert_eq!(p.kind, AprsKind::TelemetryParm);
+        assert_eq!(p.fields["analog_names"].as_array().unwrap().len(), 5);
+        assert_eq!(p.fields["digital_names"].as_array().unwrap().len(), 0);
+    }
+
+    /// A BITS. message with no project title (only the 8-bit pattern) decodes
+    /// the bit-sense flags and leaves the title empty (APRS 1.0.1 p.70: the
+    /// project title is 0-23 chars, so it may be absent).
+    #[test]
+    fn telemetry_bits_no_title_p70() {
+        let p = parse(b":N0QBF-11 :BITS.10110000");
+        assert_eq!(p.kind, AprsKind::TelemetryBits);
+        assert_eq!(p.fields["bit_sense"].as_array().unwrap().len(), 8);
+        assert_eq!(p.fields["project_title"], "");
     }
 }
