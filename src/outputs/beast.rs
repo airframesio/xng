@@ -67,10 +67,20 @@ pub fn format_beast(msg: &Message) -> Vec<Vec<u8>> {
     if msg.mode == Mode::Adsb && matches!(msg.body, MessageBody::ModeS { .. }) {
         return msg.raw.as_ref().and_then(|raw| wrap_beast(raw, ticks, sig)).into_iter().collect();
     }
-    // Non-Mode-S aircraft (UAT/HFDL): synthesize DF17 frames from the fix.
+    // Non-Mode-S aircraft (UAT/HFDL): synthesize 1090 ES frames from the fix.
+    // Native ADS-B → DF17; a UAT TIS-B/ADS-R rebroadcast → DF18 (CF preserves
+    // the provenance) so a raw-Beast consumer keeps the source class.
     if let Some(fix) = aircraft_fix(msg) {
         if let Ok(icao) = u32::from_str_radix(&fix.icao, 16) {
+            use crate::outputs::aircraft::AircraftSource;
+            use xng_mode_adsb::synth::EsSource;
+            let src = match fix.source {
+                AircraftSource::Adsb => EsSource::Adsb,
+                AircraftSource::TisB => EsSource::TisB,
+                AircraftSource::AdsR => EsSource::AdsR,
+            };
             return xng_mode_adsb::synth::synth_frames(
+                src,
                 icao,
                 fix.lat,
                 fix.lon,
@@ -241,6 +251,52 @@ mod tests {
         for f in &frames {
             assert_eq!(f[0], 0x1a);
             assert_eq!(f[1], b'3', "long (DF17) frame");
+        }
+    }
+
+    // Unescape a wrapped Beast frame: strip 0x1a + type byte, collapse doubled
+    // 0x1a; result is 6 MLAT + 1 signal + 14 ES bytes, so [7] is the ES b[0].
+    fn es_byte0(f: &[u8]) -> u8 {
+        let mut out = Vec::new();
+        let mut i = 2;
+        while i < f.len() {
+            out.push(f[i]);
+            i += if f[i] == 0x1a { 2 } else { 1 };
+        }
+        out[7]
+    }
+
+    // NEW-P0-1.3: a UAT ADS-R rebroadcast (address_qualifier) is synthesized as
+    // DF18 with CF=6 (not native DF17), so its provenance survives onto 1090.
+    #[test]
+    fn uat_adsr_synthesizes_df18_frames() {
+        let msg = Message {
+            mode: Mode::Uat,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 978_000_000,
+            signal: SignalQuality::default(),
+            decode: DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
+            body: MessageBody::Uat {
+                kind: "adsb".into(),
+                details: serde_json::json!({
+                    "address": "a1b2c3", "address_qualifier": "adsr_other",
+                    "geometric_altitude": 9500, "lat": 37.6189, "lon": -122.3750,
+                }),
+            },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        };
+        let frames = format_beast(&msg);
+        assert_eq!(frames.len(), 2, "even + odd position");
+        for f in &frames {
+            let b0 = es_byte0(f);
+            assert_eq!(b0 >> 3, 18, "DF18 for ADS-R");
+            assert_eq!(b0 & 7, 6, "CF=6 ADS-R");
         }
     }
 }

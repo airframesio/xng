@@ -22,6 +22,19 @@ pub(crate) struct AircraftFix {
     pub track_deg: Option<f64>,
     pub vertical_rate_fpm: Option<i32>,
     pub squawk: Option<String>,
+    /// Provenance class for synthesized 1090 frames (Beast): native ADS-B vs
+    /// a TIS-B / ADS-R rebroadcast (from a UAT 978 address qualifier). Drives
+    /// DF17-vs-DF18 selection so replotted UAT traffic keeps its source class.
+    pub source: AircraftSource,
+}
+
+/// How an aircraft fix was originated, for re-encoding onto 1090 (NEW-P0-1.3).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AircraftSource {
+    #[default]
+    Adsb,
+    TisB,
+    AdsR,
 }
 
 fn jf(d: &Value, k: &str) -> Option<f64> {
@@ -66,6 +79,7 @@ pub(crate) fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
             track_deg: *track_deg,
             vertical_rate_fpm: *vertical_rate_fpm,
             squawk: squawk.clone(),
+            source: AircraftSource::Adsb,
         }),
         // UAT 978 MHz ADS-B downlink — a real aircraft state vector.
         MessageBody::Uat { kind, details } if kind == "adsb" => Some(AircraftFix {
@@ -79,6 +93,13 @@ pub(crate) fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
             track_deg: jf(details, "true_track"),
             vertical_rate_fpm: ji(details, "vertical_rate"),
             squawk: None,
+            // UAT address qualifier → 1090 rebroadcast provenance: tisb_* →
+            // TIS-B, adsr_other → ADS-R, everything else is native ADS-B.
+            source: match details.get("address_qualifier").and_then(Value::as_str) {
+                Some("tisb_icao") | Some("tisb_trackfile") => AircraftSource::TisB,
+                Some("adsr_other") => AircraftSource::AdsR,
+                _ => AircraftSource::Adsb,
+            },
         }),
         // HFDL position HFNPDU: lat/lon (+ flight), ICAO back-filled from the
         // logon cache (on the nested `position`, else top-level `icao`).
@@ -100,6 +121,7 @@ pub(crate) fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
                 track_deg: None,
                 vertical_rate_fpm: None,
                 squawk: None,
+                source: AircraftSource::Adsb,
             })
         }
         _ => None,

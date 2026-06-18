@@ -15,11 +15,43 @@ use xng_dsp::checksum::mode_s_crc;
 const CPR_MAX: f64 = 131_072.0; // 2^17
 const NZ: f64 = 15.0;
 
-/// Pack a 56-bit ME field into a DF17 frame (CA=5, level-2 airborne) for
-/// `icao`, append the clean 24-bit Mode S parity, and return the 14 bytes.
-fn df17(icao: u32, me: u64) -> [u8; 14] {
+/// ADS-B message source — picks the downlink format + 3-bit control field of
+/// the synthesized frame. Native ADS-B is DF17 (CA=5); rebroadcast traffic is
+/// DF18 with the CF that [`crate::decode::df18_cf_class`] reads back as TIS-B
+/// or ADS-R, so a UAT 978 target keeps its provenance when replotted on 1090.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EsSource {
+    /// Native ADS-B — DF17, CA=5.
+    Adsb,
+    /// TIS-B (ground-station rebroadcast of secondary surveillance) — DF18 CF=2.
+    TisB,
+    /// ADS-R (rebroadcast from the other data link, e.g. UAT↔1090) — DF18 CF=6.
+    AdsR,
+}
+
+impl EsSource {
+    /// `(downlink format, 3-bit CA/CF)` for this source.
+    fn df_cf(self) -> (u8, u8) {
+        match self {
+            EsSource::Adsb => (17, 5), // CA=5 level-2 transponder
+            EsSource::TisB => (18, 2), // CF=2 fine TIS-B, ICAO address
+            EsSource::AdsR => (18, 6), // CF=6 ADS-R rebroadcast
+        }
+    }
+
+    /// Build a 14-byte extended squitter carrying `me` for this source.
+    fn frame(self, icao: u32, me: u64) -> [u8; 14] {
+        let (df, field) = self.df_cf();
+        es_frame(df, field, icao, me)
+    }
+}
+
+/// Pack a 56-bit ME field into a DF17/DF18 extended squitter for `icao`
+/// (`field` = the 3-bit CA on DF17 / CF on DF18), append the clean 24-bit
+/// Mode S parity, and return the 14 bytes.
+fn es_frame(df: u8, field: u8, icao: u32, me: u64) -> [u8; 14] {
     let mut b = [0u8; 14];
-    b[0] = (17 << 3) | 5;
+    b[0] = (df << 3) | (field & 7);
     b[1] = (icao >> 16) as u8;
     b[2] = (icao >> 8) as u8;
     b[3] = icao as u8;
@@ -70,7 +102,13 @@ fn ident_code(c: u8) -> u64 {
 /// The even+odd airborne-position pair (DF17 TC11). Both are needed for a
 /// receiver to globally decode the position. `alt_ft` of `None` emits a
 /// zero (not-available) altitude.
-pub fn airborne_position(icao: u32, lat: f64, lon: f64, alt_ft: Option<i32>) -> [[u8; 14]; 2] {
+pub fn airborne_position(
+    src: EsSource,
+    icao: u32,
+    lat: f64,
+    lon: f64,
+    alt_ft: Option<i32>,
+) -> [[u8; 14]; 2] {
     let ac = alt_ft.map(encode_alt12).unwrap_or(0) as u64;
     let frame = |odd: bool| {
         let (yz, xz) = cpr_encode(lat, lon, odd);
@@ -84,14 +122,14 @@ pub fn airborne_position(icao: u32, lat: f64, lon: f64, alt_ft: Option<i32>) -> 
         me = (me << 1) | odd as u64; // CPR odd/even
         me = (me << 17) | yz as u64; // LAT-CPR
         me = (me << 17) | xz as u64; // LON-CPR
-        df17(icao, me)
+        src.frame(icao, me)
     };
     [frame(false), frame(true)]
 }
 
 /// The identification/callsign frame (DF17 TC4). `callsign` is upper-cased,
 /// space-padded, and truncated to 8 chars.
-pub fn identification(icao: u32, callsign: &str) -> [u8; 14] {
+pub fn identification(src: EsSource, icao: u32, callsign: &str) -> [u8; 14] {
     // ME (56b): TC(5)=4 · EC(3)=0 · 8 × CHAR(6)
     let mut me: u64 = 4;
     me = (me << 3) | 0; // emitter category
@@ -100,13 +138,19 @@ pub fn identification(icao: u32, callsign: &str) -> [u8; 14] {
         let c = cs.get(k).copied().unwrap_or(b' ');
         me = (me << 6) | ident_code(c);
     }
-    df17(icao, me)
+    src.frame(icao, me)
 }
 
 /// The airborne-velocity frame (DF17 TC19 subtype 1, ground speed) from a
 /// ground speed (kt) + true track (deg) and optional vertical rate (fpm).
 /// Inverse of [`crate::decode::velocity`]'s subtype-1 path.
-pub fn velocity_frame(icao: u32, gs_kt: f64, track_deg: f64, vrate_fpm: Option<i32>) -> [u8; 14] {
+pub fn velocity_frame(
+    src: EsSource,
+    icao: u32,
+    gs_kt: f64,
+    track_deg: f64,
+    vrate_fpm: Option<i32>,
+) -> [u8; 14] {
     let tr = track_deg.to_radians();
     let vx = gs_kt * tr.sin(); // east
     let vy = gs_kt * tr.cos(); // north
@@ -134,7 +178,7 @@ pub fn velocity_frame(icao: u32, gs_kt: f64, track_deg: f64, vrate_fpm: Option<i
     me = (me << 2) | 0; // reserved
     me = (me << 1) | 0; // GNSS-baro sign
     me = (me << 7) | 0; // GNSS-baro difference
-    df17(icao, me)
+    src.frame(icao, me)
 }
 
 /// All synthesizable frames for an aircraft fix: the position pair, a callsign
@@ -142,6 +186,7 @@ pub fn velocity_frame(icao: u32, gs_kt: f64, track_deg: f64, vrate_fpm: Option<i
 /// present. Returns empty when there is no position to convey (a synthesized ES
 /// with no payload is pointless).
 pub fn synth_frames(
+    src: EsSource,
     icao: u32,
     lat: Option<f64>,
     lon: Option<f64>,
@@ -153,16 +198,16 @@ pub fn synth_frames(
 ) -> Vec<[u8; 14]> {
     let mut out = Vec::new();
     if let (Some(la), Some(lo)) = (lat, lon) {
-        out.extend(airborne_position(icao, la, lo, alt_ft));
+        out.extend(airborne_position(src, icao, la, lo, alt_ft));
     }
     if let Some(cs) = callsign {
         let cs = cs.trim();
         if !cs.is_empty() {
-            out.push(identification(icao, cs));
+            out.push(identification(src, icao, cs));
         }
     }
     if let (Some(gs), Some(tr)) = (gs_kt, track_deg) {
-        out.push(velocity_frame(icao, gs, tr, vrate_fpm));
+        out.push(velocity_frame(src, icao, gs, tr, vrate_fpm));
     }
     out
 }
@@ -190,7 +235,7 @@ mod tests {
     fn position_round_trips_through_decoder() {
         // The 1090 Megahertz Riddle worked example.
         let (icao, lat, lon) = (0x40621D, 52.25720, 3.91937);
-        let [even, odd] = airborne_position(icao, lat, lon, Some(38000));
+        let [even, odd] = airborne_position(EsSource::Adsb, icao, lat, lon, Some(38000));
         assert!(crc_clean(&even) && crc_clean(&odd), "parity clean");
         assert_eq!(even[0] >> 3, 17, "DF17");
         assert_eq!(u32::from_be_bytes([0, even[1], even[2], even[3]]), icao);
@@ -202,10 +247,34 @@ mod tests {
     #[test]
     fn position_round_trips_southern_western_hemisphere() {
         let (icao, lat, lon) = (0xABCDEF, -33.8688, 151.2093); // Sydney
-        let [even, odd] = airborne_position(icao, lat, lon, None);
+        let [even, odd] = airborne_position(EsSource::Adsb, icao, lat, lon, None);
         let (dlat, dlon) = cpr_global_airborne(cpr_of(&even), cpr_of(&odd), false).unwrap();
         assert!((dlat - lat).abs() < 1e-4, "lat {dlat} vs {lat}");
         assert!((dlon - lon).abs() < 1e-4, "lon {dlon} vs {lon}");
+    }
+
+    // NEW-P0-1.3: a rebroadcast source synthesizes a DF18 frame whose CF the
+    // decoder reads back (df18_cf_class) as the right provenance, while the
+    // position still decodes — so UAT TIS-B/ADS-R keep their class on 1090.
+    #[test]
+    fn rebroadcast_synthesizes_df18_with_correct_cf() {
+        use crate::decode::df18_cf_class;
+        let (icao, lat, lon) = (0xA12345, 37.6189, -122.3750);
+        for (src, want_class, want_key) in [
+            (EsSource::TisB, "TIS-B", "tisb_icao"),
+            (EsSource::AdsR, "ADS-R", "adsr_icao"),
+        ] {
+            let [even, odd] = airborne_position(src, icao, lat, lon, Some(9500));
+            assert!(crc_clean(&even) && crc_clean(&odd), "parity clean");
+            assert_eq!(even[0] >> 3, 18, "DF18 for {src:?}");
+            let cf = even[0] & 7;
+            let (class, key, _) = df18_cf_class(cf);
+            assert_eq!(class, want_class, "{src:?} cf={cf}");
+            assert_eq!(key, want_key, "{src:?} cf={cf}");
+            // Position still decodes through the same CPR path.
+            let (dlat, dlon) = cpr_global_airborne(cpr_of(&even), cpr_of(&odd), false).unwrap();
+            assert!((dlat - lat).abs() < 1e-4 && (dlon - lon).abs() < 1e-4, "{src:?}");
+        }
     }
 
     #[test]
@@ -219,7 +288,7 @@ mod tests {
 
     #[test]
     fn identification_round_trips_callsign() {
-        let f = identification(0x484149, "KLM1023 ");
+        let f = identification(EsSource::Adsb, 0x484149, "KLM1023 ");
         assert!(crc_clean(&f));
         assert_eq!(f[4] >> 3, 4, "TC4");
         let me = &f[4..11];
@@ -237,7 +306,7 @@ mod tests {
     #[test]
     fn velocity_round_trips_through_decoder() {
         // Due west at 420 kt, descending 1024 fpm.
-        let f = velocity_frame(0x40621D, 420.0, 270.0, Some(-1024));
+        let f = velocity_frame(EsSource::Adsb, 0x40621D, 420.0, 270.0, Some(-1024));
         assert!(crc_clean(&f), "parity clean");
         assert_eq!(f[4] >> 3, 19, "TC19");
         let v = velocity_of(&f);
@@ -247,7 +316,7 @@ mod tests {
         assert_eq!(v.vertical_rate_fpm, Some(-1024), "vrate");
 
         // A north-east climb exercises the other quadrant + positive vrate.
-        let v2 = velocity_of(&velocity_frame(0x40621D, 300.0, 45.0, Some(1472)));
+        let v2 = velocity_of(&velocity_frame(EsSource::Adsb, 0x40621D, 300.0, 45.0, Some(1472)));
         assert!((v2.speed_kt - 300.0).abs() < 1.0, "speed {}", v2.speed_kt);
         assert!((v2.track_deg - 45.0).abs() < 0.5, "track {}", v2.track_deg);
         assert_eq!(v2.vertical_rate_fpm, Some(1472), "vrate");
@@ -257,6 +326,7 @@ mod tests {
     fn synth_frames_emits_pair_plus_ident_plus_velocity() {
         // Position + callsign + ground speed/track → even, odd, ident, velocity.
         let v = synth_frames(
+            EsSource::Adsb,
             0x40621D,
             Some(52.2),
             Some(3.9),
@@ -268,9 +338,13 @@ mod tests {
         );
         assert_eq!(v.len(), 4, "even + odd + ident + velocity");
         // Position only (no callsign, no velocity) → just the even/odd pair.
-        let p = synth_frames(0x40621D, Some(52.2), Some(3.9), None, None, None, None, None);
+        let p =
+            synth_frames(EsSource::Adsb, 0x40621D, Some(52.2), Some(3.9), None, None, None, None, None);
         assert_eq!(p.len(), 2, "even + odd");
         // No position → nothing (a payload-less ES is pointless).
-        assert!(synth_frames(0x40621D, None, None, Some(35000), None, None, None, None).is_empty());
+        assert!(
+            synth_frames(EsSource::Adsb, 0x40621D, None, None, Some(35000), None, None, None, None)
+                .is_empty()
+        );
     }
 }
