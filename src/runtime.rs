@@ -357,10 +357,10 @@ impl ModeChannel {
                 let frames = dec.process(iq);
                 let seen = frames.len() as u64;
                 let ok = frames.iter().filter(|f| f.crc_ok).count() as u64;
-                let level = dec.level_dbfs();
+                let (level, noise) = (dec.level_dbfs(), dec.noise_dbfs());
                 let msgs = frames
                     .iter()
-                    .map(|f| xng_mode_acars::to_message(f, freq, level, prov.clone()))
+                    .map(|f| xng_mode_acars::to_message(f, freq, level, noise, prov.clone()))
                     .collect();
                 (msgs, seen, ok)
             }

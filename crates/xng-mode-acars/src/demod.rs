@@ -31,6 +31,13 @@ const DC_ALPHA: f32 = 0.005;
 const TIMING_GAIN: f64 = 0.15;
 /// Envelope power smoothing factor for the level estimate.
 const LEVEL_ALPHA: f32 = 0.005;
+/// Noise-floor EMA factor (slower than the level tracker).
+const NOISE_ALPHA: f32 = 0.002;
+/// A sample more than this multiple above the running floor is treated as
+/// signal (a burst) and excluded from the noise EMA, so a long transmission
+/// can't drag the floor up to the carrier level. The pure-noise tail above
+/// this is negligible (~e^-8), so the silence estimate stays ~unbiased.
+const NOISE_GATE: f32 = 8.0;
 
 pub struct MskDemod {
     mix: Nco,
@@ -50,6 +57,9 @@ pub struct MskDemod {
     level: f32,
     /// Envelope DC (carrier level) tracker.
     dc: f32,
+    /// Noise-floor estimate: envelope power EMA over inter-burst silence
+    /// (gated by `NOISE_GATE`). 0.0 until the first sample seeds it.
+    noise: f32,
 }
 
 impl MskDemod {
@@ -67,6 +77,7 @@ impl MskDemod {
             prev_bit: 1, // pre-key state is all ones
             level: 0.0,
             dc: 0.0,
+            noise: 0.0,
         }
     }
 
@@ -76,8 +87,18 @@ impl MskDemod {
         self.mixed.clear();
         for x in input {
             let env = x.norm();
-            self.level += LEVEL_ALPHA * (env * env - self.level);
+            let p = env * env;
+            self.level += LEVEL_ALPHA * (p - self.level);
             self.dc += DC_ALPHA * (env - self.dc);
+            // Noise floor: seed on the first sample, then track only samples
+            // near the floor (silence); freeze on bursts. A high seed (tuned
+            // in mid-burst) self-corrects, since silence samples fall well
+            // below the gate and pull it back down.
+            if self.noise == 0.0 {
+                self.noise = p;
+            } else if p < self.noise * NOISE_GATE {
+                self.noise += NOISE_ALPHA * (p - self.noise);
+            }
             self.mixed.push(Complex::new(env - self.dc, 0.0));
         }
         self.mix.mix(&mut self.mixed);
@@ -117,10 +138,60 @@ impl MskDemod {
     pub fn level_dbfs(&self) -> f32 {
         10.0 * self.level.max(1e-12).log10()
     }
+
+    /// Noise-floor estimate in dBFS (envelope power over silence).
+    pub fn noise_dbfs(&self) -> f32 {
+        10.0 * self.noise.max(1e-12).log10()
+    }
 }
 
 impl Default for MskDemod {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Deterministic Gaussian generator (Box-Muller over xorshift) — no rand dep.
+    struct Gauss(u64);
+    impl Gauss {
+        fn u(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            ((self.0 >> 11) as f64 + 1.0) / ((1u64 << 53) as f64 + 2.0)
+        }
+        fn z(&mut self) -> f32 {
+            let (u1, u2) = (self.u(), self.u());
+            ((-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()) as f32
+        }
+    }
+
+    // The noise-floor estimate over pure complex AWGN must converge to the
+    // analytic envelope power 2·sigma^2 (independent ground truth — NOT a
+    // demod loopback), and scale correctly in dB when sigma changes.
+    #[test]
+    fn noise_floor_tracks_known_awgn_power() {
+        let floor_dbfs = |sigma: f32| -> f32 {
+            let mut g = Gauss(0xC0FF_EE12_3456_789B);
+            let input: Vec<Complex<f32>> =
+                (0..80_000).map(|_| Complex::new(g.z() * sigma, g.z() * sigma)).collect();
+            let mut d = MskDemod::new();
+            let mut bits = Vec::new();
+            d.process(&input, &mut bits);
+            d.noise_dbfs()
+        };
+
+        let sigma = 0.03f32;
+        let expected = 10.0 * (2.0 * sigma * sigma).log10();
+        let got = floor_dbfs(sigma);
+        assert!((got - expected).abs() < 1.0, "floor {got} dBFS vs analytic {expected} dBFS");
+
+        // Doubling sigma raises the measured floor by 10·log10(4) ≈ 6.02 dB.
+        let louder = floor_dbfs(sigma * 2.0);
+        assert!((louder - got - 6.02).abs() < 1.0, "Δ {} dB vs 6.02", louder - got);
     }
 }

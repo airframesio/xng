@@ -87,7 +87,7 @@ fn oooi_fields_surface_in_message_body() {
         sdr: None,
         channel: None,
     };
-    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, source);
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, -55.0, source);
     let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
     let app = core.app.as_ref().expect("OOOI should populate app JSON");
     assert_eq!(app["depa"], "KEWR");
@@ -129,7 +129,7 @@ fn free_text_position_surfaces_in_message_body() {
         sdr: None,
         channel: None,
     };
-    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, source);
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, -55.0, source);
     let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
     let app = core.app.as_ref().expect("position should populate app JSON");
     let lat = app["position"]["latitude"].as_f64().unwrap();
@@ -173,7 +173,7 @@ fn h2_sublabel_and_mfi_surface_in_message_body() {
         sdr: None,
         channel: None,
     };
-    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, source);
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, -55.0, source);
     let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
     assert_eq!(core.label, "H2");
     assert_eq!(core.sublabel.as_deref(), Some("DF"), "H2 sublabel must surface");

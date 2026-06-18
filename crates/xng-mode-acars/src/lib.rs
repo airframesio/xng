@@ -79,6 +79,11 @@ impl AcarsChannelDecoder {
     pub fn level_dbfs(&self) -> f32 {
         self.demod.level_dbfs()
     }
+
+    /// Channel noise-floor estimate in dBFS (envelope power over silence).
+    pub fn noise_dbfs(&self) -> f32 {
+        self.demod.noise_dbfs()
+    }
 }
 
 /// Combine the structured application decode with any flat text-extracted
@@ -122,13 +127,21 @@ pub fn to_message(
     f: &frame::AcarsFrame,
     frequency_hz: u64,
     level_dbfs: f32,
+    noise_dbfs: f32,
     source: Provenance,
 ) -> Message {
     Message {
         mode: Mode::AcarsPoa,
         timestamp: Utc::now(),
         frequency_hz,
-        signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
+        // Per-burst noise floor + SNR from the demod's silence EMA (XM-1 /
+        // ACARS-4.1); snr = rssi - noise.
+        signal: SignalQuality {
+            rssi_db: Some(level_dbfs),
+            noise_db: Some(noise_dbfs),
+            snr_db: Some(level_dbfs - noise_dbfs),
+            ..Default::default()
+        },
         decode: DecodeQuality {
             crc_ok: f.crc_ok,
             fec_corrected: Some(f.fixed_bits),
