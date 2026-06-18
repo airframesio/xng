@@ -205,3 +205,145 @@ fn offair_emits_only_real_pages_no_garbage() {
         "929.9375 must auto-detect its real 3200-bps rate; got {baud_9375:?}"
     );
 }
+
+/// True iff `s` begins with a clock time of the form `H:MM` or `HH:MM`
+/// (optionally followed by ` AM`/` PM`), i.e. a real page that opens with a
+/// timestamp. Used to assert the leading FLEX signature byte was stripped so the
+/// page starts at the first real digit, not at the header/signature symbol.
+fn starts_with_time(s: &str) -> bool {
+    let b = s.as_bytes();
+    // 1 or 2 leading digits, then ':', then 2 digits.
+    let digits = b.iter().take_while(|c| c.is_ascii_digit()).count();
+    if !(1..=2).contains(&digits) {
+        return false;
+    }
+    b.get(digits) == Some(&b':')
+        && b.get(digits + 1).is_some_and(|c| c.is_ascii_digit())
+        && b.get(digits + 2).is_some_and(|c| c.is_ascii_digit())
+}
+
+/// STRICT ACCEPTANCE for the FLEX **alphanumeric leading-character fix** on the
+/// live 929.9375 (3200-bps) channel.
+///
+/// Background: real FLEX alpha messages begin with a per-message header word and
+/// a signature word whose low 7 bits are a non-display **signature/checksum**
+/// byte. The decoder previously emitted that signature byte (and, when the vector
+/// pointed one word early, the whole header word) as a spurious leading symbol —
+/// e.g. `"□Subj:…"`, `":1:34 AM…"`, `"H2.KEN NAG…"`. The fix strips that
+/// message-level header/signature from the START so text begins at the first real
+/// character, WITHOUT blindly dropping the first char of every word. A small
+/// number of fully-garbled pages (random punctuation/case) are dropped by the
+/// tightened content gate rather than emitted as fake text.
+///
+/// This test asserts, on the real capture:
+///   1. Every emitted alpha page starts with a PRINTABLE character — none begins
+///      with a non-printable / obviously-spurious signature byte.
+///   2. The known real pages decode with the right leading text: a page starting
+///      `"Subj:"`, a page opening with a clock time `H:MM`, and a page starting
+///      `"KEN NAG"` — each at the message START, no leading junk.
+///   3. The aggregate alpha printable ratio is ≥ 0.95 (cleaner now that garbled
+///      pages are dropped).
+///   4. At least a few genuinely-readable multi-word pages still decode (the fix
+///      is not "drop everything").
+///
+/// Skips cleanly if the capture is absent.
+#[test]
+fn offair_9375_alpha_leading_char_and_gate() {
+    if !Path::new(CAP).exists() {
+        eprintln!("offair: {CAP} absent — skipping alpha leading-char acceptance");
+        return;
+    }
+    let iq = load_capture();
+    let (baud, frames) = run_auto(&iq, OFFSET_9375_HZ);
+    assert_eq!(baud, Some(3200), "929.9375 must auto-detect 3200 bps");
+
+    let alpha: Vec<&FlexFrame> = frames
+        .iter()
+        .filter(|f| f.kind == FlexKind::Alpha && !f.text.is_empty())
+        .collect();
+
+    for f in &alpha {
+        eprintln!("alpha cap={} text={:?}", f.capcode, f.text);
+    }
+
+    // (1) No emitted alpha page may start with a non-printable / spurious char —
+    // the spurious leading FLEX signature byte must be gone.
+    for f in &alpha {
+        let lead = f.text.chars().next().unwrap();
+        assert!(
+            (' '..='~').contains(&lead),
+            "alpha page starts with a spurious non-printable char {:#x}: {:?}",
+            lead as u32,
+            f.text
+        );
+        // A real page never opens on a control/ETX/signature byte.
+        assert!(
+            !lead.is_control(),
+            "alpha page starts with a control char: {:?}",
+            f.text
+        );
+    }
+
+    // (2) Known real pages decode with the correct leading text at the START.
+    assert!(
+        alpha.iter().any(|f| f.text.starts_with("Subj:")),
+        "expected a page starting exactly \"Subj:\" (signature byte stripped); got {:?}",
+        alpha.iter().map(|f| &f.text).collect::<Vec<_>>()
+    );
+    assert!(
+        alpha.iter().any(|f| starts_with_time(&f.text)),
+        "expected a page opening with a clock time H:MM (leading signature byte stripped); got {:?}",
+        alpha.iter().map(|f| &f.text).collect::<Vec<_>>()
+    );
+    assert!(
+        alpha.iter().any(|f| f.text.starts_with("KEN NAG")),
+        "expected a page starting \"KEN NAG\" (header word + signature byte stripped); got {:?}",
+        alpha.iter().map(|f| &f.text).collect::<Vec<_>>()
+    );
+
+    // (3) Aggregate alpha printable ratio ≥ 0.95 (garbled pages dropped → cleaner).
+    let printable: usize = alpha
+        .iter()
+        .flat_map(|f| f.text.chars())
+        .filter(|&c| c == '\n' || c == '\r' || c == '\t' || (' '..='~').contains(&c))
+        .count();
+    let total: usize = alpha.iter().map(|f| f.text.chars().count()).sum();
+    let ratio = printable as f64 / total.max(1) as f64;
+    assert!(
+        ratio >= 0.95,
+        "929.9375 aggregate alpha printable ratio {ratio:.4} < 0.95"
+    );
+
+    // (4) Still several genuinely-readable multi-word pages (not over-pruned).
+    let multiword = alpha
+        .iter()
+        .filter(|f| f.text.contains(' ') && f.text.chars().count() >= 12)
+        .count();
+    assert!(
+        multiword >= 3,
+        "expected several readable multi-word pages; got {multiword}"
+    );
+
+    // (5) The fully-garbled random-ASCII pages must NOT survive the gate: no
+    // emitted alpha page is a space-less wall of odd punctuation. (The historical
+    // garble e.g. "VH=P@3jE6lbAZMhFKVba[4>^>Hnnm99UkHFS`cHm".)
+    for f in &alpha {
+        let n = f.text.chars().count();
+        let junk = f
+            .text
+            .chars()
+            .filter(|&c| {
+                !(c.is_ascii_alphanumeric()
+                    || c == ' '
+                    || c == '\n'
+                    || c == '\r'
+                    || ".,:;/#-+*&%$@!?()[]'\"".contains(c))
+            })
+            .count();
+        assert!(
+            (junk as f64 / n.max(1) as f64) <= 0.15,
+            "garbled alpha page survived the gate: {:?}",
+            f.text
+        );
+    }
+}

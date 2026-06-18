@@ -131,6 +131,14 @@ impl FlexKind {
 /// the BIW → address → vector → message structure, and emits one [`FlexFrame`]
 /// per address that carried a page.
 pub fn decode_bits(bits: &[u8], baud: u32) -> Vec<FlexFrame> {
+    decode_bits_inner(bits, baud, false)
+}
+
+/// As [`decode_bits`], but `offair` selects the real-FLEX alpha header/signature
+/// handling (see [`decode_alpha_offair`]) for live channel decoding; the public
+/// [`decode_bits`] keeps the synthetic spec layout (text begins at the vector's
+/// first message word, no header) for the modulate→demod / hand-built-frame tests.
+fn decode_bits_inner(bits: &[u8], baud: u32, offair: bool) -> Vec<FlexFrame> {
     let mut out = Vec::new();
     let mut search_from = 0usize;
     while let Some((sync_off, inverted)) = demod::find_sync(&bits[search_from..], SYNC_MAX_ERR) {
@@ -153,7 +161,7 @@ pub fn decode_bits(bits: &[u8], baud: u32) -> Vec<FlexFrame> {
             continue;
         }
         let fiw_pos = abs + 32 + 16; // marker + 16-bit inverted-A
-        let frame = decode_frame(bits, fiw_pos, inverted, baud);
+        let frame = decode_frame(bits, fiw_pos, inverted, baud, offair);
         let consumed = 32 + 16 + (1 + frame::WORDS_PER_PHASE) * 32;
         out.extend(frame);
         let advance = (sync_off + consumed).max(32);
@@ -193,6 +201,14 @@ fn a_code_is_1600_2level(bits: &[u8], marker_pos: usize, inverted: bool) -> bool
 /// or 6400); a sync whose A-code resolves to a different rate is skipped so a
 /// 6400-channel does not mis-decode a 3200 burst.
 pub fn decode_symbols(syms: &[u8], expected_baud: u32) -> Vec<FlexFrame> {
+    decode_symbols_inner(syms, expected_baud, false)
+}
+
+/// As [`decode_symbols`], but `offair` selects the real-FLEX alpha
+/// header/signature handling for live single-rate 4-level channels (e.g. the
+/// 3200-bps 929.9375 channel). The public [`decode_symbols`] keeps the synthetic
+/// spec layout for the hand-built 4-FSK frame tests.
+fn decode_symbols_inner(syms: &[u8], expected_baud: u32, offair: bool) -> Vec<FlexFrame> {
     let mut out = Vec::new();
     // Sync hunt operates on the per-symbol sync bit (sym<2).
     let sync_bits: Vec<u8> = syms.iter().map(|&s| demod::symbol_sync_bit(s)).collect();
@@ -242,8 +258,14 @@ pub fn decode_symbols(syms: &[u8], expected_baud: u32) -> Vec<FlexFrame> {
                         }
                     }
                 }
-                let mut frames =
-                    decode_phase_words(fiw_word, fiw_fix, &words, &fixes, expected_baud);
+                let mut frames = decode_phase_inner(
+                    fiw_word,
+                    fiw_fix,
+                    &words,
+                    &fixes,
+                    expected_baud,
+                    offair,
+                );
                 out.append(&mut frames);
             }
         }
@@ -290,7 +312,13 @@ fn read_word(bits: &[u8], pos: usize, inverted: bool) -> Option<(u32, u32)> {
 }
 
 /// Decode one FLEX frame: FIW at `fiw_pos`, then the 88-word phase right after.
-fn decode_frame(bits: &[u8], fiw_pos: usize, inverted: bool, baud: u32) -> Vec<FlexFrame> {
+fn decode_frame(
+    bits: &[u8],
+    fiw_pos: usize,
+    inverted: bool,
+    baud: u32,
+    offair: bool,
+) -> Vec<FlexFrame> {
     // --- Frame Information Word ---
     let Some((fiw_word, fiw_fix)) = read_word(bits, fiw_pos, inverted) else {
         return Vec::new();
@@ -313,7 +341,7 @@ fn decode_frame(bits: &[u8], fiw_pos: usize, inverted: bool, baud: u32) -> Vec<F
             }
         }
     }
-    decode_phase_words(fiw_word, fiw_fix, &words, &fixes, baud)
+    decode_phase_inner(fiw_word, fiw_fix, &words, &fixes, baud, offair)
 }
 
 /// Fraction of `s` that is printable ASCII (incl. space / newline / CR / tab).
@@ -363,6 +391,57 @@ fn digit_ratio(s: &str) -> f64 {
     d as f64 / total as f64
 }
 
+/// Fraction of `s` that is **not** an ordinary message character. Ordinary =
+/// letters, digits, spaces, the embedded line breaks `\n`/`\r`, and the
+/// punctuation that real pages routinely carry (sentence/URL/ID punctuation).
+/// Random-ASCII garble (a BCH-false-correct of fill/noise) is dominated by the
+/// rarer symbols left out of this set (`^ > < ? \\ ~ { } |` backtick …), so its
+/// junk fraction is high while genuine text scores ~0.
+fn junk_ratio(s: &str) -> f64 {
+    let total = s.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let ordinary = s
+        .chars()
+        .filter(|&c| {
+            c.is_ascii_alphanumeric()
+                || c == ' '
+                || c == '\n'
+                || c == '\r'
+                || ".,:;/#-+*&%$@!?()[]'\"".contains(c)
+        })
+        .count();
+    1.0 - ordinary as f64 / total as f64
+}
+
+/// Maximum overall junk-character fraction tolerated in a live alpha body. Real
+/// pages score ~0; a fully-garbled random-ASCII page scores well above this.
+const MAX_ALPHA_JUNK: f64 = 0.15;
+
+/// A live alpha body that is long, carries NO word-separating space, AND has any
+/// junk punctuation at all is structureless random ASCII, not human text. Real
+/// no-space tokens (URLs, IDs) score 0 junk and survive; a multi-word message has
+/// spaces and survives. Below this length a body is too short to judge by
+/// structure, so it is left to the printable-ratio + junk-ratio checks.
+const MIN_STRUCTURELESS_LEN: usize = 16;
+const MAX_STRUCTURELESS_JUNK: f64 = 0.05;
+
+/// True iff a LIVE alpha body reads as random-ASCII garble rather than human
+/// text. Two independent tells, either of which condemns the page:
+///   1. overall junk-character fraction over [`MAX_ALPHA_JUNK`];
+///   2. a long body with NO space and more than [`MAX_STRUCTURELESS_JUNK`] junk
+///      (structureless — words run together with scattered odd symbols).
+fn alpha_is_garble(text: &str) -> bool {
+    let junk = junk_ratio(text);
+    if junk > MAX_ALPHA_JUNK {
+        return true;
+    }
+    let len = text.chars().count();
+    let has_space = text.chars().any(|c| c == ' ');
+    len >= MIN_STRUCTURELESS_LEN && !has_space && junk > MAX_STRUCTURELESS_JUNK
+}
+
 /// Decide whether a fully-decoded page is trustworthy enough to emit, applying
 /// the shared garbage-rejection gate: sane capcode, clean BCH, and validated
 /// body content. `offair` selects the stricter rules for the off-air 4-level
@@ -393,6 +472,11 @@ fn page_is_trustworthy(capcode: u32, kind: FlexKind, text: &str, fec: u32, offai
             // The off-air search can fake a few printable chars; require a real
             // run before trusting it.
             if offair && text.chars().filter(|c| !c.is_control()).count() < 6 {
+                return false;
+            }
+            // Live pages that survive the printable gate but read as random-ASCII
+            // garble (no word structure / heavy odd punctuation) are dropped.
+            if offair && alpha_is_garble(text) {
                 return false;
             }
             true
@@ -443,27 +527,14 @@ fn viw_message_window(viw: u32, n_words: usize) -> Option<(usize, usize)> {
     Some((mw1, len))
 }
 
-/// Decode one already-assembled FLEX phase given the (corrected) FIW word and
-/// its 88 (corrected) phase words + per-word BCH fix counts.
-///
-/// This is the shared core for both the 1600-bps 2-FSK bit-stream path
-/// ([`decode_frame`]) and the 4-FSK de-interleaved phase path
-/// ([`decode_symbols`]): both produce a corrected FIW and 88 corrected words, so
-/// the BIW → address → vector → message walk lives here. Emits only pages that
-/// pass [`page_is_trustworthy`]; idle/fill address words are skipped.
-fn decode_phase_words(
-    fiw_word: u32,
-    fiw_fix: u32,
-    words: &[u32],
-    fixes: &[u32],
-    baud: u32,
-) -> Vec<FlexFrame> {
-    decode_phase_inner(fiw_word, fiw_fix, words, fixes, baud, false)
-}
-
-/// Shared phase walker for the synthetic ([`decode_alpha`]) and off-air
-/// ([`decode_alpha_offair`]) alpha-body layouts. `offair` selects the real-FLEX
-/// per-message header-word + fragment-flag-char handling.
+/// Shared phase walker, the decode core for every path: the 1600-bps 2-FSK
+/// bit-stream ([`decode_frame`]), the 4-FSK de-interleaved phases
+/// ([`decode_symbols`]), and the off-air recovery ([`decode_recovered_frames`]).
+/// Each produces a corrected FIW + 88 corrected words, so the BIW → address →
+/// vector → message walk lives here. Emits only pages that pass
+/// [`page_is_trustworthy`]; idle/fill address words are skipped. `offair` selects
+/// the real-FLEX alpha header/signature body decode ([`decode_alpha_offair`])
+/// over the synthetic spec layout ([`frame::decode_alpha`]).
 fn decode_phase_inner(
     fiw_word: u32,
     fiw_fix: u32,
@@ -608,31 +679,92 @@ fn decode_recovered_frames(
     out
 }
 
-/// Decode a real-FLEX alphanumeric body. The FIRST word of the body
-/// (`words[0]`) is a per-message **header** carrying fragment (bits 11..=12) and
-/// continuation (bit 10) flags — NOT text. Text starts at `words[1]`; the very
-/// first text character is a fragment-check byte that is dropped when the
-/// fragment field == 0x03. (multimon-ng `parse_alphanumeric`.) Remaining 7-bit
-/// chars decode as usual (0x03 ETX separators dropped, trailing control trimmed).
+/// True for a 7-bit value that is a real, display-text alphanumeric character
+/// (printable ASCII, or the line breaks `\n` / `\r` that FLEX pages embed).
+/// Used to tell a genuine text character from a header/signature/control byte.
+fn is_text_char(ch: u8) -> bool {
+    ch == b'\n' || ch == b'\r' || (0x20..=0x7e).contains(&ch)
+}
+
+/// Decode a **real-FLEX alphanumeric** message body per the documented FLEX
+/// alphanumeric **vector format** — the off-air layout the synthetic spec frames
+/// omit. (Clean-room from the published FLEX message structure; NOT a port of any
+/// GPL decoder.)
+///
+/// The codewords the alpha vector points at are, in order:
+///
+/// 1. a **message header word** — fragment number (bits 11..=12), a
+///    message-continued flag (bit 10), the message number (bits 13..=18),
+///    retrieval / mail-drop flags (bits 19, 20), and a 10-bit **fragment check**
+///    (bits 0..=9). It carries NO display text and is dropped whole;
+/// 2. a **signature word** — a 7-bit **signature/checksum** byte in bits 0..=6
+///    (NOT display text) plus the message's first **two** text characters in
+///    bits 7..=13 and 14..=20;
+/// 3. zero or more **content words** — three 7-bit characters each.
+///
+/// The single spurious leading symbol seen on live alpha pages is exactly that
+/// signature byte (and, when the vector points one word early, the header word
+/// ahead of it). We therefore drop the message-level header/signature symbol from
+/// the START and begin text at the real first character — WITHOUT blindly
+/// dropping the first character of every word.
+///
+/// Robustness: a live `mw1` is observed to point either at the header word or
+/// directly at the signature word. We resolve this from content — the signature
+/// word's two text characters are real display text, whereas a header word's two
+/// "text" positions decode to control/NUL — so a leading word whose kept
+/// characters are not display text is treated as the header and skipped.
+///
+/// The body ends at the first `0x03` (ETX) message terminator; trailing control /
+/// pad bytes after it (and any that survive) are trimmed. This also prevents an
+/// over-long VIW `len` from bleeding the next message's text into this one.
 fn decode_alpha_offair(words: &[u32]) -> String {
-    if words.len() < 2 {
+    if words.is_empty() {
         return String::new();
     }
-    let frag = (words[0] >> 11) & 0x03;
+
+    // Resolve where the signature word sits. `words[0]` is the first word the
+    // vector points at: either the message header (skip whole) or already the
+    // signature word. The signature word carries the first two display
+    // characters in its upper 14 bits; a header word's upper-14 positions are
+    // control/NUL. So if `words[0]`'s two kept characters are NOT both real
+    // text, treat `words[0]` as the header and start at `words[1]`.
+    let chars_of = |w: u32| {
+        let d = w & 0x001F_FFFF;
+        [
+            (d & 0x7F) as u8,
+            ((d >> 7) & 0x7F) as u8,
+            ((d >> 14) & 0x7F) as u8,
+        ]
+    };
+    let first = chars_of(words[0]);
+    let sig_idx = if is_text_char(first[1]) && is_text_char(first[2]) {
+        0 // words[0] is the signature word (its upper two chars are real text)
+    } else {
+        1 // words[0] is the header word; the signature word follows
+    };
+    if sig_idx >= words.len() {
+        return String::new();
+    }
+
     let mut out = String::new();
-    for (wi, &w) in words[1..].iter().enumerate() {
+    // ETX (0x03) terminates the message; stop emitting at the first one.
+    'outer: for (k, &w) in words[sig_idx..].iter().enumerate() {
         let data = w & 0x001F_FFFF;
         for c in 0..3 {
-            if wi == 0 && c == 0 && frag == 0x03 {
+            // Drop the signature byte: char 0 of the signature word (k == 0,
+            // c == 0). It is a checksum symbol, not display text.
+            if k == 0 && c == 0 {
                 continue;
             }
             let ch = ((data >> (c * 7)) & 0x7F) as u8;
-            if ch != 0x03 {
-                out.push(ch as char);
+            if ch == 0x03 {
+                break 'outer;
             }
+            out.push(ch as char);
         }
     }
-    while matches!(out.chars().last(), Some(c) if (c as u32) < 0x20) {
+    // Trim any trailing control / pad bytes (e.g. 0x7F fill after the ETX).
+    while matches!(out.chars().last(), Some(c) if !is_text_char(c as u8) || c == '\u{7f}') {
         out.pop();
     }
     out
@@ -684,6 +816,11 @@ struct Lane {
     /// Sync 1 + FIW at 1600 sym/s and DATA at the mode rate, a transition no
     /// single demod handles — so buffer channel IQ and recover per frame.
     offair_4level: bool,
+    /// True for a LIVE off-air lane (the auto-detect path): its alpha bodies carry
+    /// the real-FLEX per-message header + signature word, which must be stripped
+    /// ([`decode_alpha_offair`]). Fixed-rate lanes (the synthetic modulate→demod
+    /// and hand-built-frame tests, whose frames omit the header) stay synthetic.
+    live: bool,
     iq: Vec<Complex<f32>>,
     iq_scanned_to: usize,
     level: f32,
@@ -692,7 +829,7 @@ struct Lane {
 impl Lane {
     /// A fixed-rate lane: 2-level NRZ bits, or single-rate 4-level symbols.
     fn new(baud: u32) -> Self {
-        Self::build(baud, false)
+        Self::build(baud, false, false)
     }
 
     /// An auto-path lane. The off-air two-clock recovery is needed ONLY for
@@ -705,10 +842,10 @@ impl Lane {
     /// checksum-clean FIW, so the lane never locks).
     fn new_auto(baud: u32) -> Self {
         let mode = demod::FlexMode::from_baud(baud).expect("validated baud");
-        Self::build(baud, mode.levels == 4 && mode.sym_rate != 1600)
+        Self::build(baud, mode.levels == 4 && mode.sym_rate != 1600, true)
     }
 
-    fn build(baud: u32, offair_4level: bool) -> Self {
+    fn build(baud: u32, offair_4level: bool, live: bool) -> Self {
         // `baud` is pre-validated by the caller (FlexMode::from_baud).
         let mode = demod::FlexMode::from_baud(baud).expect("validated baud");
         let (bit_demod, sym_demod) = if mode.levels == 2 {
@@ -726,6 +863,7 @@ impl Lane {
             stream: Vec::new(),
             scanned_to: 0,
             offair_4level,
+            live,
             iq: Vec::new(),
             iq_scanned_to: 0,
             level: 0.0,
@@ -768,13 +906,13 @@ impl Lane {
         if self.mode.levels == 2 {
             let overlap = 32 + 16 + (1 + frame::WORDS_PER_PHASE) * 32;
             let start = self.scanned_to.saturating_sub(overlap);
-            let d = decode_bits(&self.stream[start..], self.baud);
+            let d = decode_bits_inner(&self.stream[start..], self.baud, self.live);
             self.scanned_to = self.stream.len();
             d
         } else {
             let overlap = 64 + 48 + 80 + demod::data_symbols(self.mode.sym_rate);
             let start = self.scanned_to.saturating_sub(overlap);
-            let d = decode_symbols(&self.stream[start..], self.baud);
+            let d = decode_symbols_inner(&self.stream[start..], self.baud, self.live);
             self.scanned_to = self.stream.len();
             d
         }
@@ -1036,6 +1174,90 @@ pub fn to_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pack a FLEX alpha word: char0 (bits 0..=6), char1 (7..=13), char2 (14..=20).
+    fn alpha_word(c0: u8, c1: u8, c2: u8) -> u32 {
+        ((c0 & 0x7F) as u32) | (((c1 & 0x7F) as u32) << 7) | (((c2 & 0x7F) as u32) << 14)
+    }
+
+    /// Build a documented FLEX alpha message body: a header word, a signature word
+    /// (low-7 = signature byte, upper 14 = first two text chars), then content
+    /// words (3 chars each). `sig_byte` is the non-display signature/checksum.
+    fn alpha_body(header_frag: u32, sig_byte: u8, text: &str) -> Vec<u32> {
+        let bytes = text.as_bytes();
+        // Header word: fragment number in bits 11..=12 (rest zero is fine here).
+        let header = (header_frag & 0x3) << 11;
+        // Signature word carries the first two text chars in its upper 14 bits.
+        let c0 = *bytes.first().unwrap_or(&0x03);
+        let c1 = *bytes.get(1).unwrap_or(&0x03);
+        let sig = ((sig_byte & 0x7F) as u32) | (((c0 & 0x7F) as u32) << 7) | (((c1 & 0x7F) as u32) << 14);
+        let mut body = vec![header, sig];
+        // Remaining chars, 3 per content word, ETX-terminated then padded.
+        let mut rest: Vec<u8> = bytes[bytes.len().min(2)..].to_vec();
+        rest.push(0x03); // ETX terminator
+        while !rest.len().is_multiple_of(3) {
+            rest.push(0x03);
+        }
+        for ch in rest.chunks(3) {
+            body.push(alpha_word(ch[0], ch[1], ch[2]));
+        }
+        body
+    }
+
+    /// The off-air alpha decoder drops the leading message HEADER word and the
+    /// signature byte, so text begins at the first REAL character — never at the
+    /// spurious signature/header symbol the live decoder used to emit.
+    #[test]
+    fn alpha_offair_strips_header_and_signature() {
+        // Vector points at the HEADER word; signature word follows.
+        let body = alpha_body(3, b'!', "KEN NAG 2");
+        assert_eq!(decode_alpha_offair(&body), "KEN NAG 2");
+
+        // Vector points DIRECTLY at the signature word (no separate header word):
+        // its two upper chars are real text, so only the signature byte is dropped.
+        let sig = alpha_word(b'%', b'1', b'1'); // sig byte '%', chars "11"
+        let mut direct = vec![sig];
+        for ch in [alpha_word(b':', b'5', b'0'), alpha_word(0x03, 0x03, 0x03)] {
+            direct.push(ch);
+        }
+        assert_eq!(decode_alpha_offair(&direct), "11:50");
+    }
+
+    /// The body terminates at the first ETX (0x03): an over-long VIW length that
+    /// runs into the next message's words must NOT bleed that text in.
+    #[test]
+    fn alpha_offair_terminates_at_etx_no_bleed() {
+        let mut body = alpha_body(3, b'#', "HELLO"); // ends with ETX after "HELLO"
+        // Append junk "words" from a following message — must be ignored.
+        body.push(alpha_word(b'X', b'Y', b'Z'));
+        body.push(alpha_word(b'Q', b'Q', b'Q'));
+        assert_eq!(decode_alpha_offair(&body), "HELLO");
+    }
+
+    /// The synthetic [`frame::decode_alpha`] (no header) and the off-air decoder
+    /// (header + signature) must NOT be confused: synthetic text begins at word 0
+    /// char 0, so applying header stripping to it would lose characters. This
+    /// guards the routing (live lanes → offair; fixed/synthetic lanes → plain).
+    #[test]
+    fn synthetic_alpha_keeps_first_char() {
+        let words = [alpha_word(b'H', b'I', b'!')];
+        assert_eq!(frame::decode_alpha(&words), "HI!");
+    }
+
+    /// The live garble gate drops random-ASCII bodies (no word structure / heavy
+    /// odd punctuation) but keeps real human text — including no-space tokens
+    /// (URLs/IDs) that score zero junk.
+    #[test]
+    fn alpha_garble_gate_separates_text_from_noise() {
+        // Real multi-word message: kept.
+        assert!(!alpha_is_garble("KEN NAG 2 #160754 [AZ6/3811]"));
+        assert!(!alpha_is_garble("Subj:Logistics Technician Escalation"));
+        // Real no-space token (zero junk): kept.
+        assert!(!alpha_is_garble("https://example.com/path?id=12345"));
+        // Fully-garbled random ASCII: dropped (heavy odd punctuation + no spaces).
+        assert!(alpha_is_garble("VH=P@3jE6lbAZMhFKVba[4>^>Hnnm99UkHFS`cHm"));
+        assert!(alpha_is_garble("[j:LiG>7?^MbLRS`AU=4T>KZdO:PcC[m\\MBmbT"));
+    }
 
     #[test]
     fn channel_rate_is_integer_bit_multiple() {
