@@ -922,7 +922,7 @@ function render() {
     const srcs = a.sources ? Object.values(a.sources) : [];
     ents.push({
       k: 'a' + id, id, type: 'aircraft', lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
-      color: altColor(a.alt), name: `${ic('✈')}${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
+      color: altColor(a.alt), name: `${ic('✈️')}${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
       sv: { id, flight: a.flight || '', icao: a.icao || '', reg: a.reg || '', type: a.actype || '', alt: a.alt, kt: a.spd, msgs: a.msgs || 0, seen: a.seen || 0 },
       cols: [escapeHtml(a.flight || ''), escapeHtml(a.icao || ''), escapeHtml(a.reg || ''), escapeHtml(a.actype || ''), a.alt ?? '', a.spd ?? '', a.msgs ?? ''],
       f: { flight: escapeHtml(a.flight || ''), icao: escapeHtml(a.icao || ''), reg: escapeHtml(a.reg || ''), type: escapeHtml(a.actype || ''), alt: a.alt ?? '', kt: a.spd ?? '', msgs: a.msgs ?? '' },
@@ -932,7 +932,7 @@ function render() {
     const m = shipMeta(v.shiptype);
     ents.push({
       k: 'v' + v.mmsi, id: String(v.mmsi), type: 'vessel', lat: v.lat ?? null, lon: v.lon ?? null, srcs: [], expandable: false,
-      color: m.color, name: `${ic('⚓')}${escapeHtml((v.name || String(v.mmsi)).trim())}`, seen: v.seen,
+      color: m.color, name: `${ic('🚢')}${escapeHtml((v.name || String(v.mmsi)).trim())}`, seen: v.seen,
       sv: { id: v.name || String(v.mmsi), flight: '', icao: '', reg: v.country || '', type: m.label || '', alt: undefined, kt: v.sog, msgs: undefined, seen: v.seen || 0 },
       cols: ['', '', escapeHtml(v.country || ''), escapeHtml(m.label || ''), '', v.sog ?? '', ''],
       f: { mmsi: v.mmsi, country: escapeHtml(v.country || ''), type: escapeHtml(m.label || ''), kt: v.sog ?? '', msgs: v.msgs ?? '' },
@@ -985,9 +985,9 @@ function render() {
   const TABS = [
     { key: 'all', label: 'All', types: null,
       cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
-    { key: 'aircraft', label: '✈ Aircraft', types: ['aircraft'],
+    { key: 'aircraft', label: '✈️ Aircraft', types: ['aircraft'],
       cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
-    { key: 'ships', label: '⚓ Ships', types: ['vessel'],
+    { key: 'ships', label: '🚢 Ships', types: ['vessel'],
       cols: [['mmsi', 'mmsi', 1], ['country', 'country'], ['type', 'type'], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
     { key: 'beacons', label: '🎈 Beacons', types: ['beacon'],
       cols: [['id', 'id'], ['type', 'type'], ['alt', 'alt', 1], ['msgs', 'msgs', 1]] },
