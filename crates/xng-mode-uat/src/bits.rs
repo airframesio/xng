@@ -24,12 +24,14 @@ impl<'a> BitReader<'a> {
     }
 
     /// Single bit at 1-based (`byte`, `bit`). `bit` is 1..=8, MSB-first.
+    /// Reads past the end of the payload return `false` rather than panicking:
+    /// a short/misclassified burst must never crash the decode worker.
     pub fn bit(&self, byte: usize, bit: usize) -> bool {
         debug_assert!(byte >= 1 && (1..=8).contains(&bit));
         let bi = (byte - 1) * 8 + bit - 1;
         let by = bi >> 3;
         let mask = 1u8 << (7 - (bi & 7));
-        (self.payload[by] & mask) != 0
+        (self.payload.get(by).copied().unwrap_or(0) & mask) != 0
     }
 
     /// Inclusive bit range `[first_byte.first_bit .. last_byte.last_bit]`
@@ -46,7 +48,9 @@ impl<'a> BitReader<'a> {
         for i in fbi..=lbi {
             let by = i >> 3;
             let mask = 1u8 << (7 - (i & 7));
-            acc = (acc << 1) | u32::from((self.payload[by] & mask) != 0);
+            // Out-of-range bytes read as 0: a short/misclassified burst (a field
+            // whose last_byte exceeds the payload) must not panic the worker.
+            acc = (acc << 1) | u32::from((self.payload.get(by).copied().unwrap_or(0) & mask) != 0);
         }
         acc
     }
@@ -55,6 +59,20 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_past_end_do_not_panic() {
+        // A short/misclassified burst: reading a field whose last_byte exceeds
+        // the payload must yield 0 for the missing bytes, never panic the
+        // decode worker (regression: bits.rs:49 indexed self.payload directly).
+        let p = [0xABu8, 0xCD];
+        let r = BitReader::new(&p);
+        // Wholly out of range → 0.
+        assert_eq!(r.bits(5, 1, 6, 8), 0);
+        assert!(!r.bit(9, 1));
+        // Straddling the end: first byte present, rest read as 0.
+        assert_eq!(r.bits(2, 1, 4, 8), 0x00cd_0000);
+    }
 
     #[test]
     fn hdr_fields_match_dump978_addressing() {
