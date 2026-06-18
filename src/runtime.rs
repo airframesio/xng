@@ -588,19 +588,25 @@ fn session_descriptor(
     center_hz: u64,
     channels_hz: &[u64],
     sample_rate: f64,
+    receiver_pos: Option<(f64, f64)>,
 ) -> serde_json::Value {
     let (selector, serial) = match sdr {
         Some(s) => (s.id.clone(), s.serial.clone().or_else(|| parse_serial(&s.id))),
         None => ("file".to_string(), None),
     };
-    serde_json::json!({
+    let mut d = serde_json::json!({
         "sdr": selector,
         "serial": serial,
         "mode": mode.as_str(),
         "center_mhz": center_hz as f64 / 1e6,
         "channels": channels_hz.iter().map(|c| *c as f64 / 1e6).collect::<Vec<_>>(),
         "sample_rate": sample_rate,
-    })
+    });
+    // Receiver position (from `receiver-pos`) so the dashboard can pin the station.
+    if let Some((lat, lon)) = receiver_pos {
+        d["receiver_pos"] = serde_json::json!([lat, lon]);
+    }
+    d
 }
 
 /// Pull `serial=…` out of a SoapySDR-style selector string.
@@ -778,8 +784,14 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 }
             });
         }
-        let desc =
-            vec![session_descriptor(&cfg.sdr, cfg.mode, capture_center, &cfg.channels_hz, sample_rate)];
+        let desc = vec![session_descriptor(
+            &cfg.sdr,
+            cfg.mode,
+            capture_center,
+            &cfg.channels_hz,
+            sample_rate,
+            cfg.receiver_pos,
+        )];
         let output_tasks = spawn_outputs(&bus, &cfg.outputs, &station, &desc);
 
         // Ctrl-C / SIGTERM → graceful stop, second signal forces quit.
@@ -1003,6 +1015,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
             capture_center,
             &cfg.channels_hz,
             sample_rate,
+            cfg.receiver_pos,
         ));
         prepared.push(Prepared { source, decoders, cfg, capture_center });
     }

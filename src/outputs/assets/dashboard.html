@@ -135,6 +135,7 @@
   #sdrbody .dot.dead { background: #f7768e; }
   /* Fixed-width icons so layer-control rows align despite emoji width. */
   .lyr-ic { display: inline-block; width: 1.5em; text-align: center; font-style: normal; }
+  .rx-ic { font-size: 17px; text-align: center; line-height: 22px; filter: drop-shadow(0 0 3px #000); }
 </style>
 </head>
 <body>
@@ -232,6 +233,20 @@ function buildLayerControl(s) {
   if (showAllTrails) trailLayer.addTo(map);
   L.control.layers(null, overlays, { position: 'topright', collapsed: false }).addTo(map);
   layerControlBuilt = true;
+}
+
+// Pin the receiver/station location on the map when any session reports a
+// receiver-pos (from the `receiver-pos` config). One marker, updated in place.
+let receiverMarker = null;
+function renderReceiver(s) {
+  const sess = (s.sessions || []).find(x => Array.isArray(x.receiver_pos) && x.receiver_pos.length === 2);
+  if (!sess) { if (receiverMarker) { map.removeLayer(receiverMarker); receiverMarker = null; } return; }
+  const [lat, lon] = sess.receiver_pos;
+  if (receiverMarker) { receiverMarker.setLatLng([lat, lon]); return; }
+  const icon = L.divIcon({ className: 'rx-ic', html: '📡', iconSize: [22, 22], iconAnchor: [11, 11] });
+  receiverMarker = L.marker([lat, lon], { icon, zIndexOffset: 1000, interactive: true })
+    .addTo(map)
+    .bindTooltip(`Receiver ${lat.toFixed(4)}, ${lon.toFixed(4)}`, { direction: 'top', className: 'lbl' });
 }
 
 map.on('overlayadd overlayremove', e => {
@@ -793,8 +808,12 @@ function upsert(key, lat, lon, icon, label, popup, trail, color, layer) {
   // it tracks selection independently; removed when neither condition holds.
   const wantTrail = (showAllTrails || selected === key) && trail && trail.length > 1;
   if (wantTrail) {
-    if (e.trail) e.trail.setLatLngs(trail);
-    else e.trail = L.polyline(trail, { color, weight: 1.5, opacity: 0.6 }).addTo(map);
+    // Unwrap longitudes around the current position so a trail crossing the
+    // ±180° antimeridian draws continuously instead of streaking across the
+    // whole map (same fix the Iridium satellite trails already use).
+    const tr = unwrapTrail(trail, lon);
+    if (e.trail) e.trail.setLatLngs(tr);
+    else e.trail = L.polyline(tr, { color, weight: 1.5, opacity: 0.6 }).addTo(map);
   } else if (e.trail) {
     map.removeLayer(e.trail);
     e.trail = null;
@@ -913,6 +932,7 @@ function render() {
   const s = state;
   if (!s) return;
   buildLayerControl(s); // builds once, with only the relevant overlays
+  renderReceiver(s);    // pin the station location if receiver-pos is configured
   markers.forEach(e => e.alive = false);
   const pts = [];
 
