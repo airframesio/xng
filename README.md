@@ -466,7 +466,7 @@ Every mode and every command shares the same output options:
 --json                                         # raw JSON to stdout
 --jsonl messages.jsonl                         # JSONL file
 --metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels)
---sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S)
+--sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S + UAT/HFDL positions)
 --beast 0.0.0.0:30005                          # Beast binary TCP (Mode S)
 --nmea-tcp 0.0.0.0:10110                       # NMEA AIVDM TCP (AIS)
 --mqtt mqtt://user:pass@broker:1883            # MQTT (JSON to <prefix>/<mode>)
