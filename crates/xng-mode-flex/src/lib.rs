@@ -242,7 +242,8 @@ pub fn decode_symbols(syms: &[u8], expected_baud: u32) -> Vec<FlexFrame> {
                         }
                     }
                 }
-                let mut frames = decode_phase_words(fiw_word, fiw_fix, &words, &fixes, expected_baud);
+                let mut frames =
+                    decode_phase_words(fiw_word, fiw_fix, &words, &fixes, expected_baud);
                 out.append(&mut frames);
             }
         }
@@ -315,13 +316,141 @@ fn decode_frame(bits: &[u8], fiw_pos: usize, inverted: bool, baud: u32) -> Vec<F
     decode_phase_words(fiw_word, fiw_fix, &words, &fixes, baud)
 }
 
+/// Fraction of `s` that is printable ASCII (incl. space / newline / CR / tab).
+/// An empty string is treated as fully printable (tone pages have no body).
+fn printable_ratio(s: &str) -> f64 {
+    let total = s.chars().count();
+    if total == 0 {
+        return 1.0;
+    }
+    let ok = s
+        .chars()
+        .filter(|&c| c == '\n' || c == '\r' || c == '\t' || (' '..='~').contains(&c))
+        .count();
+    ok as f64 / total as f64
+}
+
+/// Minimum printable-ASCII fraction for an alpha/binary page body to be emitted.
+/// Genuine FLEX alpha pages are essentially all printable; a body below this is
+/// a slicer/BCH-false-correct misread of fill/noise and is DROPPED, not guessed.
+const MIN_ALPHA_PRINTABLE: f64 = 0.90;
+
+/// Minimum fraction of a numeric body that must be actual digits (0–9). The FLEX
+/// numeric table maps every 4-bit value to *some* glyph, so a fill/noise body
+/// "decodes" to a printable string of mostly `[ ] U -` filler; a real numeric
+/// page is digit-dominant.
+const MIN_NUMERIC_DIGITS: f64 = 0.60;
+
+/// Maximum total BCH corrections (FIW + address + vector + message words)
+/// tolerated. Real pages correct a handful of bits at most; the garbage frames
+/// false-correct fill into plausible words at 15–30 corrections.
+const MAX_PAGE_FEC: u32 = 12;
+
+/// Stricter BCH-correction cap for the off-air decode-directed path. Its symbol
+/// search manufactures structurally-valid words from fill/noise, and those carry
+/// HIGH correction counts; a genuine page recovered at the true timing corrects
+/// almost nothing. Holding the manufacturing path to ≤4 total flips suppresses
+/// the noise pages while leaving cleanly-recovered real pages.
+const MAX_OFFAIR_PAGE_FEC: u32 = 4;
+
+/// Fraction of a numeric body that is ASCII digits.
+fn digit_ratio(s: &str) -> f64 {
+    let total = s.chars().count();
+    if total == 0 {
+        return 0.0;
+    }
+    let d = s.chars().filter(|c| c.is_ascii_digit()).count();
+    d as f64 / total as f64
+}
+
+/// Decide whether a fully-decoded page is trustworthy enough to emit, applying
+/// the shared garbage-rejection gate: sane capcode, clean BCH, and validated
+/// body content. `offair` selects the stricter rules for the off-air 4-level
+/// decode-directed recovery, whose symbol search can *manufacture* a
+/// structurally-valid address + VIW out of fill/noise — so a page from that path
+/// must carry a real, content-validated MESSAGE BODY (a long printable-ASCII
+/// alpha run or a digit-dominant numeric run) to be believed. A bodyless
+/// tone-only page has no content to validate and is therefore NOT emitted from
+/// the off-air path (it remains valid on the synthetic / 1600-bit and single-rate
+/// symbol paths, where words are demodulated directly rather than searched).
+fn page_is_trustworthy(capcode: u32, kind: FlexKind, text: &str, fec: u32, offair: bool) -> bool {
+    if !frame::capcode_in_range(capcode) {
+        return false;
+    }
+    let fec_cap = if offair {
+        MAX_OFFAIR_PAGE_FEC
+    } else {
+        MAX_PAGE_FEC
+    };
+    if fec > fec_cap {
+        return false;
+    }
+    match kind {
+        FlexKind::Alpha => {
+            if printable_ratio(text) < MIN_ALPHA_PRINTABLE {
+                return false;
+            }
+            // The off-air search can fake a few printable chars; require a real
+            // run before trusting it.
+            if offair && text.chars().filter(|c| !c.is_control()).count() < 6 {
+                return false;
+            }
+            true
+        }
+        FlexKind::Numeric => {
+            // Numeric bodies always "look" printable; gate on digit dominance.
+            !offair || digit_ratio(text) >= MIN_NUMERIC_DIGITS
+        }
+        FlexKind::Tone => {
+            // A bodyless page is unverifiable; the manufacturing off-air path
+            // must not emit it.
+            !offair
+        }
+    }
+}
+
+/// Validate the FIW + BIW that frame the phase. Returns `Some((aoff, voff))` if
+/// the frame structure is sane enough to walk, else `None` (drop the phase).
+///
+/// Gates (multimon-ng `decode_fiw` / `decode_biw` + idle handling): the FIW
+/// mod-16 checksum must verify, and the BIW address/vector offsets must satisfy
+/// `1 ≤ aoff ≤ voff ≤ 88` with `voff` inside the phase.
+fn phase_frame_bounds(
+    fiw: &frame::Fiw,
+    biw: &frame::Biw,
+    n_words: usize,
+) -> Option<(usize, usize)> {
+    if !fiw.checksum_ok {
+        return None;
+    }
+    let aoff = biw.address_offset;
+    let voff = biw.vector_offset;
+    if aoff == 0 || voff == 0 || aoff > voff || voff > n_words {
+        return None;
+    }
+    Some((aoff, voff))
+}
+
+/// Read a VIW's message-start / length fields, validating they point inside the
+/// phase. Returns `Some((mw_start, len))` or `None` if the VIW is invalid
+/// (multimon-ng: reject `mw1 == 0`, `mw1 > 87`, or a body running past word 88).
+fn viw_message_window(viw: u32, n_words: usize) -> Option<(usize, usize)> {
+    let mw1 = ((viw >> 7) & 0x7F) as usize;
+    let len = ((viw >> 14) & 0x7F) as usize;
+    if mw1 == 0 || mw1 >= n_words || mw1.saturating_add(len) > n_words {
+        return None;
+    }
+    Some((mw1, len))
+}
+
 /// Decode one already-assembled FLEX phase given the (corrected) FIW word and
 /// its 88 (corrected) phase words + per-word BCH fix counts.
 ///
 /// This is the shared core for both the 1600-bps 2-FSK bit-stream path
 /// ([`decode_frame`]) and the 4-FSK de-interleaved phase path
 /// ([`decode_symbols`]): both produce a corrected FIW and 88 corrected words, so
-/// the BIW → address → vector → message walk lives here.
+/// the BIW → address → vector → message walk lives here. Emits only pages that
+/// pass [`page_is_trustworthy`]; idle/fill address words are skipped.
 fn decode_phase_words(
     fiw_word: u32,
     fiw_fix: u32,
@@ -329,78 +458,111 @@ fn decode_phase_words(
     fixes: &[u32],
     baud: u32,
 ) -> Vec<FlexFrame> {
+    decode_phase_inner(fiw_word, fiw_fix, words, fixes, baud, false)
+}
+
+/// Shared phase walker for the synthetic ([`decode_alpha`]) and off-air
+/// ([`decode_alpha_offair`]) alpha-body layouts. `offair` selects the real-FLEX
+/// per-message header-word + fragment-flag-char handling.
+fn decode_phase_inner(
+    fiw_word: u32,
+    fiw_fix: u32,
+    words: &[u32],
+    fixes: &[u32],
+    baud: u32,
+    offair: bool,
+) -> Vec<FlexFrame> {
     let mut out = Vec::new();
-    let fiw = frame::parse_fiw(fiw_word);
     if words.is_empty() {
         return out;
     }
-
-    // --- Block Information Word = phase word 0 ---
+    let fiw = frame::parse_fiw(fiw_word);
     let biw = frame::parse_biw(words[0]);
-    let aoff = biw.address_offset;
-    let voff = biw.vector_offset;
-    if aoff >= words.len() || voff == 0 || voff > words.len() {
+    let Some((aoff, voff)) = phase_frame_bounds(&fiw, &biw, words.len()) else {
         return out;
-    }
+    };
 
     // Address words run from `aoff` up to (but not including) `voff`.
     let addr_end = voff.min(words.len());
     let mut i = aoff;
     while i < addr_end {
         let aw1 = words[i];
-        if aw1 == 0 {
+        // Skip idle/fill codewords (all-zeros / all-ones) — not addresses.
+        if frame::is_idle_word(aw1) {
             i += 1;
             continue;
         }
-        let addr = frame::decode_short_address(aw1);
-        // Vector word for address i is at voff + (i - aoff).
+        // The vector word for the address at `i` sits at voff + (i - aoff).
         let vidx = voff + (i - aoff);
         if vidx >= words.len() {
             break;
         }
+        // Long addresses consume a SECOND word (aw2); supply it (and advance
+        // past it) so it is not re-read as another address.
+        let aw2 = words.get(i + 1).copied().unwrap_or(0);
+        let addr = frame::decode_address(aw1, aw2);
+        let consumed = if addr.long { 2 } else { 1 };
+
         let viw = words[vidx];
         let page_type = PageType::from_viw(viw);
 
         // FEC budget so far for this page: FIW + address + vector words.
         let mut fec = fiw_fix + fixes[i] + fixes[vidx];
+        if addr.long {
+            fec += fixes.get(i + 1).copied().unwrap_or(0);
+        }
         let mut raw_words = vec![fiw_word, aw1, viw];
 
-        // Message words: the VIW carries a word pointer + count into the phase
-        // for the message body. VIW bits 7..=13 = start word, 14..=20 = word
-        // count (per the FLEX numeric/alphanumeric vector layout).
-        let mw1 = ((viw >> 7) & 0x7F) as usize;
-        let len = ((viw >> 14) & 0x7F) as usize;
-
-        let (kind, text) = match page_type {
+        let (kind, text, body_ok) = match page_type {
             PageType::Tone | PageType::Secure | PageType::ShortInstruction => {
-                (FlexKind::Tone, String::new())
+                (FlexKind::Tone, String::new(), true)
             }
             PageType::Alphanumeric | PageType::Binary => {
-                let body = collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
-                (FlexKind::Alpha, frame::decode_alpha(&body))
+                match viw_message_window(viw, words.len()) {
+                    Some((mw1, len)) => {
+                        let body =
+                            collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
+                        let text = if offair {
+                            decode_alpha_offair(&body)
+                        } else {
+                            frame::decode_alpha(&body)
+                        };
+                        (FlexKind::Alpha, text, true)
+                    }
+                    None => (FlexKind::Alpha, String::new(), false),
+                }
             }
             PageType::StandardNumeric | PageType::SpecialNumeric | PageType::NumberedNumeric => {
-                let body = collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
-                (FlexKind::Numeric, frame::decode_numeric(&body))
+                match viw_message_window(viw, words.len()) {
+                    Some((mw1, len)) => {
+                        let body =
+                            collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
+                        (FlexKind::Numeric, frame::decode_numeric(&body), true)
+                    }
+                    None => (FlexKind::Numeric, String::new(), false),
+                }
             }
         };
         // Reconcile: derived kind must match the page-type mapping.
         debug_assert_eq!(kind, FlexKind::from_page_type(page_type));
 
-        let raw = raw_words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        out.push(FlexFrame {
-            capcode: addr.capcode,
-            long_address: addr.long,
-            cycle: fiw.cycle,
-            frame: fiw.frame,
-            baud,
-            kind,
-            page_type,
-            text,
-            fec_corrected: fec,
-            raw,
-        });
-        i += 1;
+        let trust = body_ok && page_is_trustworthy(addr.capcode, kind, &text, fec, offair);
+        if trust {
+            let raw = raw_words.iter().flat_map(|w| w.to_be_bytes()).collect();
+            out.push(FlexFrame {
+                capcode: addr.capcode,
+                long_address: addr.long,
+                cycle: fiw.cycle,
+                frame: fiw.frame,
+                baud,
+                kind,
+                page_type,
+                text,
+                fec_corrected: fec,
+                raw,
+            });
+        }
+        i += consumed;
     }
     out
 }
@@ -439,78 +601,9 @@ fn decode_recovered_frames(
                 }
             }
         }
-        out.extend(decode_phase_words_offair(fiw_word, fiw_fix, &words, &fixes, baud));
-    }
-    out
-}
-
-/// Like [`decode_phase_words`] but using the real-FLEX alpha body layout (header
-/// word + fragment-flag char skip). Used only by the off-air 4-level path.
-fn decode_phase_words_offair(
-    fiw_word: u32,
-    fiw_fix: u32,
-    words: &[u32],
-    fixes: &[u32],
-    baud: u32,
-) -> Vec<FlexFrame> {
-    let mut out = Vec::new();
-    let fiw = frame::parse_fiw(fiw_word);
-    if words.is_empty() {
-        return out;
-    }
-    let biw = frame::parse_biw(words[0]);
-    let aoff = biw.address_offset;
-    let voff = biw.vector_offset;
-    if aoff >= words.len() || voff == 0 || voff > words.len() {
-        return out;
-    }
-    let addr_end = voff.min(words.len());
-    let mut i = aoff;
-    while i < addr_end {
-        let aw1 = words[i];
-        if aw1 == 0 {
-            i += 1;
-            continue;
-        }
-        let addr = frame::decode_short_address(aw1);
-        let vidx = voff + (i - aoff);
-        if vidx >= words.len() {
-            break;
-        }
-        let viw = words[vidx];
-        let page_type = PageType::from_viw(viw);
-        let mut fec = fiw_fix + fixes[i] + fixes[vidx];
-        let mut raw_words = vec![fiw_word, aw1, viw];
-        let mw1 = ((viw >> 7) & 0x7F) as usize;
-        let len = ((viw >> 14) & 0x7F) as usize;
-
-        let (kind, text) = match page_type {
-            PageType::Tone | PageType::Secure | PageType::ShortInstruction => {
-                (FlexKind::Tone, String::new())
-            }
-            PageType::Alphanumeric | PageType::Binary => {
-                let body = collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
-                (FlexKind::Alpha, decode_alpha_offair(&body))
-            }
-            PageType::StandardNumeric | PageType::SpecialNumeric | PageType::NumberedNumeric => {
-                let body = collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
-                (FlexKind::Numeric, frame::decode_numeric(&body))
-            }
-        };
-        let raw = raw_words.iter().flat_map(|w| w.to_be_bytes()).collect();
-        out.push(FlexFrame {
-            capcode: addr.capcode,
-            long_address: addr.long,
-            cycle: fiw.cycle,
-            frame: fiw.frame,
-            baud,
-            kind,
-            page_type,
-            text,
-            fec_corrected: fec,
-            raw,
-        });
-        i += 1;
+        out.extend(decode_phase_inner(
+            fiw_word, fiw_fix, &words, &fixes, baud, true,
+        ));
     }
     out
 }
@@ -602,10 +695,17 @@ impl Lane {
         Self::build(baud, false)
     }
 
-    /// An auto-path lane: 4-level rates use the off-air two-clock recovery.
+    /// An auto-path lane. The off-air two-clock recovery is needed ONLY for
+    /// modes with a sync/data rate transition — 6400 bps (sym_rate 3200): real
+    /// FLEX sends Sync 1 + FIW at 1600 sym/s but DATA at 3200 sym/s. The 3200-bps
+    /// mode is 1600 sym/s 4-level end-to-end (NO transition), so it demods
+    /// cleanly with the single-rate [`demod::SymbolDemod`] — the same path the
+    /// fixed 3200 lane uses — which off-air far out-performs the decode-directed
+    /// two-clock search (that search over-fits fill/noise and rarely lands a
+    /// checksum-clean FIW, so the lane never locks).
     fn new_auto(baud: u32) -> Self {
         let mode = demod::FlexMode::from_baud(baud).expect("validated baud");
-        Self::build(baud, mode.levels == 4)
+        Self::build(baud, mode.levels == 4 && mode.sym_rate != 1600)
     }
 
     fn build(baud: u32, offair_4level: bool) -> Self {
@@ -773,7 +873,10 @@ impl FlexChannelDecoder {
         ];
         Ok(Self {
             ddc: Self::make_ddc(input_rate, freq_offset_hz)?,
-            mode: LaneMode::Auto { lanes, locked: None },
+            mode: LaneMode::Auto {
+                lanes,
+                locked: None,
+            },
             channel_buf: Vec::new(),
             seen: Vec::new(),
         })
@@ -797,7 +900,10 @@ impl FlexChannelDecoder {
     pub fn baud(&self) -> Option<u32> {
         match &self.mode {
             LaneMode::Fixed(lane) => Some(lane.baud),
-            LaneMode::Auto { lanes, locked: Some(i) } => Some(lanes[*i].baud),
+            LaneMode::Auto {
+                lanes,
+                locked: Some(i),
+            } => Some(lanes[*i].baud),
             LaneMode::Auto { .. } => None,
         }
     }
@@ -873,10 +979,14 @@ impl FlexChannelDecoder {
     pub fn level_dbfs(&self) -> f32 {
         match &self.mode {
             LaneMode::Fixed(lane) => lane.level_dbfs(),
-            LaneMode::Auto { lanes, locked: Some(i) } => lanes[*i].level_dbfs(),
-            LaneMode::Auto { lanes, .. } => {
-                lanes.first().map(|l| l.level_dbfs()).unwrap_or(f32::NEG_INFINITY)
-            }
+            LaneMode::Auto {
+                lanes,
+                locked: Some(i),
+            } => lanes[*i].level_dbfs(),
+            LaneMode::Auto { lanes, .. } => lanes
+                .first()
+                .map(|l| l.level_dbfs())
+                .unwrap_or(f32::NEG_INFINITY),
         }
     }
 }
@@ -1037,12 +1147,18 @@ mod tests {
     #[test]
     fn new_with_zero_baud_selects_auto() {
         let dec = FlexChannelDecoder::new(CHANNEL_RATE, 0.0, 0).unwrap();
-        assert_eq!(dec.baud(), None, "baud 0 must select auto (no fixed rate yet)");
+        assert_eq!(
+            dec.baud(),
+            None,
+            "baud 0 must select auto (no fixed rate yet)"
+        );
         let dec_auto = FlexChannelDecoder::new_auto(CHANNEL_RATE, 0.0).unwrap();
         assert_eq!(dec_auto.baud(), None);
         // Fixed constructors report their rate immediately.
         assert_eq!(
-            FlexChannelDecoder::new(CHANNEL_RATE, 0.0, 6400).unwrap().baud(),
+            FlexChannelDecoder::new(CHANNEL_RATE, 0.0, 6400)
+                .unwrap()
+                .baud(),
             Some(6400)
         );
         // Unsupported baud is rejected.
@@ -1083,7 +1199,9 @@ mod tests {
         );
         // But a genuine 1600 A-code (via frame_bits) decodes fine.
         let ok = modulate::frame_bits(64, &build_alpha_frame(1_234_567, 7, 33, "HELLO WORLD"));
-        assert!(decode_bits(&ok, 1600).iter().any(|f| f.capcode == 1_234_567));
+        assert!(decode_bits(&ok, 1600)
+            .iter()
+            .any(|f| f.capcode == 1_234_567));
     }
 
     /// Auto-detect must NOT false-lock on pure noise (no valid Sync 1 / A-code
@@ -1348,7 +1466,11 @@ mod tests {
         while out.len() < n {
             let idx = (((counter >> 5) & 0xFFF8) | (counter & 7)) as usize;
             let pos = ((counter % 256) / 8) as usize;
-            let (pa, pb) = if two_phase && toggle == 1 { (2, 3) } else { (0, 1) };
+            let (pa, pb) = if two_phase && toggle == 1 {
+                (2, 3)
+            } else {
+                (0, 1)
+            };
             let a = bit(&phases[pa], idx, pos);
             let b = if four { bit(&phases[pb], idx, pos) } else { 0 };
             out.push(dibit_sym(a, b));
@@ -1548,7 +1670,10 @@ mod tests {
             let back = demod::deinterleave_phases(&syms, mode, false);
             assert_eq!(back.len(), n, "baud {baud} phase count");
             for (p, (orig, got)) in phases.iter().zip(back.iter()).enumerate() {
-                assert_eq!(orig, got, "baud {baud} phase {p} not recovered by round trip");
+                assert_eq!(
+                    orig, got,
+                    "baud {baud} phase {p} not recovered by round trip"
+                );
             }
         }
     }
@@ -1574,7 +1699,8 @@ mod tests {
             mode.sym_rate as usize * 25 / 1000,
             &[phase_a, phase_b],
         );
-        let iq = modulate::modulate_symbols_iq(&syms, CHANNEL_RATE, mode.sym_rate as f64, 1200.0, 1.0);
+        let iq =
+            modulate::modulate_symbols_iq(&syms, CHANNEL_RATE, mode.sym_rate as f64, 1200.0, 1.0);
         // 4-level FSK needs ~6 dB more SNR than 2-level for the same BER (the
         // inner tones halve the per-decision Euclidean distance); 28 dB leaves
         // BCH(31,21,2) ample margin on this page.
@@ -1639,8 +1765,8 @@ mod tests {
 
         // Align on Sync 1.
         let sync_bits: Vec<u8> = rx_syms.iter().map(|&s| demod::symbol_sync_bit(s)).collect();
-        let (off, inverted, rmode) =
-            demod::find_sync_mode(&sync_bits, SYNC_MAX_ERR).expect("4-FSK sync must lock in BER test");
+        let (off, inverted, rmode) = demod::find_sync_mode(&sync_bits, SYNC_MAX_ERR)
+            .expect("4-FSK sync must lock in BER test");
         assert_eq!(rmode.baud(), 6400, "resolved wrong mode from A-code");
 
         // De-interleave both tx and rx DATA and compare dibits.

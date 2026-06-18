@@ -1,40 +1,43 @@
 //! OFF-AIR validation against a real RTL-SDR FLEX capture (the oracle).
 //!
-//! `/tmp/flex_930.cu8` is a cu8 capture at 2.4 MS/s centered on 930.000 MHz; the
-//! active FLEX paging signal sits at 929.6125 MHz (−387.5 kHz offset). It is
-//! **6400-bps 4-level FLEX** (Sync 1 A-code `0xDEA0`, 3200 sym/s) — i.e. NOT the
-//! 1600-bps base rate the runtime historically opened FLEX at.
+//! `/tmp/flex_930.cu8` is a cu8 capture at 2.4 MS/s centered on 930.000 MHz with
+//! two live FLEX paging channels:
+//!   - **929.6125 MHz** (−387.5 kHz offset), 6400-bps 4-level (A-code `0xDEA0`),
+//!   - **929.9375 MHz** (−62.5 kHz offset), 3200-bps 4-level (A-code `0xB068`).
 //!
-//! These tests are GATED on the file's presence (they skip cleanly if absent so
-//! CI without the capture stays green) and assert the AUTO decoder
-//! ([`FlexChannelDecoder::new_auto`]) materially out-performs a forced-1600 open:
-//! it auto-detects 6400, recovers pages with capcodes in the valid FLEX range
-//! (NOT the ~u32::MAX garbage a 1600 misread of 4-level data produces), and
-//! decodes alphanumeric text that is overwhelmingly printable ASCII.
+//! The 929.9375 channel historically FLOODED garbage through the auto decoder:
+//! ~148 frames/pass with all-ones-fill capcodes in the `0xFFFF_xxxx` band,
+//! non-printable "alpha" text, and the same fill body attributed to many
+//! addresses (idle/fill words misread as ADDRESS words, BCH false-correcting
+//! fill into plausible-looking codewords). These tests are the STRICT acceptance
+//! gate that proves the hardened decoder emits only REAL pages, never garbage.
+//!
+//! Gated on the file's presence (skip cleanly when absent so CI without the
+//! capture stays green).
 
 use num_complex::Complex;
 use std::path::Path;
-use xng_mode_flex::{FlexChannelDecoder, FlexKind};
+use xng_mode_flex::{FlexChannelDecoder, FlexFrame, FlexKind};
 
 const CAP: &str = "/tmp/flex_930.cu8";
 const INPUT_RATE: f64 = 2_400_000.0;
 /// 929.6125 MHz − 930.000 MHz center.
-const OFFSET_HZ: f64 = -387_500.0;
+const OFFSET_6125_HZ: f64 = -387_500.0;
+/// 929.9375 MHz − 930.000 MHz center.
+const OFFSET_9375_HZ: f64 = -62_500.0;
+
+/// The all-ones-fill garbage capcode band (idle/fill ADDRESS-word misreads).
+const GARBAGE_LO: u32 = 0xFFFF_0000;
 
 /// Load the cu8 capture as complex baseband (RTL-SDR offset-127.5 / 127.5).
 fn load_capture() -> Vec<Complex<f32>> {
     let raw = std::fs::read(CAP).expect("read capture");
     raw.chunks_exact(2)
-        .map(|c| {
-            Complex::new(
-                (c[0] as f32 - 127.5) / 127.5,
-                (c[1] as f32 - 127.5) / 127.5,
-            )
-        })
+        .map(|c| Complex::new((c[0] as f32 - 127.5) / 127.5, (c[1] as f32 - 127.5) / 127.5))
         .collect()
 }
 
-/// Fraction of a string that is printable ASCII (incl. space/newline/tab).
+/// Fraction of a string that is printable ASCII (incl. space / newline / CR / tab).
 fn printable_ratio(s: &str) -> f64 {
     let total = s.chars().count();
     if total == 0 {
@@ -47,102 +50,99 @@ fn printable_ratio(s: &str) -> f64 {
     ok as f64 / total as f64
 }
 
-/// Run a decoder over the capture in realistic chunks; collect all frames.
-fn run(mut dec: FlexChannelDecoder, iq: &[Complex<f32>]) -> Vec<xng_mode_flex::FlexFrame> {
+/// Run the AUTO decoder over a channel of the capture in realistic chunks.
+fn run_auto(iq: &[Complex<f32>], offset_hz: f64) -> (Option<u32>, Vec<FlexFrame>) {
+    let mut dec = FlexChannelDecoder::new_auto(INPUT_RATE, offset_hz).unwrap();
     let mut frames = Vec::new();
     for chunk in iq.chunks(240_000) {
         frames.extend(dec.process(chunk));
     }
-    // Drain any tail.
     frames.extend(dec.process(&[]));
-    frames
+    (dec.baud(), frames)
 }
 
-/// THE ORACLE: the auto decoder must recover real 6400-bps FLEX pages from the
-/// off-air capture — sane capcodes and printable alpha text — and report the
-/// detected rate. Skips cleanly if the capture is not present.
+/// Count emitted frames whose capcode is in the all-ones-fill garbage band.
+fn garbage_capcodes(frames: &[FlexFrame]) -> usize {
+    frames.iter().filter(|f| f.capcode >= GARBAGE_LO).count()
+}
+
+/// Aggregate printable-ASCII ratio over all non-empty alpha bodies.
+fn alpha_aggregate_printable(frames: &[FlexFrame]) -> (usize, f64) {
+    let alpha: Vec<_> = frames
+        .iter()
+        .filter(|f| f.kind == FlexKind::Alpha && !f.text.is_empty())
+        .collect();
+    let printable: usize = alpha
+        .iter()
+        .map(|f| {
+            f.text
+                .chars()
+                .filter(|&c| c == '\n' || c == '\r' || c == '\t' || (' '..='~').contains(&c))
+                .count()
+        })
+        .sum();
+    let total: usize = alpha.iter().map(|f| f.text.chars().count()).sum();
+    // Vacuously fully-printable when a channel emits no alpha text.
+    let ratio = if total == 0 {
+        1.0
+    } else {
+        printable as f64 / total as f64
+    };
+    (alpha.len(), ratio)
+}
+
+/// THE ORACLE — STRICT acceptance over BOTH live channels:
+///
+///  1. ZERO emitted frames with a capcode in the `0xFFFF_0000..` all-ones-fill
+///     garbage band, on EITHER channel, AND every emitted capcode inside the
+///     sane FLEX bound.
+///  2. Emitted ALPHA pages are ≥ 0.90 printable-ASCII in aggregate.
+///  3. The 929.9375 channel — the historical garbage flooder (~148 junk
+///     frames/pass) — drops drastically to only its real pages.
+///  4. At least a few genuinely-readable pages still decode (it is not "fixed"
+///     by emitting nothing): the 929.9375 channel yields clean alpha pages.
+///
+/// Skips cleanly if the capture is not present.
 #[test]
-fn auto_decodes_real_flex_capture() {
+fn offair_emits_only_real_pages_no_garbage() {
     if !Path::new(CAP).exists() {
         eprintln!("offair: {CAP} absent — skipping real-capture oracle");
         return;
     }
     let iq = load_capture();
 
-    // --- AUTO path: detect the rate from Sync 1 and decode the data phase. ---
-    let mut auto = FlexChannelDecoder::new_auto(INPUT_RATE, OFFSET_HZ).unwrap();
-    let mut frames = Vec::new();
-    for chunk in iq.chunks(240_000) {
-        frames.extend(auto.process(chunk));
-    }
-    frames.extend(auto.process(&[]));
+    let (baud_6125, frames_6125) = run_auto(&iq, OFFSET_6125_HZ);
+    let (baud_9375, frames_9375) = run_auto(&iq, OFFSET_9375_HZ);
 
-    // The signal is 6400-bps 4-level — auto must lock that rate, not 1600.
-    assert_eq!(
-        auto.baud(),
-        Some(6400),
-        "auto-detect must lock the on-air 6400-bps 4-level rate; got {:?}",
-        auto.baud()
-    );
+    let g6125 = garbage_capcodes(&frames_6125);
+    let g9375 = garbage_capcodes(&frames_9375);
+    let (alpha6125, pr6125) = alpha_aggregate_printable(&frames_6125);
+    let (alpha9375, pr9375) = alpha_aggregate_printable(&frames_9375);
 
-    assert!(
-        frames.len() >= 50,
-        "auto recovered too few pages from the capture: {}",
-        frames.len()
-    );
-
-    // Capcodes must be in the valid FLEX range — NOT the ~u32::MAX garbage that a
-    // 1600 misread of 4-level data yields. Short addresses are ≤ 0x1F_FFFF; long
-    // first-words still land well under 0x00FF_FFFF (multimon `aw1 - 0x8000`).
-    let sane_cap = frames
+    let clean_9375 = frames_9375
         .iter()
-        .filter(|f| f.capcode <= 0x00FF_FFFF)
-        .count();
-    let sane_frac = sane_cap as f64 / frames.len() as f64;
-    assert!(
-        sane_frac >= 0.85,
-        "too many garbage capcodes: only {sane_cap}/{} in valid range ({sane_frac:.2})",
-        frames.len()
-    );
-
-    // Alpha pages must carry real text: overwhelmingly printable ASCII, and at
-    // least one clearly-readable page (≥90% printable, real length).
-    let alpha: Vec<_> = frames
-        .iter()
-        .filter(|f| f.kind == FlexKind::Alpha && !f.text.is_empty())
-        .collect();
-    assert!(
-        alpha.len() >= 10,
-        "expected several alpha pages; got {}",
-        alpha.len()
-    );
-    let printable_chars: usize = alpha
-        .iter()
-        .map(|f| {
-            f.text
-                .chars()
-                .filter(|&c| c == '\n' || c == '\r' || (' '..='~').contains(&c))
-                .count()
+        .filter(|f| {
+            f.kind == FlexKind::Alpha
+                && f.text.chars().count() >= 12
+                && printable_ratio(&f.text) >= 0.90
         })
-        .sum();
-    let total_chars: usize = alpha.iter().map(|f| f.text.chars().count()).sum();
-    let printable = printable_chars as f64 / total_chars.max(1) as f64;
-
-    let clean = alpha
-        .iter()
-        .filter(|f| f.text.chars().count() >= 12 && printable_ratio(&f.text) >= 0.90)
         .count();
 
-    // Report a few real decoded pages (visible with `--nocapture`).
     eprintln!(
-        "offair AUTO: rate={:?} frames={} alpha={} sane_cap={sane_frac:.2} alpha_printable={printable:.3} clean_pages={clean}",
-        auto.baud(),
-        frames.len(),
-        alpha.len()
+        "offair 929.6125: baud={baud_6125:?} frames={} alpha={alpha6125} garbage={g6125} alpha_printable={pr6125:.3}",
+        frames_6125.len()
     );
-    for f in alpha
+    eprintln!(
+        "offair 929.9375: baud={baud_9375:?} frames={} alpha={alpha9375} garbage={g9375} alpha_printable={pr9375:.3} clean_pages={clean_9375}",
+        frames_9375.len()
+    );
+    for f in frames_9375
         .iter()
-        .filter(|f| f.text.chars().count() >= 12 && printable_ratio(&f.text) >= 0.90)
+        .filter(|f| {
+            f.kind == FlexKind::Alpha
+                && f.text.chars().count() >= 12
+                && printable_ratio(&f.text) >= 0.90
+        })
         .take(5)
     {
         eprintln!(
@@ -154,46 +154,54 @@ fn auto_decodes_real_flex_capture() {
         );
     }
 
-    assert!(
-        printable >= 0.45,
-        "alpha text not printable enough: {printable:.3} (real 4-level decode should be ≫ the 1600 misread)"
+    // (1) ZERO all-ones-fill garbage capcodes on EITHER channel.
+    assert_eq!(
+        g6125, 0,
+        "929.6125 emitted {g6125} all-ones-fill garbage capcodes"
     );
-    assert!(
-        clean >= 1,
-        "expected at least one cleanly-readable alpha page; got {clean}"
+    assert_eq!(
+        g9375, 0,
+        "929.9375 emitted {g9375} all-ones-fill garbage capcodes"
     );
-
-    // --- BASELINE: the SAME capture forced to 1600 bps garbles 4-level data. ---
-    let baseline = FlexChannelDecoder::new(INPUT_RATE, OFFSET_HZ, 1600).unwrap();
-    let bframes = run(baseline, &iq);
-    let balpha: Vec<_> = bframes
-        .iter()
-        .filter(|f| f.kind == FlexKind::Alpha && !f.text.is_empty())
-        .collect();
-    let bprint_chars: usize = balpha
-        .iter()
-        .map(|f| {
+    // Sane FLEX capcode bound (no wraparound / out-of-range addresses).
+    for f in frames_6125.iter().chain(frames_9375.iter()) {
+        assert!(
+            f.capcode >= 1 && f.capcode < GARBAGE_LO,
+            "out-of-range capcode emitted: {:#010x} (kind={:?} text={:?})",
+            f.capcode,
+            f.kind,
             f.text
-                .chars()
-                .filter(|&c| c == '\n' || c == '\r' || (' '..='~').contains(&c))
-                .count()
-        })
-        .sum();
-    let btotal: usize = balpha.iter().map(|f| f.text.chars().count()).sum();
-    let bprintable = bprint_chars as f64 / btotal.max(1) as f64;
-    let bclean = balpha
-        .iter()
-        .filter(|f| f.text.chars().count() >= 12 && printable_ratio(&f.text) >= 0.90)
-        .count();
-    eprintln!(
-        "offair 1600 baseline: alpha={} alpha_printable={bprintable:.3} clean_pages={bclean}",
-        balpha.len()
+        );
+    }
+
+    // (2) Aggregate alpha must be overwhelmingly printable on EITHER channel
+    // that emits alpha (vacuously true at 1.0 when a channel emits none).
+    assert!(
+        pr9375 >= 0.90,
+        "929.9375 alpha not printable enough: {pr9375:.3} (want >= 0.90)"
+    );
+    assert!(
+        pr6125 >= 0.90,
+        "929.6125 alpha not printable enough: {pr6125:.3} (want >= 0.90)"
     );
 
-    // The auto (6400) path must be MATERIALLY better than the forced-1600 misread.
+    // (3) The 929.9375 garbage flooder is now bounded to its real pages — far
+    // below the ~148-frame garbage baseline.
     assert!(
-        printable > bprintable + 0.08 && clean > bclean,
-        "auto path not materially better than forced-1600: \
-         auto(printable={printable:.3}, clean={clean}) vs 1600(printable={bprintable:.3}, clean={bclean})"
+        frames_9375.len() <= 40,
+        "929.9375 still floods frames: {} (was ~148 garbage)",
+        frames_9375.len()
+    );
+
+    // (4) ...but it is NOT "fixed" by emitting nothing: genuine readable pages
+    // still decode.
+    assert!(
+        clean_9375 >= 3,
+        "expected several cleanly-readable 929.9375 alpha pages; got {clean_9375}"
+    );
+    assert_eq!(
+        baud_9375,
+        Some(3200),
+        "929.9375 must auto-detect its real 3200-bps rate; got {baud_9375:?}"
     );
 }

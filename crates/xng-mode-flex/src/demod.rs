@@ -425,10 +425,7 @@ impl SymbolDemod {
 /// `bit_offset` is the index of the FIRST sync bit (the MSB of A) and `mode` is
 /// resolved from the A-code; an unrecognized A-code yields no match.
 /// (multimon-ng `flex_sync` / `flex_sync_check` / `decode_mode`.)
-pub fn find_sync_mode(
-    sync_bits: &[u8],
-    max_err: u32,
-) -> Option<(usize, bool, FlexMode)> {
+pub fn find_sync_mode(sync_bits: &[u8], max_err: u32) -> Option<(usize, bool, FlexMode)> {
     if sync_bits.len() < 64 {
         return None;
     }
@@ -474,7 +471,11 @@ pub fn deinterleave_phases(syms: &[u8], mode: FlexMode, inverted: bool) -> Vec<V
     for &raw_sym in syms {
         // Polarity: inverting the symbol order reverses level numbering
         // (sym -> 3 - sym), matching the demod's both-polarity sync resolution.
-        let sym = if inverted { 3 - raw_sym.min(3) } else { raw_sym };
+        let sym = if inverted {
+            3 - raw_sym.min(3)
+        } else {
+            raw_sym
+        };
         let (bit_a, bit_b) = symbol_to_dibit(sym);
         let idx = phase_idx(counter);
 
@@ -676,14 +677,48 @@ fn find_sync_hits(disc: &[f32]) -> Vec<SyncHit> {
             continue;
         };
         // After Sync 1 (64 sync syms): 16 dotting + 32 FIW syms @ 1600 sym/s.
+        // The FIW window start can sit a symbol or two off after the sample-rate
+        // resample over the long sync; search a small offset band and prefer the
+        // alignment whose FIW BCH-corrects AND whose mod-16 checksum verifies
+        // (a clean-BCH-but-bad-checksum word is a valid codeword at the wrong
+        // shift — exactly the off-air FIW misread that floods garbage).
         let fiw_first = k + 64 + 16;
-        let mut dat = 0u32;
-        for j in 0..32 {
-            let v = window_mean(disc, center[fiw_first + j], spb_sync, 1.0);
-            let b = if inverted { (v < 0.0) as u8 } else { (v >= 0.0) as u8 };
-            dat = (dat >> 1) | ((b as u32) << 31);
+        let read_fiw = |first: i64, flip: bool| -> Option<(u32, u32)> {
+            let mut dat = 0u32;
+            for j in 0..32i64 {
+                let idx = first + j;
+                if idx < 0 || idx as usize >= center.len() {
+                    return None;
+                }
+                let v = window_mean(disc, center[idx as usize], spb_sync, 1.0);
+                let mut b = if inverted {
+                    (v < 0.0) as u8
+                } else {
+                    (v >= 0.0) as u8
+                };
+                if flip {
+                    b ^= 1;
+                }
+                dat = (dat >> 1) | ((b as u32) << 31);
+            }
+            crate::bch::correct(dat)
+        };
+        // The FIW must BCH-correct AND its mod-16 checksum must verify — a
+        // clean-BCH-but-bad-checksum word is a valid codeword at the wrong
+        // shift/polarity (the off-air FIW misread that floods garbage). Search a
+        // small alignment band and both bit polarities; the nominal alignment
+        // and the sync-resolved polarity win ties.
+        let mut fiw = None;
+        'fiw: for flip in [false, true] {
+            for d in [0i64, -1, 1, -2, 2] {
+                if let Some((w, fix)) = read_fiw(fiw_first as i64 + d, flip) {
+                    if crate::frame::parse_fiw(w).checksum_ok {
+                        fiw = Some((w, fix));
+                        break 'fiw;
+                    }
+                }
+            }
         }
-        let fiw = crate::bch::correct(dat);
         let fiw_end_sample = center[k + 111] + spb_sync / 2.0;
         hits.push(SyncHit {
             fiw_end_sample,
@@ -751,37 +786,51 @@ fn recover_data_phases(disc: &[f32], hit: &SyncHit) -> Option<Vec<Vec<u32>>> {
         }
         out
     };
-    let score = |syms: &[u8]| -> usize {
-        let phases = deinterleave_phases(syms, mode, hit.inverted);
+    // Structure-aware alignment score. Counting *any* BCH-correctable word
+    // over-fits: on a noisy off-air discriminator a large fraction of random
+    // 31-bit patterns sit within Hamming-2 of some codeword, so fill/noise
+    // "corrects" and the search locks a meaningless alignment. Instead reward
+    // words that correct CLEANLY (≤1 flip) and are NOT idle/fill — that
+    // structure only survives at the true symbol timing/polarity.
+    let score = |syms: &[u8], inverted: bool| -> usize {
+        let phases = deinterleave_phases(syms, mode, inverted);
         let mut v = 0usize;
         for ph in &phases {
             for &raw in ph {
-                if crate::bch::correct(raw).is_some() {
-                    v += 1;
+                if let Some((w, fix)) = crate::bch::correct(raw) {
+                    if fix <= 1 && !crate::frame::is_idle_word(w) {
+                        v += 1;
+                    }
                 }
             }
         }
         v
     };
 
-    // Decode-directed search over sampling phase and clock ppm.
-    let mut best = (0.0f64, spb_data, 0usize);
-    let mut ppm = -120.0;
-    while ppm <= 120.0 {
-        let period = spb_data * (1.0 + ppm / 1e6);
-        let mut phase = -0.1;
-        while phase <= 0.6 {
-            let syms = sample(phase, period);
-            let v = score(&syms);
-            if v > best.2 {
-                best = (phase, period, v);
+    // Decode-directed search over sampling phase, clock ppm, and DATA bit
+    // polarity (the off-air sync resolves polarity against the `sym<2` sync
+    // convention, which can be opposite to the `sym>1` data-bit convention —
+    // the same flip the FIW read needs). Whichever (phase, ppm, polarity)
+    // maximizes clean structure wins.
+    let mut best = (0.0f64, spb_data, hit.inverted, 0usize);
+    for &data_inv in &[hit.inverted, !hit.inverted] {
+        let mut ppm = -120.0;
+        while ppm <= 120.0 {
+            let period = spb_data * (1.0 + ppm / 1e6);
+            let mut phase = -0.1;
+            while phase <= 0.6 {
+                let syms = sample(phase, period);
+                let v = score(&syms, data_inv);
+                if v > best.3 {
+                    best = (phase, period, data_inv, v);
+                }
+                phase += 0.1;
             }
-            phase += 0.1;
+            ppm += 20.0;
         }
-        ppm += 20.0;
     }
     let syms = sample(best.0, best.1);
-    Some(deinterleave_phases(&syms, mode, hit.inverted))
+    Some(deinterleave_phases(&syms, mode, best.2))
 }
 
 /// Recover all 4-level FLEX frames from a channel-rate IQ buffer using the
@@ -921,12 +970,7 @@ mod tests {
     #[test]
     fn symbol_dibit_gray_map_matches_spec() {
         // sym : bit_a bit_b   (bit_a = sym>1 ; bit_b = sym==1 || sym==2)
-        let table = [
-            (0u8, (0u8, 0u8)),
-            (1, (0, 1)),
-            (2, (1, 1)),
-            (3, (1, 0)),
-        ];
+        let table = [(0u8, (0u8, 0u8)), (1, (0, 1)), (2, (1, 1)), (3, (1, 0))];
         for (sym, (a, b)) in table {
             assert_eq!(symbol_to_dibit(sym), (a, b), "sym {sym} dibit");
             assert_eq!(dibit_to_symbol(a, b), sym, "dibit ({a},{b}) -> sym");
@@ -968,11 +1012,17 @@ mod tests {
     fn from_baud_maps_information_rates() {
         assert_eq!(
             FlexMode::from_baud(3200).unwrap(),
-            FlexMode { sym_rate: 1600, levels: 4 }
+            FlexMode {
+                sym_rate: 1600,
+                levels: 4
+            }
         );
         assert_eq!(
             FlexMode::from_baud(6400).unwrap(),
-            FlexMode { sym_rate: 3200, levels: 4 }
+            FlexMode {
+                sym_rate: 3200,
+                levels: 4
+            }
         );
         assert_eq!(FlexMode::from_baud(1600).unwrap().num_phases(), 1);
         assert_eq!(FlexMode::from_baud(3200).unwrap().num_phases(), 2);
@@ -1009,9 +1059,8 @@ mod tests {
     #[test]
     fn find_sync_mode_locks_and_resolves_mode() {
         let a = A_CODE_3200_4; // 6400 bps mode
-        let sync64: u64 = ((a as u64) << 48)
-            | ((SYNC_MARKER_B as u64) << 16)
-            | ((!a) as u64 & 0xFFFF);
+        let sync64: u64 =
+            ((a as u64) << 48) | ((SYNC_MARKER_B as u64) << 16) | ((!a) as u64 & 0xFFFF);
         let mut bits = vec![1u8, 0, 1]; // junk
         for i in (0..64).rev() {
             bits.push(((sync64 >> i) & 1) as u8);

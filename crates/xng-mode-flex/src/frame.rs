@@ -157,26 +157,67 @@ pub struct Address {
     pub long: bool,
 }
 
-/// Decode an address word into a capcode and the long-address flag.
+/// Idle / fill codeword: the all-ones 21-bit data pattern. (multimon-ng
+/// `decode_phase`: `phaseptr[i] == 0x001FFFFF` → idle, skipped.)
+pub const FILL_WORD: u32 = 0x001F_FFFF;
+
+/// Smallest valid FLEX capcode. Capcode 0 is not assignable.
+pub const MIN_CAPCODE: u32 = 1;
+/// Largest FLEX capcode that fits the `u32` capcode field (the long-address
+/// space tops out around 4.29e9). Anything decoding above this — in particular
+/// the `0xFFFF_xxxx` band produced by `aw1 - 0x8000` wraparound on a
+/// sub-`0x8000` word — is an idle/fill misread and is rejected.
+pub const MAX_CAPCODE: u32 = 0xFFFE_FFFF;
+
+/// True iff a (BCH-corrected, 21-bit-masked) word is a FLEX idle/fill codeword
+/// that must NOT be treated as an address: all-zeros or all-ones.
+/// (multimon-ng: `phaseptr[i] == 0x00000000 || phaseptr[i] == 0x001FFFFF`.)
+pub fn is_idle_word(word: u32) -> bool {
+    let w = word & 0x001F_FFFF;
+    w == 0 || w == FILL_WORD
+}
+
+/// Decode a FLEX address into a capcode and the long-address flag.
 ///
-/// Per multimon-ng `demod_flex.c`:
-/// ```c
-/// flex->Decode.long_address = (aw1 < 0x008001L) || (aw1 > 0x1E0000L) || (aw1 > 0x1E7FFEL);
-/// flex->Decode.capcode = aw1 - 0x8000;
-/// ```
-/// The active reference emits `aw1 - 0x8000` as the capcode regardless of the
-/// long flag; the full TWO-word long-capcode reconstruction is *commented out*
-/// in the reference ("Don't ask") and is not reliably specified. This crate
-/// therefore reports the documented `long` flag and the `aw1 - 0x8000` capcode
-/// (the first word of a long pair); fusing the second long-address word is
-/// SKIPPED rather than faked — see crate notes.
-pub fn decode_short_address(aw1: u32) -> Address {
-    let aw1 = aw1 & 0x001F_FFFF;
-    let long = aw1 < 0x0000_8001 || aw1 > 0x001E_0000;
-    Address {
-        capcode: aw1.wrapping_sub(0x8000),
-        long,
-    }
+/// `aw1` is the (corrected) address word; `aw2` is the *next* phase word, used
+/// only when `aw1` selects the long (two-word) address form.
+///
+/// Per multimon-ng `demod_flex.c`, an address is **long** when
+/// `aw1 < 0x008001 || aw1 > 0x1E0000`. For SHORT addresses the capcode is
+/// `aw1 - 0x8000` (in `[1, 0x1D8000]`). For LONG addresses the reference's
+/// active code still reports `aw1 - 0x8000` (which *wraps* to `0xFFFF_xxxx`
+/// garbage for the sub-`0x8000` first word!) — so this crate instead uses the
+/// documented two-word reconstruction
+/// `aw1 + ((aw2 ^ 0x1FFFFF) << 15) + 0x1F9000` (the formula carried, commented,
+/// in the reference). Callers that reach a long address must supply `aw2` and
+/// advance past it so the second word is not re-read as another address.
+pub fn decode_address(aw1: u32, aw2: u32) -> Address {
+    let a1 = aw1 & 0x001F_FFFF;
+    let a2 = aw2 & 0x001F_FFFF;
+    // Verbatim multimon-ng `parse_capcode` window (kept literal for spec fidelity).
+    #[allow(clippy::manual_range_contains)]
+    let long = a1 < 0x0000_8001 || a1 > 0x001E_0000;
+    let capcode = if long {
+        // Long two-word capcode. A reconstruction that overflows the u32 field
+        // is pinned to `u32::MAX` so [`capcode_in_range`] (which rejects
+        // `> MAX_CAPCODE`) drops it instead of letting it wrap into a plausible
+        // small capcode.
+        let c = (a1 as u64) + (((a2 ^ 0x001F_FFFF) as u64) << 15) + 0x1F_9000;
+        if c > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            c as u32
+        }
+    } else {
+        a1 - 0x8000
+    };
+    Address { capcode, long }
+}
+
+/// True iff `capcode` is in the assignable FLEX range (rejects 0 and the
+/// `0xFFFF_xxxx` wraparound band that idle/fill words decode into).
+pub fn capcode_in_range(capcode: u32) -> bool {
+    (MIN_CAPCODE..=MAX_CAPCODE).contains(&capcode)
 }
 
 /// FLEX numeric character table (4-bit BCD groups).
@@ -282,20 +323,47 @@ mod tests {
         assert_eq!(parsed.vector_offset, 9);
     }
 
-    /// Address decode against the multimon-ng formula `capcode = aw1 - 0x8000`
-    /// and the documented `long_address` window condition.
+    /// Address decode against the multimon-ng short formula `capcode = aw1 -
+    /// 0x8000`, the documented `long_address` window, and the two-word long
+    /// reconstruction (which must NEVER wrap into the `0xFFFF_xxxx` garbage band
+    /// a bare `aw1 - 0x8000` produces for a sub-`0x8000` first word).
     #[test]
     fn short_address_capcode() {
         let aw1 = 0x8000 + 1_234_567;
-        let a = decode_short_address(aw1);
+        let a = decode_address(aw1, 0);
         assert_eq!(a.capcode, 1_234_567);
         assert!(!a.long, "value inside short window must be short address");
-        // Below 0x8001 flags long (aw1 < 0x008001).
-        assert!(decode_short_address(0x0010).long);
-        // Above 0x1E0000 flags long; capcode is still aw1 - 0x8000.
-        let high = decode_short_address(0x1E_0001);
+        assert!(capcode_in_range(a.capcode));
+        // Below 0x8001 flags long; the two-word formula must yield an in-range
+        // capcode, NOT the 0xFFFF_xxxx wraparound of `aw1 - 0x8000`.
+        let low = decode_address(0x0666f, 0x001F_FFFF);
+        assert!(low.long);
+        assert!(
+            low.capcode < 0xFFFF_0000,
+            "long capcode wrapped to garbage: {:#x}",
+            low.capcode
+        );
+        assert!(capcode_in_range(low.capcode));
+        // Above 0x1E0000 flags long.
+        let high = decode_address(0x1E_0001, 0x001F_FFFF);
         assert!(high.long);
-        assert_eq!(high.capcode, 0x1E_0001 - 0x8000);
+    }
+
+    /// Idle / fill codewords (all-zeros and the all-ones `0x1FFFFF`) must be
+    /// recognised so they are skipped instead of misread as addresses (the
+    /// all-ones word otherwise decodes to capcode `0x1F7FFF`).
+    #[test]
+    fn idle_words_recognised() {
+        assert!(is_idle_word(0x0000_0000));
+        assert!(is_idle_word(0x001F_FFFF));
+        assert!(is_idle_word(0xFFFF_FFFF)); // masks to 0x1FFFFF
+        assert!(!is_idle_word(0x0000_8001));
+        // capcode range gate rejects 0 and the 0xFFFF_xxxx wraparound band,
+        // but accepts real short/long capcodes.
+        assert!(!capcode_in_range(0));
+        assert!(!capcode_in_range(0xFFFF_F051));
+        assert!(capcode_in_range(0x001F_7FFF));
+        assert!(capcode_in_range(1_234_567));
     }
 
     /// Alphanumeric: pack "Hi!" as 7-bit LSB-first, 3 chars in one 21-bit word,
