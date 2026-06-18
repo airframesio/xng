@@ -285,6 +285,88 @@ impl FrameEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{CarrierState, SuperframeLockStateMachine};
+
+    /// Encode a 16-bit header word the way [`FrameEncoder`] does (format id
+    /// 1, given superframe, both frame counters = `counter`) and return its
+    /// MSB-first soft bits (sign carries the value) — the exact 16 bits the
+    /// framer collects after the UW.
+    fn header_soft(superframe: u8, counter: u8) -> Vec<f32> {
+        let h = FrameHeader {
+            format_id: 1,
+            superframe: superframe & 0xF,
+            frame_counter1: counter & 0xF,
+            frame_counter2: counter & 0xF,
+        }
+        .to_u16();
+        (0..HEADER_BITS)
+            .rev()
+            .map(|i| if (h >> i) & 1 == 1 { 1.0 } else { -1.0 })
+            .collect()
+    }
+
+    /// AERO-4 ORACLE: a *synthetic* header-counter sequence drives the
+    /// superframe-lock state machine through acquire and loss transitions.
+    /// This is logic validation against a synthetic stimulus (the hard rules
+    /// explicitly permit synthetic frame-counter sequences here), not an
+    /// encoder<->decoder loopback: we generate headers by their on-air bit
+    /// layout, parse them with the real `FrameHeader::from_soft_bits`, feed
+    /// them to the real state machine, and assert the transitions.
+    #[test]
+    fn superframe_lock_acquires_then_loses_on_synthetic_sequence() {
+        const N: u32 = 3;
+        const M: u32 = 4;
+        let mut sm = SuperframeLockStateMachine::with_thresholds(N, M);
+
+        // (1) An in-sequence span (locked-channel simulation): counters
+        // 0,1,2,3,4,5 within a constant superframe. Lock must assert once N
+        // consecutive in-sequence headers have been seen (the first header
+        // has no predecessor, so the N-th match is at counter == N).
+        let mut acquired_at = None;
+        for c in 0..=5u8 {
+            let h = FrameHeader::from_soft_bits(&header_soft(0, c));
+            let s = sm.update(h);
+            if s.superframe_lock && acquired_at.is_none() {
+                acquired_at = Some(c);
+            }
+        }
+        assert_eq!(
+            acquired_at,
+            Some(N as u8),
+            "lock acquires exactly at the N-th consecutive in-sequence header"
+        );
+        let locked = sm.status();
+        assert!(locked.superframe_lock);
+        assert_eq!(locked.carrier_state, CarrierState::Locked);
+        assert!(locked.dcd, "DCD asserted while locked");
+        assert!(locked.afc_locked, "AFC held while locked");
+
+        // (2) A corrupted span (jumping counters): lock must drop after M
+        // consecutive misses, not before.
+        let corrupted = [11u8, 3, 14, 7]; // four out-of-sequence headers
+        let mut held = Vec::new();
+        let mut lost_at = None;
+        for (i, &c) in corrupted.iter().enumerate() {
+            let h = FrameHeader::from_soft_bits(&header_soft(0, c));
+            let s = sm.update(h);
+            held.push(s.superframe_lock);
+            if !s.superframe_lock && lost_at.is_none() {
+                lost_at = Some(i + 1); // misses are 1-based here
+            }
+        }
+        assert_eq!(
+            &held,
+            &[true, true, true, false],
+            "lock holds through M-1 misses and drops on the M-th"
+        );
+        assert_eq!(lost_at, Some(M as usize));
+
+        // (3) AFC/DCD transitions on loss: AFC released, carrier searching.
+        let after = sm.status();
+        assert!(!after.superframe_lock);
+        assert!(!after.afc_locked, "AFC released on loss of lock");
+        assert_eq!(after.carrier_state, CarrierState::Searching);
+    }
 
     #[test]
     fn frame_roundtrip_both_rates() {

@@ -15,6 +15,7 @@ pub mod oqpsk;
 pub mod frame;
 pub mod modulate;
 pub mod satellite;
+pub mod state;
 pub mod su;
 
 use chrono::Utc;
@@ -84,6 +85,12 @@ pub struct AeroEvent {
     /// the decoded bits ([`frame::FrameDecoder::last_fec_corrected`]); `None`
     /// for paths where it is not tracked. Feeds `DecodeQuality::fec_corrected`.
     pub fec_corrected: Option<u32>,
+    /// P-channel superframe-lock + DCD/AFC state at the time this event's
+    /// frame was decoded (AERO-4; enrichment, see
+    /// [`state::SuperframeLockStateMachine`]). Only the low-rate L-band
+    /// P-channel framer (`AeroChannelDecoder`) sets this; the 10.5k OQPSK
+    /// and C-band burst paths use a different framer and leave it `None`.
+    pub lock: Option<serde_json::Value>,
 }
 
 /// One demod + framing chain at a fixed bit rate.
@@ -115,6 +122,9 @@ struct Framer {
     /// sees (AERO-2). Latches the most recent satellite from the system-
     /// table broadcasts.
     resolver: satellite::SatelliteResolver,
+    /// P-channel superframe-lock / DCD / AFC state machine (AERO-4), fed the
+    /// parsed header of every collected frame.
+    lock: state::SuperframeLockStateMachine,
 }
 
 impl Framer {
@@ -128,7 +138,14 @@ impl Framer {
             last_header: None,
             last_fec_corrected: None,
             resolver: satellite::SatelliteResolver::new(),
+            lock: state::SuperframeLockStateMachine::new(),
         }
+    }
+
+    /// Snapshot of the current superframe-lock / DCD / AFC state for
+    /// enrichment (AERO-4).
+    fn lock_json(&self) -> serde_json::Value {
+        self.lock.details_json()
     }
 
     fn push(&mut self, soft: f32, hard: u8, out: &mut Vec<su::AeroUserData>) {
@@ -136,9 +153,11 @@ impl Framer {
             buf.push(soft);
             if buf.len() == frame::HEADER_BITS + frame::CODED_BITS {
                 // Parse the 16-bit frame header (AERO-4) before the coded
-                // payload, then decode the SUs.
-                self.last_header =
-                    Some(frame::FrameHeader::from_soft_bits(&buf[..frame::HEADER_BITS]));
+                // payload, advance the superframe-lock / DCD / AFC state
+                // machine with it, then decode the SUs.
+                let header = frame::FrameHeader::from_soft_bits(&buf[..frame::HEADER_BITS]);
+                self.last_header = Some(header);
+                self.lock.update(header);
                 let coded = &buf[frame::HEADER_BITS..];
                 let bytes = self.decoder.decode(coded);
                 // Genuine FEC-correction count for this frame (AERO-6).
@@ -248,12 +267,13 @@ impl AeroChannelDecoder {
             for &(soft, hard) in &chain.bits {
                 chain.framer.push(soft, hard, &mut users);
             }
-            // The frame header (AERO-4) and resolved satellite (AERO-2) are
-            // latched in the framer; tag every event from this chain with
-            // the current state.
+            // The frame header (AERO-4), resolved satellite (AERO-2) and
+            // superframe-lock state (AERO-4) are latched in the framer; tag
+            // every event from this chain with the current state.
             let frame_header = chain.framer.last_header;
             let fec_corrected = chain.framer.last_fec_corrected;
             let satellite = chain.framer.resolver.details();
+            let lock = chain.framer.lock_json();
             for user in users {
                 let acars = su::parse_acars(&user.data);
                 out.push(AeroEvent {
@@ -266,6 +286,7 @@ impl AeroChannelDecoder {
                     frame_header,
                     satellite: satellite.clone(),
                     fec_corrected,
+                    lock: Some(lock.clone()),
                 });
             }
             for a in chain.framer.su_events.drain(..) {
@@ -273,6 +294,7 @@ impl AeroChannelDecoder {
                 e.frame_header = frame_header;
                 e.satellite = satellite.clone();
                 e.fec_corrected = fec_corrected;
+                e.lock = Some(lock.clone());
                 out.push(e);
             }
         }
@@ -308,6 +330,10 @@ impl AeroChannelDecoder {
                     frame_header,
                     satellite: satellite.clone(),
                     fec_corrected,
+                    // The 10.5k OQPSK chain uses a different framer; the
+                    // superframe-lock machine is the low-rate P-channel layer
+                    // (AERO-4 scope), so leave it unset here.
+                    lock: None,
                 });
             }
             for a in hr.framer.su_events.drain(..) {
@@ -408,6 +434,9 @@ impl AeroBurstDecoder {
                             frame_header: None,
                             satellite: satellite.clone(),
                             fec_corrected,
+                            // C-band feeder bursts use the burst framer, not
+                            // the P-channel superframe-lock layer (AERO-4).
+                            lock: None,
                         });
                     }
                     // Named control/signalling SUs (R access-request /
@@ -508,13 +537,17 @@ fn su_event_msg(a: serde_json::Value, bit_rate: u32, mode: Mode, channel: AeroCh
         frame_header: None,
         satellite: None,
         fec_corrected: None,
+        // Filled in by the caller for P-channel events; left unset here.
+        lock: None,
     }
 }
 
-/// Merge the AERO-2 resolved-satellite annotation and the AERO-4 parsed
-/// frame header into a `details` object (in place). Existing keys are never
-/// overwritten. The resolved-satellite block (`resolved_satellite`, `beam`,
-/// …) and the frame header (`frame_header`) land as nested objects.
+/// Merge the AERO-2 resolved-satellite annotation, the AERO-4 parsed frame
+/// header and the AERO-4 superframe-lock snapshot into a `details` object
+/// (in place). Existing keys are never overwritten. The resolved-satellite
+/// block (`resolved_satellite`, `beam`, …), the frame header
+/// (`frame_header`) and the lock snapshot (`superframe_lock`) land as nested
+/// objects.
 fn enrich_details(details: &mut serde_json::Value, e: &AeroEvent) {
     if let serde_json::Value::Object(map) = details {
         // `satellite` is already an object: { resolved_satellite, beam, … }.
@@ -525,6 +558,11 @@ fn enrich_details(details: &mut serde_json::Value, e: &AeroEvent) {
         }
         if let Some(h) = e.frame_header {
             map.entry("frame_header".to_string()).or_insert(h.to_json());
+        }
+        // AERO-4: the P-channel superframe-lock / DCD / AFC snapshot, when
+        // this event came from the low-rate L-band P-channel framer.
+        if let Some(lock) = &e.lock {
+            map.entry("superframe_lock".to_string()).or_insert(lock.clone());
         }
     }
 }
@@ -548,10 +586,22 @@ pub fn to_message(e: &AeroEvent, frequency_hz: u64, level_dbfs: f32, source: Pro
             enrich_details(&mut details, e);
             (MessageBody::Aero { kind: su::p_su_kind(a), details }, true, None)
         }
-        // No structured SU but we have a resolved satellite and/or a parsed
-        // frame header — surface them on their own Aero body so the AERO-2
-        // satellite tag and AERO-4 header reach `details` even for an event
-        // that is otherwise just reassembled user data (e.g. ACARS-less).
+        // No structured SU but the low-rate L-band P-channel framer tracked
+        // a superframe-lock snapshot for the frame that carried this event —
+        // surface the channel framing state (carrier_state / dcd / afc_locked
+        // / frame counters) on its own Aero body so the AERO-4 lock state is
+        // observable even for an otherwise-undecoded P-channel event (AERO-4).
+        // The frame header and any resolved satellite ride along.
+        (None, None) if e.lock.is_some() => {
+            let mut details = serde_json::json!({});
+            enrich_details(&mut details, e);
+            (MessageBody::Aero { kind: "p-channel-status".to_owned(), details }, true, None)
+        }
+        // No lock snapshot (e.g. the 10.5k OQPSK chain), but we have a
+        // resolved satellite and/or a parsed frame header — surface them on
+        // their own Aero body so the AERO-2 satellite tag and AERO-4 header
+        // reach `details` even for an event that is otherwise just
+        // reassembled user data (e.g. ACARS-less).
         (None, None) if e.satellite.is_some() || e.frame_header.is_some() => {
             let mut details = serde_json::json!({});
             enrich_details(&mut details, e);
