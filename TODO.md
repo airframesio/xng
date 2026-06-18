@@ -62,7 +62,7 @@
 - [ ] **XM-3** Shared ICAO/registration resolver (tail↔ICAO↔reg↔operator↔dbFlags mil/PIA/LADD) serving ACARS/VDL2/HFDL/Aero/Iridium/ADS-B
 - [ ] **XM-4** Multi-receiver geolocation primitive over the asf-2.0 fan-in (Iridium TDOA + Doppler self-position + ADS-B MLAT as one engine keyed on the entity)
 - [ ] **XM-5** Cross-mode dedup keyed on `(entity_id, content_hash, time-window)` (covers ADS-B multi-RX, AIS `unique on`, ecosystem fan-in)
-- [ ] **XM-6** Cross-mode distress/emergency overlay (ADS-B 7500/7600/7700 + TC28 + AIS-SART/MOB + STD-C EGC distress + future DSC / COSPAS-SARSAT 406) → one alerting surface
+- [ ] **XM-6** Cross-mode distress/emergency overlay (ADS-B 7500/7600/7700 + TC28 + AIS-SART/MOB + STD-C EGC distress + future DSC / COSPAS-SARSAT 406) → one alerting surface — ✅ **data surface DONE 2026-06-18**: `/api/state` `alerts[]` aggregates all five sources (ADS-B emergency/squawk, AIS distress-class, STD-C distress-priority, DSC distress-alert, every SARSAT 406 beacon) keyed `mode:entity`, 30-min linger, `{mode,id,kind,seen,lat?,lon?}`; `distress_alert()` helper reuses each mode's already-verified fields; test feeds one event/mode + routine traffic. ❌ remaining: dashboard.html panel rendering the array (UI; needs visual QA) + console banner (note: console.rs already renders distress inline per-message)
 
 ---
 
