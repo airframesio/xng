@@ -299,6 +299,13 @@ track is present. Each encoder is the inverse of a `decode.rs` function and is
 proven by round-tripping through this crate's own decoder, so there is no
 hand-rolled bit layout that can silently drift from the reader.
 
+An `EsSource` selects the downlink format so **rebroadcast provenance
+survives** the trip onto 1090 (NEW-P0-1.3): native ADS-B is **DF17** (CA=5),
+a UAT **TIS-B** rebroadcast becomes **DF18 CF=2**, and **ADS-R** becomes
+**DF18 CF=6** — the CF that `decode::df18_cf_class` reads back as TIS-B /
+ADS-R. The class comes from the UAT `address_qualifier`, so a 978 MHz TIS-B
+target is not mislabelled as a native transponder on tar1090.
+
 ## Validation / oracles
 
 These crates verify against external oracles, never self-loopback for field
