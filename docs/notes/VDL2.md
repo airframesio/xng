@@ -76,6 +76,15 @@ The fit cost gates acceptance: `FIT_COST_MAX = 0.25` rad². True preambles
 on the off-air capture fit below ~0.11; random data sits above ~0.5. The
 low trigger threshold is only safe because of buffer retention (below).
 
+The fit's CFO slope `b` (rad/symbol) is no longer discarded (VDL2-7): it
+is surfaced as `freq_skew_hz = b·Rs/2π` on the `Burst`/`Vdl2Frame` and into
+`SignalQuality.freq_skew_hz`. An optional `--max-ppm` (also `max-ppm` in the
+station TOML) rejects a candidate whose `|CFO|` exceeds the limit in ppm
+against the ~137 MHz band, continuing the hunt rather than collecting it;
+default off. Verified by synthesizing a burst with a known carrier offset
+and asserting the recovered skew tracks it (independent ground truth, not a
+decode loopback).
+
 ## Symbol decisions
 
 Per-symbol differential D8PSK (`collect`): Δφ of consecutive symbol
