@@ -1098,6 +1098,56 @@ fn export_gpx(d: &Dash) -> String {
     s
 }
 
+/// OGC KML 2.2: a `<Placemark>`/`<Point>` per entity fix + a `<LineString>`
+/// per trail. KML `<coordinates>` are `lon,lat[,alt]` tuples (lon first, like
+/// GeoJSON), space-separated within a LineString.
+fn export_kml(d: &Dash) -> String {
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document>\n",
+    );
+    for (kind, e) in geo_entities(d) {
+        let name = e
+            .get("flight")
+            .or_else(|| e.get("name"))
+            .or_else(|| e.get("id"))
+            .or_else(|| e.get("icao"))
+            .or_else(|| e.get("mmsi"))
+            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+            .unwrap_or_else(|| kind.to_string());
+        if let (Some(la), Some(lo)) =
+            (e.get("lat").and_then(Value::as_f64), e.get("lon").and_then(Value::as_f64))
+        {
+            s.push_str(&format!(
+                "  <Placemark><name>{}</name><Point><coordinates>{lo},{la}</coordinates></Point></Placemark>\n",
+                xml_escape(&name)
+            ));
+        }
+        let coords: Vec<String> = e
+            .get("trail")
+            .and_then(Value::as_array)
+            .map(|t| {
+                t.iter()
+                    .filter_map(|p| {
+                        let a = p.as_array()?;
+                        // stored [lat, lon] → KML "lon,lat"
+                        Some(format!("{},{}", a[1].as_f64()?, a[0].as_f64()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if coords.len() > 1 {
+            s.push_str(&format!(
+                "  <Placemark><name>{} track</name><LineString><coordinates>{}</coordinates></LineString></Placemark>\n",
+                xml_escape(&name),
+                coords.join(" ")
+            ));
+        }
+    }
+    s.push_str("</Document></kml>\n");
+    s
+}
+
 pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     addr: String,
@@ -1132,6 +1182,8 @@ pub async fn run(
                     ("application/geo+json", export_geojson(&state.lock().unwrap()))
                 } else if path.starts_with("/data/export.gpx") {
                     ("application/gpx+xml", export_gpx(&state.lock().unwrap()))
+                } else if path.starts_with("/data/export.kml") {
+                    ("application/vnd.google-earth.kml+xml", export_kml(&state.lock().unwrap()))
                 } else {
                     ("text/html; charset=utf-8", PAGE.to_string())
                 };
@@ -1498,6 +1550,20 @@ mod tests {
         assert!(gpx.contains("<gpx version=\"1.1\""), "{gpx}");
         assert!(gpx.contains("lat=\"37.5\" lon=\"-122.3\""), "{gpx}");
         assert!(gpx.trim_end().ends_with("</gpx>"));
+    }
+
+    // ECO-5: KML <coordinates> are lon,lat (lon first, like GeoJSON).
+    #[test]
+    fn export_kml_coordinates_are_lon_lat() {
+        let mut d = Dash::default();
+        update(&mut d, &msg(Mode::Ais, MessageBody::Ais {
+            nmea: vec![], msg_type: Some(1), mmsi: Some(123456789),
+            details: Some(json!({ "mmsi": 123456789, "lat": 37.5, "lon": -122.3 })),
+        }));
+        let kml = export_kml(&d);
+        assert!(kml.contains("<kml xmlns=\"http://www.opengis.net/kml/2.2\">"), "{kml}");
+        assert!(kml.contains("<coordinates>-122.3,37.5</coordinates>"), "{kml}");
+        assert!(kml.trim_end().ends_with("</kml>"));
     }
 
     // ADSB-8a: the readsb `type` provenance field. DF18 maps via the
