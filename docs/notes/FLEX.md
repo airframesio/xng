@@ -17,14 +17,35 @@ text tables) and a 2-FSK IQ front end. The DECODE core is verified against
 hand-built, spec-cited words; the DEMOD is verified ONLY by a synthetic
 modulate→AWGN→demod test — no off-air IQ exists.
 
-Status: **WIRED, SYNTHETIC-ONLY validation.** Runtime mode `Mode::Flex`,
+Status: **WIRED + REAL-OFF-AIR VALIDATED.** Runtime mode `Mode::Flex`,
 `MessageBody::Flex`, `--mode flex` (also accepts `flex-next` / `flexnext`), and
 a `FlexChannelDecoder` that owns an `xng_dsp::Ddc`. Wired through the runtime
-(`src/runtime.rs`, FLEX defaults to 1600 bps), `scan` (default centers 929/931
-MHz, scan 929 MHz), and console output. The framing/decode layer is anchored to
-spec-cited bit/field vectors; the IQ→bits front end is exercised only by a
-synthetic modulate→complex-AWGN→demod path. There is **no real off-air capture**
-in this crate.
+(opens FLEX with **`baud = 0` = auto rate-detect**), `scan`, and console output.
+
+## Rates & auto-detection (1600 / 3200 / 6400)
+
+FLEX carries Sync 1 + the Frame Information Word at **1600 bps 2-level** always,
+but the **data phase** runs at the rate encoded in the Sync-1 **A-code**: 1600
+(2-FSK), or **3200 / 6400 bps 4-level** (the rate most real US paging actually
+uses). The decoder supports all three:
+
+- `FlexChannelDecoder::new(rate, offset, baud)` — `baud` ∈ {1600, 3200, 6400}
+  forces a rate; **`baud = 0` auto-detects** it. Auto runs the candidate-rate
+  lanes; each lane self-gates on the Sync-1 A-code (`from_a_code`), so a burst
+  only decodes in the lane whose rate its A-code names — no cross-rate false
+  decodes. The 4-level data phase uses an off-air two-clock symbol recovery.
+- The 1600-only path (`decode_bits`) below is one lane; 4-level uses
+  `decode_symbols` (4-level slicer + de-interleave → the same BCH/word/page
+  core).
+
+**Real off-air validation:** a 929.6125 MHz US paging capture (6400 bps,
+4-level) is decoded by the auto path in `tests/offair.rs` — it detects 6400,
+recovers 50+ alphanumeric pages with sane capcodes and printable text (real
+hospital/alert paging), where a forced-1600 decode yields zero alpha pages
+(garbage). The test skips cleanly when the capture file is absent, so CI stays
+green; the synthetic modulate→AWGN→demod tests cover all three rates. (FLEX is
+the first of the paging/rail cores with a real-RF check — the others remain
+synthetic-only.) The 1600-specific detail below documents that lane.
 
 ## Pipeline
 
