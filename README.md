@@ -394,17 +394,21 @@ canonical station id and is independent of this per-port path.
 
 `--http 0.0.0.0:8080` (any command, or `http =` in the station config)
 serves a built-in live dashboard: a dark map of decoded **aircraft**
-(Mode S positions, callsigns, altitude/speed) and **vessels** (AIS)
-with **position trails** and altitude-colored icons, a click-to-focus
-**entity table**, countries from the ICAO/MID allocation tables,
-registrations/types from an optional `--aircraft-db` CSV
+(Mode S positions, callsigns, altitude/speed — merged across ADS-B / UAT /
+HFDL / ACARS by ICAO) and **vessels** (AIS) with altitude-colored icons, a
+click-to-focus **entity table**, countries from the ICAO/MID allocation
+tables, registrations/types from an optional `--aircraft-db` CSV
 (tar1090/Mictronics format), and a streaming message panel with
 per-mode **filter chips and live rates**, text search, and
 click-to-expand full decoded JSON for any message — the tar1090 /
 AIS-catcher-viewer experience, for every mode at once, with zero extra
-software. **Pause** freezes only the message list (the map, entity
-table and the open message details keep updating, and resuming catches
-the log up). The header shows the station id, the running **xng
+software. A **position trail** is drawn for the selected entity; a
+**"Show All Trails"** toggle reveals every entity's trail. The map's
+**layer control is mode-aware** — it lists only overlays relevant to the
+running modes (Flights, Ships, Beacons, and the Iridium satellite/spot-beam/
+beam-pattern/terminal layers only when Iridium is decoding). **Pause**
+freezes only the message list (the map, entity table and the open message
+details keep updating, and resuming catches the log up). The header shows the station id, the running **xng
 version**, and uptime, with a collapsible **SDR-status pane** (per
 session: SDR, mode, tuning, and a live/stale "last message" age). The
 page is embedded in the binary (CDN assets are SRI-pinned; RF-sourced

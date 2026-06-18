@@ -86,8 +86,10 @@ xng/
 │   │                      #   capture, device enumeration, IQ replay, rate negotiation
 │   ├── xng-acars          # application layer: ARINC 618/620/622, ADS-C, CPDLC, MIAM
 │   ├── xng-proto          # asf-2.0 .proto + prost/tonic codegen + conversions
-│   └── xng-mode-*         # one decode core per mode (acars, vdl2, hfdl, aero,
-│                          #   ais, adsb, stdc, iridium), each with a spec-faithful
+│   └── xng-mode-*         # one decode core per mode (18: acars, vdl2, hfdl,
+│                          #   aero, ais, adsb, stdc, iridium, uat, sarsat, dsc,
+│                          #   navtex, sonde, ads-l, atcs, aprs, pocsag, eot),
+│                          #   each with a spec-faithful
 │                          #   modulator for loopback tests, vendored fixtures, PROVENANCE.md
 ├── src/                   # the xng binary
 │   ├── main.rs, commands/ # CLI (listen, scan, survey, decode, iq-info, devices,
@@ -148,10 +150,13 @@ a running station's dashboard endpoint for a live per-session table.
   stats, spectrum with channel markers, and a waterfall, over a live SDR
   or a replayed file.
 - **Web dashboard** (`--http`): an embedded dark map of decoded aircraft
-  (Mode S) and vessels (AIS) with trails, an entity table, a filterable
-  streaming message panel, and Iridium overlays (satellite tracks,
-  spot-beam footprints, the reconstructed 48-beam pattern, mobile
-  terminals). Assets are embedded in the binary; RF-sourced strings are
+  (Mode S / UAT / HFDL, merged by ICAO) and vessels (AIS), an entity table,
+  a filterable streaming message panel, and a **mode-aware layer control**
+  (Flights/Ships/Beacons, plus Iridium overlays — satellite tracks,
+  spot-beam footprints, the reconstructed 48-beam pattern, mobile terminals
+  — shown only when the corresponding mode is running). Position trails
+  draw for the selected entity (or all, via a toggle). Assets are embedded
+  in the binary; RF-sourced strings are
   HTML-escaped.
 - **Station mode**: one process runs a whole receive site — several
   modes on several SDRs sharing one feed, one output set, and one
