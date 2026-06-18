@@ -358,10 +358,13 @@ facts:
 - **No phase-classified demod templates.** The demod is energy-comparison
   PPM with sub-sample phase sweeping; per-bit phase classification against
   reference pulse templates is not implemented.
-- **Beast MLAT is not RX-clock.** The 12 MHz counter is derived from the
-  host message timestamp (`timestamp_micros · 12`), not the SDR sample
-  clock, so it carries relative wall-clock timing only — true
-  receiver-clock MLAT timestamping is deferred.
+- **Beast MLAT counter is the RX sample clock** (ADSB-8 / VERIFY-12).
+  `PpmDemod::tick` derives the 6-byte 12 MHz counter from the SDR sample
+  clock — `((base_samples + pos) / input_rate) · 12e6`, with `base_samples`
+  carried across reads — and stamps it on `SignalQuality.rx_ticks_12mhz`;
+  the host wall clock (`timestamp_micros · 12`) is only the fallback when
+  that is absent. It is a consistent-rate *passive* counter (good enough for
+  an MLAT client to fit the receiver's clock drift), not GPS-disciplined.
 - **13-bit metric altitude (M-bit) rejected** — unused in practice.
 - **Surface-position global decode needs a receiver reference**
   (`--receiver-pos`); without it, surface targets resolve only once an
