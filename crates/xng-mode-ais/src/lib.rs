@@ -43,6 +43,13 @@ pub fn channel_letter(frequency_hz: u64) -> char {
     }
 }
 
+/// Build an own-ship **AIVDO** Type 1 position sentence for the receiver's own
+/// MMSI + location (AIS-5c) — lets a connected chart plotter show the station.
+/// Round-trips through the field decoder (see tests).
+pub fn own_ship_position(mmsi: u32, lat: f64, lon: f64) -> String {
+    nmea::aivdo_sentence(&fields::encode_position_report(mmsi, lat, lon))
+}
+
 /// Decodes one AIS channel out of a wideband capture.
 pub struct AisChannelDecoder {
     ddc: Option<Ddc>,
@@ -188,7 +195,26 @@ fn ais_details(f: &frame::AisFrame) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::channel_letter;
+    use super::{channel_letter, fields, nmea, own_ship_position};
+
+    // AIS-5c: an own-ship AIVDO sentence round-trips through the (pyais-
+    // oracle-validated) field decoder back to the encoded MMSI + position,
+    // with the not-available kinematic fields correctly omitted.
+    #[test]
+    fn own_ship_aivdo_round_trips() {
+        let s = own_ship_position(366_123_456, 37.5, -122.3);
+        assert!(s.starts_with("!AIVDO,1,1,,,"), "{s}");
+        assert!(s.contains('*'), "checksum present: {s}");
+        let payload = s.split(',').nth(5).unwrap();
+        let bits = nmea::payload_to_bits(payload);
+        assert_eq!((0..6).fold(0u8, |v, i| (v << 1) | bits[i]), 1, "type 1");
+        assert_eq!((8..38).fold(0u32, |v, i| (v << 1) | bits[i] as u32), 366_123_456, "mmsi");
+        let f = fields::decode(1, &bits).unwrap();
+        assert!((f["lat"].as_f64().unwrap() - 37.5).abs() < 1e-3, "lat {}", f["lat"]);
+        assert!((f["lon"].as_f64().unwrap() - (-122.3)).abs() < 1e-3, "lon {}", f["lon"]);
+        // Kinematics a fixed station can't supply are "not available" → omitted.
+        assert!(f.get("sog_kt").is_none() && f.get("cog_deg").is_none(), "{f:?}");
+    }
 
     #[test]
     fn channel_letter_labels_a_b_and_marks_unknown() {

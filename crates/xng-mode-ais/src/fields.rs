@@ -5,6 +5,40 @@
 
 use serde_json::{Value, json};
 
+/// Append `val`'s low `n` bits, MSB-first (one `u8` per bit) — the inverse of
+/// [`u`], for building AIS payloads (AIS-5c).
+fn put_bits(out: &mut Vec<u8>, val: u64, n: usize) {
+    for k in (0..n).rev() {
+        out.push(((val >> k) & 1) as u8);
+    }
+}
+
+/// Encode an own-ship **Type 1** position report (ITU-R M.1371): the inverse of
+/// the `1..=3` decode arm. Kinematic fields a fixed SDR can't supply (ROT, SOG,
+/// COG, heading, timestamp) are set to their "not available" sentinels rather
+/// than fabricated. Round-trips through [`decode`] in the tests. (AIS-5c)
+pub fn encode_position_report(mmsi: u32, lat: f64, lon: f64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(168);
+    put_bits(&mut b, 1, 6); // message type 1
+    put_bits(&mut b, 0, 2); // repeat indicator
+    put_bits(&mut b, mmsi as u64, 30);
+    put_bits(&mut b, 15, 4); // nav status: 15 = not defined
+    put_bits(&mut b, 128, 8); // ROT: 0x80 = not available
+    put_bits(&mut b, 1023, 10); // SOG: not available
+    put_bits(&mut b, 0, 1); // position accuracy
+    put_bits(&mut b, ((lon * 600_000.0).round() as i64) as u64 & 0xFFF_FFFF, 28); // lon 1/10000 min
+    put_bits(&mut b, ((lat * 600_000.0).round() as i64) as u64 & 0x7FF_FFFF, 27); // lat 1/10000 min
+    put_bits(&mut b, 3600, 12); // COG: not available
+    put_bits(&mut b, 511, 9); // heading: not available
+    put_bits(&mut b, 60, 6); // timestamp: not available
+    put_bits(&mut b, 0, 2); // maneuver
+    put_bits(&mut b, 0, 3); // spare
+    put_bits(&mut b, 0, 1); // RAIM
+    put_bits(&mut b, 0, 19); // radio status
+    debug_assert_eq!(b.len(), 168);
+    b
+}
+
 fn u(bits: &[u8], s: usize, n: usize) -> Option<u64> {
     if s + n > bits.len() {
         return None;

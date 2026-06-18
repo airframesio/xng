@@ -36,6 +36,19 @@ fn checksum(body: &str) -> u8 {
     body.bytes().fold(0, |c, b| c ^ b)
 }
 
+/// Armor `message_bits` into a single own-ship **AIVDO** sentence (AIS-5c):
+/// `!AIVDO,1,1,,,<payload>,<fill>*HH`. Used for the receiver's own position;
+/// the payload fits one sentence for the 168-bit Type 1 report.
+pub fn aivdo_sentence(message_bits: &[u8]) -> String {
+    let fill = (6 - message_bits.len() % 6) % 6;
+    let mut padded = message_bits.to_vec();
+    padded.extend(std::iter::repeat(0).take(fill));
+    let chars: String =
+        padded.chunks_exact(6).map(|c| armor(c.iter().fold(0u8, |v, &b| (v << 1) | b))).collect();
+    let body = format!("AIVDO,1,1,,,{chars},{fill}");
+    format!("!{body}*{:02X}", checksum(&body))
+}
+
 /// Build an NMEA 0183 tag-block (IEC 61162-1): `\s:<source>,c:<unix_ts>*HH\`
 /// where `HH` is the XOR checksum of the bytes between the `\` delimiters.
 /// Prepended to a sentence by transports that carry per-message source +
