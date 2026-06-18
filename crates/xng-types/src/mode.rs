@@ -45,6 +45,11 @@ pub enum Mode {
     Pocsag,
     /// Rail end-of-train / head-of-train telemetry (Manchester FSK, AAR S-9152).
     Eot,
+    /// FLEX / FLEX-NEXT radio paging (2/4-FSK, 1600/3200/6400 bps).
+    Flex,
+    /// VDES ASM — VHF Data Exchange System Application-Specific Messages
+    /// (the AIS 27/28 → ASM1/2 channels; ITU-R M.2092).
+    Vdes,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -71,6 +76,8 @@ impl Mode {
             Mode::Aprs => "aprs",
             Mode::Pocsag => "pocsag",
             Mode::Eot => "eot",
+            Mode::Flex => "flex",
+            Mode::Vdes => "vdes",
             Mode::Extern => "extern",
         }
     }
@@ -97,6 +104,8 @@ impl Mode {
             Mode::Aprs,
             Mode::Pocsag,
             Mode::Eot,
+            Mode::Flex,
+            Mode::Vdes,
         ]
     }
 }
@@ -131,6 +140,8 @@ impl std::str::FromStr for Mode {
             "aprs" | "ax25" | "ax.25" | "packet" => Ok(Mode::Aprs),
             "pocsag" | "pager" | "paging" => Ok(Mode::Pocsag),
             "eot" | "hot" | "eotd" | "dpu" => Ok(Mode::Eot),
+            "flex" | "flex-next" | "flexnext" => Ok(Mode::Flex),
+            "vdes" | "vdes-asm" | "asm" => Ok(Mode::Vdes),
             other => Err(format!("unknown mode: {other}")),
         }
     }

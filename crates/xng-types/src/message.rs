@@ -211,6 +211,18 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// FLEX pager message; `kind` = message class (alpha/numeric/tone),
+    /// `details` = capcode/frame/cycle + decoded text.
+    Flex {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// VDES Application-Specific Message; `kind` = ASM type, `details` =
+    /// source MMSI + DAC/FID + decoded ASM payload fields.
+    Vdes {
+        kind: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 
