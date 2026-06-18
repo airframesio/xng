@@ -1,6 +1,6 @@
 # ATCS (Advanced Train Control System) — implementation notes
 
-Native decode core for the North-American rail data radio (AAR
+Native decode mode for the North-American rail data radio (AAR
 Specification 200) in `crates/xng-mode-atcs`. ATCS links a dispatch
 office / ground network to wayside field equipment (MCPs) over a pair of
 900 MHz channels at 4800 bps FSK. The RF link carries a synchronous
@@ -12,36 +12,72 @@ ATCS, the Signal Identification Wiki ATCS page, and the ATCS Monitor
 address documentation — **no decoder code was ported or copied** (see
 `PROVENANCE.md`).
 
-This crate delivers the **decode layer only** — bits/bytes → structured
-fields. Two follow-ups are out of scope and explicitly deferred: the IQ →
-bits FSK front end, and the vendor codeline payload protocols (Genisys /
-ARES) carried inside the user data. xng surfaces the raw payload bytes
-and stops at the Spec-200 header.
+The crate now spans **IQ → bits → structured fields**: a 2-FSK
+discriminator front end feeds the HDLC deframer and Spec-200 header
+decode. One follow-up stays out of scope: the vendor codeline payload
+protocols (Genisys / ARES) carried inside the user data. xng surfaces
+the raw payload bytes and stops at the Spec-200 header.
 
-## Status: DECODE-CORE (not wired to `--mode`)
+## Status: RUNTIME-WIRED (demod is SYNTHETIC-validated)
 
-This is a verified, externally-anchored decode core. It is **not yet
-integrated** into the runtime: `xng-mode-atcs` is not a workspace
-dependency of the CLI (absent from the `crates/*` dependency block in the
-root `Cargo.toml`), there is no `Mode::Atcs`, no `--mode atcs`, no scan
-plan, no `to_message` mapping, and no `xng_types::Message` variant. The
-decode layer ships standalone (consumed via its public API
-`HdlcDeframer` / `decode_frame` / `decode_packet`) and is fenced by its
-own tests; nothing feeds it live samples yet.
+ATCS is integrated into the runtime: `xng-mode-atcs` is a workspace
+dependency of the `xng` binary, there is a `Mode::Atcs` / `--mode atcs`,
+a `MessageBody::Atcs` variant, an `AtcsChannelDecoder` arm in
+`src/runtime.rs`, a `scan` frequency plan (`src/commands/scan.rs`:
+2.4 Msps over 896/900 MHz), console rendering (`src/outputs/console.rs`),
+and airframes output (`src/outputs/airframes.rs`). The proto layer
+(`xng-proto`) carries the `Atcs` body.
+
+The IQ front end (`demod::FskDemod` + `AtcsChannelDecoder`) is exercised
+only by a clearly-named **synthetic** modulate → demod loopback — there
+is no public ATCS IQ vector to anchor it against. (The one real-world
+ATCS sample available is an unmodulated-carrier file, useless for demod
+validation.) The **decode core** (HDLC deframe + Spec-200 header)
+remains externally anchored by its own oracle tests. ATCS messages
+carry no lat/lon, so ATCS is **not** plotted on the dashboard beacons
+map; it surfaces as a packet record (direction + addresses).
 
 ## Pipeline
 
-NRZI-decoded link bits → `frame::HdlcDeframer` (flag hunt, bit
-destuffing, FCS = CRC-16/X-25 check) → raw frame bytes → `spec200::
-decode_packet` (control octet → priority / ARQ / service flags; BCD
-address-length octet; source + destination addresses via `address`) →
-`Spec200Packet { control fields, source, destination, direction,
-user_data }`. The `decode_frame` convenience in `lib.rs` chains frame →
-packet.
+Wideband IQ → `xng_dsp::Ddc` (mix/decimate to the 24 kHz channel) →
+`demod::FskDemod` (2-FSK discriminator → carrier-offset DC tracker →
+per-bit integrate-and-dump with zero-crossing timing recovery → NRZI
+decode) → link bits → `frame::HdlcDeframer` (flag hunt, bit destuffing,
+FCS = CRC-16/X-25 check) → raw frame bytes → `spec200::decode_packet`
+(control octet → priority / ARQ / service flags; BCD address-length
+octet; source + destination addresses via `address`) → `Spec200Packet`.
+`AtcsChannelDecoder::process` chains channel IQ → CRC-valid frame →
+packet, returning `AtcsDecoded { frame, packet }`; the standalone
+`decode_frame` convenience in `lib.rs` chains frame → packet for callers
+already holding bytes.
 
-The **input is NRZI-decoded bits**, not IQ — the FSK discriminator,
-NRZI decode, and bit-sync on the 40-alternating-bit preamble are the
-deferred front end (see below).
+`CHANNEL_RATE` = 24 kHz (5 samples/bit at 4800 bd); `CHANNEL_PASSBAND_HZ`
+= 4800 Hz (one-sided), comfortably inside a 12.5/25 kHz ATCS channel.
+
+## IQ front end — 2-FSK demod (`demod.rs`)
+
+Direct 2-FSK (mark/space tones either side of channel center) carrying
+the NRZI-encoded HDLC bit stream. The chain is the AIS `GmskDemod`
+discriminator + timing-recovery pattern (binary FSK is the BT→∞ limit of
+GMSK), retuned for ATCS's 4800 bd / ±1800 Hz deviation; there is no
+shared FSK primitive in `xng-dsp`.
+
+| Element | Value / behaviour |
+|---|---|
+| Discriminator | per-sample phase advance `arg(x · conj(prev))` |
+| Carrier-offset (DC) tracker | `FREQ_ALPHA` = 0.002; absorbs radio + rx ppm offset and recenters off the alternating-bit preamble |
+| Timing recovery | zero-crossing nudge, `TIMING_GAIN` = 0.15, `SAMPLES_PER_BIT` = 5 |
+| Bit decision | integrate-and-dump over the bit window; sign → tone level |
+| NRZI decode | no level change = 1, level change = 0 |
+| Level estimate | smoothed channel power (`LEVEL_ALPHA` = 0.005) → `level_dbfs()` |
+
+The 40-alternating-bit bit-sync and frame-sync sequence that precede each
+burst are handled by the DC/timing loops settling during the preamble
+plus the deframer's flag hunt; there is no explicit correlator.
+
+`modulate.rs` is the **self-generated** modulator for the synthetic
+loopback only (NRZI encode → 2-FSK at ±1800 Hz, with a 40-bit bit-sync
+preamble and trailing idle); it is not an external oracle.
 
 ## Layer 2 — HDLC / LAPB deframing (`frame.rs`)
 
@@ -62,8 +98,8 @@ at a time:
 A completed frame yields `AtcsFrame { bytes (FCS stripped), fcs }`; only
 CRC-valid frames are emitted. `hdlc_bits` is a transmit-order framing
 helper (opening flag, stuffed payload + FCS, closing flag) used by the
-tests and any future modulator — it is **not** a self-consistency oracle
-(see Validation).
+tests and the synthetic modulator — it is **not** a self-consistency
+oracle (see Sourcing).
 
 ## Layer 3 — Spec-200 packet header (`spec200.rs`)
 
@@ -97,6 +133,8 @@ for downstream output.
 
 **Direction** is derived from the two address types: `ground-to-field`
 (ground source → field destination), `field-to-ground`, else `other`.
+`to_message` uses this direction string as the `MessageBody::Atcs`
+`kind`, with the full `Spec200Packet` JSON as `details`.
 
 ## ATCS address decode (`address.rs`)
 
@@ -129,21 +167,23 @@ undocumented formats; the raw routing string is always preserved.
 
 ## Sourcing / oracles
 
-This crate verifies against external references, never an
+The decode core verifies against external references, never an
 encode→decode self-loopback. No raw ATCS HDLC bit capture (IQ or on-air
 bytes) is published, so the framer is anchored to a public CRC catalogue
-value and the packet/address decode is anchored to a published
-worked example.
+value and the packet/address decode is anchored to a published worked
+example. The IQ demod, having no public reference vector, is validated
+by a fenced **synthetic** loopback (see the demod row).
 
 | Fact | Oracle | How verified |
 |---|---|---|
 | HDLC FCS = CRC-16/X-25 | Public CRC catalogue (X-25 / IBM-SDLC) | `frame.rs::fcs_matches_x25_catalogue_value`: `hdlc_fcs("123456789") == 0x906E`, the catalogue check value — anchors the FCS to an external constant, not our encoder |
 | Flag / stuffing / abort / shared-flag deframing | ISO/IEC 3309 / 13239 HDLC | Catalogue-string frame with its **externally fixed** FCS (0x906E) carried through flag-hunt + destuffing; long-1-run stuffing, bad-FCS rejection, shared-flag, and 7-ones abort all asserted |
-| 4800 bps FSK, 900 MHz, 12.5 kHz channels, HDLC-LAPB | AAR Standard Manual of ATCS (Spec-200); Signal ID Wiki ATCS page (independent confirmation) | Documented; not exercised at runtime (no demod) |
+| 4800 bps FSK, 900 MHz, 12.5 kHz channels, HDLC-LAPB | AAR Standard Manual of ATCS (Spec-200); Signal ID Wiki ATCS page (independent confirmation) | Documented; the demod realizes 4800 bd / ±1800 Hz, but only against synthetic IQ |
 | Spec-200 control / addr-length / BCD header layout | AAR Standard Manual of ATCS | Spec-derived packet decoded against the documented field semantics |
 | Address user-group digit table | AAR Standard Manual of ATCS; ATCS Monitor (atcsmon.com) | `address.rs::address_type_digit_table` asserts every digit→type |
 | Worked sample addresses + railroad number | sigidwiki.com decoded Spec-200 packet | Source `5125013826` → WaysideRf / railroad 125; destination `2125385538` → Host / railroad 125; both asserted in `address.rs` and the end-to-end test |
 | Type-5 / type-7 line+node split | ATCS Monitor documented formats | Asserted on the sigidwiki sample (type 5: XX=01, AAAA=3826) and a type-7 example |
+| IQ → bits FSK demod | **SYNTHETIC** (self-generated, no public ATCS IQ) | `tests/end_to_end.rs::decodes_synth_iq_*`: the modulator NRZI/2-FSK-encodes the **same spec-derived frame**, run through `AtcsChannelDecoder` (channel-rate and wideband+DDC, with carrier offset and noise); recovered Spec-200 fields asserted equal to the known-good values. Self-consistency, **not** an oracle |
 
 **Spec-derived end-to-end** (`tests/end_to_end.rs`): a Spec-200 packet
 assembled byte-for-byte from the AAR header layout (control 0x24, three
@@ -157,33 +197,36 @@ standard's definitions and the sigidwiki sample. This is documented as
 standard, and the decode is checked against the standard plus the
 external worked example — never against a modulator in this crate.
 Additional cases cover an FCS-rejected corrupted frame and a frame buried
-in idle/noise with a stray flag and bit-sync-like preamble.
+in idle/noise with a stray flag and bit-sync-like preamble. The
+`synth_iq_to_message` case asserts the full `MessageBody::Atcs` mapping
+(mode, CRC flag, raw bytes, `kind`/`details` JSON).
 
 ## Limitations / deferred
 
-- **No IQ demodulator (deferred, marked TODO in `lib.rs`).** The
-  FSK-discriminator front end (DDC to channel → 4800 bps FSK
-  discriminator → NRZI decode → bit-sync on the 40-alternating-bit
-  preamble + frame-sync sequence) is **not implemented**. There is no
-  public ATCS IQ vector to verify a demodulator against, and project
-  policy forbids shipping an unverifiable self-consistency loopback, so
-  the demod is deferred rather than faked. The RWMON / rail.watch and
-  ATCS Monitor projects describe the front end (GNU Radio FSK demod at
-  4800 bps) for a future stage once a captured reference is available.
-  The crate's input is NRZI-decoded bits.
+- **IQ demod is synthetic-validated only.** `demod::FskDemod` /
+  `AtcsChannelDecoder` realize the 4800 bd 2-FSK front end and decode the
+  synthetic modulate → demod loopback (channel-rate and wideband+DDC,
+  with carrier offset + noise), but there is **no public ATCS IQ vector**
+  to anchor it against (the one real-world sample is an unmodulated
+  carrier). Project policy forbids presenting a self-consistency loopback
+  as validation, so the front end is fenced as SYNTHETIC and can be
+  re-anchored against a captured reference once one is published, without
+  changing the decode core. The RWMON / rail.watch and ATCS Monitor
+  projects describe the same front end (GNU Radio FSK demod at 4800 bps).
 - **Genisys / ARES payload not decoded.** The vendor codeline protocols
   inside the Spec-200 `user_data` are out of scope; the raw bytes are
   surfaced and the message-type / "Number=2.3.2" semantics from the
   sigidwiki sample are **not** parsed.
-- **Not runtime-wired.** No `Mode::Atcs`, `--mode atcs`, scan plan,
-  `Message` variant, or `to_message` mapping. The crate is a standalone
-  decode core, not yet in the CLI's dependency graph (see Status).
 - **Reserved octets 2..4** are read past but not interpreted.
 - **Line/node split** is only attempted for the two documented type-5 /
   type-7 formats; all other addresses carry the raw routing string only.
-- **No off-air fixture.** No raw ATCS bit/IQ capture is published, so
-  every test is anchored to the external CRC catalogue value and the
-  sigidwiki worked example rather than a vendored recording.
+- **No off-air fixture.** No usable raw ATCS bit/IQ capture is published,
+  so every decode-core test is anchored to the external CRC catalogue
+  value and the sigidwiki worked example, and the demod test to a
+  self-generated burst — not to a vendored recording.
+- **No position / beacons-map layer.** ATCS packets carry routing
+  addresses, not lat/lon, so they are not plotted on the dashboard map;
+  output is the packet record (direction + addresses + raw payload).
 
 ## Key references
 
@@ -196,8 +239,11 @@ in idle/noise with a stray flag and bit-sync-like preamble.
 - **ATCS Monitor** (atcsmon.com) — address decoding documentation
   (user-group table, type-5 / type-7 line/node renderings).
 - **RWMON / rail.watch, ATCS Monitor** — front-end description (GNU Radio
-  4800 bps FSK demod) for the deferred IQ stage.
+  4800 bps FSK demod), the model for the implemented 2-FSK demod.
 - ISO/IEC 3309 / 13239 — HDLC framing; CRC-16/X-25 (X-25 / IBM-SDLC)
   catalogue check value `0x906E`.
-- Shared DSP: `xng_dsp::checksum::{hdlc_fcs, hdlc_frame_ok}`.
+- Shared DSP: `xng_dsp::Ddc`, `xng_dsp::checksum::{hdlc_fcs, hdlc_frame_ok}`;
+  demod modeled on `xng_mode_ais::demod::GmskDemod`.
 - `crates/xng-mode-atcs/PROVENANCE.md` — clean-room sourcing per fact.
+</content>
+</invoke>
