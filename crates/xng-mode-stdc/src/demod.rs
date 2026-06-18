@@ -3,11 +3,11 @@
 //! timing recovery. The 180° phase ambiguity is resolved downstream at
 //! the frame layer (UW matched in both polarities).
 
-use crate::modulate::{rrc_taps, RRC_BETA};
+use crate::modulate::RRC_BETA;
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::sync::Arc;
-use xng_dsp::{lowpass_taps, Fir};
+use xng_dsp::{lowpass_taps, rrc_taps, Fir};
 
 const SYMBOL_RATE: f64 = 1200.0;
 const COARSE_FFT: usize = 8192;
@@ -63,7 +63,7 @@ impl BpskDemod {
         Self {
             spb,
             lpf: Fir::new(lowpass_taps(1000.0 / channel_rate, 121)),
-            rrc: Fir::new(rrc_taps(spb, rrc_taps_len, RRC_BETA)),
+            rrc: Fir::new(rrc_taps(RRC_BETA, spb, rrc_taps_len)),
             use_matched_filter,
             rrc_out: Vec::new(),
             filtered: Vec::new(),
