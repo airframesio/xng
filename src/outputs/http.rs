@@ -538,6 +538,45 @@ fn update(d: &mut Dash, m: &Message) {
                 merge_aircraft(d, "uat", AcIds { icao, flight, reg: None }, c, pos);
             }
         }
+        // HFDL non-ACARS events: position-bearing HFNPDUs (performance-data /
+        // frequency-data) carry an aircraft GPS fix, and the decoder back-fills
+        // the ICAO from its logon cache (HFDL-3) onto both `who` and the nested
+        // `position` object. Route any event with a resolved ICAO through the
+        // aircraft merge so HFDL positions land on the map AND coalesce with
+        // 1090/UAT ADS-B and ACARS by ICAO (XM-2.2). Uplink/pre-logon events
+        // carry no resolved ICAO and are skipped.
+        MessageBody::Hfdl { details, .. } => {
+            let posobj = details.get("position");
+            let pos = posobj.and_then(|p| {
+                match (
+                    p.get("lat").and_then(Value::as_f64),
+                    p.get("lon").and_then(Value::as_f64),
+                ) {
+                    (Some(la), Some(lo)) => Some((la, lo)),
+                    _ => None,
+                }
+            });
+            let icao = posobj
+                .and_then(|p| p.get("icao"))
+                .or_else(|| details.get("who").and_then(|w| w.get("icao")))
+                .or_else(|| details.get("icao"))
+                .and_then(Value::as_str)
+                .map(|s| s.to_uppercase())
+                .filter(|s| s.len() == 6 && s != "000000");
+            let flight = posobj
+                .and_then(|p| p.get("flight"))
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty());
+            if let Some(icao) = icao {
+                let mut c = serde_json::Map::new();
+                if let Some((la, lo)) = pos {
+                    c.insert("lat".into(), json!(la));
+                    c.insert("lon".into(), json!(lo));
+                }
+                merge_aircraft(d, "hfdl", AcIds { icao: Some(icao), flight, reg: None }, c, pos);
+            }
+        }
         // Position-bearing beacons (radiosonde / ADS-L / COSPAS-SARSAT / DSC):
         // surface them on the map as their own layer (was silently dropped).
         MessageBody::Sonde { details, .. }
@@ -933,6 +972,40 @@ mod tests {
         assert!(ac["lat"].is_number(), "has a map position");
         let srcs = ac["sources"].as_object().unwrap();
         assert!(srcs.contains_key("adsb") && srcs.contains_key("uat"), "two sources");
+    }
+
+    #[test]
+    fn hfdl_position_surfaces_as_aircraft_and_merges_by_icao() {
+        let mut d = Dash::default();
+        // ADS-B (1090) by ICAO, then an HFDL performance-data position report for
+        // the same aircraft (ICAO back-filled by the decoder onto the position
+        // object) → one merged aircraft, two sources, plotted on the map.
+        update(&mut d, &msg(Mode::Adsb, MessageBody::ModeS {
+            df: 17, icao: Some("40612F".into()), callsign: None, altitude_ft: Some(38000),
+            squawk: None, lat: Some(51.0), lon: Some(0.5), speed_kt: None, speed_type: None,
+            track_deg: None, vertical_rate_fpm: None, comm_b: None, adsb_status: None,
+        }));
+        update(&mut d, &msg(Mode::Hfdl, MessageBody::Hfdl {
+            kind: "performance-data".into(),
+            details: json!({
+                "who": {"dir": "downlink", "gs_id": 1, "aircraft_id": 0x42, "icao": "40612F"},
+                "position": {"lat": 51.02, "lon": 0.55, "utc_s": 3600, "flight": "BA117", "icao": "40612F"},
+            }),
+        }));
+        assert_eq!(d.aircraft.len(), 1, "HFDL coalesces with ADS-B by ICAO");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let ac = &snap["aircraft"][0];
+        assert_eq!(ac["icao"], "40612F");
+        assert_eq!(ac["flight"], "BA117", "flight from the HFDL position report");
+        assert!(ac["lat"].is_number(), "HFDL fix gives a map position");
+        let srcs = ac["sources"].as_object().unwrap();
+        assert!(srcs.contains_key("adsb") && srcs.contains_key("hfdl"), "two sources");
+        // An HFDL event with no resolved ICAO (uplink/pre-logon) plots nothing.
+        update(&mut d, &msg(Mode::Hfdl, MessageBody::Hfdl {
+            kind: "squitter".into(),
+            details: json!({"gs_id": 1, "gs_name": "San Francisco, USA"}),
+        }));
+        assert_eq!(d.aircraft.len(), 1, "ICAO-less HFDL event adds no aircraft");
     }
 
     #[test]
