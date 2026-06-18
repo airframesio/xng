@@ -132,6 +132,10 @@ const READ_CHUNK: usize = 65_536;
 pub struct LiveState {
     /// Per channel: (freq_hz, frames, crc_ok, level_dbfs).
     pub stats: std::sync::Mutex<Vec<(u64, u64, u64, f32)>>,
+    /// Decoded ACARS message tally keyed by `(freq_hz, label)` — the
+    /// dimension the flat `stats` Vec can't carry. Feeds the per-label
+    /// Prometheus counter (VERIFY-9 / ACARS-5.2).
+    pub acars_labels: std::sync::Mutex<std::collections::HashMap<(u64, String), u64>>,
     pub spectrum: std::sync::Mutex<Option<SpectrumFrame>>,
     pub samples: std::sync::atomic::AtomicU64,
 }
@@ -148,9 +152,27 @@ impl LiveState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             stats: std::sync::Mutex::new(Vec::new()),
+            acars_labels: std::sync::Mutex::new(std::collections::HashMap::new()),
             spectrum: std::sync::Mutex::new(None),
             samples: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Upsert one channel's cumulative frame stats keyed by frequency. Keying
+    /// by freq (not the per-session channel index) lets several station
+    /// sessions — each numbering its channels from 0 — share one `LiveState`
+    /// without clobbering each other's rows.
+    pub fn record_channel(&self, freq: u64, frames: u64, crc_ok: u64, level: f32) {
+        let mut s = self.stats.lock().unwrap();
+        match s.iter_mut().find(|e| e.0 == freq) {
+            Some(e) => *e = (freq, frames, crc_ok, level),
+            None => s.push((freq, frames, crc_ok, level)),
+        }
+    }
+
+    /// Tally one decoded ACARS message under `(freq, label)`.
+    pub fn record_acars_label(&self, freq: u64, label: &str) {
+        *self.acars_labels.lock().unwrap().entry((freq, label.to_string())).or_insert(0) += 1;
     }
 }
 
@@ -950,14 +972,15 @@ pub(crate) fn decode_loop(
                 if !label_filter.allows(&msg) {
                     continue;
                 }
+                if let (Some((state, _, _)), xng_types::MessageBody::Acars(a)) =
+                    (&live, &msg.body)
+                {
+                    state.record_acars_label(*freq, &a.label);
+                }
                 bus.publish(msg);
             }
             if let Some((state, _, _)) = &live {
-                let mut ls = state.stats.lock().unwrap();
-                if ls.len() <= i {
-                    ls.resize(decoders_len_hint(i), (0, 0, 0, 0.0));
-                }
-                ls[i] = (stats[i].0, stats[i].1, stats[i].2, dec_level_after(dec));
+                state.record_channel(stats[i].0, stats[i].1, stats[i].2, dec_level_after(dec));
             }
         }
     }
@@ -1026,16 +1049,23 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let bus = MessageBus::new();
-        if let Some(addr) = prepared[0].cfg.outputs.metrics.clone() {
+        // One shared LiveState fed by every session's decode loop, so the
+        // station's /metrics reflects real per-channel frame + per-label ACARS
+        // counts (previously the served state was never updated → all zeros).
+        // Only built when metrics is enabled, to keep the no-metrics path free
+        // of the per-channel locking + spectrum FFT.
+        let live = prepared[0].cfg.outputs.metrics.clone().map(|addr| {
             let live = LiveState::new();
+            let served = live.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    crate::outputs::metrics::serve(addr, live, "station".to_string()).await
+                    crate::outputs::metrics::serve(addr, served, "station".to_string()).await
                 {
                     tracing::warn!("metrics endpoint failed: {e}");
                 }
             });
-        }
+            live
+        });
         let output_tasks = spawn_outputs(&bus, &prepared[0].cfg.outputs, &station, &sessions_desc);
 
         spawn_interrupt_handler(stop.clone(), "station");
@@ -1045,6 +1075,8 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
             let bus = bus.clone();
             let stop = stop.clone();
             let station = station.clone();
+            let live = live.clone();
+            let capture_center = prep.capture_center;
             decode_tasks.push(tokio::task::spawn_blocking(move || {
                 let reasm_timeout = match prep.cfg.mode {
                     Mode::AcarsPoa | Mode::Vdl2 => 120.0,
@@ -1054,7 +1086,8 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                     xng_acars::reasm::Reassembler::new(reasm_timeout),
                     xng_acars::miam::FileReassembler::new(),
                 );
-                let _ = prep.capture_center;
+                let sample_rate = prep.source.sample_rate();
+                let live = live.map(|l| (l, capture_center, sample_rate));
                 decode_loop(
                     &mut *prep.source,
                     std::mem::take(&mut prep.decoders),
@@ -1062,7 +1095,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                     prep.cfg.sdr.clone(),
                     bus,
                     stop,
-                    None,
+                    live,
                     Some(&mut reasm),
                     prep.cfg.label_filter.clone(),
                 )
@@ -1169,10 +1202,6 @@ fn apply_reassembly(
             core.app = serde_json::to_value(&app).ok();
         }
     }
-}
-
-fn decoders_len_hint(i: usize) -> usize {
-    i + 1
 }
 
 fn dec_level_after(dec: &ModeChannel) -> f32 {
