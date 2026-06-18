@@ -755,6 +755,76 @@ fn snapshot(d: &mut Dash) -> String {
     .to_string()
 }
 
+/// readsb/tar1090-compatible `aircraft.json`: every live aircraft entity that
+/// has a real ICAO hex, mapped to the readsb field schema. Makes xng a
+/// drop-in source for tar1090 / graphs1090 / VRS without Beast. (ECO-4)
+fn aircraft_json(d: &Dash) -> String {
+    let now = now_s();
+    let cutoff = now.saturating_sub(EXPIRE_S);
+    let messages: u64 = d.totals.values().sum();
+    let copy = |o: &mut serde_json::Map<String, Value>, a: &Value, from: &str, to: &str| {
+        if let Some(v) = a.get(from) {
+            if !v.is_null() {
+                o.insert(to.into(), v.clone());
+            }
+        }
+    };
+    let list: Vec<Value> = d
+        .aircraft
+        .values()
+        .filter(|a| a.get("seen").and_then(Value::as_u64).unwrap_or(0) >= cutoff)
+        .filter_map(|a| {
+            let icao = a.get("icao").and_then(Value::as_str)?; // readsb needs a hex id
+            let mut o = serde_json::Map::new();
+            o.insert("hex".into(), json!(icao.to_lowercase()));
+            copy(&mut o, a, "flight", "flight");
+            copy(&mut o, a, "reg", "r");
+            copy(&mut o, a, "actype", "t");
+            copy(&mut o, a, "alt", "alt_baro");
+            copy(&mut o, a, "spd", "gs");
+            copy(&mut o, a, "trk", "track");
+            copy(&mut o, a, "squawk", "squawk");
+            copy(&mut o, a, "nacp", "nac_p");
+            copy(&mut o, a, "sil", "sil");
+            copy(&mut o, a, "adsb_version", "version");
+            copy(&mut o, a, "sel_alt", "nav_altitude_mcp");
+            if a.get("lat").is_some() && a.get("lon").is_some() {
+                copy(&mut o, a, "lat", "lat");
+                copy(&mut o, a, "lon", "lon");
+            }
+            copy(&mut o, a, "msgs", "messages");
+            if let Some(seen) = a.get("seen").and_then(Value::as_u64) {
+                let age = now.saturating_sub(seen);
+                o.insert("seen".into(), json!(age));
+                if a.get("lat").is_some() {
+                    o.insert("seen_pos".into(), json!(age));
+                }
+            }
+            Some(Value::Object(o))
+        })
+        .collect();
+    json!({ "now": now, "messages": messages, "aircraft": list }).to_string()
+}
+
+/// readsb/tar1090 `receiver.json`: version, refresh cadence, and (if a session
+/// reported `receiver-pos`) the receiver location so tar1090 centers the map.
+fn receiver_json(d: &Dash) -> String {
+    let mut o = serde_json::Map::new();
+    o.insert("version".into(), json!(format!("xng-{}", env!("CARGO_PKG_VERSION"))));
+    o.insert("refresh".into(), json!(1000));
+    o.insert("history".into(), json!(0));
+    for s in &d.sessions {
+        if let Some(rp) = s.get("receiver_pos").and_then(Value::as_array) {
+            if rp.len() == 2 {
+                o.insert("lat".into(), rp[0].clone());
+                o.insert("lon".into(), rp[1].clone());
+                break;
+            }
+        }
+    }
+    Value::Object(o).to_string()
+}
+
 pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     addr: String,
@@ -781,6 +851,10 @@ pub async fn run(
                 let path = req.split_whitespace().nth(1).unwrap_or("/");
                 let (ctype, body) = if path.starts_with("/api/state") {
                     ("application/json", snapshot(&mut state.lock().unwrap()))
+                } else if path.starts_with("/data/aircraft.json") {
+                    ("application/json", aircraft_json(&state.lock().unwrap()))
+                } else if path.starts_with("/data/receiver.json") {
+                    ("application/json", receiver_json(&state.lock().unwrap()))
                 } else {
                     ("text/html; charset=utf-8", PAGE.to_string())
                 };
@@ -1042,6 +1116,29 @@ mod tests {
         assert!(ac["lat"].is_number(), "has a map position");
         let srcs = ac["sources"].as_object().unwrap();
         assert!(srcs.contains_key("adsb") && srcs.contains_key("uat"), "two sources");
+    }
+
+    #[test]
+    fn aircraft_json_emits_readsb_schema() {
+        let mut d = Dash::default();
+        update(&mut d, &msg(Mode::Adsb, MessageBody::ModeS {
+            df: 17, icao: Some("AC82EC".into()), callsign: Some("N5130E".into()),
+            altitude_ft: Some(35000), squawk: Some("1200".into()),
+            lat: Some(40.0), lon: Some(-120.0), speed_kt: Some(420.0), speed_type: Some("GS".into()),
+            track_deg: Some(270.0), vertical_rate_fpm: None, comm_b: None, adsb_status: None,
+        }));
+        let v: Value = serde_json::from_str(&aircraft_json(&d)).unwrap();
+        assert!(v["now"].is_number() && v["messages"].is_number());
+        let a = &v["aircraft"][0];
+        assert_eq!(a["hex"], "ac82ec", "hex is lowercased ICAO");
+        assert_eq!(a["flight"], "N5130E");
+        assert_eq!(a["alt_baro"], 35000);
+        assert_eq!(a["gs"], 420.0);
+        assert_eq!(a["squawk"], "1200");
+        assert!(a["lat"].is_number() && a["lon"].is_number() && a["seen_pos"].is_number());
+        // receiver.json carries version + (no position configured here).
+        let r: Value = serde_json::from_str(&receiver_json(&d)).unwrap();
+        assert!(r["version"].as_str().unwrap().starts_with("xng-"));
     }
 
     #[test]
