@@ -196,6 +196,14 @@ fn merge_aircraft(
     let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
     o.insert("msgs".into(), json!(msgs + 1));
     for (k, v) in &contrib {
+        // Never let a bare Mode S surveillance frame downgrade an already
+        // recorded, more specific ADS-B/TIS-B/ADS-R provenance class.
+        if k == "ac_type"
+            && v.as_str() == Some("mode_s")
+            && o.get("ac_type").and_then(Value::as_str).is_some_and(|t| t != "mode_s")
+        {
+            continue;
+        }
         o.insert(k.clone(), v.clone());
     }
     if let Some((la, lo)) = pos {
@@ -268,6 +276,7 @@ fn update(d: &mut Dash, m: &Message) {
     if m.decode.crc_ok {
     match &m.body {
         MessageBody::ModeS {
+            df,
             icao: Some(icao),
             callsign,
             altitude_ft,
@@ -329,6 +338,27 @@ fn update(d: &mut Dash, m: &Message) {
             {
                 c.insert("acas_ra".into(), json!(true));
             }
+            // readsb-schema provenance `type`: DF18 carries a CF-derived
+            // source class (oracle-validated `df18_cf_class`); native ES is
+            // adsb_icao; bare Mode S surveillance is mode_s. Do NOT emit
+            // "mlat" — this is a passive single receiver.
+            let ac_type = adsb_status
+                .as_ref()
+                .and_then(|s| s.get("source_addr_type"))
+                .and_then(|v| v.as_str())
+                .map(|k| match k {
+                    "icao_nt" => "adsb_icao_nt",
+                    "non_icao" => "adsb_other",
+                    "tisb_icao" => "tisb_icao",
+                    "tisb_non_icao" => "tisb_other",
+                    "adsr_icao" => "adsr_icao",
+                    _ => "adsb_icao",
+                })
+                .unwrap_or(match df {
+                    17 | 19 => "adsb_icao",
+                    _ => "mode_s",
+                });
+            c.insert("ac_type".into(), json!(ac_type));
             let flight = callsign.as_ref().map(|x| x.trim().to_uppercase()).filter(|s| !s.is_empty());
             let pos = match (lat, lon) {
                 (Some(la), Some(lo)) => Some((*la, *lo)),
@@ -780,6 +810,7 @@ fn aircraft_json(d: &Dash) -> String {
             copy(&mut o, a, "flight", "flight");
             copy(&mut o, a, "reg", "r");
             copy(&mut o, a, "actype", "t");
+            copy(&mut o, a, "ac_type", "type");
             copy(&mut o, a, "alt", "alt_baro");
             copy(&mut o, a, "spd", "gs");
             copy(&mut o, a, "trk", "track");
@@ -1135,10 +1166,43 @@ mod tests {
         assert_eq!(a["alt_baro"], 35000);
         assert_eq!(a["gs"], 420.0);
         assert_eq!(a["squawk"], "1200");
+        assert_eq!(a["type"], "adsb_icao", "native DF17 ES");
         assert!(a["lat"].is_number() && a["lon"].is_number() && a["seen_pos"].is_number());
         // receiver.json carries version + (no position configured here).
         let r: Value = serde_json::from_str(&receiver_json(&d)).unwrap();
         assert!(r["version"].as_str().unwrap().starts_with("xng-"));
+    }
+
+    // ADSB-8a: the readsb `type` provenance field. DF18 maps via the
+    // CF-derived source class; bare Mode S is mode_s but must not downgrade a
+    // more specific class already recorded for the aircraft.
+    #[test]
+    fn provenance_type_maps_and_resists_mode_s_downgrade() {
+        let modes = |df: u8, icao: &str, st: Option<Value>| {
+            msg(Mode::Adsb, MessageBody::ModeS {
+                df, icao: Some(icao.into()), callsign: None, altitude_ft: Some(10000),
+                squawk: None, lat: None, lon: None, speed_kt: None, speed_type: None,
+                track_deg: None, vertical_rate_fpm: None, comm_b: None, adsb_status: st,
+            })
+        };
+        let type_of = |d: &Dash, hex: &str| -> String {
+            let v: Value = serde_json::from_str(&aircraft_json(d)).unwrap();
+            v["aircraft"].as_array().unwrap().iter()
+                .find(|x| x["hex"] == hex).unwrap()["type"].as_str().unwrap().to_string()
+        };
+        let mut d = Dash::default();
+        // DF18 ADS-R rebroadcast → adsr_icao.
+        update(&mut d, &modes(18, "ABCDEF", Some(json!({"source_addr_type": "adsr_icao"}))));
+        assert_eq!(type_of(&d, "abcdef"), "adsr_icao");
+        // A later bare Mode S (DF20) frame must NOT downgrade it.
+        update(&mut d, &modes(20, "ABCDEF", None));
+        assert_eq!(type_of(&d, "abcdef"), "adsr_icao", "mode_s must not downgrade adsr");
+        // DF18 fine TIS-B with non-ICAO address → tisb_other.
+        update(&mut d, &modes(18, "DDEEFF", Some(json!({"source_addr_type": "tisb_non_icao"}))));
+        assert_eq!(type_of(&d, "ddeeff"), "tisb_other");
+        // An aircraft seen only via DF20 surveillance → mode_s.
+        update(&mut d, &modes(20, "123456", None));
+        assert_eq!(type_of(&d, "123456"), "mode_s");
     }
 
     #[test]
