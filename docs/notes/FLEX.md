@@ -47,6 +47,35 @@ green; the synthetic modulate→AWGN→demod tests cover all three rates. (FLEX 
 the first of the paging/rail cores with a real-RF check — the others remain
 synthetic-only.) The 1600-specific detail below documents that lane.
 
+### Off-air garbage rejection (live RF hardening)
+
+Loopback tests never exercise the failure mode that dominates a real capture:
+the demod producing thousands of *plausible-looking but wrong* frames out of
+noise and partial bursts. Validating against the live 929 MHz capture surfaced
+four classes of junk, each now gated (so the dashboard shows clean pages, not a
+flood of fake capcodes):
+
+- **Idle / fill words** (all-ones / repeating `0x….` station fill) are skipped,
+  not read as addresses — these were minting `0xFFFFxxxx` capcodes.
+- **Address bounds**: long-address wraparound (`aw1 − 0x8000` underflow) and
+  out-of-range capcodes are rejected before a page is emitted.
+- **Block-structure validation**: the FIW mod-16 checksum, BIW address/vector
+  offsets (must point inside the phase), and the VIW message-word window are all
+  range-checked; a frame whose offsets don't self-consistently frame the page is
+  dropped.
+- **BCH-quality gate**: words needing more correction than the code can trust are
+  treated as unrecoverable rather than fed downstream.
+
+### Alpha header / signature handling
+
+Real FLEX alphanumeric vectors prepend a **signature/header word** (message-
+fragment number, mail-drop / retrieval flags) before the 7-bit text. Emitting it
+verbatim produced visible junk leaders (`□Subj`, `:1:34`, `H2.KEN`). The off-air
+alpha path (`decode_alpha_offair`) strips the leading signature byte, terminates
+at `0x03` (ETX), and applies a garble gate (`alpha_is_garble`) so a fragment that
+decodes to mostly non-printable bytes is dropped instead of shown. Live result:
+clean pages like `KEN NAG 2 #160888` and full hospital/logistics dispatch text.
+
 ## Pipeline
 
 ```

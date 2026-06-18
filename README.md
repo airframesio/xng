@@ -398,23 +398,45 @@ canonical station id and is independent of this per-port path.
 serves a built-in live dashboard: a dark map of decoded **aircraft**
 (Mode S positions, callsigns, altitude/speed — merged across ADS-B / UAT /
 HFDL / ACARS by ICAO) and **vessels** (AIS) with altitude-colored icons, a
-click-to-focus **entity table**, countries from the ICAO/MID allocation
-tables, registrations/types from an optional `--aircraft-db` CSV
-(tar1090/Mictronics format), and a streaming message panel with
+**entity table** with per-type tabs, countries from the ICAO/MID
+allocation tables, registrations/types from an optional `--aircraft-db`
+CSV (tar1090/Mictronics format), and a streaming message panel with
 per-mode **filter chips and live rates**, text search, and
 click-to-expand full decoded JSON for any message — the tar1090 /
 AIS-catcher-viewer experience, for every mode at once, with zero extra
-software. A **position trail** is drawn for the selected entity; a
-**"Show All Trails"** toggle reveals every entity's trail. The map's
-**layer control is mode-aware** — it lists only overlays relevant to the
-running modes (Flights, Ships, Beacons, and the Iridium satellite/spot-beam/
+software.
+
+The **entity table is tabbed by type** — **All** (everything, generic
+columns) plus a tab per present entity type (**✈️ Aircraft**, **🚢 Ships**,
+**🎈 Beacons**, **🚆 Trains**, **📟 Pagers**, **🛰 Sats**), each with its own
+columns (e.g. Pagers show capcode/function/baud/text; Trains show
+unit/pressure/motion/marker). Tabs appear only for types currently
+present, and the active tab is remembered. Rows expand:
+
+- an **aircraft** expands to a **per-source breakdown** — one indented row
+  per contributing carrier (ADS-B, UAT, HFDL, ACARS), so you can see which
+  modes a merged track is built from (shown on both the All and Aircraft
+  tabs);
+- a **pager** (FLEX / POCSAG) expands to its **message history** — past
+  pages as indented rows that line up under the table's columns. Clicking
+  any pager row (or one of its history rows) opens a **resizable detail
+  pane** below the table showing that message's full text plus a
+  responsive metadata grid (capcode, protocol, function, baud, received,
+  age).
+
+A **position trail** is drawn for the selected entity; a **"Show All
+Trails"** toggle reveals every entity's trail. The map's **layer control
+is mode-aware** — it lists only overlays relevant to the running modes
+(Flights, Ships, Beacons, and the Iridium satellite/spot-beam/
 beam-pattern/terminal layers only when Iridium is decoding). **Pause**
 freezes only the message list (the map, entity table and the open message
-details keep updating, and resuming catches the log up). The header shows the station id, the running **xng
-version**, and uptime, with a collapsible **SDR-status pane** (per
-session: SDR, mode, tuning, and a live/stale "last message" age). The
-page is embedded in the binary (CDN assets are SRI-pinned; RF-sourced
-strings are HTML-escaped).
+details keep updating, and resuming catches the log up). The header shows
+the station id, the running **xng version**, and uptime, with a
+collapsible **SDR-status pane** — one compact row per receiver
+(rx · mode · frequency · channels · a live/stale/dead status dot for
+last-message age). The side-panel splits (table / detail pane / log) are
+drag-resizable and persisted. The page is embedded in the binary (CDN
+assets are SRI-pinned; RF-sourced strings are HTML-escaped).
 
 For **Iridium** the map adds toggleable overlays (cf. the
 iridium-toolkit live map): satellite positions with ground tracks and
