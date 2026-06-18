@@ -26,12 +26,20 @@ pub const CHANNEL_RATE: f64 = 48_000.0;
 /// One-sided channel passband (GMSK BT=0.4 at 9600 bd in a 25 kHz channel).
 pub const CHANNEL_PASSBAND_HZ: f64 = 8_000.0;
 
-/// AIS channel A/B designators by frequency.
+/// AIS channel A/B designator by frequency. Channel A is 161.975 MHz
+/// (AIS 1, marine ch 87B), channel B is 162.025 MHz (AIS 2, ch 88B). A small
+/// ±12.5 kHz tolerance absorbs tuner rounding; anything else returns `'?'`
+/// rather than a silently wrong `'A'` (the AIVDM channel field stays a single
+/// valid ASCII char, so `(channel,total,seq)` fragment keying is unaffected).
 pub fn channel_letter(frequency_hz: u64) -> char {
-    match frequency_hz {
-        161_975_000 => 'A',
-        162_025_000 => 'B',
-        _ => 'A',
+    const TOL_HZ: i64 = 12_500;
+    let near = |center: u64| (frequency_hz as i64 - center as i64).abs() <= TOL_HZ;
+    if near(161_975_000) {
+        'A'
+    } else if near(162_025_000) {
+        'B'
+    } else {
+        '?'
     }
 }
 
@@ -176,4 +184,23 @@ fn ais_details(f: &frame::AisFrame) -> Option<serde_json::Value> {
         }
     }
     details
+}
+
+#[cfg(test)]
+mod tests {
+    use super::channel_letter;
+
+    #[test]
+    fn channel_letter_labels_a_b_and_marks_unknown() {
+        // The two canonical AIS frequencies.
+        assert_eq!(channel_letter(161_975_000), 'A');
+        assert_eq!(channel_letter(162_025_000), 'B');
+        // Tuner rounding within ±12.5 kHz still resolves.
+        assert_eq!(channel_letter(161_980_000), 'A');
+        assert_eq!(channel_letter(162_020_000), 'B');
+        // Non-AIS / out-of-band frequencies are NOT silently labelled 'A'.
+        assert_ne!(channel_letter(161_950_000), 'A'); // VDES ASM 1
+        assert_ne!(channel_letter(157_000_000), 'A');
+        assert_eq!(channel_letter(157_000_000), '?');
+    }
 }
