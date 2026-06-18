@@ -113,12 +113,18 @@ resets align with burst ends.
 4. **Carrier** — A1→A2 coherent phases (127 symbols apart) refine the
    per-symbol rotation; coherent-correlation sign resolves the global π.
 5. **Equalize + track** — a **symbol-spaced 7-tap LMS feed-forward
-   equalizer** (identity-initialized at the center tap, decision at the
-   window center, trained on the 9 preamble T segments and retrained on
-   every embedded T segment) plus a 2nd-order **decision-directed carrier
-   loop** on every symbol. The DD loop matters more than the taps: the
-   A1→A2 refinement aliases at ±π/127/symbol, leaving up to ~0.025
-   rad/symbol the loop tracks out.
+   equalizer** (identity-initialized at the center tap, the delay line
+   advanced one sample per symbol, decision at the window center, trained
+   on the 9 preamble T segments and retrained on every embedded T segment)
+   plus a 2nd-order **decision-directed carrier loop** on every symbol.
+   The DD loop matters more than the taps: the A1→A2 refinement aliases at
+   ±π/127/symbol, leaving up to ~0.025 rad/symbol the loop tracks out.
+   (VERIFY-5: the as-built count is **7 SYMBOL-spaced** taps;
+   dumphfdl's documented 15 are **T/2 (half-symbol)-spaced** because its
+   input is matched-filtered at 2 samples/symbol while ours is not. Both
+   are correct — they describe different sample geometries, so the tap
+   counts are not directly comparable. Any stale "15 taps" reading should
+   be understood as T/2-spaced, not a discrepancy.)
 6. Per data segment: 30 data symbols (descramble π flips, Gray soft
    demod) + T retrain → deinterleave → (rate-1/4 average) → Viterbi →
    LSB-first bytes → PDU parse.
@@ -127,13 +133,29 @@ resets align with burst ends.
    (±0.007/±0.017 rad/symbol) offsets, the PDU header CRC arbitrating
    (only on failed bursts). Transplanted from the AIS deep-weak lesson.
 
-**fec_corrected** (HFDL-5): the decoded bits are re-encoded through the
-same convolutional code (`Viterbi::encode`) and the Hamming distance to
-the received hard decisions — the nearest-codeword distance, exactly the
-symbols the Viterbi corrected — is stamped on every demod-path event.
-Crate-local (no `xng-dsp` change); clean burst → 0, never via parser
-loopback. Events built directly from bytes (tests, reassembled tables)
-carry `None`.
+**Per-burst quality figures** (HFDL-5): every demod-path event is stamped
+with three measured figures.
+
+- **fec_corrected** — the decoded bits are re-encoded through the same
+  convolutional code (`Viterbi::encode`) and the Hamming distance to the
+  received hard decisions — the nearest-codeword distance, exactly the
+  symbols the Viterbi corrected — is counted. Crate-local (no `xng-dsp`
+  change); clean burst → 0, never via parser loopback.
+- **snr_db** — an EVM-derived SNR: the ratio of mean equalized-symbol
+  power to residual error power on the KNOWN embedded T training symbols,
+  `10·log10(S/N)`. Accumulated only on the post-convergence embedded T
+  segments (the 9 preamble T segments are excluded — the equalizer and
+  carrier loop are still converging there and would understate the
+  steady-state SNR). `None` if no training symbols were processed.
+- **freq_skew_hz** — the carrier frequency offset the demod actually
+  removed: the acquisition rotation `theta` plus the steady-state
+  decision-directed loop frequency `carr_fr` (rad/symbol), converted at
+  the symbol rate (`f = rate · rad / 2π`). `theta` is referenced to
+  `a1_pos`, so it already excludes the +1440 Hz subcarrier removed
+  upstream. Measured, never assumed.
+
+Events built directly from bytes (tests, reassembled tables) carry `None`
+for all three.
 
 ## Link layer (all FCS = CRC-16/X-25, `HDLC_FCS`, LE trailer)
 
@@ -191,9 +213,12 @@ ac_id)). A re-logon under a new id drops the stale mapping.
   flight_leg, gs_id+name, freq_id, per-leg freq_search_cnt and
   hfdl_disabled_duration, per-bitrate {300,600,1200,1800} MPDU
   rx/rx_err/tx/delivered counters, spdus_rx/_errs, and freq_change_code
-  with its cause table (`freq_change_cause`).
+  with its cause table (`freq_change_cause`). The fix also feeds the
+  normalized `details["position"]` object (HFDL-4, Outputs).
 - **0xD5 frequency data** — flight id, lat/lon, UTC, then up to 6 per-GS
-  {gs_id+name, 20-bit prop_freqs, 20-bit tuned_freqs} records.
+  {gs_id+name, 20-bit prop_freqs, 20-bit tuned_freqs} records. Same
+  position header as 0xD1, also lifted into `details["position"]`
+  (HFDL-4).
 - **0xD0 system table partial** — emits `systable-partial` (seq, total,
   12-bit version) and feeds the reassembler (below).
 - **0xD2 system table request** (16-bit request_data), **0xDE delayed
@@ -280,7 +305,38 @@ become `MessageBody::Hfdl { kind, details }` (kinds: `squitter`,
 `logon-request`/`-confirm`/`-resume`/`-denied`, `logoff-request`,
 `unnumbered-data`, `performance-data`, `frequency-data`, `acars`,
 `systable-partial`/`-complete`, `systable-request`, `delayed-echo`,
-`hfnpdu`/`lpdu`). `fec_corrected` and rssi (level dBFS) ride along.
+`hfnpdu`/`lpdu`). Each burst-derived event also carries the
+demod-measured quality figures (HFDL-5): `decode.fec_corrected`, plus
+`signal.snr_db` (EVM-derived), `signal.freq_skew_hz` (CFO), and
+`signal.rssi_db` (level dBFS). All three are stamped onto every event a
+burst produces in `process` (`lib.rs`); byte-built events (tests,
+reassembled tables) leave them `None` — never fabricated.
+
+### HFDL-4 aircraft positions (`details["position"]`)
+
+The position-bearing HFNPDUs — **0xD1 performance-data and 0xD5
+frequency-data** — carry an aircraft fix (20-bit lat/lon, the UTC
+half-second-of-day counter, flight id) at the same fixed offsets.
+`pdu::position_obj` lifts these into a normalized `details["position"]`
+object `{lat, lon, utc_s, utc, flight}` on those two event kinds. The
+all-zero placeholder `(0,0)` is suppressed (returns `None`): an aircraft
+without a GPS fix transmits zeros, and dumphfdl likewise treats it as "no
+position", so no null-island fix is planted. The 8-bit GS-local downlink
+`aircraft_id` and — when resolved — the `icao` are copied verbatim from
+`who` onto the position object. The ICAO comes from the logon-confirm
+aircraft-ID cache (the HFDL-3 `ac_cache` `resolved()` back-fill on
+downlink LPDUs, below), so a fix only carries an ICAO once the aircraft
+has logged on.
+
+The embedded dashboard's map adapter (the XM-2.2 `position->map` path in
+`outputs/http.rs`, `MessageBody::Hfdl` arm) reads `details["position"]`
+and merges the fix into the shared aircraft table by ICAO — the same
+master entity as 1090/UAT ADS-B and ACARS, so one aircraft heard on
+several carriers coalesces into one map marker. **Events with no resolved
+ICAO are skipped** (the arm only upserts when a 6-hex ICAO is present), so
+an unkeyed fix never plants a phantom entity. The **SBS-1/Beast feed and
+a `--freq-as-squawk` option are still open** — those outputs currently
+carry ADS-B Mode S only.
 
 ## Validation / oracles
 
@@ -337,9 +393,11 @@ become `MessageBody::Hfdl { kind, details }` (kinds: `squitter`,
 - SPDU per-slot assignment codes `buf[4..52)` surfaced raw
   (`slot_assignment_hex`), not parsed — no public spec defines the
   subfield layout.
-- LMS is 7-tap symbol-spaced (identity-init), not dumphfdl's 15-tap
-  T/2-spaced lowpass-init form; the DD carrier loop + rescue cover the
-  difference at the SNRs that matter here.
+- LMS is 7-tap **symbol-spaced** (identity-init); dumphfdl's documented
+  15 are **T/2-spaced** lowpass-init (its input is matched-filtered at
+  2 samples/symbol, ours is not). This is a spacing-convention difference,
+  not a tap shortfall (VERIFY-5 resolved); the DD carrier loop + rescue
+  cover the difference at the SNRs that matter here.
 - Channel rate fixed at 12 kS/s (6.67 samples/symbol). Raising to
   24 kS/s tested worse — HFDL's marginal frames are fading/SNR-bound, not
   timing-resolution-bound; the LMS+DD loop owns that domain.

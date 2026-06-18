@@ -38,6 +38,18 @@ zero offset).
   the estimate is >4 bins from the current frequency, preserving the
   Costas fine correction), decision-directed Costas loop (phase gain
   0.05, freq gain 0.002), Gardner timing (gain 0.02, ±0.08 clamp).
+- **RRC matched filter** (STDC-8): after the NCO mix and the anti-alias
+  lowpass, an `xng_dsp::rrc_taps` root-raised-cosine FIR (β = 0.6 = the
+  TX `RRC_BETA`, unit-energy, 8·sps+1 ≈ 81 taps, run through `Fir`) is
+  applied before symbol timing. It is the receive half of the TX/RX RRC
+  pair (the TX `modulate` already shapes with the same RRC), so the
+  cascade is a raised-cosine Nyquist pulse — symbol centres carry full
+  energy at zero ISI and effective Eb/N0 rises versus the bare lowpass.
+  The filter is on in production (`BpskDemod::new`); the
+  `with_matched_filter(_, false)` constructor bypasses it and exists only
+  so the BER oracle can A/B the gain. Validated by a synthetic
+  modulate → AWGN → demod BER test (no real off-air matched-filter
+  capture); see Validation.
 - Gardner is **gated on carrier lock** (EMA of |Costas error| < 0.4):
   while the carrier spins, Gardner errors random-walk the clock into
   symbol slips that corrupt whole 10368-symbol frames. The tight timing
@@ -79,6 +91,33 @@ zero offset).
   column-write/inverse-permute → doubled UW per row), exercised by
   round-trip and error-injection unit tests.
 
+### Per-frame quality + flip recovery (STDC-8, `FrameStats`)
+
+- **UW BER**: the 128 UW symbols (64 rows × 2 doubled bits) of the
+  matched polarity give a direct, data-independent channel-quality
+  measure. `uw_ber_ppt(matches)` returns the bit-error rate in
+  parts-per-thousand (errors = 128 − matches, rounded). Populated in
+  `FrameStats.uw_ber_ppt` per frame and carried into the message.
+- **`fec_corrected`**: estimated by re-encoding the Viterbi output with
+  the same 171/133 convolutional code and counting coded symbols that
+  disagree with the hard decisions fed in — the standard external
+  estimate of corrections when the decoder does not report them. Each
+  disagreement is a channel symbol the traceback overrode. A clean frame
+  reports 0; sparse injected errors track the injection count.
+- **Mid-frame polarity-flip recovery**: a Costas 180° slip partway
+  through a frame inverts the tail, so neither whole-frame polarity
+  syncs (the two runs cancel). `detect_polarity_flip` scans every row
+  boundary `1..64` for the split that maximises total UW agreement after
+  inverting one side, and only accepts it when it buys ≥ `min_gain`
+  (`MID_FRAME_FLIP_MIN_GAIN` = 24) extra UW symbols over the best
+  whole-frame score — large enough that noise alone cannot fabricate a
+  flip. `apply_polarity_flip` inverts the odd run in place; the
+  recovered single-polarity frame then decodes on the normal path. Wired
+  into `lib.rs`: when whole-frame sync fails it tries flip recovery
+  before discarding the candidate, so frames a plain polarity test would
+  drop are still decoded. Synthetic-only (loopback flip injection); no
+  real off-air slipped frame is in the fixture.
+
 ## Packet layer (`packet.rs`, within the 640-byte frame)
 
 - Descriptor sizing: `0xxxxxxx` short — len = (b & 0x0F) + 1;
@@ -112,7 +151,9 @@ Each descriptor surfaces only the fields actually present in the packet
 - **0xAA message-data**: sat/LES, LCN, packet sequence — payload bytes
   buffered per logical channel for reassembly.
 - **0xB0 / 0xB1 / 0xB2 EGC** single / double-header parts (see below);
-  surface only as the assembled `egc-message`.
+  surface only as the assembled `egc-message`, with the
+  `details["header_format"]` field recording which header form produced
+  it (VERIFY-6).
 - **0xBD / 0xBE multiframe** start / continue — reassembled into a byte
   stream and **re-parsed recursively** through the packet walker.
 - **0x6C signalling-channel**: 8-bit `services` byte, uplink
@@ -164,6 +205,15 @@ service code) then payload; 2-byte checksum.
   pkt_seq·2 + (part==2); complete when a terminating part arrives
   (single header, or part 2) with continuation cleared; entries age out
   after 8 frames.
+- **Single vs double header (VERIFY-6, resolved)**: STD-C carries a long
+  EGC message as a 0xB1 (header / part 1, continuation set) + 0xB2
+  (continuation, part 2) pair; a short self-contained message uses a
+  single 0xB0. The assembled `egc-message` records which form produced
+  it: `details["header_format"]` is `"double-0xB1+0xB2"` when any
+  constituent part used a 0xB1/0xB2 descriptor, else `"single-0xB0"`
+  (and the packet's reported `descriptor` is 0xB1 vs 0xB0 to match). A
+  0xB1 alone does not terminate assembly — only the 0xB2 with
+  continuation cleared does.
 
 ### EGC geographic area geometry (STDC-1.1 / STDC-1.2, `egc_area`)
 
@@ -261,6 +311,10 @@ emitted as a `message` event. Stale channels age out after 8 frames.
 `to_message` maps each packet to `Message::StdC { name, text, details }`
 with `Mode::StdC`, `crc_ok = checksum_ok`, RSSI from the demod level, raw
 bytes preserved. `details` is JSON carrying the decoded fields above.
+The per-frame Viterbi correction estimate maps onto the standard
+`DecodeQuality.fec_corrected` field; the per-frame UW BER (which has no
+dedicated field in the normalized model) is carried as
+`details["uw_ber_ppt"]`.
 
 ## Validation / oracles
 
@@ -279,6 +333,24 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
   BPSK `modulate` → DDC → coherent decoder, with CFO and noise, both at
   48 kS/s and 2.4 MS/s wideband; asserts EGC text, priority, service and
   bulletin-board frame number round-trip exactly.
+- **Matched-filter BER oracle** (`tests/matched_filter.rs`, STDC-8): a
+  genuine modulate → complex-AWGN → demod noise test (NOT a noiseless
+  loopback). A frame is modulated with the TX RRC, Gaussian noise is
+  added at a controlled sigma, and the intact-frame recovery rate is
+  measured with the matched filter ON vs OFF over many seeds, swept into
+  the marginal-SNR cliff. Pass criteria: the matched-filter path recovers
+  **at least as many** frames as the bare lowpass at every SNR and
+  **materially more** net across the sweep. This is synthetic validation
+  of the matched-filter gain — there is no real off-air capture
+  isolating it. (`probe_sweep`, gated on `STDC_PROBE`, prints the full
+  gain curve.)
+- **Per-frame quality / flip recovery** (`frame.rs` unit tests): UW BER
+  ppt against an error count, `fec_corrected` = 0 on a clean frame and
+  tracking sparse injected errors, and the mid-frame polarity-flip path
+  (a tail inverted from row 40 defeats whole-frame sync, is detected,
+  corrected, and the payload recovered) plus a no-false-flip guard on a
+  clean frame. The `header_format` single-0xB0 vs double-0xB1+0xB2
+  distinction is pinned by `packet.rs::egc_header_format_single_vs_double`.
 - **Unit** (`packet.rs`, `frame.rs`): descrambler table prefix, frame
   round-trip (clean / inverted / ~1 % symbol errors), Fletcher checksum,
   LCN assembly, EGC single/multi-part assembly, ITA2 alphabet, area-shape
@@ -291,8 +363,9 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
   layout, `sat_les` region+operator), `frame_to_utc_hms` against the
   off-air oracle, and every other field-decode table against its oracle.
 - Oracles cross-referenced: inmarsatc (field tables, descriptor field
-  maps, services/status/channel-type tables + formulas), SatDump (`.frm`
-  stage goldens on the sigidwiki capture), Scytale-C (C3 geometry binary
+  maps, services/status/channel-type tables + formulas), SatDump (PHY
+  constants; `.frm` stage goldens not yet vendored — see limitations),
+  Scytale-C (C3 geometry binary
   packing + NAVAREA coordinator table), inmarsat-sniffer (C2 service-name
   classification cross-check), IMO International SafetyNET Manual (2019)
   (EGC area addressing + worked examples), ITU-T ITA2 (Baudot alphabet).
@@ -319,6 +392,17 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
   the per-slot allocation semantics are not interpreted further.
 - Demod cold-start timing acquisition is weak without receive-path
   filtering (see PHY).
+- **RRC matched filter — validated synthetic-only.** The matched-filter
+  Eb/N0 gain is proven by the modulate → AWGN → demod BER oracle
+  (`tests/matched_filter.rs`), not by a real off-air A/B capture. The
+  matched filter is on in production regardless.
+- **CMA equalizer — still open.** No blind/adaptive equalizer fronts the
+  demod; only the fixed RRC matched filter. Multipath beyond what the
+  Costas/Gardner loops absorb is not equalized.
+- **SatDump `.frm` stage goldens — still open.** No per-stage `.frm`
+  golden vectors from SatDump are vendored or asserted against; the
+  off-air validation is the full-chain field-exact decode, not a
+  stage-by-stage byte diff.
 
 ## Gotchas
 
@@ -333,6 +417,14 @@ bytes preserved. `details` is JSON carrying the decoded fields above.
    the N/S extent / radius), not on the longitude byte itself; and the
    rectangular extent is on-air nautical miles even though the manual's
    MSI-provider string states degrees.
+9. RRC matched filter is the receive RRC half — its TX counterpart must
+   use the same β (`RRC_BETA` = 0.6) or the cascade is not Nyquist. The
+   `with_matched_filter(_, false)` path is for the BER oracle only;
+   production always runs it on.
+10. Mid-frame flip recovery must clear the `MID_FRAME_FLIP_MIN_GAIN`
+    (= 24 extra UW symbols) gate or noise fabricates phantom flips; the
+    correction inverts the odd run so the **normal** (non-inverted)
+    decode path handles the result.
 
 ## Key references
 

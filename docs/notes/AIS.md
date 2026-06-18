@@ -3,8 +3,10 @@
 Native AIS demod/decode for `xng-mode-ais`. GMSK 9600 bd, h=0.5, BT=0.4 in
 the 25 kHz channels at 161.975 (A) / 162.025 (B) MHz. Clean-room — see
 PROVENANCE.md; AIS-catcher is an off-air oracle only, pyais is the
-field-decode oracle (except DAC=1 ASMs, where pyais has *no* decoder and the
-layouts are spec-derived — see below). Source: `crates/xng-mode-ais/src/`.
+field-decode oracle (except the ASMs pyais does not decode — all of DAC=1,
+DAC=200 FIDs 21/22/55, and the regional DACs — where the layouts are
+spec-derived with cited clauses; see below). Source:
+`crates/xng-mode-ais/src/`.
 
 Result: 48 unique frames on a 5 min Sacramento capture vs AIS-catcher's 53
 (91%), **zero false decodes**. The capture is inland (mostly weak distant
@@ -166,14 +168,46 @@ A recognised DAC/FID emits a nested `app` object; an unrecognised one falls
 back to a hex dump (`data_hex`) — no unverified subtypes are fabricated.
 The `dac` and `fid` themselves are always surfaced.
 
-**DAC=200 (Inland AIS, UNECE ECE/TRANS/SC.3/176)** — verified against pyais:
+**DAC=200 (Inland AIS, UNECE ECE/TRANS/SC.3/176)** — split oracle. FIDs
+10/23/24/40 are **verified against pyais**; FIDs 21/22/55 are **spec-derived**
+(pyais has no decoder for them — see the oracle split below):
 
-| FID | Name | Decoded fields |
-|---|---|---|
-| 10 | Inland ship static & voyage | VIN, length (1/10 m), beam (1/10 m), ship type, hazard, draught (1/100 m), loaded |
-| 23 | EMMA warning | start/end date-time, region corners (1/600000°), type, min/max, intensity, wind |
-| 24 | Water-level report | country (6-bit ASCII), 4 × (gauge id + level) |
-| 40 | Signal-strength / bridge status | lat/lon (1/600000°), form, facing, direction, raw status |
+| FID | Name | Decoded fields | Oracle |
+|---|---|---|---|
+| 10 | Inland ship static & voyage | VIN, length (1/10 m), beam (1/10 m), ship type, hazard, draught (1/100 m), loaded | pyais |
+| 21 | ETA at lock/bridge/terminal | country / UN-LOCODE / fairway section / terminal code / fairway hectometre (6-bit ASCII), ETA month/day/hour/minute, assisting tugs, air draught (0.01 m) | spec |
+| 22 | RTA reply | same leading block + RTA month/day/hour/minute, lock/bridge/terminal status | spec |
+| 23 | EMMA warning | start/end date-time, region corners (1/600000°), type, min/max, intensity, wind | pyais |
+| 24 | Water-level report | country (6-bit ASCII), 4 × (gauge id + level) | pyais |
+| 40 | Signal-strength / bridge status | lat/lon (1/600000°), form, facing, direction, raw status | pyais |
+| 55 | Number of persons on board | crew, passengers, shipboard personnel (each with documented N/A sentinel) | spec |
+
+FIDs 21/22/55 ride in message 6 (addressed). Their layouts are derived from
+UNECE ECE/TRANS/SC.3/176 Ed.1 (Test Standard for Inland AIS), cross-checked
+against the IALA ASM registry and e-Navigation.nl, with each FID arm citing
+its clause in a code comment; N/A sentinels (month/day 0, hour 24, minute 60,
+crew/personnel 255, passengers 8191, tugs 7) are honoured and the key is
+omitted when sentinel. They are validated by an independent-packer fixture
+(no off-air IQ — synthetic frame in, decoded values out), not a worked OSS
+oracle.
+
+**AIS-1.3 regional DACs** — `asm_decode` arms for IALA/regional applications:
+
+| DAC | Region | Decoded | Oracle |
+|---|---|---|---|
+| 235 | UK | AtoN monitoring (FID 10): internal / 2 × external voltage (0.05 V/step), RACON status, light status, health alarm, status-external, off-position | spec |
+| 250 | Ireland | AtoN monitoring (FID 10), same layout as DAC 235 | spec |
+| 366 / 316 | US/Canada St. Lawrence Seaway & PAWSS | **header-only**: `region` name + `fid` + raw `body_hex` | — |
+| 367 | US environmental / area-notice | **header-only** | — |
+| 265 | Sweden / STM route exchange | **header-only** | — |
+
+DAC 235/250 FID-10 AtoN-monitoring bodies are decoded in full (layout from
+the gpsd AIVDM reference; pyais has no decoder, so spec-derived and validated
+by an independent-packer fixture, not real RF). The other regional DACs
+(366/316/367/265) have no clean-room body layout available, so — per the
+skip-don't-fake mandate — they emit a header-only identification (`region`
+name, `fid`, and the undecoded body preserved as `body_hex`) instead of
+fabricating field positions; the body is left for downstream re-parse.
 
 **DAC=1 (IMO international, SN.1/Circ.289)** — `fields::dac1_decode`.
 The IMO international application-identifier space. **pyais has no DAC=1
@@ -225,18 +259,24 @@ AIS messages; the prefix is the marker.
   DAC=200 FID 10/23/24/40), 12, 14, 17, 18, 19, 20, 21, 22, 23, 24A/B, plus
   the ROT helper and distress classifier. No pyais code copied; vectors and
   asserted values are the reference.
-- **DAC=1 ASM (no OSS oracle — spec-derived):** pyais does **not** decode
-  DAC=1, so these cannot be validated against an off-the-shelf decoder. Each
-  FID has a unit test (`dac1_fid11/16/17/22/24/25/26/27/29/31/32_*`) whose
-  **expected values are the documented physical quantities** from the cited
-  IMO circular section. The test fixtures are built by an *independent*
-  MSB-first bit packer (`build_t8_dac1` / `pack` / `pack_i` / `pack_str`)
+- **Spec-derived ASMs (no OSS oracle):** the ASMs pyais cannot decode —
+  all of DAC=1, DAC=200 FIDs 21/22/55, and DAC 235/250 FID 10 — cannot be
+  validated against an off-the-shelf decoder. Each has a unit test
+  (DAC=1 `dac1_fid11/16/17/22/24/25/26/27/29/31/32_*`; the Inland set
+  `dac200_fid21/22/55_*`; the AtoN set `dac235_fid10_*` / `dac250_fid10_*`)
+  whose **expected values are the documented physical quantities** from the
+  cited spec section. The fixtures are built by an *independent* MSB-first
+  bit packer (`build_t8_dac1` / `build_t6` / `pack` / `pack_i` / `pack_str`)
   that takes `(value, width)` pairs in document order — it shares no code
   with the decoder, which reads by `(offset, width)`. A wrong offset/width
   mismatches the packer, so it is not a self-encode/self-decode loopback of
   the decode logic. FID 11's lat-first layout is the same physical position
   as FID 31's lon-first test, so a decoder that copied FID 31's layout into
-  FID 11 would fail.
+  FID 11 would fail. These tests are synthetic (modulated-free: bits packed
+  in, fields decoded out) — there is no real-RF validation of these ASM
+  bodies. The header-only regional DACs (366/316/367/265) have a fixture
+  (`dac_regional_header_only`) asserting they surface `region`/`fid`/
+  `body_hex` and emit no fabricated field positions.
 - **Reassembly / tracker (pyais oracle):** sentence parsing, 6-bit
   de-armoring, fill-bit accounting and the reassembly/merge semantics are
   anchored to pyais. Multi-fragment vectors are verbatim from the pyais
@@ -269,8 +309,11 @@ AIS messages; the prefix is the marker.
   grounded header/leading fields are decoded; the remainder is left for when
   worked examples with known ground truth are available — skipped rather
   than guessed. FID 18/19/20 are not decoded at all.
-- **ASM coverage is DAC=1 + DAC=200.** Other DACs (e.g. DAC=366 US, DAC=669)
-  emit `data_hex`, not parsed application fields.
+- **ASM coverage is DAC=1, DAC=200, and DAC 235/250.** The regional DACs
+  366/316/367/265 emit a header-only `app` (`region`/`fid`/`body_hex`) —
+  identification without a decoded body. Any other DAC (e.g. DAC=669) falls
+  all the way through to top-level `data_hex`, with no parsed application
+  fields.
 - **No soft-decision FCS repair.** A standing falsification: a max-log
   Chase-style search flipping the K least-reliable bits recovered none of
   the 5 genuine misses and *forged* a valid-FCS frame from a foreign MMSI
@@ -295,6 +338,8 @@ at 64 with age eviction. Result on the off-air capture: zero false decodes.
 - ISO/IEC 13239 (HDLC), NMEA 0183 / IEC 61162-1 (AIVDM armoring).
 - IMO SN.1/Circ.289 (2 June 2010) + legacy SN/Circ.236 — DAC=1 IMO
   international ASMs (spec-derived; no OSS decode oracle exists).
-- UNECE ECE/TRANS/SC.3/176 + gpsd AIVDM reference (Inland AIS DAC=200).
+- UNECE ECE/TRANS/SC.3/176 Ed.1 + gpsd AIVDM reference + IALA ASM registry
+  + e-Navigation.nl (Inland AIS DAC=200, incl. spec-derived FIDs 21/22/55,
+  and the DAC 235/250 AtoN-monitoring layout).
 - pyais (field + reassembly oracle, MIT), AIS-catcher (off-air oracle).
   See PROVENANCE.md.

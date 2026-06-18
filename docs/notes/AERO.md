@@ -5,7 +5,7 @@ Native Inmarsat Classic Aero decode core (`crates/xng-mode-aero`),
 implementation; porting permitted with attribution, see `PROVENANCE.md`).
 JAERO source is the structural reference *and* the off-air oracle. This
 note is the as-built state; numbers are what the code does and the tests
-assert (`cargo test -p xng-mode-aero` — 46 tests, 0 ignored).
+assert (`cargo test -p xng-mode-aero` — 49 tests, 0 ignored).
 
 Three front-ends spanning the P/R/T/C channel model, all feeding one
 SU/ACARS layer:
@@ -56,8 +56,30 @@ the data bits with no differential step. Per chain: rate-matched lowpass
 freq-offset EMA → square-transition timing recovery (gain 0.1) →
 per-bit integrate → running-|integral| normalize → soft bit in [-1,1].
 This is a deliberate divergence from JAERO's coherent
-OQPSK-decomposition MSK demod: simpler, ~2 dB less sensitive; a coherent
-upgrade is the planned improvement (`PROVENANCE.md`).
+OQPSK-decomposition MSK demod: simpler, ~2 dB less sensitive; the coherent
+upgrade below (AERO-6) is now wired in as a burst-path fallback.
+
+**Coherent A-BPSK fallback** (`coherent.rs::CoherentMskDemod`, AERO-6).
+A decision-directed (Costas-style) carrier-phase recovery path for the
+600/1200 bps burst demod. It shares the discriminator's front end (same
+rate-matched LPF, same zero-crossing timing loop), but replaces the FM
+discriminator with a carrier-coherent per-bit detector: it keeps a running
+absolute phase reference `θ` (carrier + accumulated data phase — continuous
+phase makes `θ` at each bit boundary known once earlier bits are decided),
+correlates each bit's matched-filtered samples against the +90° and −90°
+phase ramps anchored on `θ`, picks the larger in-phase energy, then advances
+`θ` by the decided ±90° plus a small decision-directed phase-error term (a
+Costas-style carrier loop, gain 0.05) so the reference tracks residual CFO
+and phase drift. On the C-band burst path (`lib.rs`) the discriminator runs
+first (robust on the burst preamble) and the coherent detector is a
+**fallback** for marginal bursts: a second pass only when no UW/CRC matched,
+so it cannot double-feed the cross-burst reassemblers. Validated by a
+**synthetic** modulate → complex-AWGN → demod BER-vs-SNR sweep
+(`tests/coherent_ber.rs::coherent_beats_discriminator_ber_vs_snr`): the
+coherent path reaches a given BER at a ~1 dB lower Eb/N0 than the
+discriminator through the identical front end. This is synthetic
+(noise-test) validation only — it has **not** been run against real off-air
+IQ.
 
 **OQPSK 10.5 kbps and 8.4 kbps** (`oqpsk.rs::OqpskDemod`, ported from
 JAERO `oqpskdemodulator.cpp` + `coarsefreqestimate.cpp`). Coherent: RRC
@@ -104,6 +126,20 @@ clean; a false trigger costs one frame and dies at the SU CRCs).
 - **Scrambler**: the VDL2/HFDL shared 15-stage LFSR (x^15+x+1,
   `xng_dsp::scramble::Lfsr15`), applied to the *decoded* bits, **reset at
   each UW**. Bits pack **LSB-first**.
+
+**FEC-correction count** (AERO-6): `decode.fec_corrected` is now populated
+on the P-channel (`frame.rs`), 10.5k OQPSK (`oqpsk.rs`), and C-band burst
+(`burst.rs`) paths. It is the *real* number of coded-bit errors the Viterbi
+fixed, derived by **re-encoding** the decoded bit stream with the same K=7
+rate-1/2 encoder and counting how many coded bits disagree with the received
+hard decisions over the frame's coded region (the P-channel counts from the
+overlap-carry offset so the re-encoder state has converged before the
+counted span). This costs an extra encode pass per frame — a Viterbi-side
+correction count would be cheaper, but the re-encode keeps the count
+honest without touching the decoder. `frame.rs` test
+`fec_corrected_counts_real_corrections` injects a known set of coded-bit
+flips and asserts the reported count equals exactly the injected (and
+corrected) flips, with zero for a clean frame.
 
 ### P-channel 16-bit frame header (`frame::FrameHeader`, AERO-4)
 
@@ -328,6 +364,15 @@ checks the four-nibble split against JAERO's `frameinfo` shifts
 encoder's header (format id 1, superframe 0, both counters = the running
 frame counter) by re-parsing bits 32..48 of the framed output.
 
+**SU type enumerators** (VERIFY-8, `su.rs` test
+`aero_type_enumerators_match_jaero_aerol_h`): the `AEROTypeP` /
+`AEROTypeR` / `AEROTypeC` enumerator hex values this crate dispatches on
+were verified verbatim against the JAERO source (`aerol.h`, fetched from
+`github.com/jontio/JAERO` master) before relying on the SU-type table. No
+mismatches were found — every type byte already matched JAERO; the test
+locks that in and fails if a handler's type byte ever drifts from the JAERO
+enumerator it claims to decode.
+
 **AERO-2 resolver** (`satellite.rs` tests, oracle = JAERO 0x0C field
 layout): `ocean_region_classifies_classic_slots` pins the four slot
 centres, near-slot tolerance, ±180° wrap, and the "far from every slot →
@@ -357,9 +402,13 @@ exact-result fixtures rather than CI count gates).
   The ocean region is a nominal longitude hint only (±35° to a classic
   slot); a precise satid→spacecraft mapping would need an external
   registry we cannot ground.
-- **600/1200 demod is a discriminator, not coherent** — ~2 dB below
-  JAERO's coherent MSK demod. Intentional v1 simplification; coherent
-  upgrade planned (`PROVENANCE.md`).
+- **600/1200 P-channel demod is a discriminator, not coherent** — ~2 dB
+  below JAERO's coherent MSK demod. Intentional v1 simplification. A
+  coherent (decision-directed) detector now exists (`coherent.rs`,
+  AERO-6) and is wired into the **C-band burst path** as a marginal-burst
+  fallback, but the streaming P-channel chain still runs the discriminator;
+  the coherent path's ~1 dB gain is **synthetic-only** (a modulate→AWGN→demod
+  BER sweep), not yet confirmed against off-air IQ.
 - **No off-air OQPSK fixture in CI**. The 10.5k and C-channel chains are
   exercised by RF loopback (and the 10.5k full chain has run against
   JAERO's `10.5k_sample.ogg`), but no OQPSK capture is vendored.

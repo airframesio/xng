@@ -308,6 +308,18 @@ into JSON nested under the message body.
   (0xC0 → 2^value bytes), priority (0x87), inactivity timer (0xF2), and
   the rest of the X.224 set. DR-reason and ER-cause dictionaries resolve
   to text. DT/ED user data is handed to the ATN-B1 application decoders.
+- **COTP TSDU reassembly (`CotpReassembler`)** — NEW. ISO/IEC 8073 §6.6
+  normal-data TSDU segmentation: consecutive DT TPDUs on one connection
+  (keyed by destination reference) carry user-data fragments, the final DT
+  bearing the end-of-TSDU (EOT) flag. A single-segment TSDU (first DT has
+  EOT set, seq 0) passes straight through; a multi-segment TSDU buffers
+  fragments in TPDU-sequence order until the EOT DT, then returns the
+  complete TSDU for the upper-layer (ULCS/CPDLC/CM) decode. An out-of-
+  sequence or duplicate DT returns `None` rather than reassembling a
+  corrupt TSDU. Wired in `lib.rs::cotp_reassemble` (single-segment TSDUs
+  are still decoded inline by `parse_cotp`); only DT carries TSDU
+  segmentation (ED is expedited and decoded directly). The reassembled
+  user data is dispatched by `parse_cotp_user_app`.
 - **ES-IS (`parse_esis`, ISO 9542)** — ESH (type 2, count + SAs) / ISH
   (type 4, single NET) with holding time and advertised NSAPs (hex), plus
   the trailing option TLVs: Mobile-Subnetwork-Capabilities (0x81),
@@ -327,21 +339,50 @@ into JSON nested under the message body.
 ## ATN-B1 applications (`atn_cpdlc.rs`)
 
 Protected-mode CPDLC and Context Management, decoded from the ICAO Doc
-9880/9705 ASN.1 modules (vendored as spec text in `docs/asn1/`, from
-Wireshark's transcription of the ICAO standard — module text only).
-Encoding is unaligned PER (ITU-T X.691), hand-walked: constrained whole
-numbers, length determinants (no fragmentation), and IA5 strings (7
-bits/char). Reached via COTP DT/ED user data; `parse_apdu` tries protected
-CPDLC, then `parse_cm_logon`, then `parse_cm_ground`.
+9880/9705 ASN.1 modules (`atn-cpdlc.asn` / `atn-cm.asn` / `atn-ulcs.asn`,
+vendored as spec text in `docs/asn1/`, from Wireshark's transcription of
+the ICAO standard — module text only). These are the oracle for the ATN
+air-ground modules: libacars 2.x ships only FANS-1/A and does not carry
+the ATN ASN.1, so it is not a reference here. Encoding is unaligned PER
+(ITU-T X.691), hand-walked: constrained whole numbers, the normally-small
+non-negative whole number (§10.6, for CHOICE extension-addition / extended
+ENUMERATED indices), length determinants — now including the fragmented
+form (§10.9.3.8, multiples of 16K chained until the final fragment) so
+long BIT STRING / SEQUENCE-OF lengths decode rather than aborting the walk
+— and IA5 strings (7 bits/char). Reached via COTP DT/ED user data;
+`parse_apdu` tries protected CPDLC, then `parse_cm_logon`, then
+`parse_cm_ground`.
 
 - **CPDLC** — ProtectedAircraftPDUs (4 root alts) / ProtectedGroundPDUs
   (6 root alts): abort-user, abort-provider, startup, startdown, send,
-  forward, forward-response. The ATCUplink/DownlinkMessage header decodes
-  msg id/ref, DateTimeGroup (rendered ISO 8601), and the logical-ack
-  preamble. Message elements are looked up in the **full element tables**
-  — 238 uplink + 114 downlink `(name, ASN.1 arg type, phraseology)`
-  generated from the module (`atn_cpdlc_tables.rs`) — and rendered into
-  readable text (`CLIMB TO FL360`, `WILCO`).
+  forward, forward-response. The root CHOICE is decoded as the extensible
+  CHOICE it is (X.691 §22): when the extension bit is set the
+  extension-addition alternative index (a normally-small whole number) is
+  read and the PDU is reported as `extension-alternative` with that index,
+  rather than mis-reading an extension addition as a root index. The
+  ATCUplink/DownlinkMessage header decodes msg id/ref, DateTimeGroup
+  (rendered ISO 8601), and the logical-ack preamble. The mandatory
+  **integrityCheck** BIT STRING that follows the protected message is now
+  consumed and, when non-empty, surfaced as a hex digest (`integrity_check`)
+  instead of being left dangling. Message elements are looked up in the
+  **full element tables** — 238 uplink + 114 downlink `(name, ASN.1 arg
+  type, phraseology)` generated from the module (`atn_cpdlc_tables.rs`) —
+  and rendered into readable text (`CLIMB TO FL360`, `WILCO`).
+- **CPDLC abort reasons** — abort-user decodes PMCPDLCUserAbortReason and
+  abort-provider PMCPDLCProviderAbortReason (each extensible ENUMERATED;
+  ext bit then the root index, with the dictionary resolving to text). A
+  real bug was fixed here: PMCPDLCUserAbortReason has 13 root values
+  (0..12) → 4 bits, but was being read as 3 bits, truncating the index;
+  PMCPDLCProviderAbortReason (8 values) stays 3 bits.
+- **ATCForwardMessage / ATCForwardResponse** (the `forward` /
+  `forward-response` ProtectedGroundPDUs root alternatives, ICAO Doc 9880
+  PMCPDLCAPDUsVersion1). `forward-response` decodes the ATCForwardResponse
+  ENUMERATED (success / service-not-supported / version-not-equal).
+  `forward` (`read_atc_forward_message`) decodes the ForwardHeader
+  (DateTimeGroup, AircraftFlightIdentification IA5(2..8), 24-bit aircraft
+  address) and the ForwardMessage CHOICE — a plain (unprotected)
+  up/downElementIDs BIT STRING carrying a header-less ATCUplink/Downlink-
+  MessageData, walked through the same element tables (`atc_message_data`).
 - **CPDLC argument values** — `read_argument` now covers **~63 argument
   types** (up from ~22), so the element walk no longer halts at the first
   previously-unsupported argument. Beyond the original Level / Time /
@@ -389,11 +430,49 @@ CPDLC, then `parse_cm_logon`, then `parse_cm_ground`.
   present, returns `None` to stop the walk (their sizes are then unknown)
   rather than mis-decode.
 - **CM (`parse_cm_logon`, `parse_cm_ground`)** — the dialogue that
-  precedes CPDLC. CMLogonRequest yields the flight id (and a count of
-  present optional fields); CMGroundMessage identifies the dialogue type
-  (logon-response, update, contact-request, forward-request, abort,
-  forward-response). Per-entry TSAP application lists are reported
-  present-or-absent (variable-size — staged).
+  precedes CPDLC, now decoded in full from the ICAO Doc 9705 Edition 2
+  CMMessageSetVersion1 module (`docs/asn1/atn-cm.asn`). CMAircraftMessage
+  (3 root alts) covers logon-request, contact-response, abort;
+  CMGroundMessage (6 root alts) covers logon-response, update,
+  contact-request, forward-request, abort, forward-response. The address
+  primitives are decoded structurally: **ShortTsap** (optional aRS 24-bit
+  address + 10–11-octet loc/sys/nsel/tsel selector), **LongTsap** (5-octet
+  RDP + ShortTsap), and the **APAddress** CHOICE over the two.
+  CMLogonRequest / CMForwardRequest decode the flight id, mandatory
+  cMLongTSAP, and every present OPTIONAL (ground/air-only application
+  lists, facility designation, departure/destination airports, ETD
+  DateTime). CMLogonResponse / CMUpdate decode both OPTIONAL application
+  lists. CMContactRequest decodes the facility designation + LongTsap
+  address; CMForwardResponse the ENUMERATED; abort the CMAbortReason
+  ENUMERATED (10 root values → text). The per-entry application lists
+  (`SEQUENCE SIZE(1..256) OF AEQualifierVersion[Address]`) are now walked
+  fully (ae-qualifier, ap-version, optional APAddress) rather than reported
+  present-or-absent only.
+
+## ACSE / ULCS association control (`atn_cpdlc::parse_acse_apdu`)
+
+The ULCS ACSE-1 module (`docs/asn1/atn-ulcs.asn`) carries the
+association-establishment and -release PDUs that bracket a CPDLC/CM
+dialogue. `parse_acse_apdu` decodes a bare ACSE-apdu bit-vector — an
+extensible CHOICE with 5 root alternatives (AARQ / AARE / RLRQ / RLRE /
+ABRT), all of which are recognized and dispatched:
+
+- **RLRQ / RLRE** — the release reason (Release-request- /
+  Release-response-reason ENUMERATED) is decoded.
+- **ABRT** — the abort-source (acse-service-user / acse-service-provider)
+  and the OPTIONAL abort-diagnostic ENUMERATED are decoded.
+- **AARQ / AARE** — recognized but the full SEQUENCE bodies
+  (application-context-name OBJECT IDENTIFIER, AP-title CHOICE nested
+  through ACSE-1 / InformationFramework, EXTERNAL user-information) are
+  **DEFERRED** — deeply nested and needing a captured PDU to pin the walk.
+
+`parse_acse_apdu` is intentionally **NOT** wired into the COTP user-data
+dispatch (`parse_cotp_user_app`, which tries CPDLC then CM only). On the
+wire these APDUs sit beneath the ATN session (ISO 8327 / X.225) and
+presentation (ISO 8823 / X.226) null encodings, whose framing is not in
+the `docs/asn1` oracle set; auto-dispatching a bare ACSE-apdu from COTP
+would alias the CPDLC/CM CHOICEs against an unverifiable null-encoding
+frame, so it is held until a verified session/presentation layer.
 
 ## Outputs (`lib.rs::to_message`)
 
@@ -424,7 +503,13 @@ info-hex preview. The raw frame octets are preserved on every message.
   CLIMB-TO uplink, CM logon-request, CM ground logon-response,
   cleared-route uplink, plus one worked vector for each newly-added
   argument type (the expected rendering derived from the module's
-  resolution/unit constraint comments).
+  resolution/unit constraint comments). The round-5/6 PER vectors:
+  user-abort-reason at its correct 4-bit width, a set-CHOICE extension-
+  addition alternative, a non-empty integrityCheck BIT STRING surfaced as
+  hex, a chained fragmented length determinant (§10.9.3.8), the
+  ATCForwardMessage / ATCForwardResponse PDUs, the full CM ground and
+  aircraft set (contact-request LongTsap, forward-response, abort), and
+  the ACSE RLRQ release-reason / ABRT source+diagnostic decodes.
 - **Spec-derived transport vectors** built octet-by-octet (no loopback):
   every COTP TPDU (CR/CC/DR/DC/ED/DT/AK/EA/RJ/ER), the CLNP security label
   and options, X.25 SNDCF Call-Request/Accept, IDRP OPEN/UPDATE/
@@ -449,16 +534,23 @@ never code or formatter text (clean-room; see PROVENANCE.md).
 - X.25 facilities reported numerically (no naming).
 - Compressed CLNP (LREF / deflate) labeled but not expanded.
 - IDRP OPEN's variable tail (RIB-Atts-Set / Confed-IDs / auth) stays hex.
-- CPDLC: extension-marked CHOICE alternatives, fragmented PER lengths,
-  the still-unsupported argument types, the routeInformationAdditional
-  tail, place-bearing-distance positions, the deeply-nested
+- CPDLC: the still-unsupported argument types, the routeInformation-
+  Additional tail, place-bearing-distance positions, the deeply-nested
   **DepartureClearance** FlightInformation / FurtherInstructions tail, and
   the 19 OPTIONAL **PositionReport** fields are not decoded — each stops
   its walk explicitly rather than emitting a guess. Both deferred tails
-  need a captured PDU to pin the nested SEQUENCE-OF / CHOICE walks.
-- CM: TSAP application-list entries reported present/absent only.
+  need a captured PDU to pin the nested SEQUENCE-OF / CHOICE walks. (A set
+  root-CHOICE extension bit and fragmented PER lengths are no longer gaps:
+  the extension-addition alternative is reported by index, and fragmented
+  length determinants are chained.)
+- ACSE: AARQ / AARE bodies (application-context OID, AP-title, EXTERNAL
+  user-information) are recognized but DEFERRED, and `parse_acse_apdu` is
+  not auto-dispatched from COTP — both pending a captured PDU and a
+  verified ATN session/presentation null-encoding frame.
 - **Native ATN-B2 ADS-C over COTP** is not implemented — the deferred big
-  bet (the COTP plumbing and CLNP reassembly that feed it are in place).
+  bet (no ATN-B2 ADS-C ASN.1 module is vendored and no sample is in hand;
+  the COTP plumbing, COTP TSDU reassembly, and CLNP reassembly that would
+  feed it are in place).
 
 ## Standing lessons
 

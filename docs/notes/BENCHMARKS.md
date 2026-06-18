@@ -205,6 +205,37 @@ is validated on a **live** capture: tuner on the 1090 antenna at 978 MHz for 50 
 → **879 CRC-OK frames**, real GA aircraft (callsign/ICAO/position/track/altitude,
 e.g. N402AA, N316ME). Not CI-gated (live capture, not vendored).
 
+## Synthetic demod validation (round 5/6)
+
+These are **not** off-air benchmark runs and carry no real-IQ frame counts.
+Each is a genuine modulate → complex-AWGN → demod noise/BER test (an
+explicitly-allowed synthetic oracle, not a noiseless loopback): a waveform
+is built with the crate's own `modulate`, complex Gaussian noise is added at
+a controlled SNR, and the same decoder front end recovers it. They quantify
+a sensitivity gain; they do not establish real-RF performance (STD-C and
+Aero still lack vendorable off-air captures, see the Iridium section).
+
+- **STD-C RRC matched filter.** The BPSK receive path now applies the
+  receive-half RRC matched filter (TX RRC + RX RRC = a raised-cosine Nyquist
+  pulse); it is on by default (`StdcChannelDecoder::new`), with a
+  `with_matched_filter(false)` switch kept only for the test. The
+  `matched_filter_recovers_at_lower_snr` test (xng-mode-stdc) sweeps the
+  noise sigma into the marginal-SNR cliff and counts frames recovered with
+  the matched filter ON vs OFF: ON never recovers fewer frames at any SNR
+  and recovers materially more near the cliff (measured net ≈ +66/180 frames
+  over the 10-trial × 6-frame × 3-sigma sweep), i.e. frame recovery at
+  equal-or-lower SNR.
+- **AERO-6 coherent carrier path.** A decision-directed (Costas-style)
+  coherent MSK detector (`coherent::CoherentMskDemod`) is added alongside
+  the existing non-coherent frequency-discriminator demod; both share the
+  same front end and timing loop. It runs as a fallback for marginal bursts
+  when the discriminator's packetizer fails to lock. The
+  `coherent_beats_discriminator_ber_vs_snr` test (xng-mode-aero) sweeps a
+  modulate → AWGN → demod BER curve and shows the coherent path is no worse
+  at every point and clearly better (≥20% lower BER) at the mid-range points,
+  reaching the discriminator's 8 dB error rate at ~1 dB lower SNR — recovery
+  at lower SNR than the non-coherent path.
+
 ## Decode CPU (×-realtime, Apple M-series; `bench/cpu.sh`)
 
 | mode | effort | speed |

@@ -228,6 +228,50 @@ corrupted-but-CRC-clean CPR field produces (e.g. an unlucky single-bit
 failures the anchor itself is dropped and re-acquired from a fresh pair.
 Track table caps at `TRACK_MAX = 4096`, evicting stale fixes.
 
+### Graduated position trust (ADSB-7, `resolve_position` / `decode::PosTrust`)
+
+`resolve_position` returns a *graded* fix `(lat, lon, PosTrust)` layered on
+top of the existing global/local CPR decode + speed gate. The grade records
+*how* the fix was resolved and whether it survived the plausibility gates,
+mirroring the dump1090 / pyModeS CPR trust hierarchy (most → least trusted):
+
+- **`GlobalUnambiguous`** — resolved from a fresh even/odd pair
+  (`cpr_global_airborne`); no prior reference needed.
+- **`LocalContained`** — referenced off the aircraft's last good fix (when
+  fresher than `CPR_LOCAL_SECS`) and confirmed inside the integrity-derived
+  containment of that fix (`within_local_containment`).
+- **`LocalReceiver`** — referenced off the static receiver position
+  (surface targets, or an airborne first fix with no even/odd pair yet);
+  weaker, since the aircraft may be far from the receiver.
+
+**Local-containment gate (ADSB-7b).** A `LocalContained` candidate must land
+within `local_containment_radius_m = 2·rc_m + min(motion, ½-zone) + slack`
+of its reference, else the CPR zone number wrapped (or the field is
+corrupt) and the fix is *rejected*, not merely downgraded:
+
+- `rc_m` is the per-fix NIC/NUCp containment radius — the `nuc_p_radius_m`
+  the position decoder already folds into `adsb_status` for this very frame
+  (the `2·rc_m` term covers the new fix *and* the reference; `None` → no
+  integrity term, only capped motion + slack).
+- `min(motion, ½-zone)` caps the elapsed-time motion budget
+  (`MAX_SPEED_MPS · elapsed_s`) at half an airborne CPR latitude zone
+  (`CPR_LOCAL_RANGE_M ≈ 334 km`, the dump1090 `decodeCPRrelative` "±½ zone"
+  range cap). Beyond half a zone a local decode can no longer be the
+  nearest solution, so this term is what makes the gate strictly additive
+  over the unbounded speed gate (which alone would admit an arbitrarily
+  distant zone-wrap at large `elapsed_s`).
+
+A containment-gate rejection, like a speed-gate rejection, feeds the same
+`REJECTS_TO_REANCHOR` counter — a persistently wrong anchor is dropped and
+re-acquired globally.
+
+**Surfacing.** The grade is emitted in `adsb_status` as `position_trust`
+(`global` / `local_contained` / `local_receiver`), only alongside a resolved
+position. `xng_types::MessageBody::ModeS` has no typed trust field, so this
+rides the JSON `adsb_status` channel. Oracle: pyModeS / dump1090 CPR plus
+synthetic CPR round-trips (`trust_grades_global_then_local_contained`,
+`local_containment_gate_rejects_zone_wrap`).
+
 ## Altitude / squawk codecs (`decode.rs`)
 
 13-bit AC field (`altitude13`): M-bit metric flag (rejected — unused), Q-bit
@@ -256,6 +300,13 @@ facts:
 - **Field decode:** worked examples from "The 1090 Megahertz Riddle"
   (Junzi Sun, CC BY-SA) vendored as unit vectors — the 40621D CPR pair,
   ground-speed / airspeed velocity, ident, altitude.
+- **Position trust (ADSB-7):** synthetic CPR round-trips against the 40621D
+  pair — `trust_grades_global_then_local_contained` (fresh pair → `global`,
+  lone follow-up frame inside NUCp containment → `local_contained`) and
+  `local_containment_gate_rejects_zone_wrap` (a flipped longitude bit lands a
+  CPR sub-zone away and is rejected by the containment gate even while it
+  sits under the coarse speed-gate threshold). pyModeS / dump1090 CPR are the
+  field oracle for the underlying decode.
 - **Accuracy / integrity:** pyModeS `uncertainty.py` tables; the NIC
   golden-vector set (`test_adsb`, twelve `8D3C…` frames → NIC 0…11, two
   supplement-sensitive) vendored as the `nic_v1` test; NACv / VR-source /
@@ -283,14 +334,16 @@ facts:
 
 ## Known limitations / intentional gaps
 
-- **Graduated position trust not wired.** `nic_v1` / `nic_v2` /
-  `position_quality` can resolve the version-aware NIC, and the tests pin
-  it, but at decode time position frames always call
+- **Version-aware NIC still computed-only.** Graduated position trust is now
+  wired (`PosTrust`, surfaced as `adsb_status.position_trust` — see CPR
+  tracking), but the *containment radius* it gates on is the NUCp
+  `nuc_p_radius_m`, not the version-aware NIC. `nic_v1` / `nic_v2` /
+  `position_quality` can resolve the version-aware NIC, and the tests pin it,
+  but at decode time position frames still call
   `position_quality(tc, nic_b, None, 0, 0)` — there is no per-aircraft state
   that remembers an aircraft's latest TC31 version + NIC supplements and
   feeds them into the next position fix. Only NUCp and the raw NICb bit are
-  emitted today; the resolved version-aware NIC (and a trust-graded position)
-  is deferred.
+  emitted today; the resolved version-aware NIC is deferred.
 - **No Mode A/C RF demod** — only the information-word decode kernel.
 - **No phase-classified demod templates.** The demod is energy-comparison
   PPM with sub-sample phase sweeping; per-bit phase classification against
