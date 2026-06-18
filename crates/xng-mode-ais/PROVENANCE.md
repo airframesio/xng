@@ -36,6 +36,52 @@ pyais code was copied; the vectors and asserted values are the reference.
 Unrecognised DAC/FID fall back to the existing `data_hex` field — no
 unverified subtypes are fabricated.
 
+## ASM dispatch — DAC=200 Inland AIS message-6 + regional DACs (2026-06)
+
+Three further DAC=200 Inland AIS application messages (carried in message 6,
+addressed) are decoded. **pyais has no decoder for any of them** (it ships
+only DAC=200 FID 10/23/24/40), so these are **spec-derived** from UNECE
+ECE/TRANS/SC.3/176 (Inland AIS) / the CESNI Test Standard for Inland AIS,
+cross-checked field-for-field between two independent references that agree —
+the IALA ASM registry (iala.int/asm) / e-Navigation.nl, and gpsd's published
+AIVDM reference. The governing source is cited on each arm of
+`fields::asm_decode`. FIDs decoded:
+
+- **FID 21** — ETA at lock/bridge/terminal: UN country code (12 b / 2 chars),
+  UN/LOCODE (18 b / 3), fairway section number (30 b / 5), terminal code
+  (30 b / 5), fairway hectometre (30 b / 5), ETA month 4 (0=N/A) / day 5
+  (0=N/A) / hour 5 (24=N/A) / minute 6 (60=N/A), assisting tugs 3 (7=unknown),
+  air draught 12 (0.01 m, 0=not used), spare 5.
+- **FID 22** — RTA at lock/bridge/terminal (shore→ship reply): same five
+  location strings + month/day/hour/minute, then lock/bridge/terminal status
+  2 (0=operational, 1=limited, 2=out of order, 3=N/A), spare 2.
+- **FID 55** — number of persons on board: crew 8 (255=unknown), passengers
+  13 (8191=unknown), shipboard personnel 8 (255=unknown), spare 51.
+
+Regional/national AtoN monitoring is also decoded:
+
+- **DAC 235 (UK) / DAC 250 (Ireland) FID 10** — AtoN monitoring data
+  (message 6): analogue internal 10 (0.05 V/step), analogue external #1 10,
+  analogue external #2 10, RACON status 2, light status 2, health/alarm 1,
+  status external 8, off-position 1, spare 4. Layout per the gpsd AIVDM
+  reference; no pyais oracle.
+
+HEADER-ONLY (per the skip-don't-fake mandate): **DAC 366/316** (US/Canada
+St. Lawrence Seaway & PAWSS), **DAC 367** (US environmental/area-notice) and
+**DAC 265** (Sweden STM route) have no clean-room body layout available — the
+gpsd tables list the DAC/FID pairs but document no bit fields, and the IALA
+ASM registry layouts were not reproduced clean-room. For these a header-only
+identification (`region`, `fid`) is emitted and the raw body is preserved as
+`body_hex`; the per-FID body fields are deliberately NOT guessed.
+
+VERIFICATION (no OSS oracle): each fully-decoded FID has a unit test whose
+expected values are the documented physical quantities from the cited spec.
+Fixtures are built by the independent MSB-first packer (`build_t6_dac200` /
+`build_t6` / `pack` / `pack_i` / `pack_str`) in document order — it shares no
+code with the by-`(offset, width)` decoder, so this is not a self-loopback. A
+wrong offset or width in the decoder mismatches the packer. N/A/unknown
+sentinels are regression-tested (omitted, never emitted as junk).
+
 ## ASM (DAC/FID binary) dispatch — DAC=1 IMO SN.1/Circ.289 (2026-06)
 
 DAC=1 is the IMO international application-identifier space. **pyais has no

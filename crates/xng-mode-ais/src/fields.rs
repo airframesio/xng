@@ -514,6 +514,26 @@ fn asm_decode(dac: u64, fid: u64, bits: &[u8], p: usize) -> Option<Value> {
     let mut put = |k: &str, v: Value| {
         d.insert(k.into(), v);
     };
+    // Optional unsigned field with a documented "not available"/"unknown"
+    // sentinel: emit the key only when the value is in range. `$off` is
+    // relative to the application data start `p`.
+    macro_rules! opt_u {
+        ($key:expr, $off:expr, $len:expr, $na:expr) => {{
+            let v = u(bits, p + $off, $len)?;
+            if v != $na {
+                put($key, json!(v));
+            }
+        }};
+    }
+    // Optional 6-bit-ASCII string field: emit only when non-empty.
+    macro_rules! opt_str {
+        ($key:expr, $off:expr, $chars:expr) => {{
+            let s = sixbit(bits, p + $off, $chars)?;
+            if !s.is_empty() {
+                put($key, json!(s));
+            }
+        }};
+    }
     match (dac, fid) {
         (1, _) => return dac1_decode(fid, bits, p),
         // Inland ship static & voyage data (UNECE SC.3/176, FID 10).
@@ -579,6 +599,95 @@ fn asm_decode(dac: u64, fid: u64, bits: &[u8], p: usize) -> Option<Value> {
             put("signal_facing", json!(u(bits, p + 59, 9)?));
             put("signal_direction", json!(u(bits, p + 68, 3)?));
             put("signal_status_raw", json!(u(bits, p + 71, 30)?));
+        }
+        // ETA at lock/bridge/terminal (FID 21) and RTA reply (FID 22). Inland
+        // AIS, UNECE ECE/TRANS/SC.3/176 Ed.1 Annex (Test Standard for Inland
+        // AIS, §"ETA report"/"RTA report"); cross-checked against the IALA ASM
+        // registry and e-Navigation.nl. Both ride in message 6 (addressed) and
+        // share an identical leading block: five 6-bit-ASCII location strings
+        // — UN country code (12 b / 2 chars), UN/LOCODE (18 b / 3 chars),
+        // fairway section number (30 b / 5 chars), terminal code (30 b / 5
+        // chars), fairway hectometre (30 b / 5 chars) — then month 4 (0=N/A),
+        // day 5 (0=N/A), hour 5 (24=N/A), minute 6 (60=N/A). pyais has NO
+        // decoder for these, so the layout is spec-derived, not OSS-oracle.
+        (200, 21) | (200, 22) => {
+            opt_str!("inland_country", 0, 2);
+            opt_str!("un_locode", 12, 3);
+            opt_str!("fairway_section", 30, 5);
+            opt_str!("terminal_code", 60, 5);
+            opt_str!("fairway_hectometre", 90, 5);
+            // Time block starts at bit 120 (12+18+30+30+30): month 4, day 5,
+            // hour 5, minute 6.
+            opt_u!("month", 120, 4, 0);
+            opt_u!("day", 124, 5, 0);
+            opt_u!("hour", 129, 5, 24);
+            opt_u!("minute", 134, 6, 60);
+            if fid == 21 {
+                // ETA: assisting tugs 3 (7=unknown) at bit 140, air draught 12
+                // (0.01 m, 0=not used) at bit 143, spare 5.
+                opt_u!("assisting_tugs", 140, 3, 7);
+                let ad = u(bits, p + 143, 12)?;
+                if ad != 0 {
+                    put("air_draught_m", json!(ad as f64 / 100.0));
+                }
+            } else {
+                // RTA: lock/bridge/terminal status 2 (3=N/A) at bit 140,
+                // spare 2. 0=operational, 1=limited operation, 2=out of order.
+                opt_u!("status", 140, 2, 3);
+            }
+        }
+        // Number of persons on board (FID 55). Inland AIS, UNECE
+        // ECE/TRANS/SC.3/176 Ed.1 Annex (Test Standard for Inland AIS,
+        // §"Number of persons on board"); cross-checked against the IALA ASM
+        // registry and e-Navigation.nl. Message 6, fixed 168 bits. Body:
+        // crew 8 (255=unknown), passengers 13 (8191=unknown), shipboard
+        // personnel 8 (255=unknown), spare 51. pyais has no decoder for this.
+        (200, 55) => {
+            opt_u!("crew", 0, 8, 255);
+            opt_u!("passengers", 8, 13, 8191);
+            opt_u!("personnel", 21, 8, 255);
+        }
+        // AtoN monitoring data (DAC 235 UK / DAC 250 Ireland, FID 10). Message
+        // 6. Layout per the AIVDM/AIVDO reference (gpsd, §"IALA/regional AtoN
+        // monitoring"): analogue internal 10 (0.05 V/step, 0.05–36 V),
+        // analogue external #1 10, analogue external #2 10, RACON status 2,
+        // light status 2, health 1, status external 8, off-position 1, spare 4.
+        // pyais has no decoder for this DAC; the layout is spec-derived.
+        (235, 10) | (250, 10) => {
+            let volts = |s: usize| -> Option<f64> { Some(u(bits, s, 10)? as f64 * 0.05) };
+            put("voltage_internal", json!(volts(p)?));
+            put("voltage_external_1", json!(volts(p + 10)?));
+            put("voltage_external_2", json!(volts(p + 20)?));
+            put("racon_status", json!(u(bits, p + 30, 2)?));
+            put("light_status", json!(u(bits, p + 32, 2)?));
+            put("health_alarm", json!(u(bits, p + 34, 1)? == 1));
+            put("status_external", json!(u(bits, p + 35, 8)?));
+            put("off_position", json!(u(bits, p + 43, 1)? == 1));
+        }
+        // Regional DACs with no clean-room body layout available. Per the
+        // mandate, emit a header-only identification (DAC/FID + a human-
+        // readable name) so downstream consumers can route the message; the
+        // body falls through to data_hex at the caller. These cover:
+        //   DAC 366/316 — US/Canada St. Lawrence Seaway & PAWSS (gpsd lists the
+        //     DAC/FID pairs but documents no bit layout);
+        //   DAC 367     — US environmental / area-notice (NOT in the gpsd
+        //     tables nor in pyais; IALA ASM registry has the layouts but they
+        //     are not reproduced clean-room here);
+        //   DAC 265     — Sweden / STM (Sea Traffic Management) route exchange
+        //     (no clean-room layout available).
+        // See the IALA ASM registry (iala.int/asm) for the per-FID body fields.
+        // The undecoded body is preserved as `body_hex` so nothing is lost.
+        (366, _) | (316, _) | (367, _) | (265, _) => {
+            let region = match dac {
+                366 | 316 => "US/Canada Seaway (PAWSS)",
+                367 => "US environmental/area-notice",
+                _ => "Sweden STM route",
+            };
+            put("region", json!(region));
+            put("fid", json!(fid));
+            if bits.len() > p {
+                put("body_hex", json!(data_hex(bits, p)));
+            }
         }
         _ => return None,
     }
@@ -1701,5 +1810,290 @@ mod tests {
         assert_eq!(w["to"], "09:30");
         assert_eq!(w["current_dir_deg"], 45);
         assert_eq!(w["current_speed_kt"], 1.5);
+    }
+
+    // ----------------------------------------------------------------------
+    // DAC=200 Inland AIS message-6 application messages: FID 21 (ETA), FID 22
+    // (RTA), FID 55 (number of persons on board); plus regional AtoN
+    // monitoring (DAC 235/250 FID 10) and the header-only regional DACs.
+    //
+    // ORACLE NOTE: pyais has NO decoder for any of these (it only ships
+    // DAC=200 FID 10/23/24/40). The layouts are SPEC-DERIVED from UNECE
+    // ECE/TRANS/SC.3/176 (Inland AIS) and the AIVDM/AIVDO reference, cross-
+    // checked between two independent sources (the IALA ASM registry /
+    // e-Navigation.nl and gpsd's AIVDM.html) which agree field-for-field —
+    // see the per-FID citation in `asm_decode`. Fixtures are built by the
+    // INDEPENDENT MSB-first packer (`pack`/`pack_i`/`pack_str`), which shares
+    // no code with the by-offset decoder, so this is not a self-loopback.
+    // ----------------------------------------------------------------------
+
+    /// Build a message-6 (addressed) frame for DAC=200: type(6) + repeat(2) +
+    /// mmsi(30) + seqno(2) + dest_mmsi(30) + retransmit(1) + spare(1) +
+    /// DAC(10)=200 + FID(6) header (88 bits), then the application bits.
+    fn build_t6_dac200(fid: u64, app: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        pack(&mut bits, 6, 6); // message type 6
+        pack(&mut bits, 0, 2); // repeat
+        pack(&mut bits, 211_000_001, 30); // source MMSI (German inland prefix 211)
+        pack(&mut bits, 0, 2); // sequence number
+        pack(&mut bits, 211_000_002, 30); // destination MMSI
+        pack(&mut bits, 0, 1); // retransmit
+        pack(&mut bits, 0, 1); // spare
+        pack(&mut bits, 200, 10); // DAC = 200 (Inland AIS)
+        pack(&mut bits, fid, 6); // FID
+        bits.extend_from_slice(app);
+        bits
+    }
+
+    /// Build a generic message-6 frame for an arbitrary DAC/FID.
+    fn build_t6(dac: u64, fid: u64, app: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        pack(&mut bits, 6, 6);
+        pack(&mut bits, 0, 2);
+        pack(&mut bits, 235_000_001, 30);
+        pack(&mut bits, 0, 2);
+        pack(&mut bits, 235_000_002, 30);
+        pack(&mut bits, 0, 1);
+        pack(&mut bits, 0, 1);
+        pack(&mut bits, dac, 10);
+        pack(&mut bits, fid, 6);
+        bits.extend_from_slice(app);
+        bits
+    }
+
+    #[test]
+    fn dac200_fid21_eta_lock_bridge_terminal() {
+        // Inland AIS ETA report: country "DE", LOCODE "DUI" (Duisburg),
+        // fairway section "10010", terminal "T01AB", hectometre "12345",
+        // ETA 6-15 14:30, 2 assisting tugs, air draught 7.25 m (raw 725).
+        let mut a = Vec::new();
+        pack_str(&mut a, "DE", 2); // UN country code
+        pack_str(&mut a, "DUI", 3); // UN/LOCODE
+        pack_str(&mut a, "10010", 5); // fairway section number
+        pack_str(&mut a, "T01AB", 5); // terminal code
+        pack_str(&mut a, "12345", 5); // fairway hectometre
+        pack(&mut a, 6, 4); // ETA month
+        pack(&mut a, 15, 5); // ETA day
+        pack(&mut a, 14, 5); // ETA hour
+        pack(&mut a, 30, 6); // ETA minute
+        pack(&mut a, 2, 3); // assisting tugs
+        pack(&mut a, 725, 12); // air draught 0.01 m → 7.25
+        pack(&mut a, 0, 5); // spare
+        let bits = build_t6_dac200(21, &a);
+        let d = decode(6, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 21);
+        let m = &d["app"];
+        assert_eq!(m["inland_country"], "DE");
+        assert_eq!(m["un_locode"], "DUI");
+        assert_eq!(m["fairway_section"], "10010");
+        assert_eq!(m["terminal_code"], "T01AB");
+        assert_eq!(m["fairway_hectometre"], "12345");
+        assert_eq!(m["month"], 6);
+        assert_eq!(m["day"], 15);
+        assert_eq!(m["hour"], 14);
+        assert_eq!(m["minute"], 30);
+        assert_eq!(m["assisting_tugs"], 2);
+        assert_eq!(m["air_draught_m"], 7.25);
+        assert!(d.get("data_hex").is_none());
+    }
+
+    #[test]
+    fn dac200_fid21_eta_na_sentinels_omitted() {
+        // All time/tug/air-draught sentinels → omitted keys (not junk values).
+        let mut a = Vec::new();
+        pack_str(&mut a, "NL", 2);
+        pack_str(&mut a, "RTM", 3);
+        pack_str(&mut a, "@@@@@", 5); // empty fairway section
+        pack_str(&mut a, "@@@@@", 5); // empty terminal
+        pack_str(&mut a, "@@@@@", 5); // empty hectometre
+        pack(&mut a, 0, 4); // month N/A
+        pack(&mut a, 0, 5); // day N/A
+        pack(&mut a, 24, 5); // hour N/A
+        pack(&mut a, 60, 6); // minute N/A
+        pack(&mut a, 7, 3); // tugs unknown
+        pack(&mut a, 0, 12); // air draught not used
+        pack(&mut a, 0, 5);
+        let bits = build_t6_dac200(21, &a);
+        let m = &decode(6, &bits).unwrap()["app"];
+        assert_eq!(m["inland_country"], "NL");
+        assert_eq!(m["un_locode"], "RTM");
+        assert!(m.get("fairway_section").is_none());
+        assert!(m.get("month").is_none());
+        assert!(m.get("day").is_none());
+        assert!(m.get("hour").is_none());
+        assert!(m.get("minute").is_none());
+        assert!(m.get("assisting_tugs").is_none());
+        assert!(m.get("air_draught_m").is_none());
+    }
+
+    #[test]
+    fn dac200_fid22_rta_lock_bridge_terminal() {
+        // Inland AIS RTA reply: country "BE", LOCODE "ANR" (Antwerp), fairway
+        // section "20020", terminal "L05CD", hectometre "06789", RTA 7-04
+        // 09:15, status 1 (limited operation).
+        let mut a = Vec::new();
+        pack_str(&mut a, "BE", 2);
+        pack_str(&mut a, "ANR", 3);
+        pack_str(&mut a, "20020", 5);
+        pack_str(&mut a, "L05CD", 5);
+        pack_str(&mut a, "06789", 5);
+        pack(&mut a, 7, 4); // RTA month
+        pack(&mut a, 4, 5); // RTA day
+        pack(&mut a, 9, 5); // RTA hour
+        pack(&mut a, 15, 6); // RTA minute
+        pack(&mut a, 1, 2); // status: limited operation
+        pack(&mut a, 0, 2); // spare
+        let bits = build_t6_dac200(22, &a);
+        let d = decode(6, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 22);
+        let m = &d["app"];
+        assert_eq!(m["inland_country"], "BE");
+        assert_eq!(m["un_locode"], "ANR");
+        assert_eq!(m["fairway_section"], "20020");
+        assert_eq!(m["terminal_code"], "L05CD");
+        assert_eq!(m["fairway_hectometre"], "06789");
+        assert_eq!(m["month"], 7);
+        assert_eq!(m["day"], 4);
+        assert_eq!(m["hour"], 9);
+        assert_eq!(m["minute"], 15);
+        assert_eq!(m["status"], 1);
+        // RTA has no air-draught / tugs fields.
+        assert!(m.get("assisting_tugs").is_none());
+        assert!(m.get("air_draught_m").is_none());
+    }
+
+    #[test]
+    fn dac200_fid55_number_of_persons() {
+        // Inland AIS number-of-persons: 4 crew, 250 passengers, 3 personnel.
+        let mut a = Vec::new();
+        pack(&mut a, 4, 8); // crew
+        pack(&mut a, 250, 13); // passengers
+        pack(&mut a, 3, 8); // shipboard personnel
+        pack(&mut a, 0, 51); // spare
+        let bits = build_t6_dac200(55, &a);
+        let d = decode(6, &bits).unwrap();
+        assert_eq!(d["dac"], 200);
+        assert_eq!(d["fid"], 55);
+        let m = &d["app"];
+        assert_eq!(m["crew"], 4);
+        assert_eq!(m["passengers"], 250);
+        assert_eq!(m["personnel"], 3);
+        assert!(d.get("data_hex").is_none());
+    }
+
+    #[test]
+    fn dac200_fid55_unknown_sentinels_omitted() {
+        // crew 255 / passengers 8191 / personnel 255 are all "unknown".
+        let mut a = Vec::new();
+        pack(&mut a, 255, 8);
+        pack(&mut a, 8191, 13);
+        pack(&mut a, 255, 8);
+        pack(&mut a, 0, 51);
+        let bits = build_t6_dac200(55, &a);
+        // Every field unknown → app object empty → None → data_hex fallback.
+        let d = decode(6, &bits).unwrap();
+        assert!(d.get("app").is_none());
+        assert!(d.get("data_hex").is_some());
+    }
+
+    #[test]
+    fn dac200_fid55_partial_known() {
+        // Only crew known (12); passengers & personnel unknown.
+        let mut a = Vec::new();
+        pack(&mut a, 12, 8);
+        pack(&mut a, 8191, 13);
+        pack(&mut a, 255, 8);
+        pack(&mut a, 0, 51);
+        let bits = build_t6_dac200(55, &a);
+        let m = &decode(6, &bits).unwrap()["app"];
+        assert_eq!(m["crew"], 12);
+        assert!(m.get("passengers").is_none());
+        assert!(m.get("personnel").is_none());
+    }
+
+    #[test]
+    fn dac235_fid10_aton_monitoring() {
+        // UK/Ireland AtoN monitoring (DAC 235, FID 10). internal 12.00 V
+        // (raw 240), ext#1 6.05 V (raw 121), ext#2 0.05 V (raw 1), RACON
+        // status 2, light status 1, health alarm set, status external 0xA5,
+        // off-position true.
+        let mut a = Vec::new();
+        pack(&mut a, 240, 10); // analogue internal: 240 * 0.05 = 12.0 V
+        pack(&mut a, 121, 10); // analogue external #1: 121 * 0.05 = 6.05 V
+        pack(&mut a, 1, 10); // analogue external #2: 0.05 V
+        pack(&mut a, 2, 2); // RACON status
+        pack(&mut a, 1, 2); // light status
+        pack(&mut a, 1, 1); // health alarm
+        pack(&mut a, 0xA5, 8); // status external
+        pack(&mut a, 1, 1); // off-position
+        pack(&mut a, 0, 4); // spare
+        let bits = build_t6(235, 10, &a);
+        let d = decode(6, &bits).unwrap();
+        assert_eq!(d["dac"], 235);
+        assert_eq!(d["fid"], 10);
+        let m = &d["app"];
+        assert!((m["voltage_internal"].as_f64().unwrap() - 12.0).abs() < 1e-9);
+        assert!((m["voltage_external_1"].as_f64().unwrap() - 6.05).abs() < 1e-9);
+        assert!((m["voltage_external_2"].as_f64().unwrap() - 0.05).abs() < 1e-9);
+        assert_eq!(m["racon_status"], 2);
+        assert_eq!(m["light_status"], 1);
+        assert_eq!(m["health_alarm"], true);
+        assert_eq!(m["status_external"], 0xA5);
+        assert_eq!(m["off_position"], true);
+        assert!(d.get("data_hex").is_none());
+    }
+
+    #[test]
+    fn dac250_fid10_aton_shares_layout() {
+        // Ireland (DAC 250) uses the same FID-10 AtoN layout as the UK.
+        let mut a = Vec::new();
+        pack(&mut a, 200, 10); // 10.0 V
+        pack(&mut a, 0, 10);
+        pack(&mut a, 0, 10);
+        pack(&mut a, 0, 2);
+        pack(&mut a, 0, 2);
+        pack(&mut a, 0, 1);
+        pack(&mut a, 0, 8);
+        pack(&mut a, 0, 1);
+        pack(&mut a, 0, 4);
+        let bits = build_t6(250, 10, &a);
+        let d = decode(6, &bits).unwrap();
+        assert_eq!(d["dac"], 250);
+        assert!((d["app"]["voltage_internal"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn regional_dacs_emit_header_only() {
+        // DAC 366/316 (Seaway), 367 (US env), 265 (Sweden STM): no clean-room
+        // body layout, so a header-only identification is emitted and the raw
+        // body is preserved as `body_hex` for downstream re-parse.
+        for (dac, fid, region) in [
+            (366u64, 1u64, "US/Canada Seaway (PAWSS)"),
+            (316, 2, "US/Canada Seaway (PAWSS)"),
+            (367, 33, "US environmental/area-notice"),
+            (265, 1, "Sweden STM route"),
+        ] {
+            // Type-8 broadcast carrier (these DACs are broadcast in practice).
+            let mut bits = Vec::new();
+            pack(&mut bits, 8, 6);
+            pack(&mut bits, 0, 2);
+            pack(&mut bits, 366_000_001, 30);
+            pack(&mut bits, 0, 2);
+            pack(&mut bits, dac, 10);
+            pack(&mut bits, fid, 6);
+            pack(&mut bits, 0xDEAD_BEEF, 64); // body bits → 8 octets of hex
+            let d = decode(8, &bits).unwrap();
+            assert_eq!(d["dac"], dac);
+            assert_eq!(d["fid"], fid);
+            let app = &d["app"];
+            assert_eq!(app["region"], region);
+            assert_eq!(app["fid"], fid);
+            // Body preserved (64 bits → 16 hex chars), structured app emitted
+            // instead of a top-level data_hex.
+            assert_eq!(app["body_hex"].as_str().unwrap().len(), 16);
+            assert!(d.get("data_hex").is_none());
+        }
     }
 }
