@@ -1,6 +1,6 @@
 [package]
 name = "xng-mode-flex"
-description = "Native Motorola FLEX / FLEX-NEXT radio-paging decode core for xng: 2-FSK 1600 bps demod, FLEX sync (BS1/A/B), 11x8 32-bit-word framing, BCH(31,21) + parity, alphanumeric/numeric/tone page decode with short/long capcodes and frame/cycle numbers"
+description = "Native Motorola FLEX / FLEX-NEXT radio-paging decode core for xng: 2-FSK 1600 bps and 4-FSK 3200/6400 bps demod (A/B/C/D phase de-interleave), FLEX sync (BS1/A/B + per-rate A-code), 11x8 32-bit-word framing, BCH(31,21) + parity, alphanumeric/numeric/tone page decode with short/long capcodes and frame/cycle numbers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
