@@ -433,13 +433,50 @@ const MAX_STRUCTURELESS_JUNK: f64 = 0.05;
 ///   2. a long body with NO space and more than [`MAX_STRUCTURELESS_JUNK`] junk
 ///      (structureless — words run together with scattered odd symbols).
 fn alpha_is_garble(text: &str) -> bool {
+    // A non-whitespace control char never appears in a genuine alpha page — a
+    // BCH-false-correct that lands on e.g. 0x05 reveals itself this way.
+    if text.chars().any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')) {
+        return true;
+    }
     let junk = junk_ratio(text);
     if junk > MAX_ALPHA_JUNK {
         return true;
     }
     let len = text.chars().count();
     let has_space = text.chars().any(|c| c == ' ');
-    len >= MIN_STRUCTURELESS_LEN && !has_space && junk > MAX_STRUCTURELESS_JUNK
+    if len >= MIN_STRUCTURELESS_LEN && !has_space && junk > MAX_STRUCTURELESS_JUNK {
+        return true;
+    }
+    // Random-data tell: a spaceless body whose letters/digits shatter into many
+    // short upper/lower/digit runs (avg run < 3 alnum chars) is machine garble —
+    // a BCH-false-correct of fill/noise. A genuine no-space token (phone, long
+    // ID, URL host, hex serial) runs in long same-class spans (one digit run, a
+    // word, …). Spaced human text is exempt; bodies under 10 alnum are unjudged.
+    if !has_space {
+        let (mut runs, mut alnum, mut prev) = (0usize, 0usize, None::<u8>);
+        for c in text.chars() {
+            let cls = if c.is_ascii_digit() {
+                Some(0)
+            } else if c.is_ascii_uppercase() {
+                Some(1)
+            } else if c.is_ascii_lowercase() {
+                Some(2)
+            } else {
+                None // a symbol breaks the current run
+            };
+            if let Some(k) = cls {
+                alnum += 1;
+                if prev != Some(k) {
+                    runs += 1;
+                }
+            }
+            prev = cls;
+        }
+        if alnum >= 10 && runs * 3 > alnum {
+            return true;
+        }
+    }
+    false
 }
 
 /// Decide whether a fully-decoded page is trustworthy enough to emit, applying
@@ -1257,6 +1294,20 @@ mod tests {
         // Fully-garbled random ASCII: dropped (heavy odd punctuation + no spaces).
         assert!(alpha_is_garble("VH=P@3jE6lbAZMhFKVba[4>^>Hnnm99UkHFS`cHm"));
         assert!(alpha_is_garble("[j:LiG>7?^MbLRS`AU=4T>KZdO:PcC[m\\MBmbT"));
+        // Live off-air junk that slipped the old gate — caught now:
+        // random mixed-case with ≤1 odd symbol (under the junk floor)…
+        assert!(alpha_is_garble("gMgUDJLa[7FRJc>m81JL92"));
+        assert!(alpha_is_garble("V?Fi8OdkYC[9fg1ZoWnDa3"));
+        // …pure-hex `u…v`-wrapped pages (zero junk symbols — run-density tell)…
+        assert!(alpha_is_garble("uC000F7038F08015D5C64v"));
+        assert!(alpha_is_garble("u8000F7016EB6v"));
+        assert!(alpha_is_garble("u82011B650800B4D1ADv^PW"));
+        // …and one carrying a raw control char.
+        assert!(alpha_is_garble("u82011B640800B414A0v\u{05}3"));
+        // Real no-space tokens still kept (long same-class runs / short).
+        assert!(!alpha_is_garble("+18888581081"));
+        assert!(!alpha_is_garble("704091222"));
+        assert!(!alpha_is_garble("https://example.com/path?id=12345"));
     }
 
     #[test]
