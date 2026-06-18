@@ -49,6 +49,21 @@
   #entities tr.row.sel { background: #1f2435; }
   #entities tr.row.sel td:first-child { border-left: 2px solid #7aa2f7; padding-left: 6px; }
   #entities td.age { color: #565f89; }
+  #entities tr.msgrow td { color: #aeb6d6; }
+  #entities tr.msgrow td.msgcaret { padding-left: 20px; color: #7aa2f7; }
+  /* Selected-message detail pane: sits directly below the entities table and
+     above the log. The meta grid auto-reflows so it stays readable in a narrow
+     side panel (responsive). */
+  #entcard { flex: none; max-height: 40%; overflow-y: auto; border-top: 1px solid #1c2230; background: linear-gradient(180deg, #161b29, #0e1119); padding: 10px 13px 12px; position: relative; }
+  #entcard[hidden] { display: none; }
+  #entcard .cardx { position: absolute; top: 7px; right: 11px; cursor: pointer; color: #565f89; font-size: 13px; line-height: 1; }
+  #entcard .cardx:hover { color: #c8ccd4; }
+  #entcard h3 { margin: 0 24px 8px 0; padding-bottom: 6px; font-size: 13px; color: #7aa2f7; border-bottom: 1px solid #232a3d; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  #entcard .badge { background: #1f2435; color: #7dcfff; border: 1px solid #2a3147; border-radius: 4px; padding: 0 6px; font-size: 10px; letter-spacing: 0.04em; }
+  #entcard .msgtext { white-space: pre-wrap; word-break: break-word; background: #0b0e14; border: 1px solid #1c2230; border-radius: 5px; padding: 8px 10px; color: #c8ccd4; font-size: 12px; line-height: 1.5; margin-bottom: 10px; }
+  #entcard .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 7px 16px; }
+  #entcard .meta .k { color: #565f89; text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; }
+  #entcard .meta .v { color: #c8ccd4; word-break: break-word; }
   .silh, .silh svg { width: 100%; height: 100%; display: block; }
   .silh svg * { fill: currentColor !important; stroke: none !important; }
   .silh svg image { display: none !important; }
@@ -99,6 +114,18 @@
   #sdrbody .sdrhead { color: #73daca; padding-top: 5px; }
   #sdrbody .live { color: #9ece6a; }
   #sdrbody .stale { color: #e0af68; }
+  #sdrbody .dead, #sdrbody .none { color: #565f89; }
+  /* Compact per-receiver table: one row each, status dot for liveness. */
+  #sdrbody table.sdrtab td { padding: 2px 10px 2px 0; }
+  #sdrbody .sdrtab th { text-align: left; font-weight: 400; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: #565f89; padding: 0 10px 3px 0; }
+  #sdrbody .sdrtab td.rx { color: #c8ccd4; }
+  #sdrbody .sdrtab td.mode { color: #7dcfff; }
+  #sdrbody .sdrtab td.freq { color: #a9b1d6; font-variant-numeric: tabular-nums; }
+  #sdrbody .sdrtab td.ch { color: #565f89; }
+  #sdrbody .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; background: #565f89; vertical-align: middle; }
+  #sdrbody .dot.live { background: #9ece6a; box-shadow: 0 0 5px #9ece6a88; }
+  #sdrbody .dot.stale { background: #e0af68; }
+  #sdrbody .dot.dead { background: #f7768e; }
   /* Fixed-width icons so layer-control rows align despite emoji width. */
   .lyr-ic { display: inline-block; width: 1.5em; text-align: center; font-style: normal; }
 </style>
@@ -115,6 +142,7 @@
   </div>
   <div id="enttabs"></div>
   <div id="entities"></div>
+  <div id="entcard" hidden></div>
   <div id="vres" title="Drag to resize"></div>
   <div id="logpane">
     <div id="chips"></div>
@@ -571,6 +599,8 @@ let fitted = false;
 let paused = false;
 let logMsgs = []; // log items currently shown; frozen in place while paused
 let selected = null; // entity key ('a'+icao / 'v'+mmsi)
+let selectedMsg = null; // {cap,proto,fn,baud,cls,kind,text,seen,mk} shown in the message detail pane
+let msgIndex = {};      // msgkey -> message detail; rebuilt each render so the click handler can resolve a clicked history row
 const hiddenModes = new Set();
 const expanded = new Set();
 const rateHist = []; // [t_ms, totals] samples for per-mode rates
@@ -585,6 +615,7 @@ function selectEntity(key, lat, lon) {
   if (row) row.scrollIntoView({ block: 'nearest' });
 }
 window.selectEntity = selectEntity;
+window.clearMsg = () => { selectedMsg = null; renderEntCard(); };
 window.toggleMode = m => { hiddenModes.has(m) ? hiddenModes.delete(m) : hiddenModes.add(m); render(); };
 window.toggleTerminals = () => {
   localStorage.setItem('xng.terminals', localStorage.getItem('xng.terminals') === '1' ? '0' : '1');
@@ -615,6 +646,12 @@ document.getElementById('entities').addEventListener('click', e => {
   const tr = e.target.closest('tr');
   if (!tr || !tr.dataset) return;
   if (tr.dataset.act === 'term') { window.toggleTerminals(); return; }
+  if (tr.dataset.msgkey) {
+    // A history sub-row: open that message's detail pane (no map nav).
+    const m = msgIndex[tr.dataset.msgkey];
+    if (m) { selectedMsg = { ...m, mk: tr.dataset.msgkey }; render(); }
+    return;
+  }
   const k = tr.dataset.k;
   if (!k) return;
   if (tr.dataset.exp === '1') {
@@ -757,6 +794,33 @@ function entityPopup(pic, title, kv) {
   return `<div class="pp">${pic ? `<div class="pic">${pic}</div>` : ''}` +
     `<div><h3>${title}</h3><table>${rows}</table></div></div>`;
 }
+// Per-message detail pane below the entities table. Shows the full text of a
+// selected pager message plus its metadata; the meta grid is responsive. All
+// values are escaped here — msgIndex holds raw strings, never HTML.
+function renderEntCard() {
+  const el = document.getElementById('entcard');
+  if (!el) return;
+  const m = selectedMsg;
+  if (!m) { el.hidden = true; el.innerHTML = ''; return; }
+  const proto = String(m.proto || '').toUpperCase();
+  const now = (state && state.now) || 0;
+  const recv = m.seen ? new Date(m.seen * 1000).toLocaleString() : '';
+  const meta = [
+    ['capcode', m.cap], ['protocol', proto], ['kind', m.kind || ''],
+    ['class', m.cls || ''], ['function', m.fn], ['baud', m.baud],
+    ['received', recv], ['age', m.seen ? fmtAge(now - m.seen) : ''],
+  ].filter(([, v]) => v != null && v !== '');
+  const text = String(m.text || '');
+  el.innerHTML =
+    `<span class="cardx" title="Close" onclick="clearMsg()">✕</span>` +
+    `<h3><span class="ent-ic">📟</span>${escapeHtml(String(m.cap))}` +
+    (proto ? ` <span class="badge">${escapeHtml(proto)}</span>` : '') + `</h3>` +
+    `<div class="msgtext">${text ? escapeHtml(text) : '<span style="color:#565f89">(no text)</span>'}</div>` +
+    `<div class="meta">` +
+    meta.map(([k, v]) => `<div><div class="k">${k}</div><div class="v">${escapeHtml(String(v))}</div></div>`).join('') +
+    `</div>`;
+  el.hidden = false;
+}
 function fmtUptime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
@@ -773,24 +837,29 @@ function renderSdr(s) {
   const body = document.getElementById('sdrbody');
   if (body.hidden) return; // skip the table build while collapsed
   if (!n) { body.innerHTML = '<span class="sub">no active receivers</span>'; return; }
-  body.innerHTML = sess.map(se => {
+  // Compact: one row per receiver (rx · mode · freq · channels · liveness)
+  // instead of a tall key/value block per SDR. A status dot encodes liveness.
+  const rows = sess.map(se => {
     const mode = se.mode || '';
     const seen = (s.last_seen || {})[mode];
     const age = seen != null ? s.now - seen : null;
-    const liveTxt = age == null ? '—'
-      : `<span class="${age < 30 ? 'live' : 'stale'}">${fmtAge(age)} ago</span>`;
+    const cls = age == null ? 'none' : (age < 30 ? 'live' : (age < 120 ? 'stale' : 'dead'));
+    const last = age == null ? 'no msgs' : `${fmtAge(age)} ago`;
     const ch = Array.isArray(se.channels) ? se.channels.length : (se.channels || 1);
-    const rows = [
-      ['mode', escapeHtml(mode)],
-      ['center', se.center_mhz != null ? `${(+se.center_mhz).toFixed(3)} MHz` : null],
-      ['sample rate', se.sample_rate ? `${(se.sample_rate / 1e6).toFixed(1)} MS/s` : null],
-      ['channels', ch],
-      ['serial', se.serial ? escapeHtml(String(se.serial)) : null],
-      ['last msg', liveTxt],
-    ].filter(([, v]) => v != null && v !== '')
-      .map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('');
-    return `<table><tr><td class="sdrhead" colspan="2">${escapeHtml(se.sdr || 'SDR')}</td></tr>${rows}</table>`;
+    const serial = se.serial ? String(se.serial) : (se.sdr || '').replace(/^.*serial=/, '') || '?';
+    const freq = se.center_mhz != null ? (+se.center_mhz).toFixed(3) : '';
+    const rate = se.sample_rate ? `${(se.sample_rate / 1e6).toFixed(1)} MS/s` : '';
+    const tip = escapeHtml([se.sdr, rate, freq && `${freq} MHz`].filter(Boolean).join(' · '));
+    return `<tr title="${tip}">` +
+      `<td class="rx"><span class="dot ${cls}"></span>${escapeHtml(serial)}</td>` +
+      `<td class="mode">${escapeHtml(mode)}</td>` +
+      `<td class="freq">${freq}</td>` +
+      `<td class="ch">${ch}ch</td>` +
+      `<td class="${cls}">${last}</td></tr>`;
   }).join('');
+  body.innerHTML = `<table class="sdrtab">` +
+    `<tr class="sdrhdr-row"><th>rx</th><th>mode</th><th>freq MHz</th><th>ch</th><th>last msg</th></tr>` +
+    `${rows}</table>`;
 }
 
 // msgs/min per mode over the last 60 s of samples.
@@ -972,12 +1041,17 @@ function render() {
   for (const p of (s.pagers || [])) {
     const cap = String(p.capcode ?? '');
     const txt = p.text ? String(p.text).trim() : '';
+    const hist = p.history || [];
     ents.push({
-      k: 'p' + (p.proto || '') + ':' + cap, id: cap, type: 'pager', lat: null, lon: null, srcs: [], expandable: false,
+      k: 'p' + (p.proto || '') + ':' + cap, id: cap, type: 'pager', lat: null, lon: null, srcs: [],
+      // Expandable when there's a message history — clicking shows past pages.
+      expandable: hist.length > 1, history: hist,
+      // Raw pager fields (JS-only, never injected as HTML) for the message detail pane.
+      praw: { proto: p.proto, fn: p.function, baud: p.baud, cls: p.class },
       color: '#7dcfff', name: `${ic('📟')}${escapeHtml(cap)}`, seen: p.seen,
       sv: { id: cap, flight: '', icao: '', reg: String(p.proto || ''), type: String(p.class || ''), alt: undefined, kt: undefined, msgs: p.msgs, seen: p.seen || 0 },
       cols: ['', '', escapeHtml(String(p.proto || '')), escapeHtml(String(p.class || '')), '', '', p.msgs ?? ''],
-      f: { proto: escapeHtml(String(p.proto || '')), capcode: cap, function: p.function ?? '', baud: p.baud ?? '', text: escapeHtml(txt.slice(0, 40)), msgs: p.msgs ?? '' },
+      f: { proto: escapeHtml(String(p.proto || '')), capcode: cap, function: p.function ?? '', baud: p.baud ?? '', text: escapeHtml(txt.slice(0, 48)), msgs: p.msgs ?? '' },
     });
   }
   // --- Entity-type tabs: All (everything, generic columns) + one tab per
@@ -1034,6 +1108,7 @@ function render() {
   });
 
   const rows = [];
+  msgIndex = {}; // rebuilt below as pager history rows are emitted
   for (const e of view) {
     const open = e.expandable && acExpanded.has(e.id);
     const caret = e.expandable ? (open ? '▾ ' : '▸ ') : '';
@@ -1044,7 +1119,26 @@ function render() {
       `data-id="${escapeHtml(e.id)}" data-lat="${e.lat ?? ''}" data-lon="${e.lon ?? ''}" data-exp="${e.expandable ? 1 : 0}">` +
       `<td style="color:${e.color}">${caret}${e.name}</td>` + cells +
       `<td class="age">${fmtAge(s.now - e.seen)}</td></tr>`);
-    if (open && isAll) {
+    if (open && e.type === 'pager' && e.history && e.history.length) {
+      // Message history (newest first): each past page as an indented,
+      // clickable row that mirrors the parent's columns — the text lands under
+      // the "text" column and the age under "seen", so the sub-rows line up.
+      const cap = e.id, pr = e.praw || {};
+      for (const h of [...e.history].reverse()) {
+        const mk = cap + '|' + (h.seen || 0);
+        msgIndex[mk] = { cap, proto: pr.proto, fn: pr.fn, baud: pr.baud, cls: pr.cls, kind: h.kind, text: h.text, seen: h.seen };
+        const selCls = (selectedMsg && selectedMsg.mk === mk) ? ' sel' : '';
+        const txt = escapeHtml(String(h.text || '').slice(0, 80));
+        // Middle cells: per-type tab puts text under its 'text' column (blank
+        // elsewhere); the All view has no text column, so span its generic cols.
+        const mid = isAll
+          ? `<td colspan="${e.cols.length}">${txt}</td>`
+          : tab.cols.map(([key]) => `<td>${key === 'text' ? txt : ''}</td>`).join('');
+        rows.push(`<tr class="row srcrow msgrow${selCls}" data-msgkey="${escapeHtml(mk)}">` +
+          `<td class="msgcaret">↳</td>` + mid +
+          `<td class="age">${fmtAge(s.now - (h.seen || 0))}</td></tr>`);
+      }
+    } else if (open && isAll && e.srcs.length) {
       for (const sr of [...e.srcs].sort((p, q) => (p.source || '').localeCompare(q.source || ''))) {
         rows.push(`<tr class="row srcrow">` +
           `<td style="padding-left:20px;color:#7aa2f7">↳ ${escapeHtml(sr.source || '')}</td>` +
@@ -1081,6 +1175,7 @@ function render() {
   document.getElementById('entities').innerHTML = rows.length
     ? `<table><tr>${hdr}</tr>${rows.join('')}</table>`
     : '';
+  renderEntCard();
 
   // Pause freezes only which log items are listed: capture the live list
   // while running, then always render from the captured list so message

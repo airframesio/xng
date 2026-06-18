@@ -665,8 +665,17 @@ fn update(d: &mut Dash, m: &Message) {
                     }
                 }
                 if let Some(t) = details.get("text").and_then(Value::as_str) {
-                    if !t.trim().is_empty() {
+                    let t = t.trim();
+                    if !t.is_empty() {
                         o.insert("text".into(), json!(t));
+                        // Per-capcode message history (newest last, capped) so a
+                        // pager row can expand to show its past pages.
+                        let kind = details.get("kind").cloned().unwrap_or(Value::Null);
+                        let hist = o.entry("history").or_insert_with(|| json!([])).as_array_mut().unwrap();
+                        hist.push(json!({ "text": t, "kind": kind, "seen": now_s() }));
+                        if hist.len() > 25 {
+                            hist.remove(0);
+                        }
                     }
                 }
                 o.insert("seen".into(), json!(now_s()));
