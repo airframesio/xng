@@ -60,6 +60,8 @@ pub struct OutputsToml {
     pub sbs: Option<String>,
     pub beast: Option<String>,
     pub nmea_tcp: Option<String>,
+    pub nmea_udp: Option<String>,
+    pub nmea_tag_blocks: Option<bool>,
     pub gsmtap: Option<String>,
     pub iridium_satmap: Option<String>,
     pub http: Option<String>,

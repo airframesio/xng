@@ -54,6 +54,10 @@ pub struct OutputConfig {
     pub beast: Option<String>,
     /// NMEA (AIVDM) TCP server address.
     pub nmea_tcp: Option<String>,
+    /// NMEA (AIVDM) UDP push target (host:port).
+    pub nmea_udp: Option<String>,
+    /// Prefix NMEA output with a tag-block (`\s:<station>,c:<ts>*HH\`).
+    pub nmea_tag_blocks: bool,
     /// GSMTAP/UDP target for Iridium GSM frames (Wireshark).
     pub gsmtap: Option<String>,
     /// Iridium satellite-name matching TLE source ("auto" or a path).
@@ -678,7 +682,13 @@ fn spawn_outputs(
     }
     if let Some(addr) = outputs.nmea_tcp.clone() {
         let rx = bus.subscribe();
-        output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr)));
+        let tags = outputs.nmea_tag_blocks;
+        output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr, tags)));
+    }
+    if let Some(target) = outputs.nmea_udp.clone() {
+        let rx = bus.subscribe();
+        let tags = outputs.nmea_tag_blocks;
+        output_tasks.push(tokio::spawn(crate::outputs::nmea_udp::run(rx, target, tags)));
     }
     if let Some(addr) = outputs.gsmtap.clone() {
         let rx = bus.subscribe();

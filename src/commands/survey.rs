@@ -465,6 +465,8 @@ fn dwell(
             sbs: None,
             beast: None,
             nmea_tcp: None,
+            nmea_udp: None,
+            nmea_tag_blocks: false,
             gsmtap: None,
             iridium_satmap: None,
             http: None,

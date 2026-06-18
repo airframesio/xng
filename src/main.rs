@@ -132,6 +132,12 @@ struct OutputOpts {
     /// Serve raw NMEA AIVDM over TCP (e.g. 0.0.0.0:10110)
     #[arg(long)]
     nmea_tcp: Option<String>,
+    /// Push raw NMEA AIVDM as UDP datagrams to this target (e.g. host:10110)
+    #[arg(long)]
+    nmea_udp: Option<String>,
+    /// Prefix NMEA output with a tag-block (\s:<station>,c:<unix_ts>*HH\)
+    #[arg(long)]
+    nmea_tag_blocks: bool,
     /// Send Iridium GSM (CC/MM/SMS) frames to Wireshark via GSMTAP/UDP
     /// (default 127.0.0.1:4729 when given without an address)
     #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4729")]
@@ -210,6 +216,8 @@ impl OutputOpts {
                 sbs: self.sbs.clone(),
                 beast: self.beast.clone(),
                 nmea_tcp: self.nmea_tcp.clone(),
+                nmea_udp: self.nmea_udp.clone(),
+                nmea_tag_blocks: self.nmea_tag_blocks,
                 gsmtap: self.gsmtap.clone(),
                 iridium_satmap: self.iridium_satmap.clone(),
                 http: self.http.clone(),
@@ -739,6 +747,8 @@ fn main() -> anyhow::Result<()> {
                         sbs: None,
                         beast: None,
                         nmea_tcp: None,
+                        nmea_udp: None,
+                        nmea_tag_blocks: false,
                         gsmtap: None,
                         iridium_satmap: None,
                         http: None,
@@ -778,6 +788,8 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         sbs: st.outputs.sbs.clone(),
         beast: st.outputs.beast.clone(),
         nmea_tcp: st.outputs.nmea_tcp.clone(),
+        nmea_udp: st.outputs.nmea_udp.clone(),
+        nmea_tag_blocks: st.outputs.nmea_tag_blocks.unwrap_or(false),
         gsmtap: st.outputs.gsmtap.clone(),
         iridium_satmap: st.outputs.iridium_satmap.clone(),
         http: st.outputs.http.clone(),

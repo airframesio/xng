@@ -36,6 +36,15 @@ fn checksum(body: &str) -> u8 {
     body.bytes().fold(0, |c, b| c ^ b)
 }
 
+/// Build an NMEA 0183 tag-block (IEC 61162-1): `\s:<source>,c:<unix_ts>*HH\`
+/// where `HH` is the XOR checksum of the bytes between the `\` delimiters.
+/// Prepended to a sentence by transports that carry per-message source +
+/// receive-time provenance (the form OpenCPN / aggregator pollers parse).
+pub fn tag_block(source: &str, unix_ts: i64) -> String {
+    let inner = format!("s:{source},c:{unix_ts}");
+    format!("\\{inner}*{:02X}\\", checksum(&inner))
+}
+
 pub struct SentenceBuilder {
     seq: u8,
 }
@@ -117,5 +126,19 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert!(s[0].starts_with("!AIVDM,2,1,0,B,"));
         assert!(s[1].starts_with("!AIVDM,2,2,0,B,"));
+    }
+
+    #[test]
+    fn tag_block_shape_and_checksum() {
+        let tb = tag_block("XNG", 1_577_836_800);
+        // \s:XNG,c:1577836800*HH\ — delimiters present, checksum over inner.
+        assert!(tb.starts_with('\\') && tb.ends_with('\\'), "{tb}");
+        let inner = "s:XNG,c:1577836800";
+        let expect: u8 = inner.bytes().fold(0, |c, b| c ^ b);
+        assert_eq!(tb, format!("\\{inner}*{expect:02X}\\"));
+        // The embedded *HH must equal the XOR of the inner bytes, computed
+        // independently here (not via the encoder's own checksum()).
+        let hex = &tb[tb.find('*').unwrap() + 1..tb.len() - 1];
+        assert_eq!(u8::from_str_radix(hex, 16).unwrap(), expect);
     }
 }

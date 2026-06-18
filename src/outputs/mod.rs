@@ -16,4 +16,5 @@ pub mod jsonl;
 pub mod metrics;
 pub mod mqtt;
 pub mod nmea_tcp;
+pub mod nmea_udp;
 pub mod sbs;
