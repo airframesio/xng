@@ -979,6 +979,125 @@ fn receiver_json(d: &Dash) -> String {
     Value::Object(o).to_string()
 }
 
+/// The position-bearing entity collections, each tagged with a kind label, for
+/// the geo exporters (ECO-5). Aircraft / vessels / beacons all carry `lat`/`lon`
+/// and (aircraft/beacons) a `trail` of `[lat, lon]` pairs.
+fn geo_entities(d: &Dash) -> Vec<(&'static str, &Value)> {
+    let mut out = Vec::new();
+    for e in d.aircraft.values() {
+        out.push(("aircraft", e));
+    }
+    for e in d.vessels.values() {
+        out.push(("vessel", e));
+    }
+    for e in d.beacons.values() {
+        out.push(("beacon", e));
+    }
+    out
+}
+
+/// A few identifying property fields copied verbatim onto an exported feature.
+const GEO_PROPS: [&str; 9] =
+    ["id", "icao", "mmsi", "flight", "reg", "callsign", "alt", "mode", "name"];
+
+/// RFC 7946 GeoJSON `FeatureCollection` of every positioned entity: a `Point`
+/// for the current fix plus a `LineString` for the trail (when ≥2 points).
+/// GeoJSON coordinates are `[lon, lat]`; trails are stored `[lat, lon]`.
+fn export_geojson(d: &Dash) -> String {
+    let mut features = Vec::new();
+    for (kind, e) in geo_entities(d) {
+        let mut props = serde_json::Map::new();
+        props.insert("kind".into(), json!(kind));
+        for k in GEO_PROPS {
+            if let Some(v) = e.get(k).filter(|v| !v.is_null()) {
+                props.insert(k.into(), v.clone());
+            }
+        }
+        if let (Some(la), Some(lo)) =
+            (e.get("lat").and_then(Value::as_f64), e.get("lon").and_then(Value::as_f64))
+        {
+            features.push(json!({
+                "type": "Feature",
+                "geometry": { "type": "Point", "coordinates": [lo, la] },
+                "properties": props.clone(),
+            }));
+        }
+        let coords: Vec<Value> = e
+            .get("trail")
+            .and_then(Value::as_array)
+            .map(|t| {
+                t.iter()
+                    .filter_map(|p| {
+                        let a = p.as_array()?;
+                        Some(json!([a[1].as_f64()?, a[0].as_f64()?])) // [lat,lon] → [lon,lat]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if coords.len() > 1 {
+            features.push(json!({
+                "type": "Feature",
+                "geometry": { "type": "LineString", "coordinates": coords },
+                "properties": props,
+            }));
+        }
+    }
+    json!({ "type": "FeatureCollection", "features": features }).to_string()
+}
+
+/// Minimal XML text escape for attribute/element content.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// GPX 1.1: a `<wpt>` per entity current fix + a `<trk>` of `<trkpt>` for each
+/// trail. GPX uses `lat`/`lon` *attributes* (opposite field order from
+/// GeoJSON's `[lon, lat]`) — the asymmetry the trails must respect.
+fn export_gpx(d: &Dash) -> String {
+    let mut s = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<gpx version=\"1.1\" creator=\"xng\">\n",
+    );
+    for (kind, e) in geo_entities(d) {
+        let name = e
+            .get("flight")
+            .or_else(|| e.get("name"))
+            .or_else(|| e.get("id"))
+            .or_else(|| e.get("icao"))
+            .or_else(|| e.get("mmsi"))
+            .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+            .unwrap_or_else(|| kind.to_string());
+        if let (Some(la), Some(lo)) =
+            (e.get("lat").and_then(Value::as_f64), e.get("lon").and_then(Value::as_f64))
+        {
+            s.push_str(&format!(
+                "  <wpt lat=\"{la}\" lon=\"{lo}\"><name>{}</name><type>{kind}</type></wpt>\n",
+                xml_escape(&name)
+            ));
+        }
+        let pts: Vec<(f64, f64)> = e
+            .get("trail")
+            .and_then(Value::as_array)
+            .map(|t| {
+                t.iter()
+                    .filter_map(|p| {
+                        let a = p.as_array()?;
+                        Some((a[0].as_f64()?, a[1].as_f64()?)) // stored [lat, lon]
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pts.len() > 1 {
+            s.push_str(&format!("  <trk><name>{}</name><trkseg>\n", xml_escape(&name)));
+            for (la, lo) in pts {
+                s.push_str(&format!("    <trkpt lat=\"{la}\" lon=\"{lo}\"/>\n"));
+            }
+            s.push_str("  </trkseg></trk>\n");
+        }
+    }
+    s.push_str("</gpx>\n");
+    s
+}
+
 pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     addr: String,
@@ -1009,6 +1128,10 @@ pub async fn run(
                     ("application/json", aircraft_json(&state.lock().unwrap(), query_since(path)))
                 } else if path.starts_with("/data/receiver.json") {
                     ("application/json", receiver_json(&state.lock().unwrap()))
+                } else if path.starts_with("/data/export.geojson") {
+                    ("application/geo+json", export_geojson(&state.lock().unwrap()))
+                } else if path.starts_with("/data/export.gpx") {
+                    ("application/gpx+xml", export_gpx(&state.lock().unwrap()))
                 } else {
                     ("text/html; charset=utf-8", PAGE.to_string())
                 };
@@ -1329,6 +1452,52 @@ mod tests {
         // No filter → both.
         let all: Value = serde_json::from_str(&aircraft_json(&d, None)).unwrap();
         assert_eq!(all["aircraft"].as_array().unwrap().len(), 2);
+    }
+
+    // ECO-5: GeoJSON export is RFC 7946 with [lon, lat] coordinate order, and
+    // a moved aircraft also yields a LineString trail.
+    #[test]
+    fn export_geojson_is_rfc7946_lon_lat() {
+        let mut d = Dash::default();
+        let fix = |lat: f64, lon: f64| {
+            msg(Mode::Adsb, MessageBody::ModeS {
+                df: 17, icao: Some("AC82EC".into()), callsign: Some("N5130E".into()),
+                altitude_ft: Some(35000), squawk: None, lat: Some(lat), lon: Some(lon),
+                speed_kt: None, speed_type: None, track_deg: None, vertical_rate_fpm: None,
+                comm_b: None, adsb_status: None,
+            })
+        };
+        update(&mut d, &fix(40.0, -120.0));
+        update(&mut d, &fix(40.5, -120.5)); // moves → trail grows
+
+        let v: Value = serde_json::from_str(&export_geojson(&d)).unwrap();
+        assert_eq!(v["type"], "FeatureCollection");
+        let feats = v["features"].as_array().unwrap();
+        let point = feats.iter().find(|f| f["geometry"]["type"] == "Point").unwrap();
+        // GeoJSON is [lon, lat] — longitude first.
+        assert_eq!(point["geometry"]["coordinates"][0], -120.5);
+        assert_eq!(point["geometry"]["coordinates"][1], 40.5);
+        assert_eq!(point["properties"]["kind"], "aircraft");
+        assert_eq!(point["properties"]["flight"], "N5130E");
+        let line = feats.iter().find(|f| f["geometry"]["type"] == "LineString").unwrap();
+        let c = line["geometry"]["coordinates"].as_array().unwrap();
+        assert!(c.len() >= 2, "trail has ≥2 points");
+        assert_eq!(c[0][0], -120.0, "first trail point lon-first");
+    }
+
+    // ECO-5: GPX uses lat/lon ATTRIBUTES (opposite field order from GeoJSON).
+    #[test]
+    fn export_gpx_uses_lat_lon_attributes() {
+        let mut d = Dash::default();
+        update(&mut d, &msg(Mode::Ais, MessageBody::Ais {
+            nmea: vec![], msg_type: Some(1), mmsi: Some(123456789),
+            details: Some(json!({ "mmsi": 123456789, "lat": 37.5, "lon": -122.3 })),
+        }));
+        let gpx = export_gpx(&d);
+        assert!(gpx.starts_with("<?xml"), "{gpx}");
+        assert!(gpx.contains("<gpx version=\"1.1\""), "{gpx}");
+        assert!(gpx.contains("lat=\"37.5\" lon=\"-122.3\""), "{gpx}");
+        assert!(gpx.trim_end().ends_with("</gpx>"));
     }
 
     // ADSB-8a: the readsb `type` provenance field. DF18 maps via the
