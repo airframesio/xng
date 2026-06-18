@@ -79,6 +79,10 @@ pub struct AdsbFrame {
     pub adsb_status: Option<serde_json::Value>,
     /// Signal level at decode time.
     pub level_dbfs: f32,
+    /// Noise-floor estimate (dBFS) at decode time — the demod's running
+    /// power EMA over non-pulse samples. Set by the demod after scanning;
+    /// `level_dbfs - noise_dbfs` is the per-frame SNR (XM-1).
+    pub noise_dbfs: f32,
     /// Monotonic 12 MHz sample-clock tick of this frame's arrival (set by the
     /// demod from the frame's absolute sample offset; 0 until then). Feeds the
     /// Beast MLAT counter. See `xng_types::SignalQuality::rx_ticks_12mhz`.
@@ -209,6 +213,7 @@ impl FrameValidator {
             comm_b: None,
             adsb_status: None,
             level_dbfs,
+            noise_dbfs: 0.0, // stamped by the demod after scanning (XM-1)
             rx_ticks_12mhz: 0,
         };
         match df {
@@ -308,6 +313,7 @@ impl FrameValidator {
             comm_b: None,
             adsb_status: None,
             level_dbfs,
+            noise_dbfs: 0.0, // stamped by the demod after scanning (XM-1)
             rx_ticks_12mhz: 0,
         };
         if df == 17 || df == 18 {

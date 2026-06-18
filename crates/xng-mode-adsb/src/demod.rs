@@ -351,8 +351,10 @@ impl PpmDemod {
                 }
             }
             found.sort_by_key(|(p, _)| *p);
+            let noise = self.noise_dbfs();
             out.extend(found.into_iter().map(|(p, mut f)| {
                 f.rx_ticks_12mhz = self.tick(p);
+                f.noise_dbfs = noise;
                 f
             }));
             self.power.drain(..end.min(self.power.len()));
@@ -403,8 +405,10 @@ impl PpmDemod {
             }
         }
         found.sort_by_key(|(p, _)| *p);
+        let noise = self.noise_dbfs();
         out.extend(found.into_iter().map(|(p, mut f)| {
             f.rx_ticks_12mhz = self.tick(p);
+            f.noise_dbfs = noise;
             f
         }));
 

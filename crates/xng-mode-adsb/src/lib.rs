@@ -276,6 +276,11 @@ pub fn to_message(
         frequency_hz,
         signal: SignalQuality {
             rssi_db: Some(f.level_dbfs),
+            // Per-frame noise floor + SNR from the demod's running power EMA
+            // (XM-1). The EMA has tracked real samples by the time any frame
+            // decodes, so this is a measured floor, not a fabricated one.
+            noise_db: Some(f.noise_dbfs),
+            snr_db: Some(f.level_dbfs - f.noise_dbfs),
             rx_ticks_12mhz: Some(f.rx_ticks_12mhz),
             ..Default::default()
         },
@@ -439,6 +444,7 @@ mod tests {
             comm_b: None,
             adsb_status: Some(serde_json::json!({ "nuc_p": 7 })),
             level_dbfs: -20.0,
+            noise_dbfs: -50.0,
             rx_ticks_12mhz: 0,
         };
         let source = Provenance {
@@ -448,6 +454,10 @@ mod tests {
             channel: None,
         };
         let msg = to_message(&f, 1_090_000_000, source);
+        // XM-1: noise floor + SNR ride along (snr = level - noise).
+        assert_eq!(msg.signal.noise_db, Some(-50.0));
+        assert_eq!(msg.signal.snr_db, Some(30.0));
+        assert_eq!(msg.signal.rssi_db, Some(-20.0));
         if let MessageBody::ModeS { adsb_status: Some(st), lat, .. } = msg.body {
             assert_eq!(st["position_trust"], "global");
             assert_eq!(st["nuc_p"], 7); // existing quality preserved
