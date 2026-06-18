@@ -16,8 +16,10 @@
 //!   constants cited to ITU-R M.584-2.
 //! - [`frame`] — batch/codeword framing: address codewords (capcode =
 //!   `(addr18 << 3) | frame_position`, 2 function bits), message codewords (20
-//!   payload bits → numeric 4-bit-reversed or alphanumeric 7-bit-LSB-first
-//!   text), idle handling. Spec-anchored.
+//!   payload bits → numeric 4-bit-per-char, or alphanumeric 7-bit-per-char,
+//!   both sent bit-No.1-first per ITU-R M.584-2 §2.1/§2.2, with full Table 3
+//!   numeric special characters and alpha continuation across codewords), idle
+//!   handling. Spec-anchored.
 //! - [`demod`] — 2-FSK NRZ frequency-discriminator demod + preamble/sync hunt.
 //! - [`modulate`] — waveform synthesis used ONLY by the synthetic
 //!   modulate→AWGN→demod BER test.
@@ -27,7 +29,10 @@
 //! by `freq_offset_hz` and decimates to [`CHANNEL_RATE`], runs the FSK demod at
 //! a configured baud, hunts the preamble + sync codeword, then BCH-corrects and
 //! decodes each batch into [`PocsagFrame`]s. [`to_message`] normalizes those
-//! into the [`xng_types`] bus form.
+//! into the [`xng_types`] bus form. The baud may be fixed (512/1200/2400) or
+//! **auto-detected** ([`PocsagChannelDecoder::new_auto`]): all three rates are
+//! demodulated in parallel and the one that aligns the sync codeword is locked,
+//! so a single session decodes any POCSAG rate.
 //!
 //! VERIFICATION: the DECODE/framing core (BCH, codeword layout, text tables) is
 //! validated against hand-constructed, spec-cited codewords — NOT against the
@@ -58,6 +63,13 @@ pub const CHANNEL_PASSBAND_HZ: f64 = 7_500.0;
 
 /// Maximum bit errors tolerated when matching the 32-bit frame-sync codeword.
 const SYNC_MAX_ERR: u32 = 2;
+
+/// Minimum [`BaudLane::lock_score`] before auto-detect commits to a baud:
+/// sync aligned (+1) plus at least 4 BCH-valid following codewords. A real
+/// batch scores up to 17 (sync + 16 codewords); a wrong-baud lane that matched
+/// the sync pattern by chance scores ~1, so this threshold gives a wide margin
+/// against false locks while still committing within a single batch.
+const AUTO_LOCK_MIN_SCORE: u32 = 5;
 
 /// One fully decoded POCSAG message extracted from a batch.
 #[derive(Debug, Clone, PartialEq)]
@@ -247,21 +259,99 @@ impl MsgBuilder {
     }
 }
 
+/// One demod "lane": an FSK demod for a single candidate baud, its recovered
+/// bit history, and the scan cursor over that history. Used both for a
+/// fixed-baud decoder (one lane) and for auto-detect (one lane per candidate
+/// baud, run in parallel until one locks the sync codeword).
+struct BaudLane {
+    baud: u32,
+    demod: demod::FskDemod,
+    bits: Vec<u8>,
+    /// Bit index already scanned for batches (so growing the buffer re-emits
+    /// nothing already reported).
+    scanned_to: usize,
+}
+
+impl BaudLane {
+    fn new(baud: u32) -> Self {
+        Self { baud, demod: demod::FskDemod::new(baud as f64), bits: Vec::new(), scanned_to: 0 }
+    }
+
+    /// Demod a chunk of channel IQ into this lane's bit history.
+    fn feed(&mut self, channel: &[Complex<f32>]) {
+        self.demod.process(channel, &mut self.bits);
+    }
+
+    /// Auto-detect lock score for this lane: `0` if the frame-sync codeword has
+    /// never aligned, otherwise `1 +` the number of BCH-valid/-correctable
+    /// codewords in the batch immediately following the first sync. A demod
+    /// running at the *wrong* baud yields near-random bits, so even if a 32-bit
+    /// window happens to match the sync pattern within [`SYNC_MAX_ERR`] errors,
+    /// the following codewords almost never pass BCH(31,21,2) — the correct baud
+    /// scores far higher, making the lock robust against sync false positives.
+    fn lock_score(&self) -> u32 {
+        let Some((off, inverted)) = demod::find_sync(&self.bits, SYNC_MAX_ERR) else {
+            return 0;
+        };
+        let mut score = 1u32;
+        let start = off + 32;
+        for idx in 0..frame::CODEWORDS_PER_BATCH {
+            let pos = start + idx * 32;
+            let Some(mut w) = demod::word_at(&self.bits, pos) else { break };
+            if inverted {
+                w = !w;
+            }
+            if bch::correct(w).is_some() {
+                score += 1;
+            }
+        }
+        score
+    }
+
+    /// Decode any newly available batches from this lane, advancing the scan
+    /// cursor. Returns frames (still un-deduped).
+    fn decode_new(&mut self) -> Vec<PocsagFrame> {
+        let start = self.scanned_to.saturating_sub(32 + frame::CODEWORDS_PER_BATCH * 32);
+        let decoded = decode_bits(&self.bits[start..], self.baud);
+        self.scanned_to = self.bits.len();
+        decoded
+    }
+}
+
+/// Baud-selection strategy for [`PocsagChannelDecoder`].
+enum BaudMode {
+    /// A single fixed baud (the classic `new(..)` path).
+    Fixed(BaudLane),
+    /// Auto-detect: race all three candidate bauds until one locks the sync
+    /// codeword, then commit to it for the rest of the session.
+    Auto {
+        /// Candidate lanes, still being raced (empty once `locked` is set).
+        candidates: Vec<BaudLane>,
+        /// The committed lane once a baud has locked.
+        locked: Option<BaudLane>,
+    },
+}
+
 /// Decodes one POCSAG channel out of a wideband capture.
 ///
 /// Mirrors the NAVTEX [`xng_mode_navtex::NavtexChannelDecoder`] contract: owns
 /// an internal [`Ddc`] that mixes by `freq_offset_hz` and decimates the capture
 /// to [`CHANNEL_RATE`], runs the FSK demod at the configured baud, and emits
 /// [`PocsagFrame`]s as complete batches are recovered.
+///
+/// Two modes:
+/// - **Fixed baud** ([`PocsagChannelDecoder::new`] with `baud` ∈
+///   {512, 1200, 2400}): one demod at the given rate, as before.
+/// - **Auto baud** ([`PocsagChannelDecoder::new_auto`], or `new(.., 0)`): all
+///   three bauds are demodulated in parallel off the *same* channel IQ (the
+///   shared [`CHANNEL_RATE`] is an integer-bit multiple of every baud, so one
+///   DDC serves all). Whichever lane first aligns the frame-sync codeword
+///   `0x7CD215D8` is committed for the rest of the session — so a single
+///   decoder handles any POCSAG rate without being told it in advance.
 pub struct PocsagChannelDecoder {
     ddc: Option<Ddc>,
-    demod: demod::FskDemod,
-    baud: u32,
-    bits: Vec<u8>,
+    mode: BaudMode,
     channel_buf: Vec<Complex<f32>>,
-    /// Bit index already scanned for batches (so growing the buffer re-emits
-    /// nothing already reported).
-    scanned_to: usize,
     /// Dedup keys for messages already emitted.
     seen: Vec<String>,
 }
@@ -270,29 +360,59 @@ impl PocsagChannelDecoder {
     /// `input_rate` is any capture rate ≥ [`CHANNEL_RATE`] (a non-integer
     /// multiple is resampled by the DDC). `freq_offset_hz` is the POCSAG
     /// channel center relative to the capture center. `baud` must be one of
-    /// 512 / 1200 / 2400.
+    /// 512 / 1200 / 2400 — **or `0` to select auto-detect** (equivalent to
+    /// [`new_auto`](Self::new_auto)).
     pub fn new(input_rate: f64, freq_offset_hz: f64, baud: u32) -> Result<Self, String> {
-        if !demod::BAUDS.contains(&(baud as f64)) {
-            return Err(format!("unsupported POCSAG baud {baud}; use 512/1200/2400"));
+        if baud == 0 {
+            return Self::new_auto(input_rate, freq_offset_hz);
         }
-        let ddc = if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
-            None
-        } else {
-            Some(Ddc::new(input_rate, CHANNEL_RATE, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
-        };
+        if !demod::BAUDS.contains(&(baud as f64)) {
+            return Err(format!("unsupported POCSAG baud {baud}; use 512/1200/2400 or 0 for auto"));
+        }
         Ok(Self {
-            ddc,
-            demod: demod::FskDemod::new(baud as f64),
-            baud,
-            bits: Vec::new(),
+            ddc: Self::make_ddc(input_rate, freq_offset_hz)?,
+            mode: BaudMode::Fixed(BaudLane::new(baud)),
             channel_buf: Vec::new(),
-            scanned_to: 0,
             seen: Vec::new(),
         })
     }
 
+    /// Auto-detect the POCSAG baud (512 / 1200 / 2400) from the received signal:
+    /// every candidate rate is demodulated in parallel and the one whose bit
+    /// history aligns the frame-sync codeword is locked for the session. Use
+    /// this when the rate of the channel is unknown.
+    pub fn new_auto(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let candidates = demod::BAUDS.iter().map(|&b| BaudLane::new(b as u32)).collect();
+        Ok(Self {
+            ddc: Self::make_ddc(input_rate, freq_offset_hz)?,
+            mode: BaudMode::Auto { candidates, locked: None },
+            channel_buf: Vec::new(),
+            seen: Vec::new(),
+        })
+    }
+
+    fn make_ddc(input_rate: f64, freq_offset_hz: f64) -> Result<Option<Ddc>, String> {
+        if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+            Ok(None)
+        } else {
+            Ok(Some(Ddc::new(input_rate, CHANNEL_RATE, freq_offset_hz, CHANNEL_PASSBAND_HZ)?))
+        }
+    }
+
+    /// The baud currently in use: the fixed rate, or the locked auto-detected
+    /// rate, or `None` if auto-detect has not yet committed to a baud.
+    pub fn baud(&self) -> Option<u32> {
+        match &self.mode {
+            BaudMode::Fixed(lane) => Some(lane.baud),
+            BaudMode::Auto { locked: Some(lane), .. } => Some(lane.baud),
+            BaudMode::Auto { .. } => None,
+        }
+    }
+
     /// Feed capture IQ; returns newly completed POCSAG frames.
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<PocsagFrame> {
+        // DDC once; every lane shares the same channel IQ (CHANNEL_RATE is an
+        // integer-bit multiple of all three bauds).
         let channel: &[Complex<f32>] = match &mut self.ddc {
             Some(ddc) => {
                 self.channel_buf.clear();
@@ -301,14 +421,45 @@ impl PocsagChannelDecoder {
             }
             None => input,
         };
-        self.demod.process(channel, &mut self.bits);
 
-        // Re-scan from a small overlap before the last scan point (so a sync
-        // straddling a chunk boundary is still found), decode any batches, and
-        // dedup against what we've already emitted.
-        let start = self.scanned_to.saturating_sub(32 + frame::CODEWORDS_PER_BATCH * 32);
-        let decoded = decode_bits(&self.bits[start..], self.baud);
-        self.scanned_to = self.bits.len();
+        let decoded = match &mut self.mode {
+            BaudMode::Fixed(lane) => {
+                lane.feed(channel);
+                lane.decode_new()
+            }
+            BaudMode::Auto { candidates, locked } => {
+                if let Some(lane) = locked {
+                    lane.feed(channel);
+                    lane.decode_new()
+                } else {
+                    // Race: feed every candidate, then lock the highest-scoring
+                    // lane once it clears the threshold. Score = sync aligned +
+                    // BCH-valid following codewords, so the true baud wins over a
+                    // chance sync match on a wrong-baud (near-random) lane.
+                    for lane in candidates.iter_mut() {
+                        lane.feed(channel);
+                    }
+                    let best = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, l)| (i, l.lock_score()))
+                        .max_by_key(|&(_, s)| s);
+                    if let Some((idx, score)) = best {
+                        if score >= AUTO_LOCK_MIN_SCORE {
+                            let mut lane = candidates.swap_remove(idx);
+                            candidates.clear(); // drop the losing lanes
+                            let frames = lane.decode_new();
+                            *locked = Some(lane);
+                            frames
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    }
+                }
+            }
+        };
 
         let mut out = Vec::new();
         for f in decoded {
@@ -321,9 +472,17 @@ impl PocsagChannelDecoder {
         out
     }
 
-    /// Smoothed channel power level in dBFS.
+    /// Smoothed channel power level in dBFS. During auto-detect (before lock)
+    /// this reflects the first candidate lane's estimate; once a baud is fixed
+    /// or locked it is that lane's level.
     pub fn level_dbfs(&self) -> f32 {
-        self.demod.level_dbfs()
+        match &self.mode {
+            BaudMode::Fixed(lane) => lane.demod.level_dbfs(),
+            BaudMode::Auto { locked: Some(lane), .. } => lane.demod.level_dbfs(),
+            BaudMode::Auto { candidates, .. } => {
+                candidates.first().map(|l| l.demod.level_dbfs()).unwrap_or(f32::NEG_INFINITY)
+            }
+        }
     }
 }
 
@@ -429,6 +588,10 @@ mod tests {
     }
 
     /// Spec-constructed numeric page: digits "0123456789".
+    ///
+    /// Ground truth is ITU-R M.584-2 Annex 1 §2.1 + Table 3: each 4-bit numeric
+    /// value is transmitted **bit No.1 (LSB) first**, and §2.1 pads the unused
+    /// tail of the last codeword with the Space character (value 12 = `0b1100`).
     #[test]
     fn decode_bits_recovers_spec_numeric_message() {
         let capcode = 8u32; // addr18=1, frame position 0
@@ -437,22 +600,21 @@ mod tests {
         assert_eq!(frame_position, 0);
         let addr_cw = bch::encode((((capcode >> 3) << 2) | function as u32) & 0x1F_FFFF);
 
-        // Numeric: 4 bits per digit; encode so decode's bit-reverse yields the
-        // digit value.
+        // Numeric: 4 bits per digit, transmitted LSB-first (spec §2.1). For the
+        // digits 0-9 the character value V equals the digit.
         let digits = "0123456789";
         let mut nbits = Vec::new();
         for d in digits.bytes() {
-            let val = (d - b'0') as u8;
+            let val = d - b'0';
             for i in 0..4 {
-                nbits.push((val >> (3 - i)) & 1);
+                nbits.push((val >> i) & 1); // bit No.(i+1) first → LSB first
             }
         }
-        // POCSAG pads remaining numeric positions with the "spare"/space code;
-        // pad to a 20-bit boundary with 0xC (space) so trailing junk is benign.
+        // §2.1: "Any unwanted part of the last codeword of the message is filled
+        // with space characters." Space = value 12 (0b1100), emitted LSB-first.
         while nbits.len() % 20 != 0 {
-            // space code: index 12 = 0b1100 → emit so reverse gives 12.
             for i in 0..4 {
-                nbits.push((12u8 >> (3 - i)) & 1);
+                nbits.push((12u8 >> i) & 1);
             }
         }
         let mut msg_cws = Vec::new();
@@ -653,5 +815,103 @@ mod tests {
                 "{baud_u} Bd @ {snr_db} dB: raw BER {ber:.4} too high ({errors}/{total})"
             );
         }
+    }
+
+    /// Build the codewords of a single-batch alphanumeric page (address in
+    /// frame 0 + 7-bit LSB-first message codewords, idle-padded to a full
+    /// batch). Shared by the auto-detect tests.
+    fn alpha_batch_codewords(capcode: u32, text: &[u8]) -> Vec<u32> {
+        let function = 3u8;
+        let addr_cw = bch::encode((((capcode >> 3) << 2) | function as u32) & 0x1F_FFFF);
+        let mut msg_bits = Vec::new();
+        for &ch in text {
+            for i in 0..7 {
+                msg_bits.push((ch >> i) & 1); // §2.2: bit No.1 (LSB) first
+            }
+        }
+        while msg_bits.len() % 20 != 0 {
+            msg_bits.push(0);
+        }
+        let mut codewords = vec![addr_cw];
+        for chunk in msg_bits.chunks(20) {
+            let mut payload = 0u32;
+            for &b in chunk {
+                payload = (payload << 1) | b as u32;
+            }
+            codewords.push(bch::encode((1 << 20) | payload));
+        }
+        while codewords.len() < frame::CODEWORDS_PER_BATCH {
+            codewords.push(bch::IDLE_CODEWORD);
+        }
+        codewords
+    }
+
+    /// SYNTHETIC AUTO-DETECT VALIDATION (reported as synthetic): for EACH baud
+    /// 512/1200/2400, modulate a real batch at that rate, add complex AWGN, and
+    /// feed it to a decoder created with `new_auto` (which is NOT told the baud).
+    /// The decoder must (a) lock the correct baud purely from the signal and
+    /// (b) recover the spec page. This exercises the multi-baud auto path end to
+    /// end through modulate→AWGN→demod. No real RF; synthetic.
+    #[test]
+    fn auto_detect_locks_correct_baud_all_bauds_synth_iq() {
+        for &baud in &demod::BAUDS {
+            let baud_u = baud as u32;
+            let capcode = 1_234_568u32;
+            let codewords = alpha_batch_codewords(capcode, b"AUTO");
+            // Full preamble so the demod's loops settle before sync.
+            let tx_bits = modulate::frame_bits(600, &codewords);
+            let iq = modulate::modulate_iq(&tx_bits, CHANNEL_RATE, baud, 800.0, 1.0);
+            let noisy = modulate::add_awgn(&iq, 14.0, 0xA17_0DE7 ^ baud_u as u64);
+
+            // No baud given — auto-detect must figure it out from the signal.
+            let mut dec = PocsagChannelDecoder::new_auto(CHANNEL_RATE, 800.0).unwrap();
+            let frames = dec.process(&noisy);
+            assert_eq!(
+                dec.baud(),
+                Some(baud_u),
+                "auto-detect locked the wrong baud for a {baud_u} Bd signal"
+            );
+            assert!(
+                frames.iter().any(|f| f.capcode == capcode
+                    && f.kind == PocsagKind::Alpha
+                    && f.text == "AUTO"),
+                "{baud_u} Bd auto-detect failed to recover the page; got {frames:?}"
+            );
+            // The recovered frame must report the auto-detected baud.
+            assert!(frames.iter().all(|f| f.baud == baud_u));
+        }
+    }
+
+    /// Auto-detect must NOT false-lock on noise alone (no real POCSAG signal):
+    /// `baud()` stays `None` and no frames are emitted. This guards the lock
+    /// criterion against chance sync matches on near-random demod output.
+    #[test]
+    fn auto_detect_does_not_lock_on_pure_noise() {
+        // Genuine complex AWGN: add heavy noise to a unit-amplitude carrier so
+        // `add_awgn` (which references signal power) produces real noise, then
+        // discard the determinism of any tone by using a very low SNR. The
+        // result is essentially random IQ — not a POCSAG signal.
+        let carrier: Vec<Complex<f32>> = (0..38_400 * 2)
+            .map(|n| {
+                let p = std::f64::consts::TAU * 1000.0 * n as f64 / CHANNEL_RATE;
+                Complex::new(p.cos() as f32, p.sin() as f32)
+            })
+            .collect();
+        let noise = modulate::add_awgn(&carrier, -20.0, 0xDEAD_BEEF); // noise ≫ signal
+        let mut dec = PocsagChannelDecoder::new_auto(CHANNEL_RATE, 0.0).unwrap();
+        let frames = dec.process(&noise);
+        assert_eq!(dec.baud(), None, "auto-detect false-locked on pure noise");
+        assert!(frames.is_empty(), "auto-detect emitted frames from pure noise: {frames:?}");
+    }
+
+    /// `new(.., 0)` is the documented alias for `new_auto`: it must route to the
+    /// auto path (baud unset until a signal locks it).
+    #[test]
+    fn new_with_zero_baud_selects_auto() {
+        let dec = PocsagChannelDecoder::new(CHANNEL_RATE, 0.0, 0).unwrap();
+        assert_eq!(dec.baud(), None, "baud 0 must select auto-detect (no fixed baud)");
+        // A fixed-baud decoder reports its baud immediately.
+        let fixed = PocsagChannelDecoder::new(CHANNEL_RATE, 0.0, 1200).unwrap();
+        assert_eq!(fixed.baud(), Some(1200));
     }
 }
