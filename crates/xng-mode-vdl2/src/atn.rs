@@ -541,6 +541,34 @@ fn clnp_addresses(b: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((dst, src))
 }
 
+/// Return the COTP TPDU (the CLNP data part) of a complete, unsegmented CLNP
+/// DT PDU, or `None` when `b` is not such a PDU. Used to feed the COTP TSDU
+/// reassembler (ISO/IEC 8073 §6.6) before the upper-layer (ULCS/CPDLC) decode.
+pub fn clnp_cotp_tpdu(b: &[u8]) -> Option<&[u8]> {
+    if b.len() < 9 || b[0] != 0x81 {
+        return None;
+    }
+    let hdr_len = b[1] as usize;
+    if hdr_len < 9 || hdr_len > b.len() {
+        return None;
+    }
+    let flags = b[4];
+    // Only DT PDUs carry COTP; a segmented PDU (SP set with MS or non-zero
+    // offset) is not a complete data unit here.
+    if flags & 0x1F != 0x1C {
+        return None;
+    }
+    if flags & 0x80 != 0 {
+        // SP set: check the segmentation part for more-segments / offset.
+        if let Some(seg) = clnp_segment(b) {
+            if seg.more || seg.offset != 0 {
+                return None;
+            }
+        }
+    }
+    b.get(hdr_len..)
+}
+
 /// Decode an ATN network-layer payload (after X.25 reassembly): full
 /// CLNP, or labels for the compressed forms and ES-IS/IDRP.
 pub fn parse_network(b: &[u8]) -> Option<Value> {
@@ -1291,6 +1319,99 @@ fn parse_clnp(b: &[u8]) -> Option<Value> {
     Some(out)
 }
 
+/// Segmentation view of a COTP DT TPDU (ISO/IEC 8073 §6.6 normal-data TSDU
+/// segmentation): the destination reference, the end-of-TSDU flag, the TPDU
+/// sequence number, and the user-data slice. Returns `None` when `b` is not a
+/// DT TPDU (only DT carries TSDU segmentation; ED is expedited and not
+/// segmented this way).
+pub fn cotp_dt_segment(b: &[u8]) -> Option<(u16, bool, u32, Vec<u8>)> {
+    let li = *b.first()? as usize;
+    if li == 0 || li == 0xFF || b.len() < li + 1 {
+        return None;
+    }
+    let code = *b.get(1)?;
+    if code & 0xF0 != 0xF0 {
+        return None; // not DT
+    }
+    let dst_ref = u16::from_be_bytes([*b.get(2)?, *b.get(3)?]);
+    // Extended format (32-bit seq) is signalled by an odd LI for DT.
+    let extended = li & 1 == 1;
+    let (eot, seq) = if extended {
+        let w = u32::from_be_bytes([*b.get(4)?, *b.get(5)?, *b.get(6)?, *b.get(7)?]);
+        (w & 0x8000_0000 != 0, w & 0x7FFF_FFFF)
+    } else {
+        let w = *b.get(4)?;
+        (w & 0x80 != 0, (w & 0x7F) as u32)
+    };
+    let user = b.get(li + 1..)?.to_vec();
+    Some((dst_ref, eot, seq, user))
+}
+
+/// Reassembles a COTP normal-data TSDU from its DT TPDU segments (ISO/IEC
+/// 8073 §6.6): consecutive DT TPDUs on one connection (keyed by destination
+/// reference) carry user-data fragments, with the end-of-TSDU (EOT) bit set
+/// on the final DT. Fragments accumulate in TPDU-sequence order until EOT,
+/// when the complete TSDU is returned for upper-layer (ULCS/CPDLC) decoding.
+pub struct CotpReassembler {
+    /// Keyed by destination reference: accumulated user data, the next
+    /// expected sequence number, and the last-seen timestamp.
+    pending: HashMap<u16, CotpPending>,
+}
+
+struct CotpPending {
+    data: Vec<u8>,
+    next_seq: u32,
+    last: f64,
+}
+
+const COTP_TIMEOUT_SECS: f64 = 60.0;
+
+impl CotpReassembler {
+    pub fn new() -> Self {
+        Self { pending: HashMap::new() }
+    }
+
+    /// Push one raw COTP TPDU. For a single-segment TSDU (the first DT has EOT
+    /// set) the user data passes straight through. For a multi-segment TSDU
+    /// the fragments are buffered until the EOT DT arrives, when the complete
+    /// TSDU is returned. Non-DT TPDUs and out-of-sequence DTs return `None`.
+    pub fn push(&mut self, tpdu: &[u8], now: f64) -> Option<Vec<u8>> {
+        let (dst_ref, eot, seq, user) = cotp_dt_segment(tpdu)?;
+        self.pending.retain(|_, p| now - p.last < COTP_TIMEOUT_SECS);
+
+        // A lone complete TSDU (seq 0, EOT) with nothing pending needs no work.
+        if seq == 0 && eot && !self.pending.contains_key(&dst_ref) {
+            return Some(user);
+        }
+        // Begin or continue a multi-segment TSDU. A fresh seq-0 fragment
+        // (re)starts the buffer; otherwise the seq must match what is expected.
+        if seq == 0 {
+            self.pending.insert(
+                dst_ref,
+                CotpPending { data: user.clone(), next_seq: 1, last: now },
+            );
+        } else {
+            let entry = self.pending.get_mut(&dst_ref)?;
+            if seq != entry.next_seq {
+                return None; // gap or duplicate: cannot reassemble safely
+            }
+            entry.data.extend_from_slice(&user);
+            entry.next_seq = entry.next_seq.wrapping_add(1);
+            entry.last = now;
+        }
+        if eot {
+            return self.pending.remove(&dst_ref).map(|p| p.data);
+        }
+        None
+    }
+}
+
+impl Default for CotpReassembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// COTP (ISO/IEC 8073 / ITU-T X.224) DR disconnect-reason name.
 fn cotp_dr_reason(c: u8) -> Option<&'static str> {
     Some(match c {
@@ -1584,16 +1705,31 @@ fn parse_cotp(b: &[u8]) -> Option<Value> {
     if matches!(name, "DT" | "ED") && b.len() > li + 1 {
         let user = &b[li + 1..];
         out["user_data_len"] = json!(user.len());
-        // ATN-B1 applications ride here (via the ULCS null encoding):
-        // try protected-mode CPDLC, then CM.
-        if let Some(app) = crate::atn_cpdlc::parse_apdu(user)
-            .or_else(|| crate::atn_cpdlc::parse_cm_logon(user))
-            .or_else(|| crate::atn_cpdlc::parse_cm_ground(user))
-        {
+        // ATN-B1 applications ride here (via the ULCS null encoding). A
+        // single-segment TSDU (DT with EOT set, seq 0, or any ED) decodes
+        // directly; a partial DT (EOT clear or seq > 0) carries only a TSDU
+        // fragment and must be reassembled (CotpReassembler) before decode, so
+        // it is flagged rather than mis-parsed.
+        let partial = name == "DT"
+            && (out.get("eot") == Some(&json!(false))
+                || out.get("tpdu_seq").and_then(|v| v.as_u64()).unwrap_or(0) != 0);
+        if partial {
+            out["tsdu_segment"] = json!(true);
+        } else if let Some(app) = parse_cotp_user_app(user) {
             out["app"] = app;
         }
     }
     Some(out)
+}
+
+/// Dispatch a complete COTP TSDU's user data to the ATN-B1 application
+/// decoders (ULCS null encoding): protected-mode CPDLC, then CM. Used both
+/// for single-segment TSDUs inline and for TSDUs reassembled from multiple DT
+/// TPDUs by [`CotpReassembler`].
+pub fn parse_cotp_user_app(user: &[u8]) -> Option<Value> {
+    crate::atn_cpdlc::parse_apdu(user)
+        .or_else(|| crate::atn_cpdlc::parse_cm_logon(user))
+        .or_else(|| crate::atn_cpdlc::parse_cm_ground(user))
 }
 
 #[cfg(test)]
@@ -2317,5 +2453,74 @@ mod tests {
         b.extend_from_slice(&[2, 0x47, 0x02]);
         let mut r = ClnpReassembler::new();
         assert_eq!(r.push(&b, 0.0), Some(b.clone()));
+    }
+
+    // --- VDL2-2.2: COTP normal-data TSDU reassembly (ISO/IEC 8073 §6.6) ---
+    // The DT TPDU framing (LI, code 0xF0, dst_ref, EOT|seq) and the EOT-driven
+    // TSDU segmentation rule are taken from ISO/IEC 8073 / ITU-T X.224 as
+    // profiled by ICAO Doc 9705. Vectors are built octet-by-octet (no loopback).
+
+    /// Build a normal-format COTP DT TPDU: LI=4, code 0xF0, dst_ref, EOT|seq,
+    /// then user data.
+    fn cotp_dt(dst_ref: u16, eot: bool, seq: u8, user: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x04, 0xF0];
+        b.extend_from_slice(&dst_ref.to_be_bytes());
+        b.push(if eot { 0x80 } else { 0x00 } | (seq & 0x7F));
+        b.extend_from_slice(user);
+        b
+    }
+
+    #[test]
+    fn cotp_dt_segment_extracts_fields() {
+        let dt = cotp_dt(0x1234, false, 3, &[0xAA, 0xBB]);
+        let (dst, eot, seq, user) = cotp_dt_segment(&dt).unwrap();
+        assert_eq!(dst, 0x1234);
+        assert!(!eot);
+        assert_eq!(seq, 3);
+        assert_eq!(user, vec![0xAA, 0xBB]);
+        // A CC TPDU is not a DT and must not be treated as a segment.
+        let cc = [0x06, 0xD0, 0x12, 0x34, 0x00, 0x07, 0x40];
+        assert!(cotp_dt_segment(&cc).is_none());
+    }
+
+    #[test]
+    fn cotp_single_segment_passes_through() {
+        // A lone DT with EOT set (seq 0) is a complete TSDU.
+        let dt = cotp_dt(0x0009, true, 0, &[1, 2, 3]);
+        let mut r = CotpReassembler::new();
+        assert_eq!(r.push(&dt, 0.0), Some(vec![1, 2, 3]));
+    }
+
+    #[test]
+    fn cotp_reassembles_three_dt_segments() {
+        // Three DTs (seq 0/1/2), EOT on the last, reassemble in order.
+        let s0 = cotp_dt(0x0042, false, 0, &[0xAA, 0xBB]);
+        let s1 = cotp_dt(0x0042, false, 1, &[0xCC]);
+        let s2 = cotp_dt(0x0042, true, 2, &[0xDD, 0xEE]);
+        let mut r = CotpReassembler::new();
+        assert_eq!(r.push(&s0, 0.0), None);
+        assert_eq!(r.push(&s1, 1.0), None);
+        assert_eq!(r.push(&s2, 2.0), Some(vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE]));
+    }
+
+    #[test]
+    fn cotp_out_of_sequence_dt_rejected() {
+        // A gap in the sequence (seq 2 after seq 0) cannot reassemble safely.
+        let s0 = cotp_dt(0x0001, false, 0, &[0x11]);
+        let s2 = cotp_dt(0x0001, true, 2, &[0x22]);
+        let mut r = CotpReassembler::new();
+        assert_eq!(r.push(&s0, 0.0), None);
+        assert_eq!(r.push(&s2, 1.0), None);
+    }
+
+    #[test]
+    fn clnp_cotp_tpdu_extracts_data_part() {
+        // A complete CLNP DT exposes its COTP TPDU (the data part).
+        let mut b = vec![0x81, 15, 1, 0x3F, 0x1C, 0x00, 0x14, 0x00, 0x00];
+        b.extend_from_slice(&[2, 0x47, 0x01]);
+        b.extend_from_slice(&[2, 0x47, 0x02]);
+        let dt = cotp_dt(0x0005, true, 0, b"HI");
+        b.extend_from_slice(&dt);
+        assert_eq!(clnp_cotp_tpdu(&b), Some(&dt[..]));
     }
 }
