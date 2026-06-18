@@ -238,9 +238,9 @@ impl ModeChannel {
             // (Per-session baud selection is a follow-up config knob.)
             Mode::Pocsag => Ok(Self::Pocsag(PocsagChannelDecoder::new(sample_rate, offset, 1200)?)),
             Mode::Eot => Ok(Self::Eot(EotChannelDecoder::new(sample_rate, offset)?)),
-            // FLEX paging defaults to 1600 bps (the 2-FSK base rate). 4-FSK
-            // 3200/6400 are a follow-up; per-session baud is a config knob.
-            Mode::Flex => Ok(Self::Flex(FlexChannelDecoder::new(sample_rate, offset, 1600)?)),
+            // FLEX: baud 0 = auto-detect the rate from the Sync 1 A-code
+            // (1600 2-FSK / 3200 / 6400 4-FSK) — real US paging is 4-level.
+            Mode::Flex => Ok(Self::Flex(FlexChannelDecoder::new(sample_rate, offset, 0)?)),
             Mode::Vdes => Ok(Self::Vdes(VdesChannelDecoder::new(sample_rate, offset)?)),
             other => Err(format!("mode {other} has no native core yet")),
         }
