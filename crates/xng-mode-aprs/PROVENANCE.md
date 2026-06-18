@@ -80,19 +80,65 @@ oracle:
   decode via lat = 90 − N/380926, lon = −180 + N/190463 to 49.5°N / −72.75°W.
   (Asserted in `compressed_position_spec_example`; the conversion constants
   are the spec's.)
+- **Chapter 9, p.38–40** compressed course/speed, radio-range and altitude
+  sub-fields + the compression-type `T` byte (`src/aprs.rs::decode_compressed_cs`):
+  cs `7P` → course 88°, speed 36.2 kt (`compressed_course_speed_p39`); cs `{?`
+  → radio range 20 mi (`compressed_radio_range_p39`); cs `S]` with a GGA `T`
+  byte → altitude 10004 ft (`compressed_altitude_p40`); the `c = space`
+  special case → no sub-field (`compressed_space_no_extension_p38`).
+- **Chapter 7, p.27–30** position Data Extensions (`src/aprs.rs::parse_data_extension`):
+  `088/036` course/speed (`uncompressed_course_speed_extension_p27`); `PHG5132`
+  → power 25 W, height 20 ft, gain 3 dB, directivity 90° E (`phg_extension_p28`,
+  the p.29 worked example); `DFS2360` → strength S2, height 80 ft, gain 6 dB,
+  omni (`dfs_extension_p30`, the p.30 worked example); `RNG0050` → 50 mi
+  (`rng_extension_p29`).
+- **Chapter 10, p.42–55** Mic-E (`src/mice.rs`) — the single biggest format gap
+  on real APRS traffic. The destination-address worked example on p.44
+  (`S32U6T` → 33°25.64′N, North, offset +0, West, message bits 1/0/0 = Standard
+  M3 Returning) is asserted in `dest_worked_example_p44`; the message-type
+  examples on p.46 in `message_type_examples_p46`; the information-field worked
+  example on p.53 (`` `(_fn"Oj/ `` → 112°07.74′W, 20 kt, course 251°, jeep `/j`)
+  in `info_field_worked_example_p53` / `parse_full_mic_e_p53`; the speed/course
+  worked example on p.52 (86 kt, 194°, both SP+28/DC+28 encoding schemes) in
+  `speed_course_example_p52`; the p.54 position-ambiguity example (`T4SQZZ`) in
+  `position_ambiguity_p54`. The full path through a real AX.25 UI frame (Mic-E
+  packs the latitude into the AX.25 **destination address**, so it is decoded
+  at the `decode_frame` level, joining the destination callsign to the info
+  field) is asserted in `lib.rs::mic_e_decodes_through_full_ax25_frame`.
+- **Chapter 11, p.59** Item Report (`src/aprs.rs::parse_item`): `)AID #2!4903.50N/07201.75WA`
+  → item "AID #2", live, 49°03.50′N/072°01.75′W, symbol `/A`
+  (`item_spec_example_p59`); the killed (`_`) variant (`item_killed_p59`); and
+  the compressed-position item `)MOBIL!\5L!!<*e79_sT` (`item_compressed_p59`).
 - **Chapter 14, p.71** message: `:WU2Z     :Testing{003` → addressee WU2Z,
   text "Testing", message number 003.
+- **Chapter 14, p.73–74** bulletins / announcements / group bulletins
+  (`src/aprs.rs::parse_message` BLN detection): `:BLN3     :Snow expected in
+  Tampa RSN` general bulletin (`bulletin_spec_example_p73`); `:BLNQ     :…`
+  announcement, letter id (`announcement_spec_example_p73`); `:BLN4WX   :Stand
+  by your snowplows` group bulletin (`group_bulletin_spec_example_p74`).
+- **Chapter 15, p.78** general query (`src/aprs.rs::parse_query`): `?APRS?`,
+  `?WX?`, `?IGATE?` (`general_query_spec_examples_p78`); `?APRS?
+  34.02,-117.15,0200` target footprint (`query_with_footprint_p78`).
 - **Chapter 16, p.80** status: `>Net Control Center`.
+- **Chapter 16, p.81–82** status with Maidenhead grid locator
+  (`src/aprs.rs::parse_maidenhead_status`): `>IO91SX/-` (+ ` My house` status
+  text) (`maidenhead_status_p82`) and the 4-char `>IO91/G`
+  (`maidenhead_status_4char_p82`); a plain free-text status is **not**
+  misdetected (`plain_status_not_maidenhead`).
 - **Chapter 11, p.58** object: `;LEADER   *092345z4903.50N/07201.75W>`.
 - **Chapter 13, p.68** telemetry: `T#005,199,000,255,073,123,01101001`.
 - **Chapter 12, p.63** weather field table: wind/temp/humidity/pressure
   identifiers (`c`,`s`,`g`,`t`,`r`,`p`,`P`,`h`,`b`).
 
 `MessageBody::Aprs { kind, details }` is emitted with `kind` ∈
-{`position`, `weather`, `message`, `status`, `object`, `telemetry`, `raw`} and
-`details` a JSON object merging the AX.25 addressing (`source`, `dest`,
-`via[]`, displayed in TNC-2 `CALL-SSID` form) with the decoded APRS fields
-(`lat`, `lon`, `symbol_table`, `symbol_code`, `comment`, …).
+{`position`, `weather`, `message`, `status`, `object`, `item`, `telemetry`,
+`mic-e`, `bulletin`, `query`, `raw`} and `details` a JSON object merging the
+AX.25 addressing (`source`, `dest`, `via[]`, displayed in TNC-2 `CALL-SSID`
+form) with the decoded APRS fields (`lat`, `lon`, `symbol_table`,
+`symbol_code`, `comment`, course/speed, `phg_*`/`dfs_*`, `altitude_ft`,
+`radio_range_miles`, …). No new `Mode`/`MessageBody` variant is introduced —
+the new formats are additional `kind` strings under the existing
+`MessageBody::Aprs`, so no bus rewiring is needed.
 
 ## Demod validation — SELF-GENERATED modulate→AWGN→demod (synthetic)
 

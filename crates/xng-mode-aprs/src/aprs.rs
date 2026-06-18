@@ -11,17 +11,24 @@
 //! - `!` `=`         — position without / with messaging, no timestamp
 //! - `/` `@`         — position with timestamp (no / with messaging)
 //! - `_`             — weather report (positionless)
-//! - `:`             — message
-//! - `>`             — status
+//! - `:`             — message, or bulletin/announcement (addressee `BLNn`)
+//! - `>`             — status (free text, or Maidenhead grid locator)
 //! - `;`             — object
+//! - `)`             — item report
+//! - `?`             — general query
 //! - `T` (`T#...`)   — telemetry
+//!
+//! Mic-E (`` ` ``, `'`, 0x1c, 0x1d) is dispatched one level up, in
+//! [`crate::decode_frame`], because it carries its latitude in the AX.25
+//! destination address (see [`crate::mice`]).
 //!
 //! Position reports come in two forms (APRS 1.0.1 Chapter 6):
 //! - **uncompressed**: `DDMM.mmN/DDDMM.mmW$` (lat 8 chars, sym-table id,
-//!   lon 9 chars, symbol code), then an optional comment.
+//!   lon 9 chars, symbol code), then an optional 7-byte Data Extension
+//!   (course/speed, PHG, DFS or RNG — Chapter 7) and comment.
 //! - **compressed** (Chapter 9): a Base-91 encoding — sym-table id, 4 bytes
-//!   latitude, 4 bytes longitude, symbol code, 2 bytes course/speed or
-//!   altitude, compression-type byte.
+//!   latitude, 4 bytes longitude, symbol code, 2 bytes course/speed (or radio
+//!   range or altitude), compression-type byte.
 
 use serde::Serialize;
 use serde_json::json;
@@ -34,7 +41,11 @@ pub enum AprsKind {
     Message,
     Status,
     Object,
+    Item,
     Telemetry,
+    MicE,
+    Bulletin,
+    Query,
     Raw,
 }
 
@@ -46,7 +57,11 @@ impl AprsKind {
             AprsKind::Message => "message",
             AprsKind::Status => "status",
             AprsKind::Object => "object",
+            AprsKind::Item => "item",
             AprsKind::Telemetry => "telemetry",
+            AprsKind::MicE => "mic-e",
+            AprsKind::Bulletin => "bulletin",
+            AprsKind::Query => "query",
             AprsKind::Raw => "raw",
         }
     }
@@ -79,6 +94,8 @@ pub fn parse(info: &[u8]) -> AprsPayload {
         b':' => parse_message(info),
         b'>' => parse_status(info),
         b';' => parse_object(info),
+        b')' => parse_item(info),
+        b'?' => parse_query(info),
         b'T' => parse_telemetry(info),
         _ => raw(&text),
     }
@@ -136,13 +153,19 @@ fn parse_uncompressed_position(rest: &[u8], timestamp: Option<String>) -> AprsPa
     let sym_table = rest[8] as char;
     let lon_s = &rest[9..18]; // DDDMM.mmH
     let sym_code = rest[18] as char;
-    let comment = String::from_utf8_lossy(&rest[19..]).trim().to_string();
+    let after_sym = &rest[19..];
 
     let lat = parse_lat(lat_s);
     let lon = parse_lon(lon_s);
     let (Some(lat), Some(lon)) = (lat, lon) else {
         return raw_pos(rest, timestamp);
     };
+
+    // A fixed-length 7-byte APRS Data Extension may immediately follow the
+    // symbol code (APRS 1.0.1 Chapter 7, p.27). Decode it and strip it from
+    // the comment when present.
+    let (ext, comment_bytes) = parse_data_extension(after_sym);
+    let comment = String::from_utf8_lossy(comment_bytes).trim().to_string();
 
     let mut fields = json!({
         "lat": lat,
@@ -152,6 +175,13 @@ fn parse_uncompressed_position(rest: &[u8], timestamp: Option<String>) -> AprsPa
         "comment": comment,
         "compressed": false,
     });
+    if let serde_json::Value::Object(m) = ext {
+        if let serde_json::Value::Object(fm) = &mut fields {
+            for (k, v) in m {
+                fm.insert(k, v);
+            }
+        }
+    }
     if let Some(ts) = timestamp {
         fields["timestamp"] = json!(ts);
     }
@@ -159,6 +189,129 @@ fn parse_uncompressed_position(rest: &[u8], timestamp: Option<String>) -> AprsPa
         kind: AprsKind::Position,
         fields,
     }
+}
+
+/// Parse the optional 7-byte APRS Data Extension that may follow position
+/// data (APRS 1.0.1 Chapter 7, "APRS Data Extensions", p.27-30). Returns the
+/// decoded extension fields plus the remaining comment bytes (with the
+/// extension stripped off the front). Recognized forms:
+///
+/// - `CSE/SPD` — course/speed: `nnn/nnn` (p.27).
+/// - `PHGphgd` — power/height/gain/directivity (p.28).
+/// - `RNGrrrr` — pre-calculated radio range, miles (p.29).
+/// - `DFSshgd` — DF signal strength / height / gain / directivity (p.30).
+///
+/// Anything else is left untouched as comment text.
+fn parse_data_extension(s: &[u8]) -> (serde_json::Value, &[u8]) {
+    let mut out = serde_json::Map::new();
+    if s.len() < 7 {
+        return (serde_json::Value::Object(out), s);
+    }
+    let head = &s[0..7];
+
+    // PHGphgd (p.28): literal "PHG" then 4 digit codes.
+    if &head[0..3] == b"PHG" {
+        if let Some(phg) = decode_phg(&head[3..7]) {
+            return (phg, &s[7..]);
+        }
+    }
+    // DFSshgd (p.30): literal "DFS" then 4 digit codes.
+    if &head[0..3] == b"DFS" {
+        if let Some(dfs) = decode_dfs(&head[3..7]) {
+            return (dfs, &s[7..]);
+        }
+    }
+    // RNGrrrr (p.29): literal "RNG" then 4-digit range in miles.
+    if &head[0..3] == b"RNG" {
+        if let Ok(txt) = std::str::from_utf8(&head[3..7]) {
+            if let Ok(rng) = txt.trim().parse::<u32>() {
+                out.insert("radio_range_miles".into(), json!(rng));
+                return (serde_json::Value::Object(out), &s[7..]);
+            }
+        }
+    }
+    // CSE/SPD (p.27): `nnn/nnn`, course then speed. The 4th byte is '/'.
+    if head[3] == b'/' && head[0..3].iter().all(|c| c.is_ascii_digit()) {
+        let course: Option<u32> = std::str::from_utf8(&head[0..3])
+            .ok()
+            .and_then(|t| t.parse().ok());
+        let speed: Option<u32> = std::str::from_utf8(&head[4..7])
+            .ok()
+            .and_then(|t| t.parse().ok());
+        if let (Some(course), Some(speed)) = (course, speed) {
+            out.insert("course_deg".into(), json!(course));
+            out.insert("speed_knots".into(), json!(speed));
+            return (serde_json::Value::Object(out), &s[7..]);
+        }
+    }
+    (serde_json::Value::Object(out), s)
+}
+
+/// PHG code table (APRS 1.0.1 Chapter 7, p.28 "PHG Codes"). The 4 chars are
+/// power, height, gain, directivity codes. Worked example (p.28-29):
+/// `PHG5132` => power 25 W, height 20 ft, gain 3 dB, directivity 90° (East).
+fn decode_phg(codes: &[u8]) -> Option<serde_json::Value> {
+    let p = codes[0];
+    let h = codes[1];
+    let g = codes[2];
+    let d = codes[3];
+    if !p.is_ascii_digit() || !d.is_ascii_digit() {
+        return None;
+    }
+    // power = p^2 watts (p.29). height = 10 * 2^h feet. gain = g dB.
+    let pv = (p - b'0') as i64;
+    let power = pv * pv;
+    // Height code may be any char 0-9 and above (p.28); use 2^(h-'0').
+    let hv = (h as i64) - (b'0' as i64);
+    let height = if hv >= 0 { 10i64 * (1i64 << hv) } else { 0 };
+    let gv = (g as i64) - (b'0' as i64);
+    let dv = (d - b'0') as i64;
+    // Directivity code: 0=omni, 1-8 = 45..360 in 45-deg steps (1=45 NE ...
+    // 8=360 N), per the p.28 table.
+    let dir_deg = if dv == 0 { None } else { Some(dv * 45) };
+    let mut m = serde_json::Map::new();
+    m.insert("phg_power_w".into(), json!(power));
+    m.insert("phg_height_ft".into(), json!(height));
+    m.insert("phg_gain_db".into(), json!(gv));
+    if let Some(deg) = dir_deg {
+        m.insert("phg_directivity_deg".into(), json!(deg));
+    } else {
+        m.insert("phg_directivity_deg".into(), json!("omni"));
+    }
+    Some(serde_json::Value::Object(m))
+}
+
+/// DFS code table (APRS 1.0.1 Chapter 7, p.30 "DFS Codes"). The 4 chars are
+/// strength (S-points), height, gain, directivity. Worked example (p.30):
+/// `DFS2360` => strength S2, height 80 ft, gain 6 dB, directivity 270° (W).
+fn decode_dfs(codes: &[u8]) -> Option<serde_json::Value> {
+    let strength = codes[0];
+    let h = codes[1];
+    let g = codes[2];
+    let d = codes[3];
+    if !strength.is_ascii_digit()
+        || !h.is_ascii_digit()
+        || !g.is_ascii_digit()
+        || !d.is_ascii_digit()
+    {
+        return None;
+    }
+    let sv = (strength - b'0') as i64;
+    let hv = (h - b'0') as i64;
+    let height = 10i64 * (1i64 << hv);
+    let gv = (g - b'0') as i64;
+    let dv = (d - b'0') as i64;
+    let dir_deg = if dv == 0 { None } else { Some(dv * 45) };
+    let mut m = serde_json::Map::new();
+    m.insert("dfs_strength_s".into(), json!(sv));
+    m.insert("dfs_height_ft".into(), json!(height));
+    m.insert("dfs_gain_db".into(), json!(gv));
+    if let Some(deg) = dir_deg {
+        m.insert("dfs_directivity_deg".into(), json!(deg));
+    } else {
+        m.insert("dfs_directivity_deg".into(), json!("omni"));
+    }
+    Some(serde_json::Value::Object(m))
 }
 
 fn raw_pos(rest: &[u8], timestamp: Option<String>) -> AprsPayload {
@@ -238,6 +391,17 @@ fn parse_compressed_position(rest: &[u8], timestamp: Option<String>) -> AprsPayl
         "comment": comment,
         "compressed": true,
     });
+    // Decode the compressed course/speed, radio-range or altitude sub-field
+    // from the cs bytes (rest[10], rest[11]) per the compression-type byte
+    // (rest[12]). APRS 1.0.1 Chapter 9, p.38-40.
+    let cs = decode_compressed_cs(rest[10], rest[11], rest[12]);
+    if let serde_json::Value::Object(m) = cs {
+        if let serde_json::Value::Object(fm) = &mut fields {
+            for (k, v) in m {
+                fm.insert(k, v);
+            }
+        }
+    }
     if let Some(ts) = timestamp {
         fields["timestamp"] = json!(ts);
     }
@@ -245,6 +409,61 @@ fn parse_compressed_position(rest: &[u8], timestamp: Option<String>) -> AprsPayl
         kind: AprsKind::Position,
         fields,
     }
+}
+
+/// Decode the compressed course/speed, pre-calculated radio range or altitude
+/// from the two `cs` bytes plus the compression-type `T` byte. APRS 1.0.1
+/// Chapter 9, "Course/Speed, Pre-Calculated Radio Range and Altitude" (p.38)
+/// through "Altitude" (p.40).
+///
+/// All three bytes are base-91 (char - 33). The decode is selected by the
+/// first `cs` byte `c`:
+/// - `c == ' '` (space): no course/speed/range data; cs/T ignored (p.38).
+/// - `c` in `!`..`z` (0..89 after -33): course = c*4 deg, speed = 1.08^s - 1
+///   knots (p.39).
+/// - `c == '{'` (90): radio range = 2 * 1.08^s miles (p.39).
+/// - if the T byte's NMEA-source bits (4,3) = 10 (GGA): altitude =
+///   1.002^cs feet, where cs = (c-33)*91 + (s-33) (p.40).
+pub fn decode_compressed_cs(c: u8, s: u8, t: u8) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    // Space => no data (p.38). The cs/T bytes are ignored.
+    if c == b' ' {
+        return serde_json::Value::Object(out);
+    }
+    let cv = c as i32 - 33;
+    let sv = s as i32 - 33;
+    let tv = t as i32 - 33;
+    if !(0..=90).contains(&cv) || !(0..=90).contains(&sv) {
+        return serde_json::Value::Object(out);
+    }
+
+    // Compression-type T byte: bit 5 GPS fix, bits 4-3 NMEA source,
+    // bits 2-0 origin (p.39). NMEA source 10b (GGA) => altitude.
+    let nmea_source = (tv >> 3) & 0b11;
+    let gps_fix = (tv >> 5) & 0b1;
+
+    if c == b'{' {
+        // Pre-calculated radio range (p.39): range = 2 * 1.08^s miles.
+        let range = 2.0 * 1.08f64.powi(sv);
+        out.insert(
+            "radio_range_miles".into(),
+            json!((range * 10.0).round() / 10.0),
+        );
+    } else if nmea_source == 0b10 {
+        // GGA sentence => altitude (p.40): altitude = 1.002^(c*91+s) feet,
+        // relative to the datum (cs is the base-91 pair value).
+        let cs = cv * 91 + sv;
+        let altitude = 1.002f64.powi(cs);
+        out.insert("altitude_ft".into(), json!(altitude.round() as i64));
+    } else {
+        // Course/speed (p.39): course = c*4 deg, speed = 1.08^s - 1 knots.
+        let course = cv * 4;
+        let speed = 1.08f64.powi(sv) - 1.0;
+        out.insert("course_deg".into(), json!(course));
+        out.insert("speed_knots".into(), json!((speed * 10.0).round() / 10.0));
+    }
+    out.insert("gps_fix_current".into(), json!(gps_fix == 1));
+    serde_json::Value::Object(out)
 }
 
 /// Decode a 4-character Base-91 group (each char is value-33, big-endian
@@ -339,8 +558,43 @@ fn parse_message(info: &[u8]) -> AprsPayload {
     if info.len() < 11 || info[10] != b':' {
         return raw_kind(info, AprsKind::Message);
     }
-    let addressee = String::from_utf8_lossy(&info[1..10]).trim_end().to_string();
+    let addressee_raw = &info[1..10];
+    let addressee = String::from_utf8_lossy(addressee_raw)
+        .trim_end()
+        .to_string();
     let body = String::from_utf8_lossy(&info[11..]).to_string();
+
+    // Bulletins and announcements (APRS 1.0.1 Chapter 14, p.73): the addressee
+    // is the literal "BLN" followed by a single identifier character then
+    // (for general bulletins) 5 filler spaces, or (for group bulletins) a
+    // group name. A digit identifier => general bulletin; a letter => an
+    // announcement (p.73). Bulletins are NOT acknowledged, so they carry no
+    // message number.
+    if addressee_raw.len() >= 4 && &addressee_raw[0..3] == b"BLN" {
+        let id_char = addressee_raw[3] as char;
+        let group = String::from_utf8_lossy(&addressee_raw[4..])
+            .trim_end()
+            .to_string();
+        let bulletin_kind = if id_char.is_ascii_alphabetic() {
+            "announcement"
+        } else {
+            "bulletin"
+        };
+        let mut fields = json!({
+            "addressee": addressee,
+            "bulletin_id": id_char.to_string(),
+            "bulletin_kind": bulletin_kind,
+            "text": body,
+        });
+        if !group.is_empty() {
+            fields["group"] = json!(group);
+        }
+        return AprsPayload {
+            kind: AprsKind::Bulletin,
+            fields,
+        };
+    }
+
     // Optional message number after a '{'. APRS 1.0.1 p.71.
     let (message, msg_no) = match body.rfind('{') {
         Some(p) => (body[..p].to_string(), Some(body[p + 1..].to_string())),
@@ -360,12 +614,172 @@ fn parse_message(info: &[u8]) -> AprsPayload {
 }
 
 /// Status (`>`). APRS 1.0.1 Chapter 16 (p.80): `>` then free-text status,
-/// optionally prefixed with an 8-char `DDHHMMz` timestamp.
+/// optionally prefixed with an 8-char `DDHHMMz` timestamp. The status may also
+/// carry a Maidenhead grid locator (p.81-82): a 4- or 6-character locator
+/// immediately following the `>`, then the symbol-table id + symbol code, then
+/// (optionally) a space and status text.
 fn parse_status(info: &[u8]) -> AprsPayload {
-    let text = String::from_utf8_lossy(&info[1..]).trim().to_string();
+    let body = &info[1..];
+    // Maidenhead grid locator: 4 or 6 chars (AABB or AABBcc) immediately after
+    // `>`, followed by a symbol table id + symbol code (p.82). A 6-char locator
+    // is AA(letters) BB(digits) cc(letters); a 4-char is AA(letters) BB(digits).
+    if let Some(fields) = parse_maidenhead_status(body) {
+        return AprsPayload {
+            kind: AprsKind::Status,
+            fields,
+        };
+    }
+    let text = String::from_utf8_lossy(body).trim().to_string();
     AprsPayload {
         kind: AprsKind::Status,
         fields: json!({ "status": text }),
+    }
+}
+
+/// Try to parse a Maidenhead-grid status (APRS 1.0.1 p.81-82). The locator is
+/// 4 chars (`AAnn`) or 6 chars (`AAnngg`) followed by the symbol-table id and
+/// symbol code. Returns the decoded fields, or `None` when the body is not a
+/// grid-locator status.
+fn parse_maidenhead_status(body: &[u8]) -> Option<serde_json::Value> {
+    // Helper: is this byte a valid Maidenhead field/sub-square letter?
+    let is_loc_letter = |b: u8| b.is_ascii_alphabetic();
+    // Try 6-char locator + 2 symbol bytes = 8, else 4-char + 2 = 6.
+    for loc_len in [6usize, 4usize] {
+        if body.len() < loc_len + 2 {
+            continue;
+        }
+        let loc = &body[0..loc_len];
+        // Field pair (letters A-R), square pair (digits), and for 6-char a
+        // sub-square pair (letters). p.82: letters may be upper or lower case.
+        let ok = is_loc_letter(loc[0])
+            && is_loc_letter(loc[1])
+            && loc[2].is_ascii_digit()
+            && loc[3].is_ascii_digit()
+            && (loc_len == 4 || (is_loc_letter(loc[4]) && is_loc_letter(loc[5])));
+        if !ok {
+            continue;
+        }
+        let sym_table = body[loc_len] as char;
+        let sym_code = body[loc_len + 1] as char;
+        // The symbol-table id is `/`, `\`, or an overlay char; require it to be
+        // a plausible table id to avoid false positives on plain text.
+        if !(sym_table == '/' || sym_table == '\\' || sym_table.is_ascii_alphanumeric()) {
+            continue;
+        }
+        let rest = &body[loc_len + 2..];
+        // If status text follows, its first char must be a space (p.82).
+        let text = String::from_utf8_lossy(rest).trim().to_string();
+        let mut fields = serde_json::Map::new();
+        fields.insert(
+            "maidenhead".into(),
+            json!(String::from_utf8_lossy(loc).to_uppercase()),
+        );
+        fields.insert("symbol_table".into(), json!(sym_table.to_string()));
+        fields.insert("symbol_code".into(), json!(sym_code.to_string()));
+        if !text.is_empty() {
+            fields.insert("status".into(), json!(text));
+        }
+        return Some(serde_json::Value::Object(fields));
+    }
+    None
+}
+
+/// Item Report (`)`). APRS 1.0.1 Chapter 11, "Item Report Format" (p.59): the
+/// `)` data-type id, then a variable-length item name (3-9 chars, any
+/// printable ASCII except `!` and `_`), then `!` (live) or `_` (killed), then
+/// a position (uncompressed or compressed). There is no timestamp. Worked
+/// example (p.59): `)AID #2!4903.50N/07201.75WA` — item "AID #2", live, at
+/// 49°03.50'N/072°01.75'W, symbol `/A` (Aid Station).
+fn parse_item(info: &[u8]) -> AprsPayload {
+    // Scan for the live/killed separator `!` or `_` after a 3-9 char name.
+    let body = &info[1..];
+    let mut sep_idx = None;
+    for (i, &b) in body.iter().enumerate() {
+        if (3..=9).contains(&i) && (b == b'!' || b == b'_') {
+            sep_idx = Some(i);
+            break;
+        }
+        // Names are 3-9 chars; stop scanning past the max.
+        if i > 9 {
+            break;
+        }
+    }
+    let Some(sep) = sep_idx else {
+        return raw_kind(info, AprsKind::Item);
+    };
+    let name = String::from_utf8_lossy(&body[0..sep]).to_string();
+    let live = body[sep] == b'!';
+    let pos = &body[sep + 1..];
+    let mut fields = json!({
+        "name": name,
+        "live": live,
+    });
+    if !pos.is_empty() {
+        let parsed = dispatch_position_body(pos);
+        if let serde_json::Value::Object(pm) = parsed.fields {
+            if let serde_json::Value::Object(m) = &mut fields {
+                for (k, v) in pm {
+                    if k != "info" {
+                        m.insert(k, v);
+                    }
+                }
+            }
+        }
+    }
+    AprsPayload {
+        kind: AprsKind::Item,
+        fields,
+    }
+}
+
+/// General Query (`?`). APRS 1.0.1 Chapter 15, "General Queries" (p.78):
+/// `?QUERYTYPE?` optionally followed by a target footprint `lat,long,radius`.
+/// Worked examples (p.78): `?APRS?`, `?WX?`, `?IGATE?`, and
+/// `?APRS? 34.02,-117.15,0200` (footprint query).
+fn parse_query(info: &[u8]) -> AprsPayload {
+    let body = String::from_utf8_lossy(&info[1..]).to_string();
+    // Query type runs up to the next '?' or end; a footprint may follow.
+    let (qtype, footprint) = match body.find('?') {
+        Some(p) => (body[..p].to_string(), body[p + 1..].trim().to_string()),
+        None => (body.trim().to_string(), String::new()),
+    };
+    let mut fields = json!({ "query_type": qtype });
+    if !footprint.is_empty() {
+        // Optional target footprint: lat,long,radius in floating-point degrees
+        // (p.78). North/east positive (leading space), south/west negative.
+        let parts: Vec<&str> = footprint.split(',').collect();
+        if parts.len() == 3 {
+            if let (Ok(lat), Ok(lon), Ok(radius)) = (
+                parts[0].trim().parse::<f64>(),
+                parts[1].trim().parse::<f64>(),
+                parts[2].trim().parse::<u32>(),
+            ) {
+                fields["lat"] = json!(lat);
+                fields["lon"] = json!(lon);
+                fields["radius_miles"] = json!(radius);
+            }
+        }
+        if fields.get("lat").is_none() {
+            fields["footprint"] = json!(footprint);
+        }
+    }
+    AprsPayload {
+        kind: AprsKind::Query,
+        fields,
+    }
+}
+
+/// Dispatch a position body (no data-type id, no timestamp) to the
+/// uncompressed or compressed parser based on its first byte. Shared by object
+/// and item reports. APRS 1.0.1 Chapter 6 / Chapter 9.
+fn dispatch_position_body(pos: &[u8]) -> AprsPayload {
+    let first = pos[0];
+    if first.is_ascii_digit() {
+        parse_uncompressed_position(pos, None)
+    } else if pos.len() >= 13 {
+        parse_compressed_position(pos, None)
+    } else {
+        raw(&String::from_utf8_lossy(pos))
     }
 }
 
@@ -389,14 +803,7 @@ fn parse_object(info: &[u8]) -> AprsPayload {
         "timestamp": timestamp,
     });
     if !pos.is_empty() {
-        let first = pos[0];
-        let parsed = if first.is_ascii_digit() {
-            parse_uncompressed_position(pos, None)
-        } else if pos.len() >= 13 {
-            parse_compressed_position(pos, None)
-        } else {
-            raw(&String::from_utf8_lossy(pos))
-        };
+        let parsed = dispatch_position_body(pos);
         if let serde_json::Value::Object(pm) = parsed.fields {
             if let serde_json::Value::Object(m) = &mut fields {
                 for (k, v) in pm {
@@ -418,7 +825,9 @@ fn parse_object(info: &[u8]) -> AprsPayload {
 fn parse_telemetry(info: &[u8]) -> AprsPayload {
     let s = String::from_utf8_lossy(info).to_string();
     // Expect "T#" prefix.
-    let body = s.strip_prefix("T#").unwrap_or_else(|| s.strip_prefix('T').unwrap_or(&s));
+    let body = s
+        .strip_prefix("T#")
+        .unwrap_or_else(|| s.strip_prefix('T').unwrap_or(&s));
     let parts: Vec<&str> = body.split(',').collect();
     if parts.len() < 6 {
         return raw_kind(info, AprsKind::Telemetry);
@@ -600,5 +1009,266 @@ mod tests {
         let p = parse(b"$GPGGA,nonsense");
         assert_eq!(p.kind, AprsKind::Raw);
         assert_eq!(p.fields["info"], "$GPGGA,nonsense");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 9 compressed course/speed
+    /// sub-field (p.39). The cs characters `7P` decode to course = 7*4 = 88
+    /// degrees and speed = 1.08^47 - 1 = 36.2 knots. We feed the full p.40
+    /// compressed field `/5L!!<*e7>7P[` (sym-table `/`, lat "5L!!", lon "<*e7",
+    /// sym-code `>`, cs "7P", T `[`) after the `!` DTI.
+    #[test]
+    fn compressed_course_speed_p39() {
+        let p = parse(b"!/5L!!<*e7>7P[");
+        assert_eq!(p.kind, AprsKind::Position);
+        assert_eq!(p.fields["compressed"], true);
+        assert_eq!(p.fields["course_deg"], 88);
+        let spd = p.fields["speed_knots"].as_f64().unwrap();
+        assert!((spd - 36.2).abs() < 0.1, "speed={spd}");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 9 pre-calculated radio range
+    /// sub-field (p.39). cs `{?` => c=`{` (range marker), s=`?` (63-33=30),
+    /// range = 2 * 1.08^30 ≈ 20 miles. Full field `/5L!!<*e7>{?!`.
+    #[test]
+    fn compressed_radio_range_p39() {
+        let p = parse(b"!/5L!!<*e7>{?!");
+        assert_eq!(p.kind, AprsKind::Position);
+        let rng = p.fields["radio_range_miles"].as_f64().unwrap();
+        assert!((rng - 20.0).abs() < 0.5, "range={rng}");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 9 altitude sub-field (p.40). When
+    /// the T byte indicates a GGA sentence (NMEA-source bits 4,3 = 10), cs `S]`
+    /// decodes to altitude = 1.002^((83-33)*91 + (93-33)) = 1.002^4610 ≈ 10004
+    /// feet. Full field `/5L!!<*e7OS]S` (T byte `S` => GGA).
+    #[test]
+    fn compressed_altitude_p40() {
+        let p = parse(b"!/5L!!<*e7OS]S");
+        assert_eq!(p.kind, AprsKind::Position);
+        let alt = p.fields["altitude_ft"].as_i64().unwrap();
+        assert!((alt - 10004).abs() <= 2, "altitude={alt}");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 9, the special-case `c == space`:
+    /// no course/speed/range data, cs/T ignored (p.38). Full field
+    /// `/5L!!<*e7> sT` (cs first byte is a space) carries no extension fields.
+    #[test]
+    fn compressed_space_no_extension_p38() {
+        let p = parse(b"!/5L!!<*e7> sT");
+        assert_eq!(p.kind, AprsKind::Position);
+        assert!(p.fields.get("course_deg").is_none());
+        assert!(p.fields.get("speed_knots").is_none());
+        assert!(p.fields.get("radio_range_miles").is_none());
+        assert!(p.fields.get("altitude_ft").is_none());
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 7 course/speed data extension
+    /// (p.27): the 7-byte `nnn/nnn` field. `088/036` => course 88°, speed 36
+    /// knots, appended to a position comment.
+    #[test]
+    fn uncompressed_course_speed_extension_p27() {
+        let p = parse(b"!4903.50N/07201.75W>088/036Heading out");
+        assert_eq!(p.kind, AprsKind::Position);
+        assert_eq!(p.fields["course_deg"], 88);
+        assert_eq!(p.fields["speed_knots"], 36);
+        // The extension is stripped from the comment.
+        assert_eq!(p.fields["comment"], "Heading out");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 7 PHG data extension (p.28-29).
+    /// `PHG5132` => power 5^2 = 25 watts, height 10*2^1 = 20 ft, gain 3 dB,
+    /// directivity code 2 = 90° (East). Worked example p.28-29.
+    #[test]
+    fn phg_extension_p28() {
+        let p = parse(b"=4903.50N/07201.75W#PHG5132");
+        assert_eq!(p.kind, AprsKind::Position);
+        assert_eq!(p.fields["phg_power_w"], 25);
+        assert_eq!(p.fields["phg_height_ft"], 20);
+        assert_eq!(p.fields["phg_gain_db"], 3);
+        assert_eq!(p.fields["phg_directivity_deg"], 90);
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 7 DFS data extension (p.30).
+    /// `DFS2360` => strength S2, height 10*2^3 = 80 ft, gain 6 dB, directivity
+    /// code 0 = omni. Worked example p.30: "weak signal (around strength S2)
+    /// heard on an omni antenna with 6 dB gain at 80 feet".
+    #[test]
+    fn dfs_extension_p30() {
+        let p = parse(b"@234517h4903.50N/07201.75W\\DFS2360");
+        assert_eq!(p.kind, AprsKind::Position);
+        assert_eq!(p.fields["dfs_strength_s"], 2);
+        assert_eq!(p.fields["dfs_height_ft"], 80);
+        assert_eq!(p.fields["dfs_gain_db"], 6);
+        assert_eq!(p.fields["dfs_directivity_deg"], "omni");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 7 pre-calculated radio range
+    /// extension (p.29): `RNG0050` indicates a radio range of 50 miles.
+    #[test]
+    fn rng_extension_p29() {
+        let p = parse(b"=4903.50N/07201.75W-RNG0050");
+        assert_eq!(p.kind, AprsKind::Position);
+        assert_eq!(p.fields["radio_range_miles"], 50);
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 11 Item Report (p.59), worked
+    /// example: `)AID #2!4903.50N/07201.75WA` — item "AID #2", live, at
+    /// 49°03.50'N/072°01.75'W, symbol `/A` (Aid Station).
+    #[test]
+    fn item_spec_example_p59() {
+        let p = parse(b")AID #2!4903.50N/07201.75WA");
+        assert_eq!(p.kind, AprsKind::Item);
+        assert_eq!(p.fields["name"], "AID #2");
+        assert_eq!(p.fields["live"], true);
+        let lat = p.fields["lat"].as_f64().unwrap();
+        assert!((lat - 49.058333).abs() < 1e-5, "lat={lat}");
+        assert_eq!(p.fields["symbol_table"], "/");
+        assert_eq!(p.fields["symbol_code"], "A");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 11 killed Item (p.59): the same
+    /// item with `_` (kill character) instead of `!`.
+    #[test]
+    fn item_killed_p59() {
+        let p = parse(b")AID #2_4903.50N/07201.75WA");
+        assert_eq!(p.kind, AprsKind::Item);
+        assert_eq!(p.fields["name"], "AID #2");
+        assert_eq!(p.fields["live"], false);
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 11 Item with compressed position
+    /// (p.59): `)MOBIL!\5L!!<*e79_sT` — Mobil Gas Station, compressed lat/lon,
+    /// symbol `\9` (Gas Station). cs first byte `9` is space-equivalent? No:
+    /// the spec field is `\5L!!<*e79_sT` — sym-table `\`, lat "5L!!", lon
+    /// "<*e7", sym-code `9`, cs `_s`, T `T`.
+    #[test]
+    fn item_compressed_p59() {
+        let p = parse(b")MOBIL!\\5L!!<*e79_sT");
+        assert_eq!(p.kind, AprsKind::Item);
+        assert_eq!(p.fields["name"], "MOBIL");
+        assert_eq!(p.fields["live"], true);
+        assert_eq!(p.fields["compressed"], true);
+        assert_eq!(p.fields["symbol_table"], "\\");
+        assert_eq!(p.fields["symbol_code"], "9");
+        let lat = p.fields["lat"].as_f64().unwrap();
+        assert!((lat - 49.5).abs() < 1e-3, "lat={lat}");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 14 General Bulletin (p.73),
+    /// worked example: `:BLN3     :Snow expected in Tampa RSN` — bulletin id
+    /// "3", text "Snow expected in Tampa RSN".
+    #[test]
+    fn bulletin_spec_example_p73() {
+        let p = parse(b":BLN3     :Snow expected in Tampa RSN");
+        assert_eq!(p.kind, AprsKind::Bulletin);
+        assert_eq!(p.fields["bulletin_id"], "3");
+        assert_eq!(p.fields["bulletin_kind"], "bulletin");
+        assert_eq!(p.fields["text"], "Snow expected in Tampa RSN");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 14 Announcement (p.73), worked
+    /// example: `:BLNQ     :Mt St Helen digi will be QRT this weekend` — a
+    /// letter identifier "Q" makes this an announcement (p.73).
+    #[test]
+    fn announcement_spec_example_p73() {
+        let p = parse(b":BLNQ     :Mt St Helen digi will be QRT this weekend");
+        assert_eq!(p.kind, AprsKind::Bulletin);
+        assert_eq!(p.fields["bulletin_id"], "Q");
+        assert_eq!(p.fields["bulletin_kind"], "announcement");
+        assert_eq!(
+            p.fields["text"],
+            "Mt St Helen digi will be QRT this weekend"
+        );
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 14 Group Bulletin (p.74), worked
+    /// example: `:BLN4WX   :Stand by your snowplows` — group bulletin id "4",
+    /// group name "WX".
+    #[test]
+    fn group_bulletin_spec_example_p74() {
+        let p = parse(b":BLN4WX   :Stand by your snowplows");
+        assert_eq!(p.kind, AprsKind::Bulletin);
+        assert_eq!(p.fields["bulletin_id"], "4");
+        assert_eq!(p.fields["group"], "WX");
+        assert_eq!(p.fields["text"], "Stand by your snowplows");
+    }
+
+    /// A normal message (non-bulletin) addressee still decodes as a message,
+    /// not a bulletin (regression guard for the BLN detection).
+    #[test]
+    fn normal_message_not_bulletin() {
+        let p = parse(b":WU2Z     :Testing{003");
+        assert_eq!(p.kind, AprsKind::Message);
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 15 General Query (p.78), worked
+    /// examples: `?APRS?` (all-stations query) and `?WX?` (weather query).
+    #[test]
+    fn general_query_spec_examples_p78() {
+        let p = parse(b"?APRS?");
+        assert_eq!(p.kind, AprsKind::Query);
+        assert_eq!(p.fields["query_type"], "APRS");
+
+        let p = parse(b"?WX?");
+        assert_eq!(p.kind, AprsKind::Query);
+        assert_eq!(p.fields["query_type"], "WX");
+
+        let p = parse(b"?IGATE?");
+        assert_eq!(p.kind, AprsKind::Query);
+        assert_eq!(p.fields["query_type"], "IGATE");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 15 General Query with target
+    /// footprint (p.78): `?APRS? 34.02,-117.15,0200` — query within 200 miles
+    /// of 34.02°N, 117.15°W (floating-point degrees, p.78).
+    #[test]
+    fn query_with_footprint_p78() {
+        let p = parse(b"?APRS? 34.02,-117.15,0200");
+        assert_eq!(p.kind, AprsKind::Query);
+        assert_eq!(p.fields["query_type"], "APRS");
+        let lat = p.fields["lat"].as_f64().unwrap();
+        let lon = p.fields["lon"].as_f64().unwrap();
+        assert!((lat - 34.02).abs() < 1e-6);
+        assert!((lon - (-117.15)).abs() < 1e-6);
+        assert_eq!(p.fields["radius_miles"], 200);
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 16 Status with Maidenhead grid
+    /// locator (p.82), worked examples: `>IO91SX/-` (6-char locator IO91SX,
+    /// symbol `/-`) and `>IO91SX/- My house` (with status text starting with a
+    /// space, p.82).
+    #[test]
+    fn maidenhead_status_p82() {
+        let p = parse(b">IO91SX/-");
+        assert_eq!(p.kind, AprsKind::Status);
+        assert_eq!(p.fields["maidenhead"], "IO91SX");
+        assert_eq!(p.fields["symbol_table"], "/");
+        assert_eq!(p.fields["symbol_code"], "-");
+
+        let p = parse(b">IO91SX/- My house");
+        assert_eq!(p.kind, AprsKind::Status);
+        assert_eq!(p.fields["maidenhead"], "IO91SX");
+        assert_eq!(p.fields["status"], "My house");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 16 4-char Maidenhead status
+    /// (p.82): `>IO91/G` (4-char locator IO91, symbol `/G` grid).
+    #[test]
+    fn maidenhead_status_4char_p82() {
+        let p = parse(b">IO91/G");
+        assert_eq!(p.kind, AprsKind::Status);
+        assert_eq!(p.fields["maidenhead"], "IO91");
+        assert_eq!(p.fields["symbol_table"], "/");
+        assert_eq!(p.fields["symbol_code"], "G");
+    }
+
+    /// A plain free-text status that merely starts with letters must NOT be
+    /// misdetected as a Maidenhead locator (regression guard).
+    #[test]
+    fn plain_status_not_maidenhead() {
+        let p = parse(b">Net Control Center");
+        assert_eq!(p.kind, AprsKind::Status);
+        assert_eq!(p.fields["status"], "Net Control Center");
+        assert!(p.fields.get("maidenhead").is_none());
     }
 }

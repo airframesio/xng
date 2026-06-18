@@ -18,8 +18,14 @@
 //!   extraction (callsign ASCII<<1 + SSID octet, final-octet LSB=1), control
 //!   `0x03`, PID `0xF0`, and the X.25 FCS check (§3.9–§3.14).
 //! - [`aprs`] — APRS 1.0.1 payload dispatch on the data-type identifier:
-//!   position (uncompressed DDMM.mm + Base-91 compressed), weather, message,
-//!   status, object, telemetry.
+//!   position (uncompressed DDMM.mm + Base-91 compressed, with course/speed,
+//!   PHG/DFS/RNG data extensions and the compressed cs/T sub-field), weather,
+//!   message, bulletin/announcement, status (incl. Maidenhead grid), object,
+//!   item, general query, telemetry.
+//! - [`mice`] — Mic-E (APRS 1.0.1 Chapter 10), the most common on-air format:
+//!   the latitude/message-code/N-S-E-W/longitude-offset live in the AX.25
+//!   destination address and the longitude/speed/course/symbol in the info
+//!   field, so it is decoded at the [`decode_frame`] level across both fields.
 //!
 //! # IQ front end
 //!
@@ -39,6 +45,7 @@ pub mod aprs;
 pub mod ax25;
 pub mod demod;
 pub mod hdlc;
+pub mod mice;
 pub mod modulate;
 
 pub use aprs::{AprsKind, AprsPayload};
@@ -151,7 +158,24 @@ pub fn decode_frame(raw: &[u8]) -> Option<AprsFrame> {
     let ax25 = ax25::parse_frame(raw)?;
     // APRS rides UI/PID-0xF0; other UI frames still parse but payload is raw.
     let payload = if ax25.pid == 0xf0 {
-        aprs::parse(&ax25.info)
+        // Mic-E packs the latitude into the AX.25 destination address, so it
+        // must be decoded with both the destination callsign and the info
+        // field (APRS 1.0.1 Chapter 10). Detect it by the info field's Mic-E
+        // data-type id (`` ` ``, `'`, 0x1c, 0x1d) and fall back to the
+        // info-only dispatch for every other APRS data type.
+        let info0 = ax25.info.first().copied();
+        let is_mice = matches!(info0, Some(b'`') | Some(b'\'') | Some(0x1c) | Some(0x1d));
+        if is_mice {
+            match mice::parse(&ax25.dest.callsign, &ax25.info) {
+                Some(m) => aprs::AprsPayload {
+                    kind: aprs::AprsKind::MicE,
+                    fields: m.fields,
+                },
+                None => aprs::parse(&ax25.info),
+            }
+        } else {
+            aprs::parse(&ax25.info)
+        }
     } else {
         aprs::AprsPayload {
             kind: aprs::AprsKind::Raw,
@@ -171,7 +195,8 @@ pub fn decode_frame(raw: &[u8]) -> Option<AprsFrame> {
 /// Convert a decoded APRS frame into the normalized bus message.
 ///
 /// `kind` is the APRS data class (`position`/`weather`/`message`/`status`/
-/// `object`/`telemetry`/`raw`). `details` is a JSON object carrying the AX.25
+/// `object`/`item`/`telemetry`/`mic-e`/`bulletin`/`query`/`raw`). `details` is
+/// a JSON object carrying the AX.25
 /// addressing (`source`, `dest`, `via`) merged with the decoded APRS fields
 /// (`lat`, `lon`, `symbol`, `comment`, …). `decode.crc_ok` is the AX.25 FCS
 /// result. `raw` carries the deframed link-layer octets.
@@ -226,7 +251,11 @@ mod tests {
     #[test]
     fn channel_rate_is_integer_bit_multiple() {
         let samples_per_bit = CHANNEL_RATE / demod::BAUD;
-        assert_eq!(samples_per_bit.fract(), 0.0, "{samples_per_bit} samples/bit");
+        assert_eq!(
+            samples_per_bit.fract(),
+            0.0,
+            "{samples_per_bit} samples/bit"
+        );
         // Output rate must carry the two-sided passband (Nyquist).
         let min_rate = 2.0 * CHANNEL_PASSBAND_HZ;
         assert!(CHANNEL_RATE >= min_rate, "{CHANNEL_RATE} < {min_rate}");
@@ -251,6 +280,49 @@ mod tests {
         assert!(f.ax25.fcs_ok);
         assert_eq!(f.payload.kind, aprs::AprsKind::Position);
         assert_eq!(f.ax25.source.callsign, "N0CALL");
+    }
+
+    /// SPEC GROUND TRUTH — APRS 1.0.1 Chapter 10, the information-field worked
+    /// example (p.53), routed through a full AX.25 UI frame. Mic-E carries the
+    /// latitude in the destination address, so this exercises the `decode_frame`
+    /// wiring that joins the AX.25 destination callsign to the info field.
+    ///
+    /// The destination "T7P3SY" specifies western hemisphere + longitude offset
+    /// +100 (bytes 5/6 = S/Y). The 9-byte info field is the literal spec bytes
+    /// `` `(_fn"Oj/ `` which decode to longitude 112°07.74'W, speed 20 knots,
+    /// course 251°, and the jeep symbol `/j` (p.53). `build_ui_frame` encodes
+    /// the dest callsign by the AX.25 ASCII<<1 rule, exactly as a Mic-E TNC
+    /// transmits it.
+    #[test]
+    fn mic_e_decodes_through_full_ax25_frame() {
+        let raw =
+            ax25::build_ui_frame(("T7P3SY", 0), ("N0CALL", 9), &[("WIDE1", 1)], b"`(_fn\"Oj/");
+        let f = decode_frame(&raw).expect("decode Mic-E frame");
+        assert!(f.ax25.fcs_ok);
+        assert_eq!(f.payload.kind, aprs::AprsKind::MicE);
+        let lon = f.payload.fields["lon"].as_f64().unwrap();
+        assert!((lon - (-112.129)).abs() < 1e-3, "lon={lon}");
+        assert_eq!(f.payload.fields["speed_knots"], 20);
+        assert_eq!(f.payload.fields["course_deg"], 251);
+        assert_eq!(f.payload.fields["symbol_code"], "j");
+        assert_eq!(f.payload.fields["symbol_table"], "/");
+
+        // And the normalized bus message carries kind "mic-e".
+        let prov = Provenance {
+            station: xng_types::StationIdentity::new("TEST-APRS"),
+            app: xng_types::AppInfo::xng(),
+            sdr: None,
+            channel: None,
+        };
+        let msg = to_message(&f, 144_390_000, -20.0, prov);
+        match &msg.body {
+            MessageBody::Aprs { kind, details } => {
+                assert_eq!(kind, "mic-e");
+                // Addressing is still merged in.
+                assert_eq!(details["source"], "N0CALL-9");
+            }
+            other => panic!("expected Aprs body, got {other:?}"),
+        }
     }
 
     #[test]
