@@ -142,6 +142,38 @@ impl SatMap {
             }
         }
     }
+
+    /// Satellites above the observer's horizon at `unix`, as `(name,
+    /// elevation°)`, sorted by elevation descending. Used to attribute a
+    /// space-based APRS reception (145.825 MHz / ISS digipeat) to the
+    /// satellite(s) actually in view from the receiver — `user pos + TLE`.
+    pub fn overhead(&self, lat_deg: f64, lon_deg: f64, unix: f64, min_el_deg: f64) -> Vec<(String, f64)> {
+        const RE: f64 = 6371.0; // km — spherical earth is plenty for an elevation gate
+        let (lat, lon) = (lat_deg.to_radians(), lon_deg.to_radians());
+        let (clat, slat) = (lat.cos(), lat.sin());
+        let (clon, slon) = (lon.cos(), lon.sin());
+        // Observer ECEF + local "up" — same earth-fixed frame as propagate_ecef.
+        let obs = [RE * clat * clon, RE * clat * slon, RE * slat];
+        let up = [clat * clon, clat * slon, slat];
+        let mut out: Vec<(String, f64)> = Vec::new();
+        for s in &self.sats {
+            let Some([sx, sy, sz]) = Self::propagate_ecef(s, unix) else { continue };
+            let r = [sx - obs[0], sy - obs[1], sz - obs[2]];
+            let rmag = (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt();
+            if rmag < 1e-6 {
+                continue;
+            }
+            // clamp guards asin against a near-zenith dot product that floating
+            // point can nudge just past 1.0 (which would yield NaN).
+            let sin_el = ((r[0] * up[0] + r[1] * up[1] + r[2] * up[2]) / rmag).clamp(-1.0, 1.0);
+            let el = sin_el.asin().to_degrees();
+            if el >= min_el_deg {
+                out.push((s.name.clone(), el));
+            }
+        }
+        out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        out
+    }
 }
 
 /// Greenwich Mean Sidereal Time (radians) at a Unix timestamp (IAU 1982).
@@ -179,9 +211,93 @@ pub fn load(source: &str) -> anyhow::Result<SatMap> {
     Ok(map)
 }
 
+/// Celestrak "amateur radio" TLE group — ISS plus the APRS-digipeating
+/// amateur satellites (PSAT, NO-104, …).
+pub const AMATEUR_URL: &str =
+    "https://celestrak.org/NORAD/elements/gp.php?GROUP=amateur&FORMAT=tle";
+
+/// Amateur-satellite map plus the receiver position it is evaluated from.
+struct AprsOverhead {
+    map: SatMap,
+    lat: f64,
+    lon: f64,
+}
+static APRS_SATS: OnceLock<AprsOverhead> = OnceLock::new();
+
+/// Load the amateur-satellite TLEs and pin the receiver position for APRS
+/// space-reception correlation. `source` is "auto" (Celestrak amateur group)
+/// or a local TLE file. Best-effort: call once at startup; failures are the
+/// caller's to log (the feature simply stays off). Returns the sat count.
+pub fn init_aprs(source: &str, receiver_pos: (f64, f64)) -> anyhow::Result<usize> {
+    let text = if source == "auto" {
+        fetch_tle(AMATEUR_URL)?
+    } else {
+        std::fs::read_to_string(source)?
+    };
+    let map = SatMap::from_tle(&text);
+    if map.is_empty() {
+        anyhow::bail!("no amateur TLEs parsed from {source}");
+    }
+    let n = map.len();
+    let _ = APRS_SATS.set(AprsOverhead { map, lat: receiver_pos.0, lon: receiver_pos.1 });
+    Ok(n)
+}
+
+/// Attribute a space-based APRS reception to the satellite(s) overhead.
+/// No-op unless [`init_aprs`] ran and the message is an APRS frame already
+/// tagged `reception="space"` (145.825 MHz / a satellite digipeater). Adds
+/// `satellites_overhead` (top few, name + elevation°) and, when the
+/// digipeater callsign didn't already name one, `satellite_likely` (the
+/// highest-elevation candidate).
+pub fn enrich_aprs(msg: &mut Message) {
+    let Some(ov) = APRS_SATS.get() else { return };
+    let MessageBody::Aprs { details, .. } = &mut msg.body else { return };
+    if details.get("reception").and_then(|v| v.as_str()) != Some("space") {
+        return;
+    }
+    let unix = msg.timestamp.timestamp() as f64
+        + msg.timestamp.timestamp_subsec_nanos() as f64 / 1e9;
+    let sats = ov.map.overhead(ov.lat, ov.lon, unix, 0.0);
+    if sats.is_empty() {
+        return;
+    }
+    let Some(obj) = details.as_object_mut() else { return };
+    let list: Vec<_> = sats
+        .iter()
+        .take(6)
+        .map(|(n, e)| serde_json::json!({ "name": n, "elevation_deg": (e * 10.0).round() / 10.0 }))
+        .collect();
+    obj.insert("satellites_overhead".into(), serde_json::json!(list));
+    if !obj.contains_key("satellite") {
+        obj.insert("satellite_likely".into(), serde_json::json!(sats[0].0));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overhead_elevation_geometry() {
+        // Canonical ISS TLE (same one the propagate test uses).
+        let tle = "ISS (ZARYA)\n\
+            1 25544U 98067A   08264.51782528 -.00002182  00000-0 -11606-4 0  2927\n\
+            2 25544  51.6416 247.4627 0006703 130.5360 325.0288 15.72125391563537\n";
+        let map = SatMap::from_tle(tle);
+        assert_eq!(map.len(), 1);
+        let unix = map.sats[0].epoch_unix;
+        // The satellite's own sub-point (observer directly beneath it).
+        let [sx, sy, sz] = SatMap::propagate_ecef(&map.sats[0], unix).unwrap();
+        let sublat = (sz / (sx * sx + sy * sy + sz * sz).sqrt()).asin().to_degrees();
+        let sublon = sy.atan2(sx).to_degrees();
+        // Directly underneath → near zenith.
+        let over = map.overhead(sublat, sublon, unix, 0.0);
+        assert_eq!(over.len(), 1, "ISS is overhead at its own sub-point");
+        assert!(over[0].1 > 80.0, "near-zenith expected, got {:.1}°", over[0].1);
+        // The antipode → below the horizon, filtered out.
+        let anti = map.overhead(-sublat, sublon + 180.0, unix, 0.0);
+        assert!(anti.is_empty(), "antipodal observer must not see the ISS");
+    }
 
     #[test]
     fn gmst_at_j2000() {

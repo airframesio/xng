@@ -796,6 +796,21 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
             Err(e) => tracing::warn!("iridium satmap disabled: {e}"),
         }
     }
+    // APRS satellite (TLE) overhead correlation: if an APRS session carries a
+    // receiver position, fetch the amateur-satellite TLEs so a space-based APRS
+    // reception (145.825 MHz / ISS digipeat) can be attributed to the
+    // satellite(s) in view. Best-effort (network) — failure just leaves it off.
+    if let Some(pos) = st
+        .sessions
+        .iter()
+        .filter(|s| s.mode.eq_ignore_ascii_case("aprs"))
+        .find_map(|s| parse_receiver_pos(&s.receiver_pos).ok().flatten())
+    {
+        match satmap::init_aprs("auto", pos) {
+            Ok(n) => tracing::info!("APRS satellite map: {n} amateur sats (space-reception correlation on)"),
+            Err(e) => tracing::warn!("APRS satellite correlation disabled: {e}"),
+        }
+    }
     let mut sessions = Vec::new();
     for (i, sess) in st.sessions.iter().enumerate() {
         let label = format!("session {} ({})", i + 1, sess.mode);

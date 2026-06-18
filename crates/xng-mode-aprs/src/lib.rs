@@ -200,6 +200,26 @@ pub fn decode_frame(raw: &[u8]) -> Option<AprsFrame> {
 /// addressing (`source`, `dest`, `via`) merged with the decoded APRS fields
 /// (`lat`, `lon`, `symbol`, `comment`, …). `decode.crc_ok` is the AX.25 FCS
 /// result. `raw` carries the deframed link-layer octets.
+/// Identify a space digipeater (ISS or an APRS satellite) from the AX.25 path.
+/// Matches the well-known APRS-satellite digipeater callsigns in the `via`
+/// list; the SSID is ignored. Returns the satellite's common name.
+fn satellite_digipeater(ax25: &Ax25Frame) -> Option<&'static str> {
+    for a in &ax25.via {
+        let d = a.display();
+        let base = d.split('-').next().unwrap_or("").to_ascii_uppercase();
+        match base.as_str() {
+            // ISS ARISS packet digipeater (and its historic aliases).
+            "RS0ISS" | "ARISS" | "NA1SS" => return Some("ISS (ARISS)"),
+            // US Naval Academy APRS sats (NO-84 / NO-104).
+            "PSAT" | "PSAT2" => return Some("PSAT / PSAT-2"),
+            // Generic APRS-satellite digipeater alias.
+            "APRSAT" => return Some("APRS satellite"),
+            _ => {}
+        }
+    }
+    None
+}
+
 pub fn to_message(
     f: &AprsFrame,
     frequency_hz: u64,
@@ -221,6 +241,22 @@ pub fn to_message(
     details.insert("dest".into(), serde_json::json!(f.ax25.dest.display()));
     let via: Vec<String> = f.ax25.via.iter().map(|a| a.display()).collect();
     details.insert("via".into(), serde_json::json!(via));
+
+    // Space-based reception. 145.825 MHz is the international ISS / APRS-satellite
+    // digipeat channel, so a frame heard there arrived via a spacecraft; tag it
+    // so the source is unambiguous. The specific satellite is identified from the
+    // digipeater callsign in the path when present (RS0ISS = ISS, etc.); the
+    // station runtime layers TLE/overhead correlation on top when a receiver
+    // position is configured (see `xng::aprs_sat`).
+    const SAT_APRS_HZ: u64 = 145_825_000;
+    let mut space = frequency_hz.abs_diff(SAT_APRS_HZ) <= 30_000;
+    if let Some(sat) = satellite_digipeater(&f.ax25) {
+        details.insert("satellite".into(), serde_json::json!(sat));
+        space = true;
+    }
+    if space {
+        details.insert("reception".into(), serde_json::json!("space"));
+    }
 
     Message {
         mode: Mode::Aprs,
@@ -322,6 +358,35 @@ mod tests {
                 assert_eq!(details["source"], "N0CALL-9");
             }
             other => panic!("expected Aprs body, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn space_reception_tagged_and_satellite_identified() {
+        // A frame digipeated by the ISS on 145.825 MHz: tagged space + ISS,
+        // regardless of which 2m cluster channel it was tuned on.
+        let raw = ax25::build_ui_frame(("APRS", 0), ("N0CALL", 9), &[("RS0ISS", 4)], b"!4903.50N/07201.75W-via ISS");
+        let f = decode_frame(&raw).unwrap();
+        let prov = Provenance {
+            station: xng_types::StationIdentity::new("TEST-APRS"),
+            app: xng_types::AppInfo::xng(),
+            sdr: None,
+            channel: None,
+        };
+        let msg = to_message(&f, 145_825_000, -20.0, prov.clone());
+        match &msg.body {
+            MessageBody::Aprs { details, .. } => {
+                assert_eq!(details["reception"], "space");
+                assert_eq!(details["satellite"], "ISS (ARISS)");
+            }
+            other => panic!("expected Aprs body, got {other:?}"),
+        }
+        // A terrestrial frame on 144.390 with no sat digipeater: no space tag.
+        let raw2 = ax25::build_ui_frame(("APRS", 0), ("N0CALL", 7), &[("WIDE1", 1)], b"!4903.50N/07201.75W-terrestrial");
+        let f2 = decode_frame(&raw2).unwrap();
+        if let MessageBody::Aprs { details, .. } = &to_message(&f2, 144_390_000, -20.0, prov).body {
+            assert!(details.get("reception").is_none(), "terrestrial must not be tagged space");
+            assert!(details.get("satellite").is_none());
         }
     }
 

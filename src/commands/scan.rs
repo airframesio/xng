@@ -60,8 +60,15 @@ pub(crate) fn plan(mode: Mode) -> (f64, Vec<u64>) {
         Mode::AdsL => (2_000_000.0, k(&[868_200])),
         // ATCS rail data radio (900 MHz band, representative channels).
         Mode::Atcs => (2_400_000.0, k(&[896_000, 900_000])),
-        // APRS / AX.25 packet: 144.390 (NA), 144.800 (EU), 432.500 (UK).
-        Mode::Aprs => (2_400_000.0, k(&[144_390, 144_800, 432_500])),
+        // APRS / AX.25 packet — the whole 2-meter channel cluster fits one
+        // 2.4 MHz window: 144.390 (NA/SA), 144.575 (NZ), 144.640 (CN/TW),
+        // 144.660 (JP), 144.800 (EU/RU), 144.990 (NA event), 145.175 (AU), and
+        // 145.825 (ISS / satellite digipeat). 70cm 446.100 + HF 300-baud APRS
+        // (10.1476 / 14.1030 / 29.250 MHz) are separate bands/modulation.
+        Mode::Aprs => (
+            2_400_000.0,
+            k(&[144_390, 144_575, 144_640, 144_660, 144_800, 144_990, 145_175, 145_825]),
+        ),
         // POCSAG paging: representative US (929/931) + EU (466) channels.
         Mode::Pocsag => (2_400_000.0, k(&[929_000, 931_000, 466_075])),
         // Rail EOT/HOT telemetry: EOT→HOT 457.9375, HOT→EOT 452.9375 MHz.

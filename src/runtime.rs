@@ -932,6 +932,9 @@ pub(crate) fn decode_loop(
                 // Label Iridium ring alerts with the broadcasting satellite
                 // (no-op unless a TLE satellite map was loaded at startup).
                 crate::satmap::enrich(&mut msg);
+                // Attribute space-based APRS (145.825 / ISS digipeat) to the
+                // satellite(s) overhead (no-op unless init_aprs ran).
+                crate::satmap::enrich_aprs(&mut msg);
                 if !label_filter.allows(&msg) {
                     continue;
                 }
