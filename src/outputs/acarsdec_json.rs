@@ -44,6 +44,11 @@ pub fn format_acarsdec_with_station(
         "ack": a.ack.map(|c| serde_json::json!(c.to_string())).unwrap_or(serde_json::json!(false)),
     });
     let obj = v.as_object_mut().unwrap();
+    // acarsdec's `noise` floor (dBFS) — now that the MSK demod tracks it
+    // (ACARS-4.1). Omitted when not measured.
+    if let Some(n) = msg.signal.noise_db {
+        obj.insert("noise".into(), ((n as f64 * 10.0).round() / 10.0).into());
+    }
     if let Some(b) = a.block_id {
         obj.insert("block_id".into(), b.to_string().into());
     }
@@ -107,7 +112,7 @@ mod tests {
             mode: Mode::AcarsPoa,
             timestamp: chrono::Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
             frequency_hz: 131_550_000,
-            signal: SignalQuality { rssi_db: Some(-18.42), ..Default::default() },
+            signal: SignalQuality { rssi_db: Some(-18.42), noise_db: Some(-55.0), ..Default::default() },
             decode: DecodeQuality { crc_ok: true, errors: Some(0), ..Default::default() },
             body: MessageBody::Acars(AcarsCore {
                 mode: '2',
@@ -139,6 +144,7 @@ mod tests {
         assert_eq!(v["text"], "HELLO");
         assert_eq!(v["end"], true);
         assert_eq!(v["level"], -18.4);
+        assert_eq!(v["noise"], -55.0);
         // No reassembler verdict on this fixture → field omitted.
         assert!(v.get("assstat").is_none(), "{v}");
     }
