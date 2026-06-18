@@ -23,8 +23,10 @@ use xng_mode_atcs::AtcsChannelDecoder;
 use xng_mode_aprs::AprsChannelDecoder;
 use xng_mode_dsc::DscChannelDecoder;
 use xng_mode_eot::EotChannelDecoder;
+use xng_mode_flex::FlexChannelDecoder;
 use xng_mode_navtex::NavtexChannelDecoder;
 use xng_mode_pocsag::PocsagChannelDecoder;
+use xng_mode_vdes::VdesChannelDecoder;
 use xng_mode_sarsat::SarsatChannelDecoder;
 use xng_mode_sonde::SondeChannelDecoder;
 use xng_mode_uat::UatChannelDecoder;
@@ -171,6 +173,8 @@ pub(crate) enum ModeChannel {
     Aprs(AprsChannelDecoder),
     Pocsag(PocsagChannelDecoder),
     Eot(EotChannelDecoder),
+    Flex(FlexChannelDecoder),
+    Vdes(VdesChannelDecoder),
     Sonde(SondeChannelDecoder),
     Adsl(AdslChannelDecoder),
     Atcs(AtcsChannelDecoder),
@@ -234,6 +238,10 @@ impl ModeChannel {
             // (Per-session baud selection is a follow-up config knob.)
             Mode::Pocsag => Ok(Self::Pocsag(PocsagChannelDecoder::new(sample_rate, offset, 1200)?)),
             Mode::Eot => Ok(Self::Eot(EotChannelDecoder::new(sample_rate, offset)?)),
+            // FLEX paging defaults to 1600 bps (the 2-FSK base rate). 4-FSK
+            // 3200/6400 are a follow-up; per-session baud is a config knob.
+            Mode::Flex => Ok(Self::Flex(FlexChannelDecoder::new(sample_rate, offset, 1600)?)),
+            Mode::Vdes => Ok(Self::Vdes(VdesChannelDecoder::new(sample_rate, offset)?)),
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -256,6 +264,8 @@ impl ModeChannel {
             Mode::Aprs => xng_mode_aprs::CHANNEL_PASSBAND_HZ,
             Mode::Pocsag => xng_mode_pocsag::CHANNEL_PASSBAND_HZ,
             Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
+            Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
+            Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -281,6 +291,8 @@ impl ModeChannel {
             Self::Aprs(_) => xng_mode_aprs::CHANNEL_RATE,
             Self::Pocsag(_) => xng_mode_pocsag::CHANNEL_RATE,
             Self::Eot(_) => xng_mode_eot::CHANNEL_RATE,
+            Self::Flex(_) => xng_mode_flex::CHANNEL_RATE,
+            Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
         }
     }
 
@@ -306,6 +318,8 @@ impl ModeChannel {
             Self::Aprs(d) => d.level_dbfs(),
             Self::Pocsag(d) => d.level_dbfs(),
             Self::Eot(d) => d.level_dbfs(),
+            Self::Flex(d) => d.level_dbfs(),
+            Self::Vdes(d) => d.level_dbfs(),
         }
     }
 
@@ -537,6 +551,28 @@ impl ModeChannel {
                 let msgs = frames
                     .iter()
                     .map(|f| xng_mode_eot::to_message(f, freq, level, is_hot, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Flex(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_flex::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Vdes(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                // to_message returns None for frames whose ASM payload doesn't
+                // decode; count those as seen-but-not-message.
+                let msgs: Vec<Message> = frames
+                    .iter()
+                    .filter_map(|f| xng_mode_vdes::to_message(f, freq, level, prov.clone()))
                     .collect();
                 (msgs, seen, seen)
             }

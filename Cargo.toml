@@ -50,6 +50,7 @@ xng-mode-atcs = { path = "crates/xng-mode-atcs" }
 xng-mode-aprs = { path = "crates/xng-mode-aprs" }
 xng-mode-pocsag = { path = "crates/xng-mode-pocsag" }
 xng-mode-eot = { path = "crates/xng-mode-eot" }
+xng-mode-flex = { path = "crates/xng-mode-flex" }
 xng-mode-vdes = { path = "crates/xng-mode-vdes" }
 prost = "0.13"
 tonic = "0.12"
@@ -122,6 +123,8 @@ xng-mode-atcs.workspace = true
 xng-mode-aprs.workspace = true
 xng-mode-pocsag.workspace = true
 xng-mode-eot.workspace = true
+xng-mode-flex.workspace = true
+xng-mode-vdes.workspace = true
 prost.workspace = true
 tonic.workspace = true
 quinn.workspace = true

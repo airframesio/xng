@@ -146,7 +146,9 @@ impl From<&Message> for asf2::DecodedMessage {
             | MessageBody::Atcs { kind, details }
             | MessageBody::Aprs { kind, details }
             | MessageBody::Pocsag { kind, details }
-            | MessageBody::Eot { kind, details } => {
+            | MessageBody::Eot { kind, details }
+            | MessageBody::Flex { kind, details }
+            | MessageBody::Vdes { kind, details } => {
                 Some(asf2::decoded_message::Body::Generic(asf2::GenericBody {
                     kind: kind.clone(),
                     details_json: details.to_string(),

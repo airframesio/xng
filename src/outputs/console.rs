@@ -597,6 +597,30 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::Flex { kind, details } => {
+                    let mut s = format!("FLEX {kind}");
+                    for (key, label) in [("capcode", "cap"), ("frame", "fr"), ("cycle", "cy")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={v}"));
+                        }
+                    }
+                    if let Some(t) = details.get("text").and_then(|v| v.as_str()) {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            s.push_str(&format!(" | {}", t.replace('\n', "·")));
+                        }
+                    }
+                    s
+                }
+                MessageBody::Vdes { kind, details } => {
+                    let mut s = format!("VDES {kind}");
+                    for (key, label) in [("mmsi", "mmsi"), ("dest_mmsi", "to"), ("dac", "dac"), ("fid", "fid")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={v}"));
+                        }
+                    }
+                    s
+                }
                 MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
             };
             format!(

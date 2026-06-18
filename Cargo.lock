@@ -4028,6 +4028,7 @@ dependencies = [
  "xng-mode-atcs",
  "xng-mode-dsc",
  "xng-mode-eot",
+ "xng-mode-flex",
  "xng-mode-hfdl",
  "xng-mode-iridium",
  "xng-mode-navtex",
@@ -4036,6 +4037,7 @@ dependencies = [
  "xng-mode-sonde",
  "xng-mode-stdc",
  "xng-mode-uat",
+ "xng-mode-vdes",
  "xng-mode-vdl2",
  "xng-proto",
  "xng-sdr",
@@ -4172,6 +4174,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xng-mode-flex"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
 name = "xng-mode-hfdl"
 version = "0.20.0"
 dependencies = [
@@ -4268,6 +4282,17 @@ dependencies = [
  "chrono",
  "num-complex",
  "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-vdes"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
  "serde_json",
  "xng-dsp",
  "xng-types",
