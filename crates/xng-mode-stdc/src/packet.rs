@@ -42,6 +42,13 @@ pub struct StdcPacket {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     pub details: serde_json::Value,
+    /// FEC (Viterbi) corrections on the frame this packet came from, if
+    /// known. Set by the channel decoder after frame decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fec_corrected: Option<u32>,
+    /// Unique-word BER (parts-per-thousand) of the source frame, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uw_ber_ppt: Option<u32>,
     #[serde(skip_serializing)]
     pub raw: Vec<u8>,
 }
@@ -709,6 +716,12 @@ struct EgcAssembly {
     presentation: u8,
     address: Vec<u8>,
     parts: Vec<(u16, Vec<u8>)>, // key = pkt_seq*2 + (part==2)
+    /// True if any constituent part used the double-header format
+    /// (descriptors 0xB1/0xB2) rather than the single 0xB0 header. STD-C
+    /// carries long EGC messages as a 0xB1 (header) + 0xB2 (continuation)
+    /// pair; short ones use a single self-contained 0xB0. Surfaced so the
+    /// distinction is observable downstream (VERIFY-6).
+    double_header: bool,
     age: u32,
 }
 
@@ -1043,6 +1056,8 @@ impl PacketParser {
             checksum_ok: true,
             text,
             details,
+            fec_corrected: None,
+            uw_ber_ppt: None,
             raw: pkt.to_vec(),
         });
     }
@@ -1076,6 +1091,8 @@ impl PacketParser {
             checksum_ok: true,
             text,
             details,
+            fec_corrected: None,
+            uw_ber_ppt: None,
             raw: payload,
         })
     }
@@ -1093,12 +1110,15 @@ impl PacketParser {
                     presentation: part.presentation,
                     address: part.address.clone(),
                     parts: Vec::new(),
+                    double_header: false,
                     age: 0,
                 });
                 self.egc.len() - 1
             });
         let a = &mut self.egc[idx];
         a.age = 0;
+        // 0xB0 = single header (part 0); 0xB1/0xB2 = double-header pair.
+        a.double_header |= part.double_header_part != 0;
         let key = part.pkt_seq as u16 * 2 + (part.double_header_part == 2) as u16;
         if !a.parts.iter().any(|(k, _)| *k == key) {
             a.parts.push((key, part.payload.clone()));
@@ -1124,6 +1144,9 @@ impl PacketParser {
             "msg_seq": done.msg_seq,
             "address_hex": hex(&done.address),
             "parts": done.parts.len(),
+            // VERIFY-6: distinguish the single 0xB0 header from the
+            // double 0xB1+0xB2 header pair on the assembled message.
+            "header_format": if done.double_header { "double-0xB1+0xB2" } else { "single-0xB0" },
         });
         if let Some(area) = egc_area(done.service, &done.address) {
             if let Some(obj) = details.as_object_mut() {
@@ -1136,11 +1159,15 @@ impl PacketParser {
             }
         }
         Some(StdcPacket {
-            descriptor: 0xB0,
+            // Reflect the constituent descriptor so the header format is
+            // observable on the packet itself, not just in details.
+            descriptor: if done.double_header { 0xB1 } else { 0xB0 },
             name: "egc-message",
             checksum_ok: true,
             text,
             details,
+            fec_corrected: None,
+            uw_ber_ppt: None,
             raw: payload,
         })
     }
@@ -1462,6 +1489,30 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].text.as_deref(), Some("PART ONE PART TWO"));
         assert_eq!(events[0].details["parts"], 2);
+    }
+
+    /// VERIFY-6: the single 0xB0 header vs the double 0xB1+0xB2 header pair
+    /// must be distinguishable on the assembled EGC message.
+    #[test]
+    fn egc_header_format_single_vs_double() {
+        // Single 0xB0 self-contained message.
+        let mut p = PacketParser::new();
+        let single = egc_packet(0xB0, 0x31, false, 1, 100, 1, b"SINGLE HEADER MSG");
+        let ev = p.parse_frame(&single);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].details["header_format"], "single-0xB0");
+        assert_eq!(ev[0].descriptor, 0xB0);
+
+        // Double-header pair: 0xB1 (header/part 1, continues) + 0xB2 (part 2).
+        let mut p2 = PacketParser::new();
+        let h1 = egc_packet(0xB1, 0x31, true, 1, 200, 1, b"DOUBLE ");
+        let h2 = egc_packet(0xB2, 0x31, false, 1, 200, 1, b"HEADER");
+        assert!(p2.parse_frame(&h1).is_empty(), "0xB1 alone does not terminate");
+        let ev2 = p2.parse_frame(&h2);
+        assert_eq!(ev2.len(), 1);
+        assert_eq!(ev2[0].text.as_deref(), Some("DOUBLE HEADER"));
+        assert_eq!(ev2[0].details["header_format"], "double-0xB1+0xB2");
+        assert_eq!(ev2[0].descriptor, 0xB1);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! timing recovery. The 180° phase ambiguity is resolved downstream at
 //! the frame layer (UW matched in both polarities).
 
+use crate::modulate::{rrc_taps, RRC_BETA};
 use num_complex::Complex;
 use rustfft::FftPlanner;
 use std::sync::Arc;
@@ -19,6 +20,14 @@ const AGC_ALPHA: f32 = 0.01;
 pub struct BpskDemod {
     spb: f64,
     lpf: Fir,
+    /// RRC matched filter (receive half of the TX/RX RRC pair). Applied
+    /// after the anti-alias lowpass; maximises symbol SNR in AWGN.
+    rrc: Fir,
+    /// When false, the matched-filter stage is bypassed (used by the BER
+    /// oracle to A/B the gain; production always enables it).
+    use_matched_filter: bool,
+    /// Scratch for the matched-filter stage.
+    rrc_out: Vec<Complex<f32>>,
     filtered: Vec<Complex<f32>>,
     fft: Arc<dyn rustfft::Fft<f32>>,
     /// Coarse acquisition buffer (squared signal).
@@ -41,9 +50,22 @@ pub struct BpskDemod {
 
 impl BpskDemod {
     pub fn new(channel_rate: f64) -> Self {
+        Self::with_matched_filter(channel_rate, true)
+    }
+
+    /// Construct with the RRC matched filter explicitly enabled/disabled.
+    /// Disabling is for the BER oracle only — production uses `new`.
+    pub fn with_matched_filter(channel_rate: f64, use_matched_filter: bool) -> Self {
+        let spb = channel_rate / SYMBOL_RATE;
+        // Matched filter spanning ±4 symbols (8*sps+1 taps): enough for
+        // the RRC tail at α=0.6 while staying short relative to the LPF.
+        let rrc_taps_len = (8.0 * spb).round() as usize | 1;
         Self {
-            spb: channel_rate / SYMBOL_RATE,
+            spb,
             lpf: Fir::new(lowpass_taps(1000.0 / channel_rate, 121)),
+            rrc: Fir::new(rrc_taps(spb, rrc_taps_len, RRC_BETA)),
+            use_matched_filter,
+            rrc_out: Vec::new(),
             filtered: Vec::new(),
             fft: FftPlanner::new().plan_fft_forward(COARSE_FFT),
             coarse_buf: Vec::with_capacity(COARSE_FFT),
@@ -118,7 +140,21 @@ impl BpskDemod {
             }
             self.filtered.clear();
             self.lpf.process(&[mixed], &mut self.filtered);
-            let Some(&y) = self.filtered.first() else { continue };
+            let Some(&lp) = self.filtered.first() else { continue };
+            // RRC matched filter (receive half). Combined with the TX RRC
+            // the response is a raised-cosine Nyquist pulse, so symbol
+            // centres carry the full energy with zero ISI; in AWGN this
+            // lifts effective Eb/N0 versus the bare lowpass.
+            let y = if self.use_matched_filter {
+                self.rrc_out.clear();
+                self.rrc.process(&[lp], &mut self.rrc_out);
+                match self.rrc_out.first() {
+                    Some(&v) => v,
+                    None => continue,
+                }
+            } else {
+                lp
+            };
             self.history[self.hist_pos] = y;
             self.hist_pos = (self.hist_pos + 1) % self.history.len();
             self.sample_idx += 1;
