@@ -18,11 +18,15 @@ of the decode core sits a channelized **IQ front end** (DDC + FM discriminator
 the decode core consumes.
 
 Status: the receive stack is implemented bottom-up — `demod` → `hdlc` →
-`ax25` → `aprs` — with `AprsChannelDecoder` as the channelized IQ entry point
-and `to_message` normalizing a decoded frame into the bus form
-`MessageBody::Aprs { kind, details }`. The DECODE/FRAMING/PAYLOAD tests are
-spec-anchored; the demod is exercised by a self-generated modulate→AWGN→demod
-path and documented as synthetic.
+`ax25` → `aprs` (+ `mice`) — with `AprsChannelDecoder` as the channelized IQ
+entry point and `to_message` normalizing a decoded frame into the bus form
+`MessageBody::Aprs { kind, details }`. The payload layer now covers the bulk of
+real on-air traffic: position (uncompressed + Base-91 compressed, with Chapter 7
+data extensions and the Chapter 9 cs/T sub-field), **Mic-E** (Chapter 10 — the
+single most common encoding), weather, message, bulletin/announcement/group,
+status (incl. Maidenhead grid), object, item, general query, and telemetry. The
+DECODE/FRAMING/PAYLOAD tests are spec-anchored; the demod is exercised by a
+self-generated modulate→AWGN→demod path and documented as synthetic.
 
 ## Pipeline
 
@@ -35,7 +39,8 @@ wideband capture IQ
 deframed AX.25 octet sequence (address…control PID info FCS)
   → ax25::parse_frame       address subfields (callsign<<1 + SSID), control 0x03,
                             PID 0xF0, X.25 FCS check
-  → aprs::parse             dispatch on the data-type identifier
+  → decode_frame            Mic-E? → mice::parse(dest_callsign, info)   [Ch.10, cross-field]
+                            else    → aprs::parse(info)                 dispatch on the DTI
   → aprs::AprsPayload       { kind, fields (serde_json) }
   → to_message              → xng_types::Message bus form
 ```
@@ -55,7 +60,13 @@ Two entry points:
 - `decode_frame(raw: &[u8]) -> Option<AprsFrame>` — the deframed-octet decode
   core: parse the AX.25 UI frame, then parse the APRS payload (only when
   `pid == 0xF0`; any other UI PID parses the frame but keeps the info field as
-  a `raw` payload). Returns `None` if it is not a parseable UI frame.
+  a `raw` payload). **Mic-E dispatch lives here**, not in `aprs::parse`: when
+  the info field's first byte is a Mic-E data-type id (`` ` ``, `'`, 0x1c, 0x1d)
+  it calls `mice::parse(&ax25.dest.callsign, &ax25.info)` — because Mic-E packs
+  the latitude into the AX.25 **destination** address (Chapter 10), so the
+  decoder needs both fields — and tags the payload `AprsKind::MicE`; a failed
+  Mic-E parse falls back to the info-only `aprs::parse`. Returns `None` if it is
+  not a parseable UI frame.
 
 `AprsFrame` bundles the decoded `ax25: Ax25Frame`, the parsed
 `payload: AprsPayload`, and `raw: Vec<u8>` (the deframed link-layer octets,
@@ -64,8 +75,9 @@ address…control PID info FCS).
 `to_message(frame, frequency_hz, level_dbfs, source) -> Message` normalizes an
 `AprsFrame` into the bus `Message`: `mode = Mode::Aprs`, body
 `MessageBody::Aprs { kind, details }` where `kind` is the APRS data class
-(`position` / `weather` / `message` / `status` / `object` / `telemetry` /
-`raw`) and `details` is a JSON object merging the AX.25 addressing (`source`,
+(`position` / `weather` / `message` / `status` / `object` / `item` /
+`telemetry` / `mic-e` / `bulletin` / `query` / `raw`) and `details` is a JSON
+object merging the AX.25 addressing (`source`,
 `dest`, `via[]`, each in TNC-2 `CALL-SSID` display form) with the decoded APRS
 fields (`lat`, `lon`, `symbol_table`, `symbol_code`, `comment`, …).
 `decode.crc_ok = ax25.fcs_ok`, RSSI from the channel level, and the deframed
@@ -162,42 +174,113 @@ only and are the inverse of the deframer.
 `parse(info)` dispatches on the first info byte — the APRS 1.0.1 *data-type
 identifier* (Chapter 5, p.17) — and always returns an `AprsPayload { kind,
 fields }`; anything unrecognized falls through to `AprsKind::Raw` with the raw
-text preserved.
+text preserved. **Mic-E** (`` ` ``, `'`, 0x1c, 0x1d) is *not* dispatched here —
+it carries its latitude in the AX.25 destination address, so it is decoded one
+level up in `decode_frame` (see below).
 
 | DTI | Handler | `AprsKind` |
 |---|---|---|
 | `!` `=` | `parse_position` (no timestamp) | `Position` |
 | `/` `@` | `parse_position` (7-char timestamp follows the DTI) | `Position` |
 | `_` | `parse_weather_positionless` | `Weather` |
-| `:` | `parse_message` | `Message` |
-| `>` | `parse_status` | `Status` |
+| `:` | `parse_message` (or bulletin/announcement when addressee = `BLN…`) | `Message` / `Bulletin` |
+| `>` | `parse_status` (free text, or Maidenhead grid locator) | `Status` |
 | `;` | `parse_object` | `Object` |
+| `)` | `parse_item` | `Item` |
+| `?` | `parse_query` | `Query` |
 | `T` | `parse_telemetry` | `Telemetry` |
+| `` ` `` `'` 0x1c 0x1d | (Mic-E — dispatched in `decode_frame`, `mice::parse`) | `MicE` |
 | other | `raw` | `Raw` |
 
+The full `AprsKind` enum is `Position` / `Weather` / `Message` / `Status` /
+`Object` / `Item` / `Telemetry` / `MicE` / `Bulletin` / `Query` / `Raw`; its
+`as_str()` produces the `kind` strings `position` / `weather` / `message` /
+`status` / `object` / `item` / `telemetry` / `mic-e` / `bulletin` / `query` /
+`raw` that ride on `MessageBody::Aprs { kind, .. }`.
+
 - **Position** (Chapter 6 / 9). Uncompressed: `DDMM.mmH` lat (8 chars),
-  symbol-table id, `DDDMM.mmH` lon (9 chars), symbol code, then an optional
-  comment; lat/lon decode to decimal degrees (S/W negative). Compressed
-  (Base-91, Chapter 9): symbol-table id, 4-byte lat group, 4-byte lon group,
-  symbol code, 2 cs bytes, 1 compression-type byte; `lat = 90 − N/380926`,
-  `lon = −180 + N/190463` where N is the 4-digit Base-91 value (each char − 33,
-  base 91). The form is disambiguated by the first char: a digit ⇒ uncompressed
-  (lat DD), otherwise ⇒ compressed (the symbol-table id is never a digit). Emits
-  `lat`, `lon`, `symbol_table`, `symbol_code`, `comment`, `compressed`, and
-  optional `timestamp`.
+  symbol-table id, `DDDMM.mmH` lon (9 chars), symbol code, then an **optional
+  7-byte Data Extension** (Chapter 7) and a comment; lat/lon decode to decimal
+  degrees (S/W negative). Compressed (Base-91, Chapter 9): symbol-table id,
+  4-byte lat group, 4-byte lon group, symbol code, 2 `cs` bytes, 1
+  **compression-type (`T`) byte**; `lat = 90 − N/380926`, `lon = −180 +
+  N/190463` where N is the 4-digit Base-91 value (each char − 33, base 91). The
+  form is disambiguated by the first char: a digit ⇒ uncompressed (lat DD),
+  otherwise ⇒ compressed (the symbol-table id is never a digit). Emits `lat`,
+  `lon`, `symbol_table`, `symbol_code`, `comment`, `compressed`, the decoded
+  extension/sub-field fields (below), and optional `timestamp`.
+- **Position Data Extensions** (Chapter 7, `parse_data_extension`). The
+  fixed-width 7-byte field that may follow the uncompressed symbol code, decoded
+  and stripped from the comment when present. Four forms are recognized by their
+  leading literal / shape:
+  - `CSE/SPD` = `nnn/nnn` (p.27): three course digits, `/`, three speed digits →
+    `course_deg`, `speed_knots`.
+  - `PHGphgd` (p.28, `decode_phg`): literal `PHG` + 4 codes → `phg_power_w` =
+    p², `phg_height_ft` = 10·2^h, `phg_gain_db` = g, `phg_directivity_deg` =
+    d·45 (or `"omni"` when d = 0).
+  - `DFSshgd` (p.30, `decode_dfs`): literal `DFS` + 4 codes → `dfs_strength_s`,
+    `dfs_height_ft` = 10·2^h, `dfs_gain_db`, `dfs_directivity_deg` (or `"omni"`).
+  - `RNGrrrr` (p.29): literal `RNG` + 4-digit miles → `radio_range_miles`.
+- **Compressed cs/T sub-field** (Chapter 9, `decode_compressed_cs`, p.38-40).
+  The two `cs` bytes plus the compression-type `T` byte (all Base-91) select one
+  of three sub-fields by the first `cs` byte `c`: a **space** ⇒ no data; `c == '{'`
+  ⇒ pre-calculated radio range `2·1.08^s` miles (`radio_range_miles`); when the
+  `T` byte's NMEA-source bits (4,3) = `10b` (GGA) ⇒ altitude `1.002^(c·91+s)`
+  feet (`altitude_ft`); otherwise ⇒ course `c·4` deg + speed `1.08^s − 1` knots
+  (`course_deg`, `speed_knots`). The `T` byte's bit-5 GPS-fix flag becomes
+  `gps_fix_current`.
 - **Weather** (positionless, Chapter 12): `_` + 8-char MDHM timestamp + field
   set; `parse_weather_fields` walks the `c`/`s`/`g`/`t`/`r`/`p`/`P`/`h`/`b`
   identifiers (wind dir/speed/gust, temp °F signed, rain 1h/24h/since-midnight,
   humidity %, barometric pressure 1/10 hPa) by their documented field widths.
   (`h00` is normalized to 100% humidity.)
+- **Mic-E** (Chapter 10, `mice::parse`; dispatched in `decode_frame`). The most
+  common on-air format, split across two AX.25 fields. The **destination
+  address** (6 plain-ASCII chars, the AX.25 layer having already reversed the
+  `<<1` shift) carries the six latitude digits, the 3 message bits A/B/C (one
+  per char 1-3), the N/S indicator (char 4), the longitude offset +0/+100
+  (char 5), and the W/E indicator (char 6) per the p.44 per-character table; the
+  **info field** carries the longitude (3 bytes d/m/h + 28, p.48-49), speed +
+  course (3 bytes SP/DC/SE + 28, p.52), and the symbol code + symbol-table id
+  (p.46). The message bits resolve to a `message_type`/`message_class`
+  (Standard `M0..M6`, Custom `C0..C6`, `Emergency`, or mixed-Std/Custom
+  `Unknown`) via the p.45 table. Trailing bytes are decoded as Mic-E telemetry
+  (leading `` ` ``/`'`/0x1d → `has_telemetry`) or as status text (which may carry
+  a Maidenhead locator + altitude). Position ambiguity — latitude digits sent as
+  spaces (dest chars `K`/`L`/`Z`) — is counted into `position_ambiguity`. An
+  info field shorter than the mandatory 9 bytes (p.47) or a non-Mic-E
+  destination character returns `None` and the frame falls back to the info-only
+  dispatch. Emits `lat`, `lon`, `speed_knots`, `course_deg`, `symbol_code`,
+  `symbol_table`, `message_type`, `message_class`, `mic_e`, `north`, `west`,
+  `long_offset_100`, optional `position_ambiguity`, `status`, `has_telemetry`.
 - **Message** (Chapter 14): `:ADDRESSEE:message{nnn` — 9-char space-padded
   addressee, then the message text and an optional `{` message number. Emits
   `addressee`, `message`, optional `message_number`.
-- **Status** (Chapter 16): `>` then free-text status → `status`.
+- **Bulletin / announcement / group** (Chapter 14, p.73-74). A `:` message
+  whose 9-char addressee is the literal `BLN` + an identifier char is split out
+  to `AprsKind::Bulletin` (bulletins are not acknowledged, so they carry no
+  message number). A **digit** identifier ⇒ general `bulletin`; a **letter** ⇒
+  `announcement`; any trailing addressee chars after the identifier are the
+  bulletin **group** name. Emits `addressee`, `bulletin_id`, `bulletin_kind`,
+  `text`, optional `group`.
+- **Status** (Chapter 16): `>` then free-text status → `status`. A status whose
+  body is a 4- or 6-char Maidenhead grid locator (`AAnn` / `AAnngg`) immediately
+  followed by a symbol-table id + symbol code (p.81-82) is decoded to
+  `maidenhead` (upper-cased), `symbol_table`, `symbol_code`, and optional
+  trailing `status` text; a plausibility check on the locator shape + symbol-table
+  id guards against false-detecting plain free text.
 - **Object** (Chapter 11): `;NAME     *DDHHMMz<position>` — 9-char name, state
   (`*` live / `_` killed), 7-char timestamp, then a position parsed by the same
-  uncompressed/compressed logic and merged in. Emits `name`, `live`,
-  `timestamp`, + position fields.
+  uncompressed/compressed logic (`dispatch_position_body`) and merged in. Emits
+  `name`, `live`, `timestamp`, + position fields.
+- **Item** (Chapter 11, p.59, `parse_item`): `)NAME!<position>` — a `)` DTI, a
+  variable-length 3-9 char item name, then `!` (live) or `_` (killed), then a
+  position (no timestamp) decoded by the shared `dispatch_position_body`. Emits
+  `name`, `live`, + position fields.
+- **General Query** (Chapter 15, p.78, `parse_query`): `?QUERYTYPE?` optionally
+  followed by a target **footprint** `lat,long,radius` in floating-point degrees.
+  Emits `query_type` and, when a footprint parses, `lat`/`lon`/`radius_miles`
+  (or the raw `footprint` string if it does not parse as three fields).
 - **Telemetry** (Chapter 13): `T#sss,a1,a2,a3,a4,a5,bbbbbbbb` — a sequence
   number, five analog values, and up to 8 digital bits. Emits `sequence`,
   `analog[]`, optional `digital[]`.
@@ -216,6 +299,13 @@ rule or a published worked example — never an encode→decode loopback.
 | AX.25 address octets | callsign chars = ASCII`<<1`, space-padded; SSID octet `0x60 \| (ssid<<1) \| ext`, last-octet LSB = 1 | AX.25 v2.2 §3.12 / §3.12.2 | `address_octets_match_spec_shift_rule` asserts `"APRS"` → `82 A0 A4 A6 40 40 60` and the final-octet extension bit (computed by the spec rule, not the crate's encoder); `parse_address_from_handbuilt_spec_octets` recovers `N0CALL-5` from hand-built §3.12 octets |
 | Full UI frame + X.25 FCS | dest+source+digi address field, control `0x03`, PID `0xF0`, info, FCS low byte first | AX.25 v2.2 §3.12–3.14, §3.9 | `parse_full_ui_frame_from_spec_octets` hand-builds the frame from spec octets and asserts the parser recovers all fields and validates the FCS; `corrupt_info_breaks_fcs` flips an info bit and asserts the FCS fails |
 | APRS payload formats | uncompressed/compressed position, message, status, object, telemetry, weather field table | APRS Protocol Reference 1.0.1 published worked examples | the `*_spec_example` tests feed each chapter's worked example (e.g. uncompressed `!4903.50N/07201.75W-` → 49.0583°N / −72.0292°W p.32; compressed `/5L!!<*e7>` → 49.5°N / −72.75°W p.38–39; message `:WU2Z     :Testing{003` p.71; object `;LEADER   *092345z…` p.58; telemetry `T#005,…` p.68; weather `_…c220s004…` p.63) and assert the decoded fields |
+| Position Data Extensions (Ch.7) | CSE/SPD, PHG, DFS, RNG 7-byte extensions | APRS 1.0.1 Ch.7 worked examples | `uncompressed_course_speed_extension_p27` (`088/036` → 88° / 36 kt, stripped from comment), `phg_extension_p28` (`PHG5132` → 25 W / 20 ft / 3 dB / 90°), `dfs_extension_p30` (`DFS2360` → S2 / 80 ft / 6 dB / omni), `rng_extension_p29` (`RNG0050` → 50 mi) |
+| Compressed cs/T sub-field (Ch.9) | course/speed, radio range, altitude, compression-type byte, no-data space case | APRS 1.0.1 Ch.9 p.38-40 | `compressed_course_speed_p39` (`7P` → 88° / 36.2 kt), `compressed_radio_range_p39` (`{?` → ≈20 mi), `compressed_altitude_p40` (GGA `T` byte → ≈10004 ft), `compressed_space_no_extension_p38` (space ⇒ no fields) |
+| Mic-E (Ch.10) | destination-address latitude + message code + N/S/E/W + offset; info-field lon/speed/course/symbol | APRS 1.0.1 Ch.10 worked examples (p.44-53) | `dest_worked_example_p44` (`S32U6T` → 33.4273°N, M3 Returning), `message_type_examples_p46` (Std M3, Emergency), `info_field_worked_example_p53` / `parse_full_mic_e_p53` (`` `(_fn"Oj/ `` → 112.129°W, 20 kt, 251°, jeep `/j`), `speed_course_example_p52` (86 kt / 194°, both SP+28 schemes), `position_ambiguity_p54` (2 masked digits), `short_info_rejected` (< 9 bytes ⇒ `None`); `mic_e_decodes_through_full_ax25_frame` (lib.rs) routes the p.53 example through a full AX.25 UI frame |
+| Item (Ch.11) | `)NAME!<pos>` live/killed item, uncompressed + compressed | APRS 1.0.1 Ch.11 p.59 | `item_spec_example_p59` (`)AID #2!…WA` → Aid Station `/A`), `item_killed_p59` (`_` ⇒ live=false), `item_compressed_p59` (`)MOBIL!\…` compressed Gas Station) |
+| Bulletin / announcement / group (Ch.14) | `BLN` addressee split into bulletin (digit) vs announcement (letter) vs group | APRS 1.0.1 Ch.14 p.73-74 | `bulletin_spec_example_p73` (`BLN3` → bulletin), `announcement_spec_example_p73` (`BLNQ` → announcement), `group_bulletin_spec_example_p74` (`BLN4WX` → group "WX"), `normal_message_not_bulletin` (regression guard) |
+| General query + footprint (Ch.15) | `?QUERYTYPE?` and `lat,long,radius` footprint | APRS 1.0.1 Ch.15 p.78 | `general_query_spec_examples_p78` (`?APRS?` / `?WX?` / `?IGATE?`), `query_with_footprint_p78` (`?APRS? 34.02,-117.15,0200` → 200 mi footprint) |
+| Maidenhead-grid status (Ch.16) | 4/6-char locator + symbol after `>` | APRS 1.0.1 Ch.16 p.81-82 | `maidenhead_status_p82` (`>IO91SX/-` + status text), `maidenhead_status_4char_p82` (`>IO91/G`), `plain_status_not_maidenhead` (free text not misdetected) |
 
 **2. Demod — SYNTHETIC modulate→AWGN→demod only (no real off-air IQ).** There
 is **no recorded off-air APRS IQ paired with ground-truth packets**. The demod
@@ -258,17 +348,31 @@ external reference; these are explicitly **not** real-RF results.
 - **Single FCS error detection only.** The X.25 FCS *detects* corruption but
   the crate does no FEC / error correction; a frame that fails the FCS is
   dropped (unless `set_require_fcs(false)` is used to surface candidates).
-- **Partial APRS payload coverage.** The payload parser covers the common data
-  classes (position uncompressed + Base-91 compressed, weather, message,
-  status, object, telemetry). Less-common DTIs (e.g. Mic-E, item reports, raw
-  GPS/NMEA, third-party traffic, bulletins, capabilities/query) are not
-  specially parsed and fall through to `AprsKind::Raw`. Weather decode extracts
-  the named numeric fields from the documented table; non-tabulated extensions
-  are not parsed.
-- **Object/message edge cases.** Object position reuses the position parser;
-  compressed-in-object and item (`)`) reports are not separately handled.
-  Message acks/rejects are not distinguished from message text beyond the
-  optional `{` message number.
+- **APRS payload coverage (now broad, still not exhaustive).** The payload
+  parser now covers position (uncompressed + Base-91 compressed, with Chapter 7
+  course/speed, PHG, DFS and RNG data extensions and the Chapter 9 compressed
+  cs/T course/speed/range/altitude sub-field), **Mic-E** (Chapter 10), weather,
+  message, **bulletin/announcement/group**, status (incl. **Maidenhead grid
+  locator**), object, **item (`)`)**, **general query (`?`) + footprint**, and
+  telemetry. Still **not** specially parsed (fall through to `AprsKind::Raw`):
+  raw GPS/NMEA (`$`), third-party traffic (`}`), station capabilities (`<`),
+  user-defined / experimental formats, and reply-acks / message ack-reject
+  semantics. Weather decode still extracts only the named numeric fields from
+  the documented table; non-tabulated extensions are not parsed.
+- **Mic-E trailing field not fully decoded.** The mandatory Mic-E fields
+  (lat/lon/speed/course/symbol/message-type) are decoded, but the optional
+  trailing field is only classified (telemetry vs status) and kept as raw
+  `status` text — the Mic-E telemetry channels (2/5 hex or 5 binary) and an
+  embedded Maidenhead-locator + altitude in the status text are not parsed out.
+  Mixed Standard/Custom message bits report `message_class = "unknown"` per the
+  p.45 rule.
+- **Object/message edge cases.** Object and item positions reuse the shared
+  position parser (so both uncompressed and compressed forms are handled now),
+  but message acks/rejects are not distinguished from message text beyond the
+  optional `{` message number. The Maidenhead-status detector uses a
+  shape/symbol-table plausibility check; an unusual free-text status that
+  happens to match `AAnn` + a symbol-table-like byte could in principle be
+  mis-detected.
 
 ## Gotchas
 
@@ -297,6 +401,22 @@ external reference; these are explicitly **not** real-RF results.
 9. Position compressed-vs-uncompressed is disambiguated purely by the first
    char after the (optional timestamp +) DTI: a digit ⇒ uncompressed, anything
    else ⇒ compressed. The symbol-table id is never a digit.
+10. **Mic-E spans two AX.25 fields** and is therefore dispatched in
+    `decode_frame`, NOT in `aprs::parse` — the latitude, message code, and
+    N/S/E/W + longitude-offset indicators live in the **destination address**,
+    the longitude/speed/course/symbol in the info field. `mice::parse` takes the
+    destination callsign already un-shifted to plain ASCII (the AX.25 layer
+    reverses the `<<1`); it matches the raw ASCII dest chars against the p.44
+    table. A non-Mic-E dest char or an info field < 9 bytes returns `None` and
+    the frame falls back to the info-only dispatch.
+11. Mic-E speed/course use two valid SP+28 encodings (p.50 note); both decode to
+    the same value. Speed ≥ 800 and course ≥ 400 wrap (subtract 800 / 400) per
+    the p.52 final adjustments.
+12. A `:` message is a **bulletin/announcement** (and gets `AprsKind::Bulletin`,
+    `kind = "bulletin"`) only when the 9-char addressee starts with the literal
+    `BLN`; the bulletin-vs-announcement split is by whether the 4th char is a
+    digit (bulletin) or a letter (announcement), and any chars after it are the
+    group name. Ordinary messages keep `kind = "message"`.
 
 ## Key references
 
@@ -307,9 +427,14 @@ external reference; these are explicitly **not** real-RF results.
   and `src/hdlc.rs`.
 - **APRS Protocol Reference, Protocol Version 1.0.1** (Bob Bruninga et al.,
   2000) — data-type-identifier dispatch (Ch. 5, p.17), uncompressed/Base-91
-  compressed position (Ch. 6 / 9), weather (Ch. 12), message (Ch. 14), status
-  (Ch. 16), object (Ch. 11), telemetry (Ch. 13). Each payload test uses the
-  spec's published worked example. Cited inline in `src/aprs.rs`.
+  compressed position (Ch. 6 / 9), position Data Extensions — course/speed, PHG,
+  DFS, RNG (Ch. 7, p.27-30), the compressed cs/T course/speed/range/altitude
+  sub-field (Ch. 9, p.38-40), **Mic-E** (Ch. 10, p.42-56), object (Ch. 11, p.58)
+  and **item** (Ch. 11, p.59), weather (Ch. 12, p.62-63), telemetry (Ch. 13,
+  p.68), message and **bulletin/announcement/group** (Ch. 14, p.71-74),
+  **general query + footprint** (Ch. 15, p.78), status and **Maidenhead-grid
+  status** (Ch. 16, p.80-82). Each payload test uses the spec's published worked
+  example. Cited inline in `src/aprs.rs` and `src/mice.rs`.
 - **ISO 3309 / CCITT** HDLC — the bit-stuffing, flag, and X.25 FCS definitions
   underlying AX.25's link layer.
 - `crates/xng-mode-aprs/PROVENANCE.md` — sourcing policy, per-table oracle

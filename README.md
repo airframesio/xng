@@ -87,9 +87,11 @@ ICAO); radiosonde/ADS-L/SARSAT/DSC positions plot as map beacons.
 | DSC (GMDSS, ITU-R M.493) | `dsc` | distress/all-ships/individual/area, DX/RX diversity + ECC | oracle vectors; demod synthetic (no public IQ) | [DSC.md](docs/notes/DSC.md) |
 | ADS-L (EASA SRD860) | `ads-l` | i-Conspicuity (CRC-24 + XXTEA) + variable-resolution fields | independent vectors; demod synthetic (no public IQ) | [ADSL.md](docs/notes/ADSL.md) |
 | ATCS (rail, AAR Spec-200) | `atcs` | HDLC/LAPB framer + Spec-200 address/header | spec-derived; demod synthetic (no public IQ) | [ATCS.md](docs/notes/ATCS.md) |
-| APRS / AX.25 | `aprs` | AFSK1200 (Bell 202) + AX.25 UI (callsign/SSID/digis, FCS) + APRS position/weather/message/status/object/telemetry | AX.25 2.2 + APRS 1.0.1 spec vectors; demod synthetic AWGN-BER (no public IQ) | [APRS.md](docs/notes/APRS.md) |
+| APRS / AX.25 | `aprs` | AFSK1200 (Bell 202) + AX.25 UI (callsign/SSID/digis, FCS) + APRS position/**Mic-E**/weather/message/status/object/item/bulletin/query/telemetry (uncompressed + Base-91 compressed course/speed/alt, PHG/DFS) | AX.25 2.2 + APRS 1.0.1 spec vectors; demod synthetic AWGN-BER (no public IQ) | [APRS.md](docs/notes/APRS.md) |
 | POCSAG paging | `pocsag` | 2-FSK 512/1200/2400 Bd + BCH(31,21) codewords + numeric/alpha/tone | ITU-R M.584-2 spec codewords + BCH-correction test; demod synthetic AWGN-BER | [POCSAG.md](docs/notes/POCSAG.md) |
+| FLEX paging | `flex` | 1600 bps 2-FSK + FLEX sync/FIW/BIW + BCH(31,21) + alpha/numeric/tone | FLEX-spec words + BCH test; demod synthetic AWGN-BER (4-FSK 3200/6400 deferred) | [FLEX.md](docs/notes/FLEX.md) |
 | EOT/HOT (rail telemetry) | `eot` | Manchester-FSK + AAR S-9152 (brake-pipe pressure, motion, marker light, BCH) | documented frame layout; demod synthetic (no public IQ) | [EOT.md](docs/notes/EOT.md) |
+| VDES ASM | `vdes` | GMSK 9600 + ASM transport (AIS Msg 6/8 header, source/dest MMSI + DAC/FID) + DAC=1 FID 16/31 payloads | ITU-R M.2092-1 vectors; demod synthetic AWGN-BER (sparse public spec) | [VDES.md](docs/notes/VDES.md) |
 
 All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
