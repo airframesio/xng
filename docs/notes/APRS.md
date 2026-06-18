@@ -285,6 +285,42 @@ The full `AprsKind` enum is `Position` / `Weather` / `Message` / `Status` /
   number, five analog values, and up to 8 digital bits. Emits `sequence`,
   `analog[]`, optional `digital[]`.
 
+## Frequencies & space-based reception (ISS / satellites)
+
+APRS is a single-channel protocol whose channel changes by region. The scan
+plan (`src/commands/scan.rs`) lists the whole **2-meter cluster**, which fits
+one 2.4 MHz capture window so a single tuner can watch all of it at once:
+
+| Region | MHz | | Region | MHz |
+|---|---|---|---|---|
+| NA / SA (primary) | 144.390 | | EU / RU | 144.800 |
+| New Zealand | 144.575 | | NA event/overflow | 144.990 |
+| China / Taiwan | 144.640 | | Australia | 145.175 |
+| Japan | 144.660 | | **ISS / satellite digipeat** | **145.825** |
+
+70cm (446.100 MHz) and HF APRS (300-baud packet on 10.1476 / 14.1030 /
+29.250 MHz) use a different band and/or modulation and are **not** in the
+1200-baud VHF plan (HF needs a 300-baud path — a follow-up).
+
+**145.825 MHz is the international ISS / satellite digipeat channel.** A frame
+heard there (or via a known satellite digipeater callsign) arrived through a
+spacecraft, so `to_message` tags `details.reception = "space"`:
+
+- **Satellite from the path** (`satellite_digipeater`, crate-local): the AX.25
+  `via` callsigns are matched against the well-known space digipeaters —
+  `RS0ISS` / `ARISS` / `NA1SS` → **ISS (ARISS)**, `PSAT`/`PSAT2` → PSAT, etc. —
+  and set `details.satellite`. This is the reliable primary identification (the
+  spacecraft names itself in the path).
+- **TLE / overhead correlation** (`xng::satmap`, station runtime): when an APRS
+  station session carries a `receiver-pos`, the station fetches the Celestrak
+  **amateur** TLE group at startup (`satmap::init_aprs`) and
+  `satmap::enrich_aprs` adds `details.satellites_overhead` (the amateur
+  satellites above the receiver's horizon at the reception time, name +
+  elevation°, highest first) plus `satellite_likely` when the path didn't name
+  one. `SatMap::overhead(lat, lon, unix)` reuses the SGP4 + TEME→ECEF machinery
+  the Iridium satmap uses, computing observer-relative elevation (`user pos +
+  TLE` → which bird was in view). No-op without `receiver-pos`.
+
 ## Validation / oracles
 
 Two distinct verification regimes (see `PROVENANCE.md`):
