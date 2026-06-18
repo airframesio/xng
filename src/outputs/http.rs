@@ -896,12 +896,24 @@ fn snapshot(d: &mut Dash) -> String {
     .to_string()
 }
 
+/// Parse a `since=<unix>` value from a request path's query string (ECO-4).
+/// Manual scan — no URL-parse dependency. `None` when absent/unparseable.
+fn query_since(path: &str) -> Option<u64> {
+    let q = path.split_once('?')?.1;
+    q.split('&')
+        .find_map(|kv| kv.strip_prefix("since="))
+        .and_then(|v| v.parse().ok())
+}
+
 /// readsb/tar1090-compatible `aircraft.json`: every live aircraft entity that
 /// has a real ICAO hex, mapped to the readsb field schema. Makes xng a
 /// drop-in source for tar1090 / graphs1090 / VRS without Beast. (ECO-4)
-fn aircraft_json(d: &Dash) -> String {
+fn aircraft_json(d: &Dash, since: Option<u64>) -> String {
     let now = now_s();
-    let cutoff = now.saturating_sub(EXPIRE_S);
+    // `?since=<unix>` (ECO-4) trims to aircraft heard at/after that absolute
+    // time — tar1090's incremental-poll pattern — bounded below by the normal
+    // expiry cutoff.
+    let cutoff = now.saturating_sub(EXPIRE_S).max(since.unwrap_or(0));
     let messages: u64 = d.totals.values().sum();
     let copy = |o: &mut serde_json::Map<String, Value>, a: &Value, from: &str, to: &str| {
         if let Some(v) = a.get(from) {
@@ -994,7 +1006,7 @@ pub async fn run(
                 let (ctype, body) = if path.starts_with("/api/state") {
                     ("application/json", snapshot(&mut state.lock().unwrap()))
                 } else if path.starts_with("/data/aircraft.json") {
-                    ("application/json", aircraft_json(&state.lock().unwrap()))
+                    ("application/json", aircraft_json(&state.lock().unwrap(), query_since(path)))
                 } else if path.starts_with("/data/receiver.json") {
                     ("application/json", receiver_json(&state.lock().unwrap()))
                 } else {
@@ -1269,7 +1281,7 @@ mod tests {
             lat: Some(40.0), lon: Some(-120.0), speed_kt: Some(420.0), speed_type: Some("GS".into()),
             track_deg: Some(270.0), vertical_rate_fpm: None, comm_b: None, adsb_status: None,
         }));
-        let v: Value = serde_json::from_str(&aircraft_json(&d)).unwrap();
+        let v: Value = serde_json::from_str(&aircraft_json(&d, None)).unwrap();
         assert!(v["now"].is_number() && v["messages"].is_number());
         let a = &v["aircraft"][0];
         assert_eq!(a["hex"], "ac82ec", "hex is lowercased ICAO");
@@ -1282,6 +1294,41 @@ mod tests {
         // receiver.json carries version + (no position configured here).
         let r: Value = serde_json::from_str(&receiver_json(&d)).unwrap();
         assert!(r["version"].as_str().unwrap().starts_with("xng-"));
+    }
+
+    #[test]
+    fn query_since_parses_unix() {
+        assert_eq!(query_since("/data/aircraft.json"), None);
+        assert_eq!(query_since("/data/aircraft.json?since=1700000000"), Some(1_700_000_000));
+        assert_eq!(query_since("/data/aircraft.json?foo=1&since=42"), Some(42));
+        assert_eq!(query_since("/data/aircraft.json?since=abc"), None);
+    }
+
+    // ECO-4: `?since=<unix>` returns only aircraft heard at/after that time.
+    #[test]
+    fn aircraft_json_since_filters_by_seen() {
+        let modes = |icao: &str| {
+            msg(Mode::Adsb, MessageBody::ModeS {
+                df: 17, icao: Some(icao.into()), callsign: None, altitude_ft: Some(1000),
+                squawk: None, lat: None, lon: None, speed_kt: None, speed_type: None,
+                track_deg: None, vertical_rate_fpm: None, comm_b: None, adsb_status: None,
+            })
+        };
+        let mut d = Dash::default();
+        update(&mut d, &modes("AAAAAA"));
+        update(&mut d, &modes("BBBBBB"));
+        let now = now_s();
+        d.aircraft.get_mut("AAAAAA").unwrap()["seen"] = json!(now - 100);
+        d.aircraft.get_mut("BBBBBB").unwrap()["seen"] = json!(now);
+
+        // since just inside the gap → only the freshly-seen aircraft.
+        let v: Value = serde_json::from_str(&aircraft_json(&d, Some(now - 50))).unwrap();
+        let hexes: Vec<&str> =
+            v["aircraft"].as_array().unwrap().iter().filter_map(|a| a["hex"].as_str()).collect();
+        assert_eq!(hexes, vec!["bbbbbb"], "{hexes:?}");
+        // No filter → both.
+        let all: Value = serde_json::from_str(&aircraft_json(&d, None)).unwrap();
+        assert_eq!(all["aircraft"].as_array().unwrap().len(), 2);
     }
 
     // ADSB-8a: the readsb `type` provenance field. DF18 maps via the
@@ -1346,7 +1393,7 @@ mod tests {
             })
         };
         let type_of = |d: &Dash, hex: &str| -> String {
-            let v: Value = serde_json::from_str(&aircraft_json(d)).unwrap();
+            let v: Value = serde_json::from_str(&aircraft_json(d, None)).unwrap();
             v["aircraft"].as_array().unwrap().iter()
                 .find(|x| x["hex"] == hex).unwrap()["type"].as_str().unwrap().to_string()
         };
