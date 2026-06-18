@@ -281,9 +281,18 @@ The full `AprsKind` enum is `Position` / `Weather` / `Message` / `Status` /
   followed by a target **footprint** `lat,long,radius` in floating-point degrees.
   Emits `query_type` and, when a footprint parses, `lat`/`lon`/`radius_miles`
   (or the raw `footprint` string if it does not parse as three fields).
-- **Telemetry** (Chapter 13): `T#sss,a1,a2,a3,a4,a5,bbbbbbbb` — a sequence
-  number, five analog values, and up to 8 digital bits. Emits `sequence`,
-  `analog[]`, optional `digital[]`.
+- **Telemetry** (Chapter 13):
+  - **Data** `T#sss,a1,a2,a3,a4,a5,bbbbbbbb` — a sequence number, five analog
+    values, and up to 8 digital bits. Emits `sequence`, `analog[]`, optional
+    `digital[]` (kind `telemetry`).
+  - **Definition messages** — addressed `:` messages to the telemetry
+    station's callsign with a 5-byte keyword prefix that names/scales the
+    channels, decoded into distinct kinds: **`PARM.`** (channel names →
+    `telemetry-parm`), **`UNIT.`** (units/labels → `telemetry-unit`),
+    **`EQNS.`** (per-analog `a·v²+b·v+c` coefficients → `telemetry-eqns`),
+    **`BITS.`** (8 digital bit-senses + project title → `telemetry-bits`).
+    Verified against the spec's N0QBF-11 worked examples incl. the published
+    EQNS conversion (raw `v=199`, `(0,5.2,0)` → `1034.8`).
 
 ## Frequencies & space-based reception (ISS / satellites)
 
@@ -390,7 +399,8 @@ external reference; these are explicitly **not** real-RF results.
   cs/T course/speed/range/altitude sub-field), **Mic-E** (Chapter 10), weather,
   message, **bulletin/announcement/group**, status (incl. **Maidenhead grid
   locator**), object, **item (`)`)**, **general query (`?`) + footprint**, and
-  telemetry. Still **not** specially parsed (fall through to `AprsKind::Raw`):
+  **telemetry (T# data values + PARM/UNIT/EQNS/BITS definition messages)**.
+  Still **not** specially parsed (fall through to `AprsKind::Raw`):
   raw GPS/NMEA (`$`), third-party traffic (`}`), station capabilities (`<`),
   user-defined / experimental formats, and reply-acks / message ack-reject
   semantics. Weather decode still extracts only the named numeric fields from
