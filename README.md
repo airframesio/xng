@@ -438,6 +438,13 @@ last-message age). The side-panel splits (table / detail pane / log) are
 drag-resizable and persisted. The page is embedded in the binary (CDN
 assets are SRI-pinned; RF-sourced strings are HTML-escaped).
 
+The same port also serves the **readsb/tar1090 data API** —
+`GET /data/aircraft.json` (every live aircraft in the readsb field schema:
+`hex`/`flight`/`alt_baro`/`gs`/`track`/`squawk`/`lat`/`lon`/`seen`/…, merged
+across ADS-B / UAT / HFDL by ICAO) and `GET /data/receiver.json` (version +
+the `receiver-pos` location) — so xng is a drop-in source for **tar1090 /
+graphs1090 / VRS** with no extra software.
+
 For **Iridium** the map adds toggleable overlays (cf. the
 iridium-toolkit live map): satellite positions with ground tracks and
 resolved names, targeted spot-beam footprints, the reconstructed

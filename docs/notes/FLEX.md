@@ -76,6 +76,22 @@ at `0x03` (ETX), and applies a garble gate (`alpha_is_garble`) so a fragment tha
 decodes to mostly non-printable bytes is dropped instead of shown. Live result:
 clean pages like `KEN NAG 2 #160888` and full hospital/logistics dispatch text.
 
+`alpha_is_garble` carries four tells, any of which condemns a page (tuned
+against the 929 MHz capture + live soak so spaced human text always survives):
+
+1. **junk-symbol fraction** over a threshold (rare symbols `^ > < ? \\ ~` … that
+   real pages almost never carry);
+2. **structureless**: a long no-space body with *any* junk symbol;
+3. **control character** — any non-whitespace control byte (a BCH-false-correct
+   that lands on e.g. `0x05`) is never a real alpha page;
+4. **run-density**: a spaceless body whose letters/digits shatter into many
+   short upper/lower/digit runs (avg run < 3 alnum chars) is machine garble —
+   this catches the zero-junk-symbol cases the others miss, e.g. random
+   mixed-case (`gMgUDJLa[7FRJc>m81JL92`) and pure-hex `u…v`-wrapped noise
+   (`uC000F7038F08015D5C64v`). A genuine no-space token (phone, long ID, URL
+   host, hex serial) runs in long same-class spans and survives; spaced text is
+   exempt from tells 2 and 4 entirely.
+
 ## Pipeline
 
 ```
