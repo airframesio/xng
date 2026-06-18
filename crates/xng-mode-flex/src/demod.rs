@@ -509,6 +509,309 @@ pub fn deinterleave_phases(syms: &[u8], mode: FlexMode, inverted: bool) -> Vec<V
     (0..n).map(|p| phases[p].clone()).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Off-air 4-level frame recovery (the two-clock model)
+// ---------------------------------------------------------------------------
+//
+// Real FLEX (verified against an off-air 6400-bps / A-code 0xDEA0 capture and
+// the multimon-ng `demod_flex.c` state machine) transmits **Sync 1 + the FIW at
+// 1600 sym/s, 2-level** for *every* mode, then switches **Sync 2 + DATA to the
+// mode's data symbol rate**. So a 6400-bps frame is 1600-sym/s sync/FIW followed
+// by 3200-sym/s 4-level data: a rate transition mid-frame.
+//
+// A single free-running symbol clock therefore cannot demodulate the whole
+// frame. [`recover_4level_frames`] instead:
+//   1. builds a per-sample FM discriminator over the channel IQ;
+//   2. hunts Sync 1 in the 1600-sym/s 2-level domain (sample-accurate), reading
+//      the A-code (mode) and FIW there;
+//   3. for each sync, recovers the DATA section at the mode's symbol rate with a
+//      decode-directed (sampling-phase, clock-ppm) search (RTL-SDR clocks drift
+//      tens of ppm; the search anchors the data symbols within a fraction of a
+//      symbol over the 1.76 s block) and a **majority-vote** 4-level slicer
+//      (per-sample slices voted over the mid-symbol — far more robust on a
+//      noisy off-air discriminator than a single center sample);
+//   4. de-interleaves into A/B/C/D phases.
+//
+// This is reported as the off-air path; the synthetic single-rate
+// [`SymbolDemod`] + [`crate::decode_symbols`] path is unchanged.
+
+/// Outer FSK deviation expressed as a per-sample discriminator value at
+/// [`CHANNEL_RATE`] (rad/sample): ±4800 Hz → ±2π·4800/64000.
+const DISC_DC_ALPHA: f32 = 0.0003;
+/// Discriminator boxcar-lowpass length (samples) used before slicing; tames the
+/// per-sample `arg()` variance that otherwise swamps the inner 4-level tones.
+const DISC_LP: usize = 7;
+
+/// One Sync-1 lock found in the 1600-sym/s 2-level domain.
+struct SyncHit {
+    /// Sample index (in the discriminator stream) of the symbol boundary right
+    /// after the FIW — the anchor from which Sync 2 + DATA are measured.
+    fiw_end_sample: f64,
+    /// Resolved on-air mode (from the A-code).
+    mode: FlexMode,
+    /// Polarity resolved at sync.
+    inverted: bool,
+    /// BCH-corrected FIW word, if it corrected.
+    fiw: Option<(u32, u32)>,
+}
+
+/// Build a per-sample FM discriminator (`arg(x·conj(prev))`) with a slow DC
+/// tracker and a short boxcar lowpass. One value per input sample.
+fn discriminator(chan: &[Complex<f32>]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(chan.len());
+    let mut prev = Complex::new(0.0f32, 0.0);
+    let mut dc = 0.0f32;
+    for &x in chan {
+        let raw = (x * prev.conj()).arg();
+        prev = x;
+        dc += DISC_DC_ALPHA * (raw - dc);
+        out.push(raw - dc);
+    }
+    if DISC_LP > 1 && out.len() > DISC_LP {
+        let mut filt = vec![0.0f32; out.len()];
+        let mut acc = 0.0f32;
+        for i in 0..out.len() {
+            acc += out[i];
+            if i >= DISC_LP {
+                acc -= out[i - DISC_LP];
+            }
+            filt[i] = acc / (i + 1).min(DISC_LP) as f32;
+        }
+        // Re-center the causal boxcar by its group delay.
+        let sh = DISC_LP / 2;
+        for i in 0..out.len() {
+            out[i] = filt[(i + sh).min(out.len() - 1)];
+        }
+    }
+    out
+}
+
+/// Integrate-and-dump a discriminator window of `frac·spb` samples around
+/// `center`.
+fn window_mean(disc: &[f32], center: f64, spb: f64, frac: f64) -> f32 {
+    let half = spb * frac / 2.0;
+    let lo = (center - half).floor().max(0.0) as usize;
+    let hi = ((center + half).ceil() as usize).min(disc.len());
+    if lo >= hi {
+        0.0
+    } else {
+        disc[lo..hi].iter().sum::<f32>() / (hi - lo) as f32
+    }
+}
+
+/// Estimate the inner/outer 4-level slice threshold as the midpoint of the two
+/// `|value|` clusters (inner ≈ 30–55th percentile, outer ≈ 80–98th). Adapts to
+/// whatever inner/outer deviation ratio the transmitter uses (real FLEX inner
+/// tones sit near ±0.53·outer, not the ±1/3 of the synthetic modulator).
+fn inner_outer_threshold(vals: &[f32]) -> f32 {
+    let mut a: Vec<f32> = vals.iter().map(|v| v.abs()).collect();
+    a.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let band = |lo: f64, hi: f64| {
+        let i = (a.len() as f64 * lo) as usize;
+        let j = (a.len() as f64 * hi) as usize;
+        if j > i {
+            a[i..j].iter().sum::<f32>() / (j - i) as f32
+        } else {
+            0.0
+        }
+    };
+    0.5 * (band(0.30, 0.55) + band(0.80, 0.98))
+}
+
+/// Slice a discriminator value into a 4-level symbol given the inner/outer
+/// threshold: sign picks the half, magnitude vs `thr` picks inner vs outer.
+fn slice4(v: f32, thr: f32) -> u8 {
+    if v >= thr {
+        3
+    } else if v >= 0.0 {
+        2
+    } else if v > -thr {
+        1
+    } else {
+        0
+    }
+}
+
+/// Hunt Sync 1 across the whole capture in the 1600-sym/s 2-level domain.
+fn find_sync_hits(disc: &[f32]) -> Vec<SyncHit> {
+    let spb_sync = CHANNEL_RATE / BAUD_1600;
+    let n = (disc.len() as f64 / spb_sync) as usize;
+    if n < 113 {
+        return Vec::new();
+    }
+    // Per-sync-symbol sliced bit + center sample index.
+    let mut bit = vec![0u8; n];
+    let mut center = vec![0f64; n];
+    for k in 0..n {
+        let c = (k as f64 + 0.5) * spb_sync;
+        center[k] = c;
+        bit[k] = (window_mean(disc, c, spb_sync, 1.0) >= 0.0) as u8;
+    }
+
+    let mut hits = Vec::new();
+    let mut k = 0usize;
+    while k + 113 < n {
+        // Sync 1 = A(16) | marker(32) | ~A(16), MSB-first across 64 sync symbols.
+        let mut buf = 0u64;
+        for j in 0..64 {
+            buf = (buf << 1) | (bit[k + j] as u64 & 1);
+        }
+        let mut matched = None;
+        for inverted in [false, true] {
+            let w = if inverted { !buf } else { buf };
+            let m = ((w & 0x0000_FFFF_FFFF_0000) >> 16) as u32;
+            let code_high = ((w & 0xFFFF_0000_0000_0000) >> 48) as u16;
+            let code_low = (!(w & 0x0000_0000_0000_FFFF)) as u16;
+            if (m ^ crate::frame::SYNC_MARKER_B).count_ones() <= 3
+                && (code_low ^ code_high).count_ones() <= 3
+            {
+                if let Some(mode) = FlexMode::from_a_code(code_high, 3) {
+                    matched = Some((inverted, mode));
+                    break;
+                }
+            }
+        }
+        let Some((inverted, mode)) = matched else {
+            k += 1;
+            continue;
+        };
+        // After Sync 1 (64 sync syms): 16 dotting + 32 FIW syms @ 1600 sym/s.
+        let fiw_first = k + 64 + 16;
+        let mut dat = 0u32;
+        for j in 0..32 {
+            let v = window_mean(disc, center[fiw_first + j], spb_sync, 1.0);
+            let b = if inverted { (v < 0.0) as u8 } else { (v >= 0.0) as u8 };
+            dat = (dat >> 1) | ((b as u32) << 31);
+        }
+        let fiw = crate::bch::correct(dat);
+        let fiw_end_sample = center[k + 111] + spb_sync / 2.0;
+        hits.push(SyncHit {
+            fiw_end_sample,
+            mode,
+            inverted,
+            fiw,
+        });
+        // Skip past this whole frame to the next hunt point.
+        let data_syms = data_symbols(mode.sym_rate);
+        let spb_data = CHANNEL_RATE / mode.sym_rate as f64;
+        let sync2 = (mode.sym_rate as f64 * 25.0 / 1000.0) * spb_data;
+        let frame_samples = (fiw_end_sample - center[k]) + sync2 + data_syms as f64 * spb_data;
+        let frame_syms = (frame_samples / spb_sync) as usize;
+        k += frame_syms.max(64);
+    }
+    hits
+}
+
+/// Recover the DATA symbols for one sync hit with a decode-directed
+/// (sampling-phase, clock-ppm) search + majority-vote 4-level slicer, returning
+/// the de-interleaved A/B/C/D phase word buffers.
+fn recover_data_phases(disc: &[f32], hit: &SyncHit) -> Option<Vec<Vec<u32>>> {
+    let mode = hit.mode;
+    let spb_data = CHANNEL_RATE / mode.sym_rate as f64;
+    let sync2 = (mode.sym_rate as f64 * 25.0 / 1000.0) as usize;
+    let n_data = data_symbols(mode.sym_rate);
+    let data0 = hit.fiw_end_sample + sync2 as f64 * spb_data;
+    if (data0 + n_data as f64 * spb_data) as usize + 2 >= disc.len() {
+        return None;
+    }
+    // At 3200 sym/s the odd-symbol (Phase C/D) stream comes off the per-sample
+    // differential discriminator polarity-inverted relative to the even (A/B)
+    // stream; complement odd symbols so all four phases share one polarity.
+    let odd_inv = mode.sym_rate == 3200;
+
+    let sample = |phase: f64, period: f64| -> Vec<u8> {
+        // Pass 1: center values → inner/outer threshold.
+        let mut centers = Vec::with_capacity(n_data);
+        for j in 0..n_data {
+            let c = data0 + (j as f64 + 0.5 + phase) * period;
+            centers.push(window_mean(disc, c, period, 1.1));
+        }
+        let thr = inner_outer_threshold(&centers);
+        // Pass 2: majority-vote per-sample slices over the mid-symbol.
+        let mut out = Vec::with_capacity(n_data);
+        for j in 0..n_data {
+            let c = data0 + (j as f64 + 0.5 + phase) * period;
+            let half = period * 0.4;
+            let lo = (c - half).floor().max(0.0) as usize;
+            let hi = ((c + half).ceil() as usize).min(disc.len());
+            let mut cnt = [0u32; 4];
+            for s in lo..hi {
+                cnt[slice4(disc[s], thr) as usize] += 1;
+            }
+            let mut best = 0u8;
+            for s in 1..4u8 {
+                if cnt[s as usize] > cnt[best as usize] {
+                    best = s;
+                }
+            }
+            if odd_inv && j % 2 == 1 {
+                best = 3 - best;
+            }
+            out.push(best);
+        }
+        out
+    };
+    let score = |syms: &[u8]| -> usize {
+        let phases = deinterleave_phases(syms, mode, hit.inverted);
+        let mut v = 0usize;
+        for ph in &phases {
+            for &raw in ph {
+                if crate::bch::correct(raw).is_some() {
+                    v += 1;
+                }
+            }
+        }
+        v
+    };
+
+    // Decode-directed search over sampling phase and clock ppm.
+    let mut best = (0.0f64, spb_data, 0usize);
+    let mut ppm = -120.0;
+    while ppm <= 120.0 {
+        let period = spb_data * (1.0 + ppm / 1e6);
+        let mut phase = -0.1;
+        while phase <= 0.6 {
+            let syms = sample(phase, period);
+            let v = score(&syms);
+            if v > best.2 {
+                best = (phase, period, v);
+            }
+            phase += 0.1;
+        }
+        ppm += 20.0;
+    }
+    let syms = sample(best.0, best.1);
+    Some(deinterleave_phases(&syms, mode, hit.inverted))
+}
+
+/// Recover all 4-level FLEX frames from a channel-rate IQ buffer using the
+/// two-clock model. Returns, per sync, the resolved mode, FIW, and the
+/// de-interleaved A/B/C/D phase word buffers — the decode layer then walks each
+/// phase's BIW → address → vector → message structure.
+///
+/// `expected_baud` filters syncs to one rate (so an auto-detect lane locked to
+/// 6400 ignores a stray 3200 burst); pass `0` to accept any 4-level rate.
+#[allow(clippy::type_complexity)]
+pub fn recover_4level_frames(
+    chan: &[Complex<f32>],
+    expected_baud: u32,
+) -> Vec<(FlexMode, Option<(u32, u32)>, Vec<Vec<u32>>)> {
+    let disc = discriminator(chan);
+    let mut out = Vec::new();
+    for hit in find_sync_hits(&disc) {
+        if hit.mode.levels != 4 {
+            continue;
+        }
+        if expected_baud != 0 && hit.mode.baud() != expected_baud {
+            continue;
+        }
+        if let Some(phases) = recover_data_phases(&disc, &hit) {
+            out.push((hit.mode, hit.fiw, phases));
+        }
+    }
+    out
+}
+
 /// Assemble 32 bits starting at `bits[start]` into a u32 word, MSB-first.
 /// Returns `None` if fewer than 32 bits remain.
 pub fn word_at_msb(bits: &[u8], start: usize) -> Option<u32> {

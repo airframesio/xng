@@ -138,6 +138,20 @@ pub fn decode_bits(bits: &[u8], baud: u32) -> Vec<FlexFrame> {
         // the 32-bit marker we step past it and the trailing 16-bit C field to
         // reach the FIW.
         let abs = search_from + sync_off;
+        // A-code GATE: the 16 bits before the marker are the per-rate A-code.
+        // The 1600-bps 2-level path must only decode a Sync 1 whose A-code is a
+        // **1600 sym/s 2-level** mode — otherwise a 4-level (3200/6400) burst,
+        // whose Sync 1 is still 2-level @ 1600 and so matches the marker here,
+        // would be mis-decoded as 1600 (the historical garbage bug). This makes
+        // the auto-detect lanes self-gating on the A-code.
+        if abs >= 16 && !a_code_is_1600_2level(bits, abs, inverted) {
+            let advance = (sync_off + 32).max(32);
+            if search_from + advance >= bits.len() {
+                break;
+            }
+            search_from += advance;
+            continue;
+        }
         let fiw_pos = abs + 32 + 16; // marker + 16-bit inverted-A
         let frame = decode_frame(bits, fiw_pos, inverted, baud);
         let consumed = 32 + 16 + (1 + frame::WORDS_PER_PHASE) * 32;
@@ -149,6 +163,21 @@ pub fn decode_bits(bits: &[u8], baud: u32) -> Vec<FlexFrame> {
         search_from += advance;
     }
     out
+}
+
+/// Read the 16-bit Sync-1 A-code (the 16 bits ending right before the 32-bit
+/// marker at `marker_pos`, MSB-first) and test whether it resolves to a 1600
+/// sym/s **2-level** mode. `inverted` flips polarity to match the sync lock.
+fn a_code_is_1600_2level(bits: &[u8], marker_pos: usize, inverted: bool) -> bool {
+    let mut a = 0u16;
+    for &b in &bits[marker_pos - 16..marker_pos] {
+        let bit = if inverted { b ^ 1 } else { b };
+        a = (a << 1) | (bit as u16 & 1);
+    }
+    matches!(
+        demod::FlexMode::from_a_code(a, SYNC_MAX_ERR),
+        Some(m) if m.sym_rate == 1600 && m.levels == 2
+    )
 }
 
 /// Decode all FLEX frames found in a 4-level **symbol** stream (0..=3).
@@ -376,6 +405,146 @@ fn decode_phase_words(
     out
 }
 
+/// Decode the off-air 4-level recovered phases produced by
+/// [`demod::recover_4level_frames`] into [`FlexFrame`]s.
+///
+/// `phases` holds the de-interleaved A/B/C/D phase word buffers (raw 32-bit
+/// codewords). Each phase is BCH-corrected then walked through the BIW → address
+/// → vector → message structure (the off-air alpha body honors the FLEX
+/// per-message header word + fragment-flag char that real transmissions carry,
+/// which the synthetic spec frames omit — see [`decode_alpha_offair`]).
+fn decode_recovered_frames(
+    mode: demod::FlexMode,
+    fiw: Option<(u32, u32)>,
+    phases: &[Vec<u32>],
+    baud: u32,
+) -> Vec<FlexFrame> {
+    let Some((fiw_word, fiw_fix)) = fiw else {
+        return Vec::new();
+    };
+    let _ = mode;
+    let mut out = Vec::new();
+    for phase in phases {
+        let mut words = Vec::with_capacity(frame::WORDS_PER_PHASE);
+        let mut fixes = Vec::with_capacity(frame::WORDS_PER_PHASE);
+        for &raw in phase {
+            match bch::correct(raw) {
+                Some((w, fix)) => {
+                    words.push(w & 0x001F_FFFF);
+                    fixes.push(fix);
+                }
+                None => {
+                    words.push(0);
+                    fixes.push(0);
+                }
+            }
+        }
+        out.extend(decode_phase_words_offair(fiw_word, fiw_fix, &words, &fixes, baud));
+    }
+    out
+}
+
+/// Like [`decode_phase_words`] but using the real-FLEX alpha body layout (header
+/// word + fragment-flag char skip). Used only by the off-air 4-level path.
+fn decode_phase_words_offair(
+    fiw_word: u32,
+    fiw_fix: u32,
+    words: &[u32],
+    fixes: &[u32],
+    baud: u32,
+) -> Vec<FlexFrame> {
+    let mut out = Vec::new();
+    let fiw = frame::parse_fiw(fiw_word);
+    if words.is_empty() {
+        return out;
+    }
+    let biw = frame::parse_biw(words[0]);
+    let aoff = biw.address_offset;
+    let voff = biw.vector_offset;
+    if aoff >= words.len() || voff == 0 || voff > words.len() {
+        return out;
+    }
+    let addr_end = voff.min(words.len());
+    let mut i = aoff;
+    while i < addr_end {
+        let aw1 = words[i];
+        if aw1 == 0 {
+            i += 1;
+            continue;
+        }
+        let addr = frame::decode_short_address(aw1);
+        let vidx = voff + (i - aoff);
+        if vidx >= words.len() {
+            break;
+        }
+        let viw = words[vidx];
+        let page_type = PageType::from_viw(viw);
+        let mut fec = fiw_fix + fixes[i] + fixes[vidx];
+        let mut raw_words = vec![fiw_word, aw1, viw];
+        let mw1 = ((viw >> 7) & 0x7F) as usize;
+        let len = ((viw >> 14) & 0x7F) as usize;
+
+        let (kind, text) = match page_type {
+            PageType::Tone | PageType::Secure | PageType::ShortInstruction => {
+                (FlexKind::Tone, String::new())
+            }
+            PageType::Alphanumeric | PageType::Binary => {
+                let body = collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
+                (FlexKind::Alpha, decode_alpha_offair(&body))
+            }
+            PageType::StandardNumeric | PageType::SpecialNumeric | PageType::NumberedNumeric => {
+                let body = collect_message(words, fixes, mw1, len, &mut fec, &mut raw_words);
+                (FlexKind::Numeric, frame::decode_numeric(&body))
+            }
+        };
+        let raw = raw_words.iter().flat_map(|w| w.to_be_bytes()).collect();
+        out.push(FlexFrame {
+            capcode: addr.capcode,
+            long_address: addr.long,
+            cycle: fiw.cycle,
+            frame: fiw.frame,
+            baud,
+            kind,
+            page_type,
+            text,
+            fec_corrected: fec,
+            raw,
+        });
+        i += 1;
+    }
+    out
+}
+
+/// Decode a real-FLEX alphanumeric body. The FIRST word of the body
+/// (`words[0]`) is a per-message **header** carrying fragment (bits 11..=12) and
+/// continuation (bit 10) flags — NOT text. Text starts at `words[1]`; the very
+/// first text character is a fragment-check byte that is dropped when the
+/// fragment field == 0x03. (multimon-ng `parse_alphanumeric`.) Remaining 7-bit
+/// chars decode as usual (0x03 ETX separators dropped, trailing control trimmed).
+fn decode_alpha_offair(words: &[u32]) -> String {
+    if words.len() < 2 {
+        return String::new();
+    }
+    let frag = (words[0] >> 11) & 0x03;
+    let mut out = String::new();
+    for (wi, &w) in words[1..].iter().enumerate() {
+        let data = w & 0x001F_FFFF;
+        for c in 0..3 {
+            if wi == 0 && c == 0 && frag == 0x03 {
+                continue;
+            }
+            let ch = ((data >> (c * 7)) & 0x7F) as u8;
+            if ch != 0x03 {
+                out.push(ch as char);
+            }
+        }
+    }
+    while matches!(out.chars().last(), Some(c) if (c as u32) < 0x20) {
+        out.pop();
+    }
+    out
+}
+
 /// Gather the message-word data fields for a page body, summing FEC and raw.
 fn collect_message(
     words: &[u32],
@@ -395,25 +564,172 @@ fn collect_message(
     body
 }
 
+/// One full demod+decode lane for a single FLEX information rate.
+///
+/// A lane owns its own demod (2-level [`demod::FskDemod`] for 1600 bps, or
+/// 4-level [`demod::SymbolDemod`] for 3200 / 6400 bps), the recovered
+/// bit/symbol stream, and its incremental scan cursor. `decode_new` re-scans
+/// only the newly demodulated tail (plus one frame of overlap) and returns the
+/// frames found there. Sync 1 + the FIW are always 1600 sym/s 2-level on air,
+/// but for the 4-level lanes the lane's [`demod::SymbolDemod`] reads them as the
+/// outer symbols {0,3}; the lane's `decode_symbols` only accepts a Sync 1 whose
+/// **A-code resolves to this lane's rate**, so a 3200-sym/s burst never decodes
+/// in the 1600-sym/s lane and vice-versa.
+struct Lane {
+    /// Resolved on-air mode (symbol rate + levels) for this lane's baud.
+    mode: demod::FlexMode,
+    /// 2-level NRZ bit demod (1600 bps path).
+    bit_demod: Option<demod::FskDemod>,
+    /// 4-level single-rate symbol demod (used by FIXED 3200/6400 constructors and
+    /// the synthetic modulate→demod tests, where the whole frame is one rate).
+    sym_demod: Option<demod::SymbolDemod>,
+    baud: u32,
+    /// Recovered bits (2-level) or symbols 0..=3 (single-rate 4-level).
+    stream: Vec<u8>,
+    scanned_to: usize,
+    /// Off-air two-clock recovery for 4-level (auto path only): real FLEX sends
+    /// Sync 1 + FIW at 1600 sym/s and DATA at the mode rate, a transition no
+    /// single demod handles — so buffer channel IQ and recover per frame.
+    offair_4level: bool,
+    iq: Vec<Complex<f32>>,
+    iq_scanned_to: usize,
+    level: f32,
+}
+
+impl Lane {
+    /// A fixed-rate lane: 2-level NRZ bits, or single-rate 4-level symbols.
+    fn new(baud: u32) -> Self {
+        Self::build(baud, false)
+    }
+
+    /// An auto-path lane: 4-level rates use the off-air two-clock recovery.
+    fn new_auto(baud: u32) -> Self {
+        let mode = demod::FlexMode::from_baud(baud).expect("validated baud");
+        Self::build(baud, mode.levels == 4)
+    }
+
+    fn build(baud: u32, offair_4level: bool) -> Self {
+        // `baud` is pre-validated by the caller (FlexMode::from_baud).
+        let mode = demod::FlexMode::from_baud(baud).expect("validated baud");
+        let (bit_demod, sym_demod) = if mode.levels == 2 {
+            (Some(demod::FskDemod::new(mode.sym_rate as f64)), None)
+        } else if offair_4level {
+            (None, None)
+        } else {
+            (None, Some(demod::SymbolDemod::new(mode.sym_rate as f64)))
+        };
+        Self {
+            mode,
+            bit_demod,
+            sym_demod,
+            baud,
+            stream: Vec::new(),
+            scanned_to: 0,
+            offair_4level,
+            iq: Vec::new(),
+            iq_scanned_to: 0,
+            level: 0.0,
+        }
+    }
+
+    /// Feed a channel-rate IQ chunk. 2-level / single-rate 4-level lanes demod to
+    /// their bit/symbol stream; the off-air 4-level lane buffers the IQ.
+    fn feed(&mut self, channel: &[Complex<f32>]) {
+        if self.offair_4level {
+            for &x in channel {
+                self.level += 0.002 * (x.norm_sqr() - self.level);
+            }
+            self.iq.extend_from_slice(channel);
+            return;
+        }
+        match (&mut self.bit_demod, &mut self.sym_demod) {
+            (Some(d), _) => d.process(channel, &mut self.stream),
+            (_, Some(d)) => d.process(channel, &mut self.stream),
+            _ => unreachable!("lane has neither demod"),
+        }
+    }
+
+    /// Decode newly available data (with one frame of overlap so a frame
+    /// straddling a chunk boundary still completes).
+    fn decode_new(&mut self) -> Vec<FlexFrame> {
+        if self.offair_4level {
+            // Off-air two-clock recovery over the new IQ tail + one frame overlap.
+            let spb = CHANNEL_RATE / self.mode.sym_rate as f64;
+            let frame_samples =
+                ((64.0 + 48.0 + 80.0) + demod::data_symbols(self.mode.sym_rate) as f64) * spb;
+            let start = self.iq_scanned_to.saturating_sub(frame_samples as usize);
+            let mut out = Vec::new();
+            for (mode, fiw, phases) in demod::recover_4level_frames(&self.iq[start..], self.baud) {
+                out.extend(decode_recovered_frames(mode, fiw, &phases, self.baud));
+            }
+            self.iq_scanned_to = self.iq.len();
+            return out;
+        }
+        if self.mode.levels == 2 {
+            let overlap = 32 + 16 + (1 + frame::WORDS_PER_PHASE) * 32;
+            let start = self.scanned_to.saturating_sub(overlap);
+            let d = decode_bits(&self.stream[start..], self.baud);
+            self.scanned_to = self.stream.len();
+            d
+        } else {
+            let overlap = 64 + 48 + 80 + demod::data_symbols(self.mode.sym_rate);
+            let start = self.scanned_to.saturating_sub(overlap);
+            let d = decode_symbols(&self.stream[start..], self.baud);
+            self.scanned_to = self.stream.len();
+            d
+        }
+    }
+
+    /// Smoothed channel power level in dBFS.
+    fn level_dbfs(&self) -> f32 {
+        if self.offair_4level {
+            return 10.0 * self.level.max(1e-12).log10();
+        }
+        match (&self.bit_demod, &self.sym_demod) {
+            (Some(d), _) => d.level_dbfs(),
+            (_, Some(d)) => d.level_dbfs(),
+            _ => f32::NEG_INFINITY,
+        }
+    }
+}
+
+/// Lane configuration for a [`FlexChannelDecoder`]: a single fixed-rate lane, or
+/// the auto-detect race across all three FLEX rates.
+enum LaneMode {
+    /// One lane at the explicitly requested baud.
+    Fixed(Lane),
+    /// One lane per FLEX rate, racing off the same channel IQ until one of them
+    /// decodes a frame (the Sync 1 A-code makes the race self-gating: a burst
+    /// only ever decodes in the lane whose rate its A-code resolves to). Once a
+    /// lane produces frames it is locked and the others are dropped.
+    Auto {
+        lanes: Vec<Lane>,
+        locked: Option<usize>,
+    },
+}
+
 /// Decodes one FLEX channel out of a wideband capture.
 ///
 /// Mirrors the POCSAG [`xng_mode_pocsag::PocsagChannelDecoder`] contract: owns
 /// an internal [`Ddc`] that mixes by `freq_offset_hz` and decimates the capture
 /// to [`CHANNEL_RATE`], runs the FSK demod at the configured baud, and emits
 /// [`FlexFrame`]s as frames are recovered.
+///
+/// Two modes:
+/// - **Fixed baud** ([`FlexChannelDecoder::new`] with `baud` ∈ {1600, 3200,
+///   6400}): one demod at the given rate.
+/// - **Auto rate** ([`FlexChannelDecoder::new_auto`], or `new(.., 0)`): all
+///   three rates are demodulated in parallel off the *same* channel IQ (the
+///   shared [`CHANNEL_RATE`] is an integer-bit multiple of every rate, so one
+///   DDC serves all). The FLEX Sync 1 A-code already encodes the on-air rate, so
+///   each lane's decode is self-gating — a 4-level 6400 burst never decodes in
+///   the 1600 lane. Whichever lane first decodes a real frame is locked for the
+///   rest of the session, so a single decoder handles any FLEX rate on air
+///   without being told it in advance.
 pub struct FlexChannelDecoder {
     ddc: Option<Ddc>,
-    /// Resolved on-air mode (symbol rate + levels) for the configured baud.
-    mode: demod::FlexMode,
-    /// 2-level NRZ bit demod (1600 bps path).
-    bit_demod: Option<demod::FskDemod>,
-    /// 4-level symbol demod (3200 / 6400 bps path).
-    sym_demod: Option<demod::SymbolDemod>,
-    baud: u32,
-    /// Recovered bits (2-level) or symbols 0..=3 (4-level).
-    stream: Vec<u8>,
+    mode: LaneMode,
     channel_buf: Vec<Complex<f32>>,
-    scanned_to: usize,
     seen: Vec<String>,
 }
 
@@ -421,42 +737,75 @@ impl FlexChannelDecoder {
     /// `input_rate` is any capture rate ≥ [`CHANNEL_RATE`] (a non-integer
     /// multiple is resampled by the DDC). `freq_offset_hz` is the FLEX channel
     /// center relative to the capture center. `baud` is the information bit
-    /// rate: **1600** (2-FSK), **3200** (4-FSK, 1600 sym/s, Phases A/B), or
-    /// **6400** (4-FSK, 3200 sym/s, Phases A/B/C/D).
+    /// rate: **1600** (2-FSK), **3200** (4-FSK, 1600 sym/s, Phases A/B),
+    /// **6400** (4-FSK, 3200 sym/s, Phases A/B/C/D), **or `0` to auto-detect the
+    /// rate from the Sync 1 A-code** (equivalent to [`new_auto`](Self::new_auto)).
     pub fn new(input_rate: f64, freq_offset_hz: f64, baud: u32) -> Result<Self, String> {
-        let mode = demod::FlexMode::from_baud(baud).ok_or_else(|| {
-            format!("unsupported FLEX baud {baud}; supported: 1600 (2-FSK), 3200 & 6400 (4-FSK)")
+        if baud == 0 {
+            return Self::new_auto(input_rate, freq_offset_hz);
+        }
+        demod::FlexMode::from_baud(baud).ok_or_else(|| {
+            format!(
+                "unsupported FLEX baud {baud}; use 1600 (2-FSK), 3200 / 6400 (4-FSK), or 0 for auto"
+            )
         })?;
-        let ddc = if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
-            None
-        } else {
-            Some(Ddc::new(
-                input_rate,
-                CHANNEL_RATE,
-                freq_offset_hz,
-                CHANNEL_PASSBAND_HZ,
-            )?)
-        };
-        let (bit_demod, sym_demod) = if mode.levels == 2 {
-            (Some(demod::FskDemod::new(mode.sym_rate as f64)), None)
-        } else {
-            (None, Some(demod::SymbolDemod::new(mode.sym_rate as f64)))
-        };
         Ok(Self {
-            ddc,
-            mode,
-            bit_demod,
-            sym_demod,
-            baud,
-            stream: Vec::new(),
+            ddc: Self::make_ddc(input_rate, freq_offset_hz)?,
+            mode: LaneMode::Fixed(Lane::new(baud)),
             channel_buf: Vec::new(),
-            scanned_to: 0,
             seen: Vec::new(),
         })
     }
 
+    /// Auto-detect the FLEX rate (1600 / 3200 / 6400 bps) from the on-air
+    /// signal. Every rate is demodulated in parallel off the same channel IQ;
+    /// the Sync 1 A-code (read at the always-1600 sym/s sync) selects the data
+    /// rate, so each lane's `decode_symbols`/`decode_bits` only commits a burst
+    /// whose A-code resolves to that lane's rate. The first lane to decode a
+    /// frame is locked for the session. Use this when the channel's rate is
+    /// unknown — real US paging is commonly 4-level (3200 / 6400 bps), not the
+    /// 1600-bps base rate.
+    pub fn new_auto(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let lanes = vec![
+            Lane::new_auto(1600),
+            Lane::new_auto(3200),
+            Lane::new_auto(6400),
+        ];
+        Ok(Self {
+            ddc: Self::make_ddc(input_rate, freq_offset_hz)?,
+            mode: LaneMode::Auto { lanes, locked: None },
+            channel_buf: Vec::new(),
+            seen: Vec::new(),
+        })
+    }
+
+    fn make_ddc(input_rate: f64, freq_offset_hz: f64) -> Result<Option<Ddc>, String> {
+        if (input_rate - CHANNEL_RATE).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+            Ok(None)
+        } else {
+            Ok(Some(Ddc::new(
+                input_rate,
+                CHANNEL_RATE,
+                freq_offset_hz,
+                CHANNEL_PASSBAND_HZ,
+            )?))
+        }
+    }
+
+    /// The information bit rate currently in use: the fixed rate, or the locked
+    /// auto-detected rate, or `None` if auto-detect has not yet committed.
+    pub fn baud(&self) -> Option<u32> {
+        match &self.mode {
+            LaneMode::Fixed(lane) => Some(lane.baud),
+            LaneMode::Auto { lanes, locked: Some(i) } => Some(lanes[*i].baud),
+            LaneMode::Auto { .. } => None,
+        }
+    }
+
     /// Feed capture IQ; returns newly completed FLEX frames.
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<FlexFrame> {
+        // DDC once; every lane shares the same channel IQ (CHANNEL_RATE is an
+        // integer-bit multiple of all three rates).
         let channel: &[Complex<f32>] = match &mut self.ddc {
             Some(ddc) => {
                 self.channel_buf.clear();
@@ -465,28 +814,38 @@ impl FlexChannelDecoder {
             }
             None => input,
         };
-        match (&mut self.bit_demod, &mut self.sym_demod) {
-            (Some(d), _) => d.process(channel, &mut self.stream),
-            (_, Some(d)) => d.process(channel, &mut self.stream),
-            _ => unreachable!("decoder has neither demod"),
-        }
 
-        let decoded = if self.mode.levels == 2 {
-            // Re-scan from a small overlap so a sync straddling a chunk boundary
-            // is still found; dedup against what's already emitted.
-            let overlap = 32 + 16 + (1 + frame::WORDS_PER_PHASE) * 32;
-            let start = self.scanned_to.saturating_sub(overlap);
-            let d = decode_bits(&self.stream[start..], self.baud);
-            self.scanned_to = self.stream.len();
-            d
-        } else {
-            // 4-level: a full frame spans Sync1+FIW+Sync2+DATA symbols; overlap
-            // by one whole frame so a sync near a boundary still completes.
-            let overlap = 64 + 48 + 80 + demod::data_symbols(self.mode.sym_rate);
-            let start = self.scanned_to.saturating_sub(overlap);
-            let d = decode_symbols(&self.stream[start..], self.baud);
-            self.scanned_to = self.stream.len();
-            d
+        let decoded = match &mut self.mode {
+            LaneMode::Fixed(lane) => {
+                lane.feed(channel);
+                lane.decode_new()
+            }
+            LaneMode::Auto { lanes, locked } => {
+                if let Some(i) = locked {
+                    let lane = &mut lanes[*i];
+                    lane.feed(channel);
+                    lane.decode_new()
+                } else {
+                    // Race: feed every lane, decode each, and lock the first lane
+                    // that produces a frame. The A-code gate inside each lane's
+                    // decode means only the true-rate lane can ever decode, so
+                    // the lock is correct as soon as any frame appears.
+                    let mut decoded = Vec::new();
+                    let mut winner = None;
+                    for (i, lane) in lanes.iter_mut().enumerate() {
+                        lane.feed(channel);
+                        let frames = lane.decode_new();
+                        if !frames.is_empty() && winner.is_none() {
+                            winner = Some(i);
+                            decoded = frames;
+                        }
+                    }
+                    if let Some(i) = winner {
+                        *locked = Some(i);
+                    }
+                    decoded
+                }
+            }
         };
 
         let mut out = Vec::new();
@@ -508,12 +867,16 @@ impl FlexChannelDecoder {
         out
     }
 
-    /// Smoothed channel power level in dBFS.
+    /// Smoothed channel power level in dBFS. During auto-detect (before lock)
+    /// this reflects the first lane's estimate; once a rate is fixed or locked
+    /// it is that lane's level.
     pub fn level_dbfs(&self) -> f32 {
-        match (&self.bit_demod, &self.sym_demod) {
-            (Some(d), _) => d.level_dbfs(),
-            (_, Some(d)) => d.level_dbfs(),
-            _ => f32::NEG_INFINITY,
+        match &self.mode {
+            LaneMode::Fixed(lane) => lane.level_dbfs(),
+            LaneMode::Auto { lanes, locked: Some(i) } => lanes[*i].level_dbfs(),
+            LaneMode::Auto { lanes, .. } => {
+                lanes.first().map(|l| l.level_dbfs()).unwrap_or(f32::NEG_INFINITY)
+            }
         }
     }
 }
@@ -667,6 +1030,83 @@ mod tests {
         assert_eq!(f.frame, 33);
         assert_eq!(f.page_type, PageType::Alphanumeric);
         assert!(f.text.starts_with("HELLO WORLD"), "got {:?}", f.text);
+    }
+
+    /// `new(.., 0)` is the documented alias for `new_auto`: it routes to the
+    /// auto path (no committed baud until a signal locks one).
+    #[test]
+    fn new_with_zero_baud_selects_auto() {
+        let dec = FlexChannelDecoder::new(CHANNEL_RATE, 0.0, 0).unwrap();
+        assert_eq!(dec.baud(), None, "baud 0 must select auto (no fixed rate yet)");
+        let dec_auto = FlexChannelDecoder::new_auto(CHANNEL_RATE, 0.0).unwrap();
+        assert_eq!(dec_auto.baud(), None);
+        // Fixed constructors report their rate immediately.
+        assert_eq!(
+            FlexChannelDecoder::new(CHANNEL_RATE, 0.0, 6400).unwrap().baud(),
+            Some(6400)
+        );
+        // Unsupported baud is rejected.
+        assert!(FlexChannelDecoder::new(CHANNEL_RATE, 0.0, 2400).is_err());
+    }
+
+    /// A-code GATE: a Sync 1 whose A-code is a 4-level mode (here the 6400-bps
+    /// `0xDEA0`) must NOT decode in the 1600-bps 2-level path — otherwise the
+    /// 4-level data (whose Sync 1 is still 2-level @1600) would be mis-read as
+    /// 1600. This is what makes the auto-detect lanes self-gating on the A-code.
+    #[test]
+    fn decode_bits_rejects_non_1600_a_code() {
+        let words = build_alpha_frame(1_234_567, 7, 33, "HELLO WORLD");
+        // Build a Sync 1 with the 6400-bps 4-level A-code (0xDEA0) before the
+        // marker: preamble | A | marker | ~A | data.
+        let a = demod::A_CODE_3200_4;
+        let mut bits = Vec::new();
+        for i in 0..64 {
+            bits.push((i % 2 == 0) as u8);
+        }
+        for i in (0..16).rev() {
+            bits.push(((a >> i) & 1) as u8); // A-code, MSB-first
+        }
+        for i in (0..32).rev() {
+            bits.push(((frame::SYNC_MARKER_B >> i) & 1) as u8); // marker
+        }
+        for i in (0..16).rev() {
+            bits.push((((!a) >> i) & 1) as u8); // ~A field
+        }
+        for &w in &words {
+            modulate::push_word_lsb(&mut bits, w);
+        }
+        // The 1600 path must reject this (wrong A-code) → no frames.
+        let frames = decode_bits(&bits, 1600);
+        assert!(
+            frames.is_empty(),
+            "1600 path must reject a 4-level A-code Sync 1; got {frames:?}"
+        );
+        // But a genuine 1600 A-code (via frame_bits) decodes fine.
+        let ok = modulate::frame_bits(64, &build_alpha_frame(1_234_567, 7, 33, "HELLO WORLD"));
+        assert!(decode_bits(&ok, 1600).iter().any(|f| f.capcode == 1_234_567));
+    }
+
+    /// Auto-detect must NOT false-lock on pure noise (no valid Sync 1 / A-code
+    /// anywhere) — baud stays unset and no frames are emitted.
+    #[test]
+    fn auto_does_not_lock_on_noise() {
+        let mut dec = FlexChannelDecoder::new_auto(CHANNEL_RATE, 0.0).unwrap();
+        // Deterministic pseudo-random complex noise.
+        let mut lfsr = 0x1357_9BDFu32;
+        let noise: Vec<Complex<f32>> = (0..200_000)
+            .map(|_| {
+                lfsr ^= lfsr << 13;
+                lfsr ^= lfsr >> 17;
+                lfsr ^= lfsr << 5;
+                let re = (lfsr & 0xFFFF) as f32 / 32768.0 - 1.0;
+                lfsr ^= lfsr << 7;
+                let im = (lfsr & 0xFFFF) as f32 / 32768.0 - 1.0;
+                Complex::new(re, im)
+            })
+            .collect();
+        let frames = dec.process(&noise);
+        assert!(frames.is_empty(), "auto false-locked on noise: {frames:?}");
+        assert_eq!(dec.baud(), None, "auto committed a baud on pure noise");
     }
 
     /// Spec-constructed numeric page: digits via the FLEX 4-bit table.
@@ -844,9 +1284,11 @@ mod tests {
         d.process(&noisy, &mut rx);
         let (sync_off, inverted) =
             demod::find_sync(&rx, SYNC_MAX_ERR).expect("sync must lock in BER test");
-        // Data region begins after the 32-bit marker in both tx and rx.
+        // Data region begins after the 32-bit marker in both tx and rx. In tx
+        // the marker follows preamble(600) + the 16-bit A-code, so it ends at
+        // 600 + 16 + 32.
         let data_start_rx = sync_off + 32;
-        let data_start_tx = 600 + 32;
+        let data_start_tx = 600 + 16 + 32;
 
         let mut errors = 0usize;
         let mut total = 0usize;

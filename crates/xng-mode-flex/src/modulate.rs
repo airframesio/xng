@@ -36,24 +36,29 @@ pub fn push_word_lsb(bits: &mut Vec<u8>, w: u32) {
 }
 
 /// Build the on-air bit stream for a FLEX transmission, matching the FLEX
-/// Sync 1 structure `AAAA : A6C6AAAA : CCCC`:
-/// `preamble_bits` of alternating 1/0 dotting, then the Sync 1 marker
-/// (`0xA6C6AAAA`, MSB-first), then the 16-bit C field (inverted-A), then the
-/// supplied 32-bit data words LSB-first (FIW, then the 88 phase words).
+/// Sync 1 structure `… dotting : A : A6C6AAAA : ~A : FIW …`:
+/// `preamble_bits` of alternating 1/0 dotting, the 16-bit **A-code**
+/// ([`demod::A_CODE_1600_2`], MSB-first), then the Sync 1 marker
+/// (`0xA6C6AAAA`, MSB-first), then the 16-bit ~A field, then the supplied 32-bit
+/// data words LSB-first (FIW, then the 88 phase words).
 ///
-/// The decoder ([`crate::decode_bits`]) locks the 32-bit marker and then skips
-/// the trailing 16-bit C field to reach the FIW, so the modulator emits that
-/// 16-bit field to keep the on-air layout faithful.
+/// The A-code preceding the marker is the per-rate mode selector; the 1600-bps
+/// path's A-code gate ([`crate::decode_bits`]) reads it, so this is the 1600
+/// 2-level code. The decoder locks the 32-bit marker, reads the A-code before
+/// it, then skips the trailing 16-bit ~A field to reach the FIW.
 pub fn frame_bits(preamble_bits: usize, data_words: &[u32]) -> Vec<u8> {
-    let mut bits = Vec::with_capacity(preamble_bits + 48 + data_words.len() * 32);
+    let a = demod::A_CODE_1600_2;
+    let mut bits = Vec::with_capacity(preamble_bits + 64 + data_words.len() * 32);
     for i in 0..preamble_bits {
         bits.push((i % 2 == 0) as u8);
     }
+    // 16-bit A-code (1600 sym/s 2-level), MSB-first.
+    for i in (0..16).rev() {
+        bits.push(((a >> i) & 1) as u8);
+    }
     push_word_msb(&mut bits, crate::frame::SYNC_MARKER_B);
-    // 16-bit C field (inverted A). A is the per-rate sync code; for the test
-    // waveform the exact value is immaterial — the decoder only skips 16 bits
-    // here — so emit a representative inverted-A pattern (0x870C ^ 0xFFFF).
-    let c = (0x870Cu32 ^ 0xFFFF) & 0xFFFF;
+    // 16-bit ~A field, MSB-first.
+    let c = !a;
     for i in (0..16).rev() {
         bits.push(((c >> i) & 1) as u8);
     }
@@ -309,16 +314,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frame_bits_has_preamble_then_marker() {
+    fn frame_bits_has_preamble_acode_then_marker() {
         let bits = frame_bits(8, &[]);
-        // 8 preamble + 32 marker + 16 C field.
-        assert_eq!(bits.len(), 56);
+        // 8 preamble + 16 A-code + 32 marker + 16 ~A field.
+        assert_eq!(bits.len(), 72);
         assert_eq!(&bits[..8], &[1, 0, 1, 0, 1, 0, 1, 0]);
+        // A-code (1600 2-level) precedes the marker, MSB-first.
+        let mut a = 0u16;
+        for &b in &bits[8..24] {
+            a = (a << 1) | b as u16;
+        }
+        assert_eq!(a, demod::A_CODE_1600_2);
+        // Then the 32-bit frame-sync marker.
         let mut w = 0u32;
-        for &b in &bits[8..40] {
+        for &b in &bits[24..56] {
             w = (w << 1) | b as u32;
         }
         assert_eq!(w, crate::frame::SYNC_MARKER_B);
+        // Then the ~A field.
+        let mut c = 0u16;
+        for &b in &bits[56..72] {
+            c = (c << 1) | b as u16;
+        }
+        assert_eq!(c, !demod::A_CODE_1600_2);
     }
 
     #[test]
