@@ -125,10 +125,22 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; OpenStreetMap, &copy; CARTO · silhouettes &copy; <a href="https://github.com/plane-watch/pw-silhouettes">Plane Watch</a>', maxZoom: 18,
 }).addTo(map);
 
+// Entity markers live in per-class layer groups so the layer control can
+// toggle Flights / Ships / Beacons. Visible by default.
+const flightLayer = L.layerGroup().addTo(map);
+const shipLayer = L.layerGroup().addTo(map);
+const beaconLayer = L.layerGroup().addTo(map);
+// "Show All Trails": by default a position trail is drawn only for the
+// selected entity; this toggle reveals every entity's trail. Backed by an
+// (otherwise empty) group so it lives in the Leaflet layer control — the real
+// work is the showAllTrails flag read in upsert().
+const trailLayer = L.layerGroup();
+let showAllTrails = localStorage.getItem('xng.trails') === '1';
+
 // Optional Iridium overlays: satellite positions + the targeted ring/beam
-// ground footprints (cf. iridium-toolkit live-map). Toggle via the layer
-// control; visibility is persisted. Kept out of the aircraft/vessel
-// auto-fit so global satellite positions never yank the view.
+// ground footprints (cf. iridium-toolkit live-map). Added to the control only
+// when Iridium is running. Kept out of the aircraft/vessel auto-fit so global
+// satellite positions never yank the view.
 const satLayer = L.layerGroup();
 const ringLayer = L.layerGroup();
 // Beam pattern: the full reconstructed 48-cell pattern projected under each
@@ -137,21 +149,54 @@ const patternLayer = L.layerGroup();
 // Mobile terminals: Iridium customer devices (vessels/aircraft/handhelds)
 // that report their own position — distinct from the beam footprints.
 const deviceLayer = L.layerGroup();
-L.control.layers(null,
-  { '<i class="lyr-ic">🛰</i>Iridium satellites': satLayer, '<i class="lyr-ic">◎</i>Spot beams': ringLayer,
-    '<i class="lyr-ic">⬡</i>Beam pattern': patternLayer, '<i class="lyr-ic">📟</i>Iridium terminals': deviceLayer },
-  { position: 'topright', collapsed: false }).addTo(map);
-if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
-if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
-if (localStorage.getItem('xng.deviceLayer') !== '0') deviceLayer.addTo(map);
 // "Beam pattern" (the toggle) means show ALL satellites' patterns; selecting a
 // satellite overrides it to show only that one. `patternShowAll` tracks the
 // checkbox intent; `patternForcing` marks our own programmatic add/remove (when
 // a pin reveals a pattern) so it isn't mistaken for a user toggle.
 let patternShowAll = localStorage.getItem('xng.patternLayer') === '1';
 let patternForcing = false;
-if (patternShowAll) patternLayer.addTo(map);
-map.on('overlayadd overlayremove', () => {
+
+// Build the layer control ONCE, after the first snapshot, with only the
+// overlays relevant to the modes that are actually running (or already
+// producing data) — so e.g. the four Iridium layers never appear unless an
+// Iridium session exists.
+let layerControlBuilt = false;
+function buildLayerControl(s) {
+  if (layerControlBuilt) return;
+  const modes = new Set((s.sessions || []).map(x => x.mode).filter(Boolean));
+  const any = (...ms) => ms.some(m => modes.has(m));
+  const overlays = {};
+  if (any('acars', 'vdl2', 'hfdl', 'aero', 'aero-c', 'adsb', 'uat') || (s.aircraft || []).length)
+    overlays['<i class="lyr-ic">✈</i>Flights'] = flightLayer;
+  if (any('ais') || (s.vessels || []).length)
+    overlays['<i class="lyr-ic">🚢</i>Ships'] = shipLayer;
+  if (any('sonde', 'ads-l', 'adsl', 'sarsat', 'dsc', 'navtex') || (s.beacons || []).length)
+    overlays['<i class="lyr-ic">📡</i>Beacons'] = beaconLayer;
+  const irid = any('iridium') || (s.iridium_sats || []).length
+    || (s.iridium_rings || []).length || (s.iridium_devices || []).length;
+  if (irid) {
+    overlays['<i class="lyr-ic">🛰</i>Iridium satellites'] = satLayer;
+    overlays['<i class="lyr-ic">◎</i>Spot beams'] = ringLayer;
+    overlays['<i class="lyr-ic">⬡</i>Beam pattern'] = patternLayer;
+    overlays['<i class="lyr-ic">📟</i>Iridium terminals'] = deviceLayer;
+    if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
+    if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
+    if (localStorage.getItem('xng.deviceLayer') !== '0') deviceLayer.addTo(map);
+    if (patternShowAll) patternLayer.addTo(map);
+  }
+  overlays['<i class="lyr-ic">〰</i>Show All Trails'] = trailLayer;
+  if (showAllTrails) trailLayer.addTo(map);
+  L.control.layers(null, overlays, { position: 'topright', collapsed: false }).addTo(map);
+  layerControlBuilt = true;
+}
+
+map.on('overlayadd overlayremove', e => {
+  if (e.layer === trailLayer) {
+    showAllTrails = map.hasLayer(trailLayer);
+    localStorage.setItem('xng.trails', showAllTrails ? '1' : '0');
+    render();
+    return;
+  }
   if (!patternForcing) { patternShowAll = map.hasLayer(patternLayer); applyPatternFilter(); }
   localStorage.setItem('xng.satLayer', map.hasLayer(satLayer) ? '1' : '0');
   localStorage.setItem('xng.ringLayer', map.hasLayer(ringLayer) ? '1' : '0');
@@ -640,11 +685,11 @@ drag(document.getElementById('vres'), ev => {
   localStorage.setItem('xng.eh', pct);
 });
 
-function upsert(key, lat, lon, icon, label, popup, trail, color) {
+function upsert(key, lat, lon, icon, label, popup, trail, color, layer) {
   if (lat == null || lon == null) return null;
   let e = markers.get(key);
   if (!e) {
-    e = { marker: L.marker([lat, lon], { icon }).addTo(map) };
+    e = { marker: L.marker([lat, lon], { icon }).addTo(layer), layer };
     e.marker.bindTooltip(label, { permanent: true, direction: 'right', offset: [10, 0], className: 'lbl' });
     e.marker.bindPopup(popup);
     // Clicking the marker selects the entity (highlights its row).
@@ -663,9 +708,16 @@ function upsert(key, lat, lon, icon, label, popup, trail, color) {
     e.marker.setTooltipContent(label);
     e.marker.setPopupContent(popup);
   }
-  if (trail && trail.length > 1) {
+  // Trail shows only for the selected entity, or for everything when "Show All
+  // Trails" is on. Drawn on the map directly (not the entity's layer group) so
+  // it tracks selection independently; removed when neither condition holds.
+  const wantTrail = (showAllTrails || selected === key) && trail && trail.length > 1;
+  if (wantTrail) {
     if (e.trail) e.trail.setLatLngs(trail);
     else e.trail = L.polyline(trail, { color, weight: 1.5, opacity: 0.6 }).addTo(map);
+  } else if (e.trail) {
+    map.removeLayer(e.trail);
+    e.trail = null;
   }
   e.alive = true;
   return [lat, lon];
@@ -746,6 +798,7 @@ async function tick() {
 function render() {
   const s = state;
   if (!s) return;
+  buildLayerControl(s); // builds once, with only the relevant overlays
   markers.forEach(e => e.alive = false);
   const pts = [];
 
@@ -775,7 +828,7 @@ function render() {
         ['msgs', a.msgs],
         ['seen', `${fmtAge(s.now - a.seen)} ago`],
       ]);
-    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt, sil), label, popup, a.trail, altColor(a.alt));
+    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt, sil), label, popup, a.trail, altColor(a.alt), flightLayer);
     if (p) pts.push(p);
   }
   for (const v of s.vessels) {
@@ -791,7 +844,7 @@ function render() {
       ['DISTRESS', v.distress && escapeHtml(String(v.distress))],
       ['seen', `${fmtAge(s.now - v.seen)} ago`],
     ]);
-    const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog, v.shiptype), label, popup, v.trail, sm.color);
+    const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog, v.shiptype), label, popup, v.trail, sm.color, shipLayer);
     if (p) pts.push(p);
   }
   for (const b of (s.beacons || [])) {
@@ -805,12 +858,12 @@ function render() {
     ]);
     const emoji = BEACON_EMOJI[b.mode] || '📡';
     const icon = L.divIcon({ className: 'beacon-ic', html: emoji, iconSize: [16, 16] });
-    const p = upsert('b' + b.mode + ':' + b.id, b.lat, b.lon, icon, `${emoji} ${label}`, popup, b.trail, '#e0af68');
+    const p = upsert('b' + b.mode + ':' + b.id, b.lat, b.lon, icon, `${emoji} ${label}`, popup, b.trail, '#e0af68', beaconLayer);
     if (p) pts.push(p);
   }
   markers.forEach((e, k) => {
     if (!e.alive) {
-      map.removeLayer(e.marker);
+      (e.layer || map).removeLayer(e.marker);
       if (e.trail) map.removeLayer(e.trail);
       markers.delete(k);
     }
