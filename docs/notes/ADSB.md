@@ -289,6 +289,16 @@ raw bytes, level). The app serializes to **SBS-1 / BaseStation** CSV and
 **Beast** binary (`0x1a` framing, type '2'/'3', 6-byte MLAT counter, signal
 byte), plus the standard JSON / asf-2.0 feed.
 
+**DF17 synthesis (XM-2.2).** Non-Mode-S aircraft sources (UAT 978, HFDL)
+have no raw 1090 frame, so a shared `AircraftFix` (`src/outputs/aircraft.rs`)
+is re-encoded into DF17 extended squitters by `xng_mode_adsb::synth` — the
+`uat2esnt` trick — letting any raw-Beast consumer (tar1090/readsb) plot them:
+an even/odd **airborne-position** pair (TC11), a **callsign** frame (TC4),
+and a **ground-velocity** frame (TC19 subtype 1) when a true ground speed +
+track is present. Each encoder is the inverse of a `decode.rs` function and is
+proven by round-tripping through this crate's own decoder, so there is no
+hand-rolled bit layout that can silently drift from the reader.
+
 ## Validation / oracles
 
 These crates verify against external oracles, never self-loopback for field
