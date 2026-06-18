@@ -22,6 +22,11 @@ const RECENT_SENT: usize = 2000;
 /// Drop map entities not heard from in this many seconds.
 const EXPIRE_S: u64 = 300;
 
+/// Distress/emergency alerts (XM-6) linger longer than ordinary entities —
+/// a 7700 squawk or a SARSAT burst is worth keeping on the alerting surface
+/// well after the transmitter goes quiet.
+const ALERT_EXPIRE_S: u64 = 1800;
+
 /// Iridium ring-alert positions are split by altitude (cf. iridium-toolkit
 /// live-map) via `crate::beam::classify_altitude`: a frame's geocentric
 /// position is either the broadcasting satellite (~780 km) or a ground beam
@@ -61,6 +66,10 @@ struct Dash {
     trains: HashMap<String, Value>,
     /// Pager capcodes (FLEX/POCSAG), keyed by "proto:capcode" (no position).
     pagers: HashMap<String, Value>,
+    /// Cross-mode distress/emergency alerting surface (XM-6): ADS-B emergency
+    /// squawks + TC28, AIS-SART/MOB/EPIRB-AIS, STD-C distress EGC, DSC distress
+    /// alerts, and every COSPAS-SARSAT 406 beacon, keyed by "mode:entity".
+    alerts: HashMap<String, Value>,
     /// Reconstructed 48-beam pattern, projected under tracked satellites.
     beams: crate::beam::BeamReconstructor,
     /// Last unix-secs the beam pattern was persisted.
@@ -98,6 +107,99 @@ fn push_trail(o: &mut serde_json::Map<String, Value>, lat: f64, lon: f64) {
 
 fn now_s() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Classify a message as a cross-mode distress/emergency event (XM-6).
+/// Returns `("mode:entity", entry)` — the entry is `{mode,id,kind,seen,lat?,
+/// lon?}` — when the message signals distress, else `None`. Each per-mode
+/// trigger reuses fields the mode already decodes (and verifies) elsewhere:
+/// ADS-B emergency status / 7500-7600-7700 squawks, the AIS distress-class
+/// tag, STD-C `distress` priority, the DSC distress-alert format, and every
+/// COSPAS-SARSAT 406 beacon (a beacon transmitting *is* a distress event).
+fn distress_alert(m: &Message) -> Option<(String, Value)> {
+    if !m.decode.crc_ok {
+        return None;
+    }
+    let mode = m.mode.as_str();
+    let (id, kind, lat, lon): (String, String, Option<f64>, Option<f64>) = match &m.body {
+        MessageBody::ModeS { icao: Some(icao), squawk, adsb_status, lat, lon, .. } => {
+            let emergency = adsb_status
+                .as_ref()
+                .and_then(|s| s.get("emergency"))
+                .and_then(Value::as_str)
+                .filter(|x| *x != "none");
+            let squawk_kind = squawk.as_deref().and_then(|s| match s {
+                "7500" => Some("hijack"),
+                "7600" => Some("radio-failure"),
+                "7700" => Some("general-emergency"),
+                _ => None,
+            });
+            let kind = match (emergency, squawk_kind) {
+                (Some(em), _) => em.to_string(),
+                (None, Some(s)) => s.to_string(),
+                (None, None) => return None,
+            };
+            (icao.to_uppercase(), kind, *lat, *lon)
+        }
+        MessageBody::Ais { mmsi: Some(mmsi), details, .. } => {
+            let det = details.as_ref()?;
+            let dist = det.get("distress").and_then(Value::as_str)?;
+            let lat = det.get("lat").and_then(Value::as_f64);
+            let lon = det.get("lon").and_then(Value::as_f64);
+            (mmsi.to_string(), dist.to_string(), lat, lon)
+        }
+        MessageBody::StdC { name, details, .. } => {
+            let is_distress = details.get("priority").and_then(Value::as_str) == Some("distress")
+                || name.to_lowercase().contains("distress");
+            if !is_distress {
+                return None;
+            }
+            // EGC distress is broadcast; key by any mobile/LES id, else the
+            // message name so distinct distress types stay separate.
+            let id = ["mmsi", "address", "mobile_id", "les_id"]
+                .iter()
+                .find_map(|k| details.get(*k).map(value_to_id))
+                .unwrap_or_else(|| name.clone());
+            (id, format!("distress: {name}"), None, None)
+        }
+        MessageBody::Dsc { kind, details } => {
+            let is_distress = kind == "distress_alert"
+                || details.get("category").and_then(Value::as_str) == Some("distress");
+            if !is_distress {
+                return None;
+            }
+            let id = details.get("from").map(value_to_id).unwrap_or_else(|| "?".into());
+            let nature = details.get("nature").and_then(Value::as_str).unwrap_or("unspecified");
+            (id, format!("distress: {nature}"), None, None)
+        }
+        // Every 406 MHz beacon transmission is, by definition, a distress event.
+        MessageBody::Sarsat { details, .. } => {
+            let id = details.get("hex_id").and_then(Value::as_str).unwrap_or("?").to_string();
+            let proto = details.get("protocol_type").and_then(Value::as_str).unwrap_or("406");
+            let pos = details.get("position");
+            let lat = pos.and_then(|p| p.get("latitude")).and_then(Value::as_f64);
+            let lon = pos.and_then(|p| p.get("longitude")).and_then(Value::as_f64);
+            (id, format!("sarsat: {proto}"), lat, lon)
+        }
+        _ => return None,
+    };
+    let mut e = serde_json::Map::new();
+    e.insert("mode".into(), json!(mode));
+    e.insert("id".into(), json!(id));
+    e.insert("kind".into(), json!(kind));
+    e.insert("seen".into(), json!(now_s()));
+    if let Some(la) = lat {
+        e.insert("lat".into(), json!(la));
+    }
+    if let Some(lo) = lon {
+        e.insert("lon".into(), json!(lo));
+    }
+    Some((format!("{mode}:{id}"), Value::Object(e)))
+}
+
+/// A JSON scalar reduced to a stable id string (unquoted for strings).
+fn value_to_id(v: &Value) -> String {
+    v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
 }
 
 /// Per-message aircraft identifiers. ICAO (uppercased) is the primary merge
@@ -269,6 +371,12 @@ fn update(d: &mut Dash, m: &Message) {
     let mode = m.mode.as_str().to_string();
     *d.totals.entry(mode.clone()).or_insert(0) += 1;
     d.last_seen.insert(mode.clone(), now_s());
+
+    // Cross-mode distress/emergency surface (XM-6), independent of the
+    // per-entity map layers below.
+    if let Some((key, alert)) = distress_alert(m) {
+        d.alerts.insert(key, alert);
+    }
 
     // Only clean (CRC-valid) frames compose map/table entities. Corrupt frames
     // still count toward totals and reach the message log, but must never plant
@@ -756,6 +864,8 @@ fn snapshot(d: &mut Dash) -> String {
     d.beacons.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.trains.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.pagers.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    let alert_cut = now_s().saturating_sub(ALERT_EXPIRE_S);
+    d.alerts.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= alert_cut);
     // Persist the accumulated beam pattern occasionally so it survives
     // restarts and keeps refining across sessions.
     if now_s().saturating_sub(d.beams_saved) > 120 {
@@ -772,6 +882,7 @@ fn snapshot(d: &mut Dash) -> String {
         "beacons": d.beacons.values().collect::<Vec<_>>(),
         "trains": d.trains.values().collect::<Vec<_>>(),
         "pagers": d.pagers.values().collect::<Vec<_>>(),
+        "alerts": d.alerts.values().collect::<Vec<_>>(),
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
         "iridium_devices": d.iridium_devices.values().collect::<Vec<_>>(),
@@ -1176,6 +1287,55 @@ mod tests {
     // ADSB-8a: the readsb `type` provenance field. DF18 maps via the
     // CF-derived source class; bare Mode S is mode_s but must not downgrade a
     // more specific class already recorded for the aircraft.
+    // XM-6: ADS-B / AIS / DSC / SARSAT / STD-C distress events all land on one
+    // aggregated alerting surface; routine traffic does not.
+    #[test]
+    fn xm6_aggregates_cross_mode_distress() {
+        let mut d = Dash::default();
+        update(&mut d, &msg(Mode::Adsb, MessageBody::ModeS {
+            df: 17, icao: Some("ABC123".into()), callsign: None, altitude_ft: None,
+            squawk: Some("7700".into()), lat: Some(1.0), lon: Some(2.0), speed_kt: None,
+            speed_type: None, track_deg: None, vertical_rate_fpm: None, comm_b: None, adsb_status: None,
+        }));
+        update(&mut d, &msg(Mode::Ais, MessageBody::Ais {
+            nmea: vec![], msg_type: Some(1), mmsi: Some(970_123_456),
+            details: Some(json!({"distress": "AIS-SART", "lat": 3.0, "lon": 4.0})),
+        }));
+        update(&mut d, &msg(Mode::Dsc, MessageBody::Dsc {
+            kind: "distress_alert".into(), details: json!({"from": "123456789", "nature": "sinking"}),
+        }));
+        update(&mut d, &msg(Mode::Sarsat, MessageBody::Sarsat {
+            kind: "ELT - Serial".into(),
+            details: json!({"hex_id": "ABCDEF0123456789ABCDE", "protocol_type": "ELT - Serial",
+                            "position": {"latitude": 5.0, "longitude": 6.0}}),
+        }));
+        update(&mut d, &msg(Mode::StdC, MessageBody::StdC {
+            name: "MaritimeDistressAlerting".into(), text: None, details: json!({"priority": "distress"}),
+        }));
+        // Routine traffic must NOT raise alerts.
+        update(&mut d, &msg(Mode::Adsb, MessageBody::ModeS {
+            df: 17, icao: Some("DEF456".into()), callsign: None, altitude_ft: None,
+            squawk: Some("1200".into()), lat: None, lon: None, speed_kt: None,
+            speed_type: None, track_deg: None, vertical_rate_fpm: None, comm_b: None, adsb_status: None,
+        }));
+        update(&mut d, &msg(Mode::Dsc, MessageBody::Dsc {
+            kind: "individual_station_call".into(), details: json!({"from": "111111111"}),
+        }));
+
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let alerts = snap["alerts"].as_array().unwrap();
+        assert_eq!(alerts.len(), 5, "five distinct distress events: {alerts:?}");
+        let by_mode = |m: &str| alerts.iter().find(|a| a["mode"] == m).unwrap().clone();
+        assert_eq!(by_mode("adsb")["kind"], "general-emergency");
+        assert_eq!(by_mode("adsb")["id"], "ABC123");
+        assert_eq!(by_mode("ais")["kind"], "AIS-SART");
+        assert_eq!(by_mode("ais")["lat"], 3.0);
+        assert!(by_mode("dsc")["kind"].as_str().unwrap().contains("sinking"));
+        assert!(by_mode("sarsat")["kind"].as_str().unwrap().contains("ELT"));
+        assert_eq!(by_mode("sarsat")["lat"], 5.0);
+        assert!(by_mode("std-c")["kind"].as_str().unwrap().contains("MaritimeDistressAlerting"));
+    }
+
     #[test]
     fn provenance_type_maps_and_resists_mode_s_downgrade() {
         let modes = |df: u8, icao: &str, st: Option<Value>| {
