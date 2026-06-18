@@ -1,0 +1,16 @@
+[package]
+name = "xng-mode-pocsag"
+description = "Native POCSAG (CCIR Radiopaging Code No.1 / ITU-R M.584) decode core for xng: 2-FSK NRZ demod, batch/codeword framing, BCH(31,21,2) correction, numeric/alphanumeric paging text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true
