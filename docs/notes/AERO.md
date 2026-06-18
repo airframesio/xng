@@ -162,8 +162,28 @@ the decoder's parse share one definition). The parsed header is latched
 per frame (`Framer::last_header`) and surfaced in the message `details`
 as a nested `frame_header` object. On the **10.5k OQPSK** path the same
 header is parsed from the first 16 bits of the 16+178-bit skip region
-(`oqpsk.rs::HrFramer`). The state machine that *consumes* these fields
-(superframe lock + AFC/DCD) is a deferred follow-up — see limitations.
+(`oqpsk.rs::HrFramer`).
+
+#### Superframe-lock / AFC-DCD state machine (`state.rs`, AERO-4)
+
+The framer feeds every parsed header into a per-decode-chain
+`SuperframeLockStateMachine` (`state.rs`). It tracks the previous header
+and the count of consecutive **in-sequence** frames (the two redundant
+4-bit counters advance consistently and self-agree): lock is **acquired
+after N=3** in-sequence headers and **lost after M=4** consecutive misses
+(an inconsistent header — counters that don't agree or don't advance — is
+a miss). A coupled `CarrierState` (`searching` → `acquiring` → `locked`)
+drives a data-carrier-detect (`dcd`) and `afc_locked` indicator; losing
+lock releases `afc_locked` and drops the carrier state back to
+`searching`. The lock snapshot rides the message `details`: it enriches a
+`c-channel-assignment` (and other structured-SU) body with a
+`superframe_lock` object, and for an otherwise-undecoded P-channel frame
+it emits a `MessageBody::Aero { kind: "p-channel-status", … }` carrying
+`carrier_state`/`dcd`/`afc_locked` + the frame counters. The 10.5k OQPSK
+and C-band burst chains use different framers and surface lock as `None`
+(the machine is the low-rate P-channel layer per AERO-4's scope). Verified
+by a synthetic frame-counter-sequence oracle (state-machine *logic*, not a
+decode loopback) plus the real off-air 600 bps recording (no regression).
 
 10.5 kbps OQPSK framing (`oqpsk.rs::HrFramer`): **64-bit dual-rail UW**
 (the same 32-bit UW carried on each rail, bits interleaved; per-rail

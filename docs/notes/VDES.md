@@ -34,7 +34,7 @@ wideband capture IQ
 recovered NRZI-decoded bit stream
   → frame::HdlcDeframer      0x7E flag hunt, bit destuffing, octet assembly, CRC-16/X-25 FCS, per-octet bit reversal
   → frame::VdesFrame         (msg_type, mmsi, wire_bytes, message_bits MSB-first)
-  → asm::decode              AIS Msg 6/8 transport header (source/dest MMSI + DAC/FID) + DAC=1 payloads
+  → asm::decode              AIS Msg 6/8 transport header (source/dest MMSI + DAC/FID) + DAC=1 / DAC=200 payloads
   → asm::Asm                 → to_message → xng_types::Message bus form
 ```
 
@@ -165,29 +165,47 @@ Function Identifier). `decode(bits)` reads the transport header by absolute
 `Asm` carries `msg_id`, `source_mmsi`, `dest_mmsi` (`Some` only for
 Message 6), `dac`, `fid`, and an `app` JSON value.
 
-### Application payloads decoded (DAC=1, IMO international)
+### Application payloads decoded (DAC=1 IMO + DAC=200 Inland)
 
 The DAC/FID catalogue is the one shared with AIS Message 6/8, catalogued by
 **IMO SN.1/Circ.289** ("Guidance on the use of AIS application-specific
-messages"). Two well-documented DAC=1 payloads are decoded; each arm of
-`app_decode` cites its governing clause:
+messages") for DAC=1 and **UNECE SC.3/176 (Inland AIS)** for DAC=200. Seven
+spec-cited payloads are decoded; each arm of `app_decode` cites its governing
+clause, and every field's offset/width/scaling is anchored to the BSD `gpsd`
+`driver_ais.c` tables used as a fact reference (re-asserted against an
+independent bit packer, plus a pyais cross-check for DAC=200 FID=10):
 
-- **DAC=1 FID=16 — Number of persons on board** (IMO SN.1/Circ.289 Annex;
-  ITU-R M.1371-5 Annex 5 §3.10): a 13-bit unsigned count, `0 = not
-  available` (omitted when zero), emitted as `persons_on_board`.
-- **DAC=1 FID=31 — Meteorological and hydrological data** (IMO SN.1/Circ.289
-  Annex; ITU-R M.1371-5 Annex 8): a 360-bit application block. The decoder
-  reads the leading grounded scalar fields from the application-data offset:
-  **longitude FIRST** (25-bit signed) then **latitude** (24-bit signed),
-  both in units of 1/1000 minute (raw / 60000 → degrees) with **181° / 91°
-  not-available sentinels**; a position-accuracy flag; UTC day (5) / hour (5)
-  / minute (6); average wind speed and gust (7-bit kt each, 127 = N/A); wind
-  direction (9-bit deg, 360 = N/A); air temperature (11-bit signed 0.1 °C,
-  raw -1024 = N/A); relative humidity (7-bit %, 101 = N/A). All N/A
-  sentinels are **honoured — omitted, never emitted as junk values**. The
-  WMO-coded weather tail (and the wind-gust-direction field between wind
-  direction and air temperature) is **deferred**: the decoder skips it and
-  reads air temp / humidity at their absolute offsets.
+- **DAC=1 FID=11 — Meteo/hydro (IMO236, legacy layout)** — distinct from
+  FID 31: **latitude FIRST** (24-bit) then longitude (25-bit), packed
+  `ddhhmm`, unsigned temperature encoding.
+- **DAC=1 FID=16 — Number of persons on board** (Circ.289 Annex; ITU-R
+  M.1371-5 Annex 5 §3.10): a 13-bit unsigned count, `0 = N/A` (omitted).
+- **DAC=1 FID=17 — VTS-generated/synthetic targets**: the first 122-bit
+  target report (target id type/id, lat/lon, COG, SOG, UTC second).
+- **DAC=1 FID=18 — Clearance time to enter port** (addressed): message
+  linkage, UTC month/day/hour/minute, port name, UN/LOCODE, position.
+- **DAC=1 FID=31 — Meteorological and hydrological data** (Circ.289 Annex;
+  ITU-R M.1371-5 Annex 8): a 360-bit application block. **Longitude FIRST**
+  (25-bit signed) then **latitude** (24-bit signed), both 1/1000 minute
+  (raw / 60000 → degrees) with **181° / 91° N/A sentinels**; position
+  accuracy; UTC day/hour/minute; average wind speed + gust (7-bit kt, 127 =
+  N/A); **wind-gust direction**; wind direction (9-bit deg, 360 = N/A); air
+  temperature (11-bit signed 0.1 °C, -1024 = N/A); relative humidity (7-bit
+  %, 101 = N/A); and the **deeper IMO289 weather block** — dew point,
+  pressure + tendency, visibility, water level + trend, surface current,
+  waves/swell, sea state, water temperature, salinity, ice.
+- **DAC=200 FID=10 — Inland ship static & voyage** (UNECE SC.3/176): ENI,
+  length/beam (0.1 m), ERI ship/cargo type, hazard-cone count, draught,
+  loaded/unloaded, data quality flags. *(pyais-verified against two real
+  AIVDM sentences.)*
+- **DAC=200 FID=55 — Inland persons on board**: crew / passengers /
+  shipboard-personnel counts (255 = N/A, omitted).
+
+All N/A sentinels are **honoured — omitted, never emitted as junk values**.
+Variable-length / repeated-block payloads with no single hand-verifiable
+vector (DAC=1 FID 14 tidal, 20 berthing, 22/23 area notice, 25 dangerous
+cargo; FID 17 second-and-later targets; regional DACs 235/250/366) are
+**left as `data_hex`** rather than guessed (skip-don't-fake).
 
 `details()` flattens the header (`msg_id`, `source_mmsi`, `dest_mmsi` if
 present, `dac`, `fid`) plus a nested `app` object (omitted when empty) into a
