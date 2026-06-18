@@ -6,7 +6,7 @@
 <title>xng station</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
 <style>
-  :root { color-scheme: dark; --sw: 480px; --eh: 45%; }
+  :root { color-scheme: dark; --sw: 480px; --eh: 45%; --ch: 170px; }
   * { box-sizing: border-box; }
   body { margin: 0; display: flex; height: 100vh; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0e14; color: #c8ccd4; }
   #map { flex: 1; min-width: 0; }
@@ -51,11 +51,18 @@
   #entities td.age { color: #565f89; }
   #entities tr.msgrow td { color: #aeb6d6; }
   #entities tr.msgrow td.msgcaret { padding-left: 20px; color: #7aa2f7; }
+  /* Keep a selected history row's caret aligned with its siblings: the generic
+     .sel first-child accent would shrink padding-left and shift the ↳ back. */
+  #entities tr.msgrow.sel td.msgcaret { padding-left: 20px; border-left: 0; }
   /* Selected-message detail pane: sits directly below the entities table and
      above the log. The meta grid auto-reflows so it stays readable in a narrow
      side panel (responsive). */
-  #entcard { flex: none; max-height: 40%; overflow-y: auto; border-top: 1px solid #1c2230; background: linear-gradient(180deg, #161b29, #0e1119); padding: 10px 13px 12px; position: relative; }
+  #entcard { flex: 0 0 var(--ch); overflow-y: auto; background: linear-gradient(180deg, #161b29, #0e1119); padding: 10px 13px 12px; position: relative; }
   #entcard[hidden] { display: none; }
+  /* Resize handle for the detail pane (drag its bottom edge), like #vres. */
+  #cres { flex: none; height: 6px; cursor: row-resize; background: #1c2230; }
+  #cres:hover { background: #2a2f41; }
+  #cres[hidden], body.logmin #cres { display: none; }
   #entcard .cardx { position: absolute; top: 7px; right: 11px; cursor: pointer; color: #565f89; font-size: 13px; line-height: 1; }
   #entcard .cardx:hover { color: #c8ccd4; }
   #entcard h3 { margin: 0 24px 8px 0; padding-bottom: 6px; font-size: 13px; color: #7aa2f7; border-bottom: 1px solid #232a3d; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
@@ -142,8 +149,9 @@
   </div>
   <div id="enttabs"></div>
   <div id="entities"></div>
-  <div id="entcard" hidden></div>
   <div id="vres" title="Drag to resize"></div>
+  <div id="entcard" hidden></div>
+  <div id="cres" hidden title="Drag the detail pane's edge to resize"></div>
   <div id="logpane">
     <div id="chips"></div>
     <div id="msgbar">
@@ -601,6 +609,7 @@ let logMsgs = []; // log items currently shown; frozen in place while paused
 let selected = null; // entity key ('a'+icao / 'v'+mmsi)
 let selectedMsg = null; // {cap,proto,fn,baud,cls,kind,text,seen,mk} shown in the message detail pane
 let msgIndex = {};      // msgkey -> message detail; rebuilt each render so the click handler can resolve a clicked history row
+let entMsg = {};        // entity key -> its latest message detail, so clicking a pager row (not just a history sub-row) opens the detail pane
 const hiddenModes = new Set();
 const expanded = new Set();
 const rateHist = []; // [t_ms, totals] samples for per-mode rates
@@ -658,6 +667,10 @@ document.getElementById('entities').addEventListener('click', e => {
     const id = tr.dataset.id || '';
     acExpanded.has(id) ? acExpanded.delete(id) : acExpanded.add(id);
   }
+  // A pager row: open its latest message in the detail pane (render() below
+  // re-renders the card). Single-message pagers have no history sub-rows, so
+  // the row itself is the way in.
+  if (entMsg[k]) selectedMsg = entMsg[k];
   const lat = tr.dataset.lat ? parseFloat(tr.dataset.lat) : null;
   const lon = tr.dataset.lon ? parseFloat(tr.dataset.lon) : null;
   selectEntity(k, lat, lon);
@@ -711,6 +724,7 @@ function restore(key, varName) {
 }
 restore('xng.sw', '--sw');
 restore('xng.eh', '--eh');
+restore('xng.ch', '--ch');
 if (localStorage.getItem('xng.logmin') === '1') setLogMin(true);
 
 function drag(handle, onMove) {
@@ -740,6 +754,15 @@ drag(document.getElementById('vres'), ev => {
   const pct = (h / side.height * 100).toFixed(1) + '%';
   document.documentElement.style.setProperty('--eh', pct);
   localStorage.setItem('xng.eh', pct);
+});
+// Detail pane height: drag its bottom edge (#cres). logpane (flex:1) absorbs
+// the delta, so the entcard top stays put and only its height changes.
+drag(document.getElementById('cres'), ev => {
+  const side = document.getElementById('side').getBoundingClientRect();
+  const top = document.getElementById('entcard').getBoundingClientRect().top;
+  const h = Math.min(Math.max(ev.clientY - top, 70), side.bottom - top - 80);
+  document.documentElement.style.setProperty('--ch', h + 'px');
+  localStorage.setItem('xng.ch', h + 'px');
 });
 
 function upsert(key, lat, lon, icon, label, popup, trail, color, layer) {
@@ -800,8 +823,10 @@ function entityPopup(pic, title, kv) {
 function renderEntCard() {
   const el = document.getElementById('entcard');
   if (!el) return;
+  const cres = document.getElementById('cres');
   const m = selectedMsg;
-  if (!m) { el.hidden = true; el.innerHTML = ''; return; }
+  if (!m) { el.hidden = true; el.innerHTML = ''; if (cres) cres.hidden = true; return; }
+  if (cres) cres.hidden = false;
   const proto = String(m.proto || '').toUpperCase();
   const now = (state && state.now) || 0;
   const recv = m.seen ? new Date(m.seen * 1000).toLocaleString() : '';
@@ -1047,7 +1072,7 @@ function render() {
       // Expandable when there's a message history — clicking shows past pages.
       expandable: hist.length > 1, history: hist,
       // Raw pager fields (JS-only, never injected as HTML) for the message detail pane.
-      praw: { proto: p.proto, fn: p.function, baud: p.baud, cls: p.class },
+      praw: { proto: p.proto, fn: p.function, baud: p.baud, cls: p.class, text: p.text },
       color: '#7dcfff', name: `${ic('📟')}${escapeHtml(cap)}`, seen: p.seen,
       sv: { id: cap, flight: '', icao: '', reg: String(p.proto || ''), type: String(p.class || ''), alt: undefined, kt: undefined, msgs: p.msgs, seen: p.seen || 0 },
       cols: ['', '', escapeHtml(String(p.proto || '')), escapeHtml(String(p.class || '')), '', '', p.msgs ?? ''],
@@ -1108,8 +1133,19 @@ function render() {
   });
 
   const rows = [];
-  msgIndex = {}; // rebuilt below as pager history rows are emitted
+  msgIndex = {}; entMsg = {}; // rebuilt below as pager rows are emitted
   for (const e of view) {
+    // Every pager row is clickable to open its latest message in the detail
+    // pane (not just multi-message pagers via their history sub-rows).
+    if (e.type === 'pager') {
+      const pr = e.praw || {}, h = (e.history && e.history.length) ? e.history[e.history.length - 1] : null;
+      const seen = (h && h.seen) || e.seen || 0;
+      entMsg[e.k] = {
+        cap: e.id, proto: pr.proto, fn: pr.fn, baud: pr.baud, cls: pr.cls,
+        kind: h ? h.kind : pr.cls, text: h ? h.text : pr.text, seen,
+        mk: e.id + '|' + seen,
+      };
+    }
     const open = e.expandable && acExpanded.has(e.id);
     const caret = e.expandable ? (open ? '▾ ' : '▸ ') : '';
     const cells = isAll
