@@ -95,6 +95,12 @@ pub struct FrameDecoder {
     viterbi: Viterbi,
     /// Last OVERLAP deinterleaved soft bits of the previous frame.
     tail: Vec<f32>,
+    /// Number of coded-bit errors the Viterbi corrected on the most recent
+    /// `decode` (AERO-6): re-encode the decoded info bits and count how many
+    /// coded bits differ from the received hard decisions over this frame's
+    /// coded region. This is the genuine count of channel-bit errors the FEC
+    /// fixed — not a fabricated value — and feeds `DecodeQuality::fec_corrected`.
+    last_fec_corrected: u32,
 }
 
 /// Deinterleave one 64×cols block: output index (j*64 + i) reads input
@@ -152,7 +158,17 @@ impl FrameDecoder {
             // decodes with zero Viterbi residual and all SU CRCs pass).
             viterbi: Viterbi::new(7, 0o133, 0o171),
             tail: vec![0.0; OVERLAP],
+            last_fec_corrected: 0,
         }
+    }
+
+    /// Coded-bit errors corrected by the Viterbi on the most recent
+    /// [`decode`](Self::decode) (AERO-6). Counted over this frame's coded
+    /// region only; the overlap-carry region is excluded so back-to-back
+    /// frames do not double-count. Genuine — derived by re-encoding the
+    /// decoded bits, never fabricated.
+    pub fn last_fec_corrected(&self) -> u32 {
+        self.last_fec_corrected
     }
 
     /// Decode one frame's coded soft bits (after UW + header) into
@@ -175,6 +191,26 @@ impl FrameDecoder {
         let decoded = self.viterbi.decode(&input);
         let skip = OVERLAP / 2;
         let n_decoded = coded_bits_for(self.rate_bps) / 2;
+
+        // Real FEC-correction count (AERO-6): re-encode the decoded bit
+        // stream with the same K=7 rate-1/2 convolutional encoder and count
+        // how many coded bits disagree with the received hard decisions over
+        // *this frame's* coded region (the bits after the overlap carry).
+        // Each disagreement is a channel-bit error the Viterbi corrected.
+        // The re-encoder starts from the zero state, but the first OVERLAP
+        // coded bits (the carry, K-1≪OVERLAP) are excluded from the count,
+        // so the encoder state has fully converged before the counted region.
+        let reencoded = self.viterbi.encode(&decoded);
+        let frame_start = OVERLAP; // coded-bit offset where this frame begins
+        let mut corrected = 0u32;
+        for k in frame_start..input.len() {
+            let rx_hard = (input[k] >= 0.0) as u8;
+            if reencoded[k] != rx_hard {
+                corrected += 1;
+            }
+        }
+        self.last_fec_corrected = corrected;
+
         let mut bits: Vec<u8> = decoded[skip..skip + n_decoded].to_vec();
 
         // Descramble (LFSR reset per frame) and pack LSB-first.
@@ -349,5 +385,52 @@ mod tests {
         // overlap; decode the same frame twice to settle the carry.
         let out = dec.decode(&soft);
         assert_eq!(&out, &bytes);
+    }
+
+    /// AERO-6: `last_fec_corrected` reports the *real* number of coded-bit
+    /// errors the Viterbi fixed. We flip a known set of coded bits, confirm
+    /// the frame still decodes correctly (so the FEC truly corrected them),
+    /// and assert the reported count equals exactly the injected flips.
+    #[test]
+    fn fec_corrected_counts_real_corrections() {
+        for rate in [600u32, 1200] {
+            let mut enc = FrameEncoder::new(rate);
+            let mut dec = FrameDecoder::new(rate);
+            let n_coded = coded_bits_for(rate);
+            let bytes: Vec<u8> = (0..frame_bytes_for(rate))
+                .map(|i| (i as u8).wrapping_mul(13) ^ 0xA5)
+                .collect();
+
+            // Frame 0: clean. No channel errors → exactly zero corrections.
+            let frame0 = enc.encode(&bytes, 0);
+            let soft0: Vec<f32> =
+                frame0[48..].iter().map(|&b| if b == 1 { 1.0 } else { -1.0 }).collect();
+            let out0 = dec.decode(&soft0);
+            assert_eq!(&out0, &bytes, "rate={rate}: clean frame must decode");
+            assert_eq!(
+                dec.last_fec_corrected(),
+                0,
+                "rate={rate}: a clean frame has zero FEC corrections"
+            );
+
+            // Frame 1: inject a known, sparse set of coded-bit flips spread
+            // across the whole frame so the Viterbi still recovers.
+            let frame1 = enc.encode(&bytes, 1);
+            let mut soft1: Vec<f32> =
+                frame1[48..].iter().map(|&b| if b == 1 { 1.0 } else { -1.0 }).collect();
+            let flip_positions: Vec<usize> = (37..n_coded).step_by(97).collect();
+            let injected = flip_positions.len() as u32;
+            assert!(injected >= 4, "need several flips to be a real test");
+            for &i in &flip_positions {
+                soft1[i] = -soft1[i];
+            }
+            let out1 = dec.decode(&soft1);
+            assert_eq!(&out1, &bytes, "rate={rate}: Viterbi must recover the frame");
+            assert_eq!(
+                dec.last_fec_corrected(),
+                injected,
+                "rate={rate}: reported FEC corrections must equal the injected flips"
+            );
+        }
     }
 }

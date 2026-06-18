@@ -9,6 +9,7 @@
 
 pub mod burst;
 pub mod cchannel;
+pub mod coherent;
 pub mod demod;
 pub mod oqpsk;
 pub mod frame;
@@ -78,6 +79,11 @@ pub struct AeroEvent {
     /// table broadcast has been observed on the channel (AERO-2). Already a
     /// JSON object ready to merge into the message `details`.
     pub satellite: Option<serde_json::Value>,
+    /// Coded-bit errors the Viterbi FEC corrected on the frame that carried
+    /// this event (AERO-6), when known. Genuine count derived by re-encoding
+    /// the decoded bits ([`frame::FrameDecoder::last_fec_corrected`]); `None`
+    /// for paths where it is not tracked. Feeds `DecodeQuality::fec_corrected`.
+    pub fec_corrected: Option<u32>,
 }
 
 /// One demod + framing chain at a fixed bit rate.
@@ -102,6 +108,9 @@ struct Framer {
     /// Parsed header of the most recently assembled frame (AERO-4). Latched
     /// so events surfaced from this frame carry it.
     last_header: Option<frame::FrameHeader>,
+    /// FEC-corrected coded-bit count of the most recently decoded frame
+    /// (AERO-6), latched so events from that frame carry it.
+    last_fec_corrected: Option<u32>,
     /// Self-configuring satellite/beam resolver, fed every structured SU it
     /// sees (AERO-2). Latches the most recent satellite from the system-
     /// table broadcasts.
@@ -117,6 +126,7 @@ impl Framer {
             reasm: su::Reassembler::new(),
             su_events: Vec::new(),
             last_header: None,
+            last_fec_corrected: None,
             resolver: satellite::SatelliteResolver::new(),
         }
     }
@@ -131,6 +141,8 @@ impl Framer {
                     Some(frame::FrameHeader::from_soft_bits(&buf[..frame::HEADER_BITS]));
                 let coded = &buf[frame::HEADER_BITS..];
                 let bytes = self.decoder.decode(coded);
+                // Genuine FEC-correction count for this frame (AERO-6).
+                self.last_fec_corrected = Some(self.decoder.last_fec_corrected());
                 for su_bytes in bytes.chunks_exact(su::SU_LEN) {
                     if su::su_crc_ok(su_bytes) {
                         if let Some(a) = su::parse_p_su(su_bytes) {
@@ -240,6 +252,7 @@ impl AeroChannelDecoder {
             // latched in the framer; tag every event from this chain with
             // the current state.
             let frame_header = chain.framer.last_header;
+            let fec_corrected = chain.framer.last_fec_corrected;
             let satellite = chain.framer.resolver.details();
             for user in users {
                 let acars = su::parse_acars(&user.data);
@@ -252,12 +265,14 @@ impl AeroChannelDecoder {
                     channel: AeroChannel::PChannel,
                     frame_header,
                     satellite: satellite.clone(),
+                    fec_corrected,
                 });
             }
             for a in chain.framer.su_events.drain(..) {
                 let mut e = su_event_msg(a, chain.rate, Mode::AeroL, AeroChannel::PChannel);
                 e.frame_header = frame_header;
                 e.satellite = satellite.clone();
+                e.fec_corrected = fec_corrected;
                 out.push(e);
             }
         }
@@ -279,6 +294,7 @@ impl AeroChannelDecoder {
                 hr.framer.push(soft, hard, &mut hr_users);
             }
             let frame_header = hr.framer.last_header;
+            let fec_corrected = hr.framer.last_fec_corrected;
             let satellite = hr.framer.resolver.details();
             for user in hr_users {
                 let acars = su::parse_acars(&user.data);
@@ -291,12 +307,14 @@ impl AeroChannelDecoder {
                     channel: AeroChannel::PChannel,
                     frame_header,
                     satellite: satellite.clone(),
+                    fec_corrected,
                 });
             }
             for a in hr.framer.su_events.drain(..) {
                 let mut e = su_event_msg(a, oqpsk::BIT_RATE, Mode::AeroL, AeroChannel::PChannel);
                 e.frame_header = frame_header;
                 e.satellite = satellite.clone();
+                e.fec_corrected = fec_corrected;
                 out.push(e);
             }
         }
@@ -351,8 +369,19 @@ impl AeroBurstDecoder {
         for b in self.gate.process(channel) {
             self.level = b.iter().map(|x| x.norm_sqr()).sum::<f32>() / b.len() as f32;
             for (i, &rate) in [600u32, 1200].iter().enumerate() {
+                // Discriminator detector first (robust on the burst preamble),
+                // then the coherent (decision-directed) detector as a fallback
+                // for marginal bursts — it recovers ~1 dB lower (AERO-6,
+                // tests/coherent_ber.rs). The fallback is safe: `process`
+                // returns `None` only when no UW/CRC matched, in which case it
+                // left the cross-burst reassemblers untouched, so the second
+                // pass cannot double-feed them.
                 let bits = burst::demod_burst(&b, CHANNEL_RATE, rate as f64);
-                if let Some(result) = self.packetizers[i].process(&bits) {
+                let result = self.packetizers[i].process(&bits).or_else(|| {
+                    let coh = burst::demod_burst_coherent(&b, CHANNEL_RATE, rate as f64);
+                    self.packetizers[i].process(&coh)
+                });
+                if let Some(result) = result {
                     // The C-band feeder burst is either a reserved/TDMA T
                     // burst or a random-access R burst (AERO-8.2).
                     let aero_channel = if result.is_t {
@@ -366,6 +395,7 @@ impl AeroBurstDecoder {
                         self.resolver.observe(a);
                     }
                     let satellite = self.resolver.details();
+                    let fec_corrected = Some(result.fec_corrected);
                     for user in result.users {
                         let acars = su::parse_acars(&user.data);
                         out.push(AeroEvent {
@@ -377,6 +407,7 @@ impl AeroBurstDecoder {
                             channel: aero_channel,
                             frame_header: None,
                             satellite: satellite.clone(),
+                            fec_corrected,
                         });
                     }
                     // Named control/signalling SUs (R access-request /
@@ -386,6 +417,7 @@ impl AeroBurstDecoder {
                     for a in result.su_events {
                         let mut e = su_event_msg(a, rate, Mode::AeroC, aero_channel);
                         e.satellite = satellite.clone();
+                        e.fec_corrected = fec_corrected;
                         out.push(e);
                     }
                     break; // one rate decoded this burst
@@ -475,6 +507,7 @@ fn su_event_msg(a: serde_json::Value, bit_rate: u32, mode: Mode, channel: AeroCh
         channel,
         frame_header: None,
         satellite: None,
+        fec_corrected: None,
     }
 }
 
@@ -531,7 +564,7 @@ pub fn to_message(e: &AeroEvent, frequency_hz: u64, level_dbfs: f32, source: Pro
         timestamp: Utc::now(),
         frequency_hz,
         signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
-        decode: DecodeQuality { crc_ok, fec_corrected: None, errors },
+        decode: DecodeQuality { crc_ok, fec_corrected: e.fec_corrected, errors },
         body,
         raw: Some(e.user.data.clone()),
         source,

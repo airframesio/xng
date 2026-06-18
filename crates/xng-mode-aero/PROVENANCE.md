@@ -56,10 +56,58 @@ Ported facts/structures (from `aerol.cpp/.h`, `mskdemodulator.cpp`,
 Divergence from JAERO (documented intentionally):
 
 - 600/1200 bps demodulator: JAERO uses a coherent OQPSK-decomposition MSK
-  demod with FFT square-law coarse AFC; xng v1 uses a
-  frequency-discriminator MSK demod with offset tracking (simpler, ~2 dB
-  less sensitive; the differential encoding makes discriminator output
-  the data bits directly). Coherent upgrade is a planned improvement.
+  demod with FFT square-law coarse AFC; xng's primary L-band P-channel path
+  uses a frequency-discriminator MSK demod with offset tracking (simpler;
+  the direct deviation mapping makes the discriminator output the data bits
+  directly). For the C-band R/T feeder bursts a coherent (decision-directed
+  / Costas) detector is now available and used as a fallback — see AERO-6.
+
+AERO-6 — coherent burst detector + real FEC-correction count:
+
+- Coherent A-BPSK detector (`coherent::CoherentMskDemod`): A-BPSK here is
+  CPFSK with modulation index 0.5 (MSK), bit 1 = +90°/bit, continuous phase.
+  The discriminator averages per-sample phase *angles* (non-coherent FM
+  detection, the ~2–3 dB penalty noted above). The coherent detector keeps a
+  running absolute phase reference θ (carrier + the phase accumulated by all
+  previously-decided bits), and per bit correlates the matched-filtered bit
+  samples against the +90° / −90° phase ramps anchored at θ, picking the
+  larger in-phase energy, then advances θ by the decided ±90° plus a small
+  decision-directed (Costas) phase-error correction. Timing uses the same
+  zero-crossing loop as the discriminator; the burst gate removes the bulk
+  CFO upstream.
+  - Verified by `tests/coherent_ber.rs`: a genuine modulate → complex-AWGN →
+    demod BER sweep (both demods share the identical front end and see the
+    same noisy `modulate` waveform). At 1200 bps the coherent path is ~2–3×
+    lower BER at 4–10 dB Eb/N0 and reaches the discriminator's 8 dB BER at
+    7 dB — a ~1 dB equal-BER sensitivity gain.
+  - Used in `AeroBurstDecoder` as a *fallback* after the discriminator (the
+    discriminator is robust on the burst preamble; the coherent pass gives a
+    marginal burst a second, more-sensitive chance). The fallback is safe:
+    `BurstPacketizer::process` mutates the cross-burst reassemblers only when
+    a UW + CRC matched (in which case it returns `Some`), so a `None`-yielding
+    first pass leaves them untouched and the second pass cannot double-feed.
+- Real FEC-correction count (`DecodeQuality::fec_corrected`): the Viterbi
+  returns only decoded bits, so the corrected-bit count is computed by
+  re-encoding the decoded bits with the same K=7 rate-1/2 convolutional code
+  and counting coded-bit disagreements with the received hard decisions over
+  the frame's coded region (excluding the overlap carry so back-to-back
+  frames do not double-count). This is the genuine number of channel-bit
+  errors the FEC fixed — never fabricated. Threaded through
+  `FrameDecoder::last_fec_corrected` (P-channel + 10.5k OQPSK) and the burst
+  Viterbi (`BurstResult::fec_corrected`) into every `AeroEvent`. Pinned by
+  `frame::tests::fec_corrected_counts_real_corrections` (a clean frame
+  reports 0; a frame with N injected coded-bit flips that the Viterbi
+  recovers reports exactly N).
+
+VERIFY-8 — AEROTypeP / AEROTypeR / AEROTypeC enumerator hex values verified
+against the JAERO source (`JAERO/aerol.h`, namespaces `AEROTypeP` /
+`AEROTypeR` / `AEROTypeC`, github.com/jontio/JAERO master). Every type byte
+this crate dispatches on already matched JAERO verbatim — **no mismatches
+found**. Pinned by `su::tests::aero_type_enumerators_match_jaero_aerol_h`,
+which transcribes the JAERO enumerators and asserts each handler's type byte.
+(The R-channel set reads the type from the third octet `infofield[2]`; the C
+sub-band set is `AEROTypeC` {0x01 fill, 0x30 call-progress, 0x60
+telephony-acknowledge}.)
 - No AFC of the channel center / DCD interplay (JAERO's
   FreqOffsetEstimateSlot state machine); xng channels are DDC-tuned and
   the unlocked-only coarse correction covers reacquisition.

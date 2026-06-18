@@ -184,6 +184,7 @@ fn log_on_confirm_decodes_end_to_end() {
         channel: xng_mode_aero::AeroChannel::PChannel,
         frame_header: None,
         satellite: None,
+        fec_corrected: None,
     };
     let msg = to_message(&event, 1_545_000_000, -50.0, prov());
     match msg.body {
@@ -273,6 +274,7 @@ fn pr_control_isu_decodes_end_to_end() {
         channel: xng_mode_aero::AeroChannel::PChannel,
         frame_header: None,
         satellite: None,
+        fec_corrected: None,
     };
     let msg = to_message(&event, 1_545_000_000, -50.0, prov());
     match msg.body {

@@ -776,6 +776,119 @@ pub fn fill_su() -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// VERIFY-8: the AEROTypeP / AEROTypeR / AEROTypeC enumerator hex
+    /// values this crate dispatches on are pinned against the JAERO source
+    /// (`JAERO/aerol.h`, namespaces `AEROTypeP` / `AEROTypeR` / `AEROTypeC`,
+    /// fetched from github.com/jontio/JAERO master). Every value below is
+    /// transcribed verbatim from that header; this test fails if a handler's
+    /// type byte ever drifts from the JAERO enumerator it claims to decode.
+    ///
+    /// No mismatches were found during VERIFY-8 — every type byte already
+    /// matched JAERO; this test locks that in.
+    #[test]
+    fn aero_type_enumerators_match_jaero_aerol_h() {
+        // ---- AEROTypeP (aerol.h `namespace AEROTypeP`) ----------------
+        // Build a CRC-valid 12-byte SU with the given type byte.
+        let p = |su0: u8| -> serde_json::Value {
+            let mut s = vec![0u8; 10];
+            s[0] = su0;
+            parse_p_su(&su_with_crc(s)).unwrap_or(serde_json::Value::Null)
+        };
+        // Fill (0x01) and the reserved types (0x00/0x18/0x19/0x26) are
+        // named-but-not-classified in JAERO; parse_p_su returns None → Null.
+        for reserved in [0x00u8, 0x01, 0x18, 0x19, 0x26] {
+            assert!(p(reserved).is_null(), "P 0x{reserved:02X} not classified");
+        }
+        // AES system-table broadcasts.
+        assert_eq!(p(0x05)["su_type"], "smc-channels");
+        assert_eq!(p(0x07)["su_type"], "ges-beam-support");
+        assert_eq!(p(0x0A)["su_type"], "broadcast-index");
+        assert_eq!(p(0x0C)["su_type"], "satellite-id");
+        // System log-on/log-off (0x10..=0x17).
+        let log_events = [
+            (0x10u8, "log-on-request"),
+            (0x11, "log-on-confirm"),
+            (0x12, "log-off-request"),
+            (0x13, "log-on-reject"),
+            (0x14, "log-on-interrogation"),
+            (0x15, "log-on-log-off-acknowledge"),
+            (0x16, "log-on-prompt"),
+            (0x17, "data-channel-reassignment"),
+        ];
+        for (ty, event) in log_events {
+            assert_eq!(p(ty)["su_type"], "log-control", "P 0x{ty:02X}");
+            assert_eq!(p(ty)["event"], event, "P 0x{ty:02X}");
+        }
+        // Call initiation, EIRP, C-channel related, channel info, ack, LSDU.
+        assert_eq!(p(0x21)["su_type"], "call-announcement");
+        assert_eq!(p(0x28)["su_type"], "eirp-table-broadcast");
+        // 0x30 Call_progress is named on the P channel but JAERO decodes no
+        // P-channel fields for it (it is a C/R-channel event) — not in our
+        // P dispatch, so None.
+        assert!(p(0x30).is_null(), "P 0x30 Call_progress not classified");
+        let c_assign = [
+            (0x31u8, "distress"),
+            (0x32, "flight-safety"),
+            (0x33, "other-safety"),
+            (0x34, "non-safety"),
+        ];
+        for (ty, service) in c_assign {
+            assert_eq!(p(ty)["su_type"], "c-channel-assignment", "P 0x{ty:02X}");
+            assert_eq!(p(ty)["service"], service, "P 0x{ty:02X}");
+        }
+        assert_eq!(p(0x40)["su_type"], "pr-channel-control-isu");
+        assert_eq!(p(0x41)["su_type"], "t-channel-control-isu");
+        assert_eq!(p(0x51)["su_type"], "t-channel-assignment");
+        assert_eq!(p(0x61)["su_type"], "request-for-acknowledgement");
+        assert_eq!(p(0x62)["su_type"], "acknowledge");
+        // User data: ISU 0x71 routes to the reassembler (None from classifier);
+        // the 3-/4-octet LSDU types are named events.
+        assert!(p(0x71).is_null(), "P 0x71 ISU → reassembler");
+        assert_eq!(p(0x74)["lsdu_octets"], 3);
+        assert_eq!(p(0x76)["lsdu_octets"], 4);
+
+        // ---- AEROTypeR (aerol.h `namespace AEROTypeR`) ----------------
+        // (enumerator, hex value, our su_type, request_kind) verbatim.
+        let r = |su2: u8| -> serde_json::Value {
+            let mut s = vec![0u8; R_SU_LEN];
+            s[1] = 0x00; // user-data flag clear → control SU
+            s[2] = su2; // JAERO infofield[2] holds the R control type
+            let crc = HDLC_FCS.checksum(&s[..17]);
+            s[17] = (crc & 0xFF) as u8;
+            s[18] = (crc >> 8) as u8;
+            parse_r_su(&s).unwrap_or(serde_json::Value::Null)
+        };
+        let r_types = [
+            (0x20u8, "r-access-request", Some("general-telephone")),
+            (0x23, "r-access-request", Some("abbreviated-telephone")),
+            (0x22, "r-access-request", Some("data")),
+            (0x61, "r-request-for-acknowledgement", None),
+            (0x62, "r-acknowledgement", None),
+            (0x12, "r-log-on-off-control", None),
+            (0x30, "r-call-progress", None),
+            (0x15, "r-log-on-off-acknowledgement", None),
+            (0x17, "r-log-control-ready-for-reassignment", None),
+            (0x60, "r-telephony-acknowledge", None),
+        ];
+        for (ty, su_type, kind) in r_types {
+            let v = r(ty);
+            assert_eq!(v["su_type"], su_type, "R 0x{ty:02X}");
+            assert_eq!(v["su_type_hex"], format!("0x{ty:02X}"), "R 0x{ty:02X}");
+            match kind {
+                Some(k) => assert_eq!(v["request_kind"], k, "R 0x{ty:02X}"),
+                None => assert!(v.get("request_kind").is_none(), "R 0x{ty:02X}"),
+            }
+        }
+
+        // ---- AEROTypeC (aerol.h `namespace AEROTypeC`) ----------------
+        // Fill 0x01, Call_progress 0x30, Telephony_acknowledge 0x60.
+        assert_eq!(crate::cchannel::su_type_name(0x01), "fill");
+        assert_eq!(crate::cchannel::su_type_name(0x30), "call-progress");
+        assert_eq!(crate::cchannel::su_type_name(0x60), "telephony-acknowledge");
+        // Any type not in AEROTypeC names as "other".
+        assert_eq!(crate::cchannel::su_type_name(0x71), "other");
+    }
+
     #[test]
     fn c_assignment_parses_frequencies() {
         // type 0x32 flight-safety, AES ABCDEF, GES 0x44,

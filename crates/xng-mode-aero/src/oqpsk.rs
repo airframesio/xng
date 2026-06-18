@@ -429,6 +429,9 @@ pub struct HrFramer {
     pub su_events: Vec<serde_json::Value>,
     /// Parsed header of the most recently assembled frame (AERO-4).
     pub last_header: Option<frame::FrameHeader>,
+    /// FEC-corrected coded-bit count of the most recently decoded frame
+    /// (AERO-6), latched so events from that frame carry it.
+    pub last_fec_corrected: Option<u32>,
     /// Self-configuring satellite/beam resolver (AERO-2).
     pub resolver: crate::satellite::SatelliteResolver,
 }
@@ -464,6 +467,7 @@ impl HrFramer {
             reasm: su::Reassembler::new(),
             su_events: Vec::new(),
             last_header: None,
+            last_fec_corrected: None,
             resolver: crate::satellite::SatelliteResolver::new(),
         }
     }
@@ -479,6 +483,8 @@ impl HrFramer {
                     Some(frame::FrameHeader::from_soft_bits(&buf[..frame::HEADER_BITS]));
                 let coded = &buf[HR_SKIP_BITS..];
                 let bytes = self.decoder.decode(coded);
+                // Genuine FEC-correction count for this frame (AERO-6).
+                self.last_fec_corrected = Some(self.decoder.last_fec_corrected());
                 for su_bytes in bytes.chunks_exact(su::SU_LEN) {
                     if su::su_crc_ok(su_bytes) {
                         if let Some(a) = su::parse_p_su(su_bytes) {
