@@ -82,9 +82,12 @@ impl HfdlChannelDecoder {
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
             for mut e in self.parser.parse(&burst.payload, burst.bps) {
-                // Stamp every event from this burst with the Viterbi
-                // corrected-symbol count (HFDL-5).
+                // Stamp every event from this burst with the demod-measured
+                // quality figures (HFDL-5): Viterbi corrected-symbol count,
+                // carrier frequency offset (Hz), and EVM-derived SNR (dB).
                 e.fec_corrected = Some(burst.fec_corrected);
+                e.freq_skew_hz = Some(burst.freq_skew_hz);
+                e.snr_db = burst.snr_db;
                 out.push(e);
             }
         }
@@ -114,7 +117,15 @@ pub fn to_message(e: &pdu::HfdlEvent, frequency_hz: u64, level_dbfs: f32, source
         mode: Mode::Hfdl,
         timestamp: Utc::now(),
         frequency_hz,
-        signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
+        // HFDL-5: surface the demod-measured SNR and carrier frequency
+        // offset (only set for burst-derived events; byte-built events
+        // leave them None — never fabricated).
+        signal: SignalQuality {
+            rssi_db: Some(level_dbfs),
+            snr_db: e.snr_db,
+            freq_skew_hz: e.freq_skew_hz,
+            ..Default::default()
+        },
         decode: DecodeQuality { crc_ok, fec_corrected: e.fec_corrected, errors },
         body,
         raw: Some(e.raw.clone()),

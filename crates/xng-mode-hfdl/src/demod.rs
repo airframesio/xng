@@ -25,6 +25,15 @@ pub struct Burst {
     /// Coded symbols corrected by the Viterbi decoder (HFDL-5): Hamming
     /// distance from the received hard decisions to the chosen codeword.
     pub fec_corrected: u32,
+    /// Carrier frequency offset of this burst, Hz (HFDL-5). Derived from
+    /// the recovered per-symbol carrier rotation `theta` at the symbol
+    /// rate: f = theta * SYMBOL_RATE / 2π. Measured, never fabricated.
+    pub freq_skew_hz: f32,
+    /// Burst SNR estimate, dB (HFDL-5). Measured as the ratio of mean
+    /// equalized-symbol power to the residual error power on the KNOWN T
+    /// training symbols (an EVM-derived SNR): 10·log10(S/N). Set only
+    /// when training symbols were actually processed.
+    pub snr_db: Option<f32>,
 }
 
 enum State {
@@ -33,9 +42,13 @@ enum State {
     Collect { a1_pos: f64, theta: f32, needed_syms: Option<(Setting, usize)> },
 }
 
-/// T/2-spaced 15-tap LMS feed-forward equalizer (dumphfdl runs liquid's
-/// eqlms_cccf the same way: push at 2 samples/symbol, output at symbol
-/// instants, train on the known T training symbols).
+/// Symbol-spaced LMS feed-forward equalizer (VERIFY-5: as-built this crate
+/// runs 7 SYMBOL-spaced taps — `Lms::new(7, …)` below, with the delay line
+/// advanced one sample per symbol. dumphfdl instead runs liquid's eqlms_cccf
+/// with 15 T/2-spaced taps because its input is matched-filtered at 2
+/// samples/symbol; ours is not, so the two tap counts are not comparable —
+/// they describe different sample geometries. Trains on the known T training
+/// symbols, output at the symbol instant.)
 struct Lms {
     w: Vec<Complex<f32>>,
     x: Vec<Complex<f32>>,
@@ -321,8 +334,10 @@ impl HfdlDemod {
             return None;
         }
 
-        // Walk the burst with a T/2-spaced LMS equalizer (15 taps, as in
-        // dumphfdl): CFO is removed by derotating with theta relative to
+        // Walk the burst with a symbol-spaced 7-tap LMS equalizer (VERIFY-5:
+        // 7 SYMBOL-spaced taps — not dumphfdl's 15 T/2-spaced taps, which
+        // assume a 2-sample/symbol matched-filtered input we do not run):
+        // CFO is removed by derotating with theta relative to
         // a1_pos; the equalizer absorbs the constant phase, the global pi
         // flip (its training references include `flip`), and multipath
         // ISI. It trains on the 9 preamble T segments and retrains on
@@ -356,19 +371,32 @@ impl HfdlDemod {
         }
 
         let step = std::f32::consts::TAU / (1u32 << s.bps_per_sym) as f32;
+        // EVM-based SNR accumulators (HFDL-5): on KNOWN T training symbols,
+        // the reference is the unit BPSK point `d`, so |d|^2 is the signal
+        // power and |y-d|^2 the residual (noise + ISI + carrier-loop)
+        // power. Accumulated only when `measure` is set, so convergence-era
+        // preamble training is excluded — see below.
+        let mut sig_pow = 0.0f64;
+        let mut err_pow = 0.0f64;
         // Process one symbol: window already contains the lookahead;
         // exec, train (known T bit) or slice (data), update the carrier
-        // loop, push the next sample.
+        // loop, push the next sample. `measure` gates EVM accumulation to
+        // post-convergence training symbols.
         let mut symbol = |this: &Self,
                           eq: &mut Lms,
                           tap_pos: &mut f64,
-                          train: Option<u8>|
+                          train: Option<u8>,
+                          measure: bool|
          -> Option<Complex<f32>> {
             let y = eq.exec();
             let perr = match train {
                 Some(bit) => {
                     let d = Complex::new(if bit == 1 { -1.0 } else { 1.0 }, 0.0);
                     eq.step(d, y);
+                    if measure {
+                        sig_pow += d.norm_sqr() as f64;
+                        err_pow += (y - d).norm_sqr() as f64;
+                    }
                     (y * d.conj()).arg()
                 }
                 None => {
@@ -385,9 +413,11 @@ impl HfdlDemod {
         };
 
         // Train over the 9 preamble T segments (135 known BPSK symbols).
+        // EVM is NOT measured here: the equalizer/carrier loop are still
+        // converging, so the residual would understate the steady-state SNR.
         for _ in 0..9 {
             for &tb in t.iter() {
-                symbol(self, &mut eq, &mut tap_pos, Some(tb))?;
+                symbol(self, &mut eq, &mut tap_pos, Some(tb), false)?;
             }
         }
 
@@ -397,7 +427,7 @@ impl HfdlDemod {
         let mut data_idx = 0usize;
         for _ in 0..s.data_segments() {
             for _ in 0..30 {
-                let y = symbol(self, &mut eq, &mut tap_pos, None)?;
+                let y = symbol(self, &mut eq, &mut tap_pos, None, false)?;
                 let mut ang = y.arg();
                 if flips[data_idx] == 1 {
                     ang += PI;
@@ -408,9 +438,10 @@ impl HfdlDemod {
                     soft.push(gray_soft(ang, m_levels, bit));
                 }
             }
-            // Retrain on the embedded T segment.
+            // Retrain on the embedded T segment; measure EVM here — the
+            // equalizer is converged and these are KNOWN reference symbols.
             for &tb in t.iter() {
-                symbol(self, &mut eq, &mut tap_pos, Some(tb))?;
+                symbol(self, &mut eq, &mut tap_pos, Some(tb), true)?;
             }
         }
 
@@ -437,7 +468,29 @@ impl HfdlDemod {
             .chunks(8)
             .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | (v << i)))
             .collect();
-        Some(Burst { bps: s.bps, payload, fec_corrected })
+
+        // Carrier frequency offset (HFDL-5): the recovered per-symbol
+        // carrier rotation is the acquisition estimate `theta` plus the
+        // steady-state decision-directed loop frequency `carr_fr` (rad/
+        // symbol). Convert to Hz at the symbol rate: f = rate * rad / 2π.
+        // This is the actual rotation the demod removed — measured, not
+        // assumed. `theta` is referenced to a1_pos so it already excludes
+        // the +1440 Hz subcarrier (removed upstream by the DDC/derotation).
+        let cfo_rad_per_sym = theta + carr_fr;
+        let freq_skew_hz =
+            (cfo_rad_per_sym as f64 * SYMBOL_RATE / std::f64::consts::TAU) as f32;
+
+        // EVM-based SNR (HFDL-5): S/N over the post-convergence embedded T
+        // training symbols. Only emitted when such symbols were processed
+        // (every setting has data segments, so this is always populated on
+        // a completed burst); otherwise left None rather than fabricated.
+        let snr_db = if sig_pow > 0.0 && err_pow > 0.0 {
+            Some(10.0 * (sig_pow / err_pow).log10() as f32)
+        } else {
+            None
+        };
+
+        Some(Burst { bps: s.bps, payload, fec_corrected, freq_skew_hz, snr_db })
     }
 
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Burst> {

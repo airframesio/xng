@@ -131,6 +131,48 @@ fn mpdu_stats(b: &[u8]) -> serde_json::Value {
     json!({ "300bps": b[3], "600bps": b[2], "1200bps": b[1], "1800bps": b[0] })
 }
 
+/// HFDL-4: build a normalized aircraft-position object from a
+/// position-bearing HFNPDU (the 0xD1 performance-data and 0xD5
+/// frequency-data records both carry a 20-bit lat/lon pair and the UTC
+/// half-second-of-day counter at the SAME fixed offsets — ARINC 635
+/// HFNPDU layout, mirrored by dumphfdl `performance_data_parse` /
+/// `frequency_data_parse`). Returns `None` for the all-zero placeholder
+/// (lat==0 && lon==0): an aircraft that has not yet acquired a GPS fix
+/// transmits zeros, and dumphfdl likewise treats (0,0) as "no position"
+/// — emitting it would plant a fabricated null-island fix on the map.
+///
+/// `aircraft_id` is the 8-bit GS-LOCAL downlink alias (NOT the ICAO);
+/// `icao` is back-filled from the logon-confirm ac_cache by `resolved()`
+/// upstream and carried through `who`. Both are surfaced verbatim from
+/// `who` so the map/serial layer has the keyed identity alongside the fix.
+fn position_obj(
+    lat: f64,
+    lon: f64,
+    utc_s: u32,
+    utc: &serde_json::Value,
+    flight: &str,
+    who: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if lat == 0.0 && lon == 0.0 {
+        return None;
+    }
+    let mut p = json!({
+        "lat": lat,
+        "lon": lon,
+        "utc_s": utc_s,
+        "utc": utc.clone(),
+        "flight": flight,
+    });
+    // GS-local downlink alias and (if resolved) the ICAO it maps to.
+    if let Some(id) = who.get("aircraft_id") {
+        p["aircraft_id"] = id.clone();
+    }
+    if let Some(icao) = who.get("icao") {
+        p["icao"] = icao.clone();
+    }
+    Some(p)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HfdlEvent {
     pub kind: String,
@@ -142,6 +184,14 @@ pub struct HfdlEvent {
     /// directly from bytes (tests, reassembled system tables).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fec_corrected: Option<u32>,
+    /// Carrier frequency offset (Hz) of the burst this event came from
+    /// (HFDL-5). Set by the demod path; `None` for byte-built events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freq_skew_hz: Option<f32>,
+    /// EVM-derived burst SNR (dB) (HFDL-5). Set by the demod path; `None`
+    /// for byte-built events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snr_db: Option<f32>,
     #[serde(skip_serializing)]
     pub raw: Vec<u8>,
 }
@@ -226,6 +276,8 @@ impl PduParser {
             }),
             acars: None,
             fec_corrected: None,
+            freq_skew_hz: None,
+            snr_db: None,
             raw: p[..66].to_vec(),
         });
         let _ = bps;
@@ -315,6 +367,8 @@ impl PduParser {
                 details: json!({ "icao": icao(&body[1..4]), "who": who }),
                 acars: None,
                 fec_corrected: None,
+                freq_skew_hz: None,
+                snr_db: None,
                 raw: l.to_vec(),
             }),
             0x4F if body.len() >= 4 => out.push(HfdlEvent {
@@ -322,6 +376,8 @@ impl PduParser {
                 details: json!({ "icao": icao(&body[1..4]), "who": who }),
                 acars: None,
                 fec_corrected: None,
+                freq_skew_hz: None,
+                snr_db: None,
                 raw: l.to_vec(),
             }),
             0x9F | 0x5F if body.len() >= 5 => {
@@ -334,6 +390,8 @@ impl PduParser {
                     details: json!({ "icao": icao_str, "assigned_id": body[4], "who": who }),
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: l.to_vec(),
                 });
             }
@@ -352,6 +410,8 @@ impl PduParser {
                     }),
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: l.to_vec(),
                 });
             }
@@ -371,6 +431,8 @@ impl PduParser {
                     }),
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: l.to_vec(),
                 });
             }
@@ -379,6 +441,8 @@ impl PduParser {
                 details: json!({ "type": t, "type_name": lpdu_type_name(t), "who": who }),
                 acars: None,
                 fec_corrected: None,
+                freq_skew_hz: None,
+                snr_db: None,
                 raw: l.to_vec(),
             }),
         }
@@ -398,6 +462,8 @@ impl PduParser {
                 }),
                 acars: None,
                 fec_corrected: None,
+                freq_skew_hz: None,
+                snr_db: None,
                 raw: h.to_vec(),
             });
         };
@@ -414,6 +480,8 @@ impl PduParser {
                         details: json!({ "who": who, "bps": bps }),
                         acars: Some(b),
                         fec_corrected: None,
+                        freq_skew_hz: None,
+                        snr_db: None,
                         raw: h.to_vec(),
                     });
                 } else {
@@ -432,14 +500,15 @@ impl PduParser {
                     (h[10] as u32 >> 4) | (h[11] as u32) << 4 | (h[12] as u32) << 12,
                 );
                 let (hour, min, sec) = utc_hms(u16::from_le_bytes([h[13], h[14]]));
+                let utc_s = u16::from_le_bytes([h[13], h[14]]) as u32 * 2;
+                let utc = json!({ "hour": hour, "min": min, "sec": sec });
+                let flight = flight.trim().to_string();
                 let freq_change_code = h[46] & 0x0F;
-                out.push(HfdlEvent {
-                    kind: "performance-data".into(),
-                    details: json!({
-                        "flight": flight.trim().to_string(),
+                let mut details = json!({
+                        "flight": flight,
                         "lat": lat, "lon": lon,
-                        "utc_s": u16::from_le_bytes([h[13], h[14]]) as u32 * 2,
-                        "utc": { "hour": hour, "min": min, "sec": sec },
+                        "utc_s": utc_s,
+                        "utc": utc.clone(),
                         "version": h[15],
                         "flight_leg": h[16],
                         "gs_id": h[17] & 0x7F,
@@ -462,9 +531,19 @@ impl PduParser {
                         "freq_change_code": freq_change_code,
                         "freq_change_cause": freq_change_cause(freq_change_code),
                         "who": who,
-                    }),
+                });
+                // HFDL-4: normalized aircraft-position object for the map/
+                // serial layer (only when a real fix is present).
+                if let Some(pos) = position_obj(lat, lon, utc_s, &utc, &flight, who) {
+                    details["position"] = pos;
+                }
+                out.push(HfdlEvent {
+                    kind: "performance-data".into(),
+                    details,
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: h.to_vec(),
                 });
             }
@@ -478,6 +557,9 @@ impl PduParser {
                     (h[10] as u32 >> 4) | (h[11] as u32) << 4 | (h[12] as u32) << 12,
                 );
                 let (hour, min, sec) = utc_hms(u16::from_le_bytes([h[13], h[14]]));
+                let utc_s = u16::from_le_bytes([h[13], h[14]]) as u32 * 2;
+                let utc = json!({ "hour": hour, "min": min, "sec": sec });
+                let flight = flight.trim().to_string();
                 // Up to 6 per-GS {gs_id, prop_freqs, tuned_freqs} records,
                 // 6 octets each, starting at offset 15 (dumphfdl
                 // frequency_data_parse, facts only).
@@ -500,18 +582,26 @@ impl PduParser {
                         "tuned_freqs": tuned_freqs,
                     }));
                 }
-                out.push(HfdlEvent {
-                    kind: "frequency-data".into(),
-                    details: json!({
-                        "flight": flight.trim().to_string(),
+                let mut details = json!({
+                        "flight": flight,
                         "lat": lat, "lon": lon,
-                        "utc_s": u16::from_le_bytes([h[13], h[14]]) as u32 * 2,
-                        "utc": { "hour": hour, "min": min, "sec": sec },
+                        "utc_s": utc_s,
+                        "utc": utc.clone(),
                         "freq_data": freq_data,
                         "who": who,
-                    }),
+                });
+                // HFDL-4: normalized aircraft-position object for the map/
+                // serial layer (only when a real fix is present).
+                if let Some(pos) = position_obj(lat, lon, utc_s, &utc, &flight, who) {
+                    details["position"] = pos;
+                }
+                out.push(HfdlEvent {
+                    kind: "frequency-data".into(),
+                    details,
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: h.to_vec(),
                 });
             }
@@ -523,6 +613,8 @@ impl PduParser {
                     details: json!({ "seq": seq, "total": total, "version": version }),
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: h.to_vec(),
                 });
                 if let Some(table) = self.systable.store(version, seq, total, &h[5..]) {
@@ -531,6 +623,8 @@ impl PduParser {
                         details: serde_json::to_value(&table).unwrap_or_default(),
                         acars: None,
                         fec_corrected: None,
+                        freq_skew_hz: None,
+                        snr_db: None,
                         raw: Vec::new(),
                     });
                 }
@@ -546,6 +640,8 @@ impl PduParser {
                     }),
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: h.to_vec(),
                 });
             }
@@ -556,6 +652,8 @@ impl PduParser {
                     details: json!({ "who": who }),
                     acars: None,
                     fec_corrected: None,
+                    freq_skew_hz: None,
+                    snr_db: None,
                     raw: h.to_vec(),
                 });
             }
@@ -568,6 +666,8 @@ impl PduParser {
                 }),
                 acars: None,
                 fec_corrected: None,
+                freq_skew_hz: None,
+                snr_db: None,
                 raw: h.to_vec(),
             }),
         }
@@ -1106,5 +1206,117 @@ mod tests {
         parser.parse(&confirm, 300);
         std::thread::sleep(std::time::Duration::from_millis(1));
         assert_eq!(parser.resolve_icao(0x42), None, "entry expires past TTL");
+    }
+
+    // ── HFDL-4 aircraft position extraction ─────────────────────────────
+    //
+    // The 0xD1 performance-data and 0xD5 frequency-data HFNPDUs carry the
+    // aircraft fix at FIXED offsets, pinned to ARINC 635 / dumphfdl 1.7.0
+    // hfnpdu.c (performance_data_parse / frequency_data_parse, facts only):
+    //   flight_id : buf[2..8]  (7-bit ASCII)
+    //   lat       : 20-bit two's-complement at buf[8..11] (×180/2^19)
+    //   lon       : 20-bit two's-complement at buf[10..13] (×180/2^19)
+    //   utc       : uint16 LE half-second-of-day at buf[13..15]
+    // (offsets relative to the 0xFF envelope byte). `position_obj` lifts
+    // these into a normalized `details.position` for the map/serial layer.
+
+    /// Build a 0xD1 performance-data HFNPDU body (0xFF-prefixed) with the
+    /// given fix, using the cited offsets above. The non-position fields
+    /// are left zero — only the position layout is under test here.
+    fn perf_with_fix(flight: &[u8; 6], lat_deg: f64, lon_deg: f64, utc_raw: u16) -> Vec<u8> {
+        let mut h = vec![0u8; 47];
+        h[0] = 0xFF;
+        h[1] = 0xD1;
+        h[2..8].copy_from_slice(flight);
+        let lat_raw = ((lat_deg * (1u32 << 19) as f64 / 180.0).round() as i32 as u32) & 0xFFFFF;
+        let lon_raw = ((lon_deg * (1u32 << 19) as f64 / 180.0).round() as i32 as u32) & 0xFFFFF;
+        h[8] = (lat_raw & 0xFF) as u8;
+        h[9] = ((lat_raw >> 8) & 0xFF) as u8;
+        h[10] = ((lat_raw >> 16) & 0x0F) as u8 | (((lon_raw & 0x0F) as u8) << 4);
+        h[11] = ((lon_raw >> 4) & 0xFF) as u8;
+        h[12] = ((lon_raw >> 12) & 0xFF) as u8;
+        h[13] = (utc_raw & 0xFF) as u8;
+        h[14] = (utc_raw >> 8) as u8;
+        h
+    }
+
+    #[test]
+    fn position_object_extracted_from_performance_data() {
+        // utc_raw counts half-seconds: 10800 * 2 = 21600 s = 06:00:00.
+        let h = perf_with_fix(b"UAL042", 40.0, -73.0, 10800);
+        let ev = parse_hfnpdu_body(&h);
+        let e = ev.iter().find(|e| e.kind == "performance-data").expect("perf-data");
+        let pos = &e.details["position"];
+        assert!(pos.is_object(), "performance-data must carry a normalized position");
+        assert!((pos["lat"].as_f64().unwrap() - 40.0).abs() < 0.001);
+        assert!((pos["lon"].as_f64().unwrap() - (-73.0)).abs() < 0.001);
+        assert_eq!(pos["utc_s"], 21600);
+        assert_eq!(pos["utc"]["hour"], 6);
+        assert_eq!(pos["utc"]["min"], 0);
+        assert_eq!(pos["utc"]["sec"], 0);
+        assert_eq!(pos["flight"], "UAL042");
+    }
+
+    #[test]
+    fn position_object_extracted_from_frequency_data() {
+        // 0xD5 shares the same 15-octet position header as 0xD1.
+        let mut h = vec![0xFF, 0xD5];
+        h.extend_from_slice(b"DLH456"); // flight at 2..8
+        let lat_raw = ((51.5_f64 * (1u32 << 19) as f64 / 180.0).round() as i32 as u32) & 0xFFFFF;
+        let lon_raw = ((-0.1_f64 * (1u32 << 19) as f64 / 180.0).round() as i32 as u32) & 0xFFFFF;
+        h.push((lat_raw & 0xFF) as u8);
+        h.push(((lat_raw >> 8) & 0xFF) as u8);
+        h.push(((lat_raw >> 16) & 0x0F) as u8 | (((lon_raw & 0x0F) as u8) << 4));
+        h.push(((lon_raw >> 4) & 0xFF) as u8);
+        h.push(((lon_raw >> 12) & 0xFF) as u8);
+        h.push(0x10); // utc low byte (16 * 2 s = 32 s)
+        h.push(0x00); // utc high byte
+        let ev = parse_hfnpdu_body(&h);
+        let e = ev.iter().find(|e| e.kind == "frequency-data").expect("freq-data");
+        let pos = &e.details["position"];
+        assert!(pos.is_object(), "frequency-data must carry a normalized position");
+        assert!((pos["lat"].as_f64().unwrap() - 51.5).abs() < 0.001);
+        assert!((pos["lon"].as_f64().unwrap() - (-0.1)).abs() < 0.001);
+        assert_eq!(pos["utc_s"], 32);
+        assert_eq!(pos["flight"], "DLH456");
+    }
+
+    #[test]
+    fn position_carries_resolved_icao_and_alias_after_logon_confirm() {
+        // HFDL-4 + HFDL-3: the position HFNPDU's aircraft_id is the 8-bit
+        // GS-local downlink alias, NOT the ICAO; the ICAO is back-filled
+        // from the logon-confirm ac_cache. The normalized position must
+        // surface both the alias and the resolved ICAO.
+        let mut parser = PduParser::new();
+        // GS assigns alias 0x42 -> ICAO 040087 via logon-confirm.
+        let confirm = build_mpdu_uplink(4, 0xFF, &[build_lpdu_logon_confirm(0x040087, 0x42)]);
+        parser.parse(&confirm, 300);
+
+        // Downlink performance-data from alias 0x42 with a real fix.
+        let h = perf_with_fix(b"UAL042", 40.0, -73.0, 10800);
+        let dl = build_mpdu_downlink(4, 0x42, &[build_lpdu_hfnpdu(&h)]);
+        let ev = parser.parse(&dl, 300);
+        let e = ev.iter().find(|e| e.kind == "performance-data").expect("perf-data");
+        let pos = &e.details["position"];
+        assert_eq!(pos["aircraft_id"], 0x42, "GS-local alias surfaced verbatim");
+        assert_eq!(pos["icao"], "040087", "ICAO resolved from logon-confirm cache");
+    }
+
+    #[test]
+    fn position_suppressed_for_null_island_fix() {
+        // An aircraft without a GPS fix transmits all-zero coordinates;
+        // dumphfdl treats (0,0) as "no position" and so must we — emitting
+        // a (0,0) fix would plant a fabricated point on the map.
+        let h = perf_with_fix(b"AAL999", 0.0, 0.0, 0);
+        let ev = parse_hfnpdu_body(&h);
+        let e = ev.iter().find(|e| e.kind == "performance-data").expect("perf-data");
+        assert!(
+            e.details.get("position").map(|p| p.is_null()).unwrap_or(true),
+            "all-zero (0,0) fix must NOT produce a position object"
+        );
+        // The raw lat/lon fields are still present (they're part of the
+        // record) — only the normalized position is withheld.
+        assert_eq!(e.details["lat"], 0.0);
+        assert_eq!(e.details["lon"], 0.0);
     }
 }
