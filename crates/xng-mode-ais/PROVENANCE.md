@@ -146,6 +146,38 @@ type-specific report blocks; FID 19 (marine-traffic-signal) and FID 18/20
 (clearance/berthing) are not decoded. These need worked examples with known
 ground-truth values to ground safely and were skipped rather than guessed.
 
+## SOTDMA / ITDMA radio communication state (AIS-3 leftover, 2026-06)
+
+`fields::comm_state` decodes the radio communication state carried by the
+position-report messages that include it — types 1/2 (SOTDMA), 3 (ITDMA),
+4/11 (SOTDMA base-station/UTC-response), and 9/18 (SOTDMA *or* ITDMA selected
+by the leading bit of the 20-bit field). The field sits at bit 149 (19 bits)
+for types 1/2/3/4/11 and at bit 148 (20 bits, MSB = ITDMA/SOTDMA selector)
+for types 9/18, per ITU-R M.1371-5 §3.3.7.4. Type 19 has no comm-state field
+and is left untouched.
+
+Decode is grounded in **ITU-R M.1371-5 §3.3.7.2.1** (SOTDMA, Table 21:
+sync-state 2 | slot-time-out 3 | sub-message 14) and **§3.3.7.3.2** (ITDMA,
+Table 23: sync-state 2 | slot-increment 13 | number-of-slots 3 | keep-flag 1).
+The slot-time-out value selects the SOTDMA sub-message: 0 → slot offset,
+1 → UTC hour/minute, 2/4/6 → slot number, 3/5/7 → number of received
+stations. Number-of-slots N encodes N+1 consecutive slots (exposed as both
+`num_slots` and `slots_allocated`).
+
+ORACLE: **pyais 3.1.0** (MIT) DOES expose this state via the `radio` field +
+`get_communication_state()` (`util.py` `get_sotdma_comm_state` /
+`get_itdma_comm_state`). Every asserted value in the unit tests is the value
+pyais 3.1.0 produced for the *same* AIVDM sentence (captured 2026-06-16),
+covering all four SOTDMA sub-message branches and both ITDMA cases on real
+vectors (types 1/4/9/18); the type-3 ITDMA path and the slot-time-out 4/5
+branches are additionally spec-derived from §3.3.7.2.1/§3.3.7.3.2 with
+hand-built raw words. The bit offsets (149/148) were cross-checked to
+reproduce pyais's raw `radio` value exactly across all vectors. No pyais code
+was copied; only the decoded field values are the reference. Output keys:
+`scheme`, `sync_state` (+ `sync_state_text`), and the scheme-specific
+sub-fields, nested under `comm_state` in the existing `MessageBody::Ais`
+details (no new types).
+
 ## Distress device classification (2026-06)
 
 The `distress` tag classifies SART/MOB/EPIRB-AIS transmitters by MMSI

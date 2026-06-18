@@ -739,6 +739,87 @@ pub fn distress_class(mmsi: u32) -> Option<&'static str> {
     }
 }
 
+/// SOTDMA / ITDMA sync-state names (ITU-R M.1371-5 §3.3.7.2.1, the "sync
+/// state" column): 0 = synchronised directly to UTC, 1 = synchronised
+/// indirectly to UTC, 2 = synchronised to a base station, 3 = synchronised to
+/// another station (the one reporting the highest number of received
+/// stations). Same enumeration for both access schemes.
+fn sync_state_name(code: u64) -> &'static str {
+    match code {
+        0 => "UTC direct",
+        1 => "UTC indirect",
+        2 => "base station",
+        _ => "other station",
+    }
+}
+
+/// Decode the radio communication state carried by SOTDMA/ITDMA position
+/// reports (the "AIS-3 leftover"). `raw` is the value of the comm-state field
+/// (19 bits for the message types that always use SOTDMA — 1/2/4/11; for
+/// types 3/9/18 the field is 20 bits, where the most-significant bit selects
+/// ITDMA(=1)/SOTDMA(=0) and the low 19 bits are passed here). `itdma`
+/// selects the access scheme.
+///
+/// SOTDMA (ITU-R M.1371-5 §3.3.7.2.1, Table 21): sync state (2) | slot
+/// time-out (3) | sub-message (14). The slot time-out (frames remaining
+/// before a new slot is selected, 0 = last transmission in this slot)
+/// determines the sub-message — time-out 0 → slot offset (offset to the slot
+/// used in the next frame); 1 → UTC hour (sub bits 13..9) and minute (sub
+/// bits 8..2); 3/5/7 → number of other stations received (0..16383); 2/4/6 →
+/// slot number used for this transmission (0..2249).
+///
+/// ITDMA (ITU-R M.1371-5 §3.3.7.3.2, Table 23): sync state (2) | slot
+/// increment (13) | number of slots (3) | keep flag (1). Slot increment is
+/// the offset to the next slot to be used (0 = no further transmission);
+/// number-of-slots N encodes N+1 consecutive slots; the keep flag, when set,
+/// retains the slot for one additional frame.
+///
+/// Verified field-for-field against the pyais 3.1.0 oracle
+/// (`get_sotdma_comm_state` / `get_itdma_comm_state`, util.py) on real AIVDM
+/// vectors — see the unit tests below.
+fn comm_state(raw: u64, itdma: bool) -> Value {
+    let mut d = serde_json::Map::new();
+    let sync = (raw >> 17) & 0x3;
+    d.insert("sync_state".into(), json!(sync));
+    d.insert("sync_state_text".into(), json!(sync_state_name(sync)));
+    if itdma {
+        // §3.3.7.3.2: increment (13) | num slots (3) | keep flag (1).
+        let slot_increment = (raw >> 4) & 0x1fff;
+        let num_slots = (raw >> 1) & 0x7;
+        let keep_flag = raw & 0x1;
+        d.insert("scheme".into(), json!("ITDMA"));
+        d.insert("slot_increment".into(), json!(slot_increment));
+        // N encodes N+1 consecutive slots; expose both the raw field and the
+        // human count so consumers needn't redo the +1.
+        d.insert("num_slots".into(), json!(num_slots));
+        d.insert("slots_allocated".into(), json!(num_slots + 1));
+        d.insert("keep_flag".into(), json!(keep_flag == 1));
+    } else {
+        // §3.3.7.2.1: slot time-out (3) then the time-out-dependent sub-msg.
+        let slot_timeout = (raw >> 14) & 0x7;
+        let sub = raw & 0x3fff;
+        d.insert("scheme".into(), json!("SOTDMA"));
+        d.insert("slot_timeout".into(), json!(slot_timeout));
+        match slot_timeout {
+            0 => {
+                d.insert("slot_offset".into(), json!(sub));
+            }
+            1 => {
+                d.insert("utc_hour".into(), json!((sub >> 9) & 0x1f));
+                d.insert("utc_minute".into(), json!((sub >> 2) & 0x3f));
+            }
+            2 | 4 | 6 => {
+                d.insert("slot_number".into(), json!(sub));
+            }
+            // 3, 5, 7
+            _ => {
+                d.insert("received_stations".into(), json!(sub));
+            }
+        }
+    }
+    Value::Object(d)
+}
+
 /// Decode the fields of an AIS message; `None` when the type is not
 /// (yet) field-decoded. Positions in degrees, speeds in knots.
 pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
@@ -776,6 +857,11 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
                 }
             }
             put("raim", json!(u(bits, 148, 1)? == 1));
+            // Radio communication state (19 bits at bit 149). Types 1 & 2 use
+            // SOTDMA; type 3 uses ITDMA (ITU-R M.1371-5 §3.3.7.2/§3.3.7.3).
+            if let Some(raw) = u(bits, 149, 19) {
+                put("comm_state", comm_state(raw, msg_type == 3));
+            }
         }
         // Base station report (4) / UTC-and-date response (11) — same shape.
         4 | 11 => {
@@ -798,6 +884,12 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
             }
             put("epfd", json!(epfd_name(u(bits, 134, 4)?)));
             put("raim", json!(u(bits, 148, 1)? == 1));
+            // Radio communication state (19 bits at bit 149). Base stations
+            // (4) and the UTC/date response (11) always use SOTDMA
+            // (ITU-R M.1371-5 §3.3.7.2.1).
+            if let Some(raw) = u(bits, 149, 19) {
+                put("comm_state", comm_state(raw, false));
+            }
         }
         // Static and voyage data.
         5 => {
@@ -865,6 +957,13 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
                 put("lat", json!(lat));
                 put("lon", json!(lon));
             }
+            // Radio communication state (20 bits at bit 148): the MSB selects
+            // the access scheme — 1 = ITDMA, 0 = SOTDMA — and the low 19 bits
+            // carry the state (ITU-R M.1371-5 §3.3.7.4, communication-state
+            // selector flag).
+            if let Some(raw) = u(bits, 148, 20) {
+                put("comm_state", comm_state(raw & 0x7ffff, raw >> 19 == 1));
+            }
         }
         // Addressed safety-related text.
         12 => {
@@ -894,6 +993,12 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
             }
             if msg_type == 18 {
                 put("raim", json!(u(bits, 147, 1)? == 1));
+                // Class-B CS radio communication state (20 bits at bit 148):
+                // MSB selects ITDMA(1)/SOTDMA(0), low 19 bits carry the state
+                // (ITU-R M.1371-5 §3.3.7.4). Type 19 has no comm-state field.
+                if let Some(raw) = u(bits, 148, 20) {
+                    put("comm_state", comm_state(raw & 0x7ffff, raw >> 19 == 1));
+                }
             } else {
                 // Type 19 extended: identity + dimensions + EPFD.
                 put("name", json!(sixbit(bits, 143, 20)));
@@ -1423,6 +1528,206 @@ mod tests {
         assert_eq!(distress_class(974_99_9999), Some("EPIRB-AIS"));
         assert_eq!(distress_class(366_123_456), None); // ordinary US ship
         assert_eq!(distress_class(0), None);
+    }
+
+    // ----------------------------------------------------------------------
+    // SOTDMA / ITDMA radio communication state (the AIS-3 leftover),
+    // ITU-R M.1371-5 §3.3.7.2 (SOTDMA) / §3.3.7.3 (ITDMA) / §3.3.7.4 (the
+    // SOTDMA/ITDMA selector flag in messages 9/18/26).
+    //
+    // ORACLE: pyais 3.1.0 (MIT) DOES expose the comm-state — `radio` field +
+    // `get_communication_state()` (util.py `get_sotdma_comm_state` /
+    // `get_itdma_comm_state`). Every assertion below is the value pyais 3.1.0
+    // produced for the SAME AIVDM sentence (captured 2026-06-16). No pyais
+    // code was copied; only the decoded field values are the reference. The
+    // bit offsets (149 for the 19-bit SOTDMA field of types 1/2/4/11; 148 for
+    // the 20-bit selector+state field of types 9/18) were cross-checked to
+    // reproduce pyais's `radio` raw value exactly across all of these vectors.
+    // ----------------------------------------------------------------------
+
+    /// pyais-oracle helper: decode the SOTDMA/ITDMA comm-state out of an AIVDM
+    /// payload (single-fragment, `fill` fill bits) and return the `comm_state`
+    /// object. Asserts the message type so a wrong vector fails loudly.
+    fn comm_of(payload: &str, fill: usize, want_type: u8) -> Value {
+        let (t, bits) = typed(payload, fill);
+        assert_eq!(t, want_type);
+        decode(t, &bits).unwrap()["comm_state"].clone()
+    }
+
+    #[test]
+    fn comm_state_sotdma_utc_hour_minute_matches_pyais() {
+        // Type 1, MMSI 477553000 (the crate's canonical type-1 vector).
+        // pyais: radio=149208, slot_timeout=1, sync_state=1 (UTC indirect),
+        // utc_hour=3, utc_minute=54.
+        let c = comm_of("177KQJ5000G?tO`K>RA1wUbN0TKH", 0, 1);
+        assert_eq!(c["scheme"], "SOTDMA");
+        assert_eq!(c["sync_state"], 1);
+        assert_eq!(c["sync_state_text"], "UTC indirect");
+        assert_eq!(c["slot_timeout"], 1);
+        assert_eq!(c["utc_hour"], 3);
+        assert_eq!(c["utc_minute"], 54);
+        // The other sub-fields are absent for this slot_timeout.
+        assert!(c.get("slot_offset").is_none());
+        assert!(c.get("slot_number").is_none());
+        assert!(c.get("received_stations").is_none());
+    }
+
+    #[test]
+    fn comm_state_sotdma_slot_offset_matches_pyais() {
+        // Type 1, MMSI 366053209. pyais: radio=161, slot_timeout=0,
+        // sync_state=0 (UTC direct), slot_offset=161.
+        let c = comm_of("15M67FC000G?ufbE`FepT8u8002Q", 0, 1);
+        assert_eq!(c["scheme"], "SOTDMA");
+        assert_eq!(c["sync_state"], 0);
+        assert_eq!(c["sync_state_text"], "UTC direct");
+        assert_eq!(c["slot_timeout"], 0);
+        assert_eq!(c["slot_offset"], 161);
+        assert!(c.get("utc_hour").is_none());
+    }
+
+    #[test]
+    fn comm_state_sotdma_slot_number_matches_pyais() {
+        // Type 1, MMSI 244670316. pyais: radio=33359, slot_timeout=2,
+        // sync_state=0, slot_number=591.
+        let c = comm_of("13aEOK?P00PD2wVMdLDRhgvL289?", 0, 1);
+        assert_eq!(c["slot_timeout"], 2);
+        assert_eq!(c["sync_state"], 0);
+        assert_eq!(c["slot_number"], 591);
+        assert!(c.get("received_stations").is_none());
+    }
+
+    #[test]
+    fn comm_state_sotdma_received_stations_matches_pyais() {
+        // Type 1, MMSI 545921920. pyais: radio=49198, slot_timeout=3,
+        // sync_state=0, received_stations=46.
+        let c = comm_of("1H8`KP0P00PD@l8MD6QQ9wvJ2<0f", 0, 1);
+        assert_eq!(c["slot_timeout"], 3);
+        assert_eq!(c["sync_state"], 0);
+        assert_eq!(c["received_stations"], 46);
+        assert!(c.get("slot_number").is_none());
+    }
+
+    #[test]
+    fn comm_state_type4_base_station_matches_pyais() {
+        // Type 4, MMSI 3669145 (the crate's canonical type-4 vector).
+        // pyais: radio=98739, slot_timeout=6, sync_state=0, slot_number=435.
+        let c = comm_of("403OtVAv>lba;o?Ia`E`4G?02H6k", 0, 4);
+        assert_eq!(c["scheme"], "SOTDMA");
+        assert_eq!(c["slot_timeout"], 6);
+        assert_eq!(c["sync_state"], 0);
+        assert_eq!(c["slot_number"], 435);
+    }
+
+    #[test]
+    fn comm_state_type4_sync_base_station_matches_pyais() {
+        // Type 4, MMSI 2288218. pyais: radio=166109, slot_timeout=2,
+        // sync_state=1 (UTC indirect), slot_number=2269.
+        let c = comm_of("402;bFQv@kkLc00Dl4LE52100`SM", 0, 4);
+        assert_eq!(c["slot_timeout"], 2);
+        assert_eq!(c["sync_state"], 1);
+        assert_eq!(c["slot_number"], 2269);
+    }
+
+    #[test]
+    fn comm_state_type18_itdma_matches_pyais() {
+        // Type 18, MMSI 367430530 (the crate's canonical type-18 vector).
+        // pyais: radio=917510 (> 0x7ffff → ITDMA selector set), sync_state=3
+        // (other station), keep_flag=0, slot_increment=0, num_slots=3.
+        let c = comm_of("B5NJ;PP005l4ot5Isbl03wsUkP06", 0, 18);
+        assert_eq!(c["scheme"], "ITDMA");
+        assert_eq!(c["sync_state"], 3);
+        assert_eq!(c["sync_state_text"], "other station");
+        assert_eq!(c["slot_increment"], 0);
+        assert_eq!(c["num_slots"], 3);
+        assert_eq!(c["slots_allocated"], 4); // N+1 consecutive slots
+        assert_eq!(c["keep_flag"], false);
+        // ITDMA carries no slot_timeout / SOTDMA sub-fields.
+        assert!(c.get("slot_timeout").is_none());
+        assert!(c.get("slot_offset").is_none());
+    }
+
+    #[test]
+    fn comm_state_type18_sotdma_matches_pyais() {
+        // Type 18, MMSI 423302100. pyais: radio=0 (≤ 0x7ffff → SOTDMA),
+        // slot_offset=0, slot_timeout=0, sync_state=0.
+        let c = comm_of("B6CdCm0t3`tba35RbDM21Oh00000", 0, 18);
+        assert_eq!(c["scheme"], "SOTDMA");
+        assert_eq!(c["slot_timeout"], 0);
+        assert_eq!(c["sync_state"], 0);
+        assert_eq!(c["slot_offset"], 0);
+        assert!(c.get("keep_flag").is_none());
+    }
+
+    #[test]
+    fn comm_state_type9_itdma_matches_pyais() {
+        // Type 9 SAR aircraft, MMSI 366000005. pyais: radio=703773 (ITDMA),
+        // sync_state=1 (UTC indirect), keep_flag=1, slot_increment=3025,
+        // num_slots=6.
+        let c = comm_of("95M2oQ@41Tr4L4BD5`8L3Sup6clMwd?cT5i", 0, 9);
+        assert_eq!(c["scheme"], "ITDMA");
+        assert_eq!(c["sync_state"], 1);
+        assert_eq!(c["sync_state_text"], "UTC indirect");
+        assert_eq!(c["slot_increment"], 3025);
+        assert_eq!(c["num_slots"], 6);
+        assert_eq!(c["slots_allocated"], 7);
+        assert_eq!(c["keep_flag"], true);
+    }
+
+    #[test]
+    fn comm_state_type3_is_itdma() {
+        // Type 3 always uses ITDMA (ITU-R M.1371-5 §3.3.7.3): same wire layout
+        // as type 1, so re-using the type-1 vector but forcing the type nibble
+        // to 3 must select the ITDMA interpretation. Spec-derived from the
+        // raw word: radio=149208 read as ITDMA → sync=(149208>>17)&3=1,
+        // slot_increment=(149208>>4)&0x1fff=1133, num_slots=(149208>>1)&7=4,
+        // keep_flag=149208&1=0.
+        let mut bits = bits_of("177KQJ5000G?tO`K>RA1wUbN0TKH", 0);
+        // Overwrite the 6-bit type field with 3 (000011).
+        for (k, b) in [0u8, 0, 0, 0, 1, 1].iter().enumerate() {
+            bits[k] = *b;
+        }
+        let c = decode(3, &bits).unwrap()["comm_state"].clone();
+        assert_eq!(c["scheme"], "ITDMA");
+        assert_eq!(c["sync_state"], 1);
+        assert_eq!(c["slot_increment"], 1133);
+        assert_eq!(c["num_slots"], 4);
+        assert_eq!(c["keep_flag"], false);
+    }
+
+    #[test]
+    fn comm_state_helper_spec_branches() {
+        // Spec-derived unit checks of comm_state() against ITU-R M.1371-5
+        // §3.3.7.2.1 hand-built raw words (independent of the bit-offset
+        // extraction), covering each slot-timeout branch and the ITDMA case.
+        //
+        // SOTDMA, slot_timeout=5 (in {3,5,7}) → received_stations.
+        // raw = sync(2)=2 | timeout(3)=5 | sub(14)=1000.
+        let raw = (2u64 << 17) | (5 << 14) | 1000;
+        let c = comm_state(raw, false);
+        assert_eq!(c["sync_state"], 2);
+        assert_eq!(c["sync_state_text"], "base station");
+        assert_eq!(c["slot_timeout"], 5);
+        assert_eq!(c["received_stations"], 1000);
+        // SOTDMA, slot_timeout=4 (in {2,4,6}) → slot_number.
+        let raw = (3u64 << 17) | (4 << 14) | 2249;
+        let c = comm_state(raw, false);
+        assert_eq!(c["sync_state"], 3);
+        assert_eq!(c["slot_number"], 2249);
+        // SOTDMA, slot_timeout=1 → UTC hour/minute. sub = hour<<9 | minute<<2.
+        let raw = (0u64 << 17) | (1 << 14) | ((23u64 << 9) | (59u64 << 2));
+        let c = comm_state(raw, false);
+        assert_eq!(c["utc_hour"], 23);
+        assert_eq!(c["utc_minute"], 59);
+        // ITDMA: increment(13) | num_slots(3) | keep(1).
+        // raw = sync=1 | incr=8191 | num_slots=4 | keep=1.
+        let raw = (1u64 << 17) | (8191u64 << 4) | (4u64 << 1) | 1;
+        let c = comm_state(raw, true);
+        assert_eq!(c["scheme"], "ITDMA");
+        assert_eq!(c["sync_state"], 1);
+        assert_eq!(c["slot_increment"], 8191);
+        assert_eq!(c["num_slots"], 4);
+        assert_eq!(c["slots_allocated"], 5);
+        assert_eq!(c["keep_flag"], true);
     }
 
     // ----------------------------------------------------------------------
