@@ -1,0 +1,15 @@
+[package]
+name = "xng-mode-vdes"
+description = "Native VDES ASM (VHF Data Exchange System Application-Specific Messages, ITU-R M.2092-1) decode core for xng: GMSK demod, HDLC deframing, ASM (DAC/FID) payload decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+chrono.workspace = true
+num-complex.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true
