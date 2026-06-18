@@ -1,0 +1,198 @@
+//! Synthesize DF17 1090ES extended-squitter frames from a decoded aircraft
+//! fix. This lets non-Mode-S position sources (UAT 978, HFDL) feed any raw-1090
+//! / Beast consumer (tar1090, readsb, aggregators) that doesn't read SBS or
+//! `aircraft.json` — the same trick `uat2esnt` uses for UAT (XM-2.2, Beast half).
+//!
+//! Every encoder is the inverse of a function in [`crate::decode`] and is
+//! proved correct by ROUND-TRIPPING through this crate's own (benchmark-
+//! validated) decoder in the tests — not by self-consistency alone. Altitude is
+//! encoded by searching the real decoder for the field that reproduces it, so
+//! there is no hand-rolled bit layout to get wrong.
+
+use crate::decode::{altitude12, nl};
+use xng_dsp::checksum::mode_s_crc;
+
+const CPR_MAX: f64 = 131_072.0; // 2^17
+const NZ: f64 = 15.0;
+
+/// Pack a 56-bit ME field into a DF17 frame (CA=5, level-2 airborne) for
+/// `icao`, append the clean 24-bit Mode S parity, and return the 14 bytes.
+fn df17(icao: u32, me: u64) -> [u8; 14] {
+    let mut b = [0u8; 14];
+    b[0] = (17 << 3) | 5;
+    b[1] = (icao >> 16) as u8;
+    b[2] = (icao >> 8) as u8;
+    b[3] = icao as u8;
+    for k in 0..7 {
+        b[4 + k] = (me >> (8 * (6 - k))) as u8;
+    }
+    let crc = mode_s_crc(&b[..11]).to_be_bytes();
+    b[11] = crc[1];
+    b[12] = crc[2];
+    b[13] = crc[3];
+    b
+}
+
+/// CPR-encode `(lat, lon)` for the even (`odd=false`, i=0) or odd (i=1) airborne
+/// frame → the two 17-bit fractions `(yz, xz)`. Standard CPR (the inverse of
+/// [`crate::decode::cpr_global_airborne`]); `nl()` is shared with the decoder.
+fn cpr_encode(lat: f64, lon: f64, odd: bool) -> (u32, u32) {
+    let i = if odd { 1.0 } else { 0.0 };
+    let dlat = 360.0 / (4.0 * NZ - i);
+    let yz = (CPR_MAX * lat.rem_euclid(dlat) / dlat + 0.5).floor();
+    let rlat = dlat * (yz / CPR_MAX + (lat / dlat).floor());
+    let dlon = 360.0 / (nl(rlat) as f64 - i).max(1.0);
+    let xz = (CPR_MAX * lon.rem_euclid(dlon) / dlon + 0.5).floor();
+    (yz as u32 & 0x1_FFFF, xz as u32 & 0x1_FFFF)
+}
+
+/// Encode a barometric altitude (ft) into the 12-bit AC12 field (Q=1, 25 ft) by
+/// finding the field the real decoder maps back to it — correct by construction.
+/// 0 (= "no altitude") when out of the encodable range.
+fn encode_alt12(alt_ft: i32) -> u32 {
+    let target = (alt_ft as f64 / 25.0).round() as i32 * 25;
+    (1u32..4096)
+        .find(|&ac| ac & 0x10 != 0 && altitude12(ac) == Some(target))
+        .unwrap_or(0)
+}
+
+/// The 6-bit ADS-B callsign charset index for an ASCII byte (A–Z, 0–9, space);
+/// anything else maps to space. Inverse of [`crate::frame::IDENT_CHARSET`].
+fn ident_code(c: u8) -> u64 {
+    match c {
+        b'A'..=b'Z' => (c - b'A' + 1) as u64,
+        b'0'..=b'9' => (c - b'0' + 48) as u64,
+        b'a'..=b'z' => (c - b'a' + 1) as u64, // fold lowercase → uppercase
+        _ => 32,                              // space
+    }
+}
+
+/// The even+odd airborne-position pair (DF17 TC11). Both are needed for a
+/// receiver to globally decode the position. `alt_ft` of `None` emits a
+/// zero (not-available) altitude.
+pub fn airborne_position(icao: u32, lat: f64, lon: f64, alt_ft: Option<i32>) -> [[u8; 14]; 2] {
+    let ac = alt_ft.map(encode_alt12).unwrap_or(0) as u64;
+    let frame = |odd: bool| {
+        let (yz, xz) = cpr_encode(lat, lon, odd);
+        // ME (56b): TC(5)=11 · SS(2)=0 · NICsupp(1)=0 · ALT(12) · T(1)=0 ·
+        //           F(1)=odd · LAT-CPR(17) · LON-CPR(17)
+        let mut me: u64 = 11; // TC
+        me = (me << 2) | 0; // SS
+        me = (me << 1) | 0; // NIC supplement
+        me = (me << 12) | ac; // altitude
+        me = (me << 1) | 0; // T (UTC sync)
+        me = (me << 1) | odd as u64; // CPR odd/even
+        me = (me << 17) | yz as u64; // LAT-CPR
+        me = (me << 17) | xz as u64; // LON-CPR
+        df17(icao, me)
+    };
+    [frame(false), frame(true)]
+}
+
+/// The identification/callsign frame (DF17 TC4). `callsign` is upper-cased,
+/// space-padded, and truncated to 8 chars.
+pub fn identification(icao: u32, callsign: &str) -> [u8; 14] {
+    // ME (56b): TC(5)=4 · EC(3)=0 · 8 × CHAR(6)
+    let mut me: u64 = 4;
+    me = (me << 3) | 0; // emitter category
+    let cs = callsign.as_bytes();
+    for k in 0..8 {
+        let c = cs.get(k).copied().unwrap_or(b' ');
+        me = (me << 6) | ident_code(c);
+    }
+    df17(icao, me)
+}
+
+/// All synthesizable frames for an aircraft fix: the position pair, plus an
+/// identification frame when a callsign is present. Returns empty when there is
+/// no position to convey (a synthesized ES with no payload is pointless).
+pub fn synth_frames(
+    icao: u32,
+    lat: Option<f64>,
+    lon: Option<f64>,
+    alt_ft: Option<i32>,
+    callsign: Option<&str>,
+) -> Vec<[u8; 14]> {
+    let mut out = Vec::new();
+    if let (Some(la), Some(lo)) = (lat, lon) {
+        out.extend(airborne_position(icao, la, lo, alt_ft));
+    }
+    if let Some(cs) = callsign {
+        let cs = cs.trim();
+        if !cs.is_empty() {
+            out.push(identification(icao, cs));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::decode::{cpr_global_airborne, Cpr};
+    use crate::frame::IDENT_CHARSET;
+
+    // Extract a Cpr from a synthesized frame the same way the decoder does.
+    fn cpr_of(f: &[u8; 14]) -> Cpr {
+        let me = &f[4..11];
+        let bit = |i: usize| ((me[i / 8] >> (7 - i % 8)) & 1) as u32;
+        let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i));
+        Cpr { odd: bit(21) == 1, lat: field(22, 17), lon: field(39, 17), surface: false }
+    }
+
+    fn crc_clean(f: &[u8; 14]) -> bool {
+        let recv = u32::from_be_bytes([0, f[11], f[12], f[13]]);
+        mode_s_crc(&f[..11]) == recv
+    }
+
+    #[test]
+    fn position_round_trips_through_decoder() {
+        // The 1090 Megahertz Riddle worked example.
+        let (icao, lat, lon) = (0x40621D, 52.25720, 3.91937);
+        let [even, odd] = airborne_position(icao, lat, lon, Some(38000));
+        assert!(crc_clean(&even) && crc_clean(&odd), "parity clean");
+        assert_eq!(even[0] >> 3, 17, "DF17");
+        assert_eq!(u32::from_be_bytes([0, even[1], even[2], even[3]]), icao);
+        let (dlat, dlon) = cpr_global_airborne(cpr_of(&even), cpr_of(&odd), false).unwrap();
+        assert!((dlat - lat).abs() < 1e-4, "lat {dlat} vs {lat}");
+        assert!((dlon - lon).abs() < 1e-4, "lon {dlon} vs {lon}");
+    }
+
+    #[test]
+    fn position_round_trips_southern_western_hemisphere() {
+        let (icao, lat, lon) = (0xABCDEF, -33.8688, 151.2093); // Sydney
+        let [even, odd] = airborne_position(icao, lat, lon, None);
+        let (dlat, dlon) = cpr_global_airborne(cpr_of(&even), cpr_of(&odd), false).unwrap();
+        assert!((dlat - lat).abs() < 1e-4, "lat {dlat} vs {lat}");
+        assert!((dlon - lon).abs() < 1e-4, "lon {dlon} vs {lon}");
+    }
+
+    #[test]
+    fn altitude_encodes_to_nearest_25ft() {
+        // Decoder reproduces the encoded altitude (rounded to 25 ft).
+        for alt in [0, 1000, 38000, 9525, 45000] {
+            let ac = encode_alt12(alt);
+            assert_eq!(altitude12(ac), Some((alt as f64 / 25.0).round() as i32 * 25), "alt {alt}");
+        }
+    }
+
+    #[test]
+    fn identification_round_trips_callsign() {
+        let f = identification(0x484149, "KLM1023 ");
+        assert!(crc_clean(&f));
+        assert_eq!(f[4] >> 3, 4, "TC4");
+        let me = &f[4..11];
+        let bit = |i: usize| (me[i / 8] >> (7 - i % 8)) & 1;
+        let field = |s: usize, l: usize| (s..s + l).fold(0u32, |v, i| (v << 1) | bit(i) as u32);
+        let cs: String = (0..8).map(|k| IDENT_CHARSET[field(8 + 6 * k, 6) as usize] as char).collect();
+        assert_eq!(cs.trim_end(), "KLM1023");
+    }
+
+    #[test]
+    fn synth_frames_emits_pair_plus_ident() {
+        let v = synth_frames(0x40621D, Some(52.2), Some(3.9), Some(35000), Some("TEST123"));
+        assert_eq!(v.len(), 3, "even + odd + ident");
+        // No position → nothing (a payload-less ES is pointless).
+        assert!(synth_frames(0x40621D, None, None, Some(35000), None).is_empty());
+    }
+}

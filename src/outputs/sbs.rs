@@ -4,118 +4,16 @@
 //! and stream MSG lines to every connected client.
 
 use std::sync::Arc;
-use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use xng_types::{Message, MessageBody};
+use xng_types::Message;
 
-/// A normalized aircraft state fix, extracted from any position-bearing body
-/// and keyed on the ICAO hex (the only aircraft id SBS/BaseStation can carry).
-/// This is the mode-agnostic adapter (XM-2.2): Mode S, UAT (978 ADS-B) and
-/// HFDL aircraft positions all converge here, so HFDL/UAT aircraft reach
-/// tar1090 / VRS / aggregator feeders over the same `:30003` stream.
-struct AircraftFix {
-    icao: String,
-    callsign: Option<String>,
-    altitude_ft: Option<i32>,
-    lat: Option<f64>,
-    lon: Option<f64>,
-    speed_kt: Option<f64>,
-    /// true when `speed_kt` is *airspeed* (Mode S BDS 6,0 "AS"), not ground
-    /// speed — kept out of the velocity (MSG,4) classification but still shown.
-    speed_is_airspeed: bool,
-    track_deg: Option<f64>,
-    vertical_rate_fpm: Option<i32>,
-    squawk: Option<String>,
-}
-
-fn jf(d: &Value, k: &str) -> Option<f64> {
-    d.get(k).and_then(Value::as_f64)
-}
-fn ji(d: &Value, k: &str) -> Option<i32> {
-    d.get(k).and_then(Value::as_i64).map(|x| x as i32)
-}
-fn js(d: &Value, k: &str) -> Option<String> {
-    d.get(k).and_then(Value::as_str).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-}
-/// Validate + canonicalize a 24-bit ICAO hex address.
-fn norm_icao(s: &str) -> Option<String> {
-    let s = s.trim().to_uppercase();
-    (s.len() == 6 && s != "000000" && s.bytes().all(|b| b.is_ascii_hexdigit())).then_some(s)
-}
-
-/// Extract a normalized aircraft fix from any supported body. Only bodies that
-/// carry an ICAO hex *and* some reportable state map (Mode S, UAT ADS-B, HFDL
-/// position HFNPDUs). ACARS/Aero ADS-C positions key on flight/registration,
-/// not ICAO, so they have no SBS hex id and are not emitted here.
-fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
-    match &msg.body {
-        MessageBody::ModeS {
-            icao,
-            callsign,
-            altitude_ft,
-            squawk,
-            lat,
-            lon,
-            speed_kt,
-            speed_type,
-            track_deg,
-            vertical_rate_fpm,
-            ..
-        } => Some(AircraftFix {
-            icao: norm_icao(icao.as_deref()?)?,
-            callsign: callsign.clone(),
-            altitude_ft: *altitude_ft,
-            lat: *lat,
-            lon: *lon,
-            speed_kt: *speed_kt,
-            speed_is_airspeed: speed_type.as_deref() == Some("AS"),
-            track_deg: *track_deg,
-            vertical_rate_fpm: *vertical_rate_fpm,
-            squawk: squawk.clone(),
-        }),
-        // UAT 978 MHz ADS-B downlink — a real aircraft state vector.
-        MessageBody::Uat { kind, details } if kind == "adsb" => Some(AircraftFix {
-            icao: norm_icao(details.get("address").and_then(Value::as_str)?)?,
-            callsign: js(details, "callsign"),
-            altitude_ft: ji(details, "geometric_altitude").or_else(|| ji(details, "altitude")),
-            lat: jf(details, "lat"),
-            lon: jf(details, "lon"),
-            speed_kt: jf(details, "ground_speed"),
-            speed_is_airspeed: false,
-            track_deg: jf(details, "true_track"),
-            vertical_rate_fpm: ji(details, "vertical_rate"),
-            squawk: None,
-        }),
-        // HFDL position HFNPDU: lat/lon (+ flight), ICAO back-filled from the
-        // logon cache (on the nested `position`, else top-level `icao`).
-        MessageBody::Hfdl { details, .. } => {
-            let pos = details.get("position")?;
-            let icao = norm_icao(
-                pos.get("icao")
-                    .and_then(Value::as_str)
-                    .or_else(|| details.get("icao").and_then(Value::as_str))?,
-            )?;
-            Some(AircraftFix {
-                icao,
-                callsign: js(pos, "flight"),
-                altitude_ft: None,
-                lat: jf(pos, "lat"),
-                lon: jf(pos, "lon"),
-                speed_kt: None,
-                speed_is_airspeed: false,
-                track_deg: None,
-                vertical_rate_fpm: None,
-                squawk: None,
-            })
-        }
-        _ => None,
-    }
-}
+use super::aircraft::aircraft_fix;
 
 /// Render a message as an SBS-1 ("BaseStation") MSG line. Any body that yields
-/// an [`AircraftFix`] (Mode S / UAT / HFDL) maps; everything else returns None.
+/// an [`AircraftFix`](super::aircraft::AircraftFix) (Mode S / UAT / HFDL) maps;
+/// everything else returns None.
 pub fn format_sbs(msg: &Message) -> Option<String> {
     let f = aircraft_fix(msg)?;
     let icao = &f.icao;
@@ -180,7 +78,7 @@ pub async fn run(rx: broadcast::Receiver<Arc<Message>>, addr: String) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xng_types::{DecodeQuality, Mode, Provenance, SignalQuality, StationIdentity};
+    use xng_types::{DecodeQuality, MessageBody, Mode, Provenance, SignalQuality, StationIdentity};
 
     #[test]
     fn position_message_renders_msg3() {

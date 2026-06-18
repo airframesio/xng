@@ -14,6 +14,7 @@ pub mod demod;
 pub mod frame;
 pub mod mode_ac;
 pub mod modulate;
+pub mod synth;
 
 use chrono::Utc;
 use decode::{Cpr, PosTrust};

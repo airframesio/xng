@@ -3,6 +3,7 @@
 //! land in M3).
 
 pub mod acarsdec_json;
+pub mod aircraft;
 pub mod airframes;
 pub mod beast;
 pub mod asf2_grpc;

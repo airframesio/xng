@@ -9,35 +9,34 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use xng_types::{Message, MessageBody, Mode};
 
-/// Render one message as a Beast frame; `None` for non-Mode S.
-pub fn format_beast(msg: &Message) -> Option<Vec<u8>> {
-    if msg.mode != Mode::Adsb {
-        return None;
-    }
-    if !matches!(msg.body, MessageBody::ModeS { .. }) {
-        return None;
-    }
-    let raw = msg.raw.as_ref()?;
+use super::aircraft::aircraft_fix;
+
+/// The 12 MHz MLAT counter for a message: prefer the demod's monotonic
+/// sample-clock tick (so an MLAT client can fit the receiver's clock drift),
+/// else the wall-clock-derived counter. Wraps naturally in 48 bits.
+fn beast_ticks(msg: &Message) -> u64 {
+    msg.signal
+        .rx_ticks_12mhz
+        .unwrap_or_else(|| msg.timestamp.timestamp_micros().max(0) as u64 * 12)
+        & 0xFFFF_FFFF_FFFF
+}
+
+fn sig_byte(msg: &Message) -> u8 {
+    msg.signal
+        .rssi_db
+        .map(|db| (((db + 50.0) / 50.0 * 255.0).clamp(0.0, 255.0)) as u8)
+        .unwrap_or(0x80)
+}
+
+/// Wrap a raw 7- or 14-byte Mode S frame in Beast framing: `0x1a`, type byte,
+/// 6-byte MLAT counter, signal byte, payload — every `0x1a` doubled. `None` for
+/// a non-7/14-byte payload.
+fn wrap_beast(raw: &[u8], ticks: u64, sig: u8) -> Option<Vec<u8>> {
     let kind = match raw.len() {
         7 => b'2',
         14 => b'3',
         _ => return None,
     };
-    // 12 MHz MLAT counter. Prefer the monotonic sample-clock tick the demod
-    // derived from the frame's absolute sample offset (consistent-rate, so an
-    // MLAT client can fit the receiver's clock drift); fall back to the
-    // wall-clock-derived counter only if absent. Wraps naturally in 48 bits.
-    let ticks = msg
-        .signal
-        .rx_ticks_12mhz
-        .unwrap_or_else(|| msg.timestamp.timestamp_micros().max(0) as u64 * 12)
-        & 0xFFFF_FFFF_FFFF;
-    let sig = msg
-        .signal
-        .rssi_db
-        .map(|db| (((db + 50.0) / 50.0 * 255.0).clamp(0.0, 255.0)) as u8)
-        .unwrap_or(0x80);
-
     let mut out = Vec::with_capacity(2 + 7 + 1 + raw.len() * 2);
     out.push(0x1a);
     out.push(kind);
@@ -57,6 +56,35 @@ pub fn format_beast(msg: &Message) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// The Beast frame(s) for a message. Native Mode S wraps its real 1090 frame
+/// (one frame). UAT 978 / HFDL aircraft positions have no 1090 frame, so they
+/// are SYNTHESIZED into DF17 extended squitters (even+odd position, +callsign)
+/// — the `uat2esnt` trick (XM-2.2, Beast half) — letting raw-Beast consumers
+/// (tar1090/readsb) plot them. Empty for everything else.
+pub fn format_beast(msg: &Message) -> Vec<Vec<u8>> {
+    let (ticks, sig) = (beast_ticks(msg), sig_byte(msg));
+    // Native Mode S: wrap the real frame.
+    if msg.mode == Mode::Adsb && matches!(msg.body, MessageBody::ModeS { .. }) {
+        return msg.raw.as_ref().and_then(|raw| wrap_beast(raw, ticks, sig)).into_iter().collect();
+    }
+    // Non-Mode-S aircraft (UAT/HFDL): synthesize DF17 frames from the fix.
+    if let Some(fix) = aircraft_fix(msg) {
+        if let Ok(icao) = u32::from_str_radix(&fix.icao, 16) {
+            return xng_mode_adsb::synth::synth_frames(
+                icao,
+                fix.lat,
+                fix.lon,
+                fix.altitude_ft,
+                fix.callsign.as_deref(),
+            )
+            .iter()
+            .filter_map(|f| wrap_beast(f, ticks, sig))
+            .collect();
+        }
+    }
+    Vec::new()
+}
+
 /// Serve Beast frames on `addr` (e.g. `0.0.0.0:30005`).
 pub async fn run(rx: broadcast::Receiver<Arc<Message>>, addr: String) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
@@ -69,10 +97,15 @@ pub async fn run(rx: broadcast::Receiver<Arc<Message>>, addr: String) -> std::io
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        if let Some(frame) = format_beast(&msg) {
+                        let mut dead = false;
+                        for frame in format_beast(&msg) {
                             if sock.write_all(&frame).await.is_err() {
+                                dead = true;
                                 break;
                             }
+                        }
+                        if dead {
+                            break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -121,7 +154,9 @@ mod tests {
                 channel: None,
             },
         };
-        let f = format_beast(&msg).unwrap();
+        let frames = format_beast(&msg);
+        assert_eq!(frames.len(), 1, "Mode S → one wrapped frame");
+        let f = &frames[0];
         assert_eq!(f[0], 0x1a);
         assert_eq!(f[1], b'3');
         // 0x1a payload byte must be doubled.
@@ -163,8 +198,42 @@ mod tests {
                 channel: None,
             },
         };
-        let f = format_beast(&msg).unwrap();
+        let f = &format_beast(&msg)[0];
         // [0]=0x1a, [1]='3', [2..8] = the 6 MLAT bytes, MSB first.
         assert_eq!(&f[2..8], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06], "{f:?}");
+    }
+
+    // XM-2.2 Beast half: a UAT 978 ADS-B position with no raw 1090 frame is
+    // SYNTHESIZED into DF17 ES frames (even+odd position + callsign) so raw-Beast
+    // consumers can plot it.
+    #[test]
+    fn uat_position_synthesizes_df17_beast_frames() {
+        let msg = Message {
+            mode: Mode::Uat,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 978_000_000,
+            signal: SignalQuality::default(),
+            decode: DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
+            body: MessageBody::Uat {
+                kind: "adsb".into(),
+                details: serde_json::json!({
+                    "address": "a1b2c3", "callsign": "N12345",
+                    "geometric_altitude": 9500, "lat": 37.6189, "lon": -122.3750,
+                }),
+            },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        };
+        let frames = format_beast(&msg);
+        assert_eq!(frames.len(), 3, "even + odd position + ident");
+        for f in &frames {
+            assert_eq!(f[0], 0x1a);
+            assert_eq!(f[1], b'3', "long (DF17) frame");
+        }
     }
 }
