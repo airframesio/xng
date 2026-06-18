@@ -96,14 +96,14 @@
 
 - [ ] **VDL2-1** Table/codegen-driven unaligned-PER ASN.1 core ◆ big bet (unlocks the next 5 at once)
   - [x] **VDL2-1.1** ~44 unsupported CPDLC argument types (element walk currently stops at first undecodable arg) — ✅ arg-type coverage 22→63, walk no longer halts. *(deeply-nested DepartureClearance/PositionReport optionals deferred pending a real PDU)*
-  - [ ] **VDL2-1.2** CHOICE extension alternatives / integrityCheck / PER fragmentation
-  - [ ] **VDL2-1.3** ACSE (AARQ/AARE/RLRQ/RLRE/ABRT) + Session (X.225 SPDU) layers
-  - [ ] **VDL2-1.4** Full Context Management (TSAP/NSAP addrs; CMContactRequest/LogonResponse/ForwardRequest/Update)
-  - [ ] **VDL2-1.5** Plain/unprotected CPDLC PDUs + forward/forward-response bodies
-- [ ] **VDL2-2** CLNP + COTP → native ATN-B2 ADS-C ◆ big bet — ✅ COTP DC/ED/AK/EA/RJ TPDUs + variable part (ATN checksum 0x08, credit, ext-seq) + CLNP option / ATN-security-label TLVs landed; ❌ remaining: multipart CLNP/COTP reassembly + native ATN-B2 ADS-C
+  - [x] **VDL2-1.2** CHOICE extension alternatives / integrityCheck / PER fragmentation — ✅ X.691 §10.6 extension-addition index, §10.9.3.8 fragmented length, integrityCheck surfaced; fixed a real bug (PMCPDLC User abort-reason 13 values → 4 bits, was 3)
+  - [ ] **VDL2-1.3** ACSE (AARQ/AARE/RLRQ/RLRE/ABRT) + Session (X.225 SPDU) layers — ✅ all 5 ACSE-apdu CHOICE alternatives recognized/dispatched + RLRQ/RLRE/ABRT reasons decoded; ❌ AARQ/AARE SEQUENCE bodies (need a captured PDU) + Session-SPDU auto-wire from COTP (unverifiable null-framing) deferred
+  - [x] **VDL2-1.4** Full Context Management (TSAP/NSAP addrs; CMContactRequest/LogonResponse/ForwardRequest/Update) — ✅ Long/ShortTsap+APAddress, CMLogonRequest/Response, CMUpdate, CMContactRequest/Response, CMForwardRequest, CM abort reasons
+  - [x] **VDL2-1.5** Plain/unprotected CPDLC PDUs + forward/forward-response bodies — ✅ CPDLCAPDUsVersion1 + ATCForwardMessage/ATCForwardResponse
+- [ ] **VDL2-2** CLNP + COTP → native ATN-B2 ADS-C ◆ big bet — ✅ COTP DC/ED/AK/EA/RJ TPDUs + variable part (ATN checksum 0x08, credit, ext-seq) + CLNP option / ATN-security-label TLVs + multipart CLNP reassembly + multipart COTP TSDU reassembly landed; ❌ remaining: native ATN-B2 ADS-C (2.3)
   - [x] **VDL2-2.1** Multipart CLNP reassembly + ATN security-label TLVs (traffic-type/ATSC-class/subnetwork-type) — ✅ `ClnpReassembler` (segment-offset, out-of-order, NSAP+data-unit-id keyed) + more-segments/error flags; ATN security-label TLVs already landed
-  - [ ] **VDL2-2.2** COTP DC/ED/AK/EA/RJ TPDUs + full variable part (TPDU-size, checksum, ATN checksum 0x08, credit, EOT, extended seq) + multipart COTP reassembly
-  - [ ] **VDL2-2.3** Native ATN-B2 ADS-C (ADSReport/RequestContract/Accept/Reject/PositiveAck/NonCompliance over CLNP/COTP)
+  - [x] **VDL2-2.2** COTP DC/ED/AK/EA/RJ TPDUs + full variable part (TPDU-size, checksum, ATN checksum 0x08, credit, EOT, extended seq) + multipart COTP reassembly — ✅ TPDU types + variable part already present; added EOT-driven multi-DT TSDU reassembly (`CotpReassembler`, ISO/IEC 8073 §6.6) wired through `decode_network`
+  - [ ] **VDL2-2.3** Native ATN-B2 ADS-C (ADSReport/RequestContract/Accept/Reject/PositiveAck/NonCompliance over CLNP/COTP) — ⏸ skipped (skip-don't-fake): ADS-C ASN.1 module absent from `docs/asn1` and no captured ADS-C-over-CLNP/COTP sample to verify against
 - [x] **VDL2-3** XID parameter completion — TG5(0x46), T3min(0x47), GS-address-filter(0x48), broadcast-connection(0x49), frequency-support-list(0xC0), airport-coverage(0xC1), nearest-airport(0xC3), ATN-router-NETs(0xC4), system-mask(0xC5), TG3(0xC6), TG4(0xC7) + ISO-8885 HDLC param set; decode autotune freq→MHz + timers→int
 - [x] **VDL2-4** X.25 completion — RESTART-REQ/CONF, facility naming, clear/reset/restart cause + diagnostic-code dictionaries, SNDCF compression facility
 - [x] **VDL2-5** AVLC polish — SABME (0x6F), expand FRMR info-field, pin one canonical FCS octet order; cross-check the v2.5.1 249-octet block-length bug (VERIFY-3)
@@ -123,8 +123,8 @@
   - [x] **HFDL-2.1** `--system-table` load/save persistence (cold-start enrichment) — ✅ serde save/load API. *(`--system-table` CLI flag = follow-up)*
   - [x] **HFDL-2.2** Config-driven GS name file (IDs up to 127; fill the 12 hardcoded holes) — ✅ roster pinned id-for-id to dumphfdl `systable.conf` (1–11+13–17 assigned; only id 12 was a real hole; 18–127 unassigned upstream)
 - [x] **HFDL-3** Aircraft-ID→ICAO cache (`ac_cache`, `--aircraft-cache-ttl`) — ties XM-3
-- [ ] **HFDL-4** Positions — lift `{lat,lon,utc}` into `MessageBody::Hfdl`; position from logon-request/resume (back-dated UTC); wire HFDL positions to SBS/Beast (ties XM-2.2); `--freq-as-squawk`
-- [ ] **HFDL-5** Demod — ✅ `fec_corrected` populated; ❌ remaining: per-frame SNR/signal/CFO (XM-1), FFT polyphase channelizer, LMS-tap verify
+- [ ] **HFDL-4** Positions — ✅ lift `{lat,lon,utc,flight}` into `MessageBody::Hfdl` `details["position"]` (perf-data 0xD1 / freq-data 0xD5 HFNPDUs; ICAO back-filled from the logon cache) + dashboard map plot merged by ICAO with 1090/UAT/ACARS (XM-2.2); ❌ SBS/Beast feed, `--freq-as-squawk`
+- [ ] **HFDL-5** Demod — ✅ `fec_corrected` + per-frame SNR/signal/CFO populated; LMS-tap count verified (VERIFY-5); ❌ remaining: FFT polyphase channelizer
 - [ ] **HFDL-6** — ✅ SPDU `rls_in_use`/`iso8208_supported` flags + fuller system-table decode; ❌ remaining (output-side): Prometheus/StatsD expansion + noise-floor gauge, per-slot assignment map, zmq/file-rotation, raw-frame modes
 
 ---
@@ -140,7 +140,7 @@
 - [x] **AERO-3** R/T-channel named control set (access-request/call-progress/telephony-ack/RQA/ACK); verify `SEQINDICATOR→(k,n)`
 - [ ] **AERO-4** Interpret 16-bit P-channel frame header (formatid/superframe/framecounters) for superframe lock + AFC/DCD state machine — ✅ 16-bit P-channel header parsed/exposed (format-id/superframe/frame-counters); ❌ superframe-lock + AFC/DCD state machine deferred
 - [ ] **AERO-5** C-channel voice → WAV (AMBE decode behind a feature flag) + older AERO-H LPC path; wire `CChannelDecoder` into a runtime `Mode`
-- [ ] **AERO-6** Demod — coherent 600/1200 path (close the ~2 dB gap to JAERO); populate `fec_corrected`; BER-vs-SNR curve
+- [x] **AERO-6** Demod — coherent 600/1200 path (close the ~2 dB gap to JAERO); populate `fec_corrected`; BER-vs-SNR curve — ✅ decision-directed coherent carrier path + `fec_corrected` (re-encode count) + synthetic BER-vs-SNR test
 - [ ] **AERO-7** Outputs — expand `MessageBody::Aero` bodies (log-on/satellite-id/system-table/call); aircraft-DB enrichment + Aero position plotting
 - [ ] **AERO-8** Aero-C consolidation (A5)
   - [x] **AERO-8.1** Fix `Mode::AeroC` mislabel (`to_message` hard-tags `AeroL`) + wire scan-plan/dispatch/feed — OR fold aero-c into `aero` as a PHY-selected burst sub-decoder
@@ -161,7 +161,7 @@
 - [ ] **STDC-5** Follow `0x83` → demodulate the LES message channel (closes the biggest functional gap vs tekmanoid) ◆ big bet
 - [x] **STDC-6** Text — ITA2/Baudot (presentation 6); typed presentation-7 binary capture
 - [x] **STDC-7** EGC polish — frame_number→UTC-of-day (`×8.64`); verify single `0xB0` vs double `0xB1`+`0xB2` (VERIFY-6); distress-specific position/alerting
-- [ ] **STDC-8** Demod — RRC matched filter; optional CMA equalizer; SatDump `.frm` goldens; per-frame UW BER; populate `fec_corrected`; mid-frame polarity-flip recovery
+- [ ] **STDC-8** Demod — ✅ RRC matched filter (shared `xng_dsp::rrc_taps`), per-frame UW BER, `fec_corrected`, mid-frame polarity-flip recovery (synthetic AWGN BER test); ❌ optional CMA equalizer, SatDump `.frm` goldens
 
 ---
 
@@ -182,8 +182,8 @@
 
 - [ ] **AIS-1** ASM (DAC/FID binary on 6/8) dispatch table ◆ big bet — ✅ dispatch + DAC=200 Inland (FID 10/23/24/40, pyais-verified); ❌ remaining: DAC=1 IMO Circ.289 (no pyais oracle), regional DACs
   - [x] **AIS-1.1** DAC=1 IMO SN.1/Circ.289 (FID 31/11 meteo-hydro, 21 weather-from-ship, 16 POB, 22/23 area-notice, 17 VTS, 24/25/26 static/cargo/sensor, 27-30 route/text, 32 tidal) — ✅ FIDs 11/16/17/24/27/28/29/30/31/32 full + 21/22/23/25/26 header-only (spec-derived; no pyais oracle for DAC=1)
-  - [ ] **AIS-1.2** DAC=200 Inland (FID 10/21/22/23/24/40/55)
-  - [ ] **AIS-1.3** Regional DACs (235/250/366 AtoN-monitoring, 316/366 Seaway-meteo, 367 US-environmental, 265 STM-route); validate vs pyais oracle
+  - [x] **AIS-1.2** DAC=200 Inland (FID 10/21/22/23/24/40/55) — ✅ 10/23/24/40 (pyais) + 21 ETA / 22 RTA / 55 persons-on-board (spec-derived: UNECE SC.3/176, gpsd + e-Navigation.nl cross-checked)
+  - [ ] **AIS-1.3** Regional DACs (235/250/366 AtoN-monitoring, 316/366 Seaway-meteo, 367 US-environmental, 265 STM-route); validate vs pyais oracle — ✅ DAC 235/250 AtoN-monitoring full + regional header-only (DAC/FID/identification) for the rest; ❌ full 316/366/367/265 bodies (pyais has no oracle — skip-don't-fake)
 - [x] **AIS-2** Multi-fragment AIVDM reassembly across sentences (long type 5/6/8/26); type-24 Part A+B merge by MMSI; type-5 voyage merge; per-MMSI `AISTracker` state
 - [x] **AIS-3** Easy sub-field fills — types 1-3 (ROT/accuracy/timestamp/maneuver/RAIM), type 5 (version/dims/EPFD/ETA/DTE), type 4/11 (accuracy/EPFD/RAIM/UTC), type 18 (accuracy/timestamp/RAIM), type 19 (+dims/EPFD/DTE), type 21 AtoN (accuracy/dims/EPFD/timestamp/off-position/RAIM/virtual/name-ext), type 24B (vendor_id/model/serial/callsign + dims-or-mothership). **All verified against pyais vectors** (1-3 & 5 hand-decoded; 4/18/19/21/24B vs the pyais test-suite vectors). *(only the niche SOTDMA/ITDMA radio comm-state left undecoded — optional)*
 - [x] **AIS-4** AIS-SART / MOB / EPIRB-AIS distress tagging — `fields::distress_class` (MMSI prefix 970/972/974) tags `distress` in `details`, surfaced in console + dashboard vessel; nav_status 14 (`AIS-SART`) and Msg-14 ACTIVE/TEST text already decode. *(VERIFY-4 resolved: 970/972/974 now mapped; ties XM-6 cross-mode distress overlay)*
@@ -209,7 +209,7 @@
 - [x] **ADSB-4** DF coverage — DF19 military ES; DF24-27 Comm-D ELM; surface FS/DR/UM (alert/SPI/ground) from DF4/5/20/21
 - [x] **ADSB-5** DF18 CF-subtype classification (CF=0 non-transponder, 2/3/5 TIS-B fine/coarse/mgmt, 6 ADS-R) → source tag (VERIFY-7)
 - [x] **ADSB-6** Mode A/C decode — decode kernel done (octal squawk / SPI / Gillham ladder, dump1090-oracle-verified); RF framing-pulse demod still deferred
-- [ ] **ADSB-7** Demod/trust — phase-classified per-phase bit templates (close the ~3-frame gap to readsb); graduated position trust (json-reliable / position-persistence / NIC-aware)
+- [ ] **ADSB-7** Demod/trust — ✅ graduated position trust (`PosTrust` grade GlobalUnambiguous / LocalContained / LocalReceiver; NIC/NUCp containment + dump1090 half-CPR-zone cap + speed-gate jump reject; surfaced in `adsb_status.position_trust`); ❌ phase-classified per-phase bit templates (the ~3-frame demod gap to readsb)
 - [ ] **ADSB-8** Outputs — readsb-schema `aircraft.json` (version/nic/nac/sil/gva/emergency/nav_*/acas_ra/wind/oat); true RX-clock Beast timestamps → MLAT-feedable (ties XM-4, VERIFY-12); mlat/tisb provenance flag; write `docs/notes/ADSB.md`
 
 ---
@@ -262,12 +262,12 @@
 
 - [ ] **VERIFY-1** ⚑ Iridium time re-epoch correctness in satellite-naming/SGP4/TLE code (= IRID-8)
 - [ ] **VERIFY-2** ACARS — raw MIN / 4th-char downlink-rule edge cases; per-label ACARS Prometheus counters exist?; any media-advisory v1+ exists?
-- [ ] **VERIFY-3** VDL2 — SABME folded into `U?`?; Call-Request maintenance/init status bit; ES-IS option-TLV coverage; plain/unprotected CPDLC PDUs; StatsD `good_loud`; `pp_acars`; cross-check v2.5.1 249-octet-multiple block-length bug
+- [x] **VERIFY-3** VDL2 — ✅ resolved: SABME already folded into the U-frame arm (not `U?`); ES-IS option-TLVs present; plain/unprotected CPDLC added (VDL2-1.5); the v2.5.1 249-octet-multiple block-length bug does NOT affect xng (RS row count = `div_ceil(tl_bits/1992)`, exact at the 1992-bit boundary — regression-guarded). *(StatsD `good_loud`/`pp_acars` are output-side, tracked under VDL2-8)*
 - [ ] **VERIFY-4** AIS — CIC5 droop compensation in xng-dsp; mid-frame polarity-flip recovery. *(MMSI 970/972/974 mapping: RESOLVED — added in AIS-4)*
-- [ ] **VERIFY-5** HFDL — LMS equalizer tap count 7 vs documented 15
-- [ ] **VERIFY-6** STD-C — `0xB0` vs `0xB1`+`0xB2` distinction in surfaced details; mid-frame polarity flip recovery
+- [x] **VERIFY-5** HFDL — resolved: as-built is a 7-tap **symbol-spaced** LMS equalizer; dumphfdl's 15 is **T/2 (half-symbol)-spaced** — both correct, different spacing convention (code comments fixed)
+- [x] **VERIFY-6** STD-C — resolved: `0xB0` vs `0xB1`+`0xB2` distinction surfaced in details; mid-frame polarity-flip recovery added (STDC-8)
 - [ ] **VERIFY-7** Ecosystem — dashboard station/receiver-position pin exists?; continuous autogain during `listen`?; non-Iridium trail antimeridian wrapping?; DF18 CF-subtype classification (= ADSB-5)
-- [ ] **VERIFY-8** Aero-C — exact `AEROTypeP/R` enumerator hex vs JAERO source before encoding a SU-type table
+- [x] **VERIFY-8** Aero-C — resolved: `AEROTypeP/R` enumerator hex verified against the JAERO source (AERO-6)
 - [ ] **VERIFY-9** ACARS — acarsdec `mqttout.c` in current f00b4r0 4.x tree (post-SoapySDR refactor)?; xng per-label ACARS counters?
 - [ ] **VERIFY-10** ADS-B — does `xng-mode-adsb` already emit Mode A/C? (README implies not; = ADSB-6)
 - [ ] **VERIFY-11** New-mode commitments — POCSAG/FLEX airfield usage; AeroMACS/Gatelink demand; 406 MHz front-end reuse; generic-ISM scope desire (= NEW-V)
