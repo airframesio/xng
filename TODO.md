@@ -243,11 +243,11 @@
 - [x] **NEW-P0-3** DSC — **crate `xng-mode-dsc`**: ITU-R M.493 symbol + message decode. *(IQ demod = follow-up)*
 - [x] **NEW-P1-1** Radiosondes — **crate `xng-mode-sonde`**: RS41 RS-FEC + frame (STATUS/GPS/PTU) decode. *(GFSK demod + RS92/DFM/M10/… = follow-up)*
 - [x] **NEW-P1-2** AIS-SART / MOB / EPIRB-AIS — done under **AIS-4** (cross-reference)
-- [ ] **NEW-P1-3** EOT / HOT / DPU rail telemetry — 457/452 MHz Manchester FSK, BCH, clear (brake-pipe pressure, motion, marker) → live train-tail map
+- [x] **NEW-P1-3** EOT / HOT / DPU rail telemetry — **crate `xng-mode-eot`**: Manchester-FSK + AAR S-9152 frame (unit address, brake-pipe pressure, motion, marker light + battery, turbine/valve, BCH); direction (eot/hot) by RX freq (457.9375 / 452.9375 MHz). Runtime-wired to `--mode eot`. *(reverse-engineered field semantics per cited open decoders; demod synthetic AWGN-BER — no public IQ; train-tail map plotting = follow-up)*
 - [x] **NEW-P1-4** NAVTEX — **crate `xng-mode-navtex`**: CCIR 476 + FEC-B + ZCZC message decode. *(IQ demod = follow-up)*
 - [x] **NEW-P2-1** ADS-L — **crate `xng-mode-adsl`** (the "ADS-K" item): EASA SRD860 message decode. *(FANET/OGNTP + IQ demod = follow-up)*
-- [ ] **NEW-P2-2** APRS / AX.25 (incl. HAB balloons) — AFSK1200 144.39/432; igate-style feed (demod reused by POCSAG)
-- [ ] **NEW-P2-3** POCSAG / FLEX / FLEX-NEXT paging — reuses FSK chain; airport/airline/EMS ops-paging angle (VERIFY-11)
+- [x] **NEW-P2-2** APRS / AX.25 (incl. HAB balloons) — **crate `xng-mode-aprs`**: AFSK1200 (Bell 202) over FM + AX.25 v2.2 UI (callsign/SSID/digipeaters, X.25 FCS) + APRS payload (uncompressed + Base-91 compressed position, weather, message, status, object, telemetry). Runtime-wired to `--mode aprs` (144.39 NA / 144.8 EU / 432.5 UK). *(Mic-E/PHG/item/bulletin + igate feed = follow-up; demod synthetic AWGN-BER)*
+- [ ] **NEW-P2-3** POCSAG / FLEX / FLEX-NEXT paging — ✅ **POCSAG** via **crate `xng-mode-pocsag`**: 2-FSK 512/1200/2400 Bd + CCIR Radiopaging Code No.1 (ITU-R M.584-2) batches, BCH(31,21,2)+parity correction, capcode/function + numeric/alpha/tone. Runtime-wired to `--mode pocsag` (defaults 1200 Bd). *(demod synthetic AWGN-BER; per-session baud knob = follow-up)*; ❌ FLEX / FLEX-NEXT still open
 - [x] **NEW-P2-4** ATCS — **crate `xng-mode-atcs`**: HDLC/LAPB framer + Spec-200 address/header decode. *(Genisys/ARES payload + IQ demod = follow-up)*
 - [ ] **NEW-P2-5** VDES / long-range AIS extensions — ASM channels (AIS 27/28 → ASM1/2); AIS-2.0 readiness (ITU-R M.2092)
 - [ ] **NEW-P3** Parking lot (low priority / dependent) — FLARM (after open OGN), LoRa-APRS/Horus HAB (radiosonde rider), DMR-LRRP / P25-Unit-GPS / TETRA-SDS-LIP position PDUs (metadata only), TPMS (rtl_433 subset), Orbcomm STX (breadth flex), GTFS-realtime ingest (non-RF complement), WSPR/FT8 (HF-prop health niche)
