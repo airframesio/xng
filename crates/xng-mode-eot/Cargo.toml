@@ -1,0 +1,16 @@
+[package]
+name = "xng-mode-eot"
+description = "Native rail End-of-Train / Head-of-Train telemetry decode core for xng: 1200-baud Manchester FSK, AAR S-9152 2-way frame, BCH(63,45) check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true
