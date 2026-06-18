@@ -472,7 +472,7 @@ Every mode and every command shares the same output options:
 --udp host:5550                                # acarsdec-compatible JSON
 --json                                         # raw JSON to stdout
 --jsonl messages.jsonl                         # JSONL file
---metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels)
+--metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels, per-label ACARS)
 --sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S + UAT/HFDL positions)
 --beast 0.0.0.0:30005                          # Beast binary TCP (Mode S + synthesized UAT/HFDL)
 --nmea-tcp 0.0.0.0:10110                       # NMEA AIVDM TCP (AIS)

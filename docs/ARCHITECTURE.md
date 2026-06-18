@@ -137,7 +137,11 @@ corrections, CRC failures, signal/noise, bandwidth, sample drops, and
 uptime. They surface as log lines, JSONL, Prometheus (label families
 compatible with acarshub's acars/vdlm/hfdl/imsl/irdm), `StationStats`
 frames in asf-2.0, the TUI, and the web dashboard. `xng status` queries
-a running station's dashboard endpoint for a live per-session table.
+a running station's dashboard endpoint for a live per-session table. The
+Prometheus endpoint emits `xng_frames_total` / `xng_frames_crc_ok_total`
+/ `xng_channel_level_dbfs` per `(mode, freq)`, `xng_samples_total` per
+mode, and `xng_acars_messages_total{mode,freq,label}` for per-ACARS-label
+volume. In station mode all sessions feed one shared counter set.
 
 ## Interfaces
 
