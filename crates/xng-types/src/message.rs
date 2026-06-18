@@ -193,6 +193,24 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// APRS / AX.25 packet; `kind` = packet/data type (position/weather/message/
+    /// status/telemetry/…), `details` = decoded AX.25 addresses + APRS fields.
+    Aprs {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// POCSAG pager message; `kind` = message class (numeric/alpha/tone),
+    /// `details` = capcode/function/address + decoded text.
+    Pocsag {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// Rail EOT/HOT telemetry packet; `kind` = unit (eot/hot), `details` =
+    /// unit address + brake-pipe pressure / motion / marker-light fields.
+    Eot {
+        kind: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 

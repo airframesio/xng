@@ -39,6 +39,12 @@ pub enum Mode {
     AdsL,
     /// ATCS — Advanced Train Control System rail data radio (AAR Spec-200).
     Atcs,
+    /// APRS / AX.25 packet radio (AFSK1200 Bell 202, 144.39 MHz et al.).
+    Aprs,
+    /// POCSAG radio paging (2-FSK, CCIR 584 / ITU-R M.584).
+    Pocsag,
+    /// Rail end-of-train / head-of-train telemetry (Manchester FSK, AAR S-9152).
+    Eot,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -62,6 +68,9 @@ impl Mode {
             Mode::Sonde => "sonde",
             Mode::AdsL => "ads-l",
             Mode::Atcs => "atcs",
+            Mode::Aprs => "aprs",
+            Mode::Pocsag => "pocsag",
+            Mode::Eot => "eot",
             Mode::Extern => "extern",
         }
     }
@@ -85,6 +94,9 @@ impl Mode {
             Mode::Sonde,
             Mode::AdsL,
             Mode::Atcs,
+            Mode::Aprs,
+            Mode::Pocsag,
+            Mode::Eot,
         ]
     }
 }
@@ -116,6 +128,9 @@ impl std::str::FromStr for Mode {
             "sonde" | "radiosonde" | "rs41" => Ok(Mode::Sonde),
             "ads-l" | "adsl" | "ads-k" => Ok(Mode::AdsL),
             "atcs" => Ok(Mode::Atcs),
+            "aprs" | "ax25" | "ax.25" | "packet" => Ok(Mode::Aprs),
+            "pocsag" | "pager" | "paging" => Ok(Mode::Pocsag),
+            "eot" | "hot" | "eotd" | "dpu" => Ok(Mode::Eot),
             other => Err(format!("unknown mode: {other}")),
         }
     }
