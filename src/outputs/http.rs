@@ -16,7 +16,9 @@ use tokio::sync::broadcast;
 use xng_types::{Message, MessageBody};
 
 const PAGE: &str = include_str!("assets/dashboard.html");
-const RECENT_CAP: usize = 200;
+const RECENT_CAP: usize = 4000;
+/// Recent log messages sent in each snapshot (the log pane shows these).
+const RECENT_SENT: usize = 2000;
 /// Drop map entities not heard from in this many seconds.
 const EXPIRE_S: u64 = 300;
 
@@ -55,6 +57,10 @@ struct Dash {
     /// Position-bearing non-aircraft/vessel beacons (radiosondes, ADS-L
     /// conspicuity, COSPAS-SARSAT distress, DSC distress), keyed by "mode:id".
     beacons: HashMap<String, Value>,
+    /// Rail EOT/HOT telemetry units, keyed by unit address (no position).
+    trains: HashMap<String, Value>,
+    /// Pager capcodes (FLEX/POCSAG), keyed by "proto:capcode" (no position).
+    pagers: HashMap<String, Value>,
     /// Reconstructed 48-beam pattern, projected under tracked satellites.
     beams: crate::beam::BeamReconstructor,
     /// Last unix-secs the beam pattern was persisted.
@@ -617,6 +623,57 @@ fn update(d: &mut Dash, m: &Message) {
                 push_trail(o, lat, lon);
             }
         }
+        // Rail EOT/HOT telemetry → a "train" entity keyed by unit address (no
+        // GPS position — table-only). kind = eot (telemetry) | hot (command).
+        MessageBody::Eot { kind, details } => {
+            let unit = details
+                .get("unit_addr")
+                .map(|v| v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()))
+                .filter(|u| !u.is_empty());
+            if let Some(unit) = unit {
+                let e = d.trains.entry(unit.clone()).or_insert_with(|| json!({}));
+                let o = e.as_object_mut().unwrap();
+                o.insert("unit".into(), json!(unit));
+                o.insert("kind".into(), json!(kind));
+                for (k, dk) in [
+                    ("pressure_psi", "pressure"),
+                    ("motion", "motion"),
+                    ("marker_light", "marker"),
+                    ("battery_charge_pct", "batt"),
+                ] {
+                    if let Some(v) = details.get(k) {
+                        o.insert(dk.into(), v.clone());
+                    }
+                }
+                o.insert("seen".into(), json!(now_s()));
+                let n = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+                o.insert("msgs".into(), json!(n + 1));
+            }
+        }
+        // FLEX / POCSAG paging → a "pager" entity keyed by proto+capcode (no
+        // position). Both protocols share the dashboard's Pagers view.
+        MessageBody::Flex { details, .. } | MessageBody::Pocsag { details, .. } => {
+            if let Some(cap) = details.get("capcode") {
+                let proto = m.mode.as_str();
+                let e = d.pagers.entry(format!("{proto}:{cap}")).or_insert_with(|| json!({}));
+                let o = e.as_object_mut().unwrap();
+                o.insert("proto".into(), json!(proto));
+                o.insert("capcode".into(), cap.clone());
+                for (k, dk) in [("function", "function"), ("baud", "baud"), ("kind", "class")] {
+                    if let Some(v) = details.get(k) {
+                        o.insert(dk.into(), v.clone());
+                    }
+                }
+                if let Some(t) = details.get("text").and_then(Value::as_str) {
+                    if !t.trim().is_empty() {
+                        o.insert("text".into(), json!(t));
+                    }
+                }
+                o.insert("seen".into(), json!(now_s()));
+                let n = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+                o.insert("msgs".into(), json!(n + 1));
+            }
+        }
         _ => {}
     }
     }
@@ -658,6 +715,8 @@ fn snapshot(d: &mut Dash) -> String {
     d.iridium_devices.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= ring_cut);
     d.iridium_terminals.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.beacons.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    d.trains.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    d.pagers.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     // Persist the accumulated beam pattern occasionally so it survives
     // restarts and keeps refining across sessions.
     if now_s().saturating_sub(d.beams_saved) > 120 {
@@ -672,12 +731,14 @@ fn snapshot(d: &mut Dash) -> String {
         "aircraft": d.aircraft.values().collect::<Vec<_>>(),
         "vessels": d.vessels.values().collect::<Vec<_>>(),
         "beacons": d.beacons.values().collect::<Vec<_>>(),
+        "trains": d.trains.values().collect::<Vec<_>>(),
+        "pagers": d.pagers.values().collect::<Vec<_>>(),
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
         "iridium_devices": d.iridium_devices.values().collect::<Vec<_>>(),
         "iridium_terminals": d.iridium_terminals.values().collect::<Vec<_>>(),
         "iridium_beam_cells": d.beams.project(now_s() as f64, SAT_EXPIRE_S as f64),
-        "messages": d.recent.iter().rev().take(100).collect::<Vec<_>>(),
+        "messages": d.recent.iter().rev().take(RECENT_SENT).collect::<Vec<_>>(),
         "totals": d.totals,
         "last_seen": d.last_seen,
         "now": now_s(),
@@ -1024,5 +1085,43 @@ mod tests {
         // A beacon with no position (e.g. a DSC routine call) creates nothing.
         update(&mut d, &msg(Mode::Dsc, MessageBody::Dsc { kind: "individual".into(), details: json!({"from": 1234}) }));
         assert_eq!(d.beacons.len(), 1, "no-position message plots no beacon");
+    }
+
+    #[test]
+    fn eot_creates_a_train_entity() {
+        let mut d = Dash::default();
+        update(&mut d, &msg(Mode::Eot, MessageBody::Eot {
+            kind: "eot".into(),
+            details: json!({"unit_addr": 96147, "pressure_psi": 29, "motion": 1, "marker_light": 0}),
+        }));
+        update(&mut d, &msg(Mode::Eot, MessageBody::Eot {
+            kind: "eot".into(),
+            details: json!({"unit_addr": 96147, "pressure_psi": 31, "motion": 1, "marker_light": 0}),
+        }));
+        assert_eq!(d.trains.len(), 1, "same unit coalesces");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let t = &snap["trains"][0];
+        assert_eq!(t["unit"], "96147");
+        assert_eq!(t["pressure"], 31, "latest pressure wins");
+        assert_eq!(t["msgs"], 2);
+    }
+
+    #[test]
+    fn flex_and_pocsag_create_pager_entities() {
+        let mut d = Dash::default();
+        update(&mut d, &msg(Mode::Flex, MessageBody::Flex {
+            kind: "alpha".into(),
+            details: json!({"capcode": 1234567, "function": 3, "baud": 1600, "text": "PAGE TEXT"}),
+        }));
+        update(&mut d, &msg(Mode::Pocsag, MessageBody::Pocsag {
+            kind: "numeric".into(),
+            details: json!({"capcode": 1234567, "function": 0, "baud": 1200, "text": "12345"}),
+        }));
+        // Same capcode, different protocol → two distinct pager entities.
+        assert_eq!(d.pagers.len(), 2, "flex + pocsag keyed separately by proto");
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let protos: Vec<&str> = snap["pagers"].as_array().unwrap().iter()
+            .map(|p| p["proto"].as_str().unwrap()).collect();
+        assert!(protos.contains(&"flex") && protos.contains(&"pocsag"));
     }
 }

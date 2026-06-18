@@ -34,6 +34,13 @@
   #logpane { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; border-top: 1px solid #1c2230; }
   body.logmin #logpane { flex: none; }
   body.logmin #msgs { display: none; }
+  /* Entity-type tabs above the table. */
+  #enttabs { flex: 0 0 auto; display: flex; gap: 2px; padding: 2px 4px; background: #0b0e14; border-bottom: 1px solid #1f2335; overflow-x: auto; white-space: nowrap; }
+  #enttabs .tab { cursor: pointer; padding: 2px 9px; border-radius: 4px 4px 0 0; color: #565f89; font-size: 12px; }
+  #enttabs .tab:hover { background: #16161e; color: #a9b1d6; }
+  #enttabs .tab.on { background: #1f2435; color: #7aa2f7; }
+  /* Fixed-width entity icon so narrow dingbats line up with wide emoji. */
+  .ent-ic { display: inline-block; width: 1.5em; text-align: center; }
   #entities table { width: 100%; border-collapse: collapse; }
   #entities th, #entities td { text-align: left; padding: 2px 8px; white-space: nowrap; }
   #entities th { color: #565f89; position: sticky; top: 0; background: #0b0e14; cursor: default; }
@@ -106,6 +113,7 @@
     <div id="sdrhdr" title="Show receiver / SDR status"><span class="tw" id="sdrtw">▸</span><span>SDR status</span><span class="sub" id="sdrsum"></span></div>
     <div id="sdrbody" hidden></div>
   </div>
+  <div id="enttabs"></div>
   <div id="entities"></div>
   <div id="vres" title="Drag to resize"></div>
   <div id="logpane">
@@ -588,6 +596,8 @@ window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add
 // re-renders. Entities table sort state — default: most recently seen first.
 const acExpanded = new Set();
 let sortCol = 'seen', sortDir = 'desc';
+// Active entities-table tab ('all' or an entity type). Persisted.
+let entTab = localStorage.getItem('xng.enttab') || 'all';
 // ONE delegated click handler for the entities table (rows AND sortable column
 // headers). Rows carry their identity in escaped data-* attributes (read back
 // via dataset, never re-parsed as HTML/JS), so attacker-controlled fields
@@ -614,6 +624,16 @@ document.getElementById('entities').addEventListener('click', e => {
   const lat = tr.dataset.lat ? parseFloat(tr.dataset.lat) : null;
   const lon = tr.dataset.lon ? parseFloat(tr.dataset.lon) : null;
   selectEntity(k, lat, lon);
+});
+// Entity-type tabs: switching resets the sort to "most recently seen" so the
+// new tab's columns are always a valid sort key.
+document.getElementById('enttabs').addEventListener('click', e => {
+  const t = e.target.closest('[data-tab]');
+  if (!t) return;
+  entTab = t.dataset.tab;
+  localStorage.setItem('xng.enttab', entTab);
+  sortCol = 'seen'; sortDir = 'desc';
+  render();
 });
 document.getElementById('pause').onclick = function () {
   paused = !paused;
@@ -890,54 +910,115 @@ function render() {
     })
     .join('');
 
-  // One unified, sortable entity list (aircraft + vessels + satellites). Each
-  // row carries its column values for sorting plus the precomposed trailing
-  // cells (the first/name cell is built per-row so it can carry the icon,
-  // colour and expand caret).
+  // Unified entity list. Each ent carries: `type` (for the tab filter), the
+  // generic "All" cells (`sv` for sorting, `cols` precomposed), and a per-type
+  // field map `f` for the type-specific tab columns. Icons sit in a
+  // fixed-width span so narrow text dingbats (✈ ⚓) align with wide emoji
+  // (📟 🚆 🎈) — otherwise the rows look ragged.
+  const ic = g => `<span class="ent-ic">${g}</span>`;
   const ents = [];
   for (const a of s.aircraft) {
     const id = a.id || a.icao || a.reg || a.flight || '';
     const srcs = a.sources ? Object.values(a.sources) : [];
     ents.push({
-      k: 'a' + id, id, lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
-      color: altColor(a.alt), name: `✈ ${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
+      k: 'a' + id, id, type: 'aircraft', lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
+      color: altColor(a.alt), name: `${ic('✈')}${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
       sv: { id, flight: a.flight || '', icao: a.icao || '', reg: a.reg || '', type: a.actype || '', alt: a.alt, kt: a.spd, msgs: a.msgs || 0, seen: a.seen || 0 },
       cols: [escapeHtml(a.flight || ''), escapeHtml(a.icao || ''), escapeHtml(a.reg || ''), escapeHtml(a.actype || ''), a.alt ?? '', a.spd ?? '', a.msgs ?? ''],
+      f: { flight: escapeHtml(a.flight || ''), icao: escapeHtml(a.icao || ''), reg: escapeHtml(a.reg || ''), type: escapeHtml(a.actype || ''), alt: a.alt ?? '', kt: a.spd ?? '', msgs: a.msgs ?? '' },
     });
   }
   for (const v of s.vessels) {
     const m = shipMeta(v.shiptype);
     ents.push({
-      k: 'v' + v.mmsi, id: String(v.mmsi), lat: v.lat ?? null, lon: v.lon ?? null, srcs: [], expandable: false,
-      color: m.color, name: `⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}`, seen: v.seen,
+      k: 'v' + v.mmsi, id: String(v.mmsi), type: 'vessel', lat: v.lat ?? null, lon: v.lon ?? null, srcs: [], expandable: false,
+      color: m.color, name: `${ic('⚓')}${escapeHtml((v.name || String(v.mmsi)).trim())}`, seen: v.seen,
       sv: { id: v.name || String(v.mmsi), flight: '', icao: '', reg: v.country || '', type: m.label || '', alt: undefined, kt: v.sog, msgs: undefined, seen: v.seen || 0 },
       cols: ['', '', escapeHtml(v.country || ''), escapeHtml(m.label || ''), '', v.sog ?? '', ''],
+      f: { mmsi: v.mmsi, country: escapeHtml(v.country || ''), type: escapeHtml(m.label || ''), kt: v.sog ?? '', msgs: v.msgs ?? '' },
     });
   }
   for (const sat of (s.iridium_sats || [])) {
     const nm = sat.name || ('Iridium ' + sat.sat);
     ents.push({
-      k: 's' + sat.sat, id: nm, lat: sat.lat ?? null, lon: sat.lon ?? null, srcs: [], expandable: false,
-      color: '#bb9af7', name: `🛰 ${escapeHtml(nm)}`, seen: sat.seen,
+      k: 's' + sat.sat, id: nm, type: 'sat', lat: sat.lat ?? null, lon: sat.lon ?? null, srcs: [], expandable: false,
+      color: '#bb9af7', name: `${ic('🛰')}${escapeHtml(nm)}`, seen: sat.seen,
       sv: { id: nm, flight: '', icao: '', reg: '', type: 'satellite', alt: sat.alt, kt: undefined, msgs: undefined, seen: sat.seen || 0 },
       cols: ['', '', '', 'satellite', sat.alt != null ? Math.round(sat.alt) + 'km' : '', '', ''],
+      f: { type: 'satellite', alt: sat.alt != null ? Math.round(sat.alt) + 'km' : '' },
     });
   }
   for (const b of (s.beacons || [])) {
     const emoji = BEACON_EMOJI[b.mode] || '📡';
     const ids = String(b.id || '');
     ents.push({
-      k: 'b' + b.mode + ':' + b.id, id: ids, lat: b.lat ?? null, lon: b.lon ?? null, srcs: [], expandable: false,
-      color: '#e0af68', name: `${emoji} ${escapeHtml(ids)}`, seen: b.seen,
+      k: 'b' + b.mode + ':' + b.id, id: ids, type: 'beacon', lat: b.lat ?? null, lon: b.lon ?? null, srcs: [], expandable: false,
+      color: '#e0af68', name: `${ic(emoji)}${escapeHtml(ids)}`, seen: b.seen,
       sv: { id: ids, flight: '', icao: '', reg: '', type: b.mode || '', alt: b.alt, kt: undefined, msgs: b.msgs, seen: b.seen || 0 },
       cols: ['', '', '', escapeHtml(String(b.mode || '')), b.alt ?? '', '', b.msgs ?? ''],
+      f: { id: escapeHtml(ids), type: escapeHtml(String(b.mode || '')), alt: b.alt ?? '', msgs: b.msgs ?? '' },
     });
   }
-  // Sort by the active column (numeric columns numerically); blanks sort last.
-  const numCol = sortCol === 'alt' || sortCol === 'kt' || sortCol === 'msgs' || sortCol === 'seen';
+  for (const t of (s.trains || [])) {
+    const u = String(t.unit || '');
+    ents.push({
+      k: 'e' + u, id: u, type: 'train', lat: null, lon: null, srcs: [], expandable: false,
+      color: '#9ece6a', name: `${ic('🚆')}${escapeHtml(u)}`, seen: t.seen,
+      sv: { id: u, flight: '', icao: '', reg: String(t.kind || ''), type: 'EOT', alt: undefined, kt: undefined, msgs: t.msgs, seen: t.seen || 0 },
+      cols: ['', '', escapeHtml(String(t.kind || '')), 'EOT', '', '', t.msgs ?? ''],
+      f: { unit: escapeHtml(u), class: escapeHtml(String(t.kind || '')), pressure: t.pressure ?? '', motion: t.motion ?? '', marker: t.marker ?? '', msgs: t.msgs ?? '' },
+    });
+  }
+  for (const p of (s.pagers || [])) {
+    const cap = String(p.capcode ?? '');
+    const txt = p.text ? String(p.text).trim() : '';
+    ents.push({
+      k: 'p' + (p.proto || '') + ':' + cap, id: cap, type: 'pager', lat: null, lon: null, srcs: [], expandable: false,
+      color: '#7dcfff', name: `${ic('📟')}${escapeHtml(cap)}`, seen: p.seen,
+      sv: { id: cap, flight: '', icao: '', reg: String(p.proto || ''), type: String(p.class || ''), alt: undefined, kt: undefined, msgs: p.msgs, seen: p.seen || 0 },
+      cols: ['', '', escapeHtml(String(p.proto || '')), escapeHtml(String(p.class || '')), '', '', p.msgs ?? ''],
+      f: { proto: escapeHtml(String(p.proto || '')), capcode: cap, function: p.function ?? '', baud: p.baud ?? '', text: escapeHtml(txt.slice(0, 40)), msgs: p.msgs ?? '' },
+    });
+  }
+  // --- Entity-type tabs: All (everything, generic columns) + one tab per
+  // present type, each with its own column set. Only tabs with ≥1 entity show.
+  const TABS = [
+    { key: 'all', label: 'All', types: null,
+      cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'aircraft', label: '✈ Aircraft', types: ['aircraft'],
+      cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'ships', label: '⚓ Ships', types: ['vessel'],
+      cols: [['mmsi', 'mmsi', 1], ['country', 'country'], ['type', 'type'], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'beacons', label: '🎈 Beacons', types: ['beacon'],
+      cols: [['id', 'id'], ['type', 'type'], ['alt', 'alt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'trains', label: '🚆 Trains', types: ['train'],
+      cols: [['unit', 'unit'], ['class', 'class'], ['pressure', 'psi', 1], ['motion', 'motion', 1], ['marker', 'marker', 1], ['msgs', 'msgs', 1]] },
+    { key: 'pagers', label: '📟 Pagers', types: ['pager'],
+      cols: [['proto', 'proto'], ['capcode', 'capcode', 1], ['function', 'fn', 1], ['baud', 'baud', 1], ['text', 'text'], ['msgs', 'msgs', 1]] },
+    { key: 'sats', label: '🛰 Sats', types: ['sat'], cols: [['type', 'type'], ['alt', 'alt']] },
+  ];
+  const present = new Set(ents.map(e => e.type));
+  const shownTabs = TABS.filter(t => !t.types || t.types.some(ty => present.has(ty)));
+  if (!shownTabs.some(t => t.key === entTab)) entTab = 'all';
+  const tab = shownTabs.find(t => t.key === entTab) || shownTabs[0];
+  const isAll = tab.key === 'all';
+  document.getElementById('enttabs').innerHTML = shownTabs.map(t => {
+    const n = t.types ? ents.filter(e => t.types.includes(e.type)).length : ents.length;
+    return `<span class="tab${t.key === entTab ? ' on' : ''}" data-tab="${t.key}">${t.label} ${n}</span>`;
+  }).join('');
+  const view = tab.types ? ents.filter(e => tab.types.includes(e.type)) : ents;
+
+  // Sort. `name`/`seen` always valid; otherwise the active tab's column key.
+  const colKeys = tab.cols.map(c => c[0]);
+  if (sortCol !== 'seen' && sortCol !== 'name' && !colKeys.includes(sortCol)) sortCol = 'seen';
+  const NUM = new Set(['alt', 'kt', 'msgs', 'seen', 'pressure', 'baud', 'capcode', 'function', 'motion', 'marker', 'mmsi']);
+  const numCol = NUM.has(sortCol);
   const dirMul = sortDir === 'asc' ? 1 : -1;
-  ents.sort((x, y) => {
-    let xv = x.sv[sortCol], yv = y.sv[sortCol];
+  const sval = e => sortCol === 'seen' ? (e.seen || 0)
+    : sortCol === 'name' ? (e.id || '')
+    : (isAll ? e.sv[sortCol] : e.f[sortCol]);
+  view.sort((x, y) => {
+    let xv = sval(x), yv = sval(y);
     if (numCol) {
       const xn = (xv == null || xv === '') ? null : +xv, yn = (yv == null || yv === '') ? null : +yv;
       if (xn == null && yn == null) return 0;
@@ -953,15 +1034,17 @@ function render() {
   });
 
   const rows = [];
-  for (const e of ents) {
+  for (const e of view) {
     const open = e.expandable && acExpanded.has(e.id);
     const caret = e.expandable ? (open ? '▾ ' : '▸ ') : '';
+    const cells = isAll
+      ? e.cols.map(c => `<td>${c}</td>`).join('')
+      : tab.cols.map(([key]) => `<td>${e.f[key] ?? ''}</td>`).join('');
     rows.push(`<tr class="row${selected === e.k ? ' sel' : ''}" data-k="${escapeHtml(e.k)}" ` +
       `data-id="${escapeHtml(e.id)}" data-lat="${e.lat ?? ''}" data-lon="${e.lon ?? ''}" data-exp="${e.expandable ? 1 : 0}">` +
-      `<td style="color:${e.color}">${caret}${e.name}</td>` +
-      e.cols.map(c => `<td>${c}</td>`).join('') +
+      `<td style="color:${e.color}">${caret}${e.name}</td>` + cells +
       `<td class="age">${fmtAge(s.now - e.seen)}</td></tr>`);
-    if (open) {
+    if (open && isAll) {
       for (const sr of [...e.srcs].sort((p, q) => (p.source || '').localeCompare(q.source || ''))) {
         rows.push(`<tr class="row srcrow">` +
           `<td style="padding-left:20px;color:#7aa2f7">↳ ${escapeHtml(sr.source || '')}</td>` +
@@ -972,30 +1055,29 @@ function render() {
       }
     }
   }
-  // SBD terminals stay behind their collapse toggle (not sorted into the list).
-  const terms = s.iridium_terminals || [];
+  // SBD terminals (Iridium) stay behind their toggle — only in the All view.
+  const terms = isAll ? (s.iridium_terminals || []) : [];
   if (terms.length) {
+    const ncol = tab.cols.length + 2;
     const showTerm = localStorage.getItem('xng.terminals') === '1';
     rows.push(`<tr class="row" data-act="term">` +
-      `<td colspan="9" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
+      `<td colspan="${ncol}" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
     if (showTerm) {
       for (const t of [...terms].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
         const k = 't' + t.imei;
         rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}">` +
-          `<td style="color:#e0af68">📟 ${escapeHtml(t.imei)}</td>` +
+          `<td style="color:#e0af68">${ic('📟')}${escapeHtml(t.imei)}</td>` +
           `<td></td><td></td><td></td><td>SBD${t.text ? ' · ' + escapeHtml(String(t.text).trim().slice(0, 20)) : ''}</td>` +
           `<td></td><td></td><td>${t.msgs ?? ''}</td>` +
           `<td class="age">${fmtAge(s.now - t.seen)}</td></tr>`);
       }
     }
   }
-  // Sortable headers with an active-column indicator (click via the delegated
-  // listener above).
-  const COLS = ['id', 'flight', 'icao', 'reg', 'type', 'alt', 'kt', 'msgs', 'seen'];
-  const hdr = COLS.map(c => {
-    const ind = sortCol === c ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
-    return `<th data-col="${c}" class="sortable">${c}${ind}</th>`;
-  }).join('');
+  // Sortable headers: name + the active tab's columns + seen.
+  const ind = c => sortCol === c ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  const hdr = `<th data-col="name" class="sortable">name${ind('name')}</th>` +
+    tab.cols.map(([key, label]) => `<th data-col="${key}" class="sortable">${label}${ind(key)}</th>`).join('') +
+    `<th data-col="seen" class="sortable">seen${ind('seen')}</th>`;
   document.getElementById('entities').innerHTML = rows.length
     ? `<table><tr>${hdr}</tr>${rows.join('')}</table>`
     : '';
