@@ -20,8 +20,11 @@ use xng_mode_vdl2::Vdl2ChannelDecoder;
 // New-mode decode cores (IQ demod + ChannelDecoder + to_message per crate).
 use xng_mode_adsl::AdslChannelDecoder;
 use xng_mode_atcs::AtcsChannelDecoder;
+use xng_mode_aprs::AprsChannelDecoder;
 use xng_mode_dsc::DscChannelDecoder;
+use xng_mode_eot::EotChannelDecoder;
 use xng_mode_navtex::NavtexChannelDecoder;
+use xng_mode_pocsag::PocsagChannelDecoder;
 use xng_mode_sarsat::SarsatChannelDecoder;
 use xng_mode_sonde::SondeChannelDecoder;
 use xng_mode_uat::UatChannelDecoder;
@@ -165,6 +168,9 @@ pub(crate) enum ModeChannel {
     Sarsat(SarsatChannelDecoder),
     Dsc(DscChannelDecoder),
     Navtex(NavtexChannelDecoder),
+    Aprs(AprsChannelDecoder),
+    Pocsag(PocsagChannelDecoder),
+    Eot(EotChannelDecoder),
     Sonde(SondeChannelDecoder),
     Adsl(AdslChannelDecoder),
     Atcs(AtcsChannelDecoder),
@@ -223,6 +229,11 @@ impl ModeChannel {
             Mode::Sonde => Ok(Self::Sonde(SondeChannelDecoder::new(sample_rate, offset)?)),
             Mode::AdsL => Ok(Self::Adsl(AdslChannelDecoder::new(sample_rate, offset)?)),
             Mode::Atcs => Ok(Self::Atcs(AtcsChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Aprs => Ok(Self::Aprs(AprsChannelDecoder::new(sample_rate, offset)?)),
+            // POCSAG transmits at 512/1200/2400 Bd; 1200 is the most common.
+            // (Per-session baud selection is a follow-up config knob.)
+            Mode::Pocsag => Ok(Self::Pocsag(PocsagChannelDecoder::new(sample_rate, offset, 1200)?)),
+            Mode::Eot => Ok(Self::Eot(EotChannelDecoder::new(sample_rate, offset)?)),
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -242,6 +253,9 @@ impl ModeChannel {
             Mode::Sonde => xng_mode_sonde::CHANNEL_PASSBAND_HZ,
             Mode::AdsL => xng_mode_adsl::CHANNEL_PASSBAND_HZ,
             Mode::Atcs => xng_mode_atcs::CHANNEL_PASSBAND_HZ,
+            Mode::Aprs => xng_mode_aprs::CHANNEL_PASSBAND_HZ,
+            Mode::Pocsag => xng_mode_pocsag::CHANNEL_PASSBAND_HZ,
+            Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -264,6 +278,9 @@ impl ModeChannel {
             Self::Sonde(_) => xng_mode_sonde::CHANNEL_RATE,
             Self::Adsl(_) => xng_mode_adsl::CHANNEL_RATE,
             Self::Atcs(_) => xng_mode_atcs::CHANNEL_RATE,
+            Self::Aprs(_) => xng_mode_aprs::CHANNEL_RATE,
+            Self::Pocsag(_) => xng_mode_pocsag::CHANNEL_RATE,
+            Self::Eot(_) => xng_mode_eot::CHANNEL_RATE,
         }
     }
 
@@ -286,6 +303,9 @@ impl ModeChannel {
             Self::Sonde(d) => d.level_dbfs(),
             Self::Adsl(d) => d.level_dbfs(),
             Self::Atcs(d) => d.level_dbfs(),
+            Self::Aprs(d) => d.level_dbfs(),
+            Self::Pocsag(d) => d.level_dbfs(),
+            Self::Eot(d) => d.level_dbfs(),
         }
     }
 
@@ -483,6 +503,40 @@ impl ModeChannel {
                 let msgs = decoded
                     .iter()
                     .map(|d| xng_mode_atcs::to_message(d, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Aprs(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_aprs::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Pocsag(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_pocsag::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Eot(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                // The receive frequency picks the link direction: ~452.9375 MHz
+                // carries HOT→EOT commands ("hot"); ~457.9375 MHz carries
+                // EOT→HOT telemetry ("eot").
+                let is_hot = (freq as i64 - 452_937_500).abs() < (freq as i64 - 457_937_500).abs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_eot::to_message(f, freq, level, is_hot, prov.clone()))
                     .collect();
                 (msgs, seen, seen)
             }

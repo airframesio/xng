@@ -4024,11 +4024,14 @@ dependencies = [
  "xng-mode-adsl",
  "xng-mode-aero",
  "xng-mode-ais",
+ "xng-mode-aprs",
  "xng-mode-atcs",
  "xng-mode-dsc",
+ "xng-mode-eot",
  "xng-mode-hfdl",
  "xng-mode-iridium",
  "xng-mode-navtex",
+ "xng-mode-pocsag",
  "xng-mode-sarsat",
  "xng-mode-sonde",
  "xng-mode-stdc",
@@ -4121,6 +4124,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xng-mode-aprs"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
 name = "xng-mode-atcs"
 version = "0.20.0"
 dependencies = [
@@ -4134,6 +4149,18 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-dsc"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-eot"
 version = "0.20.0"
 dependencies = [
  "chrono",
@@ -4175,6 +4202,18 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-navtex"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-pocsag"
 version = "0.20.0"
 dependencies = [
  "chrono",

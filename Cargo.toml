@@ -47,6 +47,9 @@ xng-mode-navtex = { path = "crates/xng-mode-navtex" }
 xng-mode-sonde = { path = "crates/xng-mode-sonde" }
 xng-mode-adsl = { path = "crates/xng-mode-adsl" }
 xng-mode-atcs = { path = "crates/xng-mode-atcs" }
+xng-mode-aprs = { path = "crates/xng-mode-aprs" }
+xng-mode-pocsag = { path = "crates/xng-mode-pocsag" }
+xng-mode-eot = { path = "crates/xng-mode-eot" }
 prost = "0.13"
 tonic = "0.12"
 quinn = "0.11"
@@ -115,6 +118,9 @@ xng-mode-navtex.workspace = true
 xng-mode-sonde.workspace = true
 xng-mode-adsl.workspace = true
 xng-mode-atcs.workspace = true
+xng-mode-aprs.workspace = true
+xng-mode-pocsag.workspace = true
+xng-mode-eot.workspace = true
 prost.workspace = true
 tonic.workspace = true
 quinn.workspace = true

@@ -555,6 +555,48 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::Aprs { kind, details } => {
+                    let from = details.get("source").and_then(|v| v.as_str()).unwrap_or("?");
+                    let mut s = format!("APRS {from} [{kind}]");
+                    if let (Some(lat), Some(lon)) =
+                        (details.get("lat").and_then(|v| v.as_f64()), details.get("lon").and_then(|v| v.as_f64()))
+                    {
+                        s.push_str(&format!(" pos={lat:.4},{lon:.4}"));
+                    }
+                    for (key, label) in [("comment", "·"), ("text", "msg")] {
+                        if let Some(t) = details.get(key).and_then(|v| v.as_str()) {
+                            let t = t.trim();
+                            if !t.is_empty() {
+                                s.push_str(&format!(" {label} {}", t.replace('\n', "·")));
+                            }
+                        }
+                    }
+                    s
+                }
+                MessageBody::Pocsag { kind, details } => {
+                    let mut s = format!("POCSAG {kind}");
+                    for (key, label) in [("capcode", "cap"), ("function", "fn"), ("baud", "bd")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={v}"));
+                        }
+                    }
+                    if let Some(t) = details.get("text").and_then(|v| v.as_str()) {
+                        let t = t.trim();
+                        if !t.is_empty() {
+                            s.push_str(&format!(" | {}", t.replace('\n', "·")));
+                        }
+                    }
+                    s
+                }
+                MessageBody::Eot { kind, details } => {
+                    let mut s = format!("{} ", kind.to_uppercase());
+                    for (key, label) in [("unit_addr", "unit"), ("pressure_psi", "psi"), ("motion", "motion"), ("marker_light", "marker")] {
+                        if let Some(v) = details.get(key) {
+                            s.push_str(&format!(" {label}={}", v.as_str().map(|x| x.to_string()).unwrap_or_else(|| v.to_string())));
+                        }
+                    }
+                    s
+                }
                 MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
             };
             format!(

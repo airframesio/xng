@@ -135,14 +135,18 @@ impl From<&Message> for asf2::DecodedMessage {
                 }))
             }
             // Newer decode cores share a generic kind+details body; the mode
-            // field disambiguates (uat | sarsat | dsc | navtex | sonde | ads-l | atcs).
+            // field disambiguates (uat | sarsat | dsc | navtex | sonde | ads-l |
+            // atcs | aprs | pocsag | eot).
             MessageBody::Uat { kind, details }
             | MessageBody::Sarsat { kind, details }
             | MessageBody::Dsc { kind, details }
             | MessageBody::Navtex { kind, details }
             | MessageBody::Sonde { kind, details }
             | MessageBody::AdsL { kind, details }
-            | MessageBody::Atcs { kind, details } => {
+            | MessageBody::Atcs { kind, details }
+            | MessageBody::Aprs { kind, details }
+            | MessageBody::Pocsag { kind, details }
+            | MessageBody::Eot { kind, details } => {
                 Some(asf2::decoded_message::Body::Generic(asf2::GenericBody {
                     kind: kind.clone(),
                     details_json: details.to_string(),
