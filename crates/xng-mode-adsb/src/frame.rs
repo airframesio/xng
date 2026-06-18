@@ -7,7 +7,7 @@
 //! verifiable only against addresses learned from squitters, kept in a
 //! recent-ICAO cache.
 
-use crate::decode::{self, Cpr, Velocity};
+use crate::decode::{self, Cpr, PosTrust, Velocity};
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use xng_dsp::checksum::mode_s_crc;
@@ -67,6 +67,11 @@ pub struct AdsbFrame {
     pub velocity: Option<Velocity>,
     /// Resolved position (filled by the per-aircraft tracker).
     pub position: Option<(f64, f64)>,
+    /// Trust grade of [`position`]: how it was resolved and whether it
+    /// survived the integrity-containment / speed plausibility gates
+    /// (filled alongside `position` by the per-aircraft tracker). `None`
+    /// when no position was resolved.
+    pub trust: Option<PosTrust>,
     /// Comm-B register content (DF20/21 MB field, BDS-inferred).
     pub comm_b: Option<serde_json::Value>,
     /// ADS-B operational status (TC31: version, NACp, SIL, NIC-supp, GVA) or
@@ -196,6 +201,7 @@ impl FrameValidator {
             cpr: None,
             velocity: None,
             position: None,
+            trust: None,
             comm_b: None,
             adsb_status: None,
             level_dbfs,
@@ -293,6 +299,7 @@ impl FrameValidator {
             cpr: None,
             velocity: None,
             position: None,
+            trust: None,
             comm_b: None,
             adsb_status: None,
             level_dbfs,

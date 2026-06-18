@@ -98,6 +98,104 @@ pub fn cpr_local(cpr: Cpr, ref_lat: f64, ref_lon: f64) -> (f64, f64) {
     (lat, lon)
 }
 
+/// How much a decoded position is trusted, by *how* it was resolved and
+/// whether it survives the plausibility gates. Grading mirrors the
+/// dump1090 / pyModeS CPR trust hierarchy: a globally-unambiguous even/odd
+/// pair is the gold standard (no prior reference required); a
+/// locally-referenced decode is trustworthy only when it lands within the
+/// integrity-derived containment of a recent good fix (otherwise a CPR
+/// zone-number off-by-one wraps it into a neighbouring zone — the failure
+/// dump1090's `decodeCPRrelative` "surface/airborne range" check guards
+/// against); a decode anchored only on the static receiver position is
+/// weaker still (the aircraft may be far from the receiver). The ordering
+/// is most-trusted → least-trusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PosTrust {
+    /// Resolved from a fresh even/odd pair by the globally-unambiguous CPR
+    /// algorithm ([`cpr_global_airborne`]).
+    GlobalUnambiguous,
+    /// Locally referenced off the aircraft's last good fix and confirmed
+    /// inside the NIC/NUCp containment radius of that fix
+    /// ([`within_local_containment`]).
+    LocalContained,
+    /// Locally referenced off the static receiver position (surface
+    /// targets, or an airborne first fix with no even/odd pair yet).
+    LocalReceiver,
+}
+
+impl PosTrust {
+    /// Stable lowercase tag for serialization.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PosTrust::GlobalUnambiguous => "global",
+            PosTrust::LocalContained => "local_contained",
+            PosTrust::LocalReceiver => "local_receiver",
+        }
+    }
+}
+
+/// Half the airborne CPR latitude-zone height, in metres: the hard upper
+/// bound on how far a *locally* decoded position can sit from a correct
+/// reference before the zone number `j`/`m` is off by one and the result is
+/// no longer the nearest (unambiguous) solution. dump1090's
+/// `decodeCPRrelative` enforces exactly this "within ±½ zone" range. The
+/// airborne latitude zone is `dlat = 360/(4·NZ) = 6°`; half of that, at
+/// ~111.32 km per degree of latitude, is the cap.
+pub const CPR_LOCAL_RANGE_M: f64 = (360.0 / (4.0 * NZ)) / 2.0 * 111_320.0;
+
+/// Maximum trustworthy distance (metres) between a locally-referenced fix
+/// and the reference it was decoded against. The gate is the integrity-
+/// aware refinement of dump1090's local-decode "±½ CPR zone" range check:
+///
+///   bound = rc(new) + rc(ref) + slack + min(motion, ½-zone)
+///
+/// - `rc(new) + rc(ref)` (= `2·rc_m`) is the NIC/NUCp containment of *both*
+///   the new fix and the reference — the true aircraft can sit that far
+///   either side of each reported point.
+/// - `min(motion, ½-zone)` caps the elapsed-time motion budget
+///   (`max_speed_mps · elapsed_s`) at half a CPR zone
+///   ([`CPR_LOCAL_RANGE_M`]): beyond half a zone a local decode *cannot*
+///   be the nearest solution, so the jump is corruption no matter how much
+///   time has passed. This is what makes the containment gate strictly
+///   additive over the unbounded speed gate — at large `elapsed_s` the
+///   speed gate alone would admit an arbitrarily distant zone-wrap.
+///
+/// `rc_m` is the [`nuc_p_rcu_m`] / NIC containment radius (`None` → no
+/// integrity term, only the capped motion + slack).
+pub fn local_containment_radius_m(
+    rc_m: Option<u32>,
+    elapsed_s: f64,
+    max_speed_mps: f64,
+    slack_m: f64,
+) -> f64 {
+    let containment = 2.0 * rc_m.map_or(0.0, f64::from);
+    let motion = (max_speed_mps * elapsed_s.max(0.0)).min(CPR_LOCAL_RANGE_M);
+    containment + motion + slack_m
+}
+
+/// True when a locally-referenced fix at (`lat`, `lon`) is within the
+/// integrity-derived containment of its reference (`ref_lat`, `ref_lon`)
+/// — i.e. the local decode is trustworthy and did not wrap into a
+/// neighbouring CPR zone. `rc_m`, `elapsed_s`, `max_speed_mps`, `slack_m`
+/// feed [`local_containment_radius_m`]. `dist_m` is a flat-earth metre
+/// distance function (supplied by the caller so the geometry lives in one
+/// place).
+#[allow(clippy::too_many_arguments)]
+pub fn within_local_containment(
+    lat: f64,
+    lon: f64,
+    ref_lat: f64,
+    ref_lon: f64,
+    rc_m: Option<u32>,
+    elapsed_s: f64,
+    max_speed_mps: f64,
+    slack_m: f64,
+    dist_m: impl Fn(f64, f64, f64, f64) -> f64,
+) -> bool {
+    let bound = local_containment_radius_m(rc_m, elapsed_s, max_speed_mps, slack_m);
+    dist_m(lat, lon, ref_lat, ref_lon) <= bound
+}
+
 /// Decoded TC 19 velocity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Velocity {
@@ -775,6 +873,106 @@ mod tests {
         let (lat, lon) = cpr_local(cpr_of(EVEN), 52.258, 3.918);
         assert!((lat - 52.25720).abs() < 1e-4, "lat {lat}");
         assert!((lon - 3.91937).abs() < 1e-4, "lon {lon}");
+    }
+
+    /// Flat-earth metre distance (mirrors the tracker's `flat_distance_m`)
+    /// for the containment-gate tests.
+    fn dist_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
+        let dlat = (lat1 - lat2) * 111_320.0;
+        let dlon = (lon1 - lon2) * 111_320.0 * lat1.to_radians().cos();
+        (dlat * dlat + dlon * dlon).sqrt()
+    }
+
+    #[test]
+    fn local_containment_radius_combines_integrity_motion_slack() {
+        // NUCp 7 → RCu 93 m; both fixes contribute, so 2·93 = 186 m of
+        // integrity containment, plus 700 m/s × 2 s = 1400 m of motion,
+        // plus 500 m slack → 2086 m.
+        let r = local_containment_radius_m(nuc_p_rcu_m(7), 2.0, 700.0, 500.0);
+        assert!((r - 2086.0).abs() < 1e-6, "{r}");
+        // No integrity bound (NUCp 0): only motion + slack apply.
+        let r0 = local_containment_radius_m(None, 0.0, 700.0, 500.0);
+        assert!((r0 - 500.0).abs() < 1e-6, "{r0}");
+        // Negative elapsed (same-chunk clock skew) clamps to 0.
+        let rneg = local_containment_radius_m(Some(10), -5.0, 700.0, 500.0);
+        assert!((rneg - 520.0).abs() < 1e-6, "{rneg}");
+    }
+
+    #[test]
+    fn local_containment_caps_motion_at_half_zone() {
+        // The motion budget is capped at half a CPR latitude zone
+        // (CPR_LOCAL_RANGE_M ≈ 334 km) — the dump1090 local-decode range
+        // limit. This is what makes the gate strictly tighter than the
+        // unbounded speed gate at long elapsed times: at 1000 s the raw
+        // speed budget is 700 km, but the containment bound saturates near
+        // 334 km, so a 400 km jump is rejected here yet would pass a pure
+        // speed gate.
+        assert!((CPR_LOCAL_RANGE_M - 333_960.0).abs() < 1.0);
+        let bound = local_containment_radius_m(Some(10), 1000.0, 700.0, 500.0);
+        assert!((bound - (2.0 * 10.0 + CPR_LOCAL_RANGE_M + 500.0)).abs() < 1e-6, "{bound}");
+        assert!(bound < 700.0 * 1000.0 + 500.0, "cap must beat the speed budget");
+        // A 400 km jump: rejected by the capped containment bound, but the
+        // raw speed budget (700 km) would have admitted it.
+        let jump = 400_000.0;
+        assert!(jump > bound, "containment rejects the 400 km jump");
+        assert!(jump <= 700.0 * 1000.0 + 500.0, "speed gate alone would admit it");
+    }
+
+    #[test]
+    fn within_local_containment_accepts_near_and_rejects_wrapped() {
+        // Oracle: a correctly locally-decoded fix sits within metres of a
+        // fresh reference and must be accepted; a CPR zone-number off-by-
+        // one (the dump1090 `decodeCPRrelative` failure mode) lands ~360°
+        // /nl ≈ hundreds of km away and must be rejected. Round-trip the
+        // book EVEN frame: with a reference at the true point the decode
+        // is exact (≈0 m jump), so any sane bound accepts it.
+        let (lat, lon) = cpr_local(cpr_of(EVEN), 52.2572, 3.91937);
+        assert!(
+            within_local_containment(
+                lat, lon, 52.2572, 3.91937, nuc_p_rcu_m(7), 1.0, 700.0, 500.0, dist_m,
+            ),
+            "true-reference local decode accepted"
+        );
+        // A point one CPR longitude zone east (dlon = 360/nl(52) ≈ 10°,
+        // ~685 km at 52°) is a classic wrap; it exceeds the half-zone
+        // motion cap and is rejected even at very long elapsed times — a
+        // local decode can never legitimately land that far from a correct
+        // reference.
+        let dlon_zone = 360.0 / nl(52.2572) as f64;
+        assert!(
+            !within_local_containment(
+                lat, lon + dlon_zone, 52.2572, 3.91937, nuc_p_rcu_m(7), 1.0, 700.0, 500.0, dist_m,
+            ),
+            "zone-wrapped local decode rejected (short elapsed)"
+        );
+        assert!(
+            !within_local_containment(
+                lat, lon + dlon_zone, 52.2572, 3.91937, nuc_p_rcu_m(7), 100_000.0, 700.0, 500.0, dist_m,
+            ),
+            "beyond-half-zone wrap rejected at any elapsed time"
+        );
+        // A modest displacement within the half-zone cap, given enough
+        // elapsed time for the motion budget, is accepted — the gate is
+        // motion-aware below the cap, not a flat cutoff.
+        let near_lon = lon + 0.05; // ~3.4 km east at 52°
+        let near_m = dist_m(lat, near_lon, 52.2572, 3.91937);
+        let enough_s = near_m / 700.0 + 1.0;
+        assert!(
+            within_local_containment(
+                lat, near_lon, 52.2572, 3.91937, nuc_p_rcu_m(7), enough_s, 700.0, 500.0, dist_m,
+            ),
+            "within-cap displacement accepted once motion budget covers it"
+        );
+    }
+
+    #[test]
+    fn pos_trust_ordering_and_tags() {
+        // Most-trusted sorts first (derived Ord on declaration order).
+        assert!(PosTrust::GlobalUnambiguous < PosTrust::LocalContained);
+        assert!(PosTrust::LocalContained < PosTrust::LocalReceiver);
+        assert_eq!(PosTrust::GlobalUnambiguous.as_str(), "global");
+        assert_eq!(PosTrust::LocalContained.as_str(), "local_contained");
+        assert_eq!(PosTrust::LocalReceiver.as_str(), "local_receiver");
     }
 
     #[test]
