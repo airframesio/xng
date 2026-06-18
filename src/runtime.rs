@@ -84,6 +84,8 @@ pub struct SessionConfig {
     pub receiver_pos: Option<(f64, f64)>,
     /// ACARS label filter applied before messages reach the bus.
     pub label_filter: LabelFilter,
+    /// AIS type/MMSI filter + rate downsample + content dedup (AIS-5h).
+    pub ais_filter: AisFilter,
     /// Demod effort: Max scans every timing grid (file analysis);
     /// Live trims to a real-time budget for embedded hardware.
     pub demod_effort: DemodEffort,
@@ -129,6 +131,103 @@ impl LabelFilter {
             return false;
         }
         !self.exclude.iter().any(|l| l == label)
+    }
+}
+
+/// Output-side AIS shaping (AIS-5h): keep/drop by message type and MMSI,
+/// rate-downsample dynamic position reports, and drop content-duplicate
+/// re-reports. Non-AIS messages always pass. The static keep/drop lives here
+/// (pure, testable); the time-stateful rate + dedup parts run in [`AisGate`].
+#[derive(Clone, Default)]
+pub struct AisFilter {
+    /// When non-empty, only these AIS message types pass.
+    pub include_types: Vec<u8>,
+    /// Types dropped even if included.
+    pub exclude_types: Vec<u8>,
+    /// When non-empty, only these MMSIs pass.
+    pub include_mmsi: Vec<u32>,
+    /// MMSIs dropped even if included.
+    pub exclude_mmsi: Vec<u32>,
+    /// Minimum seconds between dynamic position reports per MMSI; `None` off.
+    pub min_interval_s: Option<f64>,
+    /// Drop a `(mmsi, content)` that repeats within this many seconds; `None` off.
+    pub dedup_window_s: Option<f64>,
+}
+
+impl AisFilter {
+    /// Static keep/drop on message type + MMSI (include-then-exclude). Non-AIS
+    /// bodies always pass.
+    pub fn allows(&self, msg: &Message) -> bool {
+        let (mt, mmsi) = match &msg.body {
+            MessageBody::Ais { msg_type, mmsi, .. } => (*msg_type, *mmsi),
+            _ => return true,
+        };
+        if let Some(t) = mt {
+            if !self.include_types.is_empty() && !self.include_types.contains(&t) {
+                return false;
+            }
+            if self.exclude_types.contains(&t) {
+                return false;
+            }
+        }
+        if let Some(m) = mmsi {
+            if !self.include_mmsi.is_empty() && !self.include_mmsi.contains(&m) {
+                return false;
+            }
+            if self.exclude_mmsi.contains(&m) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Per-session time-stateful half of [`AisFilter`]: rate downsample + content
+/// dedup. Keyed on MMSI / decoded content so it generalizes to the cross-mode
+/// dedup (XM-5) later.
+#[derive(Default)]
+struct AisGate {
+    /// MMSI → time (s) of the last *kept* dynamic position report.
+    last_pos: std::collections::HashMap<u32, f64>,
+    /// content hash → time (s) last seen.
+    seen: std::collections::HashMap<u64, f64>,
+}
+
+impl AisGate {
+    /// True to keep `msg`; `now` is the message time in seconds. Applies the
+    /// rate downsample (dynamic position-report types) and content dedup from
+    /// `cfg`. Non-AIS messages always pass.
+    fn pass(&mut self, msg: &Message, cfg: &AisFilter, now: f64) -> bool {
+        let MessageBody::Ais { msg_type, mmsi, details, .. } = &msg.body else {
+            return true;
+        };
+        // Rate downsample: thin frequent dynamic position reports per vessel.
+        if let (Some(min), Some(m)) = (cfg.min_interval_s, *mmsi) {
+            if matches!(msg_type, Some(1 | 2 | 3 | 18 | 19 | 27)) {
+                if let Some(&last) = self.last_pos.get(&m) {
+                    if now - last < min {
+                        return false;
+                    }
+                }
+                self.last_pos.insert(m, now);
+            }
+        }
+        // Content dedup: collapse identical (mmsi, type, decoded content)
+        // within the window (multi-receiver echoes, repeated static reports).
+        if let Some(win) = cfg.dedup_window_s {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            mmsi.hash(&mut h);
+            msg_type.hash(&mut h);
+            details.as_ref().map(|d| d.to_string()).unwrap_or_default().hash(&mut h);
+            let key = h.finish();
+            self.seen.retain(|_, t| now - *t < win);
+            if self.seen.get(&key).is_some_and(|&t| now - t < win) {
+                return false;
+            }
+            self.seen.insert(key, now);
+        }
+        true
     }
 }
 
@@ -863,6 +962,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                         Some((live, capture_center, sample_rate)),
                         Some(&mut reasm),
                         cfg.label_filter,
+                        cfg.ais_filter,
                     )
                 }
             }
@@ -898,6 +998,7 @@ pub(crate) fn decode_loop(
     live: Option<(Arc<LiveState>, u64, f64)>,
     mut reasm: Option<&mut (xng_acars::reasm::Reassembler, xng_acars::miam::FileReassembler)>,
     label_filter: LabelFilter,
+    ais_filter: AisFilter,
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
     use std::sync::atomic::Ordering as AtomOrd;
     let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
@@ -906,6 +1007,7 @@ pub(crate) fn decode_loop(
     let mut stats: Vec<(u64, u64, u64)> = decoders.iter().map(|(f, _)| (*f, 0, 0)).collect();
     let mut consecutive_errors: u32 = 0;
     let mut dedup = DedupFilter::new();
+    let mut ais_gate = AisGate::default();
 
     while !stop.load(Ordering::Relaxed) {
         let n = match source.read(&mut buf) {
@@ -987,6 +1089,17 @@ pub(crate) fn decode_loop(
                 // satellite(s) overhead (no-op unless init_aprs ran).
                 crate::satmap::enrich_aprs(&mut msg);
                 if !label_filter.allows(&msg) {
+                    continue;
+                }
+                // AIS output shaping (AIS-5h): type/MMSI filter, then rate
+                // downsample + content dedup keyed on the message time.
+                if !ais_filter.allows(&msg)
+                    || !ais_gate.pass(
+                        &msg,
+                        &ais_filter,
+                        msg.timestamp.timestamp_millis() as f64 / 1e3,
+                    )
+                {
                     continue;
                 }
                 if let (Some((state, _, _)), xng_types::MessageBody::Acars(a)) =
@@ -1115,6 +1228,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                     live,
                     Some(&mut reasm),
                     prep.cfg.label_filter.clone(),
+                    prep.cfg.ais_filter.clone(),
                 )
             }));
         }
@@ -1278,6 +1392,70 @@ mod tests {
                 channel: None,
             },
         }
+    }
+
+    fn ais_msg(msg_type: u8, mmsi: u32, details: Option<serde_json::Value>, ts_s: i64) -> Message {
+        Message {
+            mode: Mode::Ais,
+            timestamp: chrono::DateTime::from_timestamp(ts_s, 0).unwrap(),
+            frequency_hz: 161_975_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: xng_types::MessageBody::Ais {
+                nmea: vec![],
+                msg_type: Some(msg_type),
+                mmsi: Some(mmsi),
+                details,
+            },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("XX-TEST"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn ais_filter_type_and_mmsi_keep_drop() {
+        // Include types 1 & 5 → type 3 dropped; non-AIS always passes.
+        let f = AisFilter { include_types: vec![1, 5], ..Default::default() };
+        assert!(f.allows(&ais_msg(1, 100, None, 0)));
+        assert!(!f.allows(&ais_msg(3, 100, None, 0)));
+        assert!(f.allows(&acars_msg("H1")));
+        // Exclude one MMSI.
+        let f2 = AisFilter { exclude_mmsi: vec![999], ..Default::default() };
+        assert!(!f2.allows(&ais_msg(1, 999, None, 0)));
+        assert!(f2.allows(&ais_msg(1, 100, None, 0)));
+    }
+
+    #[test]
+    fn ais_gate_rate_downsamples_dynamic_reports() {
+        let cfg = AisFilter { min_interval_s: Some(10.0), ..Default::default() };
+        let mut g = AisGate::default();
+        // Type-1 from MMSI 7: first kept, +5 s dropped, +12 s kept (from last kept).
+        assert!(g.pass(&ais_msg(1, 7, None, 1000), &cfg, 1000.0));
+        assert!(!g.pass(&ais_msg(1, 7, None, 1005), &cfg, 1005.0));
+        assert!(g.pass(&ais_msg(1, 7, None, 1012), &cfg, 1012.0));
+        // A different MMSI is independent; static type 5 is never throttled.
+        assert!(g.pass(&ais_msg(1, 8, None, 1005), &cfg, 1005.0));
+        assert!(g.pass(&ais_msg(5, 7, None, 1006), &cfg, 1006.0));
+        assert!(g.pass(&ais_msg(5, 7, None, 1007), &cfg, 1007.0));
+    }
+
+    #[test]
+    fn ais_gate_content_dedup_collapses_repeats() {
+        let cfg = AisFilter { dedup_window_s: Some(10.0), ..Default::default() };
+        let mut g = AisGate::default();
+        let same = || Some(serde_json::json!({ "lat": 1.0, "lon": 2.0 }));
+        // Identical content within the window → second dropped.
+        assert!(g.pass(&ais_msg(1, 7, same(), 1000), &cfg, 1000.0));
+        assert!(!g.pass(&ais_msg(1, 7, same(), 1003), &cfg, 1003.0));
+        // Different content from the same MMSI is kept.
+        assert!(g.pass(&ais_msg(1, 7, Some(serde_json::json!({ "lat": 9.0 })), 1004), &cfg, 1004.0));
+        // Past the window, the original content is allowed again.
+        assert!(g.pass(&ais_msg(1, 7, same(), 1011), &cfg, 1011.0));
     }
 
     #[test]

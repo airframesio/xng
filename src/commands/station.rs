@@ -150,6 +150,19 @@ pub struct SessionToml {
     pub demod_effort: Option<String>,
     /// VDL2 only: reject bursts whose carrier offset exceeds this many ppm.
     pub max_ppm: Option<f64>,
+    /// AIS output shaping (AIS-5h) — empty/None = pass everything.
+    #[serde(default)]
+    pub ais_include_types: Vec<u8>,
+    #[serde(default)]
+    pub ais_exclude_types: Vec<u8>,
+    #[serde(default)]
+    pub ais_include_mmsi: Vec<u32>,
+    #[serde(default)]
+    pub ais_exclude_mmsi: Vec<u32>,
+    /// Minimum seconds between dynamic AIS position reports per MMSI.
+    pub ais_min_interval: Option<f64>,
+    /// Drop content-duplicate AIS reports within this many seconds.
+    pub ais_dedup_window: Option<f64>,
     /// Disable Airframes feeding for this decoder even when feeding is on
     /// globally.
     pub feed: Option<bool>,

@@ -64,6 +64,7 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
                 Some((live, capture_center, sample_rate)),
                 Some(&mut reasm),
                 label_filter,
+                Default::default(),
             )
         }
     });

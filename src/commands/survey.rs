@@ -453,6 +453,7 @@ fn dwell(
         sdr: None,
         receiver_pos: None,
         label_filter: Default::default(),
+        ais_filter: Default::default(),
         demod_effort: runtime::DemodEffort::Live,
         max_ppm: None,
         outputs: runtime::OutputConfig {
@@ -499,6 +500,7 @@ fn dwell(
         stop,
         Some((live.clone(), center, rate)),
         None,
+        Default::default(),
         Default::default(),
     )?;
     let _ = stop_thread.join();
