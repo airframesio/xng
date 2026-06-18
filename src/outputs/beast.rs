@@ -76,6 +76,11 @@ pub fn format_beast(msg: &Message) -> Vec<Vec<u8>> {
                 fix.lon,
                 fix.altitude_ft,
                 fix.callsign.as_deref(),
+                // Only a true ground speed synthesizes a TC19 ground-velocity
+                // frame; an airspeed-only fix has no ground vector to encode.
+                if fix.speed_is_airspeed { None } else { fix.speed_kt },
+                fix.track_deg,
+                fix.vertical_rate_fpm,
             )
             .iter()
             .filter_map(|f| wrap_beast(f, ticks, sig))
@@ -219,6 +224,7 @@ mod tests {
                 details: serde_json::json!({
                     "address": "a1b2c3", "callsign": "N12345",
                     "geometric_altitude": 9500, "lat": 37.6189, "lon": -122.3750,
+                    "ground_speed": 142.0, "true_track": 271.0, "vertical_rate": -640,
                 }),
             },
             raw: None,
@@ -230,7 +236,8 @@ mod tests {
             },
         };
         let frames = format_beast(&msg);
-        assert_eq!(frames.len(), 3, "even + odd position + ident");
+        // even + odd position + ident + velocity (ground speed/track present).
+        assert_eq!(frames.len(), 4, "{} frames", frames.len());
         for f in &frames {
             assert_eq!(f[0], 0x1a);
             assert_eq!(f[1], b'3', "long (DF17) frame");

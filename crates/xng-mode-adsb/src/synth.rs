@@ -103,15 +103,53 @@ pub fn identification(icao: u32, callsign: &str) -> [u8; 14] {
     df17(icao, me)
 }
 
-/// All synthesizable frames for an aircraft fix: the position pair, plus an
-/// identification frame when a callsign is present. Returns empty when there is
-/// no position to convey (a synthesized ES with no payload is pointless).
+/// The airborne-velocity frame (DF17 TC19 subtype 1, ground speed) from a
+/// ground speed (kt) + true track (deg) and optional vertical rate (fpm).
+/// Inverse of [`crate::decode::velocity`]'s subtype-1 path.
+pub fn velocity_frame(icao: u32, gs_kt: f64, track_deg: f64, vrate_fpm: Option<i32>) -> [u8; 14] {
+    let tr = track_deg.to_radians();
+    let vx = gs_kt * tr.sin(); // east
+    let vy = gs_kt * tr.cos(); // north
+    let (s_ew, v_ew) = ((vx < 0.0) as u64, (vx.abs().round() as u64 + 1).min(1023));
+    let (s_ns, v_ns) = ((vy < 0.0) as u64, (vy.abs().round() as u64 + 1).min(1023));
+    let (svr, vr) = match vrate_fpm {
+        Some(r) => ((r < 0) as u64, ((r.abs() as f64 / 64.0).round() as u64 + 1).min(511)),
+        None => (0, 0),
+    };
+    // ME (56b): TC(5)=19 · ST(3)=1 · IC(1) · RESV(1) · NACv(3) · Dew(1) ·
+    //   Vew(10) · Dns(1) · Vns(10) · VrSrc(1)=GNSS · Svr(1) · VR(9) · RESV(2) ·
+    //   Sdif(1) · Ddif(7)
+    let mut me: u64 = 19;
+    me = (me << 3) | 1; // subtype 1 (subsonic ground speed)
+    me = (me << 1) | 0; // intent change
+    me = (me << 1) | 0; // reserved (IFR)
+    me = (me << 3) | 0; // NACv
+    me = (me << 1) | s_ew;
+    me = (me << 10) | v_ew;
+    me = (me << 1) | s_ns;
+    me = (me << 10) | v_ns;
+    me = (me << 1) | 0; // vertical-rate source = GNSS
+    me = (me << 1) | svr;
+    me = (me << 9) | vr;
+    me = (me << 2) | 0; // reserved
+    me = (me << 1) | 0; // GNSS-baro sign
+    me = (me << 7) | 0; // GNSS-baro difference
+    df17(icao, me)
+}
+
+/// All synthesizable frames for an aircraft fix: the position pair, a callsign
+/// frame when present, and a velocity frame when a ground speed + track are
+/// present. Returns empty when there is no position to convey (a synthesized ES
+/// with no payload is pointless).
 pub fn synth_frames(
     icao: u32,
     lat: Option<f64>,
     lon: Option<f64>,
     alt_ft: Option<i32>,
     callsign: Option<&str>,
+    gs_kt: Option<f64>,
+    track_deg: Option<f64>,
+    vrate_fpm: Option<i32>,
 ) -> Vec<[u8; 14]> {
     let mut out = Vec::new();
     if let (Some(la), Some(lo)) = (lat, lon) {
@@ -122,6 +160,9 @@ pub fn synth_frames(
         if !cs.is_empty() {
             out.push(identification(icao, cs));
         }
+    }
+    if let (Some(gs), Some(tr)) = (gs_kt, track_deg) {
+        out.push(velocity_frame(icao, gs, tr, vrate_fpm));
     }
     out
 }
@@ -188,11 +229,48 @@ mod tests {
         assert_eq!(cs.trim_end(), "KLM1023");
     }
 
+    // Read a 56-bit ME field's `velocity` back through the real decoder.
+    fn velocity_of(f: &[u8; 14]) -> crate::decode::Velocity {
+        crate::decode::velocity(&f[4..11]).expect("subtype-1 velocity")
+    }
+
     #[test]
-    fn synth_frames_emits_pair_plus_ident() {
-        let v = synth_frames(0x40621D, Some(52.2), Some(3.9), Some(35000), Some("TEST123"));
-        assert_eq!(v.len(), 3, "even + odd + ident");
+    fn velocity_round_trips_through_decoder() {
+        // Due west at 420 kt, descending 1024 fpm.
+        let f = velocity_frame(0x40621D, 420.0, 270.0, Some(-1024));
+        assert!(crc_clean(&f), "parity clean");
+        assert_eq!(f[4] >> 3, 19, "TC19");
+        let v = velocity_of(&f);
+        assert!(!v.airspeed, "ground speed, not airspeed");
+        assert!((v.speed_kt - 420.0).abs() < 1.0, "speed {}", v.speed_kt);
+        assert!((v.track_deg - 270.0).abs() < 0.5, "track {}", v.track_deg);
+        assert_eq!(v.vertical_rate_fpm, Some(-1024), "vrate");
+
+        // A north-east climb exercises the other quadrant + positive vrate.
+        let v2 = velocity_of(&velocity_frame(0x40621D, 300.0, 45.0, Some(1472)));
+        assert!((v2.speed_kt - 300.0).abs() < 1.0, "speed {}", v2.speed_kt);
+        assert!((v2.track_deg - 45.0).abs() < 0.5, "track {}", v2.track_deg);
+        assert_eq!(v2.vertical_rate_fpm, Some(1472), "vrate");
+    }
+
+    #[test]
+    fn synth_frames_emits_pair_plus_ident_plus_velocity() {
+        // Position + callsign + ground speed/track → even, odd, ident, velocity.
+        let v = synth_frames(
+            0x40621D,
+            Some(52.2),
+            Some(3.9),
+            Some(35000),
+            Some("TEST123"),
+            Some(450.0),
+            Some(90.0),
+            Some(0),
+        );
+        assert_eq!(v.len(), 4, "even + odd + ident + velocity");
+        // Position only (no callsign, no velocity) → just the even/odd pair.
+        let p = synth_frames(0x40621D, Some(52.2), Some(3.9), None, None, None, None, None);
+        assert_eq!(p.len(), 2, "even + odd");
         // No position → nothing (a payload-less ES is pointless).
-        assert!(synth_frames(0x40621D, None, None, Some(35000), None).is_empty());
+        assert!(synth_frames(0x40621D, None, None, Some(35000), None, None, None, None).is_empty());
     }
 }
