@@ -28,6 +28,9 @@ pub static STAT_BURST_OK: AtomicUsize = AtomicUsize::new(0);
 use xng_dsp::rs::ReedSolomon;
 
 pub const SYMBOL_RATE: f64 = 10_500.0;
+/// Representative VDL2 carrier (band 136.7–137.0 MHz) for converting a
+/// measured CFO in Hz to ppm — exact channel doesn't matter at ppm scale.
+const VDL2_BAND_HZ: f64 = 136_975_000.0;
 
 /// Unique word as Δφ multiples of π/4 (Annex 10 §6.4.3.1.1.2).
 pub(crate) const UW_DELTAS: [u8; 16] = [0, 3, 2, 4, 0, 1, 6, 4, 1, 7, 2, 5, 6, 5, 7, 3];
@@ -62,8 +65,12 @@ struct Collecting {
     uw_start: f64,
     /// Absolute sample position of the next symbol center.
     next_pos: f64,
-    /// Per-symbol carrier rotation estimate (radians).
+    /// Per-symbol carrier rotation estimate (radians); PLL-tracked during
+    /// collection.
     theta: f32,
+    /// The initial preamble-fit carrier-rotation estimate (rad/symbol),
+    /// preserved (unlike `theta`, which drifts) for the burst's freq skew.
+    cfo: f32,
     prev: Complex<f32>,
     /// Descrambled bits collected so far.
     bits: Vec<u8>,
@@ -95,12 +102,17 @@ pub struct Vdl2Demod {
     noise: f32,
     state: State,
     level: f32,
+    /// Optional CFO reject: candidates whose preamble-fit carrier offset
+    /// exceeds this many ppm (relative to the VDL2 band) are skipped (VDL2-7).
+    max_ppm: Option<f64>,
 }
 
 /// A demodulated, descrambled, RS-corrected burst: the AVLC bit stream.
 pub struct Burst {
     pub bits: Vec<u8>,
     pub rs_corrected: usize,
+    /// Carrier frequency offset (Hz) measured from the preamble fit (VDL2-7).
+    pub freq_skew_hz: f32,
 }
 
 impl Vdl2Demod {
@@ -114,7 +126,14 @@ impl Vdl2Demod {
             state: State::Hunt,
             last_rs_fail: f64::NEG_INFINITY,
             level: 0.0,
+            max_ppm: None,
         }
+    }
+
+    /// Set the CFO reject threshold (ppm relative to the VDL2 band); `None`
+    /// disables it (the default — every CFO-fit candidate is accepted).
+    pub fn set_max_ppm(&mut self, ppm: Option<f64>) {
+        self.max_ppm = ppm;
     }
 
     /// Linear interpolation at an absolute sample position.
@@ -278,6 +297,17 @@ impl Vdl2Demod {
                     // wasted work, never a lost burst.
                     if let Some((p, th, cost)) = self.preamble_fit(pos) {
                         if cost < FIT_COST_MAX {
+                            // CFO reject (VDL2-7): `th` is the per-symbol
+                            // carrier rotation (rad/symbol); convert to a ppm
+                            // offset against the ~137 MHz band and skip bursts
+                            // beyond the limit, continuing the hunt.
+                            if let Some(max) = self.max_ppm {
+                                let cfo_hz = th as f64 * SYMBOL_RATE / std::f64::consts::TAU;
+                                let ppm = cfo_hz.abs() / VDL2_BAND_HZ * 1e6;
+                                if ppm > max {
+                                    continue;
+                                }
+                            }
                             STAT_FIT_PASS.fetch_add(1, AOrd::Relaxed);
                             return Some((p, th));
                         }
@@ -352,6 +382,7 @@ impl Vdl2Demod {
                             uw_start: uw_pos,
                             next_pos: last_uw + self.sps,
                             theta,
+                            cfo: theta, // preamble-fit CFO, kept undrifted
                             prev,
                             bits: Vec::new(),
                             conf: Vec::new(),
@@ -390,7 +421,9 @@ impl Vdl2Demod {
                                 if soft {
                                     STAT_SOFT_OK.fetch_add(1, AOrd::Relaxed);
                                 }
-                                out.push(Burst { bits: avlc_bits, rs_corrected: fixed });
+                                let freq_skew_hz =
+                                    (c.cfo as f64 * SYMBOL_RATE / std::f64::consts::TAU) as f32;
+                                out.push(Burst { bits: avlc_bits, rs_corrected: fixed, freq_skew_hz });
                                 // An erasure-assisted pass may be a
                                 // miscorrection (the AVLC FCS arbitrates);
                                 // never let it swallow a later burst —

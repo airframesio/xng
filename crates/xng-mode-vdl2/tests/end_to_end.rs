@@ -80,6 +80,48 @@ fn decodes_burst_at_channel_rate() {
     assert!(frames[1].acars.is_none());
 }
 
+// VDL2-7: the burst's measured carrier offset tracks an injected CFO (the
+// injected value is independent ground truth, not a decode loopback).
+#[test]
+fn freq_skew_tracks_injected_cfo() {
+    for cfo in [150.0_f64, -250.0, 400.0] {
+        let iq_burst = burst_iq(&[aoa_frame()], 50_000.0, cfo, 0.5);
+        let mut iq = vec![Complex::new(0.0, 0.0); 800];
+        iq.extend(iq_burst);
+        iq.extend(vec![Complex::new(0.0, 0.0); 30_000]);
+        let mut dec = Vdl2ChannelDecoder::new(50_000.0, 0.0).unwrap();
+        let mut frames = Vec::new();
+        for chunk in iq.chunks(1024) {
+            frames.extend(dec.process(chunk));
+        }
+        assert!(!frames.is_empty(), "decoded at cfo={cfo}");
+        let skew = frames[0].freq_skew_hz as f64;
+        assert!((skew - cfo).abs() < 40.0, "freq_skew {skew} Hz vs injected {cfo} Hz");
+    }
+}
+
+// VDL2-7: an aggressive --max-ppm reject drops a far-off-frequency burst,
+// while a generous limit keeps it (and zero-CFO bursts always pass).
+#[test]
+fn max_ppm_rejects_far_off_frequency_bursts() {
+    // 400 Hz / 137 MHz ≈ 2.9 ppm. A 1 ppm gate rejects it; 10 ppm keeps it.
+    let decode_with = |max_ppm: Option<f64>| -> usize {
+        let mut iq = vec![Complex::new(0.0, 0.0); 800];
+        iq.extend(burst_iq(&[aoa_frame()], 50_000.0, 400.0, 0.5));
+        iq.extend(vec![Complex::new(0.0, 0.0); 30_000]);
+        let mut dec = Vdl2ChannelDecoder::new(50_000.0, 0.0).unwrap();
+        dec.set_max_ppm(max_ppm);
+        let mut n = 0;
+        for chunk in iq.chunks(1024) {
+            n += dec.process(chunk).len();
+        }
+        n
+    };
+    assert!(decode_with(None) >= 1, "no gate → decodes");
+    assert!(decode_with(Some(10.0)) >= 1, "generous gate → decodes");
+    assert_eq!(decode_with(Some(1.0)), 0, "tight gate → rejected");
+}
+
 #[test]
 fn decodes_from_wideband_capture_with_cfo() {
     // 2.4 MS/s capture centered at 136.900 MHz; VDL2 CSC at 136.975

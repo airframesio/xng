@@ -87,6 +87,8 @@ pub struct SessionConfig {
     /// Demod effort: Max scans every timing grid (file analysis);
     /// Live trims to a real-time budget for embedded hardware.
     pub demod_effort: DemodEffort,
+    /// VDL2 CFO reject (ppm); `None` disables it (VDL2-7).
+    pub max_ppm: Option<f64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -213,6 +215,7 @@ impl ModeChannel {
         offset: f64,
         freq: u64,
         effort: DemodEffort,
+        max_ppm: Option<f64>,
     ) -> Result<Self, String> {
         match mode {
             Mode::AcarsPoa => Ok(Self::Acars(AcarsChannelDecoder::new(sample_rate, offset)?)),
@@ -221,7 +224,11 @@ impl ModeChannel {
                 d.set_max_effort(effort == DemodEffort::Max);
                 Ok(Self::Ais(d))
             }
-            Mode::Vdl2 => Ok(Self::Vdl2(Vdl2ChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Vdl2 => {
+                let mut d = Vdl2ChannelDecoder::new(sample_rate, offset)?;
+                d.set_max_ppm(max_ppm);
+                Ok(Self::Vdl2(d))
+            }
             Mode::AeroL => Ok(Self::Aero(AeroChannelDecoder::new(sample_rate, offset)?)),
             Mode::AeroC => Ok(Self::AeroBurst(AeroBurstDecoder::new(sample_rate, offset)?)),
             Mode::StdC => Ok(Self::StdC(StdcChannelDecoder::new(sample_rate, offset)?)),
@@ -785,7 +792,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 sample_rate
             );
         }
-        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort, cfg.max_ppm)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
         if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
             d.set_receiver_position(lat, lon);
@@ -1028,7 +1035,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                 );
             }
             let mut dec =
-                ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
+                ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort, cfg.max_ppm)
                     .map_err(|e| anyhow::anyhow!("[{}] {:.3} MHz: {e}", cfg.mode, freq as f64 / 1e6))?;
             if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
                 d.set_receiver_position(lat, lon);
@@ -1238,7 +1245,7 @@ pub(crate) fn build_decoders(
                 freq as f64 / 1e6
             );
         }
-        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort, cfg.max_ppm)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
         if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
             d.set_receiver_position(lat, lon);

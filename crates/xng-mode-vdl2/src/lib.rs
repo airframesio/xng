@@ -38,6 +38,8 @@ pub struct Vdl2Frame {
     /// Decoded ATN transport (X.25 packet, CLNP/COTP) for I-frames.
     pub atn: Option<serde_json::Value>,
     pub rs_corrected: usize,
+    /// Carrier frequency offset (Hz) measured from the burst preamble (VDL2-7).
+    pub freq_skew_hz: f32,
 }
 
 pub struct Vdl2ChannelDecoder {
@@ -145,7 +147,13 @@ impl Vdl2ChannelDecoder {
                 } else {
                     None
                 };
-                out.push(Vdl2Frame { avlc: frame, acars, atn, rs_corrected: burst.rs_corrected });
+                out.push(Vdl2Frame {
+                    avlc: frame,
+                    acars,
+                    atn,
+                    rs_corrected: burst.rs_corrected,
+                    freq_skew_hz: burst.freq_skew_hz,
+                });
             }
         }
         out
@@ -153,6 +161,12 @@ impl Vdl2ChannelDecoder {
 
     pub fn level_dbfs(&self) -> f32 {
         self.demod.level_dbfs()
+    }
+
+    /// Reject bursts whose carrier offset exceeds `ppm` (VDL2-7); `None`
+    /// (default) accepts every CFO-fit candidate.
+    pub fn set_max_ppm(&mut self, ppm: Option<f64>) {
+        self.demod.set_max_ppm(ppm);
     }
 }
 
@@ -273,7 +287,11 @@ pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Pro
         mode: Mode::Vdl2,
         timestamp: Utc::now(),
         frequency_hz,
-        signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
+        signal: SignalQuality {
+            rssi_db: Some(level_dbfs),
+            freq_skew_hz: Some(f.freq_skew_hz),
+            ..Default::default()
+        },
         decode: DecodeQuality {
             crc_ok,
             fec_corrected: Some(f.rs_corrected as u32),

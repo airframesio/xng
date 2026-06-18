@@ -72,6 +72,9 @@ struct TuneOpts {
     /// commands; matters on Pi-class hardware)
     #[arg(long)]
     demod_effort: Option<runtime::DemodEffort>,
+    /// VDL2 only: reject bursts whose carrier offset exceeds this many ppm
+    #[arg(long)]
+    max_ppm: Option<f64>,
 }
 
 fn parse_receiver_pos(s: &Option<String>) -> anyhow::Result<Option<(f64, f64)>> {
@@ -630,6 +633,7 @@ fn main() -> anyhow::Result<()> {
                         exclude: tune.exclude_labels.clone(),
                     },
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Max),
+                    max_ppm: tune.max_ppm,
                 },
             )
         }
@@ -736,6 +740,7 @@ fn main() -> anyhow::Result<()> {
                         exclude: tune.exclude_labels.clone(),
                     },
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
+                    max_ppm: tune.max_ppm,
                     outputs: runtime::OutputConfig {
                         console: ConsoleFormat::Pretty,
                         jsonl: None,
@@ -842,6 +847,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
                 .map(str::parse)
                 .transpose()
                 .map_err(|e: String| anyhow::anyhow!("{label}: {e}"))?,
+            max_ppm: sess.max_ppm,
         };
         let (mode, rate, center_hz, channels) = if tune.sample_rate.is_some()
             && tune.center_freq.is_some()
@@ -898,6 +904,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
                 receiver_pos: parse_receiver_pos(&sess.receiver_pos)?,
                 label_filter: Default::default(),
                 demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
+                max_ppm: tune.max_ppm,
             },
         ));
     }
@@ -1122,6 +1129,7 @@ fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) ->
                         exclude: tune.exclude_labels.clone(),
                     },
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
+                    max_ppm: tune.max_ppm,
         },
     )
 }

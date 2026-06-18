@@ -148,6 +148,8 @@ pub struct SessionToml {
     pub channels: Vec<String>,
     pub receiver_pos: Option<String>,
     pub demod_effort: Option<String>,
+    /// VDL2 only: reject bursts whose carrier offset exceeds this many ppm.
+    pub max_ppm: Option<f64>,
     /// Disable Airframes feeding for this decoder even when feeding is on
     /// globally.
     pub feed: Option<bool>,

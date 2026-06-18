@@ -454,6 +454,7 @@ fn dwell(
         receiver_pos: None,
         label_filter: Default::default(),
         demod_effort: runtime::DemodEffort::Live,
+        max_ppm: None,
         outputs: runtime::OutputConfig {
             console: ConsoleFormat::Pretty,
             jsonl: None,
