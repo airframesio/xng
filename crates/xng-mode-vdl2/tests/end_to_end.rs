@@ -100,6 +100,31 @@ fn freq_skew_tracks_injected_cfo() {
     }
 }
 
+// VDL2-8: the EVM-derived per-burst SNR (from the symbol decision residuals)
+// is finite and falls when more noise is mixed into the same burst.
+#[test]
+fn evm_snr_drops_with_more_noise() {
+    let snr_at = |amp: f32| -> Option<f32> {
+        let mut iq = vec![Complex::new(0.0, 0.0); 800];
+        iq.extend(burst_iq(&[aoa_frame()], 50_000.0, 0.0, 0.5));
+        iq.extend(vec![Complex::new(0.0, 0.0); 30_000]);
+        let mut noise = Noise(0x51b3_2c9f_a7e1_0d44);
+        for s in &mut iq {
+            *s += Complex::new(noise.next() * amp, noise.next() * amp);
+        }
+        let mut dec = Vdl2ChannelDecoder::new(50_000.0, 0.0).unwrap();
+        let mut frames = Vec::new();
+        for chunk in iq.chunks(1024) {
+            frames.extend(dec.process(chunk));
+        }
+        frames.first().map(|f| f.snr_db)
+    };
+    let clean = snr_at(0.01).expect("decodes at low noise");
+    let noisy = snr_at(0.06).expect("decodes at higher noise");
+    assert!(clean.is_finite() && noisy.is_finite(), "clean {clean} noisy {noisy}");
+    assert!(noisy < clean, "more noise → lower EVM SNR: {noisy} vs {clean}");
+}
+
 // VDL2-7: an aggressive --max-ppm reject drops a far-off-frequency burst,
 // while a generous limit keeps it (and zero-CFO bursts always pass).
 #[test]

@@ -113,6 +113,8 @@ pub struct Burst {
     pub rs_corrected: usize,
     /// Carrier frequency offset (Hz) measured from the preamble fit (VDL2-7).
     pub freq_skew_hz: f32,
+    /// EVM-derived per-burst SNR (dB) from the symbol decision residuals (VDL2-8).
+    pub snr_db: f32,
 }
 
 impl Vdl2Demod {
@@ -423,7 +425,12 @@ impl Vdl2Demod {
                                 }
                                 let freq_skew_hz =
                                     (c.cfo as f64 * SYMBOL_RATE / std::f64::consts::TAU) as f32;
-                                out.push(Burst { bits: avlc_bits, rs_corrected: fixed, freq_skew_hz });
+                                out.push(Burst {
+                                    bits: avlc_bits,
+                                    rs_corrected: fixed,
+                                    freq_skew_hz,
+                                    snr_db: evm_snr_db(&c.conf),
+                                });
                                 // An erasure-assisted pass may be a
                                 // miscorrection (the AVLC FCS arbitrates);
                                 // never let it swallow a later burst —
@@ -503,4 +510,15 @@ impl Vdl2Demod {
     pub fn level_dbfs(&self) -> f32 {
         10.0 * self.level.max(1e-12).log10()
     }
+}
+
+/// EVM-derived SNR (dB) from the per-symbol phase-decision residuals (radians)
+/// accumulated during a burst: `snr ≈ 1 / EVM²`, with `EVM² = mean(residual²)`
+/// (small-angle PSK). A pure quality metric — higher means cleaner symbols.
+fn evm_snr_db(residuals: &[f32]) -> f32 {
+    if residuals.is_empty() {
+        return 0.0;
+    }
+    let evm2 = residuals.iter().map(|r| r * r).sum::<f32>() / residuals.len() as f32;
+    -10.0 * evm2.max(1e-9).log10()
 }

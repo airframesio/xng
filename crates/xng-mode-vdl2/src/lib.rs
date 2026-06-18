@@ -40,6 +40,8 @@ pub struct Vdl2Frame {
     pub rs_corrected: usize,
     /// Carrier frequency offset (Hz) measured from the burst preamble (VDL2-7).
     pub freq_skew_hz: f32,
+    /// EVM-derived per-burst SNR (dB) from the symbol decision residuals (VDL2-8).
+    pub snr_db: f32,
 }
 
 pub struct Vdl2ChannelDecoder {
@@ -153,6 +155,7 @@ impl Vdl2ChannelDecoder {
                     atn,
                     rs_corrected: burst.rs_corrected,
                     freq_skew_hz: burst.freq_skew_hz,
+                    snr_db: burst.snr_db,
                 });
             }
         }
@@ -289,6 +292,7 @@ pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Pro
         frequency_hz,
         signal: SignalQuality {
             rssi_db: Some(level_dbfs),
+            snr_db: Some(f.snr_db),
             freq_skew_hz: Some(f.freq_skew_hz),
             ..Default::default()
         },
