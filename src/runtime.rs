@@ -195,6 +195,8 @@ struct AisGate {
     last_pos: std::collections::HashMap<u32, f64>,
     /// content hash → time (s) last seen.
     seen: std::collections::HashMap<u64, f64>,
+    /// Messages since the last `seen` sweep, for amortized stale-entry pruning.
+    sweeps: u32,
 }
 
 impl AisGate {
@@ -202,20 +204,27 @@ impl AisGate {
     /// rate downsample (dynamic position-report types) and content dedup from
     /// `cfg`. Non-AIS messages always pass.
     fn pass(&mut self, msg: &Message, cfg: &AisFilter, now: f64) -> bool {
+        /// Prune stale `seen` entries every N gated messages rather than on
+        /// every one — the lookup already treats expired entries as absent, so
+        /// `retain` is only for memory reclamation, not correctness.
+        const SWEEP_EVERY: u32 = 256;
         let MessageBody::Ais { msg_type, mmsi, details, .. } = &msg.body else {
             return true;
         };
         // Rate downsample: thin frequent dynamic position reports per vessel.
-        if let (Some(min), Some(m)) = (cfg.min_interval_s, *mmsi) {
-            if matches!(msg_type, Some(1 | 2 | 3 | 18 | 19 | 27)) {
-                if let Some(&last) = self.last_pos.get(&m) {
-                    if now - last < min {
-                        return false;
-                    }
+        // Decide here, but DON'T advance the per-MMSI clock yet — a message
+        // dropped by the dedup stage below was never emitted, so it must not
+        // reset the rate window (else a genuinely new fix arriving shortly
+        // after a dedup-dropped duplicate would be wrongly throttled).
+        let rate_mmsi = match (cfg.min_interval_s, *mmsi) {
+            (Some(min), Some(m)) if matches!(msg_type, Some(1 | 2 | 3 | 18 | 19 | 27)) => {
+                if self.last_pos.get(&m).is_some_and(|&last| now - last < min) {
+                    return false;
                 }
-                self.last_pos.insert(m, now);
+                Some(m)
             }
-        }
+            _ => None,
+        };
         // Content dedup: collapse identical (mmsi, type, decoded content)
         // within the window (multi-receiver echoes, repeated static reports).
         if let Some(win) = cfg.dedup_window_s {
@@ -225,11 +234,19 @@ impl AisGate {
             msg_type.hash(&mut h);
             details.as_ref().map(|d| d.to_string()).unwrap_or_default().hash(&mut h);
             let key = h.finish();
-            self.seen.retain(|_, t| now - *t < win);
             if self.seen.get(&key).is_some_and(|&t| now - t < win) {
                 return false;
             }
             self.seen.insert(key, now);
+            self.sweeps += 1;
+            if self.sweeps >= SWEEP_EVERY {
+                self.sweeps = 0;
+                self.seen.retain(|_, t| now - *t < win);
+            }
+        }
+        // Both gates passed → record the kept position for the rate window.
+        if let Some(m) = rate_mmsi {
+            self.last_pos.insert(m, now);
         }
         true
     }
@@ -1123,7 +1140,13 @@ pub(crate) fn decode_loop(
                 if let (Some((state, _, _)), xng_types::MessageBody::Acars(a)) =
                     (&live, &msg.body)
                 {
-                    state.record_acars_label(*freq, &a.label);
+                    // ACARS-5.2 per-label tally — CRC-valid frames only. A
+                    // bad-CRC frame carries a garbled 2-byte label (raw 7-bit
+                    // bytes); tallying it would spawn an unbounded set of junk
+                    // `label="…"` series and blow up Prometheus cardinality.
+                    if msg.decode.crc_ok {
+                        state.record_acars_label(*freq, &a.label);
+                    }
                 }
                 bus.publish(msg);
             }
@@ -1540,6 +1563,28 @@ mod tests {
         assert!(g.pass(&ais_msg(1, 7, Some(serde_json::json!({ "lat": 9.0 })), 1004), &cfg, 1004.0));
         // Past the window, the original content is allowed again.
         assert!(g.pass(&ais_msg(1, 7, same(), 1011), &cfg, 1011.0));
+    }
+
+    #[test]
+    fn ais_gate_dedup_drop_does_not_advance_rate_clock() {
+        // Both knobs on, dedup window wider than the rate interval. A
+        // content-duplicate that clears the rate gate but is then dropped by
+        // dedup must NOT advance the per-MMSI rate clock — otherwise a
+        // genuinely new fix arriving shortly after is wrongly throttled even
+        // though nothing was emitted at the duplicate's time.
+        let cfg = AisFilter { min_interval_s: Some(10.0), dedup_window_s: Some(30.0), ..Default::default() };
+        let mut g = AisGate::default();
+        let a = || Some(serde_json::json!({ "lat": 1.0, "lon": 2.0 }));
+        let b = || Some(serde_json::json!({ "lat": 3.0, "lon": 4.0 }));
+        // t=1000 content A → kept (rate clock = 1000).
+        assert!(g.pass(&ais_msg(1, 7, a(), 1000), &cfg, 1000.0));
+        // t=1012 same content A → passes rate (12 ≥ 10) but dropped by dedup
+        // (12 < 30); the rate clock must stay at 1000, not advance to 1012.
+        assert!(!g.pass(&ais_msg(1, 7, a(), 1012), &cfg, 1012.0));
+        // t=1015 NEW content B → 1015-1000 = 15 ≥ 10, so it must be kept.
+        // (With the pre-fix last_pos pollution it would read 1015-1012 = 3 and
+        // be wrongly throttled.)
+        assert!(g.pass(&ais_msg(1, 7, b(), 1015), &cfg, 1015.0), "new fix must not be throttled");
     }
 
     #[test]

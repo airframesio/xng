@@ -77,6 +77,7 @@ pub fn format_beast(msg: &Message) -> Vec<Vec<u8>> {
             let src = match fix.source {
                 AircraftSource::Adsb => EsSource::Adsb,
                 AircraftSource::TisB => EsSource::TisB,
+                AircraftSource::TisBOther => EsSource::TisBOther,
                 AircraftSource::AdsR => EsSource::AdsR,
             };
             return xng_mode_adsb::synth::synth_frames(

@@ -135,6 +135,7 @@ pub fn parse_line(line: &str, format: ExternFormat, station: &StationIdentity) -
                 reassembled: false,
                 assstat: str_of(a, &["assstat"]).map(String::from),
                 app: appdec.app.map(|x| serde_json::to_value(&x).unwrap_or_default()),
+                vdl2_link: None,
             })
         }
         _ => MessageBody::Hfdl {

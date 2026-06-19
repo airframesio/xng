@@ -218,6 +218,21 @@ fn sanitize_id(s: &str) -> String {
     s.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '"' | '\'' | '&')).collect()
 }
 
+/// Authority ranking of a readsb `ac_type` (addrtype) for provenance merges:
+/// native ADS-B (direct ES) is the most authoritative, then ADS-R rebroadcast,
+/// then TIS-B, then bare Mode S surveillance, then unknown. A lower-ranked
+/// frame must never overwrite a higher-ranked class already recorded.
+fn ac_type_rank(t: &str) -> u8 {
+    match t {
+        "adsb_icao" | "adsb_icao_nt" => 5,
+        "adsb_other" => 4,
+        "adsr_icao" | "adsr_other" => 3,
+        "tisb_icao" | "tisb_other" | "tisb_trackfile" => 2,
+        "mode_s" => 1,
+        _ => 0,
+    }
+}
+
 /// Upsert an aircraft entity, coalescing across sources by ICAO > reg > flight.
 /// `contrib` = the display fields this message contributes (latest-wins on the
 /// merged master, recorded verbatim on the per-source row). `source` = the
@@ -298,13 +313,18 @@ fn merge_aircraft(
     let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
     o.insert("msgs".into(), json!(msgs + 1));
     for (k, v) in &contrib {
-        // Never let a bare Mode S surveillance frame downgrade an already
-        // recorded, more specific ADS-B/TIS-B/ADS-R provenance class.
-        if k == "ac_type"
-            && v.as_str() == Some("mode_s")
-            && o.get("ac_type").and_then(Value::as_str).is_some_and(|t| t != "mode_s")
-        {
-            continue;
+        // Provenance never downgrades: keep the most authoritative ac_type
+        // seen for this aircraft. Native ADS-B outranks an ADS-R rebroadcast,
+        // which outranks TIS-B, which outranks bare Mode S surveillance — so a
+        // later rebroadcast (or bare Mode S) frame can neither clobber nor
+        // flip-flop a more-authoritative class already recorded. Equal-rank
+        // updates still take the latest value.
+        if k == "ac_type" {
+            let incoming = v.as_str().map(ac_type_rank).unwrap_or(0);
+            if o.get("ac_type").and_then(Value::as_str).map(ac_type_rank).is_some_and(|c| c > incoming)
+            {
+                continue;
+            }
         }
         o.insert(k.clone(), v.clone());
     }
@@ -460,7 +480,12 @@ fn update(d: &mut Dash, m: &Message) {
                     "tisb_icao" => "tisb_icao",
                     "tisb_non_icao" => "tisb_other",
                     "adsr_icao" => "adsr_icao",
-                    _ => "adsb_icao",
+                    // DF18 CF=4/7 reads back as "unknown" (reserved format).
+                    // Don't assert native ADS-B for an unclassifiable frame —
+                    // fall back to bare Mode S rather than mislabel it to
+                    // tar1090/readsb as adsb_icao.
+                    "unknown" => "mode_s",
+                    _ => "mode_s",
                 })
                 .unwrap_or(match df {
                     17 | 19 => "adsb_icao",
@@ -1033,7 +1058,7 @@ fn export_geojson(d: &Dash) -> String {
                 t.iter()
                     .filter_map(|p| {
                         let a = p.as_array()?;
-                        Some(json!([a[1].as_f64()?, a[0].as_f64()?])) // [lat,lon] → [lon,lat]
+                        Some(json!([a.get(1)?.as_f64()?, a.first()?.as_f64()?])) // [lat,lon] → [lon,lat]
                     })
                     .collect()
             })
@@ -1085,7 +1110,7 @@ fn export_gpx(d: &Dash) -> String {
                 t.iter()
                     .filter_map(|p| {
                         let a = p.as_array()?;
-                        Some((a[0].as_f64()?, a[1].as_f64()?)) // stored [lat, lon]
+                        Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)) // stored [lat, lon]
                     })
                     .collect()
             })
@@ -1135,7 +1160,7 @@ fn export_kml(d: &Dash) -> String {
                     .filter_map(|p| {
                         let a = p.as_array()?;
                         // stored [lat, lon] → KML "lon,lat"
-                        Some(format!("{},{}", a[1].as_f64()?, a[0].as_f64()?))
+                        Some(format!("{},{}", a.get(1)?.as_f64()?, a.first()?.as_f64()?))
                     })
                     .collect()
             })
@@ -1649,6 +1674,14 @@ mod tests {
         // An aircraft seen only via DF20 surveillance → mode_s.
         update(&mut d, &modes(20, "123456", None));
         assert_eq!(type_of(&d, "123456"), "mode_s");
+        // Native ADS-B (DF17) then an ADS-R rebroadcast of the same ICAO: the
+        // rebroadcast must NOT downgrade/flip-flop the native class.
+        update(&mut d, &modes(17, "AA11BB", None));
+        assert_eq!(type_of(&d, "aa11bb"), "adsb_icao");
+        update(&mut d, &modes(18, "AA11BB", Some(json!({"source_addr_type": "adsr_icao"}))));
+        assert_eq!(type_of(&d, "aa11bb"), "adsb_icao", "adsr must not downgrade native adsb");
+        update(&mut d, &modes(17, "AA11BB", None));
+        assert_eq!(type_of(&d, "aa11bb"), "adsb_icao", "no flip-flop on the next native frame");
     }
 
     #[test]

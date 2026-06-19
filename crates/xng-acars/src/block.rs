@@ -112,6 +112,7 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
             app: appdec
                 .app
                 .map(|a| serde_json::to_value(&a).unwrap_or_default()),
+            vdl2_link: None,
         },
         downlink,
         crc_ok,

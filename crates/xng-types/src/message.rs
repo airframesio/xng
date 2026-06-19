@@ -80,6 +80,14 @@ pub struct AcarsCore {
     /// ...), as produced by xng-acars.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<serde_json::Value>,
+    /// VDL2-only transient: the AVLC link wrapper (`{src,dst,control}`) the
+    /// dumpvdl2 `decoded:json` feed needs but the public model doesn't carry.
+    /// `#[serde(skip)]` keeps it out of every serialized output (JSONL, MQTT,
+    /// asf-2.0); it rides in-memory only, from `xng_mode_vdl2::to_message` to
+    /// `outputs::dumpvdl2_json::format_dumpvdl2`. Not part of the message
+    /// contract; never populated for non-VDL2 carriers.
+    #[serde(skip)]
+    pub vdl2_link: Option<serde_json::Value>,
 }
 
 /// Typed per-mode message bodies. Deliberately minimal for M0; each mode core

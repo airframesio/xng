@@ -33,7 +33,11 @@ pub(crate) struct AircraftFix {
 pub(crate) enum AircraftSource {
     #[default]
     Adsb,
+    /// TIS-B with an ICAO address.
     TisB,
+    /// TIS-B with a non-ICAO address (track-file id) — distinct so the 1090
+    /// re-encode preserves the non-ICAO fact (DF18 CF=5, not CF=2).
+    TisBOther,
     AdsR,
 }
 
@@ -93,10 +97,12 @@ pub(crate) fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
             track_deg: jf(details, "true_track"),
             vertical_rate_fpm: ji(details, "vertical_rate"),
             squawk: None,
-            // UAT address qualifier → 1090 rebroadcast provenance: tisb_* →
-            // TIS-B, adsr_other → ADS-R, everything else is native ADS-B.
+            // UAT address qualifier → 1090 rebroadcast provenance: tisb_icao →
+            // TIS-B (ICAO addr), tisb_trackfile → TIS-B non-ICAO, adsr_other →
+            // ADS-R, everything else is native ADS-B.
             source: match details.get("address_qualifier").and_then(Value::as_str) {
-                Some("tisb_icao") | Some("tisb_trackfile") => AircraftSource::TisB,
+                Some("tisb_icao") => AircraftSource::TisB,
+                Some("tisb_trackfile") => AircraftSource::TisBOther,
                 Some("adsr_other") => AircraftSource::AdsR,
                 _ => AircraftSource::Adsb,
             },

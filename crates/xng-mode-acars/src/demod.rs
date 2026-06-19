@@ -98,6 +98,14 @@ impl MskDemod {
                 self.noise = p;
             } else if p < self.noise * NOISE_GATE {
                 self.noise += NOISE_ALPHA * (p - self.noise);
+            } else {
+                // Tiny up-creep on above-gate samples so a too-LOW floor can
+                // re-converge — an anomalously low first sample (a deep fade)
+                // would otherwise leave every later silence sample above the
+                // gate and freeze the floor low for the whole session,
+                // inflating snr_db. Mirrors the VDL2 demod's recovery; a
+                // correct floor is dominated by the silence EMA above.
+                self.noise *= 1.0 + NOISE_ALPHA * 0.1;
             }
             self.mixed.push(Complex::new(env - self.dc, 0.0));
         }

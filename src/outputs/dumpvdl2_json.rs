@@ -4,9 +4,10 @@
 //!
 //! Field names + shapes are pinned to dumpvdl2 2.6.0 / libacars 2.2.1 output
 //! captured on the vendored off-air fixture (see the golden in tests). The
-//! AVLC link wrapper rides in `core.app["_vdl2_link"]` (stashed by
-//! `xng_mode_vdl2::to_message`, which otherwise collapses the ACARS path to a
-//! bare `AcarsCore`). Non-ACARS AVLC/XID frames are not yet emitted.
+//! AVLC link wrapper rides on the `#[serde(skip)]` transient `core.vdl2_link`
+//! field (stashed by `xng_mode_vdl2::to_message`), so it never leaks into the
+//! public outputs and survives multi-block reassembly. Non-ACARS AVLC/XID
+//! frames are not yet emitted.
 
 use serde_json::{json, Value};
 use xng_types::{Message, MessageBody};
@@ -30,7 +31,7 @@ pub fn format_dumpvdl2(msg: &Message) -> Option<Value> {
     if msg.mode != xng_types::Mode::Vdl2 {
         return None;
     }
-    let link = core.app.as_ref()?.get("_vdl2_link")?;
+    let link = core.vdl2_link.as_ref()?;
     let (src, dst, control) = (link.get("src")?, link.get("dst")?, link.get("control")?);
 
     // AVLC addresses. dumpvdl2 puts the A/G status (from the dst octet-1 bit)
@@ -84,9 +85,11 @@ pub fn format_dumpvdl2(msg: &Message) -> Option<Value> {
         s
     });
     // xng's combined 4-char msg number ("M06A") splits into the 3-char id +
-    // the sequence char dumpvdl2 reports separately.
+    // the sequence char dumpvdl2 reports separately. `get(..)` is char-boundary
+    // safe (None rather than a panic) — ACARS msg nums are ASCII, but a garbled
+    // frame must never panic the feed serializer.
     let (msg_num, msg_num_seq) = match core.msg_num.as_deref() {
-        Some(m) if m.len() >= 4 => (Some(m[..3].to_string()), Some(m[3..4].to_string())),
+        Some(m) if m.len() >= 4 => (m.get(..3).map(str::to_string), m.get(3..4).map(str::to_string)),
         other => (other.map(str::to_string), None),
     };
     let mut acars = serde_json::Map::new();

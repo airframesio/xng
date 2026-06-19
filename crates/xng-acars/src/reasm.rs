@@ -164,6 +164,7 @@ mod tests {
             reassembled: false,
             assstat: None,
             app: None,
+            vdl2_link: None,
         }
     }
 

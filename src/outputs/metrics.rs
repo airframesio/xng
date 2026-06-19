@@ -68,9 +68,13 @@ fn render(live: &LiveState, mode: &str) -> String {
     out
 }
 
-/// Escape a label value for the Prometheus text exposition format: backslash,
-/// double-quote, and newline per the spec. ACARS labels are mostly two ASCII
-/// chars but can carry control bytes on a garbled frame.
+/// Escape a label value for the Prometheus text exposition format. The format
+/// defines exactly three escapes — backslash, double-quote, newline — and the
+/// reference parser *rejects* any other backslash sequence (`\r`, `\t`, …) as
+/// invalid. ACARS labels are mostly two ASCII chars but a garbled frame can
+/// carry raw control bytes (CR, NUL); left raw they break line-oriented
+/// parsing, and they can't be escaped, so emit them as a printable `{XX}` hex
+/// token (safe inside a quoted value, still distinct per byte).
 fn escape_label(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -78,6 +82,7 @@ fn escape_label(s: &str) -> String {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
+            c if c.is_control() => out.push_str(&format!("{{{:02X}}}", c as u32)),
             c => out.push(c),
         }
     }
@@ -135,5 +140,10 @@ mod tests {
     fn escapes_label_special_chars() {
         assert_eq!(escape_label("H1"), "H1");
         assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
+        // Newline → the one valid control escape; CR/NUL → printable hex token
+        // (no raw control byte leaks into the line-oriented exposition).
+        assert_eq!(escape_label("a\nb"), "a\\nb");
+        assert_eq!(escape_label("8\r"), "8{0D}");
+        assert_eq!(escape_label("\u{0}"), "{00}");
     }
 }

@@ -23,8 +23,11 @@ const NZ: f64 = 15.0;
 pub enum EsSource {
     /// Native ADS-B — DF17, CA=5.
     Adsb,
-    /// TIS-B (ground-station rebroadcast of secondary surveillance) — DF18 CF=2.
+    /// TIS-B with an ICAO address — DF18 CF=2 (fine TIS-B).
     TisB,
+    /// TIS-B with a non-ICAO address (track-file id) — DF18 CF=5. Keeps the
+    /// "this 24-bit field is not a real ICAO" fact the CF=2 path would erase.
+    TisBOther,
     /// ADS-R (rebroadcast from the other data link, e.g. UAT↔1090) — DF18 CF=6.
     AdsR,
 }
@@ -33,9 +36,10 @@ impl EsSource {
     /// `(downlink format, 3-bit CA/CF)` for this source.
     fn df_cf(self) -> (u8, u8) {
         match self {
-            EsSource::Adsb => (17, 5), // CA=5 level-2 transponder
-            EsSource::TisB => (18, 2), // CF=2 fine TIS-B, ICAO address
-            EsSource::AdsR => (18, 6), // CF=6 ADS-R rebroadcast
+            EsSource::Adsb => (17, 5),      // CA=5 level-2 transponder
+            EsSource::TisB => (18, 2),      // CF=2 fine TIS-B, ICAO address
+            EsSource::TisBOther => (18, 5), // CF=5 fine TIS-B, non-ICAO address
+            EsSource::AdsR => (18, 6),      // CF=6 ADS-R rebroadcast
         }
     }
 
@@ -262,6 +266,7 @@ mod tests {
         let (icao, lat, lon) = (0xA12345, 37.6189, -122.3750);
         for (src, want_class, want_key) in [
             (EsSource::TisB, "TIS-B", "tisb_icao"),
+            (EsSource::TisBOther, "TIS-B", "tisb_non_icao"),
             (EsSource::AdsR, "ADS-R", "adsr_icao"),
         ] {
             let [even, odd] = airborne_position(src, icao, lat, lon, Some(9500));
