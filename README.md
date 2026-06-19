@@ -162,9 +162,9 @@ The binaries need `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf`
 for native Airspy):
 
 ```bash
-sudo apt install ./xng-0.20.0-arm64.deb    # pulls runtime deps
+sudo apt install ./xng-0.21.0-arm64.deb    # pulls runtime deps
 # or
-tar xzf xng-v0.20.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
+tar xzf xng-v0.21.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
 ```
 
 Multi-arch Docker images (amd64/arm64/armv7) are published per tag:
