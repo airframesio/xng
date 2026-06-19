@@ -19,6 +19,13 @@ count() { # file fmt mode rate center channels
     grep "session complete" | grep -o '[0-9]* frame' | grep -o '[0-9]*'
 }
 
+count_crc() { # file fmt mode rate center channels — sums CRC-OK frames across channels
+  # ACARS emits bad-CRC frames too (noise-dependent), so its gate counts only
+  # frames with valid CRC, summed over the per-channel "N with valid CRC" lines.
+  "$XNG" decode "$1" -f "$2" -m "$3" -r "$4" -c "$5" --channels "$6" 2>&1 |
+    grep -oE '[0-9]+ with valid CRC' | grep -oE '^[0-9]+' | awk '{s+=$1} END{print s+0}'
+}
+
 check() { # name actual
   local min
   min=$(python3 -c "import json;print(json.load(open('$BASE'))['$1'])")
@@ -97,6 +104,16 @@ if [ -f bench/data/navtex_62500.cs16 ]; then
   check navtex_offair "$navtex"
 else
   echo "skip: bench/data/navtex_62500.cs16 not present (release asset)"
+fi
+
+# ACARS (POA): Opflasher off-air capture (release asset), 24 kS/s cs16, the
+# single active POA channel downconverted to baseband. CRC-OK gate. Head-to-head
+# on the same signal: xng 13 vs acarsdec 3.7 9 (real Korean Air HL8537 traffic).
+if [ -f bench/data/acars_24k.cs16 ]; then
+  acars=$(count_crc bench/data/acars_24k.cs16 cs16 acars 24000 131500000 131.500)
+  check acars_offair "$acars"
+else
+  echo "skip: bench/data/acars_24k.cs16 not present (release asset)"
 fi
 
 exit $fail

@@ -26,6 +26,7 @@ large to vendor).
 | Radiosonde (RS41) | 119 | rs1729 `rs41mod` 119 (100%) | radiosonde_auto_rx 96 kS/s | floor 110 |
 | NAVTEX | 29 | fldigi/YaND (real USCG msg, char-identical) | SDRplay navtex.zip 62.5 kS/s | floor 25 |
 | UAT 978 | 879 CRC-OK | (live; no oracle on this capture) | live 50 s, KSMF (not vendored) | — |
+| ACARS (POA) | 13 CRC-OK | acarsdec 3.7 9 | Opflasher 3.0 MS/s (24k slice) | floor 10 |
 
 ## ADS-B / Mode S
 
@@ -204,6 +205,34 @@ No public UAT IQ exists (the canonical dump978 dataset is bits, not IQ), so this
 is validated on a **live** capture: tuner on the 1090 antenna at 978 MHz for 50 s
 → **879 CRC-OK frames**, real GA aircraft (callsign/ICAO/position/track/altitude,
 e.g. N402AA, N316ME). Not CI-gated (live capture, not vendored).
+
+## ACARS (POA)
+
+Capture: a real off-air VHF ACARS capture contributed by **Opflasher**
+(Airframes Discord) — `discord-opflasher-acars1.cf32`, complex float32,
+**3.0 MS/s**, 120 s, quiet/sparse. A single active POA channel (≈ 50 kHz off
+the capture center) carries one aircraft's maintenance download — real **Korean
+Air** traffic, reg **HL8537**, flight **KE0402** (Sydney YSSY → Seoul RKSI,
+17 Jun 2026), H1 `#CFB`/`#DFB` ARINC-622/Boeing maintenance + `5V`.
+
+For CI the channel is downconverted to baseband and decimated 3.0 MS/s → 24 kS/s
+(integer /125), vendored as `bench/data/acars_24k.cs16` (release asset). xng
+decodes **13 CRC-OK** on the slice (15 on the full-rate file; the two weakest are
+lost to the decimation lowpass). CI floor 10, gated on CRC-OK frames (ACARS also
+emits bad-CRC frames, which are noise-dependent).
+
+Head-to-head on the same signal (the AM-detected channel resampled to acarsdec's
+12.5 kHz WAV input): **xng 13 vs acarsdec 3.7 9** — xng leads, decoding the same
+HL8537 H1 maintenance blocks (sublabels C36I–M / D57A–C match field-for-field)
+plus the weaker frames acarsdec misses. This is xng's first real-RF ACARS gate
+(previously ACARS was loopback + field-exact only — the long-deferred ACARS-4.3).
+
+Reproduce:
+
+```
+xng decode bench/data/acars_24k.cs16 -f cs16 -m acars -r 24000 -c 131500000 --channels 131.500
+acarsdec -f acars_12k5.wav -o1     # AM-detected channel resampled to 12.5 kHz mono WAV
+```
 
 ## Synthetic demod validation (round 5/6)
 
