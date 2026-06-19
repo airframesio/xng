@@ -278,6 +278,11 @@ terminal is an Iridium-equipped aircraft or vessel). Derives lat/lon/alt;
 gated to a plausible Earth radius (5000–7000 km) so a false-pass can't plant a
 phantom.
 
+mt-position fixes feed the dashboard's `iridium_devices` and export alongside
+aircraft/vessels/beacons via the geo endpoints (`http::geo_entities`, IRID-6):
+`/data/export.geojson` (RFC 7946, `[lon, lat]`), `/data/export.gpx` (GPX 1.1,
+lat/lon attrs), `/data/export.kml` (OGC KML 2.2, `lon,lat`).
+
 ## Broadcast-time conversion (`ira::iri_time_unix`, IRID-8)
 
 `fmt_iritime` (90 ms ticks, the two ERA2-window leap seconds 2015-06-30 /

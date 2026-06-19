@@ -66,7 +66,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
 | Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS TDM frames (coherent BPSK, **RRC matched filter + per-frame UW BER + mid-frame polarity recovery**), **EGC SafetyNET/FleetNET messages with named services, priority, geographic-area decode (rectangular/circular/NAVAREA·METAREA/coastal → machine-readable coordinates, IMO manual) and ITA2/Baudot + IA5 text**, multi-part EGC + logical-channel reassembly, **named LES/ocean-region routing, MES IDs, TDM frame→UTC, signalling-channel uplink frequency** | Off-air EGC capture, field-exact vs reference |
 | Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), **IBC broadcasts + ITL time-location/satellite-ranging**, **ACARS over SBD (two-layer IDA + Layer-B reassembly for long messages)**, pager messages (IMS) with multi-part reassembly, **GSM CC/MM/RR/GMM/SS/SMS signalling (IMSI/IMEI/TMSI, LAI, call-control)**, voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction, IP-channel frames (IIP ARQ / IIQ / IIR) **with plaintext PPP-PAP + HTTP Basic-Auth credential recovery**, **mobile-terminal positions**, **LCW link control + U3 signalling**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle; on a shared 300 s off-air capture xng decodes **758 CRC-OK IDA frames vs gr-iridium's 573 (132 %)** — see [Benchmarks](#benchmarks) |
-| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (TCP server + UDP push, optional tag-blocks) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary/safety messages, aids to navigation, DGNSS, link/channel management, group assignment, **Inland-AIS ASM (DAC=200: ship static, EMMA, water level, signal strength, ETA/RTA, persons-on-board)**, **regional AtoN-monitoring (DAC 235/250)**, and **IMO DAC=1 ASM (Circ.289: met/hydro, area-notice, route, tidal, …)**, and **SART/MOB/EPIRB-AIS distress tagging**; **weak-signal coherent demod (16-state GMSK MLSE + SIC, +11–12 dB)** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
+| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (TCP server + UDP push, optional tag-blocks) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary/safety messages, aids to navigation, DGNSS, link/channel management, group assignment, **Inland-AIS ASM (DAC=200: ship static, EMMA, water level, signal strength, ETA/RTA, persons-on-board)**, **regional AtoN-monitoring (DAC 235/250)**, and **IMO DAC=1 ASM (Circ.289: met/hydro, area-notice, route, tidal, …)**, and **SART/MOB/EPIRB-AIS distress tagging**; **own-ship AIVDO Type-1 emit** (periodic from the station receiver-pos) and an **output filter** (type/MMSI keep-drop + per-MMSI rate downsample + content dedup); **weak-signal coherent demod (16-state GMSK MLSE + SIC, +11–12 dB)** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
 | Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne + surface via `--receiver-pos`, speed-gated, **graduated position trust** — global / NIC-contained / receiver-referenced), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, capability 1,0/1,7, **ACAS RA 3,0**, selected-altitude 4,0, track/turn 5,0, heading/speed 6,0, **MRAR/hazard met 4,4/4,5** — pyModeS field-exact), **target state 6,2 + operational status 6,5** (ADS-B version, NACp/SIL/NIC-supp/GVA), emergency/priority status, **DF18 TIS-B/ADS-R source tagging**, single-bit CRC repair, two-sighting phantom rejection, per-aircraft tracking, Mode A/C decode kernel, **SBS + Beast outputs** (Beast carries a monotonic sample-clock 12 MHz MLAT counter, not the wall clock); any rate ≥ 2 MS/s incl. **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
 
 
@@ -372,8 +372,11 @@ classic behavior (ACARS to `feed.airframes.io:5550`); an optional
 from a base id, each routed to that mode's own Airframes ingest in its
 native format), disable feeding for one decoder with `feed = false` on its
 `[[session]]`, or override a decoder's id with `airframes-station-id`.
-The multiplexed **asf-2.0** feed carries every mode separately under the
-canonical station id and is independent of this per-port path.
+Native per-mode serialization now covers **ACARS and VDL2** (VDL2 emits
+dumpvdl2 `decoded:json` to `:5552`, field-verified against dumpvdl2 2.6.0);
+other modes route to Airframes over asf-2.0. The multiplexed **asf-2.0**
+feed carries every mode separately under the canonical station id and is
+independent of this per-port path.
 
 `xng status` prints a live per-session table for a running station
 (querying its dashboard endpoint, default `127.0.0.1:8080`, or
@@ -440,10 +443,23 @@ assets are SRI-pinned; RF-sourced strings are HTML-escaped).
 
 The same port also serves the **readsb/tar1090 data API** —
 `GET /data/aircraft.json` (every live aircraft in the readsb field schema:
-`hex`/`flight`/`alt_baro`/`gs`/`track`/`squawk`/`lat`/`lon`/`seen`/…, merged
-across ADS-B / UAT / HFDL by ICAO) and `GET /data/receiver.json` (version +
-the `receiver-pos` location) — so xng is a drop-in source for **tar1090 /
-graphs1090 / VRS** with no extra software.
+`hex`/`flight`/`alt_baro`/`gs`/`track`/`squawk`/`lat`/`lon`/`seen`/…, plus a
+provenance `type` per readsb's convention — `adsb_icao` / `tisb_icao` /
+`adsr_icao` / `mode_s` / …, merged across ADS-B / UAT / HFDL by ICAO) and
+`GET /data/receiver.json` (version + the `receiver-pos` location) — so xng
+is a drop-in source for **tar1090 / graphs1090 / VRS** with no extra
+software. `aircraft.json` accepts `?since=<unix>` for tar1090's incremental
+poll (only aircraft heard at/after that time). The dashboard's
+`GET /api/state` snapshot also carries a cross-mode **`alerts`** array — the
+distress/emergency surface aggregating ADS-B emergency/7500/7600/7700,
+AIS-SART/MOB/EPIRB, STD-C distress, DSC distress, and every COSPAS-SARSAT
+406 beacon, keyed `mode:entity`.
+
+The same data is exportable as geographic files —
+`GET /data/export.geojson` (RFC 7946), `GET /data/export.gpx` (GPX 1.1),
+and `GET /data/export.kml` (OGC KML 2.2) — each carrying the current fix
+plus a track for every positioned aircraft, vessel, beacon, and Iridium
+mobile-terminal position.
 
 For **Iridium** the map adds toggleable overlays (cf. the
 iridium-toolkit live map): satellite positions with ground tracks and
@@ -472,7 +488,7 @@ Every mode and every command shares the same output options:
 --udp host:5550                                # acarsdec-compatible JSON
 --json                                         # raw JSON to stdout
 --jsonl messages.jsonl                         # JSONL file
---metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels, per-label ACARS)
+--metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels, per-label ACARS, FEC-corrected)
 --sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S + UAT/HFDL positions)
 --beast 0.0.0.0:30005                          # Beast binary TCP (Mode S + synthesized UAT/HFDL)
 --nmea-tcp 0.0.0.0:10110                       # NMEA AIVDM TCP server (AIS)

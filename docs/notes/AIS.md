@@ -25,9 +25,9 @@ Per channel (`lib.rs::AisChannelDecoder`): wideband IQ → `xng_dsp::Ddc`
 Airspy's 2.5 MS/s resampled, integer multiples skip the resampler) →
 **two demods run in parallel** → `frame::HdlcDeframer` (flag hunt,
 destuffing, FCS) → `frame::AisFrame` → `nmea::SentenceBuilder` (AIVDM) →
-`fields::decode` → `xng_types::Message`. The NMEA UDP/TCP servers
-(`--nmea-tcp`, default port 10110) live in the `xng` binary; the crate
-emits the AIVDM strings.
+`fields::decode` → `xng_types::Message`. The NMEA sinks (`--nmea-tcp`
+default port 10110, `--nmea-udp` push, optional tag-blocks) live in the
+`xng` binary; the crate emits the AIVDM strings. See NMEA output below.
 
 A second, **inbound** NMEA path (`reassembly.rs`) parses AIVDM/AIVDO
 sentences from external feeds (e.g. an AIS-Catcher HTTP source), reassembles
@@ -100,10 +100,60 @@ bits 8..38.
 AIVDM per IEC 61162-1: 6-bit ASCII armoring (value +48, +56 above 39),
 fill bits, XOR checksum, multi-sentence fragmentation at 60 armored chars
 (82-char sentence limit) with a rotating 0–9 message sequence ID for
-multi-fragment messages. Channel A/B designator from the frequency. The
-e2e test reproduces a published gpsd example sentence
+multi-fragment messages. Channel A/B designator from the frequency
+(`lib.rs::channel_letter`): ±12.5 kHz of 161.975 → `'A'`, of 162.025 →
+`'B'`, anything else → `'?'` (never a silently wrong `'A'`; the field stays
+one valid ASCII char so `(channel,total,seq)` fragment keying is
+unaffected). The e2e test reproduces a published gpsd example sentence
 (`!AIVDM,1,1,,B,177KQJ5000G?tO`K>RA1wUbN0TKH,0*5C`) byte-for-byte from a
 synthesized burst, anchoring bit order / armoring / checksum to real data.
+
+### Transports (in the `xng` binary)
+
+The crate emits the AIVDM strings; the `xng` binary carries them. All three
+sinks drop frames that failed FCS (`decode.crc_ok`).
+
+| Sink | Flag / TOML | Notes |
+|---|---|---|
+| TCP server | `--nmea-tcp` (port 10110) `[outputs] nmea-tcp` | Pull-style; pushes to every connected client (`src/outputs/nmea_tcp.rs`). |
+| UDP push | `--nmea-udp <host:port>` `[outputs] nmea-udp` | Fire-and-forget datagrams to one target (`src/outputs/nmea_udp.rs`). |
+| Tag-blocks | `--nmea-tag-blocks` `[outputs] nmea-tag-blocks` | Prefixes every sentence on **both** sinks with `\s:<station-ident>,c:<unix_ts>*HH\` (`nmea::tag_block`; XOR checksum over the inner bytes, the form OpenCPN / aggregator pollers parse). |
+
+### Output shaping (`runtime.rs::AisFilter` / `AisGate`, AIS-5h)
+
+Applied **pre-bus** in `decode_loop` (between `LabelFilter` and
+`bus.publish`), so it gates every output uniformly. Non-AIS messages always
+pass. Two halves:
+
+- **`AisFilter::allows`** (pure, testable) — static keep/drop on message
+  type and MMSI, include-then-exclude: `ais-include-types` /
+  `ais-exclude-types` / `ais-include-mmsi` / `ais-exclude-mmsi` (per-session
+  TOML; empty = pass all).
+- **`AisGate`** (per-session, time-stateful) — `ais-min-interval` thins
+  dynamic position reports (types 1/2/3/18/19/27) to one per MMSI per N
+  seconds; `ais-dedup-window` drops a `(mmsi, type, decoded-content)` hash
+  repeated within N seconds (multi-receiver echoes, repeated static
+  reports). Both off when the key is unset. `now` is the message timestamp,
+  not wall-clock.
+
+### Own-ship AIVDO (AIS-5c)
+
+`lib.rs::own_ship_position(mmsi, lat, lon)` builds an `!AIVDO,1,1,,,…`
+Type 1 position sentence for the receiver's own MMSI + location (so a
+connected plotter shows the station). The bit packer is
+`fields::encode_position_report` — the inverse of the `1..=3` decode arm:
+type 1, the MMSI and lon/lat (1/600000°), with the kinematic fields a fixed
+SDR can't supply (ROT, SOG, COG, heading, timestamp) set to their
+"not available" sentinels rather than fabricated. The unit test
+(`own_ship_aivdo_round_trips`) round-trips the sentence back through
+`fields::decode` — whose `1..=3` arm is the pyais-validated one — recovering
+the MMSI + position and confirming the N/A kinematics are omitted.
+
+The station runtime emits it periodically: with an `own-ship-mmsi`
+(`[outputs]`) and a session `receiver-pos`, `own_ship_message` publishes one
+AIVDO fix to the bus every 30 s (polled on a 1 s tick so it stops promptly
+on shutdown). It carries `own_ship: true` in `details` and flows to every
+sink like any AIS fix.
 
 ## Inbound reassembly + per-MMSI tracking (`reassembly.rs`)
 

@@ -95,8 +95,9 @@ xng/
 │   ├── main.rs, commands/ # CLI (listen, scan, survey, decode, iq-info, devices,
 │   │                      #   selftest, tui, station, status, ingest, extern, config)
 │   ├── runtime.rs, bus.rs # session supervisor + message bus
-│   ├── outputs/           # console, JSON/JSONL, acarsdec UDP, Airframes, Prometheus,
-│   │                      #   SBS/Beast, NMEA, MQTT, asf-2.0, and the web dashboard
+│   ├── outputs/           # console, JSON/JSONL, acarsdec UDP, dumpvdl2 UDP/TCP,
+│   │                      #   Airframes, Prometheus, SBS/Beast, NMEA, MQTT, asf-2.0,
+│   │                      #   and the web dashboard (map + geo export)
 │   ├── tui.rs             # ratatui TUI
 │   ├── beam.rs, satmap.rs # Iridium beam-pattern reconstruction + satellite naming
 │   └── freq.rs, sdr_args.rs
@@ -128,7 +129,20 @@ protobuf schema multiplexing every channel/SDR/mode over a single gRPC
 (tonic/HTTP/2) or QUIC (quinn) connection, with the raw payload always
 preserved for server-side re-decode. `xng ingest` is the reference
 server. Legacy decoder-native JSON is retained so existing Airframes
-ingests work unchanged. Full protocol in [ASF2.md](ASF2.md).
+ingests work unchanged: ACARS feeds acarsdec flat JSON, and VDL2 feeds
+dumpvdl2 `decoded:json` (nested vdl2/avlc/acars; UDP `:5552` / TCP `:5553`,
+verified field-for-field against dumpvdl2 2.6.0). Modes without a
+per-port serializer reach Airframes via asf-2.0 only. Full protocol in
+[ASF2.md](ASF2.md).
+
+The web dashboard (`--http`) also exports positioned entities over
+`/data/export.geojson` (RFC 7946), `/data/export.gpx` (GPX 1.1), and
+`/data/export.kml` (OGC KML 2.2) — aircraft, vessels, beacons, and
+Iridium mobile-terminal fixes, current position plus trail (GeoJSON/KML
+are `[lon, lat]`, GPX uses `lat`/`lon` attributes) — and surfaces a
+cross-mode distress array on `/api/state` aggregating ADS-B
+emergency/7500-7600-7700, AIS SART/MOB/EPIRB, STD-C distress, DSC
+distress, and every COSPAS-SARSAT 406 beacon, keyed `mode:entity`.
 
 ## Statistics and control
 
@@ -140,8 +154,17 @@ frames in asf-2.0, the TUI, and the web dashboard. `xng status` queries
 a running station's dashboard endpoint for a live per-session table. The
 Prometheus endpoint emits `xng_frames_total` / `xng_frames_crc_ok_total`
 / `xng_channel_level_dbfs` per `(mode, freq)`, `xng_samples_total` per
-mode, and `xng_acars_messages_total{mode,freq,label}` for per-ACARS-label
-volume. In station mode all sessions feed one shared counter set.
+mode, `xng_acars_messages_total{mode,freq,label}` for per-ACARS-label
+volume, and `xng_fec_corrected_total{mode,freq}` for FEC-corrected units
+per channel. In station mode all sessions feed one shared `LiveState`
+counter set (previously the served state was a never-updated copy, so
+station `/metrics` read all zeros).
+
+The web dashboard adds a cross-mode distress surface (the `alerts` array
+on `/api/state`, above): emergency/distress events across ADS-B, AIS,
+STD-C, DSC, and SARSAT, keyed `mode:entity` and held longer than ordinary
+entities (30 min vs 5 min) so a 7700 squawk or SARSAT burst stays on the
+alerting surface after the transmitter goes quiet.
 
 ## Interfaces
 

@@ -324,6 +324,41 @@ front-end. Unit tests also live in `bits.rs` / `dlac.rs`.
   carries the `MessageBody::Uat { kind, details }` body
   (`crates/xng-proto/src/lib.rs`).
 
+### 1090-ES re-synthesis for raw-Beast consumers (XM-2.2, NEW-P0-1.3)
+
+A UAT 978 state vector has no native 1090 frame, so a raw-Beast / readsb
+consumer (tar1090, aggregators) that does not read SBS or `aircraft.json`
+would never see it. To bridge that, the UAT `kind: "adsb"` fix is
+**re-synthesized onto 1090 extended squitters** — the same trick `uat2esnt`
+uses — by `xng_mode_adsb::synth` (`crates/xng-mode-adsb/src/synth.rs`), wired
+in `src/outputs/beast.rs` (`format_beast`).
+
+The synth source (`EsSource`) is picked from the UAT `address_qualifier`
+(`aircraft_fix` in `src/outputs/aircraft.rs`), so the source class survives
+onto 1090:
+
+| UAT `address_qualifier` | `EsSource` | Downlink format / CF |
+|---|---|---|
+| `tisb_icao`, `tisb_trackfile` | `TisB` | **DF18, CF=2** (fine TIS-B) |
+| `adsr_other` | `AdsR` | **DF18, CF=6** (ADS-R rebroadcast) |
+| anything else (native ADS-B) | `Adsb` | **DF17, CA=5** |
+
+`synth_frames` emits, per fix: the **even+odd airborne-position pair** (TC11,
+both needed for a receiver to globally CPR-decode), a **callsign** frame
+(TC4) when present, and a **ground-velocity** frame (TC19 subtype 1) when a
+*true* ground speed + track are present (an airspeed-only fix encodes no
+ground vector). Each frame appends a clean 24-bit Mode S parity.
+
+Every encoder is the inverse of a `crate::decode` function and is **round-
+trip-verified through this crate's own (benchmark/oracle-validated) decoder**
+in `synth.rs`'s tests — position through `cpr_global_airborne`, callsign
+through `IDENT_CHARSET`, velocity through `decode::velocity` — not by self-
+consistency. Altitude is encoded by searching the real decoder for the AC12
+field that reproduces it (`encode_alt12`), so there is no hand-rolled bit
+layout to get wrong. The receive-side `decode_frame` is unaffected; this is a
+transmit-only re-emission for downstream 1090 tooling. (HFDL position fixes
+ride the same path, always as native `Adsb`.)
+
 ## Gotchas
 
 1. Length-dispatched FEC: 30/48/552 raw bytes pick short/long/uplink; the MDB

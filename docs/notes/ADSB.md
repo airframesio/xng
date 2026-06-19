@@ -52,7 +52,11 @@ preamble with pulses at 0, 1.0, 3.5, 4.5 µs. 56-bit (DF < 16) or 112-bit
   fractional passes) for a ~3× cheaper scan at a small recall cost
   (modes1@2.4M: 281 → 296 of max's 313 going 2 → 4 passes — live was raised
   from 2 to 4 after real-RF testing).
-- Smoothed noise floor (`NOISE_ALPHA = 1e-4`) exposed as `level_dbfs`.
+- Per-frame signal level `level_dbfs` plus a slow running power-EMA noise
+  floor `noise_dbfs` (`NOISE_ALPHA = 1e-4` — the long time constant keeps
+  brief frame bursts from lifting the floor). Both are stamped on every
+  decoded frame and surface as `SignalQuality` `rssi_db` / `noise_db` /
+  `snr_db` (= `level_dbfs - noise_dbfs`) — see Outputs (XM-1).
 
 ## Framing / CRC trust (`frame.rs`)
 
@@ -288,6 +292,29 @@ altitude, squawk, lat/lon, speed/track/vertical-rate, comm_b, adsb_status,
 raw bytes, level). The app serializes to **SBS-1 / BaseStation** CSV and
 **Beast** binary (`0x1a` framing, type '2'/'3', 6-byte MLAT counter, signal
 byte), plus the standard JSON / asf-2.0 feed.
+
+**Per-frame signal quality (XM-1).** `to_message` fills `SignalQuality`
+`noise_db` (the demod's running power-EMA floor, `noise_dbfs`) and
+`snr_db` (`level_dbfs - noise_dbfs`) alongside `rssi_db` (= `level_dbfs`)
+and `rx_ticks_12mhz`. The EMA has already tracked real samples by the time
+any frame decodes, so the floor is measured, not fabricated.
+
+**`aircraft.json` (readsb / tar1090, ECO-4 / ADSB-8a).** The HTTP server
+(`src/outputs/http.rs`) serves `/data/aircraft.json` mapping every live
+entity with a real ICAO hex onto the readsb field schema, so xng drops in
+as a tar1090 / readsb data source. Notable fields:
+
+- **provenance `type` (ADSB-8a):** DF18 carries a CF-derived source class
+  off the oracle-validated `df18_cf_class` (`source_addr_type`) →
+  `adsb_icao_nt` (icao_nt) / `adsb_other` (non_icao) / `tisb_icao` /
+  `tisb_other` (tisb_non_icao) / `adsr_icao`, else `adsb_icao`. With no
+  source class, DF17 / DF19 → `adsb_icao` and bare Mode S surveillance →
+  `mode_s`. **`mlat` is never emitted** — this is a passive single
+  receiver. A `mode_s` provenance does not downgrade an aircraft already
+  typed from an ES frame.
+- **`?since=<unix>` incremental filter (ECO-4):** `query_since` parses the
+  query string; the emit cutoff is `max(now − EXPIRE_S, since)`, so a poller
+  gets only aircraft heard at/after its supplied absolute Unix time.
 
 **DF17 synthesis (XM-2.2).** Non-Mode-S aircraft sources (UAT 978, HFDL)
 have no raw 1090 frame, so a shared `AircraftFix` (`src/outputs/aircraft.rs`)

@@ -44,6 +44,20 @@ differential decode (`prev_bit ^= change`). Smoothed envelope power is
 exposed as a rough RSSI in dBFS. There is no equalizer — the AM-envelope
 front end and 10 sps integrate-and-dump are sufficient at VHF SNRs.
 
+**Per-burst noise floor + SNR (ACARS-4.1)**: the demod keeps a second,
+slower envelope-power EMA (`NOISE_ALPHA` 0.002) that tracks only the
+inter-burst silence — a sample more than `NOISE_GATE` (8×) above the
+running floor is treated as signal and frozen out, so a long transmission
+can't drag the floor up to the carrier level (the pure-noise tail above
+the gate is ~e⁻⁸, negligible). A high seed from tuning in mid-burst
+self-corrects once silence falls back below the gate. `noise_dbfs()`
+surfaces it; `to_message` fills `SignalQuality.noise_db` from it and
+`snr_db` as `rssi - noise` (level_dbfs − noise_dbfs). A unit test
+(`noise_floor_tracks_known_awgn_power`) checks the estimate converges to
+the analytic complex-AWGN envelope power 2σ² (an independent ground truth,
+**not** a demod loopback) within 1 dB, and that doubling σ raises the
+measured floor by 10·log₁₀4 ≈ 6.02 dB.
+
 The differential mapping leaves the bit stream polarity-ambiguous at
 start-up (we tune in mid-burst), so the deframer hunts both polarities.
 
@@ -261,6 +275,15 @@ layer** over the full text (long CPDLC/OHMA/MIAM only decode complete).
 Bearer timeouts: VHF/VDL2 120 s, satcom/HF 660 s. `Reasm::assstat()`
 returns acarsdec's exact `assstat` strings (`complete`/`in progress`/
 `skipped`/`duplicate`/`out of sequence`).
+
+`apply_reassembly` stamps that verdict onto `AcarsCore.assstat` for
+**every** CRC-OK message that passes the reassembler (not just completed
+ones, ACARS-5.1) — so even a lone single-block message carries `skipped`.
+It surfaces in the native message JSON and in the acarsdec-JSON feed
+(`src/outputs/acarsdec_json.rs`, omitted when the message never went
+through the reassembler). That feed also now emits the per-burst `noise`
+floor field (dBFS, from `SignalQuality.noise_db`, omitted when unmeasured),
+matching acarsdec's `noise`.
 
 ## Validation / oracles
 

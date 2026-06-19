@@ -101,6 +101,15 @@ absolute D8PSK decoded 1 frame vs 17). Decision-directed differential
 is the only in-burst adaptation; an equalizer's 16-symbol training leaves
 the taps part-converged and injects more ISI than it removes at these sps.
 
+The per-symbol residuals double as an EVM (VDL2-8): a per-burst
+`snr_db = -10·log10(mean(residual²))` (small-angle PSK, `SNR ≈ 1/EVM²`,
+`evm_snr_db` in `demod.rs`) surfaced on the `Burst`/`Vdl2Frame` and into
+`SignalQuality.snr_db`. This is a pure symbol-quality metric — higher means
+cleaner decisions — not a calibrated channel SNR. `noise_db` is deliberately
+NOT exposed: the only floor available on this path is scaled by the
+selectivity-FIR / DDC decimation gain, which is not cleanly verifiable, so
+emitting it would be a fabricated number rather than a measured one.
+
 ## Gated noise-floor estimator
 
 The energy gate's EMA (`hunt`) learns the floor only from samples below
@@ -493,6 +502,33 @@ kind, details }`: `kind` is `xid` / `atn` / `avlc-<u/s-frame>` / `avlc-i`;
 expansion, ATN protocol label + nested transport JSON, and a truncated
 info-hex preview. The raw frame octets are preserved on every message.
 `fec_corrected` reports the RS-corrected octet count.
+
+For ACARS-over-AVLC frames `to_message` additionally stashes the AVLC link
+wrapper (src/dst/control) on the `AcarsCore` as `core.app["_vdl2_link"]`,
+since the ACARS path otherwise collapses to a bare `AcarsCore` that drops the
+link layer.
+
+## dumpvdl2 `decoded:json` feed (FEED-2.1)
+
+`src/outputs/dumpvdl2_json.rs::format_dumpvdl2` re-encodes a VDL2
+ACARS-over-AVLC `Message` into the nested
+`{vdl2:{app,t,freq,octets_corrected_by_fec,avlc:{src,dst,cr,poll,frame_type,
+rseq/sseq,acars:{…}}}}` object dumpvdl2 emits, so Airframes ingests it
+natively over UDP :5552. The AVLC wrapper is read back from
+`core.app["_vdl2_link"]`; the ACARS inner object uses dumpvdl2/libacars field
+names and conventions (leading-dot `reg`, 3-char `msg_num` + separate
+`msg_num_seq`, `ack` rendered as the char or `"!"` for a NAK). `app.name/ver`
+are hardcoded to the dumpvdl2 wire identity ("dumpvdl2"/"2.6.0") so the
+ingest recognizes the producer. `sig_level` (rssi) and `freq_skew` are
+emitted when present; fields xng does not track (`burst_len_octets`,
+`hdr_bits_fixed`, `idx`, `noise_level`) are omitted, not faked.
+
+Only ACARS-over-AVLC frames are emitted today — non-ACARS AVLC/XID/ATN frames
+return `None`. The serializer is pinned field-for-field against captured
+dumpvdl2 2.6.0 / libacars 2.2.1 output on the vendored 6 s off-air fixture
+(`matches_dumpvdl2_golden_for_offair_acars`, the HB-IJW downlink). Wired into
+the Airframes feed via `src/outputs/airframes.rs` (`has_serializer` +
+`serialize_datagram`).
 
 ## Validation / oracles
 
