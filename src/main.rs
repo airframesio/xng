@@ -604,8 +604,13 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Devices { filter } => commands::devices::run(&filter),
         Command::Decode { file, format, tune, output } => {
+            // "-" reads IQ from stdin (ECO-15): KiwiSDR/GNU Radio/rx_sdr pipes.
+            let is_stdin = file.as_os_str() == "-";
             let fmt = match format.as_deref() {
                 Some(f) => f.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+                None if is_stdin => anyhow::bail!(
+                    "reading IQ from stdin (-) requires an explicit --format (cf32|cs16|cs8|cu8)"
+                ),
                 None => IqFormat::from_extension(&file).ok_or_else(|| {
                     anyhow::anyhow!("cannot guess IQ format; pass --format (cf32|cs16|cs8|cu8)")
                 })?,
@@ -614,7 +619,11 @@ fn main() -> anyhow::Result<()> {
             let (mut outputs, station_ident) = output.build()?;
             outputs.airframes =
                 Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
-            let source = FileIqSource::open(&file, fmt, rate, center_hz)?;
+            let source = if is_stdin {
+                FileIqSource::open_stdin(fmt, rate, center_hz)
+            } else {
+                FileIqSource::open(&file, fmt, rate, center_hz)?
+            };
             runtime::run_session(
                 Box::new(source),
                 runtime::SessionConfig {
