@@ -109,7 +109,7 @@ pub fn default_endpoint(mode: Mode) -> Option<(&'static str, u16, Proto)> {
 /// Whether xng can currently serialize this mode into its Airframes native
 /// format. Modes without a serializer route to asf-2.0 only (for now).
 pub fn has_serializer(mode: Mode) -> bool {
-    matches!(mode, Mode::AcarsPoa)
+    matches!(mode, Mode::AcarsPoa | Mode::Vdl2)
 }
 
 /// The station-id suffix Airframes expects per mode (for `auto-suffix`).
@@ -201,7 +201,10 @@ fn serialize_datagram(msg: &Message, mode: Mode, station_id: &str) -> Option<Vec
     match mode {
         Mode::AcarsPoa => crate::outputs::acarsdec_json::format_acarsdec_with_station(msg, Some(station_id))
             .map(|v| v.to_string().into_bytes()),
-        // FEED-2.1 dumpvdl2 decoded:json, FEED-2.2 dumphfdl decoded:json land here.
+        // FEED-2.1: dumpvdl2 decoded:json for VDL2 ACARS-over-AVLC frames.
+        Mode::Vdl2 => crate::outputs::dumpvdl2_json::format_dumpvdl2(msg)
+            .map(|v| v.to_string().into_bytes()),
+        // FEED-2.2 dumphfdl decoded:json lands here (oracle-gated, see TODO).
         _ => None,
     }
 }
@@ -302,10 +305,13 @@ mod tests {
     #[test]
     fn cli_router_only_routes_serializable_modes() {
         let r = cli_router(true, "XX-TEST", &[Mode::AcarsPoa, Mode::Vdl2, Mode::Hfdl]);
-        // Only ACARS has a serializer today.
-        assert_eq!(r.routes.len(), 1);
+        // ACARS (acarsdec JSON) and VDL2 (dumpvdl2 JSON, FEED-2.1) have
+        // serializers; HFDL does not yet, so it is not routed.
+        assert_eq!(r.routes.len(), 2);
         assert_eq!(r.routes[0].mode, Mode::AcarsPoa);
         assert_eq!(r.routes[0].target.port, 5550);
+        assert_eq!(r.routes[1].mode, Mode::Vdl2);
+        assert_eq!(r.routes[1].target.port, 5552);
         assert!(cli_router(false, "XX-TEST", &[Mode::AcarsPoa]).is_empty());
     }
 

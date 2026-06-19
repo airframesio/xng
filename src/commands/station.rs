@@ -388,9 +388,9 @@ mode = "acars"
     }
 
     #[test]
-    fn vdl2_configured_but_serializer_not_ready() {
-        // VDL2's native serializer (FEED-2.1) isn't implemented yet, so the
-        // mode is not routed even when explicitly configured.
+    fn vdl2_routes_via_dumpvdl2_serializer() {
+        // VDL2's native serializer (FEED-2.1, dumpvdl2 decoded:json) is wired,
+        // so a configured VDL2 decoder routes to the VDL2 ingest (:5552).
         let toml = r#"
 station-id = "KE-KSEA"
 [outputs.airframes]
@@ -402,7 +402,9 @@ sdr = "rtl-vdl2"
 mode = "vdl2"
 "#;
         let f: StationFile = toml::from_str(toml).unwrap();
-        assert!(airframes_router(&f).is_empty());
+        let r = airframes_router(&f);
+        let target = r.resolve(xng_types::Mode::Vdl2, Some("rtl-vdl2")).expect("VDL2 routed");
+        assert_eq!(target.port, 5552);
     }
 
     #[test]

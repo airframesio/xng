@@ -279,11 +279,23 @@ fn cotp_reassemble(
 /// Convert a decoded frame into the normalized message model.
 pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Provenance) -> Message {
     let (body, crc_ok, errors) = match &f.acars {
-        Some(b) => (
-            MessageBody::Acars(b.core.clone()),
-            b.crc_ok,
-            Some(b.parity_errors),
-        ),
+        Some(b) => {
+            // ACARS-over-AVLC: the body is the shared ACARS core, but the AVLC
+            // link wrapper (src/dst/control) would otherwise be lost — the
+            // dumpvdl2-JSON feed (FEED-2.1) needs it, so stash it (namespaced)
+            // on the app object.
+            let mut core = b.core.clone();
+            let app = core.app.get_or_insert_with(|| serde_json::json!({}));
+            if let Some(o) = app.as_object_mut() {
+                o.insert(
+                    "_vdl2_link".into(),
+                    serde_json::json!({
+                        "src": f.avlc.src, "dst": f.avlc.dst, "control": f.avlc.control,
+                    }),
+                );
+            }
+            (MessageBody::Acars(core), b.crc_ok, Some(b.parity_errors))
+        }
         None => (avlc_body(&f.avlc, f.atn.as_ref()), true, None),
     };
     Message {

@@ -10,6 +10,7 @@ pub mod asf2_grpc;
 pub mod asf2_quic;
 pub mod console;
 pub mod dbinfo;
+pub mod dumpvdl2_json;
 pub mod gsmtap;
 pub mod http;
 pub mod jsonl;
