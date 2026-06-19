@@ -35,6 +35,7 @@ fn render(live: &LiveState, mode: &str) -> String {
     out.push_str("# TYPE xng_channel_level_dbfs gauge\n");
     out.push_str("# TYPE xng_samples_total counter\n");
     out.push_str("# TYPE xng_acars_messages_total counter\n");
+    out.push_str("# TYPE xng_fec_corrected_total counter\n");
     let stats = live.stats.lock().unwrap().clone();
     for (freq, frames, ok, level) in &stats {
         let labels = format!("{{mode=\"{mode}\",freq=\"{freq}\"}}");
@@ -52,6 +53,13 @@ fn render(live: &LiveState, mode: &str) -> String {
         out.push_str(&format!(
             "xng_acars_messages_total{{mode=\"{mode}\",freq=\"{freq}\",label=\"{label}\"}} {count}\n"
         ));
+    }
+    // Per-channel FEC-corrected units (ECO-7), sorted for stable output.
+    let mut fec: Vec<(u64, u64)> =
+        live.fec.lock().unwrap().iter().map(|(f, n)| (*f, *n)).collect();
+    fec.sort();
+    for (freq, n) in &fec {
+        out.push_str(&format!("xng_fec_corrected_total{{mode=\"{mode}\",freq=\"{freq}\"}} {n}\n"));
     }
     out.push_str(&format!(
         "xng_samples_total{{mode=\"{mode}\"}} {}\n",

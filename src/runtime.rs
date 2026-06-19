@@ -245,6 +245,8 @@ pub struct LiveState {
     /// dimension the flat `stats` Vec can't carry. Feeds the per-label
     /// Prometheus counter (VERIFY-9 / ACARS-5.2).
     pub acars_labels: std::sync::Mutex<std::collections::HashMap<(u64, String), u64>>,
+    /// Cumulative FEC-corrected octets/bits per channel freq (ECO-7).
+    pub fec: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
     pub spectrum: std::sync::Mutex<Option<SpectrumFrame>>,
     pub samples: std::sync::atomic::AtomicU64,
 }
@@ -262,9 +264,17 @@ impl LiveState {
         Arc::new(Self {
             stats: std::sync::Mutex::new(Vec::new()),
             acars_labels: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fec: std::sync::Mutex::new(std::collections::HashMap::new()),
             spectrum: std::sync::Mutex::new(None),
             samples: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Add `n` FEC-corrected units (octets/bits, mode-specific) for `freq`.
+    pub fn record_fec(&self, freq: u64, n: u64) {
+        if n > 0 {
+            *self.fec.lock().unwrap().entry(freq).or_insert(0) += n;
+        }
     }
 
     /// Upsert one channel's cumulative frame stats keyed by frequency. Keying
@@ -1079,6 +1089,10 @@ pub(crate) fn decode_loop(
             let (msgs, seen, ok) = dec.process(&buf[..n], *freq, &prov);
             stats[i].1 += seen;
             stats[i].2 += ok;
+            if let Some((state, _, _)) = &live {
+                let fec: u64 = msgs.iter().map(|m| m.decode.fec_corrected.unwrap_or(0) as u64).sum();
+                state.record_fec(*freq, fec);
+            }
             for mut msg in msgs {
                 if dedup.is_duplicate(&msg) {
                     continue;

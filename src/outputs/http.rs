@@ -993,6 +993,10 @@ fn geo_entities(d: &Dash) -> Vec<(&'static str, &Value)> {
     for e in d.beacons.values() {
         out.push(("beacon", e));
     }
+    // Iridium mobile-terminal positions (mt-position fixes) — IRID-6 export.
+    for e in d.iridium_devices.values() {
+        out.push(("iridium", e));
+    }
     out
 }
 
