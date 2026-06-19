@@ -4036,6 +4036,7 @@ dependencies = [
  "xng-mode-sarsat",
  "xng-mode-sonde",
  "xng-mode-stdc",
+ "xng-mode-time",
  "xng-mode-uat",
  "xng-mode-vdes",
  "xng-mode-vdl2",
@@ -4269,6 +4270,18 @@ dependencies = [
  "chrono",
  "num-complex",
  "rustfft",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-time"
+version = "0.21.0"
+dependencies = [
+ "chrono",
+ "num-complex",
  "serde",
  "serde_json",
  "xng-dsp",

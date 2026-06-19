@@ -26,6 +26,9 @@ attribution. GPL projects are listed as fact references only.
 | ARINC 622 / 745 (via libacars) | ATS envelope, ADS-C field layouts | via libacars source (MIT) |
 | "The 1090 Megahertz Riddle" (Junzi Sun, TU Delft, CC BY-SA) | Mode S/ADS-B decode procedures as published: CPR global/local algorithms + NL function, TC 19 velocity layouts, AC/ID field bit orders (Gillham/squawk), with the book's worked examples vendored as test vectors | https://mode-s.org/decode/ |
 | reveng CRC catalogue | CRC-16/KERMIT identification for ACARS BCS | https://reveng.sourceforge.io/crc-catalogue/16.htm |
+| NIST SP-432 + WWV/WWVH station pages | Time signals (xng-mode-time): WWV/WWVH carriers, 100 Hz subcarrier BCD time-code format (modified IRIG-H: 0=170ms / 1=470ms / marker=770ms, 30ms suppressed lead-in, sec-0 hole, LSB-first 1-2-4-8 weights, 60-s field map), 1000/1200 Hz tick station labels | https://www.nist.gov/pml/time-and-frequency-division/time-distribution/radio-station-wwv |
+| NRC CHU broadcast format + NTP refclock_chu (driver7) | Time signals (xng-mode-time): CHU carriers (3330/7850/14670 kHz), Bell-103 AFSK (2225/2025 Hz, 300 baud, 8N2), per-second timing, 10-byte packet (5 data + 5 redundancy), Format A (copy) / Format B (ones-complement) BCD nibble layouts | https://nrc.canada.ca/en/certifications-evaluations-standards/canadas-official-time/3-chu-broadcast-format ; https://www.eecis.udel.edu/~mills/ntp/html/drivers/driver7.html |
+| National time-service station descriptions (PTB / NPL / NICT / NTSC / VNIIFTRI / ANFR / Cagigal) | Time signals (xng-mode-time) catalog-only carriers + modulation families: WWVB 60 kHz, DCF77 77.5 kHz, MSF 60 kHz, JJY 40/60 kHz, BPM, RWM, TDF 162 kHz, RBU 66.66 kHz, YVTO | respective national metrology institutes |
 
 ## Source code used as reference or ported
 

@@ -38,7 +38,8 @@ struct Cli {
 #[derive(Args)]
 struct TuneOpts {
     /// Decode mode: acars, vdl2, hfdl, aero, aero-c, std-c, ais, adsb, iridium,
-    /// uat, sarsat, dsc, navtex, sonde, ads-l, or atcs
+    /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs, aprs, pocsag, eot, flex,
+    /// vdes, or time
     #[arg(short, long, default_value = "acars")]
     mode: String,
     /// Capture sample rate in Hz (must be an integer multiple of the
@@ -324,7 +325,8 @@ enum Command {
         #[arg(short, long)]
         gain: Option<f64>,
         /// Mode to survey: acars, vdl2, hfdl, aero, std-c, ais, adsb, iridium,
-        /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs
+        /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs, aprs, pocsag, eot,
+        /// flex, vdes, time
         #[arg(short, long, default_value = "acars")]
         mode: String,
         /// Capture sample rate in Hz (the mode's plan default when omitted)
