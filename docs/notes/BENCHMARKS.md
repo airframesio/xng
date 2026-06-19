@@ -63,6 +63,7 @@ oracle on the vendored captures; Iridium IDA exceeds gr-iridium (+32%).
 | ADS-B / Mode S | 164 | readsb 167 (98%) | modes1 @2.4 MS/s | floor (modes1 @2 MS/s) |
 | ADS-B / Mode S | 161 | dump1090-fa 162 (99%) | modes1 @2 MS/s | floor |
 | VDL2 | 44 | dumpvdl2 41 | sigidwiki | floor 42 |
+| VDL2 (2nd path) | 13 | dumpvdl2 2.6.0 12 | Opflasher 2.5 MS/s (105k slice) | floor 10 |
 | HFDL | 36 | dumphfdl 37 (97%) | 21931 kHz sigidwiki | floor 31 |
 | AIS | 48 | AIS-catcher 53 (91%) | 5 min, Sacramento | fixture floor |
 | Iridium IDA | 758 | gr-iridium 573 | 300 s Airspy R2 | oracle tests |
@@ -137,6 +138,15 @@ docs/notes/VDL2.md.
 Residual gap: none on this capture (xng leads 44 vs 41). The remaining
 RS failures on accepted bursts are soft-decision territory (per-symbol
 confidence into RS erasure marking).
+
+Second real-RF path (BENCH-2): the Opflasher off-air capture
+(`discord-opflasher-vdl1.cf32`, complex float32, **2.5 MS/s**, 144 s,
+single VDL2 channel at the capture center) — real **Air New Zealand**
+traffic (reg ZK-NNB, flight NZ0142, **ADS-C over VDL2** + AVLC). Downconverted
+to 105 kS/s and vendored as `bench/data/vdl2_opflasher_105k.cs16` (release
+asset). Head-to-head on that fixture: **xng 13 vs dumpvdl2 2.6.0 12** (same
+ZK-NNB / C8274F→2138B7 traffic) — xng leads by one, confirming the parity
+generalizes across a second antenna/RF path. CI floor 10 (`vdl2_offair2`).
 
 ## HFDL
 

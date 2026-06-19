@@ -88,6 +88,17 @@ else
   echo "skip: bench/data/vdl2_105k_conj.s16 not present (release asset)"
 fi
 
+# VDL2 (second path): Opflasher off-air capture (release asset), 2.5 MS/s
+# downconverted to 105 kS/s single channel. Head-to-head: xng 13 vs dumpvdl2
+# 2.6.0 12 on the same fixture (real Air NZ ZK-NNB ADS-C-over-VDL2). Proves the
+# ~98%+ parity generalizes across a second antenna/RF path.
+if [ -f bench/data/vdl2_opflasher_105k.cs16 ]; then
+  vdl2b=$(count bench/data/vdl2_opflasher_105k.cs16 cs16 vdl2 105000 136800000 136.800)
+  check vdl2_offair2 "$vdl2b"
+else
+  echo "skip: bench/data/vdl2_opflasher_105k.cs16 not present (release asset)"
+fi
+
 # Radiosonde: the projecthorus/radiosonde_auto_rx RS41 performance sample
 # (release asset), 96 kS/s cf32 complex float. Oracle-anchored 119/119 vs rs41mod.
 if [ -f bench/data/sonde_96k.cf32 ]; then
