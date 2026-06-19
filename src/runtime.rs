@@ -204,9 +204,9 @@ impl AisGate {
     /// rate downsample (dynamic position-report types) and content dedup from
     /// `cfg`. Non-AIS messages always pass.
     fn pass(&mut self, msg: &Message, cfg: &AisFilter, now: f64) -> bool {
-        /// Prune stale `seen` entries every N gated messages rather than on
-        /// every one — the lookup already treats expired entries as absent, so
-        /// `retain` is only for memory reclamation, not correctness.
+        /// Prune stale `seen`/`last_pos` entries every N kept messages rather
+        /// than on every one — the lookups already treat expired entries as
+        /// absent, so `retain` is only for memory reclamation, not correctness.
         const SWEEP_EVERY: u32 = 256;
         let MessageBody::Ais { msg_type, mmsi, details, .. } = &msg.body else {
             return true;
@@ -238,15 +238,28 @@ impl AisGate {
                 return false;
             }
             self.seen.insert(key, now);
-            self.sweeps += 1;
-            if self.sweeps >= SWEEP_EVERY {
-                self.sweeps = 0;
-                self.seen.retain(|_, t| now - *t < win);
-            }
         }
         // Both gates passed → record the kept position for the rate window.
         if let Some(m) = rate_mmsi {
             self.last_pos.insert(m, now);
+        }
+        // Amortized housekeeping: both maps only grow on kept messages, and the
+        // lookups above already treat an expired entry as absent, so `retain`
+        // is purely memory reclamation — run it every SWEEP_EVERY kept messages,
+        // not per message, and for whichever map's gate is enabled.
+        self.sweeps += 1;
+        if self.sweeps >= SWEEP_EVERY {
+            self.sweeps = 0;
+            if let Some(win) = cfg.dedup_window_s {
+                self.seen.retain(|_, t| now - *t < win);
+            }
+            if let Some(min) = cfg.min_interval_s {
+                // An entry older than `min` would clear the rate gate anyway, so
+                // dropping it is behaviour-preserving; this bounds last_pos to
+                // recently-active MMSIs instead of leaking one entry per vessel
+                // ever heard for the session's life.
+                self.last_pos.retain(|_, t| now - *t < min);
+            }
         }
         true
     }

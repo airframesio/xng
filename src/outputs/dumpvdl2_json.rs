@@ -85,11 +85,15 @@ pub fn format_dumpvdl2(msg: &Message) -> Option<Value> {
         s
     });
     // xng's combined 4-char msg number ("M06A") splits into the 3-char id +
-    // the sequence char dumpvdl2 reports separately. `get(..)` is char-boundary
-    // safe (None rather than a panic) — ACARS msg nums are ASCII, but a garbled
-    // frame must never panic the feed serializer.
+    // the sequence char dumpvdl2 reports separately. Split on CHAR boundaries
+    // (not byte offsets) so a garbled non-ASCII msg_num can never land mid-
+    // codepoint and silently drop the whole field — ACARS msg nums are ASCII,
+    // but the feed serializer must stay total on any input.
     let (msg_num, msg_num_seq) = match core.msg_num.as_deref() {
-        Some(m) if m.len() >= 4 => (m.get(..3).map(str::to_string), m.get(3..4).map(str::to_string)),
+        Some(m) if m.chars().count() >= 4 => (
+            Some(m.chars().take(3).collect::<String>()),
+            Some(m.chars().skip(3).take(1).collect::<String>()),
+        ),
         other => (other.map(str::to_string), None),
     };
     let mut acars = serde_json::Map::new();

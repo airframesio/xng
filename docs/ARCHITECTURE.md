@@ -155,8 +155,9 @@ a running station's dashboard endpoint for a live per-session table. The
 Prometheus endpoint emits `xng_frames_total` / `xng_frames_crc_ok_total`
 / `xng_channel_level_dbfs` per `(mode, freq)`, `xng_samples_total` per
 mode, `xng_acars_messages_total{mode,freq,label}` for per-ACARS-label
-volume, and `xng_fec_corrected_total{mode,freq}` for FEC-corrected units
-per channel. In station mode all sessions feed one shared `LiveState`
+volume (CRC-valid frames only — a garbled bad-CRC label would otherwise
+spawn unbounded junk series), and `xng_fec_corrected_total{mode,freq}` for
+FEC-corrected units per channel. In station mode all sessions feed one shared `LiveState`
 counter set (previously the served state was a never-updated copy, so
 station `/metrics` read all zeros).
 

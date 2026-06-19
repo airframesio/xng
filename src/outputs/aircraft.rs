@@ -33,6 +33,10 @@ pub(crate) struct AircraftFix {
 pub(crate) enum AircraftSource {
     #[default]
     Adsb,
+    /// ADS-B with a non-ICAO / anonymous (or non-aircraft) address — distinct
+    /// so the 1090 re-encode marks it non-ICAO (DF18 CF=1) instead of asserting
+    /// the 24-bit value is a real ICAO.
+    AdsbOther,
     /// TIS-B with an ICAO address.
     TisB,
     /// TIS-B with a non-ICAO address (track-file id) — distinct so the 1090
@@ -97,12 +101,20 @@ pub(crate) fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
             track_deg: jf(details, "true_track"),
             vertical_rate_fpm: ji(details, "vertical_rate"),
             squawk: None,
-            // UAT address qualifier → 1090 rebroadcast provenance: tisb_icao →
-            // TIS-B (ICAO addr), tisb_trackfile → TIS-B non-ICAO, adsr_other →
-            // ADS-R, everything else is native ADS-B.
+            // UAT address qualifier (DO-282B 2.2.4.5.1.2) → 1090 re-encode
+            // provenance. ICAO-addressed sources keep their class: adsb_icao →
+            // native ADS-B, tisb_icao → TIS-B, and adsr_other (qualifier 6, an
+            // ADS-R target) carries the rebroadcast aircraft's *real* ICAO, so
+            // it stays ADS-R (DF18 CF=6). The non-ICAO addresses get a non-ICAO
+            // CF so a receiver can't read the 24-bit value back as a real ICAO:
+            // tisb_trackfile → CF=5 (lossless), and adsb_other (qualifier 1,
+            // self-assigned/anonymous) → ADS-B non-ICAO (DF18 CF=1). vehicle/
+            // fixed_beacon fall through to native ADS-B as before (non-aircraft,
+            // out of scope).
             source: match details.get("address_qualifier").and_then(Value::as_str) {
                 Some("tisb_icao") => AircraftSource::TisB,
                 Some("tisb_trackfile") => AircraftSource::TisBOther,
+                Some("adsb_other") => AircraftSource::AdsbOther,
                 Some("adsr_other") => AircraftSource::AdsR,
                 _ => AircraftSource::Adsb,
             },

@@ -76,6 +76,7 @@ pub fn format_beast(msg: &Message) -> Vec<Vec<u8>> {
             use xng_mode_adsb::synth::EsSource;
             let src = match fix.source {
                 AircraftSource::Adsb => EsSource::Adsb,
+                AircraftSource::AdsbOther => EsSource::AdsbOther,
                 AircraftSource::TisB => EsSource::TisB,
                 AircraftSource::TisBOther => EsSource::TisBOther,
                 AircraftSource::AdsR => EsSource::AdsR,
@@ -298,6 +299,42 @@ mod tests {
             let b0 = es_byte0(f);
             assert_eq!(b0 >> 3, 18, "DF18 for ADS-R");
             assert_eq!(b0 & 7, 6, "CF=6 ADS-R");
+        }
+    }
+
+    // adsb_other (UAT qualifier 1, self-assigned / anonymous non-ICAO address)
+    // must NOT be re-emitted as native DF17 (which asserts a real ICAO): it
+    // synthesizes DF18 CF=1 (ADS-B, non-ICAO address) so a receiver can't merge
+    // it with a real aircraft sharing those 24 bits.
+    #[test]
+    fn uat_adsb_other_synthesizes_df18_cf1() {
+        let msg = Message {
+            mode: Mode::Uat,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 978_000_000,
+            signal: SignalQuality::default(),
+            decode: DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
+            body: MessageBody::Uat {
+                kind: "adsb".into(),
+                details: serde_json::json!({
+                    "address": "a1b2c3", "address_qualifier": "adsb_other",
+                    "geometric_altitude": 9500, "lat": 37.6189, "lon": -122.3750,
+                }),
+            },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        };
+        let frames = format_beast(&msg);
+        assert_eq!(frames.len(), 2, "even + odd position");
+        for f in &frames {
+            let b0 = es_byte0(f);
+            assert_eq!(b0 >> 3, 18, "DF18 for non-ICAO ADS-B");
+            assert_eq!(b0 & 7, 1, "CF=1 ADS-B non-ICAO");
         }
     }
 }

@@ -503,10 +503,12 @@ expansion, ATN protocol label + nested transport JSON, and a truncated
 info-hex preview. The raw frame octets are preserved on every message.
 `fec_corrected` reports the RS-corrected octet count.
 
-For ACARS-over-AVLC frames `to_message` additionally stashes the AVLC link
-wrapper (src/dst/control) on the `AcarsCore` as `core.app["_vdl2_link"]`,
-since the ACARS path otherwise collapses to a bare `AcarsCore` that drops the
-link layer.
+For ACARS-over-AVLC frames `to_message` additionally carries the AVLC link
+wrapper (src/dst/control) on the `AcarsCore`'s `#[serde(skip)]` transient
+`vdl2_link` field, since the ACARS path otherwise collapses to a bare
+`AcarsCore` that drops the link layer. The field is in-memory only — it never
+serializes into JSONL/MQTT/asf-2.0 and survives multi-block reassembly (unlike
+`app`, which the reassembler overwrites wholesale on completion).
 
 ## dumpvdl2 `decoded:json` feed (FEED-2.1)
 
@@ -515,7 +517,7 @@ ACARS-over-AVLC `Message` into the nested
 `{vdl2:{app,t,freq,octets_corrected_by_fec,avlc:{src,dst,cr,poll,frame_type,
 rseq/sseq,acars:{…}}}}` object dumpvdl2 emits, so Airframes ingests it
 natively over UDP :5552. The AVLC wrapper is read back from
-`core.app["_vdl2_link"]`; the ACARS inner object uses dumpvdl2/libacars field
+`core.vdl2_link`; the ACARS inner object uses dumpvdl2/libacars field
 names and conventions (leading-dot `reg`, 3-char `msg_num` + separate
 `msg_num_seq`, `ack` rendered as the char or `"!"` for a NAK). `app.name/ver`
 are hardcoded to the dumpvdl2 wire identity ("dumpvdl2"/"2.6.0") so the

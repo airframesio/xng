@@ -21,8 +21,12 @@ const NZ: f64 = 15.0;
 /// or ADS-R, so a UAT 978 target keeps its provenance when replotted on 1090.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EsSource {
-    /// Native ADS-B — DF17, CA=5.
+    /// Native ADS-B with an ICAO address — DF17, CA=5.
     Adsb,
+    /// Native ADS-B with a non-ICAO / anonymous address — DF18 CF=1. Keeps the
+    /// "this 24-bit field is not a real ICAO" fact that the DF17 path would
+    /// erase (a receiver would otherwise read the anonymous id as a real ICAO).
+    AdsbOther,
     /// TIS-B with an ICAO address — DF18 CF=2 (fine TIS-B).
     TisB,
     /// TIS-B with a non-ICAO address (track-file id) — DF18 CF=5. Keeps the
@@ -37,6 +41,7 @@ impl EsSource {
     fn df_cf(self) -> (u8, u8) {
         match self {
             EsSource::Adsb => (17, 5),      // CA=5 level-2 transponder
+            EsSource::AdsbOther => (18, 1), // CF=1 ADS-B, non-ICAO / anonymous address
             EsSource::TisB => (18, 2),      // CF=2 fine TIS-B, ICAO address
             EsSource::TisBOther => (18, 5), // CF=5 fine TIS-B, non-ICAO address
             EsSource::AdsR => (18, 6),      // CF=6 ADS-R rebroadcast
@@ -265,6 +270,7 @@ mod tests {
         use crate::decode::df18_cf_class;
         let (icao, lat, lon) = (0xA12345, 37.6189, -122.3750);
         for (src, want_class, want_key) in [
+            (EsSource::AdsbOther, "ADS-B", "non_icao"),
             (EsSource::TisB, "TIS-B", "tisb_icao"),
             (EsSource::TisBOther, "TIS-B", "tisb_non_icao"),
             (EsSource::AdsR, "ADS-R", "adsr_icao"),

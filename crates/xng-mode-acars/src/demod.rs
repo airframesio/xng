@@ -38,6 +38,13 @@ const NOISE_ALPHA: f32 = 0.002;
 /// can't drag the floor up to the carrier level. The pure-noise tail above
 /// this is negligible (~e^-8), so the silence estimate stays ~unbiased.
 const NOISE_GATE: f32 = 8.0;
+/// Per-(above-gate-)sample multiplicative up-creep that lets a too-low frozen
+/// floor re-converge (see `process`). Deliberately tiny and decoupled from
+/// `NOISE_ALPHA`: this fires on every in-burst sample at the 24 kHz channel
+/// rate, so at 2e-5 a worst-case ~250 ms contiguous burst lifts the floor only
+/// ~0.5 dB (negligible, reporting-only), while a genuinely stuck floor still
+/// recovers over a few seconds of channel activity.
+const NOISE_RECOVER: f32 = 2.0e-5;
 
 pub struct MskDemod {
     mix: Nco,
@@ -103,9 +110,10 @@ impl MskDemod {
                 // re-converge — an anomalously low first sample (a deep fade)
                 // would otherwise leave every later silence sample above the
                 // gate and freeze the floor low for the whole session,
-                // inflating snr_db. Mirrors the VDL2 demod's recovery; a
-                // correct floor is dominated by the silence EMA above.
-                self.noise *= 1.0 + NOISE_ALPHA * 0.1;
+                // inflating snr_db. NOISE_RECOVER is sized for the per-sample
+                // channel rate (see its doc); a correct floor is dominated by
+                // the silence EMA above and only creeps <1 dB on long bursts.
+                self.noise *= 1.0 + NOISE_RECOVER;
             }
             self.mixed.push(Complex::new(env - self.dc, 0.0));
         }

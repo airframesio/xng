@@ -105,6 +105,15 @@ fn push_trail(o: &mut serde_json::Map<String, Value>, lat: f64, lon: f64) {
     }
 }
 
+/// Read a `[lat, lon]` trail point (as written by [`push_trail`]) into a typed
+/// `(lat, lon)` pair, or `None` if it is not a 2-element numeric array. The one
+/// place the `[lat, lon]` storage convention is decoded — the three geo
+/// exporters share it instead of each re-indexing the raw array.
+fn trail_lat_lon(p: &Value) -> Option<(f64, f64)> {
+    let a = p.as_array()?;
+    Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))
+}
+
 fn now_s() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
@@ -218,18 +227,26 @@ fn sanitize_id(s: &str) -> String {
     s.chars().filter(|c| !c.is_control() && !matches!(c, '<' | '>' | '"' | '\'' | '&')).collect()
 }
 
-/// Authority ranking of a readsb `ac_type` (addrtype) for provenance merges:
-/// native ADS-B (direct ES) is the most authoritative, then ADS-R rebroadcast,
-/// then TIS-B, then bare Mode S surveillance, then unknown. A lower-ranked
-/// frame must never overwrite a higher-ranked class already recorded.
+/// Authority ranking of a readsb `ac_type` (addrtype) for provenance merges,
+/// following readsb's own addrtype trust order (`track.c`, where the lower
+/// enum value is more trusted and bare Mode S sorts between TIS-B-ICAO and the
+/// anonymous `*_other` classes). A lower-ranked frame must never overwrite a
+/// higher-ranked class already recorded. This is a *total* order — every
+/// distinct addrtype string has a distinct rank, so the strict `>` guard in
+/// `merge_aircraft` is deterministic and cannot flip-flop between two
+/// equal-rank-but-different labels for the same aircraft.
 fn ac_type_rank(t: &str) -> u8 {
     match t {
-        "adsb_icao" | "adsb_icao_nt" => 5,
-        "adsb_other" => 4,
-        "adsr_icao" | "adsr_other" => 3,
-        "tisb_icao" | "tisb_other" | "tisb_trackfile" => 2,
-        "mode_s" => 1,
-        _ => 0,
+        "adsb_icao" => 9,      // direct ES, real ICAO — most authoritative
+        "adsb_icao_nt" => 8,   // direct ES, non-transponder, real ICAO
+        "adsr_icao" => 7,      // ADS-R rebroadcast, real ICAO
+        "tisb_icao" => 6,      // TIS-B, real ICAO
+        "mode_s" => 5,         // bare surveillance (readsb sorts it here)
+        "adsb_other" => 4,     // direct ES, anonymous / non-ICAO address
+        "adsr_other" => 3,     // ADS-R, non-ICAO address
+        "tisb_trackfile" => 2, // TIS-B, track-file id
+        "tisb_other" => 1,     // TIS-B, non-ICAO address
+        _ => 0,                // unknown / reserved
     }
 }
 
@@ -371,6 +388,22 @@ fn fold_entity(aircraft: &mut HashMap<String, Value>, survivor: &str, other: Val
     }
     for (k, v) in oo {
         if k == "msgs" || k == "sources" || k == "id" {
+            continue;
+        }
+        // ac_type must not downgrade on coalescence either: keep whichever of
+        // survivor/other has the more authoritative class. The generic
+        // survivor-wins `or_insert_with` below would otherwise let a folded-in
+        // mode_s survivor swallow an adsb_icao from `other` (the per-frame guard
+        // in merge_aircraft only protects single-message updates, not folds).
+        if k == "ac_type" {
+            let other_rank = v.as_str().map(ac_type_rank).unwrap_or(0);
+            let keep_other = match s.get("ac_type").and_then(Value::as_str) {
+                Some(cur) => other_rank > ac_type_rank(cur),
+                None => true,
+            };
+            if keep_other {
+                s.insert(k.clone(), v.clone());
+            }
             continue;
         }
         s.entry(k.clone()).or_insert_with(|| v.clone());
@@ -1057,8 +1090,8 @@ fn export_geojson(d: &Dash) -> String {
             .map(|t| {
                 t.iter()
                     .filter_map(|p| {
-                        let a = p.as_array()?;
-                        Some(json!([a.get(1)?.as_f64()?, a.first()?.as_f64()?])) // [lat,lon] → [lon,lat]
+                        let (la, lo) = trail_lat_lon(p)?;
+                        Some(json!([lo, la])) // [lat,lon] → [lon,lat]
                     })
                     .collect()
             })
@@ -1107,12 +1140,7 @@ fn export_gpx(d: &Dash) -> String {
             .get("trail")
             .and_then(Value::as_array)
             .map(|t| {
-                t.iter()
-                    .filter_map(|p| {
-                        let a = p.as_array()?;
-                        Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?)) // stored [lat, lon]
-                    })
-                    .collect()
+                t.iter().filter_map(trail_lat_lon).collect()
             })
             .unwrap_or_default();
         if pts.len() > 1 {
@@ -1158,9 +1186,8 @@ fn export_kml(d: &Dash) -> String {
             .map(|t| {
                 t.iter()
                     .filter_map(|p| {
-                        let a = p.as_array()?;
-                        // stored [lat, lon] → KML "lon,lat"
-                        Some(format!("{},{}", a.get(1)?.as_f64()?, a.first()?.as_f64()?))
+                        let (la, lo) = trail_lat_lon(p)?;
+                        Some(format!("{lo},{la}")) // stored [lat, lon] → KML "lon,lat"
                     })
                     .collect()
             })
@@ -1682,6 +1709,13 @@ mod tests {
         assert_eq!(type_of(&d, "aa11bb"), "adsb_icao", "adsr must not downgrade native adsb");
         update(&mut d, &modes(17, "AA11BB", None));
         assert_eq!(type_of(&d, "aa11bb"), "adsb_icao", "no flip-flop on the next native frame");
+        // Intra-class stability (total-order ranking): a non-ICAO TIS-B frame
+        // must not flip an already-recorded ICAO TIS-B label, even though both
+        // are "TIS-B" — distinct ranks make it deterministic regardless of order.
+        update(&mut d, &modes(18, "C0FFEE", Some(json!({"source_addr_type": "tisb_icao"}))));
+        assert_eq!(type_of(&d, "c0ffee"), "tisb_icao");
+        update(&mut d, &modes(18, "C0FFEE", Some(json!({"source_addr_type": "tisb_non_icao"}))));
+        assert_eq!(type_of(&d, "c0ffee"), "tisb_icao", "non-ICAO TIS-B must not flip ICAO TIS-B");
     }
 
     #[test]
