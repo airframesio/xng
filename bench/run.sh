@@ -117,14 +117,15 @@ else
   echo "skip: bench/data/navtex_62500.cs16 not present (release asset)"
 fi
 
-# ACARS (POA): Opflasher off-air capture (release asset), 24 kS/s cs16, the
-# single active POA channel downconverted to baseband. CRC-OK gate. Head-to-head
-# on the same signal: xng 13 vs acarsdec 3.7 9 (real Korean Air HL8537 traffic).
-if [ -f bench/data/acars_24k.cs16 ]; then
-  acars=$(count_crc bench/data/acars_24k.cs16 cs16 acars 24000 131500000 131.500)
+# ACARS (POA): Opflasher off-air capture (release asset), the single active POA
+# channel downconverted 3.0 MS/s -> 100 kS/s cs16. CRC-OK gate. Fair head-to-head
+# on the same capture (acarsdec fed a channel-limited 12.5 kHz AM WAV): xng 16
+# CRC-OK vs acarsdec 3.7 17 clean — comparable (real Korean Air HL8537 traffic).
+if [ -f bench/data/acars_100k.cs16 ]; then
+  acars=$(count_crc bench/data/acars_100k.cs16 cs16 acars 100000 131500000 131.500)
   check acars_offair "$acars"
 else
-  echo "skip: bench/data/acars_24k.cs16 not present (release asset)"
+  echo "skip: bench/data/acars_100k.cs16 not present (release asset)"
 fi
 
 exit $fail

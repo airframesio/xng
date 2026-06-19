@@ -53,8 +53,9 @@ Per-mode coverage matrix (✓ = present):
 | POCSAG/FLEX/DSC/EOT/ADS-L/ATCS/VDES | — | ✓ | ✓ | spec / multimon-ng (facts) |
 
 Sensitivity targets, where measured: ADS-B ≥ 98% of readsb; AIS ~91% of
-AIS-catcher (deep-fade tail); HFDL ~97% of dumphfdl; VDL2 + ACARS *lead* their
-oracle on the vendored captures; Iridium IDA exceeds gr-iridium (+32%).
+AIS-catcher (deep-fade tail); HFDL ~97% of dumphfdl; VDL2 leads dumpvdl2 on both
+vendored captures; ACARS comparable to acarsdec (16 vs 17 clean); Iridium IDA
+exceeds gr-iridium (+32%).
 
 ## Results
 
@@ -70,7 +71,7 @@ oracle on the vendored captures; Iridium IDA exceeds gr-iridium (+32%).
 | Radiosonde (RS41) | 119 | rs1729 `rs41mod` 119 (100%) | radiosonde_auto_rx 96 kS/s | floor 110 |
 | NAVTEX | 29 | fldigi/YaND (real USCG msg, char-identical) | SDRplay navtex.zip 62.5 kS/s | floor 25 |
 | UAT 978 | 879 CRC-OK | (live; no oracle on this capture) | live 50 s, KSMF (not vendored) | — |
-| ACARS (POA) | 13 CRC-OK | acarsdec 3.7 9 | Opflasher 3.0 MS/s (24k slice) | floor 10 |
+| ACARS (POA) | 16 CRC-OK | acarsdec 3.7 17 clean | Opflasher 3.0 MS/s (100k slice) | floor 13 |
 
 ## ADS-B / Mode S
 
@@ -268,23 +269,27 @@ the capture center) carries one aircraft's maintenance download — real **Korea
 Air** traffic, reg **HL8537**, flight **KE0402** (Sydney YSSY → Seoul RKSI,
 17 Jun 2026), H1 `#CFB`/`#DFB` ARINC-622/Boeing maintenance + `5V`.
 
-For CI the channel is downconverted to baseband and decimated 3.0 MS/s → 24 kS/s
-(integer /125), vendored as `bench/data/acars_24k.cs16` (release asset). xng
-decodes **13 CRC-OK** on the slice (15 on the full-rate file; the two weakest are
-lost to the decimation lowpass). CI floor 10, gated on CRC-OK frames (ACARS also
-emits bad-CRC frames, which are noise-dependent).
+For CI the channel is downconverted to baseband and decimated 3.0 MS/s → 100 kS/s
+(polyphase, gentle anti-alias so xng's own DDC does the final channelization),
+vendored as `bench/data/acars_100k.cs16` (release asset). xng decodes **16
+CRC-OK** on the slice (≥ the 15 on the full-rate file). CI floor 13, gated on
+CRC-OK frames (ACARS also emits bad-CRC frames, which are noise-dependent).
 
-Head-to-head on the same signal (the AM-detected channel resampled to acarsdec's
-12.5 kHz WAV input): **xng 13 vs acarsdec 3.7 9** — xng leads, decoding the same
-HL8537 H1 maintenance blocks (sublabels C36I–M / D57A–C match field-for-field)
-plus the weaker frames acarsdec misses. This is xng's first real-RF ACARS gate
-(previously ACARS was loopback + field-exact only — the long-deferred ACARS-4.3).
+Fair head-to-head on the same capture, each decoder fed its native input —
+acarsdec gets a **channel-limited** 12.5 kHz AM WAV (the complex baseband
+resampled to 12.5 kHz *then* envelope-detected; detecting the wideband envelope
+first gives acarsdec garbage): **xng 16 CRC-OK vs acarsdec 3.7 17 clean** —
+comparable, acarsdec ahead by one weak frame, both decoding the same HL8537 H1
+maintenance blocks (sublabels C36I–M / D57A–C). This is xng's first real-RF
+ACARS gate (previously ACARS was loopback + field-exact only — the long-deferred
+ACARS-4.3). *(An earlier draft reported "xng 13 vs acarsdec 9"; that undercounted
+acarsdec because its WAV was the full-band envelope, not the channel — corrected.)*
 
 Reproduce:
 
 ```
-xng decode bench/data/acars_24k.cs16 -f cs16 -m acars -r 24000 -c 131500000 --channels 131.500
-acarsdec -f acars_12k5.wav -o1     # AM-detected channel resampled to 12.5 kHz mono WAV
+xng decode bench/data/acars_100k.cs16 -f cs16 -m acars -r 100000 -c 131500000 --channels 131.500
+acarsdec -f acars_12k5.wav -o1     # channel-limited 12.5 kHz mono AM WAV (resample complex, then abs)
 ```
 
 ## Synthetic demod validation (round 5/6)

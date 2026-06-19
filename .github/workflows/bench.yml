@@ -16,9 +16,9 @@ jobs:
         run: sudo apt install -y libsoapysdr-dev protobuf-compiler
       - name: Build
         run: cargo build --release
-      - name: Fetch AIS fixture (release asset)
+      - name: Fetch off-air fixtures (release assets)
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download bench-fixtures-v1 -p ais_96k.cs16 -p vdl2_105k_conj.s16 -p hfdl_48k.cs16 -p adsb_quiet_24m.cu8 -D bench/data/
+        run: gh release download bench-fixtures-v1 -p ais_96k.cs16 -p vdl2_105k_conj.s16 -p vdl2_opflasher_105k.cs16 -p hfdl_48k.cs16 -p adsb_quiet_24m.cu8 -p acars_100k.cs16 -p sonde_96k.cf32 -p navtex_62500.cs16 -D bench/data/
       - name: Decode-count regression gate
         run: bash bench/run.sh
