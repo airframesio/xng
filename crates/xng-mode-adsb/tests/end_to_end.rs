@@ -47,6 +47,44 @@ fn decodes_two_published_frames_at_2msps() {
     assert_eq!(frames[1].altitude_ft, Some(38_000));
 }
 
+// XM-1: every decoded frame carries a finite noise floor + SNR, and the SNR
+// falls when more noise is mixed into the same signal. We deliberately do NOT
+// assert an absolute dBFS value against dump1090 (no calibrated numeric oracle
+// for the floor) — only the measurement's internal consistency + ordering.
+#[test]
+fn frame_snr_is_finite_and_drops_with_more_noise() {
+    let build = |noise_amp: f32| -> Vec<Complex<f32>> {
+        let mut iq = vec![Complex::new(0.0f32, 0.0f32); 1000];
+        iq.extend(frame_iq(&POS_FRAME, 2, 0.6));
+        iq.extend(vec![Complex::new(0.0, 0.0); 2000]);
+        let mut noise = Noise(0x1234_5678_9abc_def0);
+        for s in &mut iq {
+            *s += Complex::new(noise.next() * noise_amp, noise.next() * noise_amp);
+        }
+        iq
+    };
+    let decode = |iq: &[Complex<f32>]| {
+        let mut dec = AdsbDecoder::new(2_000_000.0).unwrap();
+        let mut frames = Vec::new();
+        for chunk in iq.chunks(777) {
+            frames.extend(dec.process(chunk));
+        }
+        frames
+    };
+
+    let quiet = decode(&build(0.01));
+    assert!(!quiet.is_empty(), "frame decodes at low noise");
+    let f = &quiet[0];
+    assert!(f.level_dbfs.is_finite() && f.noise_dbfs.is_finite(), "{f:?}");
+    let snr_quiet = f.level_dbfs - f.noise_dbfs;
+    assert!(snr_quiet > 0.0, "signal sits above the floor: {snr_quiet}");
+
+    let noisy = decode(&build(0.06));
+    let g = noisy.first().expect("frame still decodes at higher noise");
+    let snr_noisy = g.level_dbfs - g.noise_dbfs;
+    assert!(snr_noisy < snr_quiet, "more noise → lower SNR: {snr_noisy} vs {snr_quiet}");
+}
+
 #[test]
 fn works_at_higher_sample_rates() {
     let mut iq = vec![Complex::new(0.0f32, 0.0f32); 500];

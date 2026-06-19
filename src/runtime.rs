@@ -17,6 +17,19 @@ use xng_mode_hfdl::HfdlChannelDecoder;
 use xng_mode_iridium::{IridiumChannelDecoder, IridiumWidebandDecoder};
 use xng_mode_stdc::StdcChannelDecoder;
 use xng_mode_vdl2::Vdl2ChannelDecoder;
+// New-mode decode cores (IQ demod + ChannelDecoder + to_message per crate).
+use xng_mode_adsl::AdslChannelDecoder;
+use xng_mode_atcs::AtcsChannelDecoder;
+use xng_mode_aprs::AprsChannelDecoder;
+use xng_mode_dsc::DscChannelDecoder;
+use xng_mode_eot::EotChannelDecoder;
+use xng_mode_flex::FlexChannelDecoder;
+use xng_mode_navtex::NavtexChannelDecoder;
+use xng_mode_pocsag::PocsagChannelDecoder;
+use xng_mode_vdes::VdesChannelDecoder;
+use xng_mode_sarsat::SarsatChannelDecoder;
+use xng_mode_sonde::SondeChannelDecoder;
+use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
 
@@ -41,6 +54,10 @@ pub struct OutputConfig {
     pub beast: Option<String>,
     /// NMEA (AIVDM) TCP server address.
     pub nmea_tcp: Option<String>,
+    /// NMEA (AIVDM) UDP push target (host:port).
+    pub nmea_udp: Option<String>,
+    /// Prefix NMEA output with a tag-block (`\s:<station>,c:<ts>*HH\`).
+    pub nmea_tag_blocks: bool,
     /// GSMTAP/UDP target for Iridium GSM frames (Wireshark).
     pub gsmtap: Option<String>,
     /// Iridium satellite-name matching TLE source ("auto" or a path).
@@ -51,6 +68,13 @@ pub struct OutputConfig {
     pub mqtt: Option<String>,
     /// MQTT topic prefix (messages publish to `<prefix>/<mode>`).
     pub mqtt_topic: String,
+    /// Per-mode Airframes feed router (legacy per-port native-format push;
+    /// asf-2.0 multiplexes every mode separately under the canonical ident).
+    pub airframes: Option<crate::outputs::airframes::AirframesRouter>,
+    /// Own-ship MMSI: when set (with a station `receiver-pos`), an AIVDO Type 1
+    /// position report is emitted periodically so chart plotters show the
+    /// station (AIS-5c).
+    pub own_ship_mmsi: Option<u32>,
 }
 
 pub struct SessionConfig {
@@ -64,9 +88,13 @@ pub struct SessionConfig {
     pub receiver_pos: Option<(f64, f64)>,
     /// ACARS label filter applied before messages reach the bus.
     pub label_filter: LabelFilter,
+    /// AIS type/MMSI filter + rate downsample + content dedup (AIS-5h).
+    pub ais_filter: AisFilter,
     /// Demod effort: Max scans every timing grid (file analysis);
     /// Live trims to a real-time budget for embedded hardware.
     pub demod_effort: DemodEffort,
+    /// VDL2 CFO reject (ppm); `None` disables it (VDL2-7).
+    pub max_ppm: Option<f64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -110,12 +138,145 @@ impl LabelFilter {
     }
 }
 
+/// Output-side AIS shaping (AIS-5h): keep/drop by message type and MMSI,
+/// rate-downsample dynamic position reports, and drop content-duplicate
+/// re-reports. Non-AIS messages always pass. The static keep/drop lives here
+/// (pure, testable); the time-stateful rate + dedup parts run in [`AisGate`].
+#[derive(Clone, Default)]
+pub struct AisFilter {
+    /// When non-empty, only these AIS message types pass.
+    pub include_types: Vec<u8>,
+    /// Types dropped even if included.
+    pub exclude_types: Vec<u8>,
+    /// When non-empty, only these MMSIs pass.
+    pub include_mmsi: Vec<u32>,
+    /// MMSIs dropped even if included.
+    pub exclude_mmsi: Vec<u32>,
+    /// Minimum seconds between dynamic position reports per MMSI; `None` off.
+    pub min_interval_s: Option<f64>,
+    /// Drop a `(mmsi, content)` that repeats within this many seconds; `None` off.
+    pub dedup_window_s: Option<f64>,
+}
+
+impl AisFilter {
+    /// Static keep/drop on message type + MMSI (include-then-exclude). Non-AIS
+    /// bodies always pass.
+    pub fn allows(&self, msg: &Message) -> bool {
+        let (mt, mmsi) = match &msg.body {
+            MessageBody::Ais { msg_type, mmsi, .. } => (*msg_type, *mmsi),
+            _ => return true,
+        };
+        if let Some(t) = mt {
+            if !self.include_types.is_empty() && !self.include_types.contains(&t) {
+                return false;
+            }
+            if self.exclude_types.contains(&t) {
+                return false;
+            }
+        }
+        if let Some(m) = mmsi {
+            if !self.include_mmsi.is_empty() && !self.include_mmsi.contains(&m) {
+                return false;
+            }
+            if self.exclude_mmsi.contains(&m) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Per-session time-stateful half of [`AisFilter`]: rate downsample + content
+/// dedup. Keyed on MMSI / decoded content so it generalizes to the cross-mode
+/// dedup (XM-5) later.
+#[derive(Default)]
+struct AisGate {
+    /// MMSI → time (s) of the last *kept* dynamic position report.
+    last_pos: std::collections::HashMap<u32, f64>,
+    /// content hash → time (s) last seen.
+    seen: std::collections::HashMap<u64, f64>,
+    /// Messages since the last `seen` sweep, for amortized stale-entry pruning.
+    sweeps: u32,
+}
+
+impl AisGate {
+    /// True to keep `msg`; `now` is the message time in seconds. Applies the
+    /// rate downsample (dynamic position-report types) and content dedup from
+    /// `cfg`. Non-AIS messages always pass.
+    fn pass(&mut self, msg: &Message, cfg: &AisFilter, now: f64) -> bool {
+        /// Prune stale `seen`/`last_pos` entries every N kept messages rather
+        /// than on every one — the lookups already treat expired entries as
+        /// absent, so `retain` is only for memory reclamation, not correctness.
+        const SWEEP_EVERY: u32 = 256;
+        let MessageBody::Ais { msg_type, mmsi, details, .. } = &msg.body else {
+            return true;
+        };
+        // Rate downsample: thin frequent dynamic position reports per vessel.
+        // Decide here, but DON'T advance the per-MMSI clock yet — a message
+        // dropped by the dedup stage below was never emitted, so it must not
+        // reset the rate window (else a genuinely new fix arriving shortly
+        // after a dedup-dropped duplicate would be wrongly throttled).
+        let rate_mmsi = match (cfg.min_interval_s, *mmsi) {
+            (Some(min), Some(m)) if matches!(msg_type, Some(1 | 2 | 3 | 18 | 19 | 27)) => {
+                if self.last_pos.get(&m).is_some_and(|&last| now - last < min) {
+                    return false;
+                }
+                Some(m)
+            }
+            _ => None,
+        };
+        // Content dedup: collapse identical (mmsi, type, decoded content)
+        // within the window (multi-receiver echoes, repeated static reports).
+        if let Some(win) = cfg.dedup_window_s {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            mmsi.hash(&mut h);
+            msg_type.hash(&mut h);
+            details.as_ref().map(|d| d.to_string()).unwrap_or_default().hash(&mut h);
+            let key = h.finish();
+            if self.seen.get(&key).is_some_and(|&t| now - t < win) {
+                return false;
+            }
+            self.seen.insert(key, now);
+        }
+        // Both gates passed → record the kept position for the rate window.
+        if let Some(m) = rate_mmsi {
+            self.last_pos.insert(m, now);
+        }
+        // Amortized housekeeping: both maps only grow on kept messages, and the
+        // lookups above already treat an expired entry as absent, so `retain`
+        // is purely memory reclamation — run it every SWEEP_EVERY kept messages,
+        // not per message, and for whichever map's gate is enabled.
+        self.sweeps += 1;
+        if self.sweeps >= SWEEP_EVERY {
+            self.sweeps = 0;
+            if let Some(win) = cfg.dedup_window_s {
+                self.seen.retain(|_, t| now - *t < win);
+            }
+            if let Some(min) = cfg.min_interval_s {
+                // An entry older than `min` would clear the rate gate anyway, so
+                // dropping it is behaviour-preserving; this bounds last_pos to
+                // recently-active MMSIs instead of leaking one entry per vessel
+                // ever heard for the session's life.
+                self.last_pos.retain(|_, t| now - *t < min);
+            }
+        }
+        true
+    }
+}
+
 const READ_CHUNK: usize = 65_536;
 
 /// Live session state shared with the TUI.
 pub struct LiveState {
     /// Per channel: (freq_hz, frames, crc_ok, level_dbfs).
     pub stats: std::sync::Mutex<Vec<(u64, u64, u64, f32)>>,
+    /// Decoded ACARS message tally keyed by `(freq_hz, label)` — the
+    /// dimension the flat `stats` Vec can't carry. Feeds the per-label
+    /// Prometheus counter (VERIFY-9 / ACARS-5.2).
+    pub acars_labels: std::sync::Mutex<std::collections::HashMap<(u64, String), u64>>,
+    /// Cumulative FEC-corrected octets/bits per channel freq (ECO-7).
+    pub fec: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
     pub spectrum: std::sync::Mutex<Option<SpectrumFrame>>,
     pub samples: std::sync::atomic::AtomicU64,
 }
@@ -132,9 +293,35 @@ impl LiveState {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             stats: std::sync::Mutex::new(Vec::new()),
+            acars_labels: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fec: std::sync::Mutex::new(std::collections::HashMap::new()),
             spectrum: std::sync::Mutex::new(None),
             samples: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Add `n` FEC-corrected units (octets/bits, mode-specific) for `freq`.
+    pub fn record_fec(&self, freq: u64, n: u64) {
+        if n > 0 {
+            *self.fec.lock().unwrap().entry(freq).or_insert(0) += n;
+        }
+    }
+
+    /// Upsert one channel's cumulative frame stats keyed by frequency. Keying
+    /// by freq (not the per-session channel index) lets several station
+    /// sessions — each numbering its channels from 0 — share one `LiveState`
+    /// without clobbering each other's rows.
+    pub fn record_channel(&self, freq: u64, frames: u64, crc_ok: u64, level: f32) {
+        let mut s = self.stats.lock().unwrap();
+        match s.iter_mut().find(|e| e.0 == freq) {
+            Some(e) => *e = (freq, frames, crc_ok, level),
+            None => s.push((freq, frames, crc_ok, level)),
+        }
+    }
+
+    /// Tally one decoded ACARS message under `(freq, label)`.
+    pub fn record_acars_label(&self, freq: u64, label: &str) {
+        *self.acars_labels.lock().unwrap().entry((freq, label.to_string())).or_insert(0) += 1;
     }
 }
 
@@ -150,6 +337,18 @@ pub(crate) enum ModeChannel {
     Hfdl(HfdlChannelDecoder),
     Iridium(IridiumChannelDecoder),
     IridiumWide(IridiumWidebandDecoder),
+    Uat(UatChannelDecoder),
+    Sarsat(SarsatChannelDecoder),
+    Dsc(DscChannelDecoder),
+    Navtex(NavtexChannelDecoder),
+    Aprs(AprsChannelDecoder),
+    Pocsag(PocsagChannelDecoder),
+    Eot(EotChannelDecoder),
+    Flex(FlexChannelDecoder),
+    Vdes(VdesChannelDecoder),
+    Sonde(SondeChannelDecoder),
+    Adsl(AdslChannelDecoder),
+    Atcs(AtcsChannelDecoder),
 }
 
 impl ModeChannel {
@@ -159,6 +358,7 @@ impl ModeChannel {
         offset: f64,
         freq: u64,
         effort: DemodEffort,
+        max_ppm: Option<f64>,
     ) -> Result<Self, String> {
         match mode {
             Mode::AcarsPoa => Ok(Self::Acars(AcarsChannelDecoder::new(sample_rate, offset)?)),
@@ -167,7 +367,11 @@ impl ModeChannel {
                 d.set_max_effort(effort == DemodEffort::Max);
                 Ok(Self::Ais(d))
             }
-            Mode::Vdl2 => Ok(Self::Vdl2(Vdl2ChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Vdl2 => {
+                let mut d = Vdl2ChannelDecoder::new(sample_rate, offset)?;
+                d.set_max_ppm(max_ppm);
+                Ok(Self::Vdl2(d))
+            }
             Mode::AeroL => Ok(Self::Aero(AeroChannelDecoder::new(sample_rate, offset)?)),
             Mode::AeroC => Ok(Self::AeroBurst(AeroBurstDecoder::new(sample_rate, offset)?)),
             Mode::StdC => Ok(Self::StdC(StdcChannelDecoder::new(sample_rate, offset)?)),
@@ -192,6 +396,28 @@ impl ModeChannel {
                     AdsbDecoder::new(sample_rate)?
                 }))
             }
+            // UAT 978 MHz is wideband like ADS-B: it consumes the whole capture.
+            Mode::Uat => {
+                if offset.abs() > 1e-6 {
+                    return Err("UAT uses the whole capture: tune -c to 978.000M and pass --channels 978".into());
+                }
+                Ok(Self::Uat(UatChannelDecoder::new(sample_rate)?))
+            }
+            Mode::Sarsat => Ok(Self::Sarsat(SarsatChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Dsc => Ok(Self::Dsc(DscChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Navtex => Ok(Self::Navtex(NavtexChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Sonde => Ok(Self::Sonde(SondeChannelDecoder::new(sample_rate, offset)?)),
+            Mode::AdsL => Ok(Self::Adsl(AdslChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Atcs => Ok(Self::Atcs(AtcsChannelDecoder::new(sample_rate, offset)?)),
+            Mode::Aprs => Ok(Self::Aprs(AprsChannelDecoder::new(sample_rate, offset)?)),
+            // POCSAG transmits at 512/1200/2400 Bd; 1200 is the most common.
+            // (Per-session baud selection is a follow-up config knob.)
+            Mode::Pocsag => Ok(Self::Pocsag(PocsagChannelDecoder::new(sample_rate, offset, 1200)?)),
+            Mode::Eot => Ok(Self::Eot(EotChannelDecoder::new(sample_rate, offset)?)),
+            // FLEX: baud 0 = auto-detect the rate from the Sync 1 A-code
+            // (1600 2-FSK / 3200 / 6400 4-FSK) — real US paging is 4-level.
+            Mode::Flex => Ok(Self::Flex(FlexChannelDecoder::new(sample_rate, offset, 0)?)),
+            Mode::Vdes => Ok(Self::Vdes(VdesChannelDecoder::new(sample_rate, offset)?)),
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -204,7 +430,18 @@ impl ModeChannel {
             Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
             Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
             Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
-            Mode::Adsb => 0.0, // wideband: offset must be 0, no DDC
+            Mode::Adsb | Mode::Uat => 0.0, // wideband: offset must be 0, no DDC
+            Mode::Sarsat => xng_mode_sarsat::CHANNEL_PASSBAND_HZ,
+            Mode::Dsc => xng_mode_dsc::CHANNEL_PASSBAND_HZ,
+            Mode::Navtex => xng_mode_navtex::CHANNEL_PASSBAND_HZ,
+            Mode::Sonde => xng_mode_sonde::CHANNEL_PASSBAND_HZ,
+            Mode::AdsL => xng_mode_adsl::CHANNEL_PASSBAND_HZ,
+            Mode::Atcs => xng_mode_atcs::CHANNEL_PASSBAND_HZ,
+            Mode::Aprs => xng_mode_aprs::CHANNEL_PASSBAND_HZ,
+            Mode::Pocsag => xng_mode_pocsag::CHANNEL_PASSBAND_HZ,
+            Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
+            Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
+            Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -220,6 +457,18 @@ impl ModeChannel {
             Self::Iridium(_) => xng_mode_iridium::CHANNEL_RATE,
             Self::IridiumWide(_) => xng_mode_iridium::CHANNEL_RATE,
             Self::Adsb(_) => 2_000_000.0,
+            Self::Uat(_) => xng_mode_uat::CHANNEL_RATE,
+            Self::Sarsat(_) => xng_mode_sarsat::CHANNEL_RATE,
+            Self::Dsc(_) => xng_mode_dsc::CHANNEL_RATE,
+            Self::Navtex(_) => xng_mode_navtex::CHANNEL_RATE,
+            Self::Sonde(_) => xng_mode_sonde::CHANNEL_RATE,
+            Self::Adsl(_) => xng_mode_adsl::CHANNEL_RATE,
+            Self::Atcs(_) => xng_mode_atcs::CHANNEL_RATE,
+            Self::Aprs(_) => xng_mode_aprs::CHANNEL_RATE,
+            Self::Pocsag(_) => xng_mode_pocsag::CHANNEL_RATE,
+            Self::Eot(_) => xng_mode_eot::CHANNEL_RATE,
+            Self::Flex(_) => xng_mode_flex::CHANNEL_RATE,
+            Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
         }
     }
 
@@ -235,6 +484,18 @@ impl ModeChannel {
             Self::Hfdl(d) => d.level_dbfs(),
             Self::Iridium(d) => d.level_dbfs(),
             Self::IridiumWide(d) => d.level_dbfs(),
+            Self::Uat(d) => d.level_dbfs(),
+            Self::Sarsat(d) => d.level_dbfs(),
+            Self::Dsc(d) => d.level_dbfs(),
+            Self::Navtex(d) => d.level_dbfs(),
+            Self::Sonde(d) => d.level_dbfs(),
+            Self::Adsl(d) => d.level_dbfs(),
+            Self::Atcs(d) => d.level_dbfs(),
+            Self::Aprs(d) => d.level_dbfs(),
+            Self::Pocsag(d) => d.level_dbfs(),
+            Self::Eot(d) => d.level_dbfs(),
+            Self::Flex(d) => d.level_dbfs(),
+            Self::Vdes(d) => d.level_dbfs(),
         }
     }
 
@@ -246,10 +507,10 @@ impl ModeChannel {
                 let frames = dec.process(iq);
                 let seen = frames.len() as u64;
                 let ok = frames.iter().filter(|f| f.crc_ok).count() as u64;
-                let level = dec.level_dbfs();
+                let (level, noise) = (dec.level_dbfs(), dec.noise_dbfs());
                 let msgs = frames
                     .iter()
-                    .map(|f| xng_mode_acars::to_message(f, freq, level, prov.clone()))
+                    .map(|f| xng_mode_acars::to_message(f, freq, level, noise, prov.clone()))
                     .collect();
                 (msgs, seen, ok)
             }
@@ -364,6 +625,133 @@ impl ModeChannel {
                 // The validator only surfaces parity-valid frames.
                 (msgs, seen, seen)
             }
+            // UAT is wideband (whole-capture), like ADS-B: frame carries its own
+            // level, RS-FEC gates so every surfaced frame is valid.
+            Self::Uat(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_uat::to_message(f, freq, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Sarsat(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_sarsat::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Dsc(dec) => {
+                let msgs_dec = dec.process(iq);
+                let seen = msgs_dec.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = msgs_dec
+                    .iter()
+                    .map(|f| xng_mode_dsc::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Navtex(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_navtex::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Sonde(dec) => {
+                let decoded = dec.process(iq);
+                let seen = decoded.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = decoded
+                    .iter()
+                    .map(|d| xng_mode_sonde::to_message(d, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Adsl(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_adsl::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Atcs(dec) => {
+                let decoded = dec.process(iq);
+                let seen = decoded.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = decoded
+                    .iter()
+                    .map(|d| xng_mode_atcs::to_message(d, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Aprs(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_aprs::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Pocsag(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_pocsag::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Eot(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                // The receive frequency picks the link direction: ~452.9375 MHz
+                // carries HOT→EOT commands ("hot"); ~457.9375 MHz carries
+                // EOT→HOT telemetry ("eot").
+                let is_hot = (freq as i64 - 452_937_500).abs() < (freq as i64 - 457_937_500).abs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_eot::to_message(f, freq, level, is_hot, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Flex(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_flex::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Vdes(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                let level = dec.level_dbfs();
+                // to_message returns None for frames whose ASM payload doesn't
+                // decode; count those as seen-but-not-message.
+                let msgs: Vec<Message> = frames
+                    .iter()
+                    .filter_map(|f| xng_mode_vdes::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
         }
     }
 }
@@ -376,19 +764,25 @@ fn session_descriptor(
     center_hz: u64,
     channels_hz: &[u64],
     sample_rate: f64,
+    receiver_pos: Option<(f64, f64)>,
 ) -> serde_json::Value {
     let (selector, serial) = match sdr {
         Some(s) => (s.id.clone(), s.serial.clone().or_else(|| parse_serial(&s.id))),
         None => ("file".to_string(), None),
     };
-    serde_json::json!({
+    let mut d = serde_json::json!({
         "sdr": selector,
         "serial": serial,
         "mode": mode.as_str(),
         "center_mhz": center_hz as f64 / 1e6,
         "channels": channels_hz.iter().map(|c| *c as f64 / 1e6).collect::<Vec<_>>(),
         "sample_rate": sample_rate,
-    })
+    });
+    // Receiver position (from `receiver-pos`) so the dashboard can pin the station.
+    if let Some((lat, lon)) = receiver_pos {
+        d["receiver_pos"] = serde_json::json!([lat, lon]);
+    }
+    d
 }
 
 /// Pull `serial=…` out of a SoapySDR-style selector string.
@@ -422,6 +816,12 @@ fn spawn_outputs(
         let rx = bus.subscribe();
         output_tasks.push(tokio::spawn(acarsdec_json::run(rx, target)));
     }
+    if let Some(router) = outputs.airframes.clone() {
+        if !router.is_empty() {
+            let rx = bus.subscribe();
+            output_tasks.push(tokio::spawn(crate::outputs::airframes::run(rx, router)));
+        }
+    }
     if let Some(addr) = outputs.sbs.clone() {
         let rx = bus.subscribe();
         output_tasks.push(tokio::spawn(crate::outputs::sbs::run(rx, addr)));
@@ -432,7 +832,13 @@ fn spawn_outputs(
     }
     if let Some(addr) = outputs.nmea_tcp.clone() {
         let rx = bus.subscribe();
-        output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr)));
+        let tags = outputs.nmea_tag_blocks;
+        output_tasks.push(tokio::spawn(crate::outputs::nmea_tcp::run(rx, addr, tags)));
+    }
+    if let Some(target) = outputs.nmea_udp.clone() {
+        let rx = bus.subscribe();
+        let tags = outputs.nmea_tag_blocks;
+        output_tasks.push(tokio::spawn(crate::outputs::nmea_udp::run(rx, target, tags)));
     }
     if let Some(addr) = outputs.gsmtap.clone() {
         let rx = bus.subscribe();
@@ -529,7 +935,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 sample_rate
             );
         }
-        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort, cfg.max_ppm)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
         if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
             d.set_receiver_position(lat, lon);
@@ -560,8 +966,14 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                 }
             });
         }
-        let desc =
-            vec![session_descriptor(&cfg.sdr, cfg.mode, capture_center, &cfg.channels_hz, sample_rate)];
+        let desc = vec![session_descriptor(
+            &cfg.sdr,
+            cfg.mode,
+            capture_center,
+            &cfg.channels_hz,
+            sample_rate,
+            cfg.receiver_pos,
+        )];
         let output_tasks = spawn_outputs(&bus, &cfg.outputs, &station, &desc);
 
         // Ctrl-C / SIGTERM → graceful stop, second signal forces quit.
@@ -594,6 +1006,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
                         Some((live, capture_center, sample_rate)),
                         Some(&mut reasm),
                         cfg.label_filter,
+                        cfg.ais_filter,
                     )
                 }
             }
@@ -629,6 +1042,7 @@ pub(crate) fn decode_loop(
     live: Option<(Arc<LiveState>, u64, f64)>,
     mut reasm: Option<&mut (xng_acars::reasm::Reassembler, xng_acars::miam::FileReassembler)>,
     label_filter: LabelFilter,
+    ais_filter: AisFilter,
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
     use std::sync::atomic::Ordering as AtomOrd;
     let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
@@ -637,6 +1051,7 @@ pub(crate) fn decode_loop(
     let mut stats: Vec<(u64, u64, u64)> = decoders.iter().map(|(f, _)| (*f, 0, 0)).collect();
     let mut consecutive_errors: u32 = 0;
     let mut dedup = DedupFilter::new();
+    let mut ais_gate = AisGate::default();
 
     while !stop.load(Ordering::Relaxed) {
         let n = match source.read(&mut buf) {
@@ -704,6 +1119,10 @@ pub(crate) fn decode_loop(
             let (msgs, seen, ok) = dec.process(&buf[..n], *freq, &prov);
             stats[i].1 += seen;
             stats[i].2 += ok;
+            if let Some((state, _, _)) = &live {
+                let fec: u64 = msgs.iter().map(|m| m.decode.fec_corrected.unwrap_or(0) as u64).sum();
+                state.record_fec(*freq, fec);
+            }
             for mut msg in msgs {
                 if dedup.is_duplicate(&msg) {
                     continue;
@@ -714,17 +1133,38 @@ pub(crate) fn decode_loop(
                 // Label Iridium ring alerts with the broadcasting satellite
                 // (no-op unless a TLE satellite map was loaded at startup).
                 crate::satmap::enrich(&mut msg);
+                // Attribute space-based APRS (145.825 / ISS digipeat) to the
+                // satellite(s) overhead (no-op unless init_aprs ran).
+                crate::satmap::enrich_aprs(&mut msg);
                 if !label_filter.allows(&msg) {
                     continue;
+                }
+                // AIS output shaping (AIS-5h): type/MMSI filter, then rate
+                // downsample + content dedup keyed on the message time.
+                if !ais_filter.allows(&msg)
+                    || !ais_gate.pass(
+                        &msg,
+                        &ais_filter,
+                        msg.timestamp.timestamp_millis() as f64 / 1e3,
+                    )
+                {
+                    continue;
+                }
+                if let (Some((state, _, _)), xng_types::MessageBody::Acars(a)) =
+                    (&live, &msg.body)
+                {
+                    // ACARS-5.2 per-label tally — CRC-valid frames only. A
+                    // bad-CRC frame carries a garbled 2-byte label (raw 7-bit
+                    // bytes); tallying it would spawn an unbounded set of junk
+                    // `label="…"` series and blow up Prometheus cardinality.
+                    if msg.decode.crc_ok {
+                        state.record_acars_label(*freq, &a.label);
+                    }
                 }
                 bus.publish(msg);
             }
             if let Some((state, _, _)) = &live {
-                let mut ls = state.stats.lock().unwrap();
-                if ls.len() <= i {
-                    ls.resize(decoders_len_hint(i), (0, 0, 0, 0.0));
-                }
-                ls[i] = (stats[i].0, stats[i].1, stats[i].2, dec_level_after(dec));
+                state.record_channel(stats[i].0, stats[i].1, stats[i].2, dec_level_after(dec));
             }
         }
     }
@@ -762,7 +1202,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                 );
             }
             let mut dec =
-                ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
+                ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort, cfg.max_ppm)
                     .map_err(|e| anyhow::anyhow!("[{}] {:.3} MHz: {e}", cfg.mode, freq as f64 / 1e6))?;
             if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
                 d.set_receiver_position(lat, lon);
@@ -782,6 +1222,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
             capture_center,
             &cfg.channels_hz,
             sample_rate,
+            cfg.receiver_pos,
         ));
         prepared.push(Prepared { source, decoders, cfg, capture_center });
     }
@@ -792,17 +1233,49 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let bus = MessageBus::new();
-        if let Some(addr) = prepared[0].cfg.outputs.metrics.clone() {
+        // One shared LiveState fed by every session's decode loop, so the
+        // station's /metrics reflects real per-channel frame + per-label ACARS
+        // counts (previously the served state was never updated → all zeros).
+        // Only built when metrics is enabled, to keep the no-metrics path free
+        // of the per-channel locking + spectrum FFT.
+        let live = prepared[0].cfg.outputs.metrics.clone().map(|addr| {
             let live = LiveState::new();
+            let served = live.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    crate::outputs::metrics::serve(addr, live, "station".to_string()).await
+                    crate::outputs::metrics::serve(addr, served, "station".to_string()).await
                 {
                     tracing::warn!("metrics endpoint failed: {e}");
                 }
             });
-        }
+            live
+        });
         let output_tasks = spawn_outputs(&bus, &prepared[0].cfg.outputs, &station, &sessions_desc);
+
+        // Own-ship AIVDO beacon (AIS-5c): when an own-ship MMSI is configured
+        // and some session has a receiver-pos, inject a position report every
+        // 30 s so it reaches the NMEA sinks / map like any AIS fix. Polls the
+        // stop flag each second so it never keeps the bus open past shutdown.
+        if let (Some(mmsi), Some((lat, lon))) = (
+            prepared[0].cfg.outputs.own_ship_mmsi,
+            prepared.iter().find_map(|p| p.cfg.receiver_pos),
+        ) {
+            let (bus, stop, station) = (bus.clone(), stop.clone(), station.clone());
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                let mut n: u64 = 0;
+                loop {
+                    tick.tick().await;
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if n % 30 == 0 {
+                        bus.publish(own_ship_message(mmsi, lat, lon, &station));
+                    }
+                    n += 1;
+                }
+            });
+        }
 
         spawn_interrupt_handler(stop.clone(), "station");
 
@@ -811,6 +1284,8 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
             let bus = bus.clone();
             let stop = stop.clone();
             let station = station.clone();
+            let live = live.clone();
+            let capture_center = prep.capture_center;
             decode_tasks.push(tokio::task::spawn_blocking(move || {
                 let reasm_timeout = match prep.cfg.mode {
                     Mode::AcarsPoa | Mode::Vdl2 => 120.0,
@@ -820,7 +1295,8 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                     xng_acars::reasm::Reassembler::new(reasm_timeout),
                     xng_acars::miam::FileReassembler::new(),
                 );
-                let _ = prep.capture_center;
+                let sample_rate = prep.source.sample_rate();
+                let live = live.map(|l| (l, capture_center, sample_rate));
                 decode_loop(
                     &mut *prep.source,
                     std::mem::take(&mut prep.decoders),
@@ -828,9 +1304,10 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                     prep.cfg.sdr.clone(),
                     bus,
                     stop,
-                    None,
+                    live,
                     Some(&mut reasm),
                     prep.cfg.label_filter.clone(),
+                    prep.cfg.ais_filter.clone(),
                 )
             }));
         }
@@ -926,7 +1403,11 @@ fn apply_reassembly(
             }
         }
     }
-    if let Reasm::Complete(full) = r.push(core, now) {
+    let status = r.push(core, now);
+    // Record the reassembler's verdict (libacars `assstat`) on every message
+    // that passed through it, not just completed ones (ACARS-5.1).
+    core.assstat = Some(status.assstat().to_string());
+    if let Reasm::Complete(full) = status {
         let downlink = core.block_id.is_some_and(|b| b.is_ascii_digit());
         let dec = xng_acars::decode(&core.label, &full, downlink);
         core.text = full;
@@ -937,12 +1418,36 @@ fn apply_reassembly(
     }
 }
 
-fn decoders_len_hint(i: usize) -> usize {
-    i + 1
-}
-
 fn dec_level_after(dec: &ModeChannel) -> f32 {
     dec.level()
+}
+
+/// Build the station's own-ship AIS message (AIS-5c): an AIVDO Type 1 position
+/// report carrying the receiver's own MMSI + location, so it flows to every
+/// output (NMEA sinks, the map, JSONL) like any other AIS fix.
+fn own_ship_message(mmsi: u32, lat: f64, lon: f64, station: &StationIdentity) -> Message {
+    Message {
+        mode: Mode::Ais,
+        timestamp: chrono::Utc::now(),
+        frequency_hz: 161_975_000,
+        signal: Default::default(),
+        decode: xng_types::DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
+        body: MessageBody::Ais {
+            nmea: vec![xng_mode_ais::own_ship_position(mmsi, lat, lon)],
+            msg_type: Some(1),
+            mmsi: Some(mmsi),
+            details: Some(serde_json::json!({
+                "mmsi": mmsi, "lat": lat, "lon": lon, "own_ship": true,
+            })),
+        },
+        raw: None,
+        source: Provenance {
+            station: station.clone(),
+            app: AppInfo::xng(),
+            sdr: None,
+            channel: None,
+        },
+    }
 }
 
 /// Build the per-channel decoders for a session config (shared between
@@ -961,7 +1466,7 @@ pub(crate) fn build_decoders(
                 freq as f64 / 1e6
             );
         }
-        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort)
+        let mut dec = ModeChannel::new(cfg.mode, sample_rate, offset, freq, cfg.demod_effort, cfg.max_ppm)
             .map_err(|e| anyhow::anyhow!("channel {:.3} MHz: {e}", freq as f64 / 1e6))?;
         if let (ModeChannel::Adsb(d), Some((lat, lon))) = (&mut dec, cfg.receiver_pos) {
             d.set_receiver_position(lat, lon);
@@ -996,6 +1501,105 @@ mod tests {
         }
     }
 
+    fn ais_msg(msg_type: u8, mmsi: u32, details: Option<serde_json::Value>, ts_s: i64) -> Message {
+        Message {
+            mode: Mode::Ais,
+            timestamp: chrono::DateTime::from_timestamp(ts_s, 0).unwrap(),
+            frequency_hz: 161_975_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: xng_types::MessageBody::Ais {
+                nmea: vec![],
+                msg_type: Some(msg_type),
+                mmsi: Some(mmsi),
+                details,
+            },
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("XX-TEST"),
+                app: AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    #[test]
+    fn own_ship_message_carries_aivdo() {
+        let m = own_ship_message(366_123_456, 37.5, -122.3, &StationIdentity::new("XX-TEST"));
+        assert_eq!(m.mode, Mode::Ais);
+        assert!(m.decode.crc_ok);
+        let MessageBody::Ais { nmea, mmsi, msg_type, .. } = &m.body else {
+            panic!("expected AIS body");
+        };
+        assert_eq!(*mmsi, Some(366_123_456));
+        assert_eq!(*msg_type, Some(1));
+        assert!(nmea[0].starts_with("!AIVDO,"), "{nmea:?}");
+    }
+
+    #[test]
+    fn ais_filter_type_and_mmsi_keep_drop() {
+        // Include types 1 & 5 → type 3 dropped; non-AIS always passes.
+        let f = AisFilter { include_types: vec![1, 5], ..Default::default() };
+        assert!(f.allows(&ais_msg(1, 100, None, 0)));
+        assert!(!f.allows(&ais_msg(3, 100, None, 0)));
+        assert!(f.allows(&acars_msg("H1")));
+        // Exclude one MMSI.
+        let f2 = AisFilter { exclude_mmsi: vec![999], ..Default::default() };
+        assert!(!f2.allows(&ais_msg(1, 999, None, 0)));
+        assert!(f2.allows(&ais_msg(1, 100, None, 0)));
+    }
+
+    #[test]
+    fn ais_gate_rate_downsamples_dynamic_reports() {
+        let cfg = AisFilter { min_interval_s: Some(10.0), ..Default::default() };
+        let mut g = AisGate::default();
+        // Type-1 from MMSI 7: first kept, +5 s dropped, +12 s kept (from last kept).
+        assert!(g.pass(&ais_msg(1, 7, None, 1000), &cfg, 1000.0));
+        assert!(!g.pass(&ais_msg(1, 7, None, 1005), &cfg, 1005.0));
+        assert!(g.pass(&ais_msg(1, 7, None, 1012), &cfg, 1012.0));
+        // A different MMSI is independent; static type 5 is never throttled.
+        assert!(g.pass(&ais_msg(1, 8, None, 1005), &cfg, 1005.0));
+        assert!(g.pass(&ais_msg(5, 7, None, 1006), &cfg, 1006.0));
+        assert!(g.pass(&ais_msg(5, 7, None, 1007), &cfg, 1007.0));
+    }
+
+    #[test]
+    fn ais_gate_content_dedup_collapses_repeats() {
+        let cfg = AisFilter { dedup_window_s: Some(10.0), ..Default::default() };
+        let mut g = AisGate::default();
+        let same = || Some(serde_json::json!({ "lat": 1.0, "lon": 2.0 }));
+        // Identical content within the window → second dropped.
+        assert!(g.pass(&ais_msg(1, 7, same(), 1000), &cfg, 1000.0));
+        assert!(!g.pass(&ais_msg(1, 7, same(), 1003), &cfg, 1003.0));
+        // Different content from the same MMSI is kept.
+        assert!(g.pass(&ais_msg(1, 7, Some(serde_json::json!({ "lat": 9.0 })), 1004), &cfg, 1004.0));
+        // Past the window, the original content is allowed again.
+        assert!(g.pass(&ais_msg(1, 7, same(), 1011), &cfg, 1011.0));
+    }
+
+    #[test]
+    fn ais_gate_dedup_drop_does_not_advance_rate_clock() {
+        // Both knobs on, dedup window wider than the rate interval. A
+        // content-duplicate that clears the rate gate but is then dropped by
+        // dedup must NOT advance the per-MMSI rate clock — otherwise a
+        // genuinely new fix arriving shortly after is wrongly throttled even
+        // though nothing was emitted at the duplicate's time.
+        let cfg = AisFilter { min_interval_s: Some(10.0), dedup_window_s: Some(30.0), ..Default::default() };
+        let mut g = AisGate::default();
+        let a = || Some(serde_json::json!({ "lat": 1.0, "lon": 2.0 }));
+        let b = || Some(serde_json::json!({ "lat": 3.0, "lon": 4.0 }));
+        // t=1000 content A → kept (rate clock = 1000).
+        assert!(g.pass(&ais_msg(1, 7, a(), 1000), &cfg, 1000.0));
+        // t=1012 same content A → passes rate (12 ≥ 10) but dropped by dedup
+        // (12 < 30); the rate clock must stay at 1000, not advance to 1012.
+        assert!(!g.pass(&ais_msg(1, 7, a(), 1012), &cfg, 1012.0));
+        // t=1015 NEW content B → 1015-1000 = 15 ≥ 10, so it must be kept.
+        // (With the pre-fix last_pos pollution it would read 1015-1012 = 3 and
+        // be wrongly throttled.)
+        assert!(g.pass(&ais_msg(1, 7, b(), 1015), &cfg, 1015.0), "new fix must not be throttled");
+    }
+
     #[test]
     fn label_filter_include_exclude() {
         let empty = LabelFilter::default();
@@ -1012,5 +1616,26 @@ mod tests {
         // exclude wins over include
         let both = LabelFilter { include: vec!["Q0".into()], exclude: vec!["Q0".into()] };
         assert!(!both.allows(&acars_msg("Q0")));
+    }
+
+    #[test]
+    fn reassembly_stamps_assstat() {
+        let mut r = xng_acars::reasm::Reassembler::new(660.0);
+        let mut files = xng_acars::miam::FileReassembler::new();
+
+        // A plain single block (no block_id) is "skipped" by the reassembler,
+        // but the verdict is still stamped on the message (ACARS-5.1).
+        let mut msg = acars_msg("H1");
+        msg.decode.crc_ok = true;
+        apply_reassembly(&mut msg, &mut r, &mut files);
+        let MessageBody::Acars(c) = &msg.body else { unreachable!() };
+        assert_eq!(c.assstat.as_deref(), Some("skipped"));
+
+        // A bad-CRC frame never reaches the reassembler → no verdict.
+        let mut bad = acars_msg("H1");
+        bad.decode.crc_ok = false;
+        apply_reassembly(&mut bad, &mut r, &mut files);
+        let MessageBody::Acars(c) = &bad.body else { unreachable!() };
+        assert_eq!(c.assstat, None);
     }
 }

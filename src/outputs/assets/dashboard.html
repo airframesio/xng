@@ -6,7 +6,7 @@
 <title>xng station</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous">
 <style>
-  :root { color-scheme: dark; --sw: 480px; --eh: 45%; }
+  :root { color-scheme: dark; --sw: 480px; --eh: 45%; --ch: 170px; }
   * { box-sizing: border-box; }
   body { margin: 0; display: flex; height: 100vh; font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; background: #0b0e14; color: #c8ccd4; }
   #map { flex: 1; min-width: 0; }
@@ -34,6 +34,13 @@
   #logpane { display: flex; flex-direction: column; flex: 1 1 0; min-height: 0; border-top: 1px solid #1c2230; }
   body.logmin #logpane { flex: none; }
   body.logmin #msgs { display: none; }
+  /* Entity-type tabs above the table. */
+  #enttabs { flex: 0 0 auto; display: flex; gap: 2px; padding: 2px 4px; background: #0b0e14; border-bottom: 1px solid #1f2335; overflow-x: auto; white-space: nowrap; }
+  #enttabs .tab { cursor: pointer; padding: 2px 9px; border-radius: 4px 4px 0 0; color: #565f89; font-size: 12px; }
+  #enttabs .tab:hover { background: #16161e; color: #a9b1d6; }
+  #enttabs .tab.on { background: #1f2435; color: #7aa2f7; }
+  /* Fixed-width entity icon so narrow dingbats line up with wide emoji. */
+  .ent-ic { display: inline-block; width: 1.5em; text-align: center; }
   #entities table { width: 100%; border-collapse: collapse; }
   #entities th, #entities td { text-align: left; padding: 2px 8px; white-space: nowrap; }
   #entities th { color: #565f89; position: sticky; top: 0; background: #0b0e14; cursor: default; }
@@ -42,6 +49,28 @@
   #entities tr.row.sel { background: #1f2435; }
   #entities tr.row.sel td:first-child { border-left: 2px solid #7aa2f7; padding-left: 6px; }
   #entities td.age { color: #565f89; }
+  #entities tr.msgrow td { color: #aeb6d6; }
+  #entities tr.msgrow td.msgcaret { padding-left: 20px; color: #7aa2f7; }
+  /* Keep a selected history row's caret aligned with its siblings: the generic
+     .sel first-child accent would shrink padding-left and shift the ↳ back. */
+  #entities tr.msgrow.sel td.msgcaret { padding-left: 20px; border-left: 0; }
+  /* Selected-message detail pane: sits directly below the entities table and
+     above the log. The meta grid auto-reflows so it stays readable in a narrow
+     side panel (responsive). */
+  #entcard { flex: 0 0 var(--ch); overflow-y: auto; background: linear-gradient(180deg, #161b29, #0e1119); padding: 10px 13px 12px; position: relative; }
+  #entcard[hidden] { display: none; }
+  /* Resize handle for the detail pane (drag its bottom edge), like #vres. */
+  #cres { flex: none; height: 6px; cursor: row-resize; background: #1c2230; }
+  #cres:hover { background: #2a2f41; }
+  #cres[hidden], body.logmin #cres { display: none; }
+  #entcard .cardx { position: absolute; top: 7px; right: 11px; cursor: pointer; color: #565f89; font-size: 13px; line-height: 1; }
+  #entcard .cardx:hover { color: #c8ccd4; }
+  #entcard h3 { margin: 0 24px 8px 0; padding-bottom: 6px; font-size: 13px; color: #7aa2f7; border-bottom: 1px solid #232a3d; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  #entcard .badge { background: #1f2435; color: #7dcfff; border: 1px solid #2a3147; border-radius: 4px; padding: 0 6px; font-size: 10px; letter-spacing: 0.04em; }
+  #entcard .msgtext { white-space: pre-wrap; word-break: break-word; background: #0b0e14; border: 1px solid #1c2230; border-radius: 5px; padding: 8px 10px; color: #c8ccd4; font-size: 12px; line-height: 1.5; margin-bottom: 10px; }
+  #entcard .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(115px, 1fr)); gap: 7px 16px; }
+  #entcard .meta .k { color: #565f89; text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; }
+  #entcard .meta .v { color: #c8ccd4; word-break: break-word; }
   .silh, .silh svg { width: 100%; height: 100%; display: block; }
   .silh svg * { fill: currentColor !important; stroke: none !important; }
   .silh svg image { display: none !important; }
@@ -92,8 +121,21 @@
   #sdrbody .sdrhead { color: #73daca; padding-top: 5px; }
   #sdrbody .live { color: #9ece6a; }
   #sdrbody .stale { color: #e0af68; }
+  #sdrbody .dead, #sdrbody .none { color: #565f89; }
+  /* Compact per-receiver table: one row each, status dot for liveness. */
+  #sdrbody table.sdrtab td { padding: 2px 10px 2px 0; }
+  #sdrbody .sdrtab th { text-align: left; font-weight: 400; font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: #565f89; padding: 0 10px 3px 0; }
+  #sdrbody .sdrtab td.rx { color: #c8ccd4; }
+  #sdrbody .sdrtab td.mode { color: #7dcfff; }
+  #sdrbody .sdrtab td.freq { color: #a9b1d6; font-variant-numeric: tabular-nums; }
+  #sdrbody .sdrtab td.ch { color: #565f89; }
+  #sdrbody .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; background: #565f89; vertical-align: middle; }
+  #sdrbody .dot.live { background: #9ece6a; box-shadow: 0 0 5px #9ece6a88; }
+  #sdrbody .dot.stale { background: #e0af68; }
+  #sdrbody .dot.dead { background: #f7768e; }
   /* Fixed-width icons so layer-control rows align despite emoji width. */
   .lyr-ic { display: inline-block; width: 1.5em; text-align: center; font-style: normal; }
+  .rx-ic { font-size: 17px; text-align: center; line-height: 22px; filter: drop-shadow(0 0 3px #000); }
 </style>
 </head>
 <body>
@@ -106,8 +148,11 @@
     <div id="sdrhdr" title="Show receiver / SDR status"><span class="tw" id="sdrtw">▸</span><span>SDR status</span><span class="sub" id="sdrsum"></span></div>
     <div id="sdrbody" hidden></div>
   </div>
+  <div id="enttabs"></div>
   <div id="entities"></div>
   <div id="vres" title="Drag to resize"></div>
+  <div id="entcard" hidden></div>
+  <div id="cres" hidden title="Drag the detail pane's edge to resize"></div>
   <div id="logpane">
     <div id="chips"></div>
     <div id="msgbar">
@@ -125,10 +170,22 @@ L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
   attribution: '&copy; OpenStreetMap, &copy; CARTO · silhouettes &copy; <a href="https://github.com/plane-watch/pw-silhouettes">Plane Watch</a>', maxZoom: 18,
 }).addTo(map);
 
+// Entity markers live in per-class layer groups so the layer control can
+// toggle Flights / Ships / Beacons. Visible by default.
+const flightLayer = L.layerGroup().addTo(map);
+const shipLayer = L.layerGroup().addTo(map);
+const beaconLayer = L.layerGroup().addTo(map);
+// "Show All Trails": by default a position trail is drawn only for the
+// selected entity; this toggle reveals every entity's trail. Backed by an
+// (otherwise empty) group so it lives in the Leaflet layer control — the real
+// work is the showAllTrails flag read in upsert().
+const trailLayer = L.layerGroup();
+let showAllTrails = localStorage.getItem('xng.trails') === '1';
+
 // Optional Iridium overlays: satellite positions + the targeted ring/beam
-// ground footprints (cf. iridium-toolkit live-map). Toggle via the layer
-// control; visibility is persisted. Kept out of the aircraft/vessel
-// auto-fit so global satellite positions never yank the view.
+// ground footprints (cf. iridium-toolkit live-map). Added to the control only
+// when Iridium is running. Kept out of the aircraft/vessel auto-fit so global
+// satellite positions never yank the view.
 const satLayer = L.layerGroup();
 const ringLayer = L.layerGroup();
 // Beam pattern: the full reconstructed 48-cell pattern projected under each
@@ -137,21 +194,68 @@ const patternLayer = L.layerGroup();
 // Mobile terminals: Iridium customer devices (vessels/aircraft/handhelds)
 // that report their own position — distinct from the beam footprints.
 const deviceLayer = L.layerGroup();
-L.control.layers(null,
-  { '<i class="lyr-ic">🛰</i>Iridium satellites': satLayer, '<i class="lyr-ic">◎</i>Spot beams': ringLayer,
-    '<i class="lyr-ic">⬡</i>Beam pattern': patternLayer, '<i class="lyr-ic">📟</i>Iridium terminals': deviceLayer },
-  { position: 'topright', collapsed: false }).addTo(map);
-if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
-if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
-if (localStorage.getItem('xng.deviceLayer') !== '0') deviceLayer.addTo(map);
 // "Beam pattern" (the toggle) means show ALL satellites' patterns; selecting a
 // satellite overrides it to show only that one. `patternShowAll` tracks the
 // checkbox intent; `patternForcing` marks our own programmatic add/remove (when
 // a pin reveals a pattern) so it isn't mistaken for a user toggle.
 let patternShowAll = localStorage.getItem('xng.patternLayer') === '1';
 let patternForcing = false;
-if (patternShowAll) patternLayer.addTo(map);
-map.on('overlayadd overlayremove', () => {
+
+// Build the layer control ONCE, after the first snapshot, with only the
+// overlays relevant to the modes that are actually running (or already
+// producing data) — so e.g. the four Iridium layers never appear unless an
+// Iridium session exists.
+let layerControlBuilt = false;
+function buildLayerControl(s) {
+  if (layerControlBuilt) return;
+  const modes = new Set((s.sessions || []).map(x => x.mode).filter(Boolean));
+  const any = (...ms) => ms.some(m => modes.has(m));
+  const overlays = {};
+  if (any('acars', 'vdl2', 'hfdl', 'aero', 'aero-c', 'adsb', 'uat') || (s.aircraft || []).length)
+    overlays['<i class="lyr-ic">✈</i>Flights'] = flightLayer;
+  if (any('ais') || (s.vessels || []).length)
+    overlays['<i class="lyr-ic">🚢</i>Ships'] = shipLayer;
+  if (any('sonde', 'ads-l', 'adsl', 'sarsat', 'dsc', 'navtex') || (s.beacons || []).length)
+    overlays['<i class="lyr-ic">📡</i>Beacons'] = beaconLayer;
+  const irid = any('iridium') || (s.iridium_sats || []).length
+    || (s.iridium_rings || []).length || (s.iridium_devices || []).length;
+  if (irid) {
+    overlays['<i class="lyr-ic">🛰</i>Iridium satellites'] = satLayer;
+    overlays['<i class="lyr-ic">◎</i>Spot beams'] = ringLayer;
+    overlays['<i class="lyr-ic">⬡</i>Beam pattern'] = patternLayer;
+    overlays['<i class="lyr-ic">📟</i>Iridium terminals'] = deviceLayer;
+    if (localStorage.getItem('xng.satLayer') !== '0') satLayer.addTo(map);
+    if (localStorage.getItem('xng.ringLayer') !== '0') ringLayer.addTo(map);
+    if (localStorage.getItem('xng.deviceLayer') !== '0') deviceLayer.addTo(map);
+    if (patternShowAll) patternLayer.addTo(map);
+  }
+  overlays['<i class="lyr-ic">〰</i>Show All Trails'] = trailLayer;
+  if (showAllTrails) trailLayer.addTo(map);
+  L.control.layers(null, overlays, { position: 'topright', collapsed: false }).addTo(map);
+  layerControlBuilt = true;
+}
+
+// Pin the receiver/station location on the map when any session reports a
+// receiver-pos (from the `receiver-pos` config). One marker, updated in place.
+let receiverMarker = null;
+function renderReceiver(s) {
+  const sess = (s.sessions || []).find(x => Array.isArray(x.receiver_pos) && x.receiver_pos.length === 2);
+  if (!sess) { if (receiverMarker) { map.removeLayer(receiverMarker); receiverMarker = null; } return; }
+  const [lat, lon] = sess.receiver_pos;
+  if (receiverMarker) { receiverMarker.setLatLng([lat, lon]); return; }
+  const icon = L.divIcon({ className: 'rx-ic', html: '📡', iconSize: [22, 22], iconAnchor: [11, 11] });
+  receiverMarker = L.marker([lat, lon], { icon, zIndexOffset: 1000, interactive: true })
+    .addTo(map)
+    .bindTooltip(`Receiver ${lat.toFixed(4)}, ${lon.toFixed(4)}`, { direction: 'top', className: 'lbl' });
+}
+
+map.on('overlayadd overlayremove', e => {
+  if (e.layer === trailLayer) {
+    showAllTrails = map.hasLayer(trailLayer);
+    localStorage.setItem('xng.trails', showAllTrails ? '1' : '0');
+    render();
+    return;
+  }
   if (!patternForcing) { patternShowAll = map.hasLayer(patternLayer); applyPatternFilter(); }
   localStorage.setItem('xng.satLayer', map.hasLayer(satLayer) ? '1' : '0');
   localStorage.setItem('xng.ringLayer', map.hasLayer(ringLayer) ? '1' : '0');
@@ -511,11 +615,16 @@ function syncIridium(s) {
 }
 
 const markers = new Map(); // key -> {marker, trail}
+// Map glyphs for the position-bearing beacon modes (radiosonde / ADS-L / SARSAT / DSC).
+const BEACON_EMOJI = { sonde: '🎈', 'ads-l': '🛩', sarsat: '🆘', dsc: '🆘' };
 let state = null; // latest /api/state snapshot
 let fitted = false;
 let paused = false;
 let logMsgs = []; // log items currently shown; frozen in place while paused
 let selected = null; // entity key ('a'+icao / 'v'+mmsi)
+let selectedMsg = null; // {cap,proto,fn,baud,cls,kind,text,seen,mk} shown in the message detail pane
+let msgIndex = {};      // msgkey -> message detail; rebuilt each render so the click handler can resolve a clicked history row
+let entMsg = {};        // entity key -> its latest message detail, so clicking a pager row (not just a history sub-row) opens the detail pane
 const hiddenModes = new Set();
 const expanded = new Set();
 const rateHist = []; // [t_ms, totals] samples for per-mode rates
@@ -526,16 +635,71 @@ function selectEntity(key, lat, lon) {
   const e = markers.get(key);
   if (e) e.marker.openPopup();
   render();
-  const row = document.querySelector(`#entities tr[data-k="${key}"]`);
+  const row = document.querySelector(`#entities tr[data-k="${CSS.escape(key)}"]`);
   if (row) row.scrollIntoView({ block: 'nearest' });
 }
 window.selectEntity = selectEntity;
+window.clearMsg = () => { selectedMsg = null; renderEntCard(); };
 window.toggleMode = m => { hiddenModes.has(m) ? hiddenModes.delete(m) : hiddenModes.add(m); render(); };
 window.toggleTerminals = () => {
   localStorage.setItem('xng.terminals', localStorage.getItem('xng.terminals') === '1' ? '0' : '1');
   render();
 };
 window.toggleMsg = id => { expanded.has(id) ? expanded.delete(id) : expanded.add(id); render(); };
+// Clicking an entity opens its per-source breakdown (one row per contributing
+// source). Keyed by the stable master id so the open state survives poll
+// re-renders. Entities table sort state — default: most recently seen first.
+const acExpanded = new Set();
+let sortCol = 'seen', sortDir = 'desc';
+// Active entities-table tab ('all' or an entity type). Persisted.
+let entTab = localStorage.getItem('xng.enttab') || 'all';
+// ONE delegated click handler for the entities table (rows AND sortable column
+// headers). Rows carry their identity in escaped data-* attributes (read back
+// via dataset, never re-parsed as HTML/JS), so attacker-controlled fields
+// (ACARS tail/flight, AIS name) can't break out of an inline handler — XSS-safe.
+// Attached once; survives the innerHTML re-render (it lives on the container).
+document.getElementById('entities').addEventListener('click', e => {
+  const th = e.target.closest('th[data-col]');
+  if (th) {
+    const col = th.dataset.col;
+    if (sortCol === col) { sortDir = sortDir === 'asc' ? 'desc' : 'asc'; }
+    else { sortCol = col; sortDir = (col === 'seen' || col === 'msgs' || col === 'alt' || col === 'kt') ? 'desc' : 'asc'; }
+    render();
+    return;
+  }
+  const tr = e.target.closest('tr');
+  if (!tr || !tr.dataset) return;
+  if (tr.dataset.act === 'term') { window.toggleTerminals(); return; }
+  if (tr.dataset.msgkey) {
+    // A history sub-row: open that message's detail pane (no map nav).
+    const m = msgIndex[tr.dataset.msgkey];
+    if (m) { selectedMsg = { ...m, mk: tr.dataset.msgkey }; render(); }
+    return;
+  }
+  const k = tr.dataset.k;
+  if (!k) return;
+  if (tr.dataset.exp === '1') {
+    const id = tr.dataset.id || '';
+    acExpanded.has(id) ? acExpanded.delete(id) : acExpanded.add(id);
+  }
+  // A pager row: open its latest message in the detail pane (render() below
+  // re-renders the card). Single-message pagers have no history sub-rows, so
+  // the row itself is the way in.
+  if (entMsg[k]) selectedMsg = entMsg[k];
+  const lat = tr.dataset.lat ? parseFloat(tr.dataset.lat) : null;
+  const lon = tr.dataset.lon ? parseFloat(tr.dataset.lon) : null;
+  selectEntity(k, lat, lon);
+});
+// Entity-type tabs: switching resets the sort to "most recently seen" so the
+// new tab's columns are always a valid sort key.
+document.getElementById('enttabs').addEventListener('click', e => {
+  const t = e.target.closest('[data-tab]');
+  if (!t) return;
+  entTab = t.dataset.tab;
+  localStorage.setItem('xng.enttab', entTab);
+  sortCol = 'seen'; sortDir = 'desc';
+  render();
+});
 document.getElementById('pause').onclick = function () {
   paused = !paused;
   this.classList.toggle('on', paused);
@@ -575,6 +739,7 @@ function restore(key, varName) {
 }
 restore('xng.sw', '--sw');
 restore('xng.eh', '--eh');
+restore('xng.ch', '--ch');
 if (localStorage.getItem('xng.logmin') === '1') setLogMin(true);
 
 function drag(handle, onMove) {
@@ -605,12 +770,21 @@ drag(document.getElementById('vres'), ev => {
   document.documentElement.style.setProperty('--eh', pct);
   localStorage.setItem('xng.eh', pct);
 });
+// Detail pane height: drag its bottom edge (#cres). logpane (flex:1) absorbs
+// the delta, so the entcard top stays put and only its height changes.
+drag(document.getElementById('cres'), ev => {
+  const side = document.getElementById('side').getBoundingClientRect();
+  const top = document.getElementById('entcard').getBoundingClientRect().top;
+  const h = Math.min(Math.max(ev.clientY - top, 70), side.bottom - top - 80);
+  document.documentElement.style.setProperty('--ch', h + 'px');
+  localStorage.setItem('xng.ch', h + 'px');
+});
 
-function upsert(key, lat, lon, icon, label, popup, trail, color) {
+function upsert(key, lat, lon, icon, label, popup, trail, color, layer) {
   if (lat == null || lon == null) return null;
   let e = markers.get(key);
   if (!e) {
-    e = { marker: L.marker([lat, lon], { icon }).addTo(map) };
+    e = { marker: L.marker([lat, lon], { icon }).addTo(layer), layer };
     e.marker.bindTooltip(label, { permanent: true, direction: 'right', offset: [10, 0], className: 'lbl' });
     e.marker.bindPopup(popup);
     // Clicking the marker selects the entity (highlights its row).
@@ -629,9 +803,20 @@ function upsert(key, lat, lon, icon, label, popup, trail, color) {
     e.marker.setTooltipContent(label);
     e.marker.setPopupContent(popup);
   }
-  if (trail && trail.length > 1) {
-    if (e.trail) e.trail.setLatLngs(trail);
-    else e.trail = L.polyline(trail, { color, weight: 1.5, opacity: 0.6 }).addTo(map);
+  // Trail shows only for the selected entity, or for everything when "Show All
+  // Trails" is on. Drawn on the map directly (not the entity's layer group) so
+  // it tracks selection independently; removed when neither condition holds.
+  const wantTrail = (showAllTrails || selected === key) && trail && trail.length > 1;
+  if (wantTrail) {
+    // Unwrap longitudes around the current position so a trail crossing the
+    // ±180° antimeridian draws continuously instead of streaking across the
+    // whole map (same fix the Iridium satellite trails already use).
+    const tr = unwrapTrail(trail, lon);
+    if (e.trail) e.trail.setLatLngs(tr);
+    else e.trail = L.polyline(tr, { color, weight: 1.5, opacity: 0.6 }).addTo(map);
+  } else if (e.trail) {
+    map.removeLayer(e.trail);
+    e.trail = null;
   }
   e.alive = true;
   return [lat, lon];
@@ -651,6 +836,35 @@ function entityPopup(pic, title, kv) {
   return `<div class="pp">${pic ? `<div class="pic">${pic}</div>` : ''}` +
     `<div><h3>${title}</h3><table>${rows}</table></div></div>`;
 }
+// Per-message detail pane below the entities table. Shows the full text of a
+// selected pager message plus its metadata; the meta grid is responsive. All
+// values are escaped here — msgIndex holds raw strings, never HTML.
+function renderEntCard() {
+  const el = document.getElementById('entcard');
+  if (!el) return;
+  const cres = document.getElementById('cres');
+  const m = selectedMsg;
+  if (!m) { el.hidden = true; el.innerHTML = ''; if (cres) cres.hidden = true; return; }
+  if (cres) cres.hidden = false;
+  const proto = String(m.proto || '').toUpperCase();
+  const now = (state && state.now) || 0;
+  const recv = m.seen ? new Date(m.seen * 1000).toLocaleString() : '';
+  const meta = [
+    ['capcode', m.cap], ['protocol', proto], ['kind', m.kind || ''],
+    ['class', m.cls || ''], ['function', m.fn], ['baud', m.baud],
+    ['received', recv], ['age', m.seen ? fmtAge(now - m.seen) : ''],
+  ].filter(([, v]) => v != null && v !== '');
+  const text = String(m.text || '');
+  el.innerHTML =
+    `<span class="cardx" title="Close" onclick="clearMsg()">✕</span>` +
+    `<h3><span class="ent-ic">📟</span>${escapeHtml(String(m.cap))}` +
+    (proto ? ` <span class="badge">${escapeHtml(proto)}</span>` : '') + `</h3>` +
+    `<div class="msgtext">${text ? escapeHtml(text) : '<span style="color:#565f89">(no text)</span>'}</div>` +
+    `<div class="meta">` +
+    meta.map(([k, v]) => `<div><div class="k">${k}</div><div class="v">${escapeHtml(String(v))}</div></div>`).join('') +
+    `</div>`;
+  el.hidden = false;
+}
 function fmtUptime(s) {
   const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
@@ -667,24 +881,29 @@ function renderSdr(s) {
   const body = document.getElementById('sdrbody');
   if (body.hidden) return; // skip the table build while collapsed
   if (!n) { body.innerHTML = '<span class="sub">no active receivers</span>'; return; }
-  body.innerHTML = sess.map(se => {
+  // Compact: one row per receiver (rx · mode · freq · channels · liveness)
+  // instead of a tall key/value block per SDR. A status dot encodes liveness.
+  const rows = sess.map(se => {
     const mode = se.mode || '';
     const seen = (s.last_seen || {})[mode];
     const age = seen != null ? s.now - seen : null;
-    const liveTxt = age == null ? '—'
-      : `<span class="${age < 30 ? 'live' : 'stale'}">${fmtAge(age)} ago</span>`;
+    const cls = age == null ? 'none' : (age < 30 ? 'live' : (age < 120 ? 'stale' : 'dead'));
+    const last = age == null ? 'no msgs' : `${fmtAge(age)} ago`;
     const ch = Array.isArray(se.channels) ? se.channels.length : (se.channels || 1);
-    const rows = [
-      ['mode', escapeHtml(mode)],
-      ['center', se.center_mhz != null ? `${(+se.center_mhz).toFixed(3)} MHz` : null],
-      ['sample rate', se.sample_rate ? `${(se.sample_rate / 1e6).toFixed(1)} MS/s` : null],
-      ['channels', ch],
-      ['serial', se.serial ? escapeHtml(String(se.serial)) : null],
-      ['last msg', liveTxt],
-    ].filter(([, v]) => v != null && v !== '')
-      .map(([k, v]) => `<tr><td class="k">${k}</td><td>${v}</td></tr>`).join('');
-    return `<table><tr><td class="sdrhead" colspan="2">${escapeHtml(se.sdr || 'SDR')}</td></tr>${rows}</table>`;
+    const serial = se.serial ? String(se.serial) : (se.sdr || '').replace(/^.*serial=/, '') || '?';
+    const freq = se.center_mhz != null ? (+se.center_mhz).toFixed(3) : '';
+    const rate = se.sample_rate ? `${(se.sample_rate / 1e6).toFixed(1)} MS/s` : '';
+    const tip = escapeHtml([se.sdr, rate, freq && `${freq} MHz`].filter(Boolean).join(' · '));
+    return `<tr title="${tip}">` +
+      `<td class="rx"><span class="dot ${cls}"></span>${escapeHtml(serial)}</td>` +
+      `<td class="mode">${escapeHtml(mode)}</td>` +
+      `<td class="freq">${freq}</td>` +
+      `<td class="ch">${ch}ch</td>` +
+      `<td class="${cls}">${last}</td></tr>`;
   }).join('');
+  body.innerHTML = `<table class="sdrtab">` +
+    `<tr class="sdrhdr-row"><th>rx</th><th>mode</th><th>freq MHz</th><th>ch</th><th>last msg</th></tr>` +
+    `${rows}</table>`;
 }
 
 // msgs/min per mode over the last 60 s of samples.
@@ -712,6 +931,8 @@ async function tick() {
 function render() {
   const s = state;
   if (!s) return;
+  buildLayerControl(s); // builds once, with only the relevant overlays
+  renderReceiver(s);    // pin the station location if receiver-pos is configured
   markers.forEach(e => e.alive = false);
   const pts = [];
 
@@ -731,10 +952,17 @@ function render() {
         ['speed', a.spd != null ? `${a.spd} kt` : null],
         ['track', a.trk != null ? `${a.trk}&deg;` : null],
         ['squawk', a.squawk && escapeHtml(String(a.squawk))],
+        ['sel alt', a.sel_alt != null ? `${a.sel_alt} ft` : null],
+        ['ADS-B', a.adsb_version != null ? `v${a.adsb_version}` : null],
+        ['NACp/SIL', (a.nacp != null || a.sil != null) ? `${a.nacp ?? '-'} / ${a.sil ?? '-'}` : null],
+        ['wind/OAT', (a.wind_kt != null || a.oat_c != null)
+          ? `${a.wind_kt != null ? a.wind_kt + ' kt' : ''}${a.wind_kt != null && a.oat_c != null ? ', ' : ''}${a.oat_c != null ? a.oat_c + '&deg;C' : ''}` : null],
+        ['ACAS RA', a.acas_ra ? 'ACTIVE' : null],
+        ['EMERGENCY', a.emergency ? escapeHtml(String(a.emergency)) : null],
         ['msgs', a.msgs],
         ['seen', `${fmtAge(s.now - a.seen)} ago`],
       ]);
-    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt, sil), label, popup, a.trail, altColor(a.alt));
+    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt, sil), label, popup, a.trail, altColor(a.alt), flightLayer);
     if (p) pts.push(p);
   }
   for (const v of s.vessels) {
@@ -747,14 +975,29 @@ function render() {
       ['speed', v.sog != null ? `${v.sog} kt` : null],
       ['course', v.cog != null ? `${v.cog}&deg;` : null],
       ['type', v.type != null ? `msg ${v.type}` : null],
+      ['DISTRESS', v.distress && escapeHtml(String(v.distress))],
       ['seen', `${fmtAge(s.now - v.seen)} ago`],
     ]);
-    const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog, v.shiptype), label, popup, v.trail, sm.color);
+    const p = upsert('v' + v.mmsi, v.lat, v.lon, shipIcon(v.cog, v.shiptype), label, popup, v.trail, sm.color, shipLayer);
+    if (p) pts.push(p);
+  }
+  for (const b of (s.beacons || [])) {
+    const label = escapeHtml(String(b.id || b.mode || ''));
+    const popup = entityPopup('', label, [
+      ['mode', escapeHtml(String(b.mode || ''))],
+      ['id', escapeHtml(String(b.id || ''))],
+      ['altitude', b.alt != null ? escapeHtml(String(b.alt)) : null],
+      ['msgs', b.msgs],
+      ['seen', `${fmtAge(s.now - b.seen)} ago`],
+    ]);
+    const emoji = BEACON_EMOJI[b.mode] || '📡';
+    const icon = L.divIcon({ className: 'beacon-ic', html: emoji, iconSize: [16, 16] });
+    const p = upsert('b' + b.mode + ':' + b.id, b.lat, b.lon, icon, `${emoji} ${label}`, popup, b.trail, '#e0af68', beaconLayer);
     if (p) pts.push(p);
   }
   markers.forEach((e, k) => {
     if (!e.alive) {
-      map.removeLayer(e.marker);
+      (e.layer || map).removeLayer(e.marker);
       if (e.trail) map.removeLayer(e.trail);
       markers.delete(k);
     }
@@ -781,58 +1024,217 @@ function render() {
     })
     .join('');
 
+  // Unified entity list. Each ent carries: `type` (for the tab filter), the
+  // generic "All" cells (`sv` for sorting, `cols` precomposed), and a per-type
+  // field map `f` for the type-specific tab columns. Icons sit in a
+  // fixed-width span so narrow text dingbats (✈ ⚓) align with wide emoji
+  // (📟 🚆 🎈) — otherwise the rows look ragged.
+  const ic = g => `<span class="ent-ic">${g}</span>`;
+  const ents = [];
+  for (const a of s.aircraft) {
+    const id = a.id || a.icao || a.reg || a.flight || '';
+    const srcs = a.sources ? Object.values(a.sources) : [];
+    ents.push({
+      k: 'a' + id, id, type: 'aircraft', lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
+      color: altColor(a.alt), name: `${ic('✈️')}${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
+      sv: { id, flight: a.flight || '', icao: a.icao || '', reg: a.reg || '', type: a.actype || '', alt: a.alt, kt: a.spd, msgs: a.msgs || 0, seen: a.seen || 0 },
+      cols: [escapeHtml(a.flight || ''), escapeHtml(a.icao || ''), escapeHtml(a.reg || ''), escapeHtml(a.actype || ''), a.alt ?? '', a.spd ?? '', a.msgs ?? ''],
+      f: { flight: escapeHtml(a.flight || ''), icao: escapeHtml(a.icao || ''), reg: escapeHtml(a.reg || ''), type: escapeHtml(a.actype || ''), alt: a.alt ?? '', kt: a.spd ?? '', msgs: a.msgs ?? '' },
+    });
+  }
+  for (const v of s.vessels) {
+    const m = shipMeta(v.shiptype);
+    ents.push({
+      k: 'v' + v.mmsi, id: String(v.mmsi), type: 'vessel', lat: v.lat ?? null, lon: v.lon ?? null, srcs: [], expandable: false,
+      color: m.color, name: `${ic('🚢')}${escapeHtml((v.name || String(v.mmsi)).trim())}`, seen: v.seen,
+      sv: { id: v.name || String(v.mmsi), flight: '', icao: '', reg: v.country || '', type: m.label || '', alt: undefined, kt: v.sog, msgs: undefined, seen: v.seen || 0 },
+      cols: ['', '', escapeHtml(v.country || ''), escapeHtml(m.label || ''), '', v.sog ?? '', ''],
+      f: { mmsi: v.mmsi, country: escapeHtml(v.country || ''), type: escapeHtml(m.label || ''), kt: v.sog ?? '', msgs: v.msgs ?? '' },
+    });
+  }
+  for (const sat of (s.iridium_sats || [])) {
+    const nm = sat.name || ('Iridium ' + sat.sat);
+    ents.push({
+      k: 's' + sat.sat, id: nm, type: 'sat', lat: sat.lat ?? null, lon: sat.lon ?? null, srcs: [], expandable: false,
+      color: '#bb9af7', name: `${ic('🛰')}${escapeHtml(nm)}`, seen: sat.seen,
+      sv: { id: nm, flight: '', icao: '', reg: '', type: 'satellite', alt: sat.alt, kt: undefined, msgs: undefined, seen: sat.seen || 0 },
+      cols: ['', '', '', 'satellite', sat.alt != null ? Math.round(sat.alt) + 'km' : '', '', ''],
+      f: { type: 'satellite', alt: sat.alt != null ? Math.round(sat.alt) + 'km' : '' },
+    });
+  }
+  for (const b of (s.beacons || [])) {
+    const emoji = BEACON_EMOJI[b.mode] || '📡';
+    const ids = String(b.id || '');
+    ents.push({
+      k: 'b' + b.mode + ':' + b.id, id: ids, type: 'beacon', lat: b.lat ?? null, lon: b.lon ?? null, srcs: [], expandable: false,
+      color: '#e0af68', name: `${ic(emoji)}${escapeHtml(ids)}`, seen: b.seen,
+      sv: { id: ids, flight: '', icao: '', reg: '', type: b.mode || '', alt: b.alt, kt: undefined, msgs: b.msgs, seen: b.seen || 0 },
+      cols: ['', '', '', escapeHtml(String(b.mode || '')), b.alt ?? '', '', b.msgs ?? ''],
+      f: { id: escapeHtml(ids), type: escapeHtml(String(b.mode || '')), alt: b.alt ?? '', msgs: b.msgs ?? '' },
+    });
+  }
+  for (const t of (s.trains || [])) {
+    const u = String(t.unit || '');
+    ents.push({
+      k: 'e' + u, id: u, type: 'train', lat: null, lon: null, srcs: [], expandable: false,
+      color: '#9ece6a', name: `${ic('🚆')}${escapeHtml(u)}`, seen: t.seen,
+      sv: { id: u, flight: '', icao: '', reg: String(t.kind || ''), type: 'EOT', alt: undefined, kt: undefined, msgs: t.msgs, seen: t.seen || 0 },
+      cols: ['', '', escapeHtml(String(t.kind || '')), 'EOT', '', '', t.msgs ?? ''],
+      f: { unit: escapeHtml(u), class: escapeHtml(String(t.kind || '')), pressure: t.pressure ?? '', motion: t.motion ?? '', marker: t.marker ?? '', msgs: t.msgs ?? '' },
+    });
+  }
+  for (const p of (s.pagers || [])) {
+    const cap = String(p.capcode ?? '');
+    const txt = p.text ? String(p.text).trim() : '';
+    const hist = p.history || [];
+    ents.push({
+      k: 'p' + (p.proto || '') + ':' + cap, id: cap, type: 'pager', lat: null, lon: null, srcs: [],
+      // Expandable when there's a message history — clicking shows past pages.
+      expandable: hist.length > 1, history: hist,
+      // Raw pager fields (JS-only, never injected as HTML) for the message detail pane.
+      praw: { proto: p.proto, fn: p.function, baud: p.baud, cls: p.class, text: p.text },
+      color: '#7dcfff', name: `${ic('📟')}${escapeHtml(cap)}`, seen: p.seen,
+      sv: { id: cap, flight: '', icao: '', reg: String(p.proto || ''), type: String(p.class || ''), alt: undefined, kt: undefined, msgs: p.msgs, seen: p.seen || 0 },
+      cols: ['', '', escapeHtml(String(p.proto || '')), escapeHtml(String(p.class || '')), '', '', p.msgs ?? ''],
+      f: { proto: escapeHtml(String(p.proto || '')), capcode: cap, function: p.function ?? '', baud: p.baud ?? '', text: escapeHtml(txt.slice(0, 48)), msgs: p.msgs ?? '' },
+    });
+  }
+  // --- Entity-type tabs: All (everything, generic columns) + one tab per
+  // present type, each with its own column set. Only tabs with ≥1 entity show.
+  const TABS = [
+    { key: 'all', label: 'All', types: null,
+      cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'aircraft', label: '✈️ Aircraft', types: ['aircraft'],
+      cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'ships', label: '🚢 Ships', types: ['vessel'],
+      cols: [['mmsi', 'mmsi', 1], ['country', 'country'], ['type', 'type'], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'beacons', label: '🎈 Beacons', types: ['beacon'],
+      cols: [['id', 'id'], ['type', 'type'], ['alt', 'alt', 1], ['msgs', 'msgs', 1]] },
+    { key: 'trains', label: '🚆 Trains', types: ['train'],
+      cols: [['unit', 'unit'], ['class', 'class'], ['pressure', 'psi', 1], ['motion', 'motion', 1], ['marker', 'marker', 1], ['msgs', 'msgs', 1]] },
+    { key: 'pagers', label: '📟 Pagers', types: ['pager'],
+      cols: [['proto', 'proto'], ['capcode', 'capcode', 1], ['function', 'fn', 1], ['baud', 'baud', 1], ['text', 'text'], ['msgs', 'msgs', 1]] },
+    { key: 'sats', label: '🛰 Sats', types: ['sat'], cols: [['type', 'type'], ['alt', 'alt']] },
+  ];
+  const present = new Set(ents.map(e => e.type));
+  const shownTabs = TABS.filter(t => !t.types || t.types.some(ty => present.has(ty)));
+  if (!shownTabs.some(t => t.key === entTab)) entTab = 'all';
+  const tab = shownTabs.find(t => t.key === entTab) || shownTabs[0];
+  const isAll = tab.key === 'all';
+  document.getElementById('enttabs').innerHTML = shownTabs.map(t => {
+    const n = t.types ? ents.filter(e => t.types.includes(e.type)).length : ents.length;
+    return `<span class="tab${t.key === entTab ? ' on' : ''}" data-tab="${t.key}">${t.label} ${n}</span>`;
+  }).join('');
+  const view = tab.types ? ents.filter(e => tab.types.includes(e.type)) : ents;
+
+  // Sort. `name`/`seen` always valid; otherwise the active tab's column key.
+  const colKeys = tab.cols.map(c => c[0]);
+  if (sortCol !== 'seen' && sortCol !== 'name' && !colKeys.includes(sortCol)) sortCol = 'seen';
+  const NUM = new Set(['alt', 'kt', 'msgs', 'seen', 'pressure', 'baud', 'capcode', 'function', 'motion', 'marker', 'mmsi']);
+  const numCol = NUM.has(sortCol);
+  const dirMul = sortDir === 'asc' ? 1 : -1;
+  const sval = e => sortCol === 'seen' ? (e.seen || 0)
+    : sortCol === 'name' ? (e.id || '')
+    : (isAll ? e.sv[sortCol] : e.f[sortCol]);
+  view.sort((x, y) => {
+    let xv = sval(x), yv = sval(y);
+    if (numCol) {
+      const xn = (xv == null || xv === '') ? null : +xv, yn = (yv == null || yv === '') ? null : +yv;
+      if (xn == null && yn == null) return 0;
+      if (xn == null) return 1;
+      if (yn == null) return -1;
+      return (xn - yn) * dirMul;
+    }
+    xv = (xv ?? '').toString().toLowerCase(); yv = (yv ?? '').toString().toLowerCase();
+    if (xv === yv) return 0;
+    if (xv === '') return 1;
+    if (yv === '') return -1;
+    return (xv < yv ? -1 : 1) * dirMul;
+  });
+
   const rows = [];
-  for (const a of [...s.aircraft].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
-    const k = 'a' + a.icao;
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-      `onclick="selectEntity('${k}',${a.lat ?? 'null'},${a.lon ?? 'null'})">` +
-      `<td style="color:${altColor(a.alt)}">✈ ${escapeHtml(a.callsign || a.icao)}</td>` +
-      `<td>${escapeHtml(a.reg || '')}</td><td>${escapeHtml(a.actype || '')}</td>` +
-      `<td>${a.alt ?? ''}</td><td>${a.spd ?? ''}</td><td>${a.msgs ?? ''}</td>` +
-      `<td class="age">${fmtAge(s.now - a.seen)}</td></tr>`);
+  msgIndex = {}; entMsg = {}; // rebuilt below as pager rows are emitted
+  for (const e of view) {
+    // Every pager row is clickable to open its latest message in the detail
+    // pane (not just multi-message pagers via their history sub-rows).
+    if (e.type === 'pager') {
+      const pr = e.praw || {}, h = (e.history && e.history.length) ? e.history[e.history.length - 1] : null;
+      const seen = (h && h.seen) || e.seen || 0;
+      entMsg[e.k] = {
+        cap: e.id, proto: pr.proto, fn: pr.fn, baud: pr.baud, cls: pr.cls,
+        kind: h ? h.kind : pr.cls, text: h ? h.text : pr.text, seen,
+        mk: e.id + '|' + seen,
+      };
+    }
+    const open = e.expandable && acExpanded.has(e.id);
+    const caret = e.expandable ? (open ? '▾ ' : '▸ ') : '';
+    const cells = isAll
+      ? e.cols.map(c => `<td>${c}</td>`).join('')
+      : tab.cols.map(([key]) => `<td>${e.f[key] ?? ''}</td>`).join('');
+    rows.push(`<tr class="row${selected === e.k ? ' sel' : ''}" data-k="${escapeHtml(e.k)}" ` +
+      `data-id="${escapeHtml(e.id)}" data-lat="${e.lat ?? ''}" data-lon="${e.lon ?? ''}" data-exp="${e.expandable ? 1 : 0}">` +
+      `<td style="color:${e.color}">${caret}${e.name}</td>` + cells +
+      `<td class="age">${fmtAge(s.now - e.seen)}</td></tr>`);
+    if (open && e.type === 'pager' && e.history && e.history.length) {
+      // Message history (newest first): each past page as an indented,
+      // clickable row that mirrors the parent's columns — the text lands under
+      // the "text" column and the age under "seen", so the sub-rows line up.
+      const cap = e.id, pr = e.praw || {};
+      for (const h of [...e.history].reverse()) {
+        const mk = cap + '|' + (h.seen || 0);
+        msgIndex[mk] = { cap, proto: pr.proto, fn: pr.fn, baud: pr.baud, cls: pr.cls, kind: h.kind, text: h.text, seen: h.seen };
+        const selCls = (selectedMsg && selectedMsg.mk === mk) ? ' sel' : '';
+        const txt = escapeHtml(String(h.text || '').slice(0, 80));
+        // Middle cells: per-type tab puts text under its 'text' column (blank
+        // elsewhere); the All view has no text column, so span its generic cols.
+        const mid = isAll
+          ? `<td colspan="${e.cols.length}">${txt}</td>`
+          : tab.cols.map(([key]) => `<td>${key === 'text' ? txt : ''}</td>`).join('');
+        rows.push(`<tr class="row srcrow msgrow${selCls}" data-msgkey="${escapeHtml(mk)}">` +
+          `<td class="msgcaret">↳</td>` + mid +
+          `<td class="age">${fmtAge(s.now - (h.seen || 0))}</td></tr>`);
+      }
+    } else if (open && e.srcs.length) {
+      // Per-source breakdown. srcs only exist on aircraft, which appear only in
+      // the All and Aircraft tabs — both share this 9-cell layout — so the rows
+      // line up in either (previously gated to All, leaving Aircraft carets dead).
+      for (const sr of [...e.srcs].sort((p, q) => (p.source || '').localeCompare(q.source || ''))) {
+        rows.push(`<tr class="row srcrow">` +
+          `<td style="padding-left:20px;color:#7aa2f7">↳ ${escapeHtml(sr.source || '')}</td>` +
+          `<td>${escapeHtml(sr.flight || '')}</td><td>${escapeHtml(sr.icao || '')}</td>` +
+          `<td>${escapeHtml(sr.reg || '')}</td><td>${escapeHtml(sr.type || sr.actype || '')}</td>` +
+          `<td>${sr.alt ?? ''}</td><td>${sr.spd ?? ''}</td><td>${sr.msgs ?? ''}</td>` +
+          `<td class="age">${sr.seen ? fmtAge(s.now - sr.seen) : ''}</td></tr>`);
+      }
+    }
   }
-  for (const v of [...s.vessels].sort((x, y) => (y.mmsi||0) - (x.mmsi||0))) {
-    const k = 'v' + v.mmsi;
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-      `onclick="selectEntity('${k}',${v.lat ?? 'null'},${v.lon ?? 'null'})">` +
-      `<td style="color:${shipMeta(v.shiptype).color}">⚓ ${escapeHtml((v.name || String(v.mmsi)).trim())}</td>` +
-      `<td>${escapeHtml(v.country || '')}</td><td>${escapeHtml(shipMeta(v.shiptype).label || '')}</td>` +
-      `<td></td><td>${v.sog ?? ''}</td><td></td>` +
-      `<td class="age">${fmtAge(s.now - v.seen)}</td></tr>`);
-  }
-  // Iridium satellites (broadcasting overhead) and SBD terminals (identifiable
-  // transmitters on the short-burst-data channel) are entities too.
-  for (const sat of [...(s.iridium_sats || [])].sort((x, y) => (x.sat||0) - (y.sat||0))) {
-    const k = 's' + sat.sat;
-    rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-      `onclick="selectEntity('${k}',${sat.lat ?? 'null'},${sat.lon ?? 'null'})">` +
-      `<td style="color:#bb9af7">🛰 ${escapeHtml(sat.name || ('Iridium ' + sat.sat))}</td>` +
-      `<td></td><td>satellite</td>` +
-      `<td>${sat.alt != null ? Math.round(sat.alt) + 'km' : ''}</td><td></td><td></td>` +
-      `<td class="age">${fmtAge(s.now - sat.seen)}</td></tr>`);
-  }
-  // SBD terminals are interesting but not immediately useful, so they're
-  // collapsed behind a toggle row (state persisted, hidden by default).
-  const terms = s.iridium_terminals || [];
+  // SBD terminals (Iridium) stay behind their toggle — only in the All view.
+  const terms = isAll ? (s.iridium_terminals || []) : [];
   if (terms.length) {
+    const ncol = tab.cols.length + 2;
     const showTerm = localStorage.getItem('xng.terminals') === '1';
-    rows.push(`<tr class="row" onclick="toggleTerminals()">` +
-      `<td colspan="7" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
+    rows.push(`<tr class="row" data-act="term">` +
+      `<td colspan="${ncol}" style="color:#565f89">📟 ${terms.length} Iridium SBD terminal${terms.length > 1 ? 's' : ''} — click to ${showTerm ? 'hide' : 'show'}</td></tr>`);
     if (showTerm) {
       for (const t of [...terms].sort((x, y) => (y.msgs||0) - (x.msgs||0))) {
         const k = 't' + t.imei;
-        rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${k}" ` +
-          `onclick="selectEntity('${k}',null,null)">` +
-          `<td style="color:#e0af68">📟 ${escapeHtml(t.imei)}</td>` +
-          `<td></td><td>SBD${t.text ? ' · ' + escapeHtml(String(t.text).trim().slice(0, 20)) : ''}</td>` +
+        rows.push(`<tr class="row${selected === k ? ' sel' : ''}" data-k="${escapeHtml(k)}">` +
+          `<td style="color:#e0af68">${ic('📟')}${escapeHtml(t.imei)}</td>` +
+          `<td></td><td></td><td></td><td>SBD${t.text ? ' · ' + escapeHtml(String(t.text).trim().slice(0, 20)) : ''}</td>` +
           `<td></td><td></td><td>${t.msgs ?? ''}</td>` +
           `<td class="age">${fmtAge(s.now - t.seen)}</td></tr>`);
       }
     }
   }
+  // Sortable headers: name + the active tab's columns + seen.
+  const ind = c => sortCol === c ? (sortDir === 'asc' ? ' ▲' : ' ▼') : '';
+  const hdr = `<th data-col="name" class="sortable">name${ind('name')}</th>` +
+    tab.cols.map(([key, label]) => `<th data-col="${key}" class="sortable">${label}${ind(key)}</th>`).join('') +
+    `<th data-col="seen" class="sortable">seen${ind('seen')}</th>`;
   document.getElementById('entities').innerHTML = rows.length
-    ? `<table><tr><th>id</th><th>reg</th><th>type</th><th>alt</th><th>kt</th><th>msgs</th><th>seen</th></tr>${rows.join('')}</table>`
+    ? `<table><tr>${hdr}</tr>${rows.join('')}</table>`
     : '';
+  renderEntCard();
 
   // Pause freezes only which log items are listed: capture the live list
   // while running, then always render from the captured list so message

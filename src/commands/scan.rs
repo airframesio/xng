@@ -46,6 +46,37 @@ pub(crate) fn plan(mode: Mode) -> (f64, Vec<u64>) {
                 17_928, 17_934, 17_958, 17_967, 17_985, 21_928, 21_931,
                 21_934, 21_937, 21_949, 21_955, 21_982, 21_990, 21_997]),
         ),
+        // UAT 978 MHz is wideband like ADS-B (whole capture, single center).
+        Mode::Uat => (2_400_000.0, k(&[978_000])),
+        // COSPAS-SARSAT 406 MHz beacon channels.
+        Mode::Sarsat => (2_400_000.0, k(&[406_025, 406_028, 406_037])),
+        // DSC MF/HF distress + calling (the implemented 100 Bd FSK path).
+        Mode::Dsc => (768_000.0, vec![2_187_500, 4_207_500, 6_312_000, 8_414_500, 12_577_000, 16_804_500]),
+        // NAVTEX international (518), national (490), HF (4209.5 kHz).
+        Mode::Navtex => (768_000.0, vec![518_000, 490_000, 4_209_500]),
+        // Radiosonde common RS41 frequencies (400–406 MHz; sondes also hop).
+        Mode::Sonde => (2_400_000.0, k(&[402_700, 404_000, 405_000])),
+        // ADS-L on the EASA SRD860 868 MHz band.
+        Mode::AdsL => (2_000_000.0, k(&[868_200])),
+        // ATCS rail data radio (900 MHz band, representative channels).
+        Mode::Atcs => (2_400_000.0, k(&[896_000, 900_000])),
+        // APRS / AX.25 packet — the whole 2-meter channel cluster fits one
+        // 2.4 MHz window: 144.390 (NA/SA), 144.575 (NZ), 144.640 (CN/TW),
+        // 144.660 (JP), 144.800 (EU/RU), 144.990 (NA event), 145.175 (AU), and
+        // 145.825 (ISS / satellite digipeat). 70cm 446.100 + HF 300-baud APRS
+        // (10.1476 / 14.1030 / 29.250 MHz) are separate bands/modulation.
+        Mode::Aprs => (
+            2_400_000.0,
+            k(&[144_390, 144_575, 144_640, 144_660, 144_800, 144_990, 145_175, 145_825]),
+        ),
+        // POCSAG paging: representative US (929/931) + EU (466) channels.
+        Mode::Pocsag => (2_400_000.0, k(&[929_000, 931_000, 466_075])),
+        // Rail EOT/HOT telemetry: EOT→HOT 457.9375, HOT→EOT 452.9375 MHz.
+        Mode::Eot => (2_400_000.0, k(&[457_937, 452_937])),
+        // FLEX paging: representative US 929/931 MHz channels.
+        Mode::Flex => (2_400_000.0, k(&[929_000, 931_000])),
+        // VDES ASM 1/2 (the former AIS 27/28 region): 161.950 / 162.000 MHz.
+        Mode::Vdes => (2_400_000.0, k(&[161_950, 162_000])),
         _ => (2_400_000.0, vec![]),
     }
 }
@@ -65,6 +96,16 @@ pub(crate) fn core_channels(mode: Mode) -> Vec<u64> {
         Mode::Adsb => k(&[1_090_000]),
         // Primary ring-alert channel.
         Mode::Iridium => k(&[1_626_271]),
+        Mode::Uat => k(&[978_000]),
+        Mode::Sarsat => k(&[406_025]),
+        Mode::Dsc => vec![2_187_500],
+        Mode::Navtex => vec![518_000],
+        Mode::AdsL => k(&[868_200]),
+        Mode::Aprs => k(&[144_390]),
+        Mode::Pocsag => k(&[929_000]),
+        Mode::Eot => k(&[457_937]),
+        Mode::Flex => k(&[929_000]),
+        Mode::Vdes => k(&[161_950]),
         _ => Vec::new(),
     }
 }
@@ -77,7 +118,18 @@ pub(crate) fn passband(mode: Mode) -> f64 {
         Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
         Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
         Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
-        Mode::Adsb => 0.0,
+        Mode::Adsb | Mode::Uat => 0.0,
+        Mode::Sarsat => xng_mode_sarsat::CHANNEL_PASSBAND_HZ,
+        Mode::Dsc => xng_mode_dsc::CHANNEL_PASSBAND_HZ,
+        Mode::Navtex => xng_mode_navtex::CHANNEL_PASSBAND_HZ,
+        Mode::Sonde => xng_mode_sonde::CHANNEL_PASSBAND_HZ,
+        Mode::AdsL => xng_mode_adsl::CHANNEL_PASSBAND_HZ,
+        Mode::Atcs => xng_mode_atcs::CHANNEL_PASSBAND_HZ,
+        Mode::Aprs => xng_mode_aprs::CHANNEL_PASSBAND_HZ,
+        Mode::Pocsag => xng_mode_pocsag::CHANNEL_PASSBAND_HZ,
+        Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
+        Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
+        Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
         _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
     }
 }
@@ -91,8 +143,19 @@ pub(crate) fn channel_rate(mode: Mode) -> f64 {
         Mode::Hfdl => xng_mode_hfdl::CHANNEL_RATE,
         Mode::StdC => xng_mode_stdc::CHANNEL_RATE,
         Mode::Iridium => xng_mode_iridium::CHANNEL_RATE,
-        // Consumes the whole capture at its native rate.
-        Mode::Adsb => 1.0,
+        // Consumes the whole capture at its native rate (wideband).
+        Mode::Adsb | Mode::Uat => 1.0,
+        Mode::Sarsat => xng_mode_sarsat::CHANNEL_RATE,
+        Mode::Dsc => xng_mode_dsc::CHANNEL_RATE,
+        Mode::Navtex => xng_mode_navtex::CHANNEL_RATE,
+        Mode::Sonde => xng_mode_sonde::CHANNEL_RATE,
+        Mode::AdsL => xng_mode_adsl::CHANNEL_RATE,
+        Mode::Atcs => xng_mode_atcs::CHANNEL_RATE,
+        Mode::Aprs => xng_mode_aprs::CHANNEL_RATE,
+        Mode::Pocsag => xng_mode_pocsag::CHANNEL_RATE,
+        Mode::Eot => xng_mode_eot::CHANNEL_RATE,
+        Mode::Flex => xng_mode_flex::CHANNEL_RATE,
+        Mode::Vdes => xng_mode_vdes::CHANNEL_RATE,
         _ => xng_mode_acars::CHANNEL_RATE,
     }
 }
@@ -165,7 +228,7 @@ fn candidates_from_ranges(ranges: &[(f64, f64, f64)], mode: Mode) -> Vec<u32> {
 /// only care that the rate is an integer multiple of their channel rate, so
 /// this preference applies to Mode S alone.
 pub(crate) fn prefers_even_integer_rate(mode: Mode) -> bool {
-    matches!(mode, Mode::Adsb)
+    matches!(mode, Mode::Adsb | Mode::Uat)
 }
 
 /// True when `rate` gives an even integer number of samples per µs.
@@ -512,7 +575,9 @@ pub(crate) fn scan_group(
         sdr: None,
         receiver_pos: None,
         label_filter: Default::default(),
+        ais_filter: Default::default(),
         demod_effort: runtime::DemodEffort::Live,
+        max_ppm: None,
         outputs: runtime::OutputConfig {
             console: crate::outputs::console::ConsoleFormat::Pretty,
             jsonl: None,
@@ -524,11 +589,15 @@ pub(crate) fn scan_group(
             sbs: None,
             beast: None,
             nmea_tcp: None,
+            nmea_udp: None,
+            nmea_tag_blocks: false,
             gsmtap: None,
             iridium_satmap: None,
             http: None,
             mqtt: None,
             mqtt_topic: "xng".into(),
+            airframes: None,
+            own_ship_mmsi: None,
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;
@@ -557,6 +626,7 @@ pub(crate) fn scan_group(
         stop,
         Some((live.clone(), center, rate)),
         None,
+        Default::default(),
         Default::default(),
     )?;
     let _ = stop_thread.join();

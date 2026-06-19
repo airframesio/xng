@@ -18,6 +18,12 @@ pub struct SignalQuality {
     /// Carrier frequency offset from channel center, Hz.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freq_skew_hz: Option<f32>,
+    /// Receive time as a monotonic 12 MHz sample-clock tick (the dump1090 /
+    /// Beast MLAT counter convention), derived from the frame's absolute
+    /// sample offset rather than the wall clock — so the Beast feed is
+    /// monotonic and consistent-rate (MLAT-client-acceptable). Mode S only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_ticks_12mhz: Option<u64>,
 }
 
 /// Decode/FEC quality for a frame.
@@ -65,10 +71,23 @@ pub struct AcarsCore {
     /// True when `text` was reassembled from multiple blocks.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reassembled: bool,
+    /// Reassembly status as named by acarsdec/libacars (`complete`,
+    /// `in progress`, `skipped`, `duplicate`, `out of sequence`); `None`
+    /// when the message never passed through the reassembler.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assstat: Option<String>,
     /// Decoded application layer (ADS-C, CPDLC envelope, media advisory,
     /// ...), as produced by xng-acars.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<serde_json::Value>,
+    /// VDL2-only transient: the AVLC link wrapper (`{src,dst,control}`) the
+    /// dumpvdl2 `decoded:json` feed needs but the public model doesn't carry.
+    /// `#[serde(skip)]` keeps it out of every serialized output (JSONL, MQTT,
+    /// asf-2.0); it rides in-memory only, from `xng_mode_vdl2::to_message` to
+    /// `outputs::dumpvdl2_json::format_dumpvdl2`. Not part of the message
+    /// contract; never populated for non-VDL2 carriers.
+    #[serde(skip)]
+    pub vdl2_link: Option<serde_json::Value>,
 }
 
 /// Typed per-mode message bodies. Deliberately minimal for M0; each mode core
@@ -116,6 +135,10 @@ pub enum MessageBody {
         /// Comm-B register content (BDS-inferred from DF20/21).
         #[serde(skip_serializing_if = "Option::is_none")]
         comm_b: Option<serde_json::Value>,
+        /// ADS-B operational status (TC31: version/NACp/SIL/NIC-supp/GVA) or
+        /// aircraft/emergency status (TC28).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        adsb_status: Option<serde_json::Value>,
     },
     /// Iridium frame (ring alert, broadcast, ...).
     Iridium {
@@ -144,6 +167,78 @@ pub enum MessageBody {
     /// application-layer interpretation.
     /// Inmarsat Aero non-ACARS structures (C-channel assignments, ...).
     Aero {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// UAT 978 MHz frame — `kind` = "adsb" (downlink state vector) or
+    /// "fisb" (uplink weather product); `details` carries the decoded fields.
+    Uat {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// COSPAS-SARSAT 406 MHz distress beacon (ELT/EPIRB/PLB); `kind` = beacon
+    /// protocol class, `details` = decoded beacon fields (ID, position, …).
+    Sarsat {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// Digital Selective Calling message; `kind` = call format
+    /// (distress/all-ships/individual/area), `details` = decoded fields.
+    Dsc {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// NAVTEX message; `kind` = B2 subject indicator, `details` = station /
+    /// serial / text.
+    Navtex {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// Radiosonde telemetry frame (RS41); `kind` = sonde type, `details` =
+    /// status / PTU / GPS fields.
+    Sonde {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// ADS-L electronic-conspicuity frame; `kind` = message type, `details` =
+    /// iConspicuity fields (position, track, …).
+    AdsL {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// ATCS rail data-radio packet; `kind` = Spec-200 packet type, `details` =
+    /// address/header fields.
+    Atcs {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// APRS / AX.25 packet; `kind` = packet/data type (position/weather/message/
+    /// status/telemetry/…), `details` = decoded AX.25 addresses + APRS fields.
+    Aprs {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// POCSAG pager message; `kind` = message class (numeric/alpha/tone),
+    /// `details` = capcode/function/address + decoded text.
+    Pocsag {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// Rail EOT/HOT telemetry packet; `kind` = unit (eot/hot), `details` =
+    /// unit address + brake-pipe pressure / motion / marker-light fields.
+    Eot {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// FLEX pager message; `kind` = message class (alpha/numeric/tone),
+    /// `details` = capcode/frame/cycle + decoded text.
+    Flex {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// VDES Application-Specific Message; `kind` = ASM type, `details` =
+    /// source MMSI + DAC/FID + decoded ASM payload fields.
+    Vdes {
         kind: String,
         details: serde_json::Value,
     },

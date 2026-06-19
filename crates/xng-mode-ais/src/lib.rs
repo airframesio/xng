@@ -14,6 +14,7 @@ pub mod fields;
 pub mod frame;
 pub mod modulate;
 pub mod nmea;
+pub mod reassembly;
 
 use chrono::Utc;
 use num_complex::Complex;
@@ -25,13 +26,28 @@ pub const CHANNEL_RATE: f64 = 48_000.0;
 /// One-sided channel passband (GMSK BT=0.4 at 9600 bd in a 25 kHz channel).
 pub const CHANNEL_PASSBAND_HZ: f64 = 8_000.0;
 
-/// AIS channel A/B designators by frequency.
+/// AIS channel A/B designator by frequency. Channel A is 161.975 MHz
+/// (AIS 1, marine ch 87B), channel B is 162.025 MHz (AIS 2, ch 88B). A small
+/// ±12.5 kHz tolerance absorbs tuner rounding; anything else returns `'?'`
+/// rather than a silently wrong `'A'` (the AIVDM channel field stays a single
+/// valid ASCII char, so `(channel,total,seq)` fragment keying is unaffected).
 pub fn channel_letter(frequency_hz: u64) -> char {
-    match frequency_hz {
-        161_975_000 => 'A',
-        162_025_000 => 'B',
-        _ => 'A',
+    const TOL_HZ: i64 = 12_500;
+    let near = |center: u64| (frequency_hz as i64 - center as i64).abs() <= TOL_HZ;
+    if near(161_975_000) {
+        'A'
+    } else if near(162_025_000) {
+        'B'
+    } else {
+        '?'
     }
+}
+
+/// Build an own-ship **AIVDO** Type 1 position sentence for the receiver's own
+/// MMSI + location (AIS-5c) — lets a connected chart plotter show the station.
+/// Round-trips through the field decoder (see tests).
+pub fn own_ship_position(mmsi: u32, lat: f64, lon: f64) -> String {
+    nmea::aivdo_sentence(&fields::encode_position_report(mmsi, lat, lon))
 }
 
 /// Decodes one AIS channel out of a wideband capture.
@@ -157,9 +173,60 @@ pub fn to_message(
             nmea,
             msg_type: Some(f.msg_type),
             mmsi: Some(f.mmsi),
-            details: fields::decode(f.msg_type, &f.message_bits),
+            details: ais_details(f),
         },
         raw: Some(f.wire_bytes.clone()),
         source,
+    }
+}
+
+/// Field decode plus a `distress` tag for SART/MOB/EPIRB-AIS devices
+/// (classified by MMSI prefix — see [`fields::distress_class`]).
+fn ais_details(f: &frame::AisFrame) -> Option<serde_json::Value> {
+    let mut details = fields::decode(f.msg_type, &f.message_bits);
+    if let Some(device) = fields::distress_class(f.mmsi) {
+        let d = details.get_or_insert_with(|| serde_json::json!({}));
+        if let Some(obj) = d.as_object_mut() {
+            obj.insert("distress".into(), serde_json::json!(device));
+        }
+    }
+    details
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{channel_letter, fields, nmea, own_ship_position};
+
+    // AIS-5c: an own-ship AIVDO sentence round-trips through the (pyais-
+    // oracle-validated) field decoder back to the encoded MMSI + position,
+    // with the not-available kinematic fields correctly omitted.
+    #[test]
+    fn own_ship_aivdo_round_trips() {
+        let s = own_ship_position(366_123_456, 37.5, -122.3);
+        assert!(s.starts_with("!AIVDO,1,1,,,"), "{s}");
+        assert!(s.contains('*'), "checksum present: {s}");
+        let payload = s.split(',').nth(5).unwrap();
+        let bits = nmea::payload_to_bits(payload);
+        assert_eq!((0..6).fold(0u8, |v, i| (v << 1) | bits[i]), 1, "type 1");
+        assert_eq!((8..38).fold(0u32, |v, i| (v << 1) | bits[i] as u32), 366_123_456, "mmsi");
+        let f = fields::decode(1, &bits).unwrap();
+        assert!((f["lat"].as_f64().unwrap() - 37.5).abs() < 1e-3, "lat {}", f["lat"]);
+        assert!((f["lon"].as_f64().unwrap() - (-122.3)).abs() < 1e-3, "lon {}", f["lon"]);
+        // Kinematics a fixed station can't supply are "not available" → omitted.
+        assert!(f.get("sog_kt").is_none() && f.get("cog_deg").is_none(), "{f:?}");
+    }
+
+    #[test]
+    fn channel_letter_labels_a_b_and_marks_unknown() {
+        // The two canonical AIS frequencies.
+        assert_eq!(channel_letter(161_975_000), 'A');
+        assert_eq!(channel_letter(162_025_000), 'B');
+        // Tuner rounding within ±12.5 kHz still resolves.
+        assert_eq!(channel_letter(161_980_000), 'A');
+        assert_eq!(channel_letter(162_020_000), 'B');
+        // Non-AIS / out-of-band frequencies are NOT silently labelled 'A'.
+        assert_ne!(channel_letter(161_950_000), 'A'); // VDES ASM 1
+        assert_ne!(channel_letter(157_000_000), 'A');
+        assert_eq!(channel_letter(157_000_000), '?');
     }
 }

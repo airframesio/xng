@@ -2,12 +2,15 @@
 //! libacars (asn1c-generated FANSAC* tables + asn1-format-cpdlc-text.c
 //! labels; see ../PROVENANCE.md).
 //!
-//! Scope (v1): unaligned-PER decode of the ATC message header (message
-//! id, optional reference number, optional timestamp) and the FIRST
-//! message element's CHOICE tag, mapped to its human-readable template.
-//! Element arguments and additional elements (rare; their presence is
-//! reported) are left as remaining raw bits — full argument decoding is
-//! a planned follow-up.
+//! Scope: unaligned-PER decode of the ATC message header (message id,
+//! optional reference number, optional timestamp), the first message
+//! element's CHOICE tag mapped to its human-readable template, and the
+//! element arguments for the shapes we decode (rendered into the
+//! template). Additional elements are walked while every preceding
+//! element's argument shape decodes (UPER has no per-element length
+//! prefix). Argument shapes not yet decoded (e.g. FANSPositionReport,
+//! RouteClearance trackDetail) leave the bracketed template in place and
+//! stop the walk.
 //!
 //! UPER layout (from the generated constraint tables):
 //! - ATCDownlinkMessage / ATCUplinkMessage = SEQUENCE { header,
@@ -125,16 +128,32 @@ fn read_ia5(b: &mut Bits, len_bits: usize, min: u32) -> Option<String> {
 
 /// FANSPosition CHOICE (3-bit index): fix name, navaid, airport,
 /// latitude/longitude (degrees + optional tenths-of-minutes +
-/// direction), or place-bearing-distance (not decoded).
+/// direction), or place-bearing-distance.
 fn read_position(b: &mut Bits) -> Option<String> {
     match b.read(3)? {
         0 => read_ia5(b, 3, 1), // fixName SIZE(1..5)
         1 => read_ia5(b, 2, 1), // navaid SIZE(1..4)
         2 => read_ia5(b, 0, 4), // airport SIZE(4)
         3 => read_latlon(b),
-        // placeBearingDistance: not decoded.
+        4 => read_place_bearing_distance(b),
         _ => None,
     }
+}
+
+/// FANSPlaceBearingDistance: SEQUENCE { fixName (IA5 SIZE 1..5),
+/// latitudeLongitude OPTIONAL, degrees, distance }. One OPTIONAL → a
+/// leading presence bit. Constraints + member order from the libacars
+/// asn1c FANSPlaceBearingDistance tables (lat/lon is optional member 1).
+fn read_place_bearing_distance(b: &mut Bits) -> Option<String> {
+    let has_ll = b.read(1)? == 1;
+    let fix = read_ia5(b, 3, 1)?; // FANSFixName SIZE(1..5)
+    let ll = if has_ll { Some(read_latlon(b)?) } else { None };
+    let deg = read_degrees(b)?;
+    let dist = read_distance(b)?;
+    Some(match ll {
+        Some(ll) => format!("{fix} ({ll}) BRG {deg} DIST {dist}"),
+        None => format!("{fix} BRG {deg} DIST {dist}"),
+    })
 }
 
 fn read_latlon(b: &mut Bits) -> Option<String> {
@@ -311,6 +330,213 @@ fn read_freetext(b: &mut Bits) -> Option<String> {
     Some(s)
 }
 
+/// FANSDistanceOffset: CHOICE(1 bit) of distanceOffsetNm (INTEGER 1..128,
+/// 7 bits, integer nm) / distanceOffsetKm (INTEGER 1..256, 8 bits,
+/// integer km). Constraints + units from libacars asn1c tables and
+/// asn1-format-cpdlc-text.c (FANSDistanceOffsetNm " nm", DistanceMetric
+/// " km").
+fn read_distance_offset(b: &mut Bits) -> Option<String> {
+    Some(if b.read(1)? == 0 {
+        format!("{} nm", b.read(7)? + 1)
+    } else {
+        format!("{} km", b.read(8)? + 1)
+    })
+}
+
+/// FANSDistance: CHOICE(1 bit) of distanceNm (INTEGER 0..9999, 14 bits,
+/// tenths of nm via FANSDistanceEnglish 0.1) / distanceKm (INTEGER
+/// 1..1024, 10 bits, integer km via FANSDistanceMetric).
+fn read_distance(b: &mut Bits) -> Option<String> {
+    Some(if b.read(1)? == 0 {
+        format!("{:.1} nm", b.read(14)? as f64 / 10.0)
+    } else {
+        format!("{} km", b.read(10)? + 1)
+    })
+}
+
+/// FANSFrequency: CHOICE(2 bits) of hf (INTEGER 2850..28000 kHz, 15 bits,
+/// rendered in kHz) / vhf (117000..138000 kHz, 15 bits) / uhf
+/// (225000..399975 kHz, 18 bits) — vhf/uhf rendered in MHz — /
+/// satchannel (NumericString SIZE 12, 4 bits per char). Constraints +
+/// formatters from libacars asn1c tables and asn1-format-cpdlc-text.c.
+fn read_frequency(b: &mut Bits) -> Option<String> {
+    match b.read(2)? {
+        0 => Some(format!("{} kHz", 2850 + b.read(15)?)),
+        1 => Some(format!("{:.3} MHz", (117000 + b.read(15)?) as f64 / 1000.0)),
+        2 => Some(format!("{:.3} MHz", (225000 + b.read(18)?) as f64 / 1000.0)),
+        3 => {
+            // NumericString SIZE(12): 12 chars, each a 4-bit constrained
+            // alphabet index into " 0123456789" (NumericString PER
+            // alphabet; per-char index range 32..57 in the asn1c table).
+            const NUM: &[u8] = b" 0123456789";
+            let mut s = String::with_capacity(12);
+            for _ in 0..12 {
+                let idx = b.read(4)? as usize;
+                s.push(*NUM.get(idx).unwrap_or(&b'?') as char);
+            }
+            Some(s.trim().to_string())
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// FANSBeaconCode: SEQUENCE OF SIZE(4..4) FANSBeaconCodeOctalDigit
+/// (INTEGER 0..7, 3 bits). Fixed size → no length count. Rendered as the
+/// 4-digit squawk (libacars FANSBeaconCode formatter "%ld%ld%ld%ld").
+fn read_beacon_code(b: &mut Bits) -> Option<String> {
+    let mut s = String::with_capacity(4);
+    for _ in 0..4 {
+        let d = b.read(3)?;
+        if d > 7 {
+            return None;
+        }
+        s.push((b'0' + d as u8) as char);
+    }
+    Some(s)
+}
+
+/// FANSProcedureName: SEQUENCE { procedureType (ENUM 0..2, 2 bits),
+/// procedure (IA5 SIZE 1..6, 3-bit length offset 1), procedureTransition
+/// OPTIONAL (IA5 SIZE 1..6) }. One OPTIONAL → a leading presence bit.
+/// Constraints from libacars asn1c tables.
+fn read_procedure_name(b: &mut Bits) -> Option<String> {
+    let has_transition = b.read(1)? == 1;
+    let ptype = match b.read(2)? {
+        0 => "ARRIVAL",
+        1 => "APPROACH",
+        2 => "DEPARTURE",
+        _ => return None,
+    };
+    let name = read_ia5(b, 3, 1)?; // FANSProcedure SIZE(1..6)
+    let mut s = format!("{name} ({ptype})");
+    if has_transition {
+        s.push_str(&format!(" TRANS {}", read_ia5(b, 3, 1)?)); // SIZE(1..6)
+    }
+    Some(s)
+}
+
+/// FANSAltimeter: CHOICE(1 bit) of altimeterEnglish (INTEGER 2200..3200,
+/// 10 bits, inHg ×0.01, 2 decimals) / altimeterMetric (7500..12500,
+/// 13 bits, hPa ×0.1, 1 decimal). Constraints + formatters from libacars.
+fn read_altimeter(b: &mut Bits) -> Option<String> {
+    Some(if b.read(1)? == 0 {
+        format!("{:.2} inHg", (2200 + b.read(10)?) as f64 / 100.0)
+    } else {
+        format!("{:.1} hPa", (7500 + b.read(13)?) as f64 / 10.0)
+    })
+}
+
+/// FANSATISCode: IA5String SIZE(1..1) — exactly one 7-bit char, no length
+/// bits. Constraint from libacars asn1c table.
+fn read_atis_code(b: &mut Bits) -> Option<String> {
+    read_ia5(b, 0, 1)
+}
+
+/// FANSRemainingFuel: SEQUENCE { hours (0..23, 5 bits), minutes (0..59,
+/// 6 bits) } — endurance as HH:MM (libacars renders it via the FANSTime
+/// formatter "%02ld:%02ld").
+fn read_remaining_fuel(b: &mut Bits) -> Option<String> {
+    let h = b.read(5)?;
+    let m = b.read(6)?;
+    if h > 23 || m > 59 {
+        return None;
+    }
+    Some(format!("{h:02}:{m:02}"))
+}
+
+/// FANSRemainingSouls: INTEGER 1..1024 (10 bits). Persons on board.
+fn read_remaining_souls(b: &mut Bits) -> Option<String> {
+    Some(format!("{}", b.read(10)? + 1))
+}
+
+/// FANSErrorInformation: ENUMERATED 0..16 (5 bits). Labels from the
+/// libacars FANSErrorInformation enum (asn1c FANSErrorInformation.c).
+fn read_error_information(b: &mut Bits) -> Option<String> {
+    const ERRS: [&str; 17] = [
+        "application error",
+        "duplicate message identification number",
+        "unrecognized message reference number",
+        "end service with pending messages",
+        "end service with no valid response",
+        "insufficient message storage capacity",
+        "no available message identification number",
+        "commanded termination",
+        "insufficient data",
+        "unexpected data",
+        "invalid data",
+        "reserved error message 1",
+        "reserved error message 2",
+        "reserved error message 3",
+        "reserved error message 4",
+        "reserved error message 5",
+        "reserved error message 6",
+    ];
+    ERRS.get(b.read(5)? as usize).map(|s| s.to_string())
+}
+
+/// FANSVersionNumber: INTEGER 0..15 (4 bits).
+fn read_version_number(b: &mut Bits) -> Option<String> {
+    Some(format!("{}", b.read(4)?))
+}
+
+/// FANSICAOfacilitydesignation: IA5String SIZE(4..4) — 4 fixed 7-bit
+/// chars, no length bits. Constraint from libacars asn1c table.
+fn read_icao_facility_designation(b: &mut Bits) -> Option<String> {
+    read_ia5(b, 0, 4)
+}
+
+/// FANSTp4table: ENUMERATED 0..1 (1 bit): labelA / labelB.
+fn read_tp4table(b: &mut Bits) -> Option<String> {
+    Some(match b.read(1)? {
+        0 => "label A".to_string(),
+        _ => "label B".to_string(),
+    })
+}
+
+/// FANSToFrom: ENUMERATED 0..1 (1 bit): to / from.
+fn read_tofrom(b: &mut Bits) -> Option<String> {
+    Some(match b.read(1)? {
+        0 => "TO".to_string(),
+        _ => "FROM".to_string(),
+    })
+}
+
+/// FANSICAOFacilityIdentification: CHOICE(1 bit) of
+/// iCAOfacilitydesignation (IA5 SIZE 4) / iCAOfacilityname (IA5 SIZE
+/// 3..18, 4-bit length offset 3).
+fn read_icao_facility_id(b: &mut Bits) -> Option<String> {
+    match b.read(1)? {
+        0 => read_ia5(b, 0, 4), // designation SIZE(4)
+        _ => read_ia5(b, 4, 3), // name SIZE(3..18)
+    }
+}
+
+/// FANSICAOUnitName: SEQUENCE { iCAOFacilityIdentification,
+/// iCAOFacilityFunction (ENUM 0..7, 3 bits) }. Function labels from the
+/// libacars FANSICAOFacilityFunction enum.
+fn read_icao_unit_name(b: &mut Bits) -> Option<String> {
+    let id = read_icao_facility_id(b)?;
+    const FUNCS: [&str; 8] = [
+        "center",
+        "approach",
+        "tower",
+        "final",
+        "ground control",
+        "clearance delivery",
+        "departure",
+        "control",
+    ];
+    let func = FUNCS.get(b.read(3)? as usize)?;
+    Some(format!("{id} {func}"))
+}
+
+/// FANSICAOUnitNameFrequency: SEQUENCE { iCAOUnitName, frequency }.
+fn read_icao_unit_name_frequency(b: &mut Bits) -> Option<(String, String)> {
+    let unit = read_icao_unit_name(b)?;
+    let freq = read_frequency(b)?;
+    Some((unit, freq))
+}
+
 fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
     let ty = tag.trim_start_matches(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == 'M');
     match ty {
@@ -338,10 +564,66 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
         "VerticalRate" => Some(vec![read_vertical_rate(b)?]),
         "Degrees" => Some(vec![read_degrees(b)?]),
         "DirectionDegrees" => Some(vec![read_direction(b)?, read_degrees(b)?]),
+        "PositionDegrees" => Some(vec![read_position(b)?, read_degrees(b)?]),
         "FreeText" => Some(vec![read_freetext(b)?]),
         "RouteClearance" => Some(vec![read_route_clearance(b)?]),
         "PositionRouteClearance" => {
             Some(vec![read_position(b)?, read_route_clearance(b)?])
+        }
+        // --- ACARS-3.1: additional argument shapes ---
+        "DistanceOffsetDirection" => {
+            Some(vec![read_distance_offset(b)?, read_direction(b)?])
+        }
+        "PositionDistanceOffsetDirection" => Some(vec![
+            read_position(b)?,
+            read_distance_offset(b)?,
+            read_direction(b)?,
+        ]),
+        "TimeDistanceOffsetDirection" => Some(vec![
+            read_time(b)?,
+            read_distance_offset(b)?,
+            read_direction(b)?,
+        ]),
+        "Frequency" => Some(vec![read_frequency(b)?]),
+        "BeaconCode" => Some(vec![read_beacon_code(b)?]),
+        "ProcedureName" => Some(vec![read_procedure_name(b)?]),
+        "PositionProcedureName" => {
+            Some(vec![read_position(b)?, read_procedure_name(b)?])
+        }
+        "Altimeter" => Some(vec![read_altimeter(b)?]),
+        "ATISCode" => Some(vec![read_atis_code(b)?]),
+        "RemainingFuelRemainingSouls" => {
+            Some(vec![read_remaining_fuel(b)?, read_remaining_souls(b)?])
+        }
+        "ErrorInformation" => Some(vec![read_error_information(b)?]),
+        "VersionNumber" => Some(vec![read_version_number(b)?]),
+        "ICAOfacilitydesignation" => {
+            Some(vec![read_icao_facility_designation(b)?])
+        }
+        "ICAOfacilitydesignationTp4table" => Some(vec![
+            read_icao_facility_designation(b)?,
+            read_tp4table(b)?,
+        ]),
+        "ToFromPosition" => Some(vec![read_tofrom(b)?, read_position(b)?]),
+        "TimeDistanceToFromPosition" => Some(vec![
+            read_time(b)?,
+            read_distance(b)?,
+            read_tofrom(b)?,
+            read_position(b)?,
+        ]),
+        "ICAOunitnameFrequency" => {
+            let (unit, freq) = read_icao_unit_name_frequency(b)?;
+            Some(vec![unit, freq])
+        }
+        "PositionICAOunitnameFrequency" => {
+            let pos = read_position(b)?;
+            let (unit, freq) = read_icao_unit_name_frequency(b)?;
+            Some(vec![pos, unit, freq])
+        }
+        "TimeICAOunitnameFrequency" => {
+            let time = read_time(b)?;
+            let (unit, freq) = read_icao_unit_name_frequency(b)?;
+            Some(vec![time, unit, freq])
         }
         _ => None,
     }
@@ -726,5 +1008,157 @@ mod route_tests {
         assert_eq!(m.element, "dM40RouteClearance");
         assert!(m.text.contains("DEST KSFO"), "{}", m.text);
         assert!(m.text.contains("ROUTE J501 OAK"), "{}", m.text);
+    }
+}
+
+
+#[cfg(test)]
+mod arg_reader_tests {
+    //! ACARS-3.1 argument-reader vectors. Each body is a spec-derived
+    //! FANS-1/A UPER message whose bit layout follows the libacars asn1c
+    //! PER constraints (the external oracle); the EXPECTED decode of every
+    //! one was independently confirmed by running the same body, wrapped in
+    //! a valid ARINC-622 envelope, through the libacars reference decoder
+    //! (`decode_acars_apps`) — these are NOT encode/decode loopbacks. The
+    //! reference output is quoted next to each case.
+    use super::*;
+
+    fn dec(hex: &str, downlink: bool) -> CpdlcMessage {
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        decode(&bytes, downlink).expect("decodes")
+    }
+
+    #[test]
+    fn distance_offset_direction() {
+        // libacars: "REQUEST OFFSET ... Offset: 20 nm / Direction: right".
+        let m = dec("01878988", true);
+        assert_eq!(m.element, "dM15DistanceOffsetDirection");
+        assert_eq!(m.args, vec!["20 nm", "RIGHT"]);
+        assert_eq!(m.text, "REQUEST OFFSET 20 nm RIGHT OF ROUTE");
+    }
+
+    #[test]
+    fn beacon_code() {
+        // libacars: "SQUAWKING ... Code: 2401".
+        let m = dec("0197a808", true);
+        assert_eq!(m.element, "dM47BeaconCode");
+        assert_eq!(m.args, vec!["2401"]);
+    }
+
+    #[test]
+    fn frequency_vhf() {
+        // libacars: "REQUEST VOICE CONTACT ... VHF: 132.025 MHz".
+        let m = dec("018aaeac40", true);
+        assert_eq!(m.element, "dM21Frequency");
+        assert_eq!(m.args, vec!["132.025 MHz"]);
+    }
+
+    #[test]
+    fn frequency_hf() {
+        // libacars renders HF in kHz: "8891 kHz" (CHECK STUCK MICROPHONE).
+        let m = dec("01ce85e640", false);
+        assert_eq!(m.element, "uM157Frequency");
+        assert_eq!(m.args, vec!["8891 kHz"]);
+    }
+
+    #[test]
+    fn procedure_name() {
+        // libacars: "REQUEST ... Procedure type: arrival / name: ROBN1".
+        let m = dec("018b894a7c29cc40", true);
+        assert_eq!(m.element, "dM23ProcedureName");
+        assert_eq!(m.args, vec!["ROBN1 (ARRIVAL)"]);
+    }
+
+    #[test]
+    fn altimeter_english() {
+        // libacars: "ALTIMETER ... Altimeter: 29.92 inHg".
+        let m = dec("01ccb180", false);
+        assert_eq!(m.element, "uM153Altimeter");
+        assert_eq!(m.args, vec!["29.92 inHg"]);
+    }
+
+    #[test]
+    fn atis_code() {
+        // libacars: "ATIS ... ATIS code: B".
+        let m = dec("01cf42", false);
+        assert_eq!(m.element, "uM158ATISCode");
+        assert_eq!(m.args, vec!["B"]);
+    }
+
+    #[test]
+    fn remaining_fuel_and_souls() {
+        // libacars: "Remaining fuel: 03:45 / Persons on board: 250".
+        let m = dec("019c8ed3e4", true);
+        assert_eq!(m.element, "dM57RemainingFuelRemainingSouls");
+        assert_eq!(m.args, vec!["03:45", "250"]);
+        assert_eq!(m.text, "03:45 OF FUEL REMAINING AND 250 SOULS ON BOARD");
+    }
+
+    #[test]
+    fn error_information() {
+        // libacars: "ERROR ... Error information: invalidData" (enum 10).
+        let m = dec("019f28", true);
+        assert_eq!(m.element, "dM62ErrorInformation");
+        assert_eq!(m.args, vec!["invalid data"]);
+    }
+
+    #[test]
+    fn version_number() {
+        let m = dec("01a488", true);
+        assert_eq!(m.element, "dM73VersionNumber");
+        assert_eq!(m.args, vec!["1"]);
+    }
+
+    #[test]
+    fn icao_facility_designation() {
+        // libacars: "[icaofacilitydesignation]" -> KZAK.
+        let m = dec("01a04bb50658", true);
+        assert_eq!(m.element, "dM64ICAOfacilitydesignation");
+        assert_eq!(m.args, vec!["KZAK"]);
+    }
+
+    #[test]
+    fn icao_facility_designation_tp4table() {
+        // libacars: "KZAK" + "TP4 table: labelB".
+        let m = dec("01d1cbb5065c", false);
+        assert_eq!(m.element, "uM163ICAOfacilitydesignationTp4table");
+        assert_eq!(m.args, vec!["KZAK", "label B"]);
+    }
+
+    #[test]
+    fn tofrom_position() {
+        // libacars: "REPORT DISTANCE ... To/From: from / Fix: ABC".
+        let m = dec("01dac2830a18", false);
+        assert_eq!(m.element, "uM181ToFromPosition");
+        assert_eq!(m.args, vec!["FROM", "ABC"]);
+    }
+
+    #[test]
+    fn time_distance_tofrom_position() {
+        // libacars: "AT ... Time 14:30 / Distance 12.5 nm / to / Fix XYZ".
+        let m = dec("01a739e00fa0ac59b4", true);
+        assert_eq!(m.element, "dM78TimeDistanceToFromPosition");
+        assert_eq!(m.args, vec!["14:30", "12.5 nm", "TO", "XYZ"]);
+    }
+
+    #[test]
+    fn icao_unitname_frequency() {
+        // libacars: "CONTACT ... designation KZAK / function center /
+        // VHF 121.500 MHz".
+        let m = dec("01baa5da832c246500", false);
+        assert_eq!(m.element, "uM117ICAOunitnameFrequency");
+        assert_eq!(m.args, vec!["KZAK center", "121.500 MHz"]);
+    }
+
+    #[test]
+    fn position_place_bearing_distance() {
+        // libacars: "REQUEST DIRECT TO ... Fix FOO / Degrees (magnetic)
+        // 270 deg / Distance 50.0 nm".
+        let m = dec("018b428d3e7a1a07d0", true);
+        assert_eq!(m.element, "dM22Position");
+        assert_eq!(m.args, vec!["FOO BRG 270°M DIST 50.0 nm"]);
     }
 }

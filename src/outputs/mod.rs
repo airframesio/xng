@@ -3,15 +3,19 @@
 //! land in M3).
 
 pub mod acarsdec_json;
+pub mod aircraft;
+pub mod airframes;
 pub mod beast;
 pub mod asf2_grpc;
 pub mod asf2_quic;
 pub mod console;
 pub mod dbinfo;
+pub mod dumpvdl2_json;
 pub mod gsmtap;
 pub mod http;
 pub mod jsonl;
 pub mod metrics;
 pub mod mqtt;
 pub mod nmea_tcp;
+pub mod nmea_udp;
 pub mod sbs;

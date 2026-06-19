@@ -90,6 +90,8 @@ fn decodes_t_burst_with_acars() {
     }
     let e = events.iter().find(|e| e.acars.is_some()).expect("ACARS from T burst");
     assert_eq!(e.bit_rate, 1200);
+    // AERO-8.2: a reserved/TDMA T burst is tagged as the T channel.
+    assert_eq!(e.channel, xng_mode_aero::AeroChannel::TChannel);
     let b = e.acars.as_ref().unwrap();
     assert!(b.crc_ok);
     assert_eq!(b.core.tail.as_deref(), Some("VT-ANB"));
@@ -138,4 +140,82 @@ fn decodes_r_burst() {
     assert_eq!(events[0].user.data, payload);
     assert_eq!(events[0].user.aes_id, "123456");
     assert_eq!(events[0].bit_rate, 600);
+    // AERO-8.2: a random-access return burst is tagged as the R channel.
+    assert_eq!(events[0].channel, xng_mode_aero::AeroChannel::RChannel);
+}
+
+/// AERO-3: an R-channel control SU (call-progress 0x30) decodes through the
+/// full burst chain and surfaces a named control event tagged AeroC at the
+/// burst bit rate. Type byte at R-SU offset 2, user-data flag (byte1 bit 3)
+/// clear — JAERO `aerol.cpp` R-channel branch / `AEROTypeR`.
+#[test]
+fn decodes_r_control_su() {
+    use xng_types::Mode;
+
+    // Build a 19-byte R control SU: call-progress 0x30 at su[2], flag clear.
+    let mut r_su = vec![0u8; 19];
+    r_su[1] = 0x00; // user-data flag clear → control SU
+    r_su[2] = 0x30; // Call_progress_R_channel
+    let crc = xng_dsp::checksum::HDLC_FCS.checksum(&r_su[..17]);
+    r_su[17] = (crc & 0xFF) as u8;
+    r_su[18] = (crc >> 8) as u8;
+
+    let mut bytes = r_su.clone();
+    bytes.push(0); // pad to 20 (one 64x5 section)
+    let mut bits: Vec<u8> =
+        bytes.iter().flat_map(|&b| (0..8).map(move |i| (b >> i) & 1)).collect();
+    Lfsr15::new().apply(&mut bits);
+    let coded = Viterbi::k7().encode(&bits);
+    let mut burst_bits: Vec<u8> = (0..74).map(|i| (i % 2) as u8).collect();
+    for i in (0..32).rev() {
+        burst_bits.push(((xng_mode_aero::frame::UW >> i) & 1) as u8);
+    }
+    interleave(&coded[..320], 5, &mut burst_bits);
+
+    let spb = CHANNEL_RATE / 600.0;
+    let mut iq: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 1500];
+    let mut phase = 0.0f64;
+    for _ in 0..(150.0 * spb) as usize {
+        phase += std::f64::consts::TAU * -90.0 / CHANNEL_RATE;
+        iq.push(Complex::from_polar(0.5, phase as f32));
+    }
+    iq.extend(modulate(&burst_bits, 600.0, CHANNEL_RATE, -90.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 3000]);
+
+    let mut dec = AeroBurstDecoder::new(CHANNEL_RATE, 0.0).unwrap();
+    let mut events = Vec::new();
+    for chunk in iq.chunks(4096) {
+        events.extend(dec.process(chunk));
+    }
+    let e = events
+        .iter()
+        .find(|e| e.su_event.as_ref().is_some_and(|v| v["su_type"] == "r-call-progress"))
+        .expect("R control SU surfaces a named event");
+    assert_eq!(e.mode, Mode::AeroC);
+    assert_eq!(e.bit_rate, 600);
+    assert_eq!(e.channel, xng_mode_aero::AeroChannel::RChannel);
+    assert_eq!(e.su_event.as_ref().unwrap()["su_type_hex"], "0x30");
+
+    // AERO-8.2: the channel tag + physical line rate land in the message.
+    use xng_types::{AppInfo, MessageBody, Provenance, StationIdentity};
+    let msg = xng_mode_aero::to_message(
+        e,
+        3_686_000_000,
+        -50.0,
+        Provenance {
+            station: StationIdentity::new("TEST-AERO-C"),
+            app: AppInfo::xng(),
+            sdr: None,
+            channel: None,
+        },
+    );
+    assert_eq!(msg.mode, Mode::AeroC);
+    match msg.body {
+        MessageBody::Aero { kind, details } => {
+            assert_eq!(kind, "r-call-progress");
+            assert_eq!(details["channel"], "r-channel");
+            assert_eq!(details["line_bit_rate"], 600);
+        }
+        other => panic!("expected MessageBody::Aero, got {other:?}"),
+    }
 }

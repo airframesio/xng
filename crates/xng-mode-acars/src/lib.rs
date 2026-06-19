@@ -8,8 +8,10 @@
 //! See PROVENANCE.md for the clean-room sourcing of every protocol fact.
 
 pub mod demod;
+pub mod fec;
 pub mod frame;
 pub mod modulate;
+pub mod sublabel;
 
 use chrono::Utc;
 use num_complex::Complex;
@@ -77,6 +79,47 @@ impl AcarsChannelDecoder {
     pub fn level_dbfs(&self) -> f32 {
         self.demod.level_dbfs()
     }
+
+    /// Channel noise-floor estimate in dBFS (envelope power over silence).
+    pub fn noise_dbfs(&self) -> f32 {
+        self.demod.noise_dbfs()
+    }
+}
+
+/// Combine the structured application decode with any flat text-extracted
+/// fields (OOOI gate/wheels times + airports, free-text position) into the
+/// single `app` JSON value carried by the message body. Returns `None` when
+/// there is nothing decoded. Flat fields appear at the top level (matching
+/// acarsdec's flat JSON); the structured app object is nested under `app`
+/// when both are present.
+fn build_app_value(appdec: &xng_acars::AppDecode) -> Option<serde_json::Value> {
+    let mut flat = serde_json::Map::new();
+
+    if let Some(serde_json::Value::Object(oooi_map)) =
+        appdec.oooi.as_ref().and_then(|o| serde_json::to_value(o).ok())
+    {
+        flat.extend(oooi_map);
+    }
+    if let Some(pos) = appdec.position.as_ref().and_then(|p| serde_json::to_value(p).ok()) {
+        flat.insert("position".to_string(), pos);
+    }
+    if let Some(serde_json::Value::Object(met_map)) =
+        appdec.met.as_ref().and_then(|m| serde_json::to_value(m).ok())
+    {
+        flat.extend(met_map);
+    }
+
+    let app_val = appdec.app.as_ref().map(|a| serde_json::to_value(a).unwrap_or_default());
+
+    match (flat.is_empty(), app_val) {
+        (true, None) => None,
+        (true, Some(a)) => Some(a),
+        (false, None) => Some(serde_json::Value::Object(flat)),
+        (false, Some(a)) => {
+            flat.insert("app".to_string(), a);
+            Some(serde_json::Value::Object(flat))
+        }
+    }
 }
 
 /// Convert a decoded frame into the normalized message model.
@@ -84,13 +127,21 @@ pub fn to_message(
     f: &frame::AcarsFrame,
     frequency_hz: u64,
     level_dbfs: f32,
+    noise_dbfs: f32,
     source: Provenance,
 ) -> Message {
     Message {
         mode: Mode::AcarsPoa,
         timestamp: Utc::now(),
         frequency_hz,
-        signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
+        // Per-burst noise floor + SNR from the demod's silence EMA (XM-1 /
+        // ACARS-4.1); snr = rssi - noise.
+        signal: SignalQuality {
+            rssi_db: Some(level_dbfs),
+            noise_db: Some(noise_dbfs),
+            snr_db: Some(level_dbfs - noise_dbfs),
+            ..Default::default()
+        },
         decode: DecodeQuality {
             crc_ok: f.crc_ok,
             fec_corrected: Some(f.fixed_bits),
@@ -98,12 +149,30 @@ pub fn to_message(
         },
         body: {
             let appdec = xng_acars::decode(&f.label, &f.text, f.downlink);
+            // ACARS-3.2: xng-acars sets sublabel/MFI only for H1. Extend the
+            // SAME libacars grammar to the other sublabel-bearing labels (H2,
+            // …) locally, so those families surface `sublabel`/`mfi` too.
+            // Falls back to the H1 values when xng-acars already produced them.
+            let (sublabel, mfi) = match (&appdec.sublabel, &appdec.mfi) {
+                (None, None) => match sublabel::extract(&f.label, &f.text, f.downlink) {
+                    Some(s) => (s.sublabel, s.mfi),
+                    None => (None, None),
+                },
+                _ => (appdec.sublabel.clone(), appdec.mfi.clone()),
+            };
+            // Carry the structured application decode plus any OOOI
+            // (OUT/OFF/ON/IN gate/wheels times + depa/dsta/eta) extracted
+            // from the text into the body's `app` JSON value (the existing
+            // structured field). OOOI fields are merged at the top of the
+            // object so they serialize like acarsdec's flat JSON
+            // (depa/dsta/eta/gtout/gtin/wloff/wlin).
+            let app = build_app_value(&appdec);
             MessageBody::Acars(AcarsCore {
                 mode: f.mode,
                 tail: f.tail.clone(),
                 label: f.label.clone(),
-                sublabel: appdec.sublabel,
-                mfi: appdec.mfi,
+                sublabel,
+                mfi,
                 block_id: f.block_id,
                 ack: f.ack,
                 flight: f.flight.clone(),
@@ -111,7 +180,9 @@ pub fn to_message(
                 text: f.text.clone(),
                 more_to_come: f.more_to_come,
                 reassembled: false,
-                app: appdec.app.map(|a| serde_json::to_value(&a).unwrap_or_default()),
+                assstat: None,
+                app,
+                vdl2_link: None,
             })
         },
         raw: Some(f.raw.clone()),

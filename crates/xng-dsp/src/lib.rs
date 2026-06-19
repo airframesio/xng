@@ -17,7 +17,7 @@ pub mod window;
 
 pub use channelizer::PfbChannelizer;
 pub use ddc::Ddc;
-pub use fir::{lowpass_taps, Fir};
+pub use fir::{lowpass_taps, rrc_taps, Fir};
 pub use nco::Nco;
 pub use resample::Resampler;
 

@@ -4021,11 +4021,23 @@ dependencies = [
  "xng-dsp",
  "xng-mode-acars",
  "xng-mode-adsb",
+ "xng-mode-adsl",
  "xng-mode-aero",
  "xng-mode-ais",
+ "xng-mode-aprs",
+ "xng-mode-atcs",
+ "xng-mode-dsc",
+ "xng-mode-eot",
+ "xng-mode-flex",
  "xng-mode-hfdl",
  "xng-mode-iridium",
+ "xng-mode-navtex",
+ "xng-mode-pocsag",
+ "xng-mode-sarsat",
+ "xng-mode-sonde",
  "xng-mode-stdc",
+ "xng-mode-uat",
+ "xng-mode-vdes",
  "xng-mode-vdl2",
  "xng-proto",
  "xng-sdr",
@@ -4077,6 +4089,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "xng-mode-adsl"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
 name = "xng-mode-aero"
 version = "0.20.0"
 dependencies = [
@@ -4096,6 +4120,66 @@ version = "0.20.0"
 dependencies = [
  "chrono",
  "num-complex",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-aprs"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-atcs"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-dsc"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-eot"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-flex"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
  "serde_json",
  "xng-dsp",
  "xng-types",
@@ -4131,6 +4215,54 @@ dependencies = [
 ]
 
 [[package]]
+name = "xng-mode-navtex"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-pocsag"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-sarsat"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-sonde"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
 name = "xng-mode-stdc"
 version = "0.20.0"
 dependencies = [
@@ -4138,6 +4270,29 @@ dependencies = [
  "num-complex",
  "rustfft",
  "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-uat"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-vdes"
+version = "0.20.0"
+dependencies = [
+ "chrono",
+ "num-complex",
  "serde_json",
  "xng-dsp",
  "xng-types",

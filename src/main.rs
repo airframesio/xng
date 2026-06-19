@@ -18,8 +18,6 @@ use outputs::console::ConsoleFormat;
 use std::path::PathBuf;
 use xng_sdr::{FileIqSource, IqFormat};
 
-const AIRFRAMES_ACARS_UDP: &str = "feed.airframes.io:5550";
-
 #[derive(Parser)]
 #[command(name = "xng", version, about = "Next-generation multi-mode SDR decoder (ACARS, VDL2, HFDL, satcom, AIS, ...)")]
 struct Cli {
@@ -39,7 +37,8 @@ struct Cli {
 
 #[derive(Args)]
 struct TuneOpts {
-    /// Decode mode: acars, vdl2, hfdl, aero, aero-c, std-c, ais, adsb, or iridium
+    /// Decode mode: acars, vdl2, hfdl, aero, aero-c, std-c, ais, adsb, iridium,
+    /// uat, sarsat, dsc, navtex, sonde, ads-l, or atcs
     #[arg(short, long, default_value = "acars")]
     mode: String,
     /// Capture sample rate in Hz (must be an integer multiple of the
@@ -73,6 +72,9 @@ struct TuneOpts {
     /// commands; matters on Pi-class hardware)
     #[arg(long)]
     demod_effort: Option<runtime::DemodEffort>,
+    /// VDL2 only: reject bursts whose carrier offset exceeds this many ppm
+    #[arg(long)]
+    max_ppm: Option<f64>,
 }
 
 fn parse_receiver_pos(s: &Option<String>) -> anyhow::Result<Option<(f64, f64)>> {
@@ -133,6 +135,12 @@ struct OutputOpts {
     /// Serve raw NMEA AIVDM over TCP (e.g. 0.0.0.0:10110)
     #[arg(long)]
     nmea_tcp: Option<String>,
+    /// Push raw NMEA AIVDM as UDP datagrams to this target (e.g. host:10110)
+    #[arg(long)]
+    nmea_udp: Option<String>,
+    /// Prefix NMEA output with a tag-block (\s:<station>,c:<unix_ts>*HH\)
+    #[arg(long)]
+    nmea_tag_blocks: bool,
     /// Send Iridium GSM (CC/MM/SMS) frames to Wireshark via GSMTAP/UDP
     /// (default 127.0.0.1:4729 when given without an address)
     #[arg(long, num_args = 0..=1, default_missing_value = "127.0.0.1:4729")]
@@ -176,13 +184,14 @@ impl OutputOpts {
         } else {
             outputs::asf2_quic::TrustMode::SystemRoots
         };
-        let mut udp = self.udp.clone();
+        let udp = self.udp.clone();
         if self.feed_airframes {
             anyhow::ensure!(
                 self.station_id.is_some(),
                 "--feed-airframes requires --station-id (e.g. XX-KSEA-ACARS1)"
             );
-            udp.push(AIRFRAMES_ACARS_UDP.to_owned());
+            // Airframes feeding itself is wired per-session by the caller via
+            // `outputs::airframes::cli_router` (the mode isn't known here).
         }
         if let Some(p) = &self.gs_file {
             outputs::console::load_gs_names(p)?;
@@ -210,11 +219,16 @@ impl OutputOpts {
                 sbs: self.sbs.clone(),
                 beast: self.beast.clone(),
                 nmea_tcp: self.nmea_tcp.clone(),
+                nmea_udp: self.nmea_udp.clone(),
+                nmea_tag_blocks: self.nmea_tag_blocks,
                 gsmtap: self.gsmtap.clone(),
                 iridium_satmap: self.iridium_satmap.clone(),
                 http: self.http.clone(),
                 mqtt: self.mqtt.clone(),
                 mqtt_topic: self.mqtt_topic.clone(),
+                // Set per-session by the caller once the mode is known.
+                airframes: None,
+                own_ship_mmsi: None,
             },
             ident,
         ))
@@ -309,7 +323,8 @@ enum Command {
         /// Tuner gain in dB (hardware AGC when omitted; see --tune-gain)
         #[arg(short, long)]
         gain: Option<f64>,
-        /// Mode to survey: acars, vdl2, hfdl, aero, std-c, ais, adsb, iridium
+        /// Mode to survey: acars, vdl2, hfdl, aero, std-c, ais, adsb, iridium,
+        /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs
         #[arg(short, long, default_value = "acars")]
         mode: String,
         /// Capture sample rate in Hz (the mode's plan default when omitted)
@@ -596,7 +611,9 @@ fn main() -> anyhow::Result<()> {
                 })?,
             };
             let (mode, rate, center_hz, channels_hz) = parse_tune(&tune)?;
-            let (outputs, station_ident) = output.build()?;
+            let (mut outputs, station_ident) = output.build()?;
+            outputs.airframes =
+                Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
             let source = FileIqSource::open(&file, fmt, rate, center_hz)?;
             runtime::run_session(
                 Box::new(source),
@@ -616,7 +633,9 @@ fn main() -> anyhow::Result<()> {
                         include: tune.filter_labels.clone(),
                         exclude: tune.exclude_labels.clone(),
                     },
+                    ais_filter: Default::default(),
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Max),
+                    max_ppm: tune.max_ppm,
                 },
             )
         }
@@ -631,7 +650,17 @@ fn main() -> anyhow::Result<()> {
         Command::Extern { format, output, command } => {
             let fmt: commands::extern_cmd::ExternFormat =
                 format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-            let (outputs, station_ident) = output.build()?;
+            let (mut outputs, station_ident) = output.build()?;
+            outputs.airframes = Some(outputs::airframes::cli_router(
+                output.feed_airframes,
+                &station_ident,
+                &[
+                    xng_types::Mode::AcarsPoa,
+                    xng_types::Mode::Vdl2,
+                    xng_types::Mode::Hfdl,
+                    xng_types::Mode::Ais,
+                ],
+            ));
             commands::extern_cmd::run(fmt, &command, station_ident, outputs)
         }
         Command::Survey {
@@ -712,7 +741,9 @@ fn main() -> anyhow::Result<()> {
                         include: tune.filter_labels.clone(),
                         exclude: tune.exclude_labels.clone(),
                     },
+                    ais_filter: Default::default(),
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
+                    max_ppm: tune.max_ppm,
                     outputs: runtime::OutputConfig {
                         console: ConsoleFormat::Pretty,
                         jsonl: None,
@@ -724,11 +755,15 @@ fn main() -> anyhow::Result<()> {
                         sbs: None,
                         beast: None,
                         nmea_tcp: None,
+                        nmea_udp: None,
+                        nmea_tag_blocks: false,
                         gsmtap: None,
                         iridium_satmap: None,
                         http: None,
                         mqtt: None,
                         mqtt_topic: "xng".into(),
+                        airframes: None,
+                        own_ship_mmsi: None,
                     },
                 },
             )
@@ -748,10 +783,9 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
     let st = commands::station::load(config)?;
 
     // Shared outputs (the first session's SessionConfig carries them).
-    let mut udp = st.outputs.udp.clone();
-    if st.outputs.feed_airframes {
-        udp.push(AIRFRAMES_ACARS_UDP.to_owned());
-    }
+    // Airframes feeding is routed per-mode/per-session by the router below,
+    // not appended to the generic `udp` sinks.
+    let udp = st.outputs.udp.clone();
     let outputs = runtime::OutputConfig {
         console: if st.outputs.json { ConsoleFormat::Json } else { ConsoleFormat::Pretty },
         jsonl: st.outputs.jsonl.clone(),
@@ -763,11 +797,15 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         sbs: st.outputs.sbs.clone(),
         beast: st.outputs.beast.clone(),
         nmea_tcp: st.outputs.nmea_tcp.clone(),
+        nmea_udp: st.outputs.nmea_udp.clone(),
+        nmea_tag_blocks: st.outputs.nmea_tag_blocks.unwrap_or(false),
         gsmtap: st.outputs.gsmtap.clone(),
         iridium_satmap: st.outputs.iridium_satmap.clone(),
         http: st.outputs.http.clone(),
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
+        airframes: Some(commands::station::airframes_router(&st)),
+        own_ship_mmsi: st.outputs.own_ship_mmsi,
     };
 
     if let Some(p) = &st.outputs.aircraft_db {
@@ -778,6 +816,21 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         match satmap::init(src) {
             Ok(n) => tracing::info!("iridium satmap: {n} satellites ({src})"),
             Err(e) => tracing::warn!("iridium satmap disabled: {e}"),
+        }
+    }
+    // APRS satellite (TLE) overhead correlation: if an APRS session carries a
+    // receiver position, fetch the amateur-satellite TLEs so a space-based APRS
+    // reception (145.825 MHz / ISS digipeat) can be attributed to the
+    // satellite(s) in view. Best-effort (network) — failure just leaves it off.
+    if let Some(pos) = st
+        .sessions
+        .iter()
+        .filter(|s| s.mode.eq_ignore_ascii_case("aprs"))
+        .find_map(|s| parse_receiver_pos(&s.receiver_pos).ok().flatten())
+    {
+        match satmap::init_aprs("auto", pos) {
+            Ok(n) => tracing::info!("APRS satellite map: {n} amateur sats (space-reception correlation on)"),
+            Err(e) => tracing::warn!("APRS satellite correlation disabled: {e}"),
         }
     }
     let mut sessions = Vec::new();
@@ -799,6 +852,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
                 .map(str::parse)
                 .transpose()
                 .map_err(|e: String| anyhow::anyhow!("{label}: {e}"))?,
+            max_ppm: sess.max_ppm,
         };
         let (mode, rate, center_hz, channels) = if tune.sample_rate.is_some()
             && tune.center_freq.is_some()
@@ -854,7 +908,16 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
                 outputs: outputs.clone(),
                 receiver_pos: parse_receiver_pos(&sess.receiver_pos)?,
                 label_filter: Default::default(),
+                ais_filter: runtime::AisFilter {
+                    include_types: sess.ais_include_types.clone(),
+                    exclude_types: sess.ais_exclude_types.clone(),
+                    include_mmsi: sess.ais_include_mmsi.clone(),
+                    exclude_mmsi: sess.ais_exclude_mmsi.clone(),
+                    min_interval_s: sess.ais_min_interval,
+                    dedup_window_s: sess.ais_dedup_window,
+                },
                 demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
+                max_ppm: tune.max_ppm,
             },
         ));
     }
@@ -1055,7 +1118,9 @@ fn open_soapy(
 
 fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
     let (mode, rate, center_hz, channels_hz) = parse_tune(tune)?;
-    let (outputs, station_ident) = output.build()?;
+    let (mut outputs, station_ident) = output.build()?;
+    outputs.airframes =
+        Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
     let serial = sdr_args::SdrArgs::parse(sdr).serial;
     let (source, driver) = open_sdr(sdr, rate, center_hz, gain)?;
     runtime::run_session(
@@ -1076,7 +1141,9 @@ fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) ->
                         include: tune.filter_labels.clone(),
                         exclude: tune.exclude_labels.clone(),
                     },
+                    ais_filter: Default::default(),
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
+                    max_ppm: tune.max_ppm,
         },
     )
 }

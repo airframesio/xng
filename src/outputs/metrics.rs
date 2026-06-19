@@ -34,6 +34,8 @@ fn render(live: &LiveState, mode: &str) -> String {
     out.push_str("# TYPE xng_frames_crc_ok_total counter\n");
     out.push_str("# TYPE xng_channel_level_dbfs gauge\n");
     out.push_str("# TYPE xng_samples_total counter\n");
+    out.push_str("# TYPE xng_acars_messages_total counter\n");
+    out.push_str("# TYPE xng_fec_corrected_total counter\n");
     let stats = live.stats.lock().unwrap().clone();
     for (freq, frames, ok, level) in &stats {
         let labels = format!("{{mode=\"{mode}\",freq=\"{freq}\"}}");
@@ -41,9 +43,107 @@ fn render(live: &LiveState, mode: &str) -> String {
         out.push_str(&format!("xng_frames_crc_ok_total{labels} {ok}\n"));
         out.push_str(&format!("xng_channel_level_dbfs{labels} {level:.1}\n"));
     }
+    // Per-label ACARS message counts (VERIFY-9 / ACARS-5.2): the dimension
+    // the flat per-channel stats can't carry. Sorted for stable output.
+    let mut acars: Vec<((u64, String), u64)> =
+        live.acars_labels.lock().unwrap().iter().map(|(k, v)| (k.clone(), *v)).collect();
+    acars.sort();
+    for ((freq, label), count) in &acars {
+        let label = escape_label(label);
+        out.push_str(&format!(
+            "xng_acars_messages_total{{mode=\"{mode}\",freq=\"{freq}\",label=\"{label}\"}} {count}\n"
+        ));
+    }
+    // Per-channel FEC-corrected units (ECO-7), sorted for stable output.
+    let mut fec: Vec<(u64, u64)> =
+        live.fec.lock().unwrap().iter().map(|(f, n)| (*f, *n)).collect();
+    fec.sort();
+    for (freq, n) in &fec {
+        out.push_str(&format!("xng_fec_corrected_total{{mode=\"{mode}\",freq=\"{freq}\"}} {n}\n"));
+    }
     out.push_str(&format!(
         "xng_samples_total{{mode=\"{mode}\"}} {}\n",
         live.samples.load(Ordering::Relaxed)
     ));
     out
+}
+
+/// Escape a label value for the Prometheus text exposition format. The format
+/// defines exactly three escapes — backslash, double-quote, newline — and the
+/// reference parser *rejects* any other backslash sequence (`\r`, `\t`, …) as
+/// invalid. ACARS labels are mostly two ASCII chars but a garbled frame can
+/// carry raw control bytes (CR, NUL); left raw they break line-oriented
+/// parsing, and they can't be escaped, so emit them as a printable `{XX}` hex
+/// token (safe inside a quoted value, still distinct per byte).
+fn escape_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            c if c.is_control() => out.push_str(&format!("{{{:02X}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_per_channel_and_per_label_counters() {
+        let live = LiveState::new();
+        live.record_channel(131_550_000, 10, 7, -42.5);
+        // Two messages of label 80, one of label H1 on the same channel.
+        live.record_acars_label(131_550_000, "80");
+        live.record_acars_label(131_550_000, "80");
+        live.record_acars_label(131_550_000, "H1");
+        let body = render(&live, "acars");
+
+        assert!(body.contains("# TYPE xng_acars_messages_total counter\n"));
+        assert!(
+            body.contains("xng_frames_total{mode=\"acars\",freq=\"131550000\"} 10\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "xng_acars_messages_total{mode=\"acars\",freq=\"131550000\",label=\"80\"} 2\n"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains(
+                "xng_acars_messages_total{mode=\"acars\",freq=\"131550000\",label=\"H1\"} 1\n"
+            ),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn record_channel_keys_by_freq_not_index() {
+        // Two station sessions both number their first channel 0, but distinct
+        // freqs must not clobber each other in the shared state.
+        let live = LiveState::new();
+        live.record_channel(131_550_000, 5, 5, -40.0);
+        live.record_channel(162_000_000, 3, 2, -38.0);
+        live.record_channel(131_550_000, 9, 8, -41.0); // update, not duplicate
+        let stats = live.stats.lock().unwrap().clone();
+        assert_eq!(stats.len(), 2, "one row per freq: {stats:?}");
+        let acars = stats.iter().find(|e| e.0 == 131_550_000).unwrap();
+        assert_eq!((acars.1, acars.2), (9, 8));
+    }
+
+    #[test]
+    fn escapes_label_special_chars() {
+        assert_eq!(escape_label("H1"), "H1");
+        assert_eq!(escape_label("a\"b\\c"), "a\\\"b\\\\c");
+        // Newline → the one valid control escape; CR/NUL → printable hex token
+        // (no raw control byte leaks into the line-oriented exposition).
+        assert_eq!(escape_label("a\nb"), "a\\nb");
+        assert_eq!(escape_label("8\r"), "8{0D}");
+        assert_eq!(escape_label("\u{0}"), "{00}");
+    }
 }

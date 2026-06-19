@@ -7,14 +7,19 @@
 
 use serde_json::{json, Value};
 
-/// Major protocol label for a transaction-identifier high byte.
+/// Major protocol label for a transaction-identifier / protocol-discriminator
+/// high byte. The low nibble of an L3 message's first byte is the GSM 04.08
+/// protocol discriminator; on Iridium these appear as the whole first byte
+/// (the skip/transaction nibble is 0). IRID-3 adds RR (PD 0x06) and GMM (0x08)
+/// labelling per iridium-toolkit IDA-GSM.txt.
 fn major(tmaj: u8) -> Option<&'static str> {
     Some(match tmaj {
         0x03 => "CC",
         0x83 => "CC(dest)",
         0x05 => "MM",
-        0x06 => "06",
-        0x08 => "08",
+        0x06 => "RR",  // Radio Resource Management (was raw "06")
+        0x08 => "GMM", // GPRS Mobility Management (was raw "08")
+        0x0b => "SS",  // Supplementary Services (non-call related)
         0x09 => "SMS",
         0x89 => "SMS(dest)",
         _ => return None,
@@ -40,6 +45,35 @@ fn minor(tmin: u16) -> Option<&'static str> {
         0x0518 => "Identity request",
         0x0519 => "Identity response",
         0x051a => "TMSI Reallocation Command",
+        0x0521 => "CM Service Accept",
+        0x0522 => "CM Service Reject",
+        // RR (Radio Resource, PD 0x06). The 0x06xx message-type values are
+        // GSM 04.08 / 3GPP TS 44.018 §10.4 RR types; those marked (Iridium)
+        // are the subset iridium-toolkit's IDA-GSM.txt documents on-air.
+        0x0618 => "System Information Type 1",
+        0x0619 => "System Information Type 2",
+        0x061a => "System Information Type 3",
+        0x061b => "System Information Type 4",
+        0x061c => "System Information Type 5",
+        0x061d => "System Information Type 6",
+        0x0602 => "System Information Type 2ter",
+        0x0607 => "System Information Type 2quater", // (Iridium)
+        0x0605 => "System Information Type 5bis",     // (Iridium)
+        0x0606 => "System Information Type 5ter",
+        0x061f => "System Information Type 2bis",
+        0x0621 => "Paging Request Type 1",
+        0x0622 => "Paging Request Type 2",
+        0x0624 => "Paging Request Type 3",
+        0x0627 => "Paging Response",
+        0x063f => "Immediate Assignment",
+        0x0639 => "Immediate Assignment Extended",
+        0x063a => "Immediate Assignment Reject",     // (Iridium)
+        0x063b => "Additional Assignment",           // (Iridium)
+        0x0635 => "Channel Release",
+        // GMM (GPRS Mobility Management, PD 0x08) — Iridium IDA-GSM.txt.
+        0x0805 => "GMM Detach Request",
+        // SS (Supplementary Services / non-call related, PD 0x0b).
+        0x0b3b => "Register (SS)",
         0x0600 => "Register/SBD:uplink",
         0x0901 => "CP-DATA",
         0x0904 => "CP-ACK",
@@ -234,6 +268,17 @@ pub fn decode(data: &[u8]) -> Option<Value> {
         }
         _ => {}
     }
+
+    // Surface the raw L3 body bytes. iridium-toolkit always prints the
+    // message payload as hex (the trailing-bytes line in ReassembleIDAPP),
+    // so messages with no typed sub-field decode (CP-DATA/Setup/Paging/RR
+    // bodies/…) still carry their content rather than dropping it. The typed
+    // fields above are the decoded view; `body_hex` is the verbatim L3 body.
+    if !body.is_empty() {
+        let body_hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+        obj.insert("body_hex".into(), json!(body_hex));
+    }
+
     Some(out)
 }
 
@@ -254,5 +299,72 @@ mod tests {
         assert_eq!(v["protocol"], "MM");
         assert_eq!(v["message"], "Identity request");
         assert_eq!(v["requested"], "IMEI");
+    }
+
+    /// IRID-3: RR (Radio Resource, PD 0x06) messages must be labelled, not
+    /// left as raw "06". Oracle for the Iridium-observed types is
+    /// iridium-toolkit IDA-GSM.txt; the Immediate-Assignment / Paging /
+    /// System-Info families follow GSM 04.08 / 3GPP TS 44.018 §10.4.
+    #[test]
+    fn rr_messages_are_labelled() {
+        // IDA-GSM.txt Iridium-observed RR values:
+        for (mt, name) in [
+            (0x3a_u8, "Immediate Assignment Reject"), // 06.3a
+            (0x3b, "Additional Assignment"),          // 06.3b
+            (0x05, "System Information Type 5bis"),    // 06.05
+            (0x07, "System Information Type 2quater"), // 06.07
+        ] {
+            let v = decode(&[0x06, mt, 0x00, 0x00, 0x00]).expect("RR decodes");
+            assert_eq!(v["protocol"], "RR", "0x06{mt:02x}");
+            assert_eq!(v["message"], name, "0x06{mt:02x}");
+        }
+        // GSM 04.08 §10.4 standard RR types the task names explicitly:
+        for (mt, name) in [
+            (0x3f_u8, "Immediate Assignment"),
+            (0x21, "Paging Request Type 1"),
+            (0x27, "Paging Response"),
+            (0x18, "System Information Type 1"),
+            (0x1a, "System Information Type 3"),
+            (0x35, "Channel Release"),
+        ] {
+            let v = decode(&[0x06, mt, 0x00, 0x00, 0x00]).expect("RR decodes");
+            assert_eq!(v["protocol"], "RR", "0x06{mt:02x}");
+            assert_eq!(v["message"], name, "0x06{mt:02x}");
+        }
+    }
+
+    /// The 0x0600 RR opcode collides with the SBD-HELLO / Register transport
+    /// type, which the ACARS/SBD path owns — gsm::decode must still defer it.
+    #[test]
+    fn rr_does_not_steal_sbd_hello() {
+        assert!(decode(&[0x06, 0x00, 0x00, 0x00, 0x00]).is_none());
+    }
+
+    /// Every GSM message must carry its raw L3 body as hex (the toolkit's
+    /// trailing-bytes line). A type with no typed sub-field decode (here SMS
+    /// CP-DATA, PD 0x09) previously dropped its payload entirely.
+    #[test]
+    fn body_bytes_are_surfaced_as_hex() {
+        // CP-DATA (0x0901) with a 5-byte body. The toolkit prints the body as
+        // "01 02 03 de ad" (concatenated: 010203dead).
+        let v = decode(&[0x09, 0x01, 0x01, 0x02, 0x03, 0xde, 0xad]).expect("SMS decodes");
+        assert_eq!(v["protocol"], "SMS");
+        assert_eq!(v["message"], "CP-DATA");
+        assert_eq!(v["body_hex"], "010203dead");
+        // A field-parsed message keeps both the decoded view and the raw body.
+        let v = decode(&[0x05, 0x18, 0x02]).expect("decodes");
+        assert_eq!(v["requested"], "IMEI");
+        assert_eq!(v["body_hex"], "02");
+    }
+
+    /// GMM (PD 0x08) and SS (PD 0x0b) per IDA-GSM.txt are labelled too.
+    #[test]
+    fn gmm_and_ss_are_labelled() {
+        let v = decode(&[0x08, 0x05, 0x00, 0x00, 0x00]).expect("GMM decodes");
+        assert_eq!(v["protocol"], "GMM");
+        assert_eq!(v["message"], "GMM Detach Request");
+        let v = decode(&[0x0b, 0x3b, 0x00, 0x00, 0x00]).expect("SS decodes");
+        assert_eq!(v["protocol"], "SS");
+        assert_eq!(v["message"], "Register (SS)");
     }
 }

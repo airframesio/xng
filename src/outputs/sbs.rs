@@ -7,56 +7,45 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
-use xng_types::{Message, MessageBody};
+use xng_types::Message;
 
-/// Render a message as an SBS MSG line (only Mode S bodies map).
+use super::aircraft::aircraft_fix;
+
+/// Render a message as an SBS-1 ("BaseStation") MSG line. Any body that yields
+/// an [`AircraftFix`](super::aircraft::AircraftFix) (Mode S / UAT / HFDL) maps;
+/// everything else returns None.
 pub fn format_sbs(msg: &Message) -> Option<String> {
-    let MessageBody::ModeS {
-        icao,
-        callsign,
-        altitude_ft,
-        squawk,
-        lat,
-        lon,
-        speed_kt,
-        speed_type,
-        track_deg,
-        vertical_rate_fpm,
-        ..
-    } = &msg.body
-    else {
-        return None;
-    };
-    let icao = icao.as_deref()?;
+    let f = aircraft_fix(msg)?;
+    let icao = &f.icao;
     // Transmission type: 1 ident, 3 airborne position, 4 velocity,
     // 5 surveillance altitude, 6 squawk.
-    let tt = if lat.is_some() {
+    let tt = if f.lat.is_some() {
         3
-    } else if speed_kt.is_some() && speed_type.as_deref() != Some("AS") {
+    } else if f.speed_kt.is_some() && !f.speed_is_airspeed {
         4
-    } else if callsign.is_some() {
+    } else if f.callsign.is_some() {
         1
-    } else if squawk.is_some() {
+    } else if f.squawk.is_some() {
         6
-    } else if altitude_ft.is_some() {
+    } else if f.altitude_ft.is_some() {
         5
     } else {
         return None;
     };
     let d = msg.timestamp.format("%Y/%m/%d");
     let t = msg.timestamp.format("%H:%M:%S%.3f");
-    let fmt_f = |v: &Option<f64>, p: usize| v.map(|x| format!("{x:.p$}")).unwrap_or_default();
-    let fmt_i = |v: &Option<i32>| v.map(|x| x.to_string()).unwrap_or_default();
+    let fmt_f = |v: Option<f64>, p: usize| v.map(|x| format!("{x:.p$}")).unwrap_or_default();
+    let fmt_i = |v: Option<i32>| v.map(|x| x.to_string()).unwrap_or_default();
     Some(format!(
         "MSG,{tt},1,1,{icao},1,{d},{t},{d},{t},{},{},{},{},{},{},{},{},,,,",
-        callsign.as_deref().unwrap_or(""),
-        fmt_i(altitude_ft),
-        fmt_f(speed_kt, 1),
-        fmt_f(track_deg, 1),
-        fmt_f(lat, 5),
-        fmt_f(lon, 5),
-        fmt_i(vertical_rate_fpm),
-        squawk.as_deref().unwrap_or(""),
+        f.callsign.as_deref().unwrap_or(""),
+        fmt_i(f.altitude_ft),
+        fmt_f(f.speed_kt, 1),
+        fmt_f(f.track_deg, 1),
+        fmt_f(f.lat, 5),
+        fmt_f(f.lon, 5),
+        fmt_i(f.vertical_rate_fpm),
+        f.squawk.as_deref().unwrap_or(""),
     ))
 }
 
@@ -89,7 +78,7 @@ pub async fn run(rx: broadcast::Receiver<Arc<Message>>, addr: String) -> std::io
 #[cfg(test)]
 mod tests {
     use super::*;
-    use xng_types::{DecodeQuality, Mode, Provenance, SignalQuality, StationIdentity};
+    use xng_types::{DecodeQuality, MessageBody, Mode, Provenance, SignalQuality, StationIdentity};
 
     #[test]
     fn position_message_renders_msg3() {
@@ -112,6 +101,7 @@ mod tests {
                 track_deg: None,
                 vertical_rate_fpm: None,
                 comm_b: None,
+                adsb_status: None,
             },
             raw: None,
             source: Provenance {
@@ -125,5 +115,65 @@ mod tests {
         assert!(line.starts_with("MSG,3,1,1,40621D,1,"), "{line}");
         assert!(line.contains(",38000,"), "{line}");
         assert!(line.contains(",52.25720,3.91937,"), "{line}");
+    }
+
+    fn msg_with(mode: Mode, body: MessageBody) -> Message {
+        Message {
+            mode,
+            timestamp: chrono::Utc::now(),
+            frequency_hz: 0,
+            signal: SignalQuality::default(),
+            decode: DecodeQuality { crc_ok: true, fec_corrected: None, errors: None },
+            body,
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("T"),
+                app: xng_types::AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        }
+    }
+
+    // XM-2.2: a UAT 978 ADS-B state vector renders an SBS position line keyed
+    // on the same ICAO hex Mode S uses, so 978 traffic reaches tar1090/VRS.
+    #[test]
+    fn uat_position_renders_sbs() {
+        let body = MessageBody::Uat {
+            kind: "adsb".into(),
+            details: serde_json::json!({
+                "address": "a1b2c3", "callsign": "N12345",
+                "geometric_altitude": 9500, "ground_speed": 142.0,
+                "true_track": 271.0, "lat": 37.6189, "lon": -122.3750,
+            }),
+        };
+        let line = format_sbs(&msg_with(Mode::Uat, body)).unwrap();
+        assert!(line.starts_with("MSG,3,1,1,A1B2C3,1,"), "{line}");
+        assert!(line.contains(",N12345,"), "{line}");
+        assert!(line.contains(",9500,"), "{line}");
+        assert!(line.contains(",37.61890,-122.37500,"), "{line}");
+    }
+
+    // XM-2.2: an HFDL position HFNPDU (ICAO from the logon cache) renders too.
+    #[test]
+    fn hfdl_position_renders_sbs() {
+        let body = MessageBody::Hfdl {
+            kind: "hfnpdu".into(),
+            details: serde_json::json!({
+                "icao": "ABCDEF",
+                "position": { "lat": 51.5, "lon": -0.12, "flight": "BAW123", "icao": "ABCDEF" },
+            }),
+        };
+        let line = format_sbs(&msg_with(Mode::Hfdl, body)).unwrap();
+        assert!(line.starts_with("MSG,3,1,1,ABCDEF,1,"), "{line}");
+        assert!(line.contains(",BAW123,"), "{line}");
+        assert!(line.contains(",51.50000,-0.12000,"), "{line}");
+    }
+
+    // A non-position body (or one without an ICAO) yields no SBS line.
+    #[test]
+    fn non_aircraft_body_has_no_sbs_line() {
+        let body = MessageBody::Hfdl { kind: "logon".into(), details: serde_json::json!({ "who": {} }) };
+        assert!(format_sbs(&msg_with(Mode::Hfdl, body)).is_none());
     }
 }

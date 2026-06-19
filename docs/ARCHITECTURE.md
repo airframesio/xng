@@ -86,15 +86,18 @@ xng/
 │   │                      #   capture, device enumeration, IQ replay, rate negotiation
 │   ├── xng-acars          # application layer: ARINC 618/620/622, ADS-C, CPDLC, MIAM
 │   ├── xng-proto          # asf-2.0 .proto + prost/tonic codegen + conversions
-│   └── xng-mode-*         # one decode core per mode (acars, vdl2, hfdl, aero,
-│                          #   ais, adsb, stdc, iridium), each with a spec-faithful
+│   └── xng-mode-*         # one decode core per mode (18: acars, vdl2, hfdl,
+│                          #   aero, ais, adsb, stdc, iridium, uat, sarsat, dsc,
+│                          #   navtex, sonde, ads-l, atcs, aprs, pocsag, eot),
+│                          #   each with a spec-faithful
 │                          #   modulator for loopback tests, vendored fixtures, PROVENANCE.md
 ├── src/                   # the xng binary
 │   ├── main.rs, commands/ # CLI (listen, scan, survey, decode, iq-info, devices,
 │   │                      #   selftest, tui, station, status, ingest, extern, config)
 │   ├── runtime.rs, bus.rs # session supervisor + message bus
-│   ├── outputs/           # console, JSON/JSONL, acarsdec UDP, Airframes, Prometheus,
-│   │                      #   SBS/Beast, NMEA, MQTT, asf-2.0, and the web dashboard
+│   ├── outputs/           # console, JSON/JSONL, acarsdec UDP, dumpvdl2 UDP/TCP,
+│   │                      #   Airframes, Prometheus, SBS/Beast, NMEA, MQTT, asf-2.0,
+│   │                      #   and the web dashboard (map + geo export)
 │   ├── tui.rs             # ratatui TUI
 │   ├── beam.rs, satmap.rs # Iridium beam-pattern reconstruction + satellite naming
 │   └── freq.rs, sdr_args.rs
@@ -126,7 +129,20 @@ protobuf schema multiplexing every channel/SDR/mode over a single gRPC
 (tonic/HTTP/2) or QUIC (quinn) connection, with the raw payload always
 preserved for server-side re-decode. `xng ingest` is the reference
 server. Legacy decoder-native JSON is retained so existing Airframes
-ingests work unchanged. Full protocol in [ASF2.md](ASF2.md).
+ingests work unchanged: ACARS feeds acarsdec flat JSON, and VDL2 feeds
+dumpvdl2 `decoded:json` (nested vdl2/avlc/acars; UDP `:5552` / TCP `:5553`,
+verified field-for-field against dumpvdl2 2.6.0). Modes without a
+per-port serializer reach Airframes via asf-2.0 only. Full protocol in
+[ASF2.md](ASF2.md).
+
+The web dashboard (`--http`) also exports positioned entities over
+`/data/export.geojson` (RFC 7946), `/data/export.gpx` (GPX 1.1), and
+`/data/export.kml` (OGC KML 2.2) — aircraft, vessels, beacons, and
+Iridium mobile-terminal fixes, current position plus trail (GeoJSON/KML
+are `[lon, lat]`, GPX uses `lat`/`lon` attributes) — and surfaces a
+cross-mode distress array on `/api/state` aggregating ADS-B
+emergency/7500-7600-7700, AIS SART/MOB/EPIRB, STD-C distress, DSC
+distress, and every COSPAS-SARSAT 406 beacon, keyed `mode:entity`.
 
 ## Statistics and control
 
@@ -135,7 +151,21 @@ corrections, CRC failures, signal/noise, bandwidth, sample drops, and
 uptime. They surface as log lines, JSONL, Prometheus (label families
 compatible with acarshub's acars/vdlm/hfdl/imsl/irdm), `StationStats`
 frames in asf-2.0, the TUI, and the web dashboard. `xng status` queries
-a running station's dashboard endpoint for a live per-session table.
+a running station's dashboard endpoint for a live per-session table. The
+Prometheus endpoint emits `xng_frames_total` / `xng_frames_crc_ok_total`
+/ `xng_channel_level_dbfs` per `(mode, freq)`, `xng_samples_total` per
+mode, `xng_acars_messages_total{mode,freq,label}` for per-ACARS-label
+volume (CRC-valid frames only — a garbled bad-CRC label would otherwise
+spawn unbounded junk series), and `xng_fec_corrected_total{mode,freq}` for
+FEC-corrected units per channel. In station mode all sessions feed one shared `LiveState`
+counter set (previously the served state was a never-updated copy, so
+station `/metrics` read all zeros).
+
+The web dashboard adds a cross-mode distress surface (the `alerts` array
+on `/api/state`, above): emergency/distress events across ADS-B, AIS,
+STD-C, DSC, and SARSAT, keyed `mode:entity` and held longer than ordinary
+entities (30 min vs 5 min) so a 7700 squawk or SARSAT burst stays on the
+alerting surface after the transmitter goes quiet.
 
 ## Interfaces
 
@@ -148,10 +178,13 @@ a running station's dashboard endpoint for a live per-session table.
   stats, spectrum with channel markers, and a waterfall, over a live SDR
   or a replayed file.
 - **Web dashboard** (`--http`): an embedded dark map of decoded aircraft
-  (Mode S) and vessels (AIS) with trails, an entity table, a filterable
-  streaming message panel, and Iridium overlays (satellite tracks,
-  spot-beam footprints, the reconstructed 48-beam pattern, mobile
-  terminals). Assets are embedded in the binary; RF-sourced strings are
+  (Mode S / UAT / HFDL, merged by ICAO) and vessels (AIS), an entity table,
+  a filterable streaming message panel, and a **mode-aware layer control**
+  (Flights/Ships/Beacons, plus Iridium overlays — satellite tracks,
+  spot-beam footprints, the reconstructed 48-beam pattern, mobile terminals
+  — shown only when the corresponding mode is running). Position trails
+  draw for the selected entity (or all, via a toggle). Assets are embedded
+  in the binary; RF-sourced strings are
   HTML-escaped.
 - **Station mode**: one process runs a whole receive site — several
   modes on several SDRs sharing one feed, one output set, and one

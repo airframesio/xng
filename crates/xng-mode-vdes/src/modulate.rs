@@ -1,0 +1,181 @@
+//! VDES ASM modulator for loopback testing: message bits → wire bytes + FCS
+//! → stuffed HDLC bit stream with training/flags → NRZI → FM (MSK-shaped or
+//! Gaussian GMSK; the discriminator decoder handles both).
+//!
+//! ITU-R M.2092-1 Annex 1 (ASM): GMSK, 9600 bit/s, h = 0.5 (±2400 Hz),
+//! Gaussian filter BT = 0.5. The ASM burst leads with a 32-bit ramp-up /
+//! training sequence (longer than the AIS 24-bit training) before the
+//! opening flag. This is a synthetic transmit path used only for the
+//! modulate→AWGN→demod BER test; no real off-air VDES IQ exists.
+
+use num_complex::Complex;
+use std::f64::consts::TAU;
+use xng_dsp::checksum::hdlc_fcs;
+
+const BAUD: f64 = 9_600.0;
+const DEVIATION_HZ: f64 = 2_400.0;
+/// ITU-R M.2092-1 ASM Gaussian filter bandwidth-time product.
+const BT: f64 = 0.5;
+/// ASM training/ramp-up length in bits before the opening flag (M.2092-1
+/// Annex 1 ASM burst format: 32-bit training; AIS uses 24).
+const TRAINING_BITS: usize = 32;
+
+/// Pack a message bit string (MSB-first field order) into wire octets
+/// (arrival-LSB-first) and append the FCS.
+pub fn wire_bytes_from_message_bits(message_bits: &[u8]) -> Vec<u8> {
+    assert_eq!(message_bits.len() % 8, 0, "ASM messages are octet-aligned");
+    let mut bytes: Vec<u8> = message_bits
+        .chunks_exact(8)
+        .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &v)| b | (v << (7 - i))))
+        .collect();
+    let fcs = hdlc_fcs(&bytes);
+    bytes.extend_from_slice(&fcs.to_le_bytes());
+    bytes
+}
+
+/// Build the transmitted bit stream: ASM training sequence (32 bits),
+/// opening flag, bit-stuffed payload, closing flag, tail.
+pub fn hdlc_bits(wire_bytes: &[u8]) -> Vec<u8> {
+    let mut bits: Vec<u8> = (0..TRAINING_BITS).map(|i| (i % 2) as u8).collect(); // 0101… training
+    let flag = [0, 1, 1, 1, 1, 1, 1, 0];
+    bits.extend(flag);
+    let mut ones = 0;
+    for &b in wire_bytes {
+        for i in 0..8 {
+            let bit = (b >> i) & 1;
+            bits.push(bit);
+            if bit == 1 {
+                ones += 1;
+                if ones == 5 {
+                    bits.push(0); // stuff
+                    ones = 0;
+                }
+            } else {
+                ones = 0;
+            }
+        }
+    }
+    bits.extend(flag);
+    bits.extend([0, 1, 0, 1, 0, 1, 0, 1]); // tail/turnaround
+    bits
+}
+
+/// NRZI-encode (0 = level change) and FM-modulate at ±2400 Hz deviation
+/// (rectangular frequency pulse — the MSK limit; the discriminator demod is
+/// blind to the exact pulse shape).
+pub fn modulate_iq(
+    bits: &[u8],
+    sample_rate: f64,
+    freq_offset_hz: f64,
+    amplitude: f32,
+) -> Vec<Complex<f32>> {
+    let spb = sample_rate / BAUD;
+    let mut out = Vec::with_capacity((bits.len() as f64 * spb) as usize + 1);
+    let mut phase: f64 = 0.0;
+    let mut level: f64 = 1.0;
+    let mut emitted: usize = 0;
+    for (i, &bit) in bits.iter().enumerate() {
+        if bit == 0 {
+            level = -level;
+        }
+        let freq = freq_offset_hz + level * DEVIATION_HZ;
+        let end = (((i + 1) as f64) * spb).round() as usize;
+        while emitted < end {
+            phase += TAU * freq / sample_rate;
+            out.push(Complex::new(phase.cos() as f32, phase.sin() as f32) * amplitude);
+            emitted += 1;
+        }
+    }
+    out
+}
+
+/// GMSK modulator (ITU-R M.2092-1 ASM: BT = 0.5, h = 0.5): the NRZI level
+/// stream drives a Gaussian frequency pulse (±2T support) integrated into a
+/// continuous phase. This is the realistic ASM waveform.
+pub fn modulate_iq_gmsk(
+    bits: &[u8],
+    sample_rate: f64,
+    freq_offset_hz: f64,
+    amplitude: f32,
+) -> Vec<Complex<f32>> {
+    let spb = sample_rate / BAUD;
+    const SPAN: f64 = 2.0; // pulse support in bits, each side
+
+    // Gaussian frequency pulse g(t) normalized so each bit advances the
+    // phase by ±π/2, implemented as the difference of error functions.
+    let a = (2.0 * std::f64::consts::PI / (2.0f64.ln()).sqrt()) * BT;
+    let erf = |x: f64| {
+        // Abramowitz-Stegun 7.1.26
+        let t = 1.0 / (1.0 + 0.3275911 * x.abs());
+        let y = 1.0
+            - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736)
+                * t
+                + 0.254829592)
+                * t
+                * (-x * x).exp();
+        if x < 0.0 { -y } else { y }
+    };
+    // Integrated phase pulse q(t): 0 → 1/2 over the pulse, in bit units.
+    let q = |t: f64| -> f64 {
+        0.25 * (erf(a * (t + 0.5) / std::f64::consts::SQRT_2)
+            - erf(a * (t - 0.5) / std::f64::consts::SQRT_2))
+    };
+
+    // NRZI levels per bit.
+    let mut levels = Vec::with_capacity(bits.len());
+    let mut level = 1.0f64;
+    for &b in bits {
+        if b == 0 {
+            level = -level;
+        }
+        levels.push(level);
+    }
+
+    let nsamples = ((bits.len() as f64 + 2.0 * SPAN) * spb).ceil() as usize;
+    let mut out = Vec::with_capacity(nsamples);
+    let mut phase = 0.0f64;
+    for n in 0..nsamples {
+        let t_bit = n as f64 / spb - SPAN;
+        let lo = ((t_bit - SPAN).floor().max(0.0)) as usize;
+        let hi = ((t_bit + SPAN).ceil()).min(levels.len() as f64 - 1.0) as usize;
+        let mut f_inst = 0.0;
+        for (k, &lv) in levels.iter().enumerate().take(hi + 1).skip(lo) {
+            f_inst += lv * q(t_bit - k as f64);
+        }
+        // q sums to 1/2 per bit → ×2·DEVIATION for ±2400 Hz on long runs.
+        let freq = freq_offset_hz + 2.0 * DEVIATION_HZ * f_inst;
+        phase += TAU * freq / sample_rate;
+        out.push(Complex::new(phase.cos() as f32, phase.sin() as f32) * amplitude);
+    }
+    out
+}
+
+/// Full burst IQ with GMSK shaping.
+pub fn burst_iq_gmsk(
+    message_bits: &[u8],
+    sample_rate: f64,
+    freq_offset_hz: f64,
+    amplitude: f32,
+) -> Vec<Complex<f32>> {
+    modulate_iq_gmsk(
+        &hdlc_bits(&wire_bytes_from_message_bits(message_bits)),
+        sample_rate,
+        freq_offset_hz,
+        amplitude,
+    )
+}
+
+/// Convenience: full burst IQ (MSK-shaped) for a message bit string.
+pub fn burst_iq(
+    message_bits: &[u8],
+    sample_rate: f64,
+    freq_offset_hz: f64,
+    amplitude: f32,
+) -> Vec<Complex<f32>> {
+    modulate_iq(
+        &hdlc_bits(&wire_bytes_from_message_bits(message_bits)),
+        sample_rate,
+        freq_offset_hz,
+        amplitude,
+    )
+}

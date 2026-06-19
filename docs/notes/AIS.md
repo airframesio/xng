@@ -1,0 +1,395 @@
+# AIS (ITU-R M.1371-5) — implementation notes
+
+Native AIS demod/decode for `xng-mode-ais`. GMSK 9600 bd, h=0.5, BT=0.4 in
+the 25 kHz channels at 161.975 (A) / 162.025 (B) MHz. Clean-room — see
+PROVENANCE.md; AIS-catcher is an off-air oracle only, pyais is the
+field-decode oracle (except the ASMs pyais does not decode — all of DAC=1,
+DAC=200 FIDs 21/22/55, and the regional DACs — where the layouts are
+spec-derived with cited clauses; see below). Source:
+`crates/xng-mode-ais/src/`.
+
+Result: 48 unique frames on a 5 min Sacramento capture vs AIS-catcher's 53
+(91%), **zero false decodes**. The capture is inland (mostly weak distant
+type-4 base-station reports), a sensitivity test by construction; the gap
+is 5 payloads that anchor but never pass FCS under any tested hypothesis —
+a fade tail, not a convention bug. CI-fenced by the off-air fixture
+(`ais_96k.cs16`, a 96 kS/s decimation of the 6 MS/s capture, a release
+asset — see [bench/README.md](../../bench/README.md)): the regression
+floor is on raw decoded frames (`ais_offair` ≥ 65; the capture yields
+71 live / 72 max), a coarser gate than the 48/53 unique-payload count.
+
+## Pipeline
+
+Per channel (`lib.rs::AisChannelDecoder`): wideband IQ → `xng_dsp::Ddc`
+(48 kHz channel IQ; any capture rate ≥ 48 kHz, fractional rates like an
+Airspy's 2.5 MS/s resampled, integer multiples skip the resampler) →
+**two demods run in parallel** → `frame::HdlcDeframer` (flag hunt,
+destuffing, FCS) → `frame::AisFrame` → `nmea::SentenceBuilder` (AIVDM) →
+`fields::decode` → `xng_types::Message`. The NMEA sinks (`--nmea-tcp`
+default port 10110, `--nmea-udp` push, optional tag-blocks) live in the
+`xng` binary; the crate emits the AIVDM strings. See NMEA output below.
+
+A second, **inbound** NMEA path (`reassembly.rs`) parses AIVDM/AIVDO
+sentences from external feeds (e.g. an AIS-Catcher HTTP source), reassembles
+multi-fragment messages, and field-decodes / tracks them — the interchange
+counterpart to the on-air path (see Reassembly below).
+
+`CHANNEL_RATE` = 48 kHz fixed (5 samples/bit at 9600 bd); the
+`GmskDemod::new` constructor asserts the 5× relationship. Channel
+passband 8 kHz one-sided.
+
+Two channels are decoded by instantiating one `AisChannelDecoder` per
+designator off a single wideband capture (the e2e test does both A and B
+off one 2.4 MS/s capture, B carrying a deliberate 700 Hz CFO).
+
+## PHY / demod — two paths per channel
+
+**Streaming (`demod.rs::GmskDemod`)** — the strong-signal path (~14 dB
+SNR). Per-sample frequency discriminator (`arg(x · conj(prev))`) → slow DC
+tracker (`FREQ_ALPHA = 0.002`) that absorbs ship + receiver-ppm carrier
+offset → per-bit integrate-and-dump with zero-crossing timing recovery
+(`TIMING_GAIN = 0.15`) → NRZI decode (a *zero* is a level change, a *one*
+is no change). Also tracks smoothed channel power for the dBFS RSSI.
+
+**Coherent (`coherent.rs::CoherentDemod`)** — the weak-signal path,
++11–12 dB over the discriminator. Power gate (`GATE_FACTOR = 2.0` over a
+tracked floor) finds candidate bursts; a complex template (last 16
+preamble bits `0101…` + the 8-bit HDLC start flag, 24 bits) anchors them
+via a differential-coherent, CFO-immune metric (four partial-sum
+magnitudes); stride-2 coarse hunt with ±1 refine and low-metric span
+skipping for CPU. At the anchor: coarse CFO grid (±1200 Hz, 150 Hz step) →
+fractional-sample timing refine (±0.5, linear interp) → fine CFO from the
+two-half template phase slope → carrier phase. Then a **16-state
+GMSK-exact MLSE Viterbi** (`const NS = 16`): state = (phase quadrant of
+completed pulses × two in-flight levels l_prev, l_cur), branch chooses
+l_next; branch waveforms are synthesized from the true BT=0.4 Gaussian
+integrated phase pulse q̃(t) (cached erf table). NRZI is decoded inside the
+trellis transitions; a traceback matrix (not per-branch path clones) keeps
+it O(n). Both **GMSK and MSK pulse hypotheses** run per burst; the FCS
+arbitrates. (The module-level doc comment that calls the trellis "4-state"
+is stale; the code is 16-state.)
+
+Weak-burst escalations, gated by `--demod-effort` (live vs max):
+- **Hypothesis fan-out (rescue):** when the nominal single hypothesis
+  yields no FCS-valid frame, re-decode over a CFO × phase-gain grid
+  (±60/±120 Hz × gain 0.25/0.1/0.0, both pulse tables ≈ 30 hypotheses) and
+  shifted timing windows (±1..±4 samples max, ±1..±2 live).
+- **Successive interference cancellation (SIC):** an FCS-valid burst is
+  reconstructed exactly (bits known, synthesis is the modulator's: CFO +
+  complex-LS amplitude fit, gated to explain ≥25% of window energy),
+  subtracted, and the residual re-hunted for a colliding weaker burst.
+- **Max effort** lowers the anchor threshold from 0.72 to 0.55 (the deep-
+  weak floor; off-air misses peak at 0.56–0.60) at ~3× hunt CPU.
+
+The streaming and coherent paths dedup against each other (a `recent`
+ring keyed on message bits, expired after ~4 slots).
+
+## Framing (`frame.rs::HdlcDeframer`)
+
+ISO/IEC 13239 as profiled by ITU-R M.1371: 0x7E flag hunt, bit destuffing
+(a 0 after five 1s removed), 7+ ones abort, octet assembly, **CRC-16/X-25
+FCS** (`xng_dsp::checksum::hdlc_frame_ok`). A closing flag may also open
+the next frame (back-to-back bursts share a flag). Length bounds 56–1280
+bits. Wire octets are LSB-first (arrival order); the emitted
+`message_bits` are per-octet reversed to the MSB-first field order that
+AIS fields and NMEA armoring consume. `msg_type` = bits 0..6, `mmsi` =
+bits 8..38.
+
+## NMEA output (`nmea.rs::SentenceBuilder`)
+
+AIVDM per IEC 61162-1: 6-bit ASCII armoring (value +48, +56 above 39),
+fill bits, XOR checksum, multi-sentence fragmentation at 60 armored chars
+(82-char sentence limit) with a rotating 0–9 message sequence ID for
+multi-fragment messages. Channel A/B designator from the frequency
+(`lib.rs::channel_letter`): ±12.5 kHz of 161.975 → `'A'`, of 162.025 →
+`'B'`, anything else → `'?'` (never a silently wrong `'A'`; the field stays
+one valid ASCII char so `(channel,total,seq)` fragment keying is
+unaffected). The e2e test reproduces a published gpsd example sentence
+(`!AIVDM,1,1,,B,177KQJ5000G?tO`K>RA1wUbN0TKH,0*5C`) byte-for-byte from a
+synthesized burst, anchoring bit order / armoring / checksum to real data.
+
+### Transports (in the `xng` binary)
+
+The crate emits the AIVDM strings; the `xng` binary carries them. All three
+sinks drop frames that failed FCS (`decode.crc_ok`).
+
+| Sink | Flag / TOML | Notes |
+|---|---|---|
+| TCP server | `--nmea-tcp` (port 10110) `[outputs] nmea-tcp` | Pull-style; pushes to every connected client (`src/outputs/nmea_tcp.rs`). |
+| UDP push | `--nmea-udp <host:port>` `[outputs] nmea-udp` | Fire-and-forget datagrams to one target (`src/outputs/nmea_udp.rs`). |
+| Tag-blocks | `--nmea-tag-blocks` `[outputs] nmea-tag-blocks` | Prefixes every sentence on **both** sinks with `\s:<station-ident>,c:<unix_ts>*HH\` (`nmea::tag_block`; XOR checksum over the inner bytes, the form OpenCPN / aggregator pollers parse). |
+
+### Output shaping (`runtime.rs::AisFilter` / `AisGate`, AIS-5h)
+
+Applied **pre-bus** in `decode_loop` (between `LabelFilter` and
+`bus.publish`), so it gates every output uniformly. Non-AIS messages always
+pass. Two halves:
+
+- **`AisFilter::allows`** (pure, testable) — static keep/drop on message
+  type and MMSI, include-then-exclude: `ais-include-types` /
+  `ais-exclude-types` / `ais-include-mmsi` / `ais-exclude-mmsi` (per-session
+  TOML; empty = pass all).
+- **`AisGate`** (per-session, time-stateful) — `ais-min-interval` thins
+  dynamic position reports (types 1/2/3/18/19/27) to one per MMSI per N
+  seconds; `ais-dedup-window` drops a `(mmsi, type, decoded-content)` hash
+  repeated within N seconds (multi-receiver echoes, repeated static
+  reports). Both off when the key is unset. `now` is the message timestamp,
+  not wall-clock.
+
+### Own-ship AIVDO (AIS-5c)
+
+`lib.rs::own_ship_position(mmsi, lat, lon)` builds an `!AIVDO,1,1,,,…`
+Type 1 position sentence for the receiver's own MMSI + location (so a
+connected plotter shows the station). The bit packer is
+`fields::encode_position_report` — the inverse of the `1..=3` decode arm:
+type 1, the MMSI and lon/lat (1/600000°), with the kinematic fields a fixed
+SDR can't supply (ROT, SOG, COG, heading, timestamp) set to their
+"not available" sentinels rather than fabricated. The unit test
+(`own_ship_aivdo_round_trips`) round-trips the sentence back through
+`fields::decode` — whose `1..=3` arm is the pyais-validated one — recovering
+the MMSI + position and confirming the N/A kinematics are omitted.
+
+The station runtime emits it periodically: with an `own-ship-mmsi`
+(`[outputs]`) and a session `receiver-pos`, `own_ship_message` publishes one
+AIVDO fix to the bus every 30 s (polled on a 1 s tick so it stops promptly
+on shutdown). It carries `own_ship: true` in `details` and flows to every
+sink like any AIS fix.
+
+## Inbound reassembly + per-MMSI tracking (`reassembly.rs`)
+
+The RF path deframes one whole HDLC burst at a time, so a multi-slot
+message already arrives as one bit string. The *interchange* form of AIS —
+the AIVDM/AIVDO sentences every other tool (and the AIS-Catcher HTTP feed)
+speaks — instead splits long messages across sentences. `reassembly.rs` is
+the inverse of the `nmea.rs` encoder:
+
+- **`parse_sentence`** accepts `AIVDM`/`AIVDO` and talker-prefixed variants
+  (`BSVDM`/`ARVDM` — keyed on the `VDM`/`VDO` suffix, matching pyais),
+  tolerates a leading `\…\` tag block and the `*HH` checksum, and rejects
+  non-AIS lines (`$GPGGA…`).
+- **`SentenceReassembler`** joins fragments keyed on `(channel, total,
+  seq)`, accepts them in **any order**, keeps interleaved (different-`seq`)
+  streams separate, trims only the *final* fragment's fill bits, and yields
+  a `ReassembledMessage` (`msg_type` / `mmsi` / `decode`) the moment the
+  last fragment lands. Single-fragment sentences pass straight through.
+- **`AisTracker` / `VesselRecord`** fold static/identity fields per MMSI —
+  most importantly merging type-24 **Part A** (name) with **Part B**
+  (type / vendor / callsign / dimensions or mothership), and successive
+  type-5 voyage reports, into one record. Merge rule = pyais `update_track`:
+  a newer non-null field overwrites; absent fields are preserved. The
+  `STATIC_FIELDS` allow-list excludes volatile kinematics (a later type-1
+  position cannot clobber a vessel's name/destination).
+
+## Message / field decode (`fields.rs::decode`)
+
+Field-decoded message types (positions in degrees, speeds in knots; "not
+available" sentinels honored — 181°/91° position, SOG 1023, COG 3600,
+heading 511, ROT −128, etc.):
+
+| Type | Content |
+|---|---|
+| 1–3 | Class A position: nav status, ROT (ROTais → deg/min), SOG, position accuracy, lat/lon, COG, heading, UTC second, maneuver, RAIM |
+| 4, 11 | Base-station report / UTC-date response: UTC datetime, position, EPFD, RAIM |
+| 5 | Static & voyage: AIS version, IMO, callsign, name, ship type, dimensions, EPFD, draught, destination, ETA, DTE |
+| 6 | Addressed binary: seqno, dest MMSI, retransmit, **DAC/FID → ASM `app`** (else data_hex) |
+| 7, 13 | Binary / safety ACK: dest MMSI |
+| 8 | Broadcast binary: **DAC/FID → ASM `app`** (else data_hex) |
+| 9 | SAR aircraft: altitude, SOG, position |
+| 12 | Addressed safety text: dest MMSI, retransmit, 6-bit text |
+| 14 | Broadcast safety text: 6-bit text |
+| 17 | DGNSS broadcast: lat/lon (1/10-min /10 to match pyais), data_hex |
+| 18 | Class B position: SOG, accuracy, lat/lon, COG, heading, UTC sec, RAIM |
+| 19 | Extended Class B: 18's kinematics + name, type, dimensions, EPFD, DTE |
+| 20 | Data-link management: up to four slot-reservation blocks (offset/slots/timeout/increment) |
+| 21 | Aids-to-navigation: AtoN type, name, position, dimensions, EPFD, off-position, RAIM, virtual flag, name extension |
+| 22 | Channel management: channels A/B, txrx, high power, addressed flag, region corners, bands, zone size |
+| 23 | Group assignment: region corners, station type, ship type, txrx, interval, quiet time |
+| 24 | Static data report — part A (name); part B (type, vendor ID, model, serial, callsign, dimensions, or **mothership MMSI** for 98x auxiliary craft) |
+| 27 | Long-range position: lat/lon (1/600), SOG |
+
+Supporting tables: 16-entry nav-status, 9-entry EPFD (code 15 = "internal
+GNSS"), AtoN type as a raw code, ship type as a raw code.
+
+### Application-specific messages (ASM)
+
+Type-6 (addressed, payload at bit 88) and type-8 (broadcast, payload at
+bit 56) binary bodies are dispatched by DAC/FID in `fields::asm_decode`.
+A recognised DAC/FID emits a nested `app` object; an unrecognised one falls
+back to a hex dump (`data_hex`) — no unverified subtypes are fabricated.
+The `dac` and `fid` themselves are always surfaced.
+
+**DAC=200 (Inland AIS, UNECE ECE/TRANS/SC.3/176)** — split oracle. FIDs
+10/23/24/40 are **verified against pyais**; FIDs 21/22/55 are **spec-derived**
+(pyais has no decoder for them — see the oracle split below):
+
+| FID | Name | Decoded fields | Oracle |
+|---|---|---|---|
+| 10 | Inland ship static & voyage | VIN, length (1/10 m), beam (1/10 m), ship type, hazard, draught (1/100 m), loaded | pyais |
+| 21 | ETA at lock/bridge/terminal | country / UN-LOCODE / fairway section / terminal code / fairway hectometre (6-bit ASCII), ETA month/day/hour/minute, assisting tugs, air draught (0.01 m) | spec |
+| 22 | RTA reply | same leading block + RTA month/day/hour/minute, lock/bridge/terminal status | spec |
+| 23 | EMMA warning | start/end date-time, region corners (1/600000°), type, min/max, intensity, wind | pyais |
+| 24 | Water-level report | country (6-bit ASCII), 4 × (gauge id + level) | pyais |
+| 40 | Signal-strength / bridge status | lat/lon (1/600000°), form, facing, direction, raw status | pyais |
+| 55 | Number of persons on board | crew, passengers, shipboard personnel (each with documented N/A sentinel) | spec |
+
+FIDs 21/22/55 ride in message 6 (addressed). Their layouts are derived from
+UNECE ECE/TRANS/SC.3/176 Ed.1 (Test Standard for Inland AIS), cross-checked
+against the IALA ASM registry and e-Navigation.nl, with each FID arm citing
+its clause in a code comment; N/A sentinels (month/day 0, hour 24, minute 60,
+crew/personnel 255, passengers 8191, tugs 7) are honoured and the key is
+omitted when sentinel. They are validated by an independent-packer fixture
+(no off-air IQ — synthetic frame in, decoded values out), not a worked OSS
+oracle.
+
+**AIS-1.3 regional DACs** — `asm_decode` arms for IALA/regional applications:
+
+| DAC | Region | Decoded | Oracle |
+|---|---|---|---|
+| 235 | UK | AtoN monitoring (FID 10): internal / 2 × external voltage (0.05 V/step), RACON status, light status, health alarm, status-external, off-position | spec |
+| 250 | Ireland | AtoN monitoring (FID 10), same layout as DAC 235 | spec |
+| 366 / 316 | US/Canada St. Lawrence Seaway & PAWSS | **header-only**: `region` name + `fid` + raw `body_hex` | — |
+| 367 | US environmental / area-notice | **header-only** | — |
+| 265 | Sweden / STM route exchange | **header-only** | — |
+
+DAC 235/250 FID-10 AtoN-monitoring bodies are decoded in full (layout from
+the gpsd AIVDM reference; pyais has no decoder, so spec-derived and validated
+by an independent-packer fixture, not real RF). The other regional DACs
+(366/316/367/265) have no clean-room body layout available, so — per the
+skip-don't-fake mandate — they emit a header-only identification (`region`
+name, `fid`, and the undecoded body preserved as `body_hex`) instead of
+fabricating field positions; the body is left for downstream re-parse.
+
+**DAC=1 (IMO international, SN.1/Circ.289)** — `fields::dac1_decode`.
+The IMO international application-identifier space. **pyais has no DAC=1
+decoder**, so there is *no OSS decode oracle* for these: every field layout
+is **spec-derived** from IMO SN.1/Circ.289 ("Guidance on the use of AIS
+application-specific messages", 2 June 2010) and the legacy SN/Circ.236
+layouts retained by ITU-R M.1371-5 Annex 5 / Annex 8. The governing
+circular section is cited in a code comment on every FID arm. The IMO ASM
+position convention is **1/1000-minute** (raw/60000°, distinct from the
+core position messages' 1/600000°), with sentinels lon 181° / lat 91° =
+"not available" (`imo_lonlat`); the route/tidal FIDs use the higher core
+resolution where the spec specifies it.
+
+| FID | Name | Decoded | Deferred |
+|---|---|---|---|
+| 11 | Met/hydro (legacy, Circ.236) | full met/hydro block; **latitude precedes longitude** (24/25-bit 1/1000-min pair), water level 0.1 m | — |
+| 16 | Persons on board | 13-bit count (0 = N/A) | — |
+| 17 | VTS-generated / synthetic targets | repeating 122-bit records (id-type, MMSI/target-id, lat/lon, COG, timestamp, SOG) | — |
+| 21 | Weather observation from ship | variant flag, location name (6-bit), position, UTC | WMO-coded weather block |
+| 22 | Area notice (broadcast) | header (linkage, notice descr, valid-from m/d/h/m, duration) + sub-area count | per-shape geometry (circle/rect/sector/polyline/polygon/text) |
+| 23 | Area notice (addressed) | same as FID 22 | same as FID 22 |
+| 24 | Extended ship static & voyage | linkage, air draught (0.1 m), last/next/2nd-next port UN/LOCODEs | cargo amounts table |
+| 25 | Dangerous cargo indication | linkage, amount unit, amount, cargo-code count | per-item IMDG/IGC codes |
+| 26 | Environmental / sensor report | site position + UTC header + sensor-report count | per-sensor type-specific blocks |
+| 27 | Route info (broadcast) | linkage, sender class, route type, valid-from, duration, waypoint count + **waypoint list** (1/10000-min, raw/600000°) | — |
+| 28 | Route info (addressed) | same as FID 27 | — |
+| 29 | Text description (broadcast) | linkage + 6-bit ASCII free text | — |
+| 30 | Text description (addressed) | same as FID 29 | — |
+| 31 | Met/hydro (Circ.289, supersedes 11) | lon-first 25/24-bit 1/1000-min position, pos-accuracy flag, day/hour/minute, avg+gust wind speed/dir, air temp (0.1 °C), humidity, dew point (0.1 °C), pressure (hPa +799), tendency, visibility (0.1 NM + ">" flag), water level (0.01 m, −10 m offset), trend, surface current (0.1 kt) + dir | — |
+| 32 | Tidal window | header (linkage, month, day) + repeating 88-bit window records (lon/lat 1/1000-min, from/to UTC, current dir, current speed 0.1 kt) | — |
+
+DAC=1 N/A sentinels are honoured per the cited circular (e.g. 127 / 360 /
+−1024 / 511 / 4001 / 255). FIDs **18/19/20** (clearance / marine-traffic-
+signal / berthing) are not decoded; their bodies fall through to `data_hex`.
+FID 11's lat-before-lon ordering vs FID 31's lon-first is the key divergence
+and is regression-tested.
+
+**Distress classification (`fields::distress_class`)** — `lib.rs` tags a
+`distress` field by MMSI prefix per ITU-R M.1371 / MID device allocations:
+970 = AIS-SART, 972 = AIS-MOB, 974 = EPIRB-AIS. These devices emit ordinary
+AIS messages; the prefix is the marker.
+
+## Validation / oracles
+
+- **Field decode (pyais oracle):** every pyais-decodable type-and-subtype
+  arm asserts against **pyais** (MIT, 3.1.0) decode vectors as ground truth
+  — published AIVDM sentences with pyais-asserted values, hand-checked for
+  the AIS-3 fills pyais doesn't expose. Covers types 1, 4, 5, 6, 8 (incl.
+  DAC=200 FID 10/23/24/40), 12, 14, 17, 18, 19, 20, 21, 22, 23, 24A/B, plus
+  the ROT helper and distress classifier. No pyais code copied; vectors and
+  asserted values are the reference.
+- **Spec-derived ASMs (no OSS oracle):** the ASMs pyais cannot decode —
+  all of DAC=1, DAC=200 FIDs 21/22/55, and DAC 235/250 FID 10 — cannot be
+  validated against an off-the-shelf decoder. Each has a unit test
+  (DAC=1 `dac1_fid11/16/17/22/24/25/26/27/29/31/32_*`; the Inland set
+  `dac200_fid21/22/55_*`; the AtoN set `dac235_fid10_*` / `dac250_fid10_*`)
+  whose **expected values are the documented physical quantities** from the
+  cited spec section. The fixtures are built by an *independent* MSB-first
+  bit packer (`build_t8_dac1` / `build_t6` / `pack` / `pack_i` / `pack_str`)
+  that takes `(value, width)` pairs in document order — it shares no code
+  with the decoder, which reads by `(offset, width)`. A wrong offset/width
+  mismatches the packer, so it is not a self-encode/self-decode loopback of
+  the decode logic. FID 11's lat-first layout is the same physical position
+  as FID 31's lon-first test, so a decoder that copied FID 31's layout into
+  FID 11 would fail. These tests are synthetic (modulated-free: bits packed
+  in, fields decoded out) — there is no real-RF validation of these ASM
+  bodies. The header-only regional DACs (366/316/367/265) have a fixture
+  (`dac_regional_header_only`) asserting they surface `region`/`fid`/
+  `body_hex` and emit no fabricated field positions.
+- **Reassembly / tracker (pyais oracle):** sentence parsing, 6-bit
+  de-armoring, fill-bit accounting and the reassembly/merge semantics are
+  anchored to pyais. Multi-fragment vectors are verbatim from the pyais
+  suite (`test_msg_type_5`, `test_msg_type_8_multipart`, the two-fragment
+  type-21, `test_msg_type_6_very_large`, `test_decode_out_of_order`,
+  `test_byte_stream`/`test_multiline_message`); the type-24 Part A/Part B
+  pair is gpsd's canonical example (MMSI 271041815, "PROGUY"/"TC6163").
+  Asserted values were produced by running pyais on the same sentences.
+- **Framing / NMEA:** RF loopback (`tests/end_to_end.rs`) anchored to a
+  published gpsd example sentence — reproduced exactly, so bit order,
+  armoring, and checksum are checked against real-world data, not self-
+  consistency. Stuffing roundtrip, bad-FCS rejection, back-to-back shared
+  flag, GMSK-shaped burst, and dual-channel-with-CFO from one wideband
+  capture are unit-tested.
+- **Off-air:** AIS-catcher on a shared capture, CI-fenced by the
+  `ais_offair` frame floor (≥ 65) over the `ais_96k.cs16` release-asset
+  fixture (`bench/run.sh`; the file is fetched, not vendored). The 48/53
+  unique-payload comparison is the human-facing sensitivity number.
+  See [BENCHMARKS.md](BENCHMARKS.md).
+
+## Known limitations / intentional gaps
+
+- **Types 10, 15, 16, 25, 26 are not field-decoded** (coordination /
+  interrogation / single-and-multi-slot binary) — `decode` returns `None`
+  for them; the NMEA and frame layers still emit. (Type-16/25/26 here are
+  the core message *types*, distinct from the DAC=1 *FIDs* 16/25/26.)
+- **DAC=1 deferred sub-blocks (spec-derived, no worked-example oracle):**
+  FID 21 WMO weather block; FID 22/23 sub-area shape geometry; FID 24 cargo
+  amounts table; FID 25 per-item cargo codes; FID 26 per-sensor blocks. The
+  grounded header/leading fields are decoded; the remainder is left for when
+  worked examples with known ground truth are available — skipped rather
+  than guessed. FID 18/19/20 are not decoded at all.
+- **ASM coverage is DAC=1, DAC=200, and DAC 235/250.** The regional DACs
+  366/316/367/265 emit a header-only `app` (`region`/`fid`/`body_hex`) —
+  identification without a decoded body. Any other DAC (e.g. DAC=669) falls
+  all the way through to top-level `data_hex`, with no parsed application
+  fields.
+- **No soft-decision FCS repair.** A standing falsification: a max-log
+  Chase-style search flipping the K least-reliable bits recovered none of
+  the 5 genuine misses and *forged* a valid-FCS frame from a foreign MMSI
+  (it even subverted the two-sighting MMSI guard by emitting two variants
+  that "confirm" each other). FCS-16 is too weak to gate a search that
+  large; at the noise floor, sensitivity is a capture problem.
+
+## Rescue acceptance (false-decode discipline)
+
+The wide hypothesis fan-out + SIC makes a random FCS-16 pass a *real* rate.
+Nominal single-hypothesis decodes pass through (negligible odds). Rescue/SIC
+decodes additionally require a sane message type (1–27) **and** a confirmed
+source MMSI — one already seen, or a second held frame from the same MMSI
+(random passes never repeat a source). This is the Mode S two-sighting
+ICAO-confirmation policy transplanted; the `pending_rescue` table is capped
+at 64 with age eviction. Result on the off-air capture: zero false decodes.
+
+## References
+
+- ITU-R M.1371-5 (GMSK 9600 bd BT=0.4, NRZI, 24-bit training, HDLC
+  framing, message field layouts; Annex 5 / Annex 8 ASM layouts).
+- ISO/IEC 13239 (HDLC), NMEA 0183 / IEC 61162-1 (AIVDM armoring).
+- IMO SN.1/Circ.289 (2 June 2010) + legacy SN/Circ.236 — DAC=1 IMO
+  international ASMs (spec-derived; no OSS decode oracle exists).
+- UNECE ECE/TRANS/SC.3/176 Ed.1 + gpsd AIVDM reference + IALA ASM registry
+  + e-Navigation.nl (Inland AIS DAC=200, incl. spec-derived FIDs 21/22/55,
+  and the DAC 235/250 AtoN-monitoring layout).
+- pyais (field + reassembly oracle, MIT), AIS-catcher (off-air oracle).
+  See PROVENANCE.md.

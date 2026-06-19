@@ -60,16 +60,53 @@ impl<'a> Per<'a> {
         Some(lo + self.uint(bits)? as i64)
     }
 
-    /// General length determinant (X.691 §10.9, unaligned): 0xxxxxxx or
-    /// 10xxxxxx xxxxxxxx (fragmentation unsupported — not seen in CPDLC).
+    /// General length determinant (X.691 §10.9, unaligned): 0xxxxxxx (0..127),
+    /// 10xxxxxx xxxxxxxx (128..16383), or the fragmented form 11xxxxxx where
+    /// the low 6 bits (1..4) give a multiple of 16K (X.691 §10.9.3.8). Returns
+    /// `(count, more_fragments)`; the caller iterates while `more_fragments`.
+    fn length_frag(&mut self) -> Option<(usize, bool)> {
+        if self.bit()? == 0 {
+            return Some((self.uint(7)? as usize, false));
+        }
+        if self.bit()? == 0 {
+            return Some((self.uint(14)? as usize, false));
+        }
+        // Fragmented: 11 then a 6-bit multiplier m (1..=4) → m·16384 bits/items,
+        // with a further length determinant following the fragment.
+        let m = self.uint(6)? as usize;
+        if m == 0 || m > 4 {
+            return None;
+        }
+        Some((m * 16384, true))
+    }
+
+    /// General length determinant (X.691 §10.9, unaligned), unfragmented forms
+    /// only. Now also recognises the fragmented form by chaining fragments
+    /// (§10.9.3.8) so long BIT STRING / SEQUENCE-OF lengths decode rather than
+    /// aborting the walk.
     fn length(&mut self) -> Option<usize> {
-        if self.bit()? == 0 {
-            return Some(self.uint(7)? as usize);
+        let (mut total, mut more) = self.length_frag()?;
+        while more {
+            let (n, m) = self.length_frag()?;
+            total = total.checked_add(n)?;
+            more = m;
         }
+        Some(total)
+    }
+
+    /// Normally-small non-negative whole number (X.691 §10.6), used for
+    /// extension-addition indices in a CHOICE and for ENUMERATED extension
+    /// values: a single bit 0 then a 6-bit value (0..63), or bit 1 then a
+    /// length-prefixed unconstrained integer (the latter unseen in ATN — the
+    /// values are tiny — so it is decoded via the general length determinant).
+    fn normally_small(&mut self) -> Option<u64> {
         if self.bit()? == 0 {
-            return Some(self.uint(14)? as usize);
+            return self.uint(6);
         }
-        None
+        // "Large" form: a length-determinant (octets) then that many octets.
+        let n = self.length()?;
+        let bytes = self.remaining_bytes(n * 8)?;
+        Some(bytes.iter().fold(0u64, |v, &b| (v << 8) | b as u64))
     }
 
     /// IA5String with a constrained SIZE: 7 bits per character (UPER).
@@ -100,16 +137,237 @@ pub fn parse_apdu(bytes: &[u8]) -> Option<Value> {
     parse_pdus(bytes, true).or_else(|| parse_pdus(bytes, false))
 }
 
+/// Build a protected-mode downlink WILCO (dM0NULL) APDU for cross-module
+/// (COTP reassembly pipeline) tests. Hand-assembled unaligned-PER per the
+/// ICAO Doc 9880 module, mirroring `tests::build_downlink_wilco`.
+#[cfg(test)]
+pub(crate) fn build_downlink_wilco_for_test() -> Vec<u8> {
+    fn push(bits: &mut Vec<u8>, v: u64, n: usize) {
+        for k in (0..n).rev() {
+            bits.push(((v >> k) & 1) as u8);
+        }
+    }
+    let mut m = Vec::new();
+    push(&mut m, 0, 1); // msgRef absent
+    push(&mut m, 0, 1); // logicalAck default
+    push(&mut m, 12, 6); // msg id 12
+    push(&mut m, (2026 - 1996) as u64, 7); // year
+    push(&mut m, 6 - 1, 4); // month
+    push(&mut m, 11 - 1, 5); // day
+    push(&mut m, 1, 5); // hours
+    push(&mut m, 22, 6); // minutes
+    push(&mut m, 33, 6); // seconds
+    push(&mut m, 0, 1); // no constrainedData
+    push(&mut m, 0, 3); // 1 element
+    push(&mut m, 0, 7); // dM0NULL (WILCO)
+    let inner_bits = m.len();
+    let mut o = Vec::new();
+    push(&mut o, 0, 1); // CHOICE not extended
+    push(&mut o, 3, 2); // aircraft send
+    push(&mut o, 0, 1); // sequence not extended
+    push(&mut o, 0, 1); // no algorithmIdentifier
+    push(&mut o, 1, 1); // protectedMessage present
+    push(&mut o, 0, 1); // length short form
+    push(&mut o, inner_bits as u64, 7);
+    o.extend(&m);
+    push(&mut o, 0, 1); // integrityCheck length determinant
+    push(&mut o, 0, 7); // integrityCheck length 0
+    o.chunks(8)
+        .map(|c| c.iter().enumerate().fold(0u8, |v, (i, &b)| v | (b << (7 - i))))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// VDL2-1.3: ACSE / ULCS association-control PDUs.
+//
+// Oracle: the ULCS ASN.1 (docs/asn1/atn-ulcs.asn) — the connection-oriented
+// ACSE-1 module — and unaligned PER (ITU-T X.691). ACSE-apdu is a top-level
+// extensible CHOICE with 5 root alternatives (aarq/aare/rlrq/rlre/abrt), so a
+// PER encoding begins with 1 extension bit + a 3-bit root index.
+//
+// The full AARQ/AARE bodies (application-context-name OBJECT IDENTIFIER,
+// AP-title CHOICE nested through ACSE-1 / InformationFramework, EXTERNAL
+// user-information) are deeply nested and not exercised here; per the task
+// guidance they are recognised and DEFERRED. The RLRQ/RLRE release reasons
+// and the ABRT source/diagnostic — the reliably-framed leading fields — are
+// decoded.
+//
+// NOTE (dispatch): on the wire these APDUs sit beneath the ATN session
+// (ISO 8327 / X.225) and presentation (ISO 8823 / X.226) null encodings,
+// whose framing is NOT in the docs/asn1 oracle set. This function therefore
+// decodes a bare ACSE-apdu bit-vector; it is intentionally not auto-dispatched
+// from COTP user data (it would alias the CPDLC/CM CHOICEs), pending a
+// verified session/presentation layer.
+// ---------------------------------------------------------------------------
+
+/// Decode a bare ACSE-apdu (ULCS ACSE-1, ICAO Doc 9705 SV IV). Returns the
+/// PDU kind and, for the release/abort PDUs, the decoded reason fields.
+pub fn parse_acse_apdu(bytes: &[u8]) -> Option<Value> {
+    let mut store = Vec::new();
+    let mut p = Per::new(bytes, &mut store);
+    // ACSE-apdu CHOICE (extensible, 5 root): ext bit + 3-bit root index.
+    if p.bit()? != 0 {
+        return Some(json!({
+            "application": "ACSE",
+            "pdu": "extension-alternative",
+            "note": "ACSE-apdu CHOICE extension addition; body undecoded",
+        }));
+    }
+    let idx = p.uint(3)?;
+    let kind = match idx {
+        0 => "aarq",
+        1 => "aare",
+        2 => "rlrq",
+        3 => "rlre",
+        4 => "abrt",
+        _ => return None,
+    };
+    let mut out = json!({ "application": "ACSE", "pdu": kind });
+    match idx {
+        // AARQ-apdu / AARE-apdu: SEQUENCE with an extension-marker pair and a
+        // long OPTIONAL list (most "Excluded" in the ULCS profile). The body
+        // is nested via ACSE-1 / InformationFramework (AP-title CHOICE,
+        // application-context-name OID, EXTERNAL user-information) and is
+        // DEFERRED per the task guidance.
+        0 | 1 => {
+            out["note"] = json!(
+                "AARQ/AARE recognised; body (application-context-name OID, \
+                 AP-title, user-information EXTERNAL) deferred"
+            );
+        }
+        // RLRQ-apdu ::= SEQUENCE { reason [0] Release-request-reason OPTIONAL,
+        // ..., ..., user-information [30] OPTIONAL }. Extension-marker pair →
+        // 1 ext bit; two OPTIONALs in the root preamble (reason, plus the
+        // post-extension user-information is handled via the addition bitmap,
+        // but for the unextended kernel case only the `reason` presence bit is
+        // in the root preamble).
+        2 => read_acse_release(&mut p, &mut out, true),
+        // RLRE-apdu: same shape with Release-response-reason.
+        3 => read_acse_release(&mut p, &mut out, false),
+        // ABRT-apdu ::= SEQUENCE { abort-source [0] ABRT-source,
+        // abort-diagnostic [1] ABRT-diagnostic OPTIONAL, ..., ...,
+        // user-information [30] OPTIONAL }.
+        4 => read_acse_abrt(&mut p, &mut out),
+        _ => {}
+    }
+    Some(out)
+}
+
+/// RLRQ/RLRE release reason. `request` selects the request- vs response-reason
+/// value set. The SEQUENCE carries an extension-marker pair (1 ext bit) then
+/// the `reason` OPTIONAL presence bit. Release-request/response-reason are
+/// INTEGERs with a constrained-but-sparse value set (0 | 1 | 30, extensible);
+/// per the ULCS encoding guidance (2.5.10) the value occupies 5 bits.
+fn read_acse_release(p: &mut Per, out: &mut Value, request: bool) {
+    // Outer SEQUENCE extension bit (extension-marker pair → at least one bit).
+    let Some(ext) = p.bit() else { return };
+    if ext != 0 {
+        out["note"] = json!("RLRQ/RLRE extension additions present; reason deferred");
+        return;
+    }
+    // Root preamble: presence bit for the OPTIONAL `reason`.
+    let Some(has_reason) = p.bit() else { return };
+    if has_reason == 0 {
+        out["reason"] = json!("absent");
+        return;
+    }
+    // Constrained INTEGER over {0,1,30} extensible → ext bit then 5-bit value.
+    let Some(rext) = p.bit() else { return };
+    if rext != 0 {
+        out["reason"] = json!("(extended)");
+        return;
+    }
+    let Some(v) = p.uint(5) else { return };
+    out["reason"] = json!(v);
+    let name = if request {
+        match v {
+            0 => Some("normal"),
+            1 => Some("urgent"),
+            30 => Some("user-defined"),
+            _ => None,
+        }
+    } else {
+        match v {
+            0 => Some("normal"),
+            1 => Some("not-finished"),
+            30 => Some("user-defined"),
+            _ => None,
+        }
+    };
+    if let Some(n) = name {
+        out["reason_text"] = json!(n);
+    }
+}
+
+/// ABRT-source ::= INTEGER {acse-service-user(0), acse-service-provider(1)}
+/// (0..1, ...) → ext bit + 1-bit value. ABRT-diagnostic ENUMERATED is OPTIONAL.
+fn read_acse_abrt(p: &mut Per, out: &mut Value) {
+    // Outer SEQUENCE extension bit.
+    let Some(ext) = p.bit() else { return };
+    if ext != 0 {
+        out["note"] = json!("ABRT extension additions present; body deferred");
+        return;
+    }
+    // Root preamble: presence bit for OPTIONAL abort-diagnostic.
+    let Some(has_diag) = p.bit() else { return };
+    // abort-source INTEGER(0..1, ...): ext bit + 1-bit value.
+    let Some(sext) = p.bit() else { return };
+    if sext == 0 {
+        if let Some(s) = p.bit() {
+            out["abort_source"] = json!(match s {
+                0 => "acse-service-user",
+                _ => "acse-service-provider",
+            });
+        }
+    } else {
+        out["abort_source"] = json!("(extended)");
+    }
+    if has_diag == 1 {
+        // ABRT-diagnostic ENUMERATED (extensible, 6 root values 1..6 encoded as
+        // indices 0..5 → ext bit + 3-bit index).
+        let Some(dext) = p.bit() else { return };
+        if dext == 0 {
+            if let Some(d) = p.uint(3) {
+                const D: [&str; 6] = [
+                    "no-reason-given",
+                    "protocol-error",
+                    "authentication-mechanism-name-not-recognized",
+                    "authentication-mechanism-name-required",
+                    "authentication-failure",
+                    "authentication-required",
+                ];
+                out["abort_diagnostic"] = json!(D.get(d as usize).copied().unwrap_or("?"));
+            }
+        } else {
+            out["abort_diagnostic"] = json!("(extended)");
+        }
+    }
+}
+
 fn parse_pdus(bytes: &[u8], downlink: bool) -> Option<Value> {
     let mut store = Vec::new();
     let mut p = Per::new(bytes, &mut store);
-    // CHOICE with extension marker: 1 extension bit + root index.
-    if p.bit()? != 0 {
-        return None; // extension alternatives: not decoded
-    }
+    // ProtectedAircraftPDUs / ProtectedGroundPDUs are extensible CHOICEs
+    // (X.691 §22): 1 extension bit, then either the root index (over the root
+    // alternatives) or — when the extension bit is set — a normally-small
+    // index over the extension-addition alternatives. No extension additions
+    // are defined in the current module, so a set extension bit is reported
+    // (VDL2-1.2) rather than silently dropping the PDU.
+    let extended = p.bit()? != 0;
     // ProtectedAircraftPDUs: 4 root alternatives (2 bits);
     // ProtectedGroundPDUs: 6 root alternatives (3 bits).
     let (alts, idx_bits) = if downlink { (4u64, 2) } else { (6u64, 3) };
+    if extended {
+        let ext_idx = p.normally_small()?;
+        return Some(json!({
+            "application": "CPDLC",
+            "version": "ATN-B1",
+            "direction": if downlink { "downlink" } else { "uplink" },
+            "pdu": "extension-alternative",
+            "extension_index": ext_idx,
+            "note": "CHOICE extension addition (no root alternative); body undecoded",
+        }));
+    }
     let idx = p.uint(idx_bits)?;
     if idx >= alts {
         return None;
@@ -143,10 +401,45 @@ fn parse_pdus(bytes: &[u8], downlink: bool) -> Option<Value> {
             }
             out["message"] = protected_message(&mut p, downlink)?;
         }
-        "abort-user" | "abort-provider" => {
-            // Extensible ENUMERATED: ext bit + root index.
+        "abort-user" => {
+            // PMCPDLCUserAbortReason ENUMERATED (extensible): ext bit, then a
+            // root index over 13 values (0..12) → 4 bits (ICAO Doc 9880
+            // PMCPDLCAPDUsVersion1). The previous 3-bit read truncated this.
             if p.bit()? == 0 {
-                out["reason"] = json!(p.uint(3)?);
+                let r = p.constrained(0, 12)?;
+                out["reason"] = json!(r);
+                if let Some(t) = pm_user_abort_reason(r) {
+                    out["reason_text"] = json!(t);
+                }
+            } else {
+                out["reason"] = json!("(extended)");
+            }
+        }
+        "abort-provider" => {
+            // PMCPDLCProviderAbortReason ENUMERATED (extensible): ext bit,
+            // then a root index over 8 values (0..7) → 3 bits.
+            if p.bit()? == 0 {
+                let r = p.constrained(0, 7)?;
+                out["reason"] = json!(r);
+                if let Some(t) = pm_provider_abort_reason(r) {
+                    out["reason_text"] = json!(t);
+                }
+            } else {
+                out["reason"] = json!("(extended)");
+            }
+        }
+        "forward-response" => {
+            // ATCForwardResponse ENUMERATED (extensible, 3 root): ext + 2 bits.
+            if p.bit()? == 0 {
+                out["response"] = json!(atc_forward_response(p.constrained(0, 2)?));
+            } else {
+                out["response"] = json!("(extended)");
+            }
+        }
+        "forward" => {
+            // ATCForwardMessage: forwardHeader + forwardMessage (VDL2-1.5).
+            if let Some(fwd) = read_atc_forward_message(&mut p, downlink) {
+                out["forward"] = fwd;
             }
         }
         _ => {}
@@ -154,9 +447,102 @@ fn parse_pdus(bytes: &[u8], downlink: bool) -> Option<Value> {
     Some(out)
 }
 
-/// ProtectedUplink/DownlinkMessage: extensible SEQUENCE with two
-/// OPTIONAL components, the second being the PER-encoded
-/// ATCUplink/DownlinkMessage in a BIT STRING.
+/// PMCPDLCUserAbortReason names (ICAO Doc 9880 PMCPDLCAPDUsVersion1).
+fn pm_user_abort_reason(r: i64) -> Option<&'static str> {
+    const R: [&str; 13] = [
+        "undefined",
+        "no-message-identification-numbers-available",
+        "duplicate-message-identification-numbers",
+        "no-longer-next-data-authority",
+        "current-data-authority-abort",
+        "commanded-termination",
+        "invalid-response",
+        "time-out-of-synchronisation",
+        "unknown-integrity-check",
+        "validation-failure",
+        "unable-to-decode-message",
+        "invalid-pdu",
+        "invalid-CPDLC-message",
+    ];
+    R.get(r as usize).copied()
+}
+
+/// PMCPDLCProviderAbortReason names (ICAO Doc 9880 PMCPDLCAPDUsVersion1).
+fn pm_provider_abort_reason(r: i64) -> Option<&'static str> {
+    const R: [&str; 8] = [
+        "timer-expired",
+        "undefined-error",
+        "invalid-PDU",
+        "protocol-error",
+        "communication-service-error",
+        "communication-service-failure",
+        "invalid-QOS-parameter",
+        "expected-PDU-missing",
+    ];
+    R.get(r as usize).copied()
+}
+
+/// ATCForwardResponse names (ICAO Doc 9880 PMCPDLCAPDUsVersion1, 3 root).
+fn atc_forward_response(r: i64) -> &'static str {
+    match r {
+        0 => "success",
+        1 => "service-not-supported",
+        2 => "version-not-equal",
+        _ => "?",
+    }
+}
+
+/// ATCForwardMessage ::= SEQUENCE { forwardHeader ForwardHeader,
+/// forwardMessage ForwardMessage } (ICAO Doc 9880 PMCPDLCAPDUsVersion1).
+/// ForwardHeader ::= SEQUENCE { dateTime DateTimeGroup, aircraftID
+/// AircraftFlightIdentification IA5(2..8), aircraftAddress BIT STRING(24) }.
+/// ForwardMessage ::= CHOICE { upElementIDs [0] BIT STRING, downElementIDs
+/// [1] BIT STRING } — the inner BIT STRING is a PER-encoded
+/// ATCUplink/DownlinkMessageData, surfaced as a nested element walk.
+fn read_atc_forward_message(p: &mut Per, _downlink: bool) -> Option<Value> {
+    // None of ForwardHeader / ForwardMessage carries a SEQUENCE extension
+    // marker in the module, so there is no leading preamble bit here.
+    // DateTimeGroup: Date{year 1996..2095, month 1..12, day 1..31} +
+    // Timehhmmss{hours 0..23, minutes 0..59, seconds 0..59}.
+    let (y, mo, d) = (
+        p.constrained(1996, 2095)?,
+        p.constrained(1, 12)?,
+        p.constrained(1, 31)?,
+    );
+    let (h, mi, sec) = (
+        p.constrained(0, 23)?,
+        p.constrained(0, 59)?,
+        p.constrained(0, 59)?,
+    );
+    let aircraft_id = p.ia5(2, 8)?;
+    // AircraftAddress ::= BIT STRING (SIZE(24)) — fixed size, no length field.
+    let addr = p.remaining_bytes(24)?;
+    // ForwardMessage CHOICE (2 alts, non-extensible) → 1 bit selects the
+    // direction of the carried element list.
+    let carried_uplink = p.bit()? == 0;
+    let n = p.length()?;
+    let inner = p.remaining_bytes(n)?;
+    // The carried element list is an ATCUplink/DownlinkMessageData (no
+    // header), decoded by the shared element walk. `downlink` = !uplink.
+    let elements = atc_message_data(&inner, n, !carried_uplink);
+    let mut out = json!({
+        "timestamp": format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z"),
+        "aircraft_id": aircraft_id,
+        "aircraft_address": addr.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "carried_direction": if carried_uplink { "uplink" } else { "downlink" },
+    });
+    if let Some(els) = elements {
+        out["elements"] = els;
+    }
+    Some(out)
+}
+
+/// ProtectedUplink/DownlinkMessage ::= SEQUENCE { algorithmIdentifier [0]
+/// OPTIONAL, protectedMessage [1] CPDLCMessage(=BIT STRING) OPTIONAL,
+/// integrityCheck [2] BIT STRING, ... } (ICAO Doc 9880). The SEQUENCE has an
+/// extension marker (1 ext bit) plus two OPTIONALs (2 presence bits). The
+/// integrityCheck is mandatory and follows the message; VDL2-1.2 consumes and
+/// reports it instead of leaving it dangling.
 fn protected_message(p: &mut Per, downlink: bool) -> Option<Value> {
     if p.bit()? != 0 {
         return None; // extension additions present: bail
@@ -168,14 +554,26 @@ fn protected_message(p: &mut Per, downlink: bool) -> Option<Value> {
         let n = p.length()?;
         p.remaining_bytes(n * 8)?;
     }
-    if !has_msg {
-        return Some(json!({ "empty": true }));
+    let mut out = if !has_msg {
+        json!({ "empty": true })
+    } else {
+        let nbits = p.length()?;
+        let inner = p.remaining_bytes(nbits)?;
+        // The BIT STRING length is in bits; the inner message is itself
+        // PER, decoded from its own bit zero.
+        atc_message(&inner, nbits, downlink)?
+    };
+    // integrityCheck BIT STRING: unconstrained → length determinant (bits)
+    // then the bits. Reported as a hex digest when non-empty.
+    if let Some(nbits) = p.length() {
+        if let Some(ic) = p.remaining_bytes(nbits) {
+            if !ic.is_empty() {
+                out["integrity_check"] =
+                    json!(ic.iter().map(|b| format!("{b:02x}")).collect::<String>());
+            }
+        }
     }
-    let nbits = p.length()?;
-    let inner = p.remaining_bytes(nbits)?;
-    // The BIT STRING length is in bits; the inner message is itself
-    // PER, decoded from its own bit zero.
-    atc_message(&inner, nbits, downlink)
+    Some(out)
 }
 
 /// ATCUplinkMessage / ATCDownlinkMessage.
@@ -207,8 +605,44 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
         "not-required"
     };
 
+    // messageData (elementIds + optional constrainedData) is shared with the
+    // Forward message's carried element list.
+    let (elements, route_clearances) = walk_message_data(&mut p, downlink)?;
+    let mut out = json!({
+        "msg_id": msg_id,
+        "msg_ref": msg_ref,
+        "timestamp": format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z"),
+        "logical_ack": ack,
+        "elements": elements,
+    });
+    if let Some(rcs) = route_clearances {
+        out["route_clearances"] = rcs;
+    }
+    Some(out)
+}
+
+/// ATCUplink/DownlinkMessageData (no ATCMessageHeader): the carried element
+/// list of an ATCForwardMessage (VDL2-1.5). `bytes`/`nbits` is the inner BIT
+/// STRING. Returns `{ elements: [...], route_clearances?: [...] }`.
+fn atc_message_data(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
+    let mut store = Vec::new();
+    let mut p = Per::new(bytes, &mut store);
+    p.bits = &p.bits[..nbits.min(p.bits.len())];
+    let (elements, route_clearances) = walk_message_data(&mut p, downlink)?;
+    let mut out = json!({ "elements": elements });
+    if let Some(rcs) = route_clearances {
+        out["route_clearances"] = rcs;
+    }
+    Some(out)
+}
+
+/// Decode an ATCUplink/DownlinkMessageData body (the part after the header):
+/// `elementIds SEQUENCE SIZE(1..5) OF MsgElementId` then an optional
+/// `constrainedData` SEQUENCE carrying the route clearances. Returns the
+/// element JSON array and the optional route-clearance JSON.
+fn walk_message_data(p: &mut Per, downlink: bool) -> Option<(Value, Option<Value>)> {
     // MessageData: SEQUENCE {elementIds SIZE(1..5), constrainedData OPT}.
-    let _has_constrained = p.bit()? == 1;
+    let has_constrained = p.bit()? == 1;
     let count = p.constrained(1, 5)? as usize;
     let table: &[(&str, &str, &str)] =
         if downlink { &DOWNLINK_ELEMENTS } else { &UPLINK_ELEMENTS };
@@ -223,7 +657,7 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
         let mut el = json!({ "element": name, "phrase": phrase });
         if arg_ty != "NULL" {
             el["argument_type"] = json!(arg_ty);
-            match read_argument(&mut p, arg_ty) {
+            match read_argument(p, arg_ty) {
                 Some(vals) => {
                     el["text"] = json!(fill_phrase(phrase, &vals));
                     el["arguments"] = json!(vals);
@@ -245,34 +679,28 @@ fn atc_message(bytes: &[u8], nbits: usize, downlink: bool) -> Option<Value> {
         elements.push(el);
     }
 
-    let mut out = json!({
-        "msg_id": msg_id,
-        "msg_ref": msg_ref,
-        "timestamp": format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{sec:02}Z"),
-        "logical_ack": ack,
-        "elements": elements,
-    });
     // constrainedData (route clearances) sits after the element list —
     // reachable only when every element argument decoded.
-    if _has_constrained && !bailed {
+    let mut route_clearances = None;
+    if has_constrained && !bailed {
         // SEQUENCE { routeClearanceData SIZE(1..2) OPTIONAL, ... }:
         // extension bit + presence bit.
         if p.bit() == Some(0) && p.bit() == Some(1) {
             if let Some(n) = p.constrained(1, 2) {
                 let mut rcs = Vec::new();
                 for _ in 0..n {
-                    match read_route_clearance(&mut p) {
+                    match read_route_clearance(p) {
                         Some(rc) => rcs.push(rc),
                         None => break,
                     }
                 }
                 if !rcs.is_empty() {
-                    out["route_clearances"] = json!(rcs);
+                    route_clearances = Some(json!(rcs));
                 }
             }
         }
     }
-    Some(out)
+    Some((json!(elements), route_clearances))
 }
 
 
@@ -453,6 +881,142 @@ fn read_argument(p: &mut Per, ty: &str) -> Option<Vec<String>> {
             read_position(p)?,
             format!("(route clearance #{})", p.constrained(1, 2)?),
         ],
+
+        // --- VDL2-1.1: extended argument-type coverage (ICAO Doc 9880 module,
+        // docs/asn1/atn-cpdlc.asn; unaligned PER per ITU-T X.691). ---
+
+        // Frequency CHOICE (4 alts) and its two-component compounds.
+        "Frequency" => vec![read_frequency(p)?],
+        "UnitNameFrequency" => vec![read_unit_name(p)?, read_frequency(p)?],
+        "PositionUnitNameFrequency" => {
+            vec![read_position(p)?, read_unit_name(p)?, read_frequency(p)?]
+        }
+        "TimeUnitNameFrequency" => {
+            vec![read_time(p)?, read_unit_name(p)?, read_frequency(p)?]
+        }
+
+        // Altimeter CHOICE (english/metric) and its compounds.
+        "Altimeter" => vec![read_altimeter(p)?],
+        "FacilityDesignation" => vec![read_facility_designation(p)?],
+        "Facility" => vec![read_facility(p)?],
+        "FacilityDesignationAltimeter" => {
+            vec![read_facility_designation(p)?, read_altimeter(p)?]
+        }
+        "FacilityDesignationATISCode" => {
+            vec![read_facility_designation(p)?, read_atis_code(p)?]
+        }
+
+        // Codes, text, ATIS, simple enums.
+        "ATISCode" => vec![read_atis_code(p)?],
+        "Code" => vec![read_code(p)?],
+        "FreeText" => vec![read_free_text(p)?],
+        "VersionNumber" => vec![format!("v{}", p.constrained(0, 15)?)],
+        "TrafficType" => vec![read_traffic_type(p)?],
+        "ClearanceType" => vec![read_clearance_type(p)?],
+        "ErrorInformation" => vec![read_error_information(p)?],
+
+        // Procedure / runway compounds.
+        "ProcedureName" => vec![read_procedure(p)?],
+        "PositionProcedureName" => vec![read_position(p)?, read_procedure(p)?],
+        "RunwayRVR" => vec![read_runway(p)?, read_rvr(p)?],
+
+        // Speed-type triples and the level/speed/position compounds whose
+        // shapes were previously unknown.
+        "SpeedTypeSpeedTypeSpeedType" => read_speed_type_triple(p)?,
+        "SpeedTypeSpeedTypeSpeedTypeSpeed" => {
+            let mut v = read_speed_type_triple(p)?;
+            v.push(read_speed(p)?);
+            v
+        }
+        // SpeedSpeed is a SEQUENCE SIZE(2) OF Speed.
+        "LevelSpeedSpeed" => vec![read_level(p)?, read_speed(p)?, read_speed(p)?],
+        "PositionSpeedSpeed" => {
+            vec![read_position(p)?, read_speed(p)?, read_speed(p)?]
+        }
+        "TimeSpeed" => vec![read_time(p)?, read_speed(p)?],
+        "SpeedTime" => vec![read_speed(p)?, read_time(p)?],
+        "TimeSpeedSpeed" => vec![read_time(p)?, read_speed(p)?, read_speed(p)?],
+        "PositionLevelLevel" => {
+            vec![read_position(p)?, read_level(p)?, read_level(p)?]
+        }
+        "PositionLevelSpeed" => {
+            // PositionLevelSpeed { positionlevel PositionLevel, speed Speed }.
+            vec![read_position(p)?, read_level(p)?, read_speed(p)?]
+        }
+        "PositionTimeTime" => {
+            // PositionTimeTime { position, times TimeTime } (2 times).
+            vec![read_position(p)?, read_time(p)?, read_time(p)?]
+        }
+        "PositionTimeLevel" => {
+            // PositionTimeLevel { positionTime PositionTime, level }.
+            vec![read_position(p)?, read_time(p)?, read_level(p)?]
+        }
+        "TimePositionLevel" => {
+            // TimePositionLevel { timeposition TimePosition, level }.
+            vec![read_time(p)?, read_position(p)?, read_level(p)?]
+        }
+        "TimePositionLevelSpeed" => {
+            // { timeposition TimePosition, levelspeed LevelSpeed }; LevelSpeed
+            // carries a SpeedSpeed (two speeds).
+            vec![
+                read_time(p)?,
+                read_position(p)?,
+                read_level(p)?,
+                read_speed(p)?,
+                read_speed(p)?,
+            ]
+        }
+
+        // Distance/direction offset family.
+        "DistanceSpecifiedDirection" => {
+            let (d, dir) = read_distance_specified_direction(p)?;
+            vec![d, dir]
+        }
+        "PositionDistanceSpecifiedDirection" => {
+            let pos = read_position(p)?;
+            let (d, dir) = read_distance_specified_direction(p)?;
+            vec![pos, d, dir]
+        }
+        "TimeDistanceSpecifiedDirection" => {
+            let t = read_time(p)?;
+            let (d, dir) = read_distance_specified_direction(p)?;
+            vec![t, d, dir]
+        }
+        "DistanceSpecifiedDirectionTime" => {
+            let (d, dir) = read_distance_specified_direction(p)?;
+            vec![d, dir, read_time(p)?]
+        }
+
+        // To/From distance reports.
+        "ToFromPosition" => vec![read_tofrom(p)?, read_position(p)?],
+        "TimeToFromPosition" => {
+            vec![read_time(p)?, read_tofrom(p)?, read_position(p)?]
+        }
+        "TimeDistanceToFromPosition" => vec![
+            read_time(p)?,
+            read_distance(p)?,
+            read_tofrom(p)?,
+            read_position(p)?,
+        ],
+
+        // Vertical rate and remaining-fuel/POB.
+        "VerticalRate" => vec![read_vertical_rate(p)?],
+        "RemainingFuelPersonsOnBoard" => {
+            // RemainingFuel ::= Time; PersonsOnBoard ::= INTEGER(1..1024).
+            vec![read_time(p)?, format!("{}", p.constrained(1, 1024)?)]
+        }
+
+        // HoldClearance: one OPTIONAL (legType) → one presence bit.
+        "HoldClearance" => read_hold_clearance(p)?,
+        // DepartureClearance: two OPTIONALs (flightInformation,
+        // furtherInstructions); the mandatory head decodes cleanly, the
+        // optional tail is reported present-but-undecoded (it is last).
+        "DepartureClearance" => read_departure_clearance(p)?,
+        // PositionReport: 3 mandatory + 19 OPTIONAL fields. Decode the
+        // mandatory head; succeed only when every optional is absent (else
+        // the field sizes downstream are unknown — stop the element walk).
+        "PositionReport" => read_position_report(p)?,
+
         _ => return None,
     })
 }
@@ -574,8 +1138,447 @@ fn read_lat_or_lon(p: &mut Per, max_milli: i64, max_whole: i64) -> Option<String
     })
 }
 
-/// CM ground-generated messages: identify the dialogue type (logon
-/// response, update, contact request, abort, forward).
+// ---------------------------------------------------------------------------
+// VDL2-1.1: argument-type readers added for the extended CPDLC coverage.
+// Every encoding is taken directly from the ICAO Doc 9880 ASN.1 module
+// (docs/asn1/atn-cpdlc.asn) and unaligned PER (ITU-T X.691): CHOICE indices
+// are the minimal bit-field over the (non-extensible) root alternatives,
+// constrained INTEGERs are minimal-width offsets, ENUMERATEDs with a "..."
+// extension marker carry a leading extension bit then the root index.
+// ---------------------------------------------------------------------------
+
+/// Frequency ::= CHOICE { hf [0] INTEGER(2850..28000) kHz,
+/// vhf [1] INTEGER(23600..27398) (118.000..136.990 MHz, step 0.005),
+/// uhf [2] INTEGER(9000..15999) (225.000..399.975 MHz, step 0.025),
+/// satchannel [3] NumericString(SIZE(12)) }. Non-extensible CHOICE → 2 bits.
+fn read_frequency(p: &mut Per) -> Option<String> {
+    Some(match p.uint(2)? {
+        0 => format!("{} kHz", p.constrained(2850, 28000)?),
+        1 => format!("{:.3} MHz", p.constrained(23600, 27398)? as f64 * 0.005),
+        2 => format!("{:.3} MHz", p.constrained(9000, 15999)? as f64 * 0.025),
+        // NumericString(SIZE(12)): fixed size, 4 bits/char (UPER permitted
+        // alphabet "0123456789" has 10 symbols → 4 bits each, X.691 §27.5.7).
+        _ => {
+            let mut s = String::with_capacity(12);
+            for _ in 0..12 {
+                s.push((b'0' + p.uint(4)? as u8) as char);
+            }
+            format!("SAT {s}")
+        }
+    })
+}
+
+/// Altimeter ::= CHOICE { english [0] INTEGER(2200..3200) (in·0.01),
+/// metric [1] INTEGER(7500..12500) (hPa·0.1) }. 2-alt CHOICE → 1 bit.
+fn read_altimeter(p: &mut Per) -> Option<String> {
+    Some(if p.bit()? == 0 {
+        format!("{:.2} inHg", p.constrained(2200, 3200)? as f64 / 100.0)
+    } else {
+        format!("{:.1} hPa", p.constrained(7500, 12500)? as f64 / 10.0)
+    })
+}
+
+/// ATISCode ::= IA5String(SIZE(1)) — fixed size, 7 bits, no length field.
+fn read_atis_code(p: &mut Per) -> Option<String> {
+    Some((p.uint(7)? as u8 as char).to_string())
+}
+
+/// FacilityDesignation ::= IA5String(SIZE(4..8)).
+fn read_facility_designation(p: &mut Per) -> Option<String> {
+    p.ia5(4, 8)
+}
+
+/// Facility ::= CHOICE { noFacility [0] NULL, facilityDesignation [1] }.
+fn read_facility(p: &mut Per) -> Option<String> {
+    if p.bit()? == 0 {
+        Some("(none)".to_string())
+    } else {
+        read_facility_designation(p)
+    }
+}
+
+/// Code ::= SEQUENCE SIZE(4) OF CodeOctalDigit (INTEGER 0..7) → a transponder
+/// squawk: four 3-bit octal digits, no length field (fixed SIZE).
+fn read_code(p: &mut Per) -> Option<String> {
+    let mut s = String::with_capacity(4);
+    for _ in 0..4 {
+        s.push((b'0' + p.constrained(0, 7)? as u8) as char);
+    }
+    Some(s)
+}
+
+/// FreeText ::= IA5String(SIZE(1..256)).
+fn read_free_text(p: &mut Per) -> Option<String> {
+    p.ia5(1, 256)
+}
+
+/// TrafficType ::= ENUMERATED { noneSpecified..diverging, ... } (extensible).
+fn read_traffic_type(p: &mut Per) -> Option<String> {
+    if p.bit()? != 0 {
+        return Some("(extended)".to_string());
+    }
+    const TT: [&str; 6] = [
+        "NONE", "OPPOSITE DIRECTION", "SAME DIRECTION", "CONVERGING",
+        "CROSSING", "DIVERGING",
+    ];
+    TT.get(p.constrained(0, 5)? as usize).map(|s| s.to_string())
+}
+
+/// ClearanceType ::= ENUMERATED { noneSpecified..downstream, ... }
+/// (12 root values, extensible).
+fn read_clearance_type(p: &mut Per) -> Option<String> {
+    if p.bit()? != 0 {
+        return Some("(extended)".to_string());
+    }
+    const CT: [&str; 12] = [
+        "NONE", "APPROACH", "DEPARTURE", "FURTHER", "START-UP", "PUSHBACK",
+        "TAXI", "TAKE-OFF", "LANDING", "OCEANIC", "EN-ROUTE", "DOWNSTREAM",
+    ];
+    CT.get(p.constrained(0, 11)? as usize).map(|s| s.to_string())
+}
+
+/// ErrorInformation ::= ENUMERATED (5 root values, extensible).
+fn read_error_information(p: &mut Per) -> Option<String> {
+    if p.bit()? != 0 {
+        return Some("(extended)".to_string());
+    }
+    const EI: [&str; 5] = [
+        "UNRECOGNIZED MSG REFERENCE NUMBER",
+        "LOGICAL ACKNOWLEDGMENT NOT ACCEPTED",
+        "INSUFFICIENT RESOURCES",
+        "INVALID MESSAGE ELEMENT COMBINATION",
+        "INVALID MESSAGE ELEMENT",
+    ];
+    EI.get(p.constrained(0, 4)? as usize).map(|s| s.to_string())
+}
+
+/// ToFrom ::= ENUMERATED { to (0), from (1) } (non-extensible) → 1 bit.
+fn read_tofrom(p: &mut Per) -> Option<String> {
+    Some(if p.constrained(0, 1)? == 0 { "TO" } else { "FROM" }.to_string())
+}
+
+/// UnitName ::= SEQUENCE { facilityDesignation [0], facilityName [1]
+/// FacilityName(SIZE(3..18)) OPTIONAL, facilityFunction [2] }.
+/// FacilityFunction ::= ENUMERATED (9 root values, extensible).
+fn read_unit_name(p: &mut Per) -> Option<String> {
+    let has_name = p.bit()? == 1;
+    let designation = read_facility_designation(p)?;
+    let name = if has_name { Some(p.ia5(3, 18)?) } else { None };
+    let function = read_facility_function(p)?;
+    Some(match name {
+        Some(n) => format!("{designation} {n} {function}"),
+        None => format!("{designation} {function}"),
+    })
+}
+
+fn read_facility_function(p: &mut Per) -> Option<String> {
+    if p.bit()? != 0 {
+        return Some("(extended)".to_string());
+    }
+    const FF: [&str; 9] = [
+        "CENTER", "APPROACH", "TOWER", "FINAL", "GROUND", "DELIVERY",
+        "DEPARTURE", "CONTROL", "RADIO",
+    ];
+    FF.get(p.constrained(0, 8)? as usize).map(|s| s.to_string())
+}
+
+/// RVR ::= CHOICE { feet [0] INTEGER(0..6100), meters [1] INTEGER(0..1500) }.
+fn read_rvr(p: &mut Per) -> Option<String> {
+    Some(if p.bit()? == 0 {
+        format!("{} FT", p.constrained(0, 6100)?)
+    } else {
+        format!("{} M", p.constrained(0, 1500)?)
+    })
+}
+
+/// VerticalRate ::= CHOICE { english [0] INTEGER(0..3000) (·10 ft/min),
+/// metric [1] INTEGER(0..1000) (·10 m/min) }.
+fn read_vertical_rate(p: &mut Per) -> Option<String> {
+    Some(if p.bit()? == 0 {
+        format!("{} FPM", p.constrained(0, 3000)? * 10)
+    } else {
+        format!("{} M/MIN", p.constrained(0, 1000)? * 10)
+    })
+}
+
+/// SpeedType ::= ENUMERATED (9 root values, extensible).
+fn read_speed_type(p: &mut Per) -> Option<String> {
+    if p.bit()? != 0 {
+        return Some("(extended)".to_string());
+    }
+    const ST: [&str; 9] = [
+        "NONE", "INDICATED", "TRUE", "GROUND", "MACH", "APPROACH", "CRUISE",
+        "MINIMUM", "MAXIMUM",
+    ];
+    ST.get(p.constrained(0, 8)? as usize).map(|s| s.to_string())
+}
+
+/// SpeedTypeSpeedTypeSpeedType ::= SEQUENCE SIZE(3) OF SpeedType.
+fn read_speed_type_triple(p: &mut Per) -> Option<Vec<String>> {
+    Some(vec![read_speed_type(p)?, read_speed_type(p)?, read_speed_type(p)?])
+}
+
+/// DistanceSpecified ::= CHOICE { nm [0] INTEGER(1..250), km [1]
+/// INTEGER(1..500) }; DistanceSpecifiedDirection adds a Direction enum.
+/// Returns (distance, direction).
+fn read_distance_specified_direction(p: &mut Per) -> Option<(String, String)> {
+    let dist = if p.bit()? == 0 {
+        format!("{} NM", p.constrained(1, 250)?)
+    } else {
+        format!("{} KM", p.constrained(1, 500)?)
+    };
+    Some((dist, read_direction(p)?))
+}
+
+/// HoldClearance ::= SEQUENCE { position, level, degrees, direction,
+/// legType OPTIONAL }. One OPTIONAL → one leading presence bit.
+fn read_hold_clearance(p: &mut Per) -> Option<Vec<String>> {
+    let has_leg = p.bit()? == 1;
+    let position = read_position(p)?;
+    let level = read_level(p)?;
+    let degrees = read_degrees(p)?;
+    let direction = read_direction(p)?;
+    let leg = if has_leg { read_leg_type(p)? } else { "(none)".to_string() };
+    Some(vec![position, level, degrees, direction, leg])
+}
+
+/// LegType ::= CHOICE { legDistance [0] LegDistance, legTime [1] LegTime }.
+/// LegDistance ::= CHOICE { english [0] INTEGER(0..50) NM, metric [1]
+/// INTEGER(1..128) km }; LegTime ::= INTEGER(0..10) min.
+fn read_leg_type(p: &mut Per) -> Option<String> {
+    Some(if p.bit()? == 0 {
+        if p.bit()? == 0 {
+            format!("{} NM", p.constrained(0, 50)?)
+        } else {
+            format!("{} KM", p.constrained(1, 128)?)
+        }
+    } else {
+        format!("{} MIN", p.constrained(0, 10)?)
+    })
+}
+
+/// DepartureClearance ::= SEQUENCE { aircraftFlightIdentification [0]
+/// IA5(2..8), clearanceLimit [1] Position, flightInformation [2] OPTIONAL,
+/// furtherInstructions [3] OPTIONAL }. Two OPTIONALs → two presence bits.
+/// The optional tail (FlightInformation / FurtherInstructions) is deeply
+/// nested and sits last; we decode the mandatory head and flag the tail.
+fn read_departure_clearance(p: &mut Per) -> Option<Vec<String>> {
+    let has_flight_info = p.bit()? == 1;
+    let has_further = p.bit()? == 1;
+    let flight_id = p.ia5(2, 8)?;
+    let limit = read_position(p)?;
+    let mut s = format!("{flight_id} CLEARED TO {limit}");
+    if has_flight_info || has_further {
+        s.push_str(" (+flight-info/further-instructions present, undecoded)");
+    }
+    Some(vec![s])
+}
+
+/// PositionReport ::= SEQUENCE { positioncurrent [0], timeatpositioncurrent
+/// [1], level [2], then 19 OPTIONAL fields [3..21] }. Decode the 3 mandatory
+/// fields; succeed only when every optional is absent (the optional field
+/// sizes are otherwise unknown, which would corrupt the element walk).
+fn read_position_report(p: &mut Per) -> Option<Vec<String>> {
+    // 19 OPTIONAL components → 19 leading presence bits.
+    let mut any_optional = false;
+    for _ in 0..19 {
+        if p.bit()? == 1 {
+            any_optional = true;
+        }
+    }
+    let position = read_position(p)?;
+    let time = read_time(p)?;
+    let level = read_level(p)?;
+    let mut s = format!("{position} {time} {level}");
+    if any_optional {
+        // Optional fields present but their full decode is staged; the
+        // element walk cannot safely continue past an unsized tail.
+        s.push_str(" (+optional fields present, undecoded)");
+        // Signal "stop here" to the caller: a position report with optional
+        // fields is necessarily the message's terminal element in practice,
+        // but to stay correct we return None so later elements aren't
+        // mis-decoded from an unknown offset.
+        return None;
+    }
+    Some(vec![s])
+}
+
+// ---------------------------------------------------------------------------
+// VDL2-1.4: full Context Management (CM) decode.
+// Oracle: ICAO Doc 9705 Edition 2 CMMessageSetVersion1 ASN.1 module
+// (docs/asn1/atn-cm.asn), unaligned PER (ITU-T X.691). CM SEQUENCE types
+// carry no extension marker (no "..." in the body), so each has only its
+// OPTIONAL presence preamble; the two message CHOICEs are extensible.
+// ---------------------------------------------------------------------------
+
+/// ShortTsap ::= SEQUENCE { aRS [0] OCTET STRING(SIZE(3)) OPTIONAL,
+/// locSysNselTsel [1] OCTET STRING(SIZE(10..11)) }. One OPTIONAL → 1 preamble
+/// bit. The aRS is the ICAO 24-bit address (aircraft) or a ground address.
+fn read_short_tsap(p: &mut Per) -> Option<Value> {
+    let has_ars = p.bit()? == 1;
+    let mut out = serde_json::Map::new();
+    if has_ars {
+        let ars = p.remaining_bytes(3 * 8)?;
+        out.insert(
+            "ars".into(),
+            json!(ars.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+        );
+    }
+    // OCTET STRING SIZE(10..11): constrained length (2 values → 1 bit) then
+    // the octets.
+    let n = p.constrained(10, 11)? as usize;
+    let sel = p.remaining_bytes(n * 8)?;
+    out.insert(
+        "loc_sys_nsel_tsel".into(),
+        json!(sel.iter().map(|b| format!("{b:02x}")).collect::<String>()),
+    );
+    Some(Value::Object(out))
+}
+
+/// LongTsap ::= SEQUENCE { rDP OCTET STRING(SIZE(5)), shortTsap ShortTsap }.
+fn read_long_tsap(p: &mut Per) -> Option<Value> {
+    let rdp = p.remaining_bytes(5 * 8)?;
+    Some(json!({
+        "rdp": rdp.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+        "short_tsap": read_short_tsap(p)?,
+    }))
+}
+
+/// APAddress ::= CHOICE { longTsap [0] LongTsap, shortTsap [1] ShortTsap }
+/// (non-extensible, 2 alts → 1 bit).
+fn read_ap_address(p: &mut Per) -> Option<Value> {
+    Some(if p.bit()? == 0 {
+        json!({ "long_tsap": read_long_tsap(p)? })
+    } else {
+        json!({ "short_tsap": read_short_tsap(p)? })
+    })
+}
+
+/// AEQualifierVersion ::= SEQUENCE { aeQualifier INTEGER(0..255), apVersion
+/// VersionNumber INTEGER(1..255) }.
+fn read_ae_qualifier_version(p: &mut Per, with_address: bool) -> Option<Value> {
+    let ae = p.constrained(0, 255)?;
+    let ver = p.constrained(1, 255)?;
+    let mut out = json!({ "ae_qualifier": ae, "ap_version": ver });
+    if with_address {
+        out["ap_address"] = read_ap_address(p)?;
+    }
+    Some(out)
+}
+
+/// SEQUENCE SIZE(1..256) OF AEQualifierVersion[Address]. The SIZE-constrained
+/// count uses 8 bits (range 256). `with_address` selects the entry shape.
+fn read_app_list(p: &mut Per, with_address: bool) -> Option<Vec<Value>> {
+    let n = p.constrained(1, 256)? as usize;
+    let mut out = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        out.push(read_ae_qualifier_version(p, with_address)?);
+    }
+    Some(out)
+}
+
+/// DateTime ::= SEQUENCE { date Date, time Time }; Date = Year(1996..2095) +
+/// Month(1..12) + Day(1..31); Time = Timehours(0..23) + Timeminutes(0..59).
+fn read_cm_datetime(p: &mut Per) -> Option<String> {
+    let (y, mo, d) =
+        (p.constrained(1996, 2095)?, p.constrained(1, 12)?, p.constrained(1, 31)?);
+    let (h, mi) = (p.constrained(0, 23)?, p.constrained(0, 59)?);
+    Some(format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}Z"))
+}
+
+/// CMAbortReason ::= ENUMERATED (extensible, 10 root values → ext + 4 bits).
+fn cm_abort_reason(r: i64) -> Option<&'static str> {
+    const R: [&str; 10] = [
+        "timer-expired",
+        "undefined-error",
+        "invalid-PDU",
+        "protocol-error",
+        "dialogue-acceptance-not-permitted",
+        "dialogue-end-not-accepted",
+        "communication-service-error",
+        "communication-service-failure",
+        "invalid-QOS-parameter",
+        "expected-PDU-missing",
+    ];
+    R.get(r as usize).copied()
+}
+
+/// Decode a CMAbortReason ENUMERATED into the output object.
+fn read_cm_abort(p: &mut Per, out: &mut Value) -> Option<()> {
+    if p.bit()? == 0 {
+        let r = p.constrained(0, 9)?;
+        out["reason"] = json!(r);
+        if let Some(t) = cm_abort_reason(r) {
+            out["reason_text"] = json!(t);
+        }
+    } else {
+        out["reason"] = json!("(extended)");
+    }
+    Some(())
+}
+
+/// CMLogonResponse ::= SEQUENCE { airInitiatedApplications [0] OPTIONAL,
+/// groundOnlyInitiatedApplications [1] OPTIONAL }. CMUpdate = CMLogonResponse.
+/// airInitiated carries APAddress (AEQualifierVersionAddress); groundOnly
+/// does not (AEQualifierVersion).
+fn read_cm_logon_response(p: &mut Per, out: &mut Value) -> Option<()> {
+    let has_air = p.bit()? == 1;
+    let has_ground = p.bit()? == 1;
+    if has_air {
+        out["air_initiated_applications"] = json!(read_app_list(p, true)?);
+    }
+    if has_ground {
+        out["ground_only_initiated_applications"] = json!(read_app_list(p, false)?);
+    }
+    Some(())
+}
+
+/// CMLogonRequest ::= SEQUENCE { aircraftFlightIdentification [0] IA5(2..8),
+/// cMLongTSAP [1] LongTsap, groundInitiatedApplications [2] OPTIONAL,
+/// airOnlyInitiatedApplications [3] OPTIONAL, facilityDesignation [4]
+/// IA5(4..8) OPTIONAL, airportDeparture [5] IA5(4) OPTIONAL, airportDestination
+/// [6] IA5(4) OPTIONAL, dateTimeDepartureETD [7] DateTime OPTIONAL }. Six
+/// OPTIONALs → six preamble bits. CMForwardRequest = CMLogonRequest.
+fn read_cm_logon_request(p: &mut Per) -> Option<Value> {
+    // Presence preamble for the six OPTIONAL components (in declaration order:
+    // groundInitiated, airOnlyInitiated, facilityDesignation, airportDeparture,
+    // airportDestination, dateTimeDepartureETD).
+    let has_ground = p.bit()? == 1;
+    let has_air_only = p.bit()? == 1;
+    let has_facility = p.bit()? == 1;
+    let has_dep = p.bit()? == 1;
+    let has_dest = p.bit()? == 1;
+    let has_etd = p.bit()? == 1;
+    let flight_id = p.ia5(2, 8)?;
+    let long_tsap = read_long_tsap(p)?;
+    let mut out = json!({
+        "flight_id": flight_id,
+        "cm_long_tsap": long_tsap,
+    });
+    if has_ground {
+        out["ground_initiated_applications"] = json!(read_app_list(p, true)?);
+    }
+    if has_air_only {
+        out["air_only_initiated_applications"] = json!(read_app_list(p, false)?);
+    }
+    if has_facility {
+        out["facility_designation"] = json!(read_facility_designation(p)?);
+    }
+    if has_dep {
+        out["airport_departure"] = json!(p.ia5(4, 4)?);
+    }
+    if has_dest {
+        out["airport_destination"] = json!(p.ia5(4, 4)?);
+    }
+    if has_etd {
+        out["etd"] = json!(read_cm_datetime(p)?);
+    }
+    Some(out)
+}
+
+/// CM ground-generated messages (CMGroundMessage CHOICE, ICAO Doc 9705
+/// CMMessageSetVersion1): logon response, update, contact request, forward
+/// request, abort, forward response.
 pub fn parse_cm_ground(bytes: &[u8]) -> Option<Value> {
     let mut store = Vec::new();
     let mut p = Per::new(bytes, &mut store);
@@ -593,19 +1596,41 @@ pub fn parse_cm_ground(bytes: &[u8]) -> Option<Value> {
         _ => return None,
     };
     let mut out = json!({ "application": "CM", "pdu": kind });
-    if matches!(kind, "logon-response" | "update") {
-        // Two OPTIONAL application lists; report presence only (the
-        // per-entry TSAP addresses are variable-size — staged).
-        let air = p.bit()? == 1;
-        let ground = p.bit()? == 1;
-        out["air_apps_present"] = json!(air);
-        out["ground_apps_present"] = json!(ground);
+    match kind {
+        // CMLogonResponse / CMUpdate: two OPTIONAL application lists.
+        "logon-response" | "update" => {
+            read_cm_logon_response(&mut p, &mut out)?;
+        }
+        // CMContactRequest ::= SEQUENCE { facilityDesignation, address LongTsap }.
+        "contact-request" => {
+            out["facility_designation"] = json!(read_facility_designation(&mut p)?);
+            out["address"] = read_long_tsap(&mut p)?;
+        }
+        // CMForwardRequest ::= CMLogonRequest.
+        "forward-request" => {
+            out["request"] = read_cm_logon_request(&mut p)?;
+        }
+        // CMAbortReason ENUMERATED.
+        "abort" => {
+            read_cm_abort(&mut p, &mut out)?;
+        }
+        // CMForwardResponse ::= ENUMERATED { success, incompatible-version,
+        // service-not-supported } (non-extensible, 3 → 2 bits).
+        "forward-response" => {
+            out["response"] = json!(match p.constrained(0, 2)? {
+                0 => "success",
+                1 => "incompatible-version",
+                2 => "service-not-supported",
+                _ => "?",
+            });
+        }
+        _ => {}
     }
     Some(out)
 }
 
-/// CM (context management) logon request — the dialogue that precedes
-/// CPDLC; identifies the flight.
+/// CM aircraft-generated messages (CMAircraftMessage CHOICE, ICAO Doc 9705
+/// CMMessageSetVersion1): logon request, contact response, abort.
 pub fn parse_cm_logon(bytes: &[u8]) -> Option<Value> {
     let mut store = Vec::new();
     let mut p = Per::new(bytes, &mut store);
@@ -613,18 +1638,35 @@ pub fn parse_cm_logon(bytes: &[u8]) -> Option<Value> {
     if p.bit()? != 0 {
         return None;
     }
-    if p.uint(2)? != 0 {
-        return None; // only cmLogonRequest decoded for now
+    match p.uint(2)? {
+        // cmLogonRequest [0] CMLogonRequest.
+        0 => {
+            let req = read_cm_logon_request(&mut p)?;
+            let mut out = json!({ "application": "CM", "pdu": "logon-request" });
+            if let Value::Object(m) = req {
+                for (k, v) in m {
+                    out[k] = v;
+                }
+            }
+            Some(out)
+        }
+        // cmContactResponse [1] CMContactResponse (= Response ENUMERATED).
+        1 => {
+            let r = p.constrained(0, 1)?;
+            Some(json!({
+                "application": "CM",
+                "pdu": "contact-response",
+                "response": if r == 0 { "contactSuccess" } else { "contactNotSuccessful" },
+            }))
+        }
+        // cmAbortReason [2] CMAbortReason.
+        2 => {
+            let mut out = json!({ "application": "CM", "pdu": "abort" });
+            read_cm_abort(&mut p, &mut out)?;
+            Some(out)
+        }
+        _ => None,
     }
-    // CMLogonRequest: 6 OPTIONAL components → presence bitmap.
-    let present: Vec<bool> = (0..6).map(|_| p.bit() == Some(1)).collect();
-    let flight_id = p.ia5(2, 8)?;
-    Some(json!({
-        "application": "CM",
-        "pdu": "logon-request",
-        "flight_id": flight_id,
-        "optional_fields_present": present.iter().filter(|&&b| b).count(),
-    }))
 }
 
 #[cfg(test)]
@@ -634,20 +1676,13 @@ mod tests {
     #[test]
     fn cm_ground_logon_response() {
         // CMGroundMessage CHOICE: ext=0, index=0 (logon-response),
-        // both OPTIONAL application lists absent.
+        // both OPTIONAL application lists absent (two 0 presence bits).
         let v = parse_cm_ground(&[0b0_000_0_0_00]).unwrap();
         assert_eq!(v["application"], "CM");
         assert_eq!(v["pdu"], "logon-response");
-        assert_eq!(v["air_apps_present"], false);
-        assert_eq!(v["ground_apps_present"], false);
-    }
-
-    #[test]
-    fn cm_ground_contact_request() {
-        // ext=0, index=2 (contact-request): no presence bits read.
-        let v = parse_cm_ground(&[0b0_010_0000]).unwrap();
-        assert_eq!(v["pdu"], "contact-request");
-        assert!(v.get("air_apps_present").is_none());
+        // No application lists present → neither key is emitted.
+        assert!(v.get("air_initiated_applications").is_none());
+        assert!(v.get("ground_only_initiated_applications").is_none());
     }
 
     /// Bit-builder for synthetic UPER vectors.
@@ -659,6 +1694,11 @@ mod tests {
         fn push(&mut self, v: u64, n: usize) {
             for k in (0..n).rev() {
                 self.0.push(((v >> k) & 1) as u8);
+            }
+        }
+        fn ia5(&mut self, s: &str) {
+            for c in s.bytes() {
+                self.push(c as u64, 7);
             }
         }
         fn bytes(&self) -> Vec<u8> {
@@ -758,8 +1798,36 @@ mod tests {
         assert_eq!(el["text"], "CLIMB TO FL360");
     }
 
+    /// Append a ShortTsap to a Bits builder: presence bit for aRS, optional
+    /// aRS (3 octets), then locSysNselTsel (SIZE 10..11 → 1 length bit + octets).
+    fn push_short_tsap(b: &mut Bits, ars: Option<&[u8]>, sel: &[u8]) {
+        match ars {
+            Some(a) => {
+                b.push(1, 1);
+                for &x in a {
+                    b.push(x as u64, 8);
+                }
+            }
+            None => b.push(0, 1),
+        }
+        b.push((sel.len() - 10) as u64, 1); // SIZE(10..11)
+        for &x in sel {
+            b.push(x as u64, 8);
+        }
+    }
+
+    /// Append a LongTsap: rDP (5 octets) + ShortTsap.
+    fn push_long_tsap(b: &mut Bits, rdp: &[u8], ars: Option<&[u8]>, sel: &[u8]) {
+        for &x in rdp {
+            b.push(x as u64, 8);
+        }
+        push_short_tsap(b, ars, sel);
+    }
+
     #[test]
     fn cm_logon_request_flight_id_decodes() {
+        // CMLogonRequest: flight id + the now-mandatory cMLongTSAP, six absent
+        // optionals (ICAO Doc 9705 atn-cm.asn).
         let mut b = Bits::new();
         b.push(0, 1); // not extended
         b.push(0, 2); // cmLogonRequest
@@ -769,9 +1837,353 @@ mod tests {
         for c in b"UAL123" {
             b.push(*c as u64, 7);
         }
+        // cMLongTSAP: rDP 47 00 27 01 02, ShortTsap aRS = ICAO addr ABCDEF,
+        // locSysNselTsel = 10 octets.
+        let sel: Vec<u8> = (0..10).collect();
+        push_long_tsap(&mut b, &[0x47, 0x00, 0x27, 0x01, 0x02], Some(&[0xAB, 0xCD, 0xEF]), &sel);
         let v = parse_cm_logon(&b.bytes()).expect("cm");
         assert_eq!(v["pdu"], "logon-request");
         assert_eq!(v["flight_id"], "UAL123");
+        assert_eq!(v["cm_long_tsap"]["rdp"], "4700270102");
+        assert_eq!(v["cm_long_tsap"]["short_tsap"]["ars"], "abcdef");
+        assert_eq!(
+            v["cm_long_tsap"]["short_tsap"]["loc_sys_nsel_tsel"],
+            "00010203040506070809"
+        );
+    }
+
+    #[test]
+    fn cm_contact_response_and_abort() {
+        // CMAircraftMessage index 1 = cmContactResponse (Response ENUM, 1 bit):
+        // contactNotSuccessful (1).
+        let mut b = Bits::new();
+        b.push(0, 1); // not extended
+        b.push(1, 2); // cmContactResponse
+        b.push(1, 1); // Response = contactNotSuccessful
+        let v = parse_cm_logon(&b.bytes()).expect("cm");
+        assert_eq!(v["pdu"], "contact-response");
+        assert_eq!(v["response"], "contactNotSuccessful");
+        // CMAircraftMessage index 2 = cmAbortReason ENUM (ext + 4 bits):
+        // protocol-error (3).
+        let mut b = Bits::new();
+        b.push(0, 1);
+        b.push(2, 2); // cmAbortReason
+        b.push(0, 1); // not extended
+        b.push(3, 4); // protocol-error
+        let v = parse_cm_logon(&b.bytes()).expect("cm");
+        assert_eq!(v["pdu"], "abort");
+        assert_eq!(v["reason"], 3);
+        assert_eq!(v["reason_text"], "protocol-error");
+    }
+
+    #[test]
+    fn cm_ground_contact_request_full() {
+        // CMContactRequest: facilityDesignation IA5(4..8) "KZAK" (len 4 → 0),
+        // address LongTsap (rDP + ShortTsap without aRS, 11-octet selector).
+        let mut b = Bits::new();
+        b.push(0, 1); // not extended
+        b.push(2, 3); // contact-request
+        b.push(4 - 4, 3); // facility designation len 4
+        for c in b"KZAK" {
+            b.push(*c as u64, 7);
+        }
+        let sel: Vec<u8> = (20..31).collect(); // 11 octets
+        push_long_tsap(&mut b, &[0x10, 0x20, 0x30, 0x40, 0x50], None, &sel);
+        let v = parse_cm_ground(&b.bytes()).expect("cm");
+        assert_eq!(v["pdu"], "contact-request");
+        assert_eq!(v["facility_designation"], "KZAK");
+        assert_eq!(v["address"]["rdp"], "1020304050");
+        assert!(v["address"]["short_tsap"].get("ars").is_none());
+        assert_eq!(v["address"]["short_tsap"]["loc_sys_nsel_tsel"].as_str().unwrap().len(), 22);
+    }
+
+    #[test]
+    fn cm_ground_forward_response_enum() {
+        // CMForwardResponse ENUM (non-ext, 3 → 2 bits): index 1 =
+        // incompatible-version.
+        let mut b = Bits::new();
+        b.push(0, 1); // not extended
+        b.push(5, 3); // forward-response
+        b.push(1, 2); // incompatible-version
+        let v = parse_cm_ground(&b.bytes()).expect("cm");
+        assert_eq!(v["pdu"], "forward-response");
+        assert_eq!(v["response"], "incompatible-version");
+    }
+
+    #[test]
+    fn cm_ground_logon_response_with_app_lists() {
+        // CMLogonResponse: airInitiatedApplications present (1 entry with
+        // APAddress), groundOnlyInitiatedApplications absent.
+        let mut b = Bits::new();
+        b.push(0, 1); // not extended
+        b.push(0, 3); // logon-response
+        b.push(1, 1); // air list present
+        b.push(0, 1); // ground list absent
+        // SEQUENCE SIZE(1..256): count 1 → offset 0, 8 bits.
+        b.push(1 - 1, 8);
+        // AEQualifierVersionAddress: aeQualifier INTEGER(0..255)=22,
+        // apVersion INTEGER(1..255)=1, apAddress = shortTsap (CHOICE bit 1).
+        b.push(22, 8);
+        b.push(1 - 1, 8); // version 1 → offset 0
+        b.push(1, 1); // APAddress: shortTsap
+        let sel: Vec<u8> = (0..10).collect();
+        push_short_tsap(&mut b, None, &sel);
+        let v = parse_cm_ground(&b.bytes()).expect("cm");
+        assert_eq!(v["pdu"], "logon-response");
+        let apps = v["air_initiated_applications"].as_array().unwrap();
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0]["ae_qualifier"], 22);
+        assert_eq!(apps[0]["ap_version"], 1);
+        assert!(apps[0]["ap_address"]["short_tsap"].is_object());
+        assert!(v.get("ground_only_initiated_applications").is_none());
+    }
+
+    #[test]
+    fn cm_ground_abort_reason() {
+        // CMGroundMessage index 4 = cmAbortReason ENUM (ext + 4 bits):
+        // dialogue-end-not-accepted (5).
+        let mut b = Bits::new();
+        b.push(0, 1);
+        b.push(4, 3); // abort
+        b.push(0, 1); // not extended
+        b.push(5, 4);
+        let v = parse_cm_ground(&b.bytes()).expect("cm");
+        assert_eq!(v["pdu"], "abort");
+        assert_eq!(v["reason_text"], "dialogue-end-not-accepted");
+    }
+
+    // --- VDL2-1.2: PER CHOICE extension / abort widths / integrityCheck ---
+
+    #[test]
+    fn protected_user_abort_reason_uses_four_bits() {
+        // ProtectedAircraftPDUs CHOICE: ext 0, index 0 = abortUser.
+        // PMCPDLCUserAbortReason has 13 root values → 4-bit index (not 3).
+        // value 12 = invalid-CPDLC-message; a 3-bit read could not represent it.
+        let mut b = Bits::new();
+        b.push(0, 1); // CHOICE not extended
+        b.push(0, 2); // aircraft PDUs: 4 root alts → 2 bits, abortUser (0)
+        b.push(0, 1); // ENUM not extended
+        b.push(12, 4); // PMCPDLCUserAbortReason index 12
+        let v = parse_pdus(&b.bytes(), true).expect("apdu");
+        assert_eq!(v["pdu"], "abort-user");
+        assert_eq!(v["reason"], 12);
+        assert_eq!(v["reason_text"], "invalid-CPDLC-message");
+    }
+
+    #[test]
+    fn provider_abort_reason_named() {
+        // ProtectedGroundPDUs: ext 0, index 1 = abortProvider (3 bits for 6
+        // root alts). PMCPDLCProviderAbortReason: ext 0 + 3-bit index 4 =
+        // communication-service-error.
+        let mut b = Bits::new();
+        b.push(0, 1);
+        b.push(1, 3); // ground PDUs: 6 root → 3 bits, abortProvider (1)
+        b.push(0, 1); // ENUM not extended
+        b.push(4, 3);
+        let v = parse_pdus(&b.bytes(), false).expect("apdu");
+        assert_eq!(v["pdu"], "abort-provider");
+        assert_eq!(v["reason_text"], "communication-service-error");
+    }
+
+    #[test]
+    fn choice_extension_alternative_reported() {
+        // A set CHOICE extension bit selects an extension-addition alternative
+        // (none defined in the module). The decoder reports it via a
+        // normally-small index rather than dropping the PDU.
+        let mut b = Bits::new();
+        b.push(1, 1); // CHOICE extended
+        b.push(0, 1); // normally-small: short form (bit 0)
+        b.push(0, 6); // extension index 0
+        let v = parse_pdus(&b.bytes(), true).expect("apdu");
+        assert_eq!(v["pdu"], "extension-alternative");
+        assert_eq!(v["extension_index"], 0);
+    }
+
+    #[test]
+    fn integrity_check_is_consumed_and_reported() {
+        // Downlink WILCO but with a non-empty integrityCheck BIT STRING after
+        // the message. The integrity check is surfaced as hex (VDL2-1.2).
+        let mut m = Bits::new();
+        m.push(0, 1); // msgRef absent
+        m.push(0, 1); // logicalAck default
+        m.push(9, 6); // msg id
+        m.push(30, 7); // year 2026
+        m.push(5, 4); // June
+        m.push(10, 5); // day 11
+        m.push(0, 5);
+        m.push(0, 6);
+        m.push(0, 6);
+        m.push(0, 1); // no constrainedData
+        m.push(0, 3); // 1 element
+        m.push(0, 7); // dM0NULL (WILCO)
+        let inner_bits = m.0.len();
+        let mut o = Bits::new();
+        o.push(0, 1); // CHOICE not extended
+        o.push(3, 2); // aircraft send
+        o.push(0, 1); // sequence not extended
+        o.push(0, 1); // no algorithmIdentifier
+        o.push(1, 1); // protectedMessage present
+        o.push(0, 1);
+        o.push(inner_bits as u64, 7);
+        o.0.extend(&m.0);
+        // integrityCheck BIT STRING: length 16 bits, value 0xBEEF.
+        o.push(0, 1);
+        o.push(16, 7);
+        o.push(0xBEEF, 16);
+        let v = parse_apdu(&o.bytes()).expect("apdu");
+        assert_eq!(v["pdu"], "send");
+        assert_eq!(v["message"]["integrity_check"], "beef");
+    }
+
+    #[test]
+    fn fragmented_length_determinant_chains() {
+        // X.691 §10.9.3.8 fragmented length: 11 + 6-bit multiplier m gives
+        // m·16384, with another determinant following. Verify the reader sums
+        // a 16384-bit fragment plus a 3-bit tail to 16387.
+        let mut b = Bits::new();
+        b.push(0b11, 2);
+        b.push(1, 6); // m = 1 → 16384, more follows
+        b.push(0, 1); // next determinant: short form
+        b.push(3, 7); // 3
+        let bytes = b.bytes();
+        let mut store = Vec::new();
+        let mut p = Per::new(&bytes, &mut store);
+        assert_eq!(p.length(), Some(16384 + 3));
+    }
+
+    // --- VDL2-1.5: ATCForwardMessage / ATCForwardResponse ---
+
+    #[test]
+    fn forward_response_enum_decodes() {
+        // ProtectedGroundPDUs index 5 = forwardresponse (ATCForwardResponse
+        // ENUM, ext + 2 bits): version-not-equal (2).
+        let mut b = Bits::new();
+        b.push(0, 1);
+        b.push(5, 3); // ground PDUs: forwardresponse
+        b.push(0, 1); // ENUM not extended
+        b.push(2, 2);
+        let v = parse_pdus(&b.bytes(), false).expect("apdu");
+        assert_eq!(v["pdu"], "forward-response");
+        assert_eq!(v["response"], "version-not-equal");
+    }
+
+    #[test]
+    fn forward_message_header_and_carried_uplink_decodes() {
+        // ProtectedGroundPDUs index 4 = forward (ATCForwardMessage).
+        // ForwardHeader: dateTime + aircraftID "DLH7" + aircraftAddress(24).
+        // ForwardMessage: upElementIDs BIT STRING carrying an
+        // ATCUplinkMessageData with one uM0NULL UNABLE element (no header).
+        // Build the carried ATCUplinkMessageData first.
+        let mut data = Bits::new();
+        data.push(0, 1); // no constrainedData
+        data.push(0, 3); // 1 element
+        data.push(0, 8); // uM0NULL (238 elements → 8-bit index)
+        let data_bits = data.0.len();
+
+        let mut b = Bits::new();
+        b.push(0, 1); // CHOICE not extended
+        b.push(4, 3); // ground PDUs: forward
+        // ForwardHeader.dateTime (DateTimeGroup with seconds).
+        b.push(30, 7); // year 2026
+        b.push(5, 4); // June
+        b.push(10, 5); // day 11
+        b.push(8, 5);
+        b.push(15, 6);
+        b.push(0, 6); // 08:15:00
+        // aircraftID IA5(2..8) "DLH7" len 4 → offset 2.
+        b.push(4 - 2, 3);
+        b.ia5("DLH7");
+        // aircraftAddress BIT STRING(24) = 0xABCDEF.
+        b.push(0xAB, 8);
+        b.push(0xCD, 8);
+        b.push(0xEF, 8);
+        // ForwardMessage CHOICE: upElementIDs (bit 0), then length + bits.
+        b.push(0, 1);
+        b.push(0, 1); // length short form
+        b.push(data_bits as u64, 7);
+        b.0.extend(&data.0);
+
+        let v = parse_pdus(&b.bytes(), false).expect("apdu");
+        assert_eq!(v["pdu"], "forward");
+        let f = &v["forward"];
+        assert_eq!(f["timestamp"], "2026-06-11T08:15:00Z");
+        assert_eq!(f["aircraft_id"], "DLH7");
+        assert_eq!(f["aircraft_address"], "abcdef");
+        assert_eq!(f["carried_direction"], "uplink");
+        // The carried element list decodes uM0NULL UNABLE.
+        assert_eq!(f["elements"]["elements"][0]["element"], "uM0NULL");
+        assert_eq!(f["elements"]["elements"][0]["text"], "UNABLE");
+    }
+
+    // --- VDL2-1.3: ACSE / ULCS association-control PDUs ---
+    // Oracle: docs/asn1/atn-ulcs.asn (ACSE-1 module), unaligned PER.
+
+    #[test]
+    fn acse_rlrq_release_reason_decodes() {
+        // ACSE-apdu CHOICE: ext 0, index 2 = rlrq. RLRQ SEQUENCE: ext 0,
+        // reason present, Release-request-reason {0|1|30,...}: ext 0 + 5-bit
+        // value 30 = user-defined (ULCS 2.5.10: 5-bit encoding).
+        let mut b = Bits::new();
+        b.push(0, 1); // ACSE CHOICE not extended
+        b.push(2, 3); // rlrq
+        b.push(0, 1); // SEQUENCE not extended
+        b.push(1, 1); // reason present
+        b.push(0, 1); // reason INTEGER not extended
+        b.push(30, 5); // value 30
+        let v = parse_acse_apdu(&b.bytes()).expect("acse");
+        assert_eq!(v["application"], "ACSE");
+        assert_eq!(v["pdu"], "rlrq");
+        assert_eq!(v["reason"], 30);
+        assert_eq!(v["reason_text"], "user-defined");
+    }
+
+    #[test]
+    fn acse_rlre_not_finished_reason() {
+        // index 3 = rlre; Release-response-reason value 1 = not-finished.
+        let mut b = Bits::new();
+        b.push(0, 1);
+        b.push(3, 3); // rlre
+        b.push(0, 1); // SEQUENCE not extended
+        b.push(1, 1); // reason present
+        b.push(0, 1); // not extended
+        b.push(1, 5); // value 1
+        let v = parse_acse_apdu(&b.bytes()).expect("acse");
+        assert_eq!(v["pdu"], "rlre");
+        assert_eq!(v["reason_text"], "not-finished");
+    }
+
+    #[test]
+    fn acse_abrt_source_and_diagnostic() {
+        // index 4 = abrt. ABRT SEQUENCE: ext 0, abort-diagnostic present,
+        // abort-source INTEGER(0..1,...): ext 0 + 1-bit value 1 =
+        // acse-service-provider; ABRT-diagnostic ENUM ext 0 + 3-bit index 1 =
+        // protocol-error (value 2 → index 1).
+        let mut b = Bits::new();
+        b.push(0, 1); // ACSE not extended
+        b.push(4, 3); // abrt
+        b.push(0, 1); // SEQUENCE not extended
+        b.push(1, 1); // abort-diagnostic present
+        b.push(0, 1); // abort-source INTEGER not extended
+        b.push(1, 1); // source 1 = acse-service-provider
+        b.push(0, 1); // diagnostic ENUM not extended
+        b.push(1, 3); // index 1 = protocol-error
+        let v = parse_acse_apdu(&b.bytes()).expect("acse");
+        assert_eq!(v["pdu"], "abrt");
+        assert_eq!(v["abort_source"], "acse-service-provider");
+        assert_eq!(v["abort_diagnostic"], "protocol-error");
+    }
+
+    #[test]
+    fn acse_aarq_aare_recognised_and_deferred() {
+        // index 0 = aarq, index 1 = aare: recognised, body deferred.
+        for (idx, kind) in [(0u64, "aarq"), (1, "aare")] {
+            let mut b = Bits::new();
+            b.push(0, 1);
+            b.push(idx, 3);
+            let v = parse_acse_apdu(&b.bytes()).expect("acse");
+            assert_eq!(v["pdu"], kind);
+            assert!(v["note"].as_str().unwrap().contains("deferred"));
+        }
     }
 }
 
@@ -858,5 +2270,393 @@ mod route_tests {
         assert_eq!(rc["destination_airport"], "KSFO");
         assert_eq!(rc["route"][0], "J501");
         assert_eq!(rc["route"][1], "OAK");
+    }
+}
+
+/// VDL2-1.1 argument-type decode tests.
+///
+/// Oracle: the ICAO Doc 9880 ASN.1 module (docs/asn1/atn-cpdlc.asn) — each
+/// vector is the unaligned-PER (ITU-T X.691) encoding of a worked example
+/// built bit-by-bit from the type's definition, with the expected
+/// human-readable rendering derived from the published value constraints
+/// (resolution / unit comments in the module). No encode→decode loopback:
+/// the vectors are hand-assembled bit strings, decoded by the production
+/// `read_argument` path, and asserted against spec-derived strings.
+#[cfg(test)]
+mod arg_tests {
+    use super::*;
+
+    /// Minimal MSB-first bit builder for hand-assembling PER vectors.
+    struct Bb(Vec<u8>);
+    impl Bb {
+        fn new() -> Self {
+            Bb(Vec::new())
+        }
+        fn push(&mut self, v: u64, n: usize) {
+            for k in (0..n).rev() {
+                self.0.push(((v >> k) & 1) as u8);
+            }
+        }
+        fn ia5(&mut self, s: &str) {
+            for c in s.bytes() {
+                self.push(c as u64, 7);
+            }
+        }
+        fn bytes(&self) -> Vec<u8> {
+            self.0
+                .chunks(8)
+                .map(|c| c.iter().enumerate().fold(0u8, |v, (i, &b)| v | (b << (7 - i))))
+                .collect()
+        }
+    }
+
+    /// Decode `ty` from the assembled bits and return the rendered values.
+    fn decode(b: &Bb, ty: &str) -> Vec<String> {
+        let bytes = b.bytes();
+        let mut store = Vec::new();
+        let mut p = Per::new(&bytes, &mut store);
+        read_argument(&mut p, ty).expect("argument decodes")
+    }
+
+    #[test]
+    fn frequency_vhf_decodes() {
+        // Frequency CHOICE index 1 (vhf, 2 bits) + INTEGER(23600..27398),
+        // 12 bits. 121.500 MHz → raw 24300 → offset 700.
+        let mut b = Bb::new();
+        b.push(1, 2);
+        b.push(24300 - 23600, 12);
+        assert_eq!(decode(&b, "Frequency"), vec!["121.500 MHz"]);
+    }
+
+    #[test]
+    fn frequency_hf_and_uhf_and_sat() {
+        // HF: index 0, INTEGER(2850..28000), 15 bits, 8825 kHz.
+        let mut b = Bb::new();
+        b.push(0, 2);
+        b.push(8825 - 2850, 15);
+        assert_eq!(decode(&b, "Frequency"), vec!["8825 kHz"]);
+        // UHF: index 2, INTEGER(9000..15999), 13 bits, 243.000 MHz → raw 9720.
+        let mut b = Bb::new();
+        b.push(2, 2);
+        b.push(9720 - 9000, 13);
+        assert_eq!(decode(&b, "Frequency"), vec!["243.000 MHz"]);
+        // SAT: index 3, NumericString(SIZE 12), 4 bits/char.
+        let mut b = Bb::new();
+        b.push(3, 2);
+        for c in "123456789012".chars() {
+            b.push((c as u8 - b'0') as u64, 4);
+        }
+        assert_eq!(decode(&b, "Frequency"), vec!["SAT 123456789012"]);
+    }
+
+    #[test]
+    fn altimeter_english_and_metric() {
+        // english: CHOICE bit 0, INTEGER(2200..3200) 10 bits, 2992 → 29.92".
+        let mut b = Bb::new();
+        b.push(0, 1);
+        b.push(2992 - 2200, 10);
+        assert_eq!(decode(&b, "Altimeter"), vec!["29.92 inHg"]);
+        // metric: CHOICE bit 1, INTEGER(7500..12500), 13 bits, 10132 → 1013.2.
+        let mut b = Bb::new();
+        b.push(1, 1);
+        b.push(10132 - 7500, 13);
+        assert_eq!(decode(&b, "Altimeter"), vec!["1013.2 hPa"]);
+    }
+
+    #[test]
+    fn code_squawk_four_octal_digits() {
+        // Code: SEQUENCE SIZE(4) OF INTEGER(0..7) → 7600 octal.
+        let mut b = Bb::new();
+        for d in [7u64, 6, 0, 0] {
+            b.push(d, 3);
+        }
+        assert_eq!(decode(&b, "Code"), vec!["7600"]);
+    }
+
+    #[test]
+    fn atis_code_single_char() {
+        // ATISCode: IA5String(SIZE 1) → 7 bits, 'B'.
+        let mut b = Bb::new();
+        b.push(b'B' as u64, 7);
+        assert_eq!(decode(&b, "ATISCode"), vec!["B"]);
+    }
+
+    #[test]
+    fn free_text_length_prefixed() {
+        // FreeText: IA5String(SIZE 1..256). Length determinant for the
+        // constrained range 1..256 needs ceil(log2(256))=8 bits (offset).
+        // "HELLO" len 5 → offset 4.
+        let mut b = Bb::new();
+        b.push(5 - 1, 8);
+        b.ia5("HELLO");
+        assert_eq!(decode(&b, "FreeText"), vec!["HELLO"]);
+    }
+
+    #[test]
+    fn facility_designation_and_facility() {
+        // FacilityDesignation: IA5(4..8). Length 5 → range 4..8 → 3 bits.
+        let mut b = Bb::new();
+        b.push(5 - 4, 3);
+        b.ia5("KZAKZ");
+        assert_eq!(decode(&b, "FacilityDesignation"), vec!["KZAKZ"]);
+        // Facility CHOICE: noFacility (bit 0).
+        let mut b = Bb::new();
+        b.push(0, 1);
+        assert_eq!(decode(&b, "Facility"), vec!["(none)"]);
+    }
+
+    #[test]
+    fn unit_name_frequency_full() {
+        // UnitNameFrequency = UnitName + Frequency.
+        // UnitName: facilityName present (bit 1), designation IA5(4..8)
+        // "KZAK" (len 4 → 0), name IA5(3..18) "OAKLAND" (len 7 → range
+        // 3..18 → 4 bits → offset 4), function CENTER (ext 0 + index 0,
+        // 9 root → 4 bits). Frequency vhf 134.150 → raw 26830.
+        let mut b = Bb::new();
+        b.push(1, 1); // facilityName present
+        b.push(4 - 4, 3); // designation len 4
+        b.ia5("KZAK");
+        b.push(7 - 3, 4); // name len 7
+        b.ia5("OAKLAND");
+        b.push(0, 1); // function not extended
+        b.push(0, 4); // function = CENTER
+        b.push(1, 2); // frequency vhf
+        b.push(26830 - 23600, 12); // 134.150 MHz
+        assert_eq!(
+            decode(&b, "UnitNameFrequency"),
+            vec!["KZAK OAKLAND CENTER", "134.150 MHz"]
+        );
+    }
+
+    #[test]
+    fn vertical_rate_english() {
+        // VerticalRate CHOICE bit 0, INTEGER(0..3000) 12 bits, 50 → 500 fpm.
+        let mut b = Bb::new();
+        b.push(0, 1);
+        b.push(50, 12);
+        assert_eq!(decode(&b, "VerticalRate"), vec!["500 FPM"]);
+    }
+
+    #[test]
+    fn distance_specified_direction_nm() {
+        // DistanceSpecifiedDirection: DistanceSpecified CHOICE bit 0 (nm),
+        // INTEGER(1..250) 8 bits, 20 → offset 19; Direction LEFT (0),
+        // 11 values non-ext → constrained(0..10) → 4 bits.
+        let mut b = Bb::new();
+        b.push(0, 1); // nm
+        b.push(20 - 1, 8);
+        b.push(0, 4); // LEFT
+        assert_eq!(decode(&b, "DistanceSpecifiedDirection"), vec!["20 NM", "LEFT"]);
+    }
+
+    #[test]
+    fn traffic_type_enum() {
+        // TrafficType ENUM (extensible): ext 0 + index 1 (oppositeDirection),
+        // 6 root → constrained(0..5) → 3 bits.
+        let mut b = Bb::new();
+        b.push(0, 1); // not extended
+        b.push(1, 3);
+        assert_eq!(decode(&b, "TrafficType"), vec!["OPPOSITE DIRECTION"]);
+    }
+
+    #[test]
+    fn clearance_type_enum() {
+        // ClearanceType ENUM (extensible): ext 0 + index 2 (departure),
+        // 12 root → constrained(0..11) → 4 bits.
+        let mut b = Bb::new();
+        b.push(0, 1);
+        b.push(2, 4);
+        assert_eq!(decode(&b, "ClearanceType"), vec!["DEPARTURE"]);
+    }
+
+    #[test]
+    fn error_information_enum() {
+        // ErrorInformation ENUM (extensible): ext 0 + index 4
+        // (invalidMessageElement), 5 root → constrained(0..4) → 3 bits.
+        let mut b = Bb::new();
+        b.push(0, 1);
+        b.push(4, 3);
+        assert_eq!(decode(&b, "ErrorInformation"), vec!["INVALID MESSAGE ELEMENT"]);
+    }
+
+    #[test]
+    fn speed_type_triple_and_speed() {
+        // SpeedTypeSpeedTypeSpeedTypeSpeed: three SpeedType then a Speed.
+        // SpeedType ENUM (extensible): ext 0 + index, 9 root → 4 bits.
+        // INDICATED(1), TRUE(2), MACH(4); then Speed mach M0.840.
+        let mut b = Bb::new();
+        for idx in [1u64, 2, 4] {
+            b.push(0, 1); // not extended
+            b.push(idx, 4);
+        }
+        // Speed CHOICE index 6 (mach, 7 alts → 3 bits), INTEGER(500..4000),
+        // bits = ceil(log2(3501)) = 12. M0.840 → raw 840 → offset 340.
+        b.push(6, 3);
+        b.push(840 - 500, 12);
+        assert_eq!(
+            decode(&b, "SpeedTypeSpeedTypeSpeedTypeSpeed"),
+            vec!["INDICATED", "TRUE", "MACH", "M0.840"]
+        );
+    }
+
+    #[test]
+    fn position_time_time_two_times() {
+        // PositionTimeTime: position (airport KSFO) + two Times.
+        // Position CHOICE index 2 (airport, 5 alts → 3 bits), IA5(4) fixed.
+        // Time: hours(0..23) 5 bits, minutes(0..59) 6 bits.
+        let mut b = Bb::new();
+        b.push(2, 3); // airport
+        b.ia5("KSFO");
+        b.push(10, 5);
+        b.push(30, 6); // 10:30
+        b.push(11, 5);
+        b.push(45, 6); // 11:45
+        assert_eq!(
+            decode(&b, "PositionTimeTime"),
+            vec!["KSFO", "10:30", "11:45"]
+        );
+    }
+
+    #[test]
+    fn tofrom_position() {
+        // ToFromPosition: ToFrom enum (to/from, 1 bit) + Position.
+        // FROM (1), then airport "EGLL".
+        let mut b = Bb::new();
+        b.push(1, 1); // FROM
+        b.push(2, 3); // airport
+        b.ia5("EGLL");
+        assert_eq!(decode(&b, "ToFromPosition"), vec!["FROM", "EGLL"]);
+    }
+
+    #[test]
+    fn hold_clearance_full() {
+        // HoldClearance: legType OPTIONAL present.
+        // presence bit 1; position airport "KSFO"; level FL250;
+        // degrees magnetic 270; direction RIGHT; legType legTime 5 min.
+        let mut b = Bb::new();
+        b.push(1, 1); // legType present
+        b.push(2, 3); // position: airport
+        b.ia5("KSFO");
+        b.push(0, 1); // level: singleLevel
+        b.push(2, 2); // levelFlightLevel
+        b.push(250 - 30, 10); // FL250
+        b.push(0, 1); // degrees: magnetic
+        b.push(270 - 1, 9); // INTEGER(1..360) 9 bits → 270
+        b.push(1, 4); // direction RIGHT (1)
+        b.push(1, 1); // legType: legTime
+        b.push(5, 4); // INTEGER(0..10) → 5 min
+        assert_eq!(
+            decode(&b, "HoldClearance"),
+            vec!["KSFO", "FL250", "270°M", "RIGHT", "5 MIN"]
+        );
+    }
+
+    #[test]
+    fn departure_clearance_head() {
+        // DepartureClearance: both OPTIONALs absent. flight id "DLH456"
+        // IA5(2..8) len 6 → range 2..8 → 3 bits → offset 4; clearance limit
+        // airport "EDDF".
+        let mut b = Bb::new();
+        b.push(0, 1); // flightInformation absent
+        b.push(0, 1); // furtherInstructions absent
+        b.push(6 - 2, 3); // flight id len 6
+        b.ia5("DLH456");
+        b.push(2, 3); // position: airport
+        b.ia5("EDDF");
+        assert_eq!(
+            decode(&b, "DepartureClearance"),
+            vec!["DLH456 CLEARED TO EDDF"]
+        );
+    }
+
+    #[test]
+    fn runway_rvr() {
+        // RunwayRVR: Runway (dir 1..36 → 6 bits, config 2 bits) + RVR.
+        // RWY 27L: dir 27 → offset 26; config LEFT(0). RVR feet 1200.
+        let mut b = Bb::new();
+        b.push(27 - 1, 6);
+        b.push(0, 2); // L
+        b.push(0, 1); // RVR feet
+        b.push(1200, 13); // INTEGER(0..6100) → 13 bits
+        assert_eq!(decode(&b, "RunwayRVR"), vec!["RWY 27L", "1200 FT"]);
+    }
+
+    #[test]
+    fn position_report_mandatory_only() {
+        // PositionReport with every optional absent: 19 presence bits = 0,
+        // then position (airport KSFO), time 12:00, level FL350.
+        let mut b = Bb::new();
+        b.push(0, 19); // all 19 optionals absent
+        b.push(2, 3); // airport
+        b.ia5("KSFO");
+        b.push(12, 5);
+        b.push(0, 6); // 12:00
+        b.push(0, 1); // level singleLevel
+        b.push(2, 2); // FL
+        b.push(350 - 30, 10);
+        assert_eq!(
+            decode(&b, "PositionReport"),
+            vec!["KSFO 12:00 FL350"]
+        );
+    }
+
+    #[test]
+    fn remaining_fuel_persons_on_board() {
+        // RemainingFuelPersonsOnBoard: RemainingFuel(=Time) 02:30 +
+        // PersonsOnBoard INTEGER(1..1024) → 150 → offset 149, 10 bits.
+        let mut b = Bb::new();
+        b.push(2, 5);
+        b.push(30, 6); // 02:30
+        b.push(150 - 1, 10);
+        assert_eq!(
+            decode(&b, "RemainingFuelPersonsOnBoard"),
+            vec!["02:30", "150"]
+        );
+    }
+
+    #[test]
+    fn version_number() {
+        // VersionNumber INTEGER(0..15) → 4 bits, value 5.
+        let mut b = Bb::new();
+        b.push(5, 4);
+        assert_eq!(decode(&b, "VersionNumber"), vec!["v5"]);
+    }
+
+    /// End-to-end: a ground uM166 DUE TO [traffictype] TRAFFIC element walk
+    /// no longer stops at the (previously unsupported) TrafficType argument.
+    #[test]
+    fn uplink_traffic_type_element_walks() {
+        let mut m = Bb::new();
+        m.push(0, 1); // no msgRef
+        m.push(0, 1); // default logicalAck
+        m.push(7, 6); // msg id
+        m.push(30, 7); // year 2026
+        m.push(5, 4); // June
+        m.push(10, 5); // day 11
+        m.push(0, 5);
+        m.push(0, 6);
+        m.push(0, 6);
+        m.push(0, 1); // no constrainedData
+        m.push(0, 3); // 1 element
+        m.push(166, 8); // uM166TrafficType
+        m.push(0, 1); // TrafficType: not extended
+        m.push(3, 3); // index 3 = converging
+        let inner_bits = m.0.len();
+        let mut o = Bb::new();
+        o.push(0, 1);
+        o.push(3, 3); // ground: send
+        o.push(0, 1);
+        o.push(0, 1);
+        o.push(1, 1);
+        o.push(0, 1);
+        o.push(inner_bits as u64, 7);
+        o.0.extend(&m.0);
+        o.push(0, 1);
+        o.push(0, 7);
+        let v = parse_pdus(&o.bytes(), false).expect("apdu");
+        let el = &v["message"]["elements"][0];
+        assert_eq!(el["element"], "uM166TrafficType");
+        assert_eq!(el["argument_type"], "TrafficType");
+        assert_eq!(el["text"], "DUE TO CONVERGINGTRAFFIC");
     }
 }

@@ -28,8 +28,12 @@ TL ∈ {1, 100, 1000, 131071}, AVLC FCS residue.
 
 Items flagged for live-capture verification (free spec ambiguity):
 which 2/4 of the 6 RS check octets are transmitted for short rows
-(assumed: first by transmission order), and AVLC FCS octet order (both
-orders accepted, which one matched is recorded).
+(assumed: first by transmission order). The AVLC FCS octet order is now
+pinned to little-endian (low octet transmitted first) per ISO/IEC 13239
+§4.4 — confirmed against the off-air fixture, which decodes only under
+little-endian, and consistent with dumpvdl2's GOOD_FCS=0xF0B8 residue
+check. The earlier "accept either order" behaviour was dropped to remove
+a false-accept path (the byte-swapped FCS matched ~1 bad frame in 65536).
 
 ## Off-air validation (2026-06)
 
@@ -113,9 +117,64 @@ ICAO Doc 9776/9705 — dumpvdl2 (GPL) was not consulted for this module.
 X.25 M-bit sequences reassemble per logical channel before network-
 layer parsing. ATN's LREF/deflate-compressed CLNP variants are labeled
 but deliberately left as hex (layouts not yet verified against the
-spec). XID ground-station list parameters (0x41/0x45) decode as AVLC
-addresses via the standard EN 301 841-2 address parser; the autotune
-frequency parameter stays hex under the same hex-not-guessed policy.
+spec). XID ground-station list parameters decode as AVLC addresses via
+the standard EN 301 841-2 address parser (see the XID completion note
+below).
+
+## XID parameter completion (2026-06, VDL2-3)
+
+The VDL-private parameter-set table (group 0xF0) was completed and
+corrected. The earlier table mis-numbered every entry in the 0x40–0x49
+range (e.g. it labelled 0x42 "destination-airport" — that is parameter
+0x83; 0x42 is Timer T4). The corrected numbering and the added IDs
+(autotune-frequency 0x40, replacement-GS 0x41, T4 0x42, MAC-persistence
+0x43, counter-M1 0x44, TM2 0x45, TG5 0x46, T3min 0x47, GS-address-filter
+0x48, broadcast-connection 0x49, modulation-support 0x81, alternate-GS
+0x82, destination-airport 0x83, aircraft-location 0x84, frequency-
+support-list 0xC0, airport-coverage 0xC1, nearest-airport-id 0xC3,
+ATN-router-NETs 0xC4, system-mask 0xC5, TG3 0xC6, TG4 0xC7, GS-location
+0xC8) plus the public ISO 8885 HDLC parameter set (group 0x80: 0x01–0x0B)
+were cross-checked against the *parameter-ID dictionary* in dumpvdl2's
+`xid.c` (`xid_vdl_params` / `xid_pub_params`) — protocol facts (the
+integer→name assignment and the frequency encoding), not code or
+formatter text. The 2-octet VDL2 frequency field (autotune 0x40 and each
+frequency-support-list entry) decodes to MHz via the SARPs encoding
+`freq_khz = (raw12 + 10000)·10`, rounded up to the next 25 kHz step, with
+the modulation-support nibble in the top 4 bits; timer/counter parameters
+also decode to a big-endian integer alongside the preserved raw hex.
+Address-list parameters (replacement-GS 0x41, GS-address-filter 0x48,
+alternate-GS 0x82, system-mask 0xC5) decode as 4-octet AVLC addresses.
+
+## IDRP + ES-IS completion (2026-06, VDL2-6)
+
+The IDRP (ISO/IEC 10747) decoder gained the sixth BISPDU type RIB-REFRESH
+(type 6), the OPEN PDU body's reliably-framed leading fields (version,
+hold-time, max-PDU-size, source RDI — the variable RIB-Atts-Set /
+Confed-IDs / auth-mech tail stays in raw hex), the credit-offered/avail
+header octets, and named ERROR code + subcode text. The ES-IS (ISO/IEC
+9542) decoder now parses the trailing option TLVs on ESH/ISH PDUs:
+Mobile-Subnetwork-Capabilities (0x81), ATN-Data-Link-Capabilities (0x88),
+Priority (0xCF), and Security (0xC5). The BISPDU-type number (6), the
+error-code/subcode dictionaries, and the ES-IS option-type IDs/names were
+cross-checked against dumpvdl2's `idrp.c`/`idrp.h` and `esis.c` — protocol
+facts (the integer→name assignments) only, not code or formatter text.
+
+## X.25 completion (2026-06, VDL2-4)
+
+The X.25 (ISO/IEC 8208) packet decoder gained RESTART-REQUEST (0xFB,
+carrying cause + diagnostic) and RESTART-CONFIRM (0xFF) — previously
+dropped — and now resolves the clearing/reset/restart cause and the
+diagnostic code to text. Three separate cause tables (clear/reset/restart,
+ITU-T X.25 Table 5-7) and one ~150-entry diagnostic table (X.25 Annex E +
+ISO 8208 + ICAO Doc 9705 Table 5.7-3 / Doc 9880 extensions) are applied;
+RESET-REQUEST now captures its cause + diagnostic too (it previously
+carried neither). The X.25 Table 5-7 rule that a cause octet with bit 8
+set carries the remote DTE's lower bits is honoured by normalising the
+lookup key to 0. The packet-type constants (RESTART 0xFB/0xFF, DIAG 0xF1)
+and the cause/diagnostic dictionaries were cross-checked against
+dumpvdl2's `x25.c`/`x25.h` — protocol facts only, not code or formatter
+text. Facility codes remain numeric (facility naming was out of this
+task's scope).
 
 ## ATN-B1 CPDLC + CM (2026-06)
 
@@ -139,3 +198,152 @@ compounds) implemented from the same vendored Doc 9880 module; decoded
 values render into the module's phraseology templates ("CLIMB TO
 FL360"). Elements whose argument type is not yet supported stop the
 walk explicitly (sizes unknown), matching the staged FANS approach.
+
+## ATN-B1 CPDLC argument coverage extension (2026-06, VDL2-1.1)
+
+The CPDLC argument-type walk was extended from ~22 supported types to ~63
+so the element walk no longer stops at the first previously-unsupported
+argument. Added readers (all from the vendored Doc 9880 ASN.1 module
+`docs/asn1/atn-cpdlc.asn`, unaligned PER per ITU-T X.691):
+
+- **Frequency** CHOICE (HF kHz / VHF·0.005 MHz / UHF·0.025 MHz / 12-digit
+  SAT NumericString) and the UnitNameFrequency, PositionUnitNameFrequency,
+  TimeUnitNameFrequency compounds (UnitName = facilityDesignation +
+  optional facilityName + facilityFunction enum).
+- **Altimeter** CHOICE (english in·0.01 / metric hPa·0.1), and the
+  FacilityDesignation, Facility (noFacility | designation),
+  FacilityDesignationAltimeter, FacilityDesignationATISCode compounds.
+- **Code** (4×octal squawk), **ATISCode** (single IA5 char), **FreeText**
+  (IA5 1..256), **VersionNumber** (INTEGER 0..15).
+- The ENUMERATED arguments **TrafficType**, **ClearanceType**,
+  **ErrorInformation**, **ToFrom**, **SpeedType**, **FacilityFunction**
+  (each with its X.691 extension bit when the module marks `...`).
+- **ProcedureName** / **PositionProcedureName**, **RunwayRVR** (Runway +
+  RVR CHOICE feet/meters), **VerticalRate** CHOICE (english·10 fpm /
+  metric·10 m/min), **RemainingFuelPersonsOnBoard** (Time + INTEGER
+  1..1024).
+- The level/speed/time/position compound shapes whose layouts were
+  previously unknown: LevelSpeedSpeed, PositionSpeedSpeed, TimeSpeed,
+  SpeedTime, TimeSpeedSpeed, PositionLevelLevel, PositionLevelSpeed,
+  PositionTimeTime, PositionTimeLevel, TimePositionLevel,
+  TimePositionLevelSpeed, SpeedTypeSpeedTypeSpeedType and
+  SpeedTypeSpeedTypeSpeedTypeSpeed.
+- The distance/direction offset family DistanceSpecifiedDirection,
+  PositionDistanceSpecifiedDirection, TimeDistanceSpecifiedDirection,
+  DistanceSpecifiedDirectionTime; the to/from reports ToFromPosition,
+  TimeToFromPosition, TimeDistanceToFromPosition.
+- **HoldClearance** (position/level/degrees/direction + optional LegType
+  CHOICE distance/time) and **DepartureClearance** (the mandatory flight
+  id + clearance-limit position head is decoded; the deeply-nested
+  FlightInformation / FurtherInstructions optional tail is flagged
+  present-but-undecoded since it is last in the SEQUENCE).
+- **PositionReport** (the 3 mandatory fields position/time/level are
+  decoded; the 19 OPTIONAL meteorology/waypoint fields stop the walk
+  explicitly when any are present, since their sizes are then unknown).
+
+Oracle: each new decode is verified by a unit test whose vector is the
+unaligned-PER encoding hand-assembled bit-by-bit from the type's ASN.1
+definition, with the expected rendering derived from the module's
+resolution/unit constraint comments (no encode→decode loopback).
+Deliberately deferred (recorded as undecoded-but-flagged, not faked): the
+full DepartureClearance optional tail and the full PositionReport optional
+fields — both need a captured PDU to pin the nested SEQUENCE-OF/CHOICE
+walks unambiguously.
+
+## COTP TPDU completion (2026-06, VDL2-2.2 partial)
+
+The COTP (ISO/IEC 8073 / ITU-T X.224) decoder was extended from 5 TPDU
+types to all 10: it now decodes DC, ED, AK, EA and RJ in addition to the
+existing CR/CC/DR/DT/ER. Each TPDU's full fixed header is parsed
+(destination/source references, CR/CC protocol class + options, DR
+disconnect reason, ER reject cause, DT/ED end-of-TPDU flag, and the TPDU
+sequence numbers and flow-control credit for the data-flow TPDUs), in
+both the normal (7-bit sequence) and extended (31-bit sequence) formats —
+the extended format being signalled by an odd length-indicator per X.224.
+The variable part is parsed as `type|length|value` parameters including
+the **ATN checksum (0x08)** profiled by ICAO Doc 9705, the **TPDU-size
+(0xC0, decoded to bytes as 2^value)**, priority (0x87), inactivity timer
+(0xF2) and the rest of the X.224 parameter set; the DR disconnect-reason
+and ER reject-cause dictionaries are applied to text. The TPDU code
+values (CR 0xE0 … ER 0x70), the header octet layouts and variable-part
+offsets, the parameter-code/name table, and the reason/cause dictionaries
+were cross-checked against the ISO/IEC 8073 framing as profiled by ICAO
+Doc 9705 and against dumpvdl2's `src/cotp.{c,h}` — protocol facts (the
+integer→name/layout assignments) only, not code or formatter text. Tests
+pin spec-derived TPDU vectors built octet-by-octet from the X.224 layout
+(no encode→decode loopback). Multipart COTP reassembly and native ATN-B2
+ADS-C over COTP remain the deferred big bet (VDL2-2.3).
+
+## CLNP options + ATN security label (2026-06, VDL2-2.1 partial)
+
+The full (uncompressed) CLNP (ISO/IEC 8473) decoder now walks the header's
+options part (the optional 6-octet segmentation part — data-unit id,
+segment offset, total length — is decoded and skipped when the SP flag is
+set) as standard `type|length|value` options, naming the X.233 set (QoS
+maintenance 0xC3, discard reason 0xC1, padding 0xCC, priority 0xCD,
+security 0xC5, source routing 0xC8, record route 0xCB, …). The **Security
+option (0xC5)** is decoded as the ATN Security Label (ICAO Doc 9705 §5.6 /
+Doc 9880): the leading globally-unique security-format octet (0xC0), then
+the security-registration-ID octet string, then the length-prefixed
+security-information part. Each security tag set is a
+`name-len(1)=1 | name(1) | set-len(1) | value` block parsed against the
+ATN security-tag dictionary: **traffic-type (tag 0x0F)** with its
+type/category/route-policy sub-fields, **security classification (0x03)**,
+**subnetwork type (0x05)** with subnet name + permitted-traffic-types
+bitfield, and **supported ATSC classes (0x06/0x07)** as an A..H class
+bitfield. The CLNP option codes/names, the security-label structure, the
+security-tag codes, and the traffic-type/ATSC-class/subnet/security-class
+dictionaries were cross-checked against ISO/IEC 8473 (X.233) and ICAO Doc
+9705 and against dumpvdl2's `src/clnp.c` and `src/atn.c` — protocol facts
+(the integer→name/structure assignments) only, not code or formatter text.
+Tests pin spec-derived security-label examples built octet-by-octet (no
+loopback).
+
+## Multipart CLNP reassembly (2026-06, VDL2-2.1 reassembly part)
+
+The CLNP (ISO/IEC 8473) decoder now exposes the full flags byte (§6.6):
+the **more-segments (MS, 0x40)** and error-report (E/R, 0x20) flags
+alongside the existing SP (0x80) flag, and marks a PDU `segmented` when MS
+is set or its segment offset is non-zero. A non-initial fragment (offset
+≠ 0) or a fragment with more segments to follow is no longer parsed as a
+COTP TPDU — its data part is a partial byte stream, so COTP parsing waits
+for the reassembled data unit.
+
+A new `ClnpReassembler` performs §6.7 reassembly: derived PDUs of one
+initial PDU share a data-unit identifier; each carries a fragment of the
+data part at its *segment offset*, and the initial PDU's *total length*
+(header + complete data) bounds the data unit. Fragments are placed by
+offset (so out-of-order arrival reassembles correctly), the first
+segment's header is preserved, and on completion a single de-segmented
+CLNP PDU is reconstructed (more-segments flag cleared) and handed to the
+normal CLNP/COTP walk. Reassembly is keyed by (src NSAP, dst NSAP,
+data-unit id) with a 60 s timeout (mirroring the X.25 M-bit reassembler),
+and is wired into the decode pipeline (`Vdl2ChannelDecoder` →
+`decode_network`) after X.25 M-bit reassembly. The flags-byte bit
+assignments, the segmentation-part layout (data-unit id, segment offset,
+total length) and the reassembly-by-offset rule are from ISO/IEC 8473
+(X.233) as profiled by ICAO Doc 9705. Tests pin spec-derived two-segment
+vectors (in-order, out-of-order, unsegmented pass-through, and a complete
+COTP DT recovered across two segments), built octet-by-octet from the
+header layout (no loopback).
+
+## X.25 SNDCF field (2026-06, VDL2-4 follow-up)
+
+The X.25 (ISO/IEC 8208) Call-Request / Call-Accept decoder now decodes the
+SNDCF (Subnetwork Dependent Convergence Function) field that the ATN
+profile (ICAO Doc 9705 §5.7) places between the facility block and the call
+user data. On a Call-Request the field is `id(0xC1) | length | version(=1) |
+… | compression-bitfield` (the compression byte is the 4th octet of the
+SNDCF value, length ≥ 4); on a Call-Accept it is a single compression
+octet. The compression-support bitfield is decoded against the ATN
+algorithm set (ACA 0x40, DEFLATE 0x20, LREF 0x02, LREF-CAN 0x01) plus the
+M/I (maintenance/initialisation) bit 0x10. Previously the SNDCF field was
+swallowed into the call user data, so the compression negotiation was
+invisible and the network-protocol identifier in the CUD was offset by the
+SNDCF length. The SNDCF identifier/version constants and the
+compression-algorithm bitfield were cross-checked against ISO/IEC 8208 /
+ICAO Doc 9705 and against dumpvdl2's `src/x25.{c,h}` (`X25_SNDCF_ID`,
+`X25_SNDCF_VERSION`, `x25_comp_algos`) — protocol facts only, not code or
+formatter text. Tests pin spec-derived Call-Request / Call-Accept SNDCF
+vectors and verify the CUD is no longer offset (no loopback). General X.25
+facility naming remains numeric (out of scope, as before).

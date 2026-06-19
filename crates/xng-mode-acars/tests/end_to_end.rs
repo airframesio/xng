@@ -3,6 +3,7 @@
 use num_complex::Complex;
 use xng_mode_acars::modulate::{burst_iq, FrameSpec};
 use xng_mode_acars::AcarsChannelDecoder;
+use xng_types::{MessageBody, Provenance};
 
 fn downlink<'a>(text: &'a str, flight: &'a str) -> FrameSpec<'a> {
     FrameSpec {
@@ -50,6 +51,170 @@ fn decodes_at_channel_rate() {
     assert_eq!(f.flight.as_deref(), Some("XG0042"));
     assert_eq!(f.msg_num.as_deref(), Some("M42A"));
     assert_eq!(f.text, "POSN 4737.2N 12218.1W");
+}
+
+#[test]
+fn oooi_fields_surface_in_message_body() {
+    // ACARS-2.1: a real documented QQ "OFF Report" (research/QQ.md:
+    // origin KEWR, dest KSWF) flows through the full RF path and the OOOI
+    // fields appear in the message body's `app` JSON (acarsdec field names).
+    let spec = FrameSpec {
+        mode: '2',
+        tail: "N471XG",
+        ack: None,
+        label: "QQ",
+        block_id: '4',
+        msg_num: Some("M01A"),
+        flight: Some("XG0042"),
+        text: "KEWRKSWF20041942",
+        etb: false,
+    };
+    let mut iq = vec![Complex::new(0.0, 0.0); 500];
+    iq.extend(burst_iq(&spec, 24_000.0, 0.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 500]);
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(1024) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 1, "expected one frame");
+    assert!(frames[0].crc_ok);
+
+    let source = Provenance {
+        station: xng_types::StationIdentity::new("XX-TEST-ACARS"),
+        app: xng_types::AppInfo::xng(),
+        sdr: None,
+        channel: None,
+    };
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, -55.0, source);
+    let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
+    let app = core.app.as_ref().expect("OOOI should populate app JSON");
+    assert_eq!(app["depa"], "KEWR");
+    assert_eq!(app["dsta"], "KSWF");
+    assert_eq!(app["wloff"], "2004");
+}
+
+#[test]
+fn free_text_position_surfaces_in_message_body() {
+    // ACARS-2.2: a real documented label-20 POS report (Label_20_POS
+    // test data: 38.160 / -77.075) flows through the RF path and the
+    // lat/lon appear in the message body's `app` JSON.
+    let spec = FrameSpec {
+        mode: '2',
+        tail: "N471XG",
+        ack: None,
+        label: "20",
+        block_id: '3',
+        msg_num: Some("M01A"),
+        flight: Some("XG0042"),
+        text: "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544",
+        etb: false,
+    };
+    let mut iq = vec![Complex::new(0.0, 0.0); 500];
+    iq.extend(burst_iq(&spec, 24_000.0, 0.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 500]);
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(1024) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 1);
+    assert!(frames[0].crc_ok);
+
+    let source = Provenance {
+        station: xng_types::StationIdentity::new("XX-TEST-ACARS"),
+        app: xng_types::AppInfo::xng(),
+        sdr: None,
+        channel: None,
+    };
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, -55.0, source);
+    let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
+    let app = core.app.as_ref().expect("position should populate app JSON");
+    let lat = app["position"]["latitude"].as_f64().unwrap();
+    let lon = app["position"]["longitude"].as_f64().unwrap();
+    assert!((lat - 38.160).abs() < 1e-3, "lat {lat}");
+    assert!((lon + 77.075).abs() < 1e-3, "lon {lon}");
+}
+
+#[test]
+fn h2_sublabel_and_mfi_surface_in_message_body() {
+    // ACARS-3.2: a non-H1 sublabel-bearing label (H2) carries the same
+    // libacars `#xxB/yy ` downlink grammar. The decoded sublabel/MFI must
+    // surface on AcarsCore the way H1 already does. Grammar oracle: libacars
+    // 2.2.1 `la_acars_extract_sublabel_and_mfi`.
+    let spec = FrameSpec {
+        mode: '2',
+        tail: "N471XG",
+        ack: None,
+        label: "H2",
+        block_id: '3',
+        msg_num: Some("M01A"),
+        flight: Some("XG0042"),
+        text: "#DFB/M1 ENGINE DATA",
+        etb: false,
+    };
+    let mut iq = vec![Complex::new(0.0, 0.0); 500];
+    iq.extend(burst_iq(&spec, 24_000.0, 0.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 500]);
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(1024) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 1, "expected one frame");
+    assert!(frames[0].crc_ok);
+
+    let source = Provenance {
+        station: xng_types::StationIdentity::new("XX-TEST-ACARS"),
+        app: xng_types::AppInfo::xng(),
+        sdr: None,
+        channel: None,
+    };
+    let msg = xng_mode_acars::to_message(&frames[0], 131_550_000, -20.0, -55.0, source);
+    let MessageBody::Acars(core) = &msg.body else { panic!("not acars") };
+    assert_eq!(core.label, "H2");
+    assert_eq!(core.sublabel.as_deref(), Some("DF"), "H2 sublabel must surface");
+    assert_eq!(core.mfi.as_deref(), Some("M1"), "H2 MFI must surface");
+}
+
+#[test]
+fn single_bit_error_recovered_through_rf_path() {
+    // ACARS-4.2: a single bit error injected at RF in a real-shape block is
+    // recovered by the O(1) syndrome lookup (acarsdec syndrom.h scheme) over
+    // the full demod→deframe→FEC path, restoring the exact original text and
+    // reporting exactly one corrected bit.
+    use xng_mode_acars::modulate::{burst_bits, modulate_audio, modulate_iq};
+
+    let spec = downlink("ENROUTE WX REQUEST", "XG0042");
+
+    // Build the on-air bit stream and flip ONE bit inside the frame body.
+    // 128 pre-key bits + 5 sync octets (40 bits) precede the frame; pick a bit
+    // well inside the payload so it lands on a text character.
+    let mut bits = burst_bits(&spec);
+    let flip_idx = 128 + 40 + 8 * 18; // ~18 octets into the frame (text region)
+    bits[flip_idx] ^= 1;
+
+    let audio = modulate_audio(&bits, 24_000.0);
+    let burst = modulate_iq(&audio, 24_000.0, 0.0, 0.5, 0.85);
+
+    let mut iq = vec![Complex::new(0.0, 0.0); 500];
+    iq.extend(burst);
+    iq.extend(vec![Complex::new(0.0, 0.0); 500]);
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(1024) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 1, "expected one frame");
+    let f = &frames[0];
+    assert!(f.crc_ok, "single-bit RF error should be repaired: {f:?}");
+    assert_eq!(f.fixed_bits, 1, "exactly one bit corrected by syndrome FEC");
+    assert_eq!(f.parity_errors, 0);
+    assert_eq!(f.text, "ENROUTE WX REQUEST", "original text must be recovered");
 }
 
 #[test]

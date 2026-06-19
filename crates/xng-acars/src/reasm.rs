@@ -27,6 +27,24 @@ pub enum Reasm {
     Incomplete,
 }
 
+impl Reasm {
+    /// The reassembly-status name as emitted by acarsdec / libacars in the
+    /// `assstat` JSON field. The exact wording matches libacars'
+    /// `la_reasm_status_name_get` (reassembly.c): `complete`, `in progress`,
+    /// `skipped`, `duplicate`, `out of sequence`. Our [`Reasm::Incomplete`]
+    /// (final block, holes in the sequence) is libacars'
+    /// `LA_REASM_FRAG_OUT_OF_SEQUENCE` → `"out of sequence"`.
+    pub fn assstat(&self) -> &'static str {
+        match self {
+            Reasm::Complete(_) => "complete",
+            Reasm::InProgress => "in progress",
+            Reasm::Skipped => "skipped",
+            Reasm::Duplicate => "duplicate",
+            Reasm::Incomplete => "out of sequence",
+        }
+    }
+}
+
 #[derive(Hash, PartialEq, Eq, Clone)]
 struct Key {
     tail: String,
@@ -63,12 +81,13 @@ impl Reassembler {
         let downlink = ('0'..='9').contains(&block_id);
         let (seq, msg_num, wrap) = if downlink {
             // Downlink message number "M01A": 3-char id + sequence char.
+            // The split and the 4th-character sequence rule are the shared
+            // libacars-faithful logic in `min` (handles the edge cases
+            // where the 4th char is not a valid sequence letter).
             let Some(num) = core.msg_num.as_deref() else { return Reasm::Skipped };
-            if num.len() < 4 {
-                return Reasm::Skipped;
-            }
-            let seq = num.as_bytes()[3] as i32 - 'A' as i32;
-            (seq, num[..3].to_owned(), i32::MAX)
+            let Some(m) = crate::min::split_downlink(num) else { return Reasm::Skipped };
+            let Some(seq) = m.seq else { return Reasm::Skipped };
+            (seq as i32, m.msg_num, i32::MAX)
         } else {
             // Empty-text uplink ACKs use out-of-sequence block ids (X,Y,Z).
             if core.text.is_empty() {
@@ -143,7 +162,9 @@ mod tests {
             text: text.into(),
             more_to_come: more,
             reassembled: false,
+            assstat: None,
             app: None,
+            vdl2_link: None,
         }
     }
 
@@ -189,6 +210,35 @@ mod tests {
         // Final block arrives after the timeout: first fragment is gone,
         // sequence starts at B → holes → incomplete.
         assert_eq!(r.push(&b, 200.0), Reasm::Incomplete);
+    }
+
+    #[test]
+    fn assstat_names_match_libacars() {
+        // Oracle: libacars reassembly.c la_reasm_status_name_get() — the
+        // exact strings acarsdec emits in the JSON `assstat` field.
+        let mut r = Reassembler::new(120.0);
+
+        // Single block → skipped.
+        let single = core("N12345", "H1", '2', Some("M01A"), "HELLO", false);
+        assert_eq!(r.push(&single, 0.0).assstat(), "skipped");
+
+        // First fragment of a multi-block downlink → in progress.
+        let a = core("N99999", "H1", '2', Some("M07A"), "FIRST-", true);
+        assert_eq!(r.push(&a, 0.0).assstat(), "in progress");
+
+        // Re-offering the same fragment → duplicate.
+        assert_eq!(r.push(&a, 1.0).assstat(), "duplicate");
+
+        // Final contiguous fragment → complete.
+        let b = core("N99999", "H1", '3', Some("M07B"), "SECOND", false);
+        assert_eq!(r.push(&b, 2.0).assstat(), "complete");
+
+        // Final fragment with a hole in the sequence → out of sequence.
+        let mut r2 = Reassembler::new(120.0);
+        let f0 = core("N55555", "H1", '2', Some("M09A"), "A", true);
+        let f2 = core("N55555", "H1", '4', Some("M09C"), "C", false);
+        assert_eq!(r2.push(&f0, 0.0).assstat(), "in progress");
+        assert_eq!(r2.push(&f2, 1.0).assstat(), "out of sequence");
     }
 
     #[test]

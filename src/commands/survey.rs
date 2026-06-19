@@ -453,7 +453,9 @@ fn dwell(
         sdr: None,
         receiver_pos: None,
         label_filter: Default::default(),
+        ais_filter: Default::default(),
         demod_effort: runtime::DemodEffort::Live,
+        max_ppm: None,
         outputs: runtime::OutputConfig {
             console: ConsoleFormat::Pretty,
             jsonl: None,
@@ -465,11 +467,15 @@ fn dwell(
             sbs: None,
             beast: None,
             nmea_tcp: None,
+            nmea_udp: None,
+            nmea_tag_blocks: false,
             gsmtap: None,
             iridium_satmap: None,
             http: None,
             mqtt: None,
             mqtt_topic: "xng".into(),
+            airframes: None,
+            own_ship_mmsi: None,
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;
@@ -495,6 +501,7 @@ fn dwell(
         stop,
         Some((live.clone(), center, rate)),
         None,
+        Default::default(),
         Default::default(),
     )?;
     let _ = stop_thread.join();

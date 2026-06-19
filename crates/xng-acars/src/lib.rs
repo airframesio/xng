@@ -9,12 +9,20 @@
 mod bits;
 
 pub mod adsc;
+pub mod airline5z;
 pub mod arinc622;
 pub mod cpdlc;
 pub mod block;
+pub mod cfb;
+pub mod fpn;
 pub mod media_adv;
+pub mod met;
 pub mod miam;
+pub mod min;
 pub mod ohma;
+pub mod oooi;
+pub mod position;
+pub mod qseries;
 pub mod reasm;
 pub mod sublabel;
 
@@ -51,6 +59,15 @@ pub enum AcarsApp {
     },
     /// Media advisory (label SA): datalink availability report.
     MediaAdvisory(media_adv::MediaAdvisory),
+    /// `Q`-series link-test / squitter / OOOI-event label classification.
+    QSeries(qseries::QSeries),
+    /// H1 `#CFB` ("Crew Flight Bag") maintenance-telemetry family.
+    Cfb(cfb::Cfb),
+    /// ARINC 702 flight plan (H1 `FPN/` preamble).
+    FlightPlan(fpn::FlightPlan),
+    /// Label 5Z "Airline Designated Downlink" (United telex / structured
+    /// free-text).
+    Airline5z(airline5z::Airline5z),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -60,6 +77,20 @@ pub struct AppDecode {
     pub sublabel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mfi: Option<String>,
+    /// OOOI (OUT/OFF/ON/IN) gate/wheels times + departure/destination
+    /// airports + ETA extracted from the text (acarsdec
+    /// `depa`/`dsta`/`eta`/`gtout`/`gtin`/`wloff`/`wlin` fields). Flattened
+    /// so the fields appear at the top level like acarsdec's JSON.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub oooi: Option<oooi::Oooi>,
+    /// Latitude/longitude extracted from a free-text position report
+    /// (labels `20`/POS, `4J`, `H1` POS).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<position::Position>,
+    /// Winds-aloft / met fields from a position-weather report (label `4J`
+    /// POSWX).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub met: Option<met::Met>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app: Option<AcarsApp>,
 }
@@ -80,12 +111,26 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
 
     out.app = match label {
         "A6" | "AA" | "B6" | "BA" => arinc622::parse(body, downlink),
+        // H1 carries ARINC 622, OHMA, or the #CFB maintenance family; #CFB
+        // is recognized from the original text (the `#CFB` preamble is the
+        // H1 `CF` sublabel, already stripped from `body`).
         "H1" => arinc622::parse(body, downlink)
+            .or_else(|| fpn::parse(body).map(AcarsApp::FlightPlan))
+            .or_else(|| cfb::classify(text).map(AcarsApp::Cfb))
             .or_else(|| ohma::parse(body).map(|message| AcarsApp::Ohma { message })),
         "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
-        _ => None,
+        "5Z" => airline5z::parse(body).map(AcarsApp::Airline5z),
+        _ => qseries::classify(label).map(AcarsApp::QSeries),
     };
+
+    // OOOI fields can be embedded in many labels' text (Q-series and several
+    // airline-application labels); run the extractor on the original text.
+    out.oooi = oooi::decode(label, text);
+    // Free-text position reports (labels 20/POS, 4J, H1 POS) → lat/lon.
+    out.position = position::decode(label, text);
+    // Winds-aloft / met from the 4J POSWX position-weather report.
+    out.met = met::decode(label, text);
     out
 }
 
@@ -103,6 +148,24 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
             if m.established { "established" } else { "lost" },
             m.time
         )),
+        AcarsApp::QSeries(q) => Some(format!("{} {}", q.label, q.description)),
+        AcarsApp::Cfb(c) => Some(if c.subtype.is_empty() {
+            format!("CFB {}", c.description)
+        } else {
+            format!("CFB {} ({})", c.subtype, c.description)
+        }),
+        AcarsApp::FlightPlan(fp) => Some(format!(
+            "FPN {}{}->{}",
+            fp.flight_number.as_deref().map(|f| format!("{f} ")).unwrap_or_default(),
+            fp.origin.as_deref().unwrap_or("?"),
+            fp.destination.as_deref().unwrap_or("?"),
+        )),
+        AcarsApp::Airline5z(a) => Some(match a {
+            airline5z::Airline5z::Text { text } => format!("5Z TXT {text}"),
+            airline5z::Airline5z::Typed { message_type, description, .. } => {
+                format!("5Z {message_type} ({description})")
+            }
+        }),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(
                 "MIAM v{} {}{}{}",

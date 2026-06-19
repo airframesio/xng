@@ -9,22 +9,28 @@
 //! number is present, then concatenate in order and parse as consecutive
 //! ground-station records.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Frequencies per station are bounded by the 20-bit frequency bitmaps
 /// used in SPDUs and frequency-data HFNPDUs.
 const MAX_FREQS: usize = 20;
 const GS_RECORD_MIN: usize = 8; // 7-octet fixed part + at least one frequency/slot octet
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GsFrequency {
     pub freq_hz: u32,
     pub master_frame_slot: u8,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroundStation {
     pub gs_id: u8,
+    /// Human-readable station name from the built-in public ARINC HFDL GS
+    /// list (mirrors dumphfdl's per-station `name` JSON field, which it
+    /// fills from its config systable). Populated on decode; `None` for the
+    /// 12 unassigned IDs in 1..=17 and any ID outside that range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gs_name: Option<String>,
     pub utc_sync: bool,
     pub lat: f64,
     pub lon: f64,
@@ -32,10 +38,52 @@ pub struct GroundStation {
     pub frequencies: Vec<GsFrequency>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SystemTable {
     pub version: u16,
     pub stations: Vec<GroundStation>,
+}
+
+impl SystemTable {
+    /// Serialize the learned system table to `path` as pretty JSON.
+    ///
+    /// Cold-start enrichment counterpart to [`SystemTable::load`]: a
+    /// long-running receiver writes the most recent reassembled table so a
+    /// later run starts with known GS positions/frequencies instead of
+    /// waiting for the next over-the-air 0xD0 set. This is the serde
+    /// equivalent of dumphfdl's libconfig `systable_save_config()`
+    /// (src/systable.c) — same persisted facts (id 0..=127, optional name,
+    /// lat/lon, frequencies), JSON rather than libconfig so it round-trips
+    /// through the crate's existing serde_json channel with no new
+    /// dependency.
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(path, json)
+    }
+
+    /// Load a previously [`saved`](SystemTable::save) system table from
+    /// `path`. Counterpart to dumphfdl's `systable_read_from_file()`.
+    pub fn load(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let bytes = std::fs::read(path)?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+}
+
+/// Free-function form of [`SystemTable::load`] matching the
+/// `load_system_table(path)` API named in the task / CLI follow-up.
+pub fn load_system_table(path: impl AsRef<std::path::Path>) -> std::io::Result<SystemTable> {
+    SystemTable::load(path)
+}
+
+/// Free-function form of [`SystemTable::save`] matching the
+/// `save_system_table(path)` API named in the task / CLI follow-up.
+pub fn save_system_table(
+    table: &SystemTable,
+    path: impl AsRef<std::path::Path>,
+) -> std::io::Result<()> {
+    table.save(path)
 }
 
 /// 20-bit two's-complement coordinate, degrees ×180/2^19.
@@ -85,8 +133,10 @@ pub fn parse_stations(mut buf: &[u8]) -> Option<Vec<GroundStation>> {
                 }
             })
             .collect();
+        let gs_id = buf[0] & 0x7F;
         stations.push(GroundStation {
-            gs_id: buf[0] & 0x7F,
+            gs_id,
+            gs_name: crate::pdu::gs_name(gs_id).map(str::to_string),
             utc_sync: buf[0] & 0x80 != 0,
             lat,
             lon,
@@ -202,6 +252,7 @@ mod tests {
         vec![
             GroundStation {
                 gs_id: 1,
+                gs_name: None,
                 utc_sync: true,
                 lat: 37.0179,
                 lon: -122.9059,
@@ -214,6 +265,7 @@ mod tests {
             },
             GroundStation {
                 gs_id: 13,
+                gs_name: None,
                 utc_sync: true,
                 lat: -37.6691,
                 lon: 144.8410,
@@ -238,6 +290,23 @@ mod tests {
         assert!((parsed[0].lon + 122.9059).abs() < 0.001);
         assert_eq!(parsed[1].gs_id, 13);
         assert!((parsed[1].lat + 37.6691).abs() < 0.001);
+        // Decode-side enrichment from the built-in ARINC GS list: id 1 =
+        // San Francisco, id 13 = Santa Cruz, Bolivia (same public list
+        // asserted by pdu::gs_name and mirroring dumphfdl's `name`).
+        assert_eq!(parsed[0].gs_name.as_deref(), Some("San Francisco, USA"));
+        assert_eq!(parsed[1].gs_name.as_deref(), Some("Santa Cruz, Bolivia"));
+    }
+
+    #[test]
+    fn gs_name_none_for_unassigned_id() {
+        // ID 12 is one of the 12 holes in the public 1..=17 GS list; the
+        // decoded record must leave gs_name unset rather than invent a name.
+        let mut gs = sample_stations()[0].clone();
+        gs.gs_id = 12;
+        let body = build_gs_record(&gs);
+        let parsed = parse_stations(&body).expect("parses");
+        assert_eq!(parsed[0].gs_id, 12);
+        assert_eq!(parsed[0].gs_name, None);
     }
 
     #[test]
@@ -281,6 +350,80 @@ mod tests {
         body[6] |= 0x1F << 3;
         assert!(parse_stations(&body).is_none());
         assert!(parse_stations(&[]).is_none());
+    }
+
+    /// Unique temp path so concurrent test runs don't collide (no
+    /// tempfile dependency in this crate).
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("xng_hfdl_systable_{tag}_{}_{nanos}.json", std::process::id()))
+    }
+
+    #[test]
+    fn systable_persistence_round_trip() {
+        // Build a table the way the decoder would: real GS records run
+        // through parse_stations so gs_name enrichment (id 1 = San
+        // Francisco) and the None hole (id 12) are both present.
+        let mut stations = sample_stations();
+        stations[1].gs_id = 12; // force an unassigned-id (no name) record
+        let body: Vec<u8> = stations.iter().flat_map(build_gs_record).collect();
+        let parsed = parse_stations(&body).expect("parses");
+        let table = SystemTable { version: 52, stations: parsed };
+        assert_eq!(table.stations[0].gs_name.as_deref(), Some("San Francisco, USA"));
+        assert_eq!(table.stations[1].gs_name, None);
+
+        let path = temp_path("rt");
+        // Both the method form and the free-function form must round-trip.
+        save_system_table(&table, &path).expect("save");
+        let loaded = load_system_table(&path).expect("load");
+        // All integer/string/bool fields round-trip exactly; coordinates
+        // are f64 and compared to ~sub-metre tolerance (text serialization
+        // of f64 is round-trip-exact in practice but not guaranteed by the
+        // serde contract, so coordinates are not asserted bit-identical).
+        assert_eq!(loaded.version, 52);
+        assert_eq!(loaded.stations.len(), table.stations.len());
+        for (a, b) in loaded.stations.iter().zip(&table.stations) {
+            assert_eq!(a.gs_id, b.gs_id);
+            assert_eq!(a.gs_name, b.gs_name);
+            assert_eq!(a.utc_sync, b.utc_sync);
+            assert_eq!(a.spdu_version, b.spdu_version);
+            assert_eq!(a.frequencies, b.frequencies);
+            assert!((a.lat - b.lat).abs() < 1e-6, "lat {} vs {}", a.lat, b.lat);
+            assert!((a.lon - b.lon).abs() < 1e-6, "lon {} vs {}", a.lon, b.lon);
+        }
+        // Enrichment and the None hole survive serialization.
+        assert_eq!(loaded.stations[0].gs_name.as_deref(), Some("San Francisco, USA"));
+        assert_eq!(loaded.stations[1].gs_name, None);
+        assert_eq!(loaded.stations[0].frequencies[0].freq_hz, 21_934_000);
+        assert_eq!(loaded.stations[0].frequencies[2].master_frame_slot, 7);
+
+        // Once a table has been through one save→load cycle it is a fixed
+        // point: saving the loaded table and loading again reproduces it
+        // bit-for-bit (PartialEq, floats included). This pins exact
+        // persistence without depending on f64 text round-trip being a
+        // fixed point for freshly computed coordinates.
+        let path2 = temp_path("rt2");
+        loaded.save(&path2).expect("save method");
+        let reloaded = SystemTable::load(&path2).expect("load method");
+        assert_eq!(reloaded, loaded, "save→load must be a fixed point");
+
+        // A station with no name serializes without a gs_name key, and
+        // loading a doc that omits the key restores None (serde default).
+        let json = serde_json::to_string(&table).unwrap();
+        assert!(!json.contains("\"gs_name\":null"));
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+    }
+
+    #[test]
+    fn systable_load_missing_file_errors() {
+        let path = temp_path("missing");
+        let _ = std::fs::remove_file(&path);
+        assert!(load_system_table(&path).is_err());
     }
 
     #[test]

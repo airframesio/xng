@@ -31,16 +31,43 @@ fn decodes_real_squitter() {
     for chunk in samples.chunks(65_536) {
         for e in dec.process(chunk) {
             if e.kind == "squitter" {
-                squitters.push(e.details.clone());
+                squitters.push(e.clone());
             }
         }
     }
     assert!(!squitters.is_empty(), "no squitter decoded from the off-air capture");
     // Ground truth from dumphfdl 1.7.0 on the same recording.
-    let s = &squitters[0];
+    let s = &squitters[0].details;
     assert_eq!(s["gs_id"], 4, "ground station (Riverhead)");
     assert_eq!(s["frame_index"], 2397);
     assert_eq!(s["frame_offset"], 1);
     assert_eq!(s["systable_version"], 52);
     assert_eq!(s["utc_sync"], true);
+    // HFDL-6 first-octet squitter flags, decoded from this real capture's
+    // own first octet (byte0 = 0x10): rls/iso clear, version 0, change_note
+    // 0 — the bit math matches dumphfdl spdu.c spdu_parse() on the same air.
+    assert_eq!(squitters[0].raw[0], 0x10, "real squitter first octet");
+    assert_eq!(s["rls_in_use"], false);
+    assert_eq!(s["iso8208_supported"], false);
+    assert_eq!(s["spdu_version"], 0);
+    assert_eq!(s["change_note"], 0);
+    // HFDL-6 TDMA reservation / per-slot assignment region (buf[4..52), the
+    // largest span dumphfdl leaves opaque) is surfaced raw, 48 octets wide,
+    // taken verbatim from this off-air frame's own bytes.
+    let slots = s["slot_assignment_hex"].as_str().expect("slot_assignment_hex");
+    assert_eq!(slots.len(), 96, "48 octets of reservation data");
+    assert_eq!(
+        slots,
+        squitters[0].raw[4..52]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+        "assignment region surfaced verbatim from the off-air bytes"
+    );
+    // HFDL-5: the demod path stamps the Viterbi corrected-symbol count on
+    // every real-signal event (it CRC-validated, so the count is bounded).
+    assert!(
+        squitters[0].fec_corrected.is_some(),
+        "fec_corrected populated on the off-air squitter"
+    );
 }

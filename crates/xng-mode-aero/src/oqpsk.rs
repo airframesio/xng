@@ -424,8 +424,16 @@ pub struct HrFramer {
     /// When collecting: (soft bits after UW, rail inversion masks).
     collecting: Option<(Vec<f32>, [f32; 2])>,
     pub reasm: su::Reassembler,
-    /// C-channel assignment SUs decoded this push (drained per chunk).
-    pub assignments: Vec<serde_json::Value>,
+    /// Structured (non-user-data) P-channel SUs decoded this push, drained
+    /// per chunk (see [`su::parse_p_su`]).
+    pub su_events: Vec<serde_json::Value>,
+    /// Parsed header of the most recently assembled frame (AERO-4).
+    pub last_header: Option<frame::FrameHeader>,
+    /// FEC-corrected coded-bit count of the most recently decoded frame
+    /// (AERO-6), latched so events from that frame carry it.
+    pub last_fec_corrected: Option<u32>,
+    /// Self-configuring satellite/beam resolver (AERO-2).
+    pub resolver: crate::satellite::SatelliteResolver,
 }
 
 /// Check a 64-bit window: even-position bits = one rail's 32-bit UW,
@@ -457,7 +465,10 @@ impl HrFramer {
             shift: 0,
             collecting: None,
             reasm: su::Reassembler::new(),
-            assignments: Vec::new(),
+            su_events: Vec::new(),
+            last_header: None,
+            last_fec_corrected: None,
+            resolver: crate::satellite::SatelliteResolver::new(),
         }
     }
 
@@ -466,12 +477,19 @@ impl HrFramer {
             let k = buf.len();
             buf.push(soft * inv[k % 2]);
             if buf.len() == HR_SKIP_BITS + HR_CODED_BITS {
+                // First 16 bits of the skip region are the frame header
+                // (AERO-4); the remainder is the 178-bit dummy.
+                self.last_header =
+                    Some(frame::FrameHeader::from_soft_bits(&buf[..frame::HEADER_BITS]));
                 let coded = &buf[HR_SKIP_BITS..];
                 let bytes = self.decoder.decode(coded);
+                // Genuine FEC-correction count for this frame (AERO-6).
+                self.last_fec_corrected = Some(self.decoder.last_fec_corrected());
                 for su_bytes in bytes.chunks_exact(su::SU_LEN) {
                     if su::su_crc_ok(su_bytes) {
-                        if let Some(a) = su::parse_c_assignment(su_bytes) {
-                            self.assignments.push(a);
+                        if let Some(a) = su::parse_p_su(su_bytes) {
+                            self.resolver.observe(&a);
+                            self.su_events.push(a);
                         }
                         if let Some(u) = self.reasm.push(su_bytes) {
                             out.push(u);

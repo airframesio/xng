@@ -85,6 +85,7 @@ impl From<&Message> for asf2::DecodedMessage {
                 track_deg,
                 vertical_rate_fpm,
                 comm_b,
+                adsb_status,
             } => {
                 Some(asf2::decoded_message::Body::ModeS(asf2::ModeSBody {
                     df: u32::from(*df),
@@ -99,6 +100,7 @@ impl From<&Message> for asf2::DecodedMessage {
                     track_deg: *track_deg,
                     vertical_rate_fpm: *vertical_rate_fpm,
                     comm_b_json: comm_b.as_ref().map(|v| v.to_string()),
+                    adsb_status_json: adsb_status.as_ref().map(|v| v.to_string()),
                 }))
             }
             MessageBody::Iridium { kind, details } => {
@@ -129,6 +131,26 @@ impl From<&Message> for asf2::DecodedMessage {
                 Some(asf2::decoded_message::Body::Stdc(asf2::StdcBody {
                     name: name.clone(),
                     text: text.clone(),
+                    details_json: details.to_string(),
+                }))
+            }
+            // Newer decode cores share a generic kind+details body; the mode
+            // field disambiguates (uat | sarsat | dsc | navtex | sonde | ads-l |
+            // atcs | aprs | pocsag | eot).
+            MessageBody::Uat { kind, details }
+            | MessageBody::Sarsat { kind, details }
+            | MessageBody::Dsc { kind, details }
+            | MessageBody::Navtex { kind, details }
+            | MessageBody::Sonde { kind, details }
+            | MessageBody::AdsL { kind, details }
+            | MessageBody::Atcs { kind, details }
+            | MessageBody::Aprs { kind, details }
+            | MessageBody::Pocsag { kind, details }
+            | MessageBody::Eot { kind, details }
+            | MessageBody::Flex { kind, details }
+            | MessageBody::Vdes { kind, details } => {
+                Some(asf2::decoded_message::Body::Generic(asf2::GenericBody {
+                    kind: kind.clone(),
                     details_json: details.to_string(),
                 }))
             }

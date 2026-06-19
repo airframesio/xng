@@ -4,7 +4,7 @@ use num_complex::Complex;
 use xng_mode_stdc::frame::encode_frame;
 use xng_mode_stdc::modulate::modulate;
 use xng_mode_stdc::packet::build_packet;
-use xng_mode_stdc::{StdcChannelDecoder, CHANNEL_RATE};
+use xng_mode_stdc::StdcChannelDecoder;
 
 struct Noise(u64);
 impl Noise {

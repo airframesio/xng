@@ -38,6 +38,10 @@ pub struct Vdl2Frame {
     /// Decoded ATN transport (X.25 packet, CLNP/COTP) for I-frames.
     pub atn: Option<serde_json::Value>,
     pub rs_corrected: usize,
+    /// Carrier frequency offset (Hz) measured from the burst preamble (VDL2-7).
+    pub freq_skew_hz: f32,
+    /// EVM-derived per-burst SNR (dB) from the symbol decision residuals (VDL2-8).
+    pub snr_db: f32,
 }
 
 pub struct Vdl2ChannelDecoder {
@@ -53,6 +57,8 @@ pub struct Vdl2ChannelDecoder {
     rs: ReedSolomon,
     channel_buf: Vec<Complex<f32>>,
     x25: atn::X25Reassembler,
+    clnp: atn::ClnpReassembler,
+    cotp: atn::CotpReassembler,
     samples_seen: u64,
     input_rate: f64,
 }
@@ -99,6 +105,8 @@ impl Vdl2ChannelDecoder {
             rs: interleave::vdl2_rs(),
             channel_buf: Vec::new(),
             x25: atn::X25Reassembler::new(),
+            clnp: atn::ClnpReassembler::new(),
+            cotp: atn::CotpReassembler::new(),
             samples_seen: 0,
             input_rate,
         })
@@ -137,11 +145,18 @@ impl Vdl2ChannelDecoder {
                 let atn = if acars.is_none()
                     && matches!(frame.control, avlc::Control::Info { .. })
                 {
-                    decode_atn(&frame.info, &mut self.x25, now)
+                    decode_atn(&frame.info, &mut self.x25, &mut self.clnp, &mut self.cotp, now)
                 } else {
                     None
                 };
-                out.push(Vdl2Frame { avlc: frame, acars, atn, rs_corrected: burst.rs_corrected });
+                out.push(Vdl2Frame {
+                    avlc: frame,
+                    acars,
+                    atn,
+                    rs_corrected: burst.rs_corrected,
+                    freq_skew_hz: burst.freq_skew_hz,
+                    snr_db: burst.snr_db,
+                });
             }
         }
         out
@@ -150,12 +165,20 @@ impl Vdl2ChannelDecoder {
     pub fn level_dbfs(&self) -> f32 {
         self.demod.level_dbfs()
     }
+
+    /// Reject bursts whose carrier offset exceeds `ppm` (VDL2-7); `None`
+    /// (default) accepts every CFO-fit candidate.
+    pub fn set_max_ppm(&mut self, ppm: Option<f64>) {
+        self.demod.set_max_ppm(ppm);
+    }
 }
 
 /// Decode an I-frame information field as ATN transport.
 fn decode_atn(
     info: &[u8],
     x25: &mut atn::X25Reassembler,
+    clnp: &mut atn::ClnpReassembler,
+    cotp: &mut atn::CotpReassembler,
     now: f64,
 ) -> Option<serde_json::Value> {
     if let Some(pkt) = atn::parse_x25(info) {
@@ -163,7 +186,7 @@ fn decode_atn(
         v["layer"] = serde_json::json!("x25");
         if pkt.kind == "data" {
             if let Some(full) = x25.push(&pkt, now) {
-                if let Some(net) = atn::parse_network(&full) {
+                if let Some(net) = decode_network(&full, clnp, cotp, now) {
                     v["network"] = net;
                 }
             } else {
@@ -171,30 +194,118 @@ fn decode_atn(
             }
         } else if !pkt.payload.is_empty() {
             // Call user data names the network protocol.
-            if let Some(net) = atn::parse_network(&pkt.payload) {
+            if let Some(net) = decode_network(&pkt.payload, clnp, cotp, now) {
                 v["network"] = net;
             }
         }
         return Some(v);
     }
-    atn::parse_network(info)
+    decode_network(info, clnp, cotp, now)
+}
+
+/// Parse an ATN network-layer payload, reassembling segmented CLNP data
+/// units (ISO/IEC 8473 §6.7) before the full CLNP/COTP walk. A CLNP segment
+/// that does not complete a data unit is reported as `reassembling` (its own
+/// per-fragment CLNP header is still surfaced for visibility). Complete CLNP
+/// DT PDUs additionally feed the COTP TSDU reassembler (ISO/IEC 8073 §6.6):
+/// a multi-DT TSDU is decoded as one ATN-B1 application only once its EOT DT
+/// arrives.
+fn decode_network(
+    b: &[u8],
+    clnp: &mut atn::ClnpReassembler,
+    cotp: &mut atn::CotpReassembler,
+    now: f64,
+) -> Option<serde_json::Value> {
+    // Only CLNP (NLPID 0x81) is segmentable here; other protocols pass
+    // straight through.
+    if b.first() == Some(&0x81) {
+        match clnp.push(b, now) {
+            Some(full) => {
+                let mut v = atn::parse_network(&full)?;
+                cotp_reassemble(&full, &mut v, cotp, now);
+                Some(v)
+            }
+            None => {
+                // Incomplete data unit: surface this fragment's header plus a
+                // reassembling marker.
+                let mut v = atn::parse_network(b)?;
+                v["reassembling"] = serde_json::json!(true);
+                Some(v)
+            }
+        }
+    } else {
+        atn::parse_network(b)
+    }
+}
+
+/// Feed a complete CLNP DT PDU's COTP TPDU to the TSDU reassembler (ISO/IEC
+/// 8073 §6.6) and, when a multi-segment TSDU completes, decode the ATN-B1
+/// application on the assembled user data and splice it into the COTP node.
+/// Single-segment TSDUs are already decoded inline by [`atn::parse_cotp`];
+/// here we only act on the reassembled (multi-DT) case, and mark a DT that is
+/// still awaiting further segments.
+fn cotp_reassemble(
+    full: &[u8],
+    v: &mut serde_json::Value,
+    cotp: &mut atn::CotpReassembler,
+    now: f64,
+) {
+    let Some(tpdu) = atn::clnp_cotp_tpdu(full) else { return };
+    // Only DT TPDUs carry a segmentable TSDU.
+    let Some((_, eot, seq, _)) = atn::cotp_dt_segment(tpdu) else { return };
+    // A lone complete TSDU (seq 0, EOT) is handled inline already.
+    let multi_segment = !(seq == 0 && eot);
+    if !multi_segment {
+        return;
+    }
+    match cotp.push(tpdu, now) {
+        Some(tsdu) => {
+            if let Some(app) = atn::parse_cotp_user_app(&tsdu) {
+                if let Some(c) = v.get_mut("cotp") {
+                    c["app"] = app;
+                    c["tsdu_reassembled"] = serde_json::json!(true);
+                    c["tsdu_len"] = serde_json::json!(tsdu.len());
+                }
+            }
+        }
+        None => {
+            if let Some(c) = v.get_mut("cotp") {
+                c["tsdu_reassembling"] = serde_json::json!(true);
+            }
+        }
+    }
 }
 
 /// Convert a decoded frame into the normalized message model.
 pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Provenance) -> Message {
     let (body, crc_ok, errors) = match &f.acars {
-        Some(b) => (
-            MessageBody::Acars(b.core.clone()),
-            b.crc_ok,
-            Some(b.parity_errors),
-        ),
+        Some(b) => {
+            // ACARS-over-AVLC: the body is the shared ACARS core, but the AVLC
+            // link wrapper (src/dst/control) would otherwise be lost — the
+            // dumpvdl2-JSON feed (FEED-2.1) needs it. Carry it on the
+            // `#[serde(skip)]` transient `vdl2_link` field, NOT inside `app`:
+            // `app` is serialized into every public output (JSONL/MQTT/asf-2.0)
+            // and is overwritten wholesale by the reassembler on completion, so
+            // stashing link data there both leaked internal plumbing and got
+            // destroyed on multi-block reassembly.
+            let mut core = b.core.clone();
+            core.vdl2_link = Some(serde_json::json!({
+                "src": f.avlc.src, "dst": f.avlc.dst, "control": f.avlc.control,
+            }));
+            (MessageBody::Acars(core), b.crc_ok, Some(b.parity_errors))
+        }
         None => (avlc_body(&f.avlc, f.atn.as_ref()), true, None),
     };
     Message {
         mode: Mode::Vdl2,
         timestamp: Utc::now(),
         frequency_hz,
-        signal: SignalQuality { rssi_db: Some(level_dbfs), ..Default::default() },
+        signal: SignalQuality {
+            rssi_db: Some(level_dbfs),
+            snr_db: Some(f.snr_db),
+            freq_skew_hz: Some(f.freq_skew_hz),
+            ..Default::default()
+        },
         decode: DecodeQuality {
             crc_ok,
             fec_corrected: Some(f.rs_corrected as u32),
@@ -238,6 +349,11 @@ fn avlc_body(frame: &avlc::AvlcFrame, atn: Option<&serde_json::Value>) -> Messag
             details["params"] = serde_json::json!(params);
         }
     }
+    if matches!(frame.control, Control::Unnumbered { kind: "FRMR", .. }) {
+        if let Some(frmr) = avlc::parse_frmr(&frame.info) {
+            details["frmr"] = serde_json::json!(frmr);
+        }
+    }
     if !frame.info.is_empty() {
         let shown = &frame.info[..frame.info.len().min(64)];
         details["info_hex"] =
@@ -245,4 +361,72 @@ fn avlc_body(frame: &avlc::AvlcFrame, atn: Option<&serde_json::Value>) -> Messag
         details["info_len"] = serde_json::json!(frame.info.len());
     }
     MessageBody::Vdl2 { kind, details }
+}
+
+#[cfg(test)]
+mod cotp_pipeline_tests {
+    use super::*;
+
+    /// Wrap a COTP TPDU in an unsegmented CLNP DT PDU (dst NSAP 47 01, src
+    /// 47 02). Header = 9 fixed + 3 + 3 = 15 octets.
+    fn clnp_dt(cotp: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x81, 15, 1, 0x3F, 0x1C, 0x00, 0x00, 0x00, 0x00];
+        b.extend_from_slice(&[2, 0x47, 0x01]);
+        b.extend_from_slice(&[2, 0x47, 0x02]);
+        b.extend_from_slice(cotp);
+        b
+    }
+
+    /// Normal-format COTP DT: LI=4, code 0xF0, dst_ref, EOT|seq, user data.
+    fn cotp_dt(dst_ref: u16, eot: bool, seq: u8, user: &[u8]) -> Vec<u8> {
+        let mut b = vec![0x04, 0xF0];
+        b.extend_from_slice(&dst_ref.to_be_bytes());
+        b.push(if eot { 0x80 } else { 0x00 } | (seq & 0x7F));
+        b.extend_from_slice(user);
+        b
+    }
+
+    #[test]
+    fn cpdlc_reassembled_across_two_cotp_dt_segments() {
+        // A protected-mode downlink WILCO whose user data is split across two
+        // COTP DT TPDUs (seq 0 EOT=0, seq 1 EOT=1) on one connection. The
+        // first segment is reported as a TSDU fragment; the second completes
+        // the TSDU, which decodes as a CPDLC WILCO.
+        let apdu = atn_cpdlc::build_downlink_wilco_for_test();
+        assert!(apdu.len() >= 2, "need at least two octets to split");
+        let split = apdu.len() / 2;
+        let s0 = cotp_dt(0x0001, false, 0, &apdu[..split]);
+        let s1 = cotp_dt(0x0001, true, 1, &apdu[split..]);
+
+        let mut clnp = atn::ClnpReassembler::new();
+        let mut cotp = atn::CotpReassembler::new();
+
+        // First CLNP DT (carrying COTP segment 0): TSDU still reassembling.
+        let v0 = decode_network(&clnp_dt(&s0), &mut clnp, &mut cotp, 0.0).unwrap();
+        assert_eq!(v0["cotp"]["tpdu"], "DT");
+        assert_eq!(v0["cotp"]["tsdu_segment"], true);
+        assert!(v0["cotp"].get("app").is_none());
+        assert_eq!(v0["cotp"]["tsdu_reassembling"], true);
+
+        // Second CLNP DT (COTP segment 1, EOT): TSDU completes → CPDLC app.
+        let v1 = decode_network(&clnp_dt(&s1), &mut clnp, &mut cotp, 1.0).unwrap();
+        assert_eq!(v1["cotp"]["tsdu_reassembled"], true);
+        let app = &v1["cotp"]["app"];
+        assert_eq!(app["application"], "CPDLC");
+        assert_eq!(app["pdu"], "send");
+        assert_eq!(app["message"]["elements"][0]["element"], "dM0NULL");
+    }
+
+    #[test]
+    fn single_segment_cotp_still_decodes_inline() {
+        // A single complete DT (EOT, seq 0) still decodes the app inline,
+        // unchanged from the pre-reassembly behaviour.
+        let apdu = atn_cpdlc::build_downlink_wilco_for_test();
+        let dt = cotp_dt(0x0002, true, 0, &apdu);
+        let mut clnp = atn::ClnpReassembler::new();
+        let mut cotp = atn::CotpReassembler::new();
+        let v = decode_network(&clnp_dt(&dt), &mut clnp, &mut cotp, 0.0).unwrap();
+        assert_eq!(v["cotp"]["app"]["pdu"], "send");
+        assert!(v["cotp"].get("tsdu_reassembled").is_none());
+    }
 }

@@ -1,100 +1,445 @@
-# Inmarsat STD-C / EGC
+# Inmarsat STD-C / EGC — implementation notes
 
-Facts cross-verified across inmarsatc (GPL, facts only), SatDump (GPL,
-facts only), and Scytale-C documentation; scrambler table and UW
-numerically verified. All code re-derived (not ported from these GPL
-sources).
+Native Inmarsat-C NCS common-channel (TDM) decode for `xng-mode-stdc`.
+Coherent BPSK at 1200 sym/s, full PHY → frame → packet → application
+chain. Clean-room: protocol facts cross-verified across inmarsatc
+(GPL-3), SatDump (GPL-3) and Scytale-C (GPL-3) and numerically
+re-verified; **all code is re-derived** (see PROVENANCE.md). Field-decode
+tables are typed verbatim from inmarsatc (facts only) and the IMO
+International SafetyNET Manual.
 
-## PHY
+Result: oracle-validated field-exact on the public sigidwiki Inmarsat-C
+TDM/EGC IQ capture (AOR-E). The full native chain decodes one frame's
+worth of packets (51 in the source recording; ≥5 in the vendored 14 s
+slice) — bulletin boards with consecutive TDM frame numbers, logical-
+channel announcements with MES IDs and named LES routing, signalling-
+channel descriptors and confirmations — every packet checksum passing.
+No count-style benchmark (no peer decoder is run head-to-head); fenced by
+the off-air fixture + RF-loopback tests in CI. Source:
+`crates/xng-mode-stdc/src/`.
 
-- NCS carriers: AOR-W 1537.70 MHz, IOR 1537.10, AOR-E 1541.45,
-  POR 1541.45. Continuous.
-- BPSK 1200 sym/s, coherent (NOT differential despite some wiki labels):
-  Costas loop + Gardner timing; RRC α=0.6 (SatDump: 31 taps, pll_bw 0.03).
-  180° ambiguity resolved at the UW (correlate normal + inverted; if
-  inverted wins, complement the frame). Handle mid-frame polarity flips.
-- Frame = 10368 symbols = 8.64 s exactly; frame number 0..9999 resets at
-  UTC midnight (seconds_of_day = frame_number × 8.64).
+## Pipeline
 
-## Frame structure
+wideband IQ → `xng_dsp::Ddc` → 12 kHz channel IQ → `demod::BpskDemod`
+(coarse AFC, Costas, Gardner) → `frame::FrameDecoder` (UW sync both
+polarities, depermute, deinterleave, Viterbi, descramble) →
+`packet::PacketParser` (Fletcher checksum, EGC/LCN/multiframe assembly)
+→ `xng_types::Message::StdC`. `CHANNEL_RATE` = 12 kS/s (10 samples/sym);
+one-sided passband 2 kHz (DDC bypassed when input is already 12 kHz at
+zero offset).
 
-- 64 rows × 162 columns, transmitted row by row; each row = 2 UW symbols
-  + 160 data symbols.
-- **UW (64 bits, each bit sent twice at row start):**
-  `07 EA CD DA 4E 2F 28 C2` (MSB-first). Accept ≥121/128 matches
-  (SatDump) over a sliding window.
-- **Row permutation**: transmitted row j carries original row
-  i = (j×39) mod 64; receiver: j = (i×23) mod 64.
-  `out[i*162..] = in[((i*23)%64)*162..]`.
-- **Deinterleave**: strip 2 UW columns, read 64×160 column-wise:
-  `out[col*64+row] = in[row*162+col+2]` → 10240 soft symbols.
-- **Convolutional**: K=7 r=1/2, textbook 171/133 octal (our Viterbi::k7).
-  10240 → 5120 bits = 640 bytes; transmitter appends a flush byte
-  (639 info + 1 flush, trellis ends in state 0).
-- **Bit-reverse every byte** between Viterbi output and descrambler
-  (chainback order → wire order). Mandatory.
-- **Scrambler (after Viterbi)**: 640 bytes = 160 groups of 4 bytes; a
-  7-bit LFSR G = 1+x³+x⁴+x⁵+x⁷, **init 0x80** (docs saying 0x40 are
-  wrong), one output bit per group; bit=1 → XOR the 4 bytes with 0xFF.
-  Step: `out = reg&1; new = out ^ (reg>>2&1) ^ (reg>>3&1) ^ (reg>>4&1);
-  reg = (reg>>1) | (new<<7)`.
-  First table entries: 0,0,0,0,0,0,0,1,0,0,0,1,1,1,0,0,0,1,0,0,1,0,1,1,
-  1,0,0,0,0,0,0,1,1,0,0,1,0,0,1,0,0,1,1,0,1,1,1,0,0,1,0,0,0,0,...
+## PHY / demod
 
-## Packet layer (within the 640-byte frame)
+- NCS carriers (continuous): AOR-W 1537.70 MHz, IOR 1537.10,
+  AOR-E 1541.45, POR 1541.45.
+- BPSK 1200 sym/s, **coherent** (not differential despite some wiki
+  labels). `demod.rs`: square-law FFT coarse frequency acquisition
+  (8192-pt FFT on x², tone at 2× carrier offset; snaps the NCO only when
+  the estimate is >4 bins from the current frequency, preserving the
+  Costas fine correction), decision-directed Costas loop (phase gain
+  0.05, freq gain 0.002), Gardner timing (gain 0.02, ±0.08 clamp).
+- **RRC matched filter** (STDC-8): after the NCO mix and the anti-alias
+  lowpass, an `xng_dsp::rrc_taps` root-raised-cosine FIR (β = 0.6 = the
+  TX `RRC_BETA`, unit-energy, 8·sps+1 ≈ 81 taps, run through `Fir`) is
+  applied before symbol timing. It is the receive half of the TX/RX RRC
+  pair (the TX `modulate` already shapes with the same RRC), so the
+  cascade is a raised-cosine Nyquist pulse — symbol centres carry full
+  energy at zero ISI and effective Eb/N0 rises versus the bare lowpass.
+  The filter is on in production (`BpskDemod::new`); the
+  `with_matched_filter(_, false)` constructor bypasses it and exists only
+  so the BER oracle can A/B the gain. Validated by a synthetic
+  modulate → AWGN → demod BER test (no real off-air matched-filter
+  capture); see Validation.
+- Gardner is **gated on carrier lock** (EMA of |Costas error| < 0.4):
+  while the carrier spins, Gardner errors random-walk the clock into
+  symbol slips that corrupt whole 10368-symbol frames. The tight timing
+  clamp ensures a spike can never accumulate into a slip within a frame.
+- 180° BPSK ambiguity is **not** resolved in the demod — it is resolved
+  at the frame layer by correlating the UW in both polarities and
+  complementing the frame when the inverted UW wins.
+- Known demod limit (PROVENANCE): cold-start timing acquisition on an
+  unfiltered direct-injection signal is weak; the Gardner loop needs the
+  receive-path DDC filtering and a few seconds of the continuous carrier
+  to converge — which deployment always provides. Loopback tests
+  prepend settling symbols to mirror this.
 
-- Descriptor: `0xxxxxxx` short — type=(b>>4)&7, len=(b&0xF)+1;
-  `10xxxxxx` medium — type=b&0x3F, len=byte[1]+2;
-  `11xxxxxx` long — len=(b1<<8|b2)+3.
-  Descriptor 0x00 = padding, stop.
-- **Checksum** (last 2 bytes of every packet; Fletcher/ISO-8473 style):
-  C0+=B; C1+=C0 over the packet with checksum bytes as 0;
-  CB1=u8(C0−C1), CB2=u8(C1−2·C0). Accept transmitted 0x0000 inside
-  re-encapsulated multiframe content.
-- Key types: 0x7D Bulletin Board (frame number at [2-3]);
-  0xAA Message Data (LCN at [3], packet seq at [4]); 0x81 Announcement /
-  0x83 LC Assignment (open logical channel); 0x27 LC Clear;
-  0xB0 EGC single header / 0xB1+0xB2 EGC double header parts;
-  0xBD multiframe start / 0xBE continue (reassemble, parse recursively).
-- Channel freq: uplink MHz = ((b0<<8|b1)−6000)·0.0025+1626.5;
-  downlink MHz = ((b0<<8|b1)−8000)·0.0025+1530.5.
-- Sat/LES byte: bits 7-6 ocean region (0 AOR-W, 1 AOR-E, 2 POR, 3 IOR),
-  bits 5-0 LES id; display LES = sat×100+id. MES id = 24-bit.
+## Frame structure (`frame.rs`)
 
-## EGC header (0xB0/B1/B2, same layout)
+- Frame = 10368 symbols = 8.64 s exactly; 64 rows × 162 columns sent
+  row by row (2 UW symbols + 160 data symbols per row). Frame number
+  0..9999 resets at UTC midnight.
+- **UW** = `07 EA CD DA 4E 2F 28 C2` (64 bits, each bit sent twice at
+  row start, MSB-first). Sync threshold ≥121/128 matching symbol pairs
+  (`UW_MIN_MATCH`) over a sliding window, scored in both polarities.
+- **Row depermute**: original row i was transmitted as row (i·23) mod 64
+  on RX (TX uses the inverse (j·39) mod 64).
+- **Deinterleave**: strip the 2 UW columns, read the 64×160 matrix
+  column-wise → 10240 soft symbols.
+- **FEC**: K=7 r=1/2 convolutional, 171/133 octal, shared `xng_dsp`
+  Viterbi. **Coded-pair order is 133-output first** — the off-air
+  finding (same as Aero and HFDL): with 171-first the frame decodes to
+  pseudorandom bytes and no packet checksum passes; with 133-first every
+  packet validates. 10240 → 5120 bits = 640 bytes (639 info + 1 flush,
+  trellis ends in state 0).
+- **Bit packing**: decoded bits pack **LSB-first per byte** (equivalent
+  to KA9Q chainback + per-byte bit reversal in the GPL references).
+- **Descrambler**: 640 bytes = 160 four-byte groups; 7-bit LFSR
+  G = 1 + x³ + x⁴ + x⁵ + x⁷, **init 0x80** (docs saying 0x40 are
+  wrong); one output bit per group, bit=1 → XOR the 4 bytes with 0xFF.
+  Self-inverse (same routine used by the TX encoder).
+- `encode_frame` is the full inverse TX chain (scramble → conv encode →
+  column-write/inverse-permute → doubled UW per row), exercised by
+  round-trip and error-injection unit tests.
 
-[2] service code; [3] bit7 continuation, bits6-5 priority (Routine/
-Safety/Urgency/Distress), bits4-0 repetition; [4-5] message sequence
-(BE); [6] packet sequence (1-based); [7] presentation (0 IA5 byte-per-
-char & 0x7F, 6 ITA2 Baudot, 7 binary); [8..8+A-1] address; payload;
-2-byte checksum.
+### Per-frame quality + flip recovery (STDC-8, `FrameStats`)
 
-Address length A by service code: 0x00→3, 0x02→5, 0x04→7, 0x11→4,
-0x13→6, 0x14→7, 0x23→6, 0x24→7, 0x31→4, 0x33→6, 0x34→7, 0x44→7,
-0x72→5, 0x73→6, default 3. (Area decoding per IMO SafetyNET manual —
-carry raw hex initially.)
+- **UW BER**: the 128 UW symbols (64 rows × 2 doubled bits) of the
+  matched polarity give a direct, data-independent channel-quality
+  measure. `uw_ber_ppt(matches)` returns the bit-error rate in
+  parts-per-thousand (errors = 128 − matches, rounded). Populated in
+  `FrameStats.uw_ber_ppt` per frame and carried into the message.
+- **`fec_corrected`**: estimated by re-encoding the Viterbi output with
+  the same 171/133 convolutional code and counting coded symbols that
+  disagree with the hard decisions fed in — the standard external
+  estimate of corrections when the decoder does not report them. Each
+  disagreement is a channel symbol the traceback overrode. A clean frame
+  reports 0; sparse injected errors track the injection count.
+- **Mid-frame polarity-flip recovery**: a Costas 180° slip partway
+  through a frame inverts the tail, so neither whole-frame polarity
+  syncs (the two runs cancel). `detect_polarity_flip` scans every row
+  boundary `1..64` for the split that maximises total UW agreement after
+  inverting one side, and only accepts it when it buys ≥ `min_gain`
+  (`MID_FRAME_FLIP_MIN_GAIN` = 24) extra UW symbols over the best
+  whole-frame score — large enough that noise alone cannot fabricate a
+  flip. `apply_polarity_flip` inverts the odd run in place; the
+  recovered single-polarity frame then decodes on the normal path. Wired
+  into `lib.rs`: when whole-frame sync fails it tries flip recovery
+  before discarding the candidate, so frames a plain polarity test would
+  drop are still decoded. Synthetic-only (loopback flip injection); no
+  real off-air slipped frame is in the fixture.
 
-Assembly: key = message sequence number; order by (pkt_no×2 + is_part2);
-complete when a 0xB2 (or single-header 0xB0) arrives with
-continuation=0; ~30 s timeout fallback.
+## Packet layer (`packet.rs`, within the 640-byte frame)
 
-## Test material
+- Descriptor sizing: `0xxxxxxx` short — len = (b & 0x0F) + 1;
+  `10xxxxxx` medium — len = byte[1] + 2; `11xxxxxx` long —
+  len = (b1<<8|b2) + 3. Descriptor 0x00 = padding (stop).
+- **Checksum** (last 2 bytes, ISO-8473 / Fletcher style): C0 += B,
+  C1 += C0 over the packet with the two checksum bytes zeroed;
+  CB1 = u8(C0 − C1), CB2 = u8(C1 − 2·C0). A transmitted `00 00` is
+  accepted (re-encapsulated multiframe content). Packets failing the
+  checksum are silently skipped; only checksum-valid packets emit.
 
-xng's STD-C is oracle-validated field-exact (no count-style benchmark).
+### Packet types decoded (descriptor → name + fields)
 
-- sigidwiki "Inmarsat-C TDM" page hosts `Inmarsat-C_TDM_EGC_IQ.zip`, the
-  public IQ test vector; validated field-exact against SatDump-derived
-  goldens.
-- SatDump writes `.frm` (640-byte descrambled frames) + JSON: run it on
-  the sigidwiki capture for stage-by-stage goldens.
-- Full TX chain is specified above, so synthetic roundtrip vectors are
-  straightforward (scramble 639+1 bytes → conv encode → 64×160
-  column-write/row-read → inverse row permutation → doubled UW per row).
+The C-channel descriptor field depth is typed verbatim from inmarsatc's
+`decode_*` functions (facts only; re-derived — see PROVENANCE "STDC-2").
+Each descriptor surfaces only the fields actually present in the packet
+(short forms fall back to the bare name).
+
+- **0x7D bulletin-board**: network version, frame number (BE [2..3]),
+  **UTC-of-day** (frame × 8.64 s), `signalling_channel`, `count`,
+  `channel_type` + `channel_type_name` (1 NCS / 2 LES TDM / 3 joint /
+  4 ST-BY NCS), `local`, NCS `sat_les`, decoded `status` flags
+  (bauds_600 / operational / in_service / clear / links_open) and the
+  16-bit `services` list.
+- **0x27 logical-channel-clear**: MES id (24-bit), sat/LES, LCN —
+  terminates the LCN and flushes its assembled message.
+- **0x81 announcement**: MES id, sat/LES, LCN.
+- **0x83 logical-channel-assignment**: MES id, sat/LES, status_bits,
+  LCN, frame_length, duration, downlink/uplink **MHz**, frame_offset,
+  packet_descriptor1 — enough to actually tune the message channel.
+- **0xAA message-data**: sat/LES, LCN, packet sequence — payload bytes
+  buffered per logical channel for reassembly.
+- **0xB0 / 0xB1 / 0xB2 EGC** single / double-header parts (see below);
+  surface only as the assembled `egc-message`, with the
+  `details["header_format"]` field recording which header form produced
+  it (VERIFY-6).
+- **0xBD / 0xBE multiframe** start / continue — reassembled into a byte
+  stream and **re-parsed recursively** through the packet walker.
+- **0x6C signalling-channel**: 8-bit `services` byte, uplink
+  channel-number word → **uplink MHz** = (word − 6000)·0.0025 + 1626.5
+  (downlink helper: (word − 8000)·0.0025 + 1530.5), and the 28-entry
+  `tdm_slots` array (4 two-bit codes per byte).
+- **0x92 login-ack**: login-ack length, LES id, downlink MHz, station
+  start, and (when the list is present) station count + a `stations`
+  directory (6-byte records: sat/LES, services, downlink MHz).
+- **0xA8 confirmation**: MES id, sat/LES, short-message length, and the
+  short IA5 message text when present.
+- **0xAB les-list**: list length, station start/count, full `stations`
+  directory (same 6-byte record layout as login-ack).
+- **0x08 ack-request**: sat/LES, LCN, uplink MHz (ship's return channel).
+- **0xA3 individual-poll**: MES id, sat/LES, and the short IA5 message
+  text when the packet is long enough (inmarsatc: packetLength ≥ 38).
+- Flagged-only (name, no extra fields): 0x2A inbound-message-ack, 0x91
+  distress-alert-ack, 0x9A enhanced-data-report-ack, 0xA0
+  distress-test-request, 0xAC request-status, 0xAD test-result.
+  Anything else → `unknown` (hex).
+
+### EGC header (0xB0/B1/B2, common layout)
+
+[2] service code; [3] bit7 continuation, bits6-5 priority (routine /
+safety / urgency / distress), bits4-0 repetition; [4-5] message sequence
+(BE); [6] packet sequence; [7] presentation; [8..] address (length by
+service code) then payload; 2-byte checksum.
+
+- **Address length by service code**: 0x00→3; 0x02,0x72→5;
+  0x04,0x14,0x24,0x34,0x44→7; 0x11,0x31→4; 0x13,0x23,0x33,0x73→6;
+  default 3.
+- **Service codes named** (short + canonical long name from inmarsatc
+  `getServiceCodeAndAddressName` / IMO SafetyNET): 0x00 all-ships,
+  0x02 FleetNET group-call, 0x04 SafetyNET rect warning, 0x11 Inmarsat
+  system, 0x13 coastal warning, 0x14 distress-circ, 0x23 EGC system,
+  0x24 warning-circ, 0x31 NAVAREA/METAREA warning, 0x33 download
+  group-id, 0x34 SAR-rect, 0x44 SAR-circ, 0x72 FleetNET chart
+  correction, 0x73 SafetyNET chart correction.
+- **Geographic area address — classified _and_ decoded** (STDC-1 /
+  STDC-1.1 / STDC-1.2, `area_shape` / `egc_area` + `*_geom`): the C2
+  service code is classified into its addressing shape and documented C3
+  field layout (per the IMO International SafetyNET Manual 2019 Annex 4
+  part A §5.2–5.3), **and** the on-air binary C3 address code is now
+  decoded into machine-readable geometry. The structured `details["area"]`
+  object carries `shape`, `c2`, the `c3_format` digit-layout string, the
+  raw `address_payload_hex` (the leading C2-repeat byte stripped), and a
+  nested `geometry` object — see the EGC geometry table below.
+- Assembly (`push_egc`): keyed by message sequence; parts ordered by
+  pkt_seq·2 + (part==2); complete when a terminating part arrives
+  (single header, or part 2) with continuation cleared; entries age out
+  after 8 frames.
+- **Single vs double header (VERIFY-6, resolved)**: STD-C carries a long
+  EGC message as a 0xB1 (header / part 1, continuation set) + 0xB2
+  (continuation, part 2) pair; a short self-contained message uses a
+  single 0xB0. The assembled `egc-message` records which form produced
+  it: `details["header_format"]` is `"double-0xB1+0xB2"` when any
+  constituent part used a 0xB1/0xB2 descriptor, else `"single-0xB0"`
+  (and the packet's reported `descriptor` is 0xB1 vs 0xB0 to match). A
+  0xB1 alone does not terminate assembly — only the 0xB2 with
+  continuation cleared does.
+
+### EGC geographic area geometry (STDC-1.1 / STDC-1.2, `egc_area`)
+
+The on-air binary C3 address code is decoded into signed degrees /
+nautical miles and emitted as `details["area"]["geometry"]`. Layout is
+read on the C3 payload (the address field with the leading C2-repeat byte
+stripped). **This is the only known open decode of the C3 binary** —
+inmarsatc, SatDump, sdrangel and inmarsat-sniffer all carry the EGC
+address as raw bytes (each marks the area decode "TODO" / `lat = NaN`).
+
+| Shape | C2 | On-air C3 bytes (post C2-repeat) | `geometry` fields emitted |
+|---|---|---|---|
+| Rectangular | 04, 34 | `[0]` bit7 N(0)/S(1) ∣ bits6-0 SW-lat°; `[1]` SW-lon°; `[2]` bit7 E(0)/W(1) ∣ bits6-0 north extent NM; `[3]` east extent NM | `sw_corner.{lat_deg,lon_deg}` (signed), `north_extent_nm`, `east_extent_nm`, `lat_hemisphere`, `lon_hemisphere` |
+| Circular | 14, 24, 44 | `[0]` bit7 N/S ∣ bits6-0 centre lat°; `[1]` centre lon°; `[2]` bit7 E/W ∣ bits6-0 radius hi; `[3]` radius lo (15-bit NM) | `center.{lat_deg,lon_deg}` (signed), `radius_nm`, `lat_hemisphere`, `lon_hemisphere` |
+| NAVAREA/METAREA | 31 | `[0]` area number 1–21 | `area_number`, `area_roman` (e.g. "XII"), `coordinator` |
+| Coastal / NAVTEX | 13, 73 | `[0]` area number; `[1]` coastal-area letter A–Z; `[2]` subject indicator | `area_number`, `area_roman`, `coordinator`, `coastal_area`, `subject_indicator`, `subject` |
+| All-ships | 00 | — | (no geometry; shape only) |
+
+- **Signs**: latitude bit7 set → south (negative `lat_deg`); the longitude
+  hemisphere bit lives in C3 byte `[2]` bit7 (set → west, negative
+  `lon_deg`). Both the signed degrees **and** the explicit
+  `lat_hemisphere`/`lon_hemisphere` strings are surfaced.
+- **Units note**: the manual's *MSI-provider* rectangular C3 _string_
+  states the extent in degrees (worked example `60N010W30025` = 30°/25°),
+  but the LES re-encodes the on-air binary field in **nautical miles**
+  (Scytale-C). The raw on-air integer (`*_extent_nm` / `radius_nm`) and
+  the corner/centre degrees are both surfaced so a map layer plots without
+  re-deriving the packing.
+- **Coastal subject indicator** (byte `[2]`, IMO Manual Annex 4 §5.3/§3.3):
+  `A` navigational-warnings, `L` other-navigational-warnings, `B`
+  meteorological-warnings, `E` meteorological-forecasts.
+- **NAVAREA/METAREA coordinator** table (issuing authority for area 1–21)
+  is verbatim from Scytale-C `ReturnNavMetAreaCoordinator`.
+
+### Text / presentation decode (`decode_payload`)
+
+- Presentation **0 = IA5** — one char per byte, top bit masked,
+  non-printable → `·`.
+- Presentation **6 = ITA2 / Baudot** (STDC-6) — one 5-bit code per
+  on-air byte with LTRS (0x1F) / FIGS (0x1B) shift; international ITU-T
+  ITA2 alphabet tables (`ITA2_LTRS` / `ITA2_FIGS`). No open decoder
+  (inmarsatc, SatDump) implements this.
+- Unknown presentation → IA5 when the payload is ≥85 % printable 7-bit
+  (`looks_textual`, the pragmatic inmarsatc test), else raw hex.
+
+### Logical-channel message reassembly
+
+0xAA payloads buffer per LCN; the 0x27 channel-clear flushes them — parts
+sorted by sequence, concatenated, text-decoded via the heuristic path,
+emitted as a `message` event. Stale channels age out after 8 frames.
+
+### Field-decode tables (oracles)
+
+- **frame_number → UTC-of-day** and **channel-frequency formulas**:
+  deterministic; cross-checked against inmarsatc `decode_7D` /
+  `uplinkChannelMhz` / `downlinkChannelMhz`. Validated on the real
+  capture (frame 5987 → 14:22:07; uplink word 0x2748 → 1636.64 MHz,
+  inside the L-band uplink band).
+- **Ocean region** (sat/LES bits 7-6: AOR-W / AOR-E / POR / IOR) +
+  short/long names; **LES/NCS operator name** keyed on the full
+  region×100+id display code (the same id maps to different operators by
+  region) — both verbatim from inmarsatc `getSatName` / `getLesName`.
+- **C-channel descriptor field maps (STDC-2)**: per-descriptor byte
+  layouts typed verbatim from inmarsatc `decode_6C` / `decode_7D` /
+  `decode_83` / `decode_92` / `decode_AB` / `decode_A3` / `decode_A8` /
+  `decode_08` / `getStations`; **services bit→name** tables
+  (`services_short` 8-bit, `services_full` 16-bit) from inmarsatc
+  `getServices_short` / `getServices`; **channel-type name** and the
+  **0x7D status-byte flag names** from `decode_7D`. Two transcription
+  bugs in the inmarsatc C++ are fixed here: `getStations` reads the
+  downlink byte twice (the field is a two-byte word), and `decode_7D`'s
+  channelType `switch` omits the `break`s (so its name always falls
+  through to "Reserved"); the intended per-value names are used. Channel
+  frequencies reuse the off-air-validated uplink/downlink formulas. The
+  descriptor maps without a public real-byte sample are pinned by
+  spec-derived packets built to the exact inmarsatc byte layout (not
+  encode→decode loopbacks).
+- **EGC service long names** — verbatim from inmarsatc
+  `getServiceCodeAndAddressName`.
+- **EGC C3 geometry binary packing** (STDC-1.1/1.2): oracle is
+  **Scytale-C** `PacketDecoderGeoUtils.cs` (`ReturnRectangularArea` /
+  `ReturnCircularArea` / `ReturnNavArea`), whose own cited bibliography is
+  the IMO/USCG International SafetyNET Manual; Scytale-C is the upstream
+  origin of the inmarsatc reference this crate already cross-verifies
+  against (facts only; re-derived in Rust). Verified against the manual's
+  published worked examples — rectangular `60N010W30025` (SW 60°N 010°W,
+  30 NM N, 25 NM E), circular `56N034W035` (centre 56°N 034°W, r 35 NM)
+  and body example `14N 66W 300` (centre 14°N 66°W, r 300 NM) — each
+  re-encodes bit-exact through the Scytale-C layout and is pinned as an
+  inline test vector. A southern/eastern case (38°S 164°E, r 999 NM)
+  pins both negative-lat and positive-lon paths.
+
+## Output
+
+`to_message` maps each packet to `Message::StdC { name, text, details }`
+with `Mode::StdC`, `crc_ok = checksum_ok`, RSSI from the demod level, raw
+bytes preserved. `details` is JSON carrying the decoded fields above.
+The per-frame Viterbi correction estimate maps onto the standard
+`DecodeQuality.fec_corrected` field; the per-frame UW BER (which has no
+dedicated field in the normalized model) is carried as
+`details["uw_ber_ppt"]`.
+
+## Validation / oracles
+
+- **Off-air** (`tests/offair.rs`): the sigidwiki Inmarsat-C TDM/EGC IQ
+  recording (CC BY-SA, AOR-E, TDM carrier +216 Hz). The full native
+  chain decodes the real frame — UW scored 128/128 on the first frame;
+  bulletin board frame 5987 → 14:22:07, announcement LES → "Vizada-
+  Telenor, Norway" (AOR-E, region_long "Atlantic Ocean Region East"),
+  0x6C → 1636.64 MHz uplink. The deepened descriptors decode self-
+  consistently on the real bytes: 0x7D channel_type 1 = NCS, sat/LES =
+  AOR-E NCS station (les 144), status operational + in-service, services
+  including SafetyNet/InmarsatC; the same 0x6C carries services byte 0xB4
+  and a 28-entry TDM-slot array. A 14 s slice is vendored as a CI fixture
+  (`tests/data/stdc_egc_14s.i16`, 24 kHz I/Q, attributed).
+- **RF loopback** (`tests/end_to_end.rs`): packets → `encode_frame` →
+  BPSK `modulate` → DDC → coherent decoder, with CFO and noise, both at
+  48 kS/s and 2.4 MS/s wideband; asserts EGC text, priority, service and
+  bulletin-board frame number round-trip exactly.
+- **Matched-filter BER oracle** (`tests/matched_filter.rs`, STDC-8): a
+  genuine modulate → complex-AWGN → demod noise test (NOT a noiseless
+  loopback). A frame is modulated with the TX RRC, Gaussian noise is
+  added at a controlled sigma, and the intact-frame recovery rate is
+  measured with the matched filter ON vs OFF over many seeds, swept into
+  the marginal-SNR cliff. Pass criteria: the matched-filter path recovers
+  **at least as many** frames as the bare lowpass at every SNR and
+  **materially more** net across the sweep. This is synthetic validation
+  of the matched-filter gain — there is no real off-air capture
+  isolating it. (`probe_sweep`, gated on `STDC_PROBE`, prints the full
+  gain curve.)
+- **Per-frame quality / flip recovery** (`frame.rs` unit tests): UW BER
+  ppt against an error count, `fec_corrected` = 0 on a clean frame and
+  tracking sparse injected errors, and the mid-frame polarity-flip path
+  (a tail inverted from row 40 defeats whole-frame sync, is detected,
+  corrected, and the payload recovered) plus a no-false-flip guard on a
+  clean frame. The `header_format` single-0xB0 vs double-0xB1+0xB2
+  distinction is pinned by `packet.rs::egc_header_format_single_vs_double`.
+- **Unit** (`packet.rs`, `frame.rs`): descrambler table prefix, frame
+  round-trip (clean / inverted / ~1 % symbol errors), Fletcher checksum,
+  LCN assembly, EGC single/multi-part assembly, ITA2 alphabet, area-shape
+  classification, the rectangular/circular/NAVAREA/coastal C3 geometry
+  decode against the manual worked examples (incl. a southern/eastern
+  hemisphere case) and end-to-end through the EGC assembly path, the
+  STDC-2 helper tables against their inmarsatc oracle values
+  (`channel_type_name`, `bulletin_status`, `services_short` /
+  `services_full`, `tdm_slots` two-bit unpacking, `parse_stations` record
+  layout, `sat_les` region+operator), `frame_to_utc_hms` against the
+  off-air oracle, and every other field-decode table against its oracle.
+- Oracles cross-referenced: inmarsatc (field tables, descriptor field
+  maps, services/status/channel-type tables + formulas), SatDump (PHY
+  constants; `.frm` stage goldens not yet vendored — see limitations),
+  Scytale-C (C3 geometry binary
+  packing + NAVAREA coordinator table), inmarsat-sniffer (C2 service-name
+  classification cross-check), IMO International SafetyNET Manual (2019)
+  (EGC area addressing + worked examples), ITU-T ITA2 (Baudot alphabet).
+  STD-C is oracle-validated field-exact — see
+  [BENCHMARKS.md](BENCHMARKS.md) (no count-style head-to-head yet).
+
+## Known limitations / intentional gaps
+
+- **EGC area coordinate extraction — now DONE** (was deferred). The
+  on-air binary C3 address code is decoded into signed degrees /
+  nautical miles for rectangular, circular, NAVAREA/METAREA and
+  coastal/NAVTEX areas, emitted as `details["area"]["geometry"]` (see the
+  EGC geometry table). The binary packing is sourced from Scytale-C and
+  pinned to the SafetyNET Manual worked examples. Remaining gap: no EGC
+  area packet appears in the vendored off-air fixture, so the geometry
+  path is verified against the manual's worked-example byte layouts (round-
+  trip + Scytale-C) rather than against a real area-addressed capture.
+- The remaining control descriptors (0x2A inbound-message-ack, 0x91
+  distress-alert-ack, 0x9A enhanced-data-report-ack, 0xA0
+  distress-test-request, 0xAC request-status, 0xAD test-result) are
+  recognized and named but their inner fields are not broken out — most
+  have no public real-byte sample to verify a field map against.
+- The 28-entry 0x6C `tdm_slots` array is surfaced as raw two-bit codes;
+  the per-slot allocation semantics are not interpreted further.
+- Demod cold-start timing acquisition is weak without receive-path
+  filtering (see PHY).
+- **RRC matched filter — validated synthetic-only.** The matched-filter
+  Eb/N0 gain is proven by the modulate → AWGN → demod BER oracle
+  (`tests/matched_filter.rs`), not by a real off-air A/B capture. The
+  matched filter is on in production regardless.
+- **CMA equalizer — still open.** No blind/adaptive equalizer fronts the
+  demod; only the fixed RRC matched filter. Multipath beyond what the
+  Costas/Gardner loops absorb is not equalized.
+- **SatDump `.frm` stage goldens — still open.** No per-stage `.frm`
+  golden vectors from SatDump are vendored or asserted against; the
+  off-air validation is the full-chain field-exact decode, not a
+  stage-by-stage byte diff.
 
 ## Gotchas
 
-1. Byte bit-reversal between Viterbi and descrambler.
-2. Scrambler init 0x80.
-3. Accept checksum 0x0000 in multiframe content.
-4. Mid-frame polarity reversal handling.
-5. Packet length fields exclude descriptor byte(s) — add 1/2/3.
+1. Coded-pair order: 133-output first (171-first → garbage).
+2. Bit packing is LSB-first per byte (chainback + byte reversal).
+3. Scrambler init 0x80, not 0x40.
+4. Accept checksum `00 00` inside multiframe content.
+5. Packet length fields exclude the descriptor byte(s) — add 1/2/3.
+6. 180° ambiguity is resolved at the UW (both polarities), not in demod.
+7. Gardner must be gated on carrier lock or frames slip and corrupt.
+8. EGC C3 geometry: longitude hemisphere bit is in byte `[2]` bit7 (with
+   the N/S extent / radius), not on the longitude byte itself; and the
+   rectangular extent is on-air nautical miles even though the manual's
+   MSI-provider string states degrees.
+9. RRC matched filter is the receive RRC half — its TX counterpart must
+   use the same β (`RRC_BETA` = 0.6) or the cascade is not Nyquist. The
+   `with_matched_filter(_, false)` path is for the BER oracle only;
+   production always runs it on.
+10. Mid-frame flip recovery must clear the `MID_FRAME_FLIP_MIN_GAIN`
+    (= 24 extra UW symbols) gate or noise fabricates phantom flips; the
+    correction inverts the odd run so the **normal** (non-inverted)
+    decode path handles the result.
+
+## Key references
+
+- inmarsatc (GPL-3) — field tables, channel/frame formulas (facts only).
+- SatDump (GPL-3) — PHY constants, `.frm` stage goldens (facts only).
+- Scytale-C (GPL-3) — frame structure cross-check and the C3 area
+  geometry binary packing (`PacketDecoderGeoUtils.cs`:
+  `ReturnRectangularArea` / `ReturnCircularArea` / `ReturnNavArea`) +
+  NAVAREA/METAREA coordinator table (`ReturnNavMetAreaCoordinator`)
+  (facts only).
+- inmarsat-sniffer — C2 service-name classification cross-check (facts
+  only).
+- IMO International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3 /
+  part B §3.3 — EGC geographic area addressing + worked examples
+  (`60N010W30025`, `56N034W035`, `14N 66W 300`).
+- ITU-T ITA2 (International Telegraph Alphabet No. 2) — Baudot alphabet.
+- sigidwiki Inmarsat-C TDM page — public IQ test vector (CC BY-SA).
+- PROVENANCE.md — sourcing policy and per-table oracle notes.

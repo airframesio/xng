@@ -25,6 +25,11 @@ pub struct AcarsBlock {
     pub downlink: bool,
     pub crc_ok: bool,
     pub parity_errors: u32,
+    /// Downlink MIN split into the raw 3-character message number and its
+    /// 4th (sequence) character, the libacars `msg_num` / `msg_num_seq`
+    /// pair (see [`crate::min`]). `None` for uplinks and textless blocks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<crate::min::DownlinkMin>,
 }
 
 /// Parse an ACARS block starting at SOH. Returns None when the structure
@@ -87,7 +92,9 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
     }
 
     let appdec = crate::decode(&label, &text, downlink);
+    let min = msg_num.as_deref().and_then(crate::min::split_downlink);
     Some(AcarsBlock {
+        min,
         core: AcarsCore {
             mode,
             tail,
@@ -101,9 +108,11 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
             text,
             more_to_come: ch[suffix_idx] == ETB,
             reassembled: false,
+            assstat: None,
             app: appdec
                 .app
                 .map(|a| serde_json::to_value(&a).unwrap_or_default()),
+            vdl2_link: None,
         },
         downlink,
         crc_ok,
@@ -184,6 +193,40 @@ mod tests {
         let app = b.core.app.expect("ADS-C app should decode");
         assert_eq!(app["app"], "adsc");
         assert_eq!(app["crc_ok"], true);
+    }
+
+    #[test]
+    fn downlink_block_surfaces_split_min() {
+        // A downlink block's text begins with the 4-char MIN + 6-char
+        // flight id. libacars splits the MIN into msg_num (3) + the 4th
+        // sequence char; the block must surface both.
+        let octets = build(
+            '2',
+            "N12345",
+            None,
+            "H1",
+            '4',
+            Some("M07C"),
+            Some("UA1234"),
+            "HELLO",
+            false,
+        );
+        let b = parse(&octets).expect("must parse");
+        assert!(b.crc_ok);
+        assert_eq!(b.core.msg_num.as_deref(), Some("M07C"));
+        let min = b.min.expect("downlink block has a split MIN");
+        assert_eq!(min.msg_num, "M07");
+        assert_eq!(min.msg_num_seq, 'C');
+        assert_eq!(min.seq, Some(2));
+    }
+
+    #[test]
+    fn uplink_block_has_no_min() {
+        // Uplink blocks (letter block id) carry no downlink MIN.
+        let octets = build('2', "N12345", Some('3'), "H1", 'A', None, None, "HI", false);
+        let b = parse(&octets).expect("must parse");
+        assert!(!b.downlink);
+        assert!(b.min.is_none());
     }
 
     #[test]

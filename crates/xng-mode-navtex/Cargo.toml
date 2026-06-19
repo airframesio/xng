@@ -1,0 +1,16 @@
+[package]
+name = "xng-mode-navtex"
+description = "Native NAVTEX (SITOR-B / CCIR 476) decode core for xng: 7-bit constant-ratio alphabet, FEC-B time-diversity, ZCZC message framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true

@@ -42,13 +42,239 @@ pub struct StdcPacket {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     pub details: serde_json::Value,
+    /// FEC (Viterbi) corrections on the frame this packet came from, if
+    /// known. Set by the channel decoder after frame decode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fec_corrected: Option<u32>,
+    /// Unique-word BER (parts-per-thousand) of the source frame, if known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uw_ber_ppt: Option<u32>,
     #[serde(skip_serializing)]
     pub raw: Vec<u8>,
 }
 
+/// L-band uplink (ship→LES) centre frequency in MHz from a 16-bit
+/// channel-number word. Per docs/notes/STDC.md (matches inmarsatc
+/// `uplinkChannelMhz`): MHz = (word − 6000) × 0.0025 + 1626.5.
+pub fn uplink_mhz(channel_word: u16) -> f64 {
+    (channel_word as f64 - 6000.0) * 0.0025 + 1626.5
+}
+
+/// L-band downlink (LES→ship) centre frequency in MHz from a 16-bit
+/// channel-number word. Per docs/notes/STDC.md (matches inmarsatc
+/// `downlinkChannelMhz`): MHz = (word − 8000) × 0.0025 + 1530.5.
+pub fn downlink_mhz(channel_word: u16) -> f64 {
+    (channel_word as f64 - 8000.0) * 0.0025 + 1530.5
+}
+
+/// Round a channel frequency to 4 decimals (0.1 kHz) for stable JSON.
+fn round4(mhz: f64) -> f64 {
+    (mhz * 1e4).round() / 1e4
+}
+
+/// Ocean-region long name from the 2-bit region field (sat/LES byte
+/// bits 7-6). Names verbatim from inmarsatc `getSatName`.
+pub fn ocean_region_long(region: u8) -> &'static str {
+    match region {
+        0 => "Atlantic Ocean Region West (AOR-W)",
+        1 => "Atlantic Ocean Region East (AOR-E)",
+        2 => "Pacific Ocean Region (POR)",
+        3 => "Indian Ocean Region (IOR)",
+        _ => "Unknown",
+    }
+}
+
+/// LES/NCS operator name from the display LES code (region×100 + id).
+/// Table verbatim from inmarsatc `getLesName`; the operator depends on
+/// *both* region and id (e.g. id 2 is Stratos Burum-2 in the Atlantic
+/// but Stratos Auckland in the Pacific), so the full code is the key.
+pub fn les_name(les_code: u16) -> Option<&'static str> {
+    Some(match les_code {
+        1 => "Vizada-Telenor, USA",
+        2 => "Stratos Global (Burum-2), Netherlands",
+        3 => "KDDI Japan",
+        4 => "Vizada-Telenor, Norway",
+        12 => "Stratos Global (Burum), Netherlands",
+        21 => "Vizada (FT), France",
+        44 => "NCS",
+        101 => "Vizada-Telenor, USA",
+        102 => "Stratos Global (Burum-2), Netherlands",
+        103 => "KDDI Japan",
+        104 => "Vizada-Telenor, Norway",
+        105 => "Telecom, Italia",
+        110 => "Turk Telecom, Turkey",
+        112 => "Stratos Global (Burum), Netherlands",
+        114 => "Embratel, Brazil",
+        116 => "Telekomunikacja Polska, Poland",
+        117 => "Morsviazsputnik, Russia",
+        120 => "OTESTAT, Greece",
+        121 => "Vizada (FT), France",
+        127 => "Bezeq, Israel",
+        144 => "NCS",
+        201 => "Vizada-Telenor, USA",
+        202 => "Stratos Global (Aukland), New Zealand",
+        203 => "KDDI Japan",
+        204 => "Vizada-Telenor, Norway",
+        210 => "Singapore Telecom, Singapore",
+        211 => "Beijing MCN, China",
+        212 => "Stratos Global (Burum), Netherlands",
+        217 => "Morsviazsputnik, Russia",
+        221 => "Vizada (FT), France",
+        244 => "NCS",
+        301 => "Vizada-Telenor, USA",
+        302 => "Stratos Global (Burum-2), Netherlands",
+        303 => "KDDI Japan",
+        304 => "Vizada-Telenor, Norway",
+        305 => "OTESTAT, Greece",
+        306 => "VSNL, India",
+        310 => "Turk Telecom, Turkey",
+        311 => "Beijing MCN, China",
+        312 => "Stratos Global (Burum), Netherlands",
+        316 => "Telekomunikacja Polska, Poland",
+        317 => "Morsviazsputnik, Russia",
+        321 => "Vizada (FT), France",
+        327 => "Bezeq, Israel",
+        328 => "Singapore Telecom, Singapore",
+        330 => "VISHIPEL, Vietnam",
+        335 => "Telecom, Italia",
+        344 => "NCS",
+        _ => return None,
+    })
+}
+
 fn sat_les(b: u8) -> serde_json::Value {
-    let region = ["AOR-W", "AOR-E", "POR", "IOR"][(b >> 6) as usize];
-    json!({ "region": region, "les": (b >> 6) as u16 * 100 + (b & 0x3F) as u16 })
+    let region = (b >> 6) & 0x3;
+    let region_short = ["AOR-W", "AOR-E", "POR", "IOR"][region as usize];
+    let les_code = region as u16 * 100 + (b & 0x3F) as u16;
+    json!({
+        "region": region_short,
+        "region_long": ocean_region_long(region),
+        "les": les_code,
+        "les_name": les_name(les_code),
+    })
+}
+
+/// Decode the 8-bit station-services bitfield (the high byte of the
+/// services word). Bit names verbatim from inmarsatc `getServices_short`
+/// (the same bits as the high byte of `getServices`). Only the set bits
+/// are returned, in MSB→LSB order, so the array doubles as a compact
+/// capability summary.
+pub fn services_short(is8: u8) -> Vec<&'static str> {
+    const NAMES: [&str; 8] = [
+        "MaritimeDistressAlerting", // 0x80
+        "SafetyNet",                // 0x40
+        "InmarsatC",                // 0x20
+        "StoreFwd",                 // 0x10
+        "HalfDuplex",               // 0x08
+        "FullDuplex",               // 0x04
+        "ClosedNetwork",            // 0x02
+        "FleetNet",                 // 0x01
+    ];
+    (0..8)
+        .filter(|i| is8 & (0x80 >> i) != 0)
+        .map(|i| NAMES[i])
+        .collect()
+}
+
+/// Decode the full 16-bit station-services bitfield. Bit names verbatim
+/// from inmarsatc `getServices` (the high byte matches `services_short`).
+/// Only the set bits are returned, in MSB→LSB order.
+pub fn services_full(iss: u16) -> Vec<&'static str> {
+    const NAMES: [&str; 16] = [
+        "MaritimeDistressAlerting", // 0x8000
+        "SafetyNet",                // 0x4000
+        "InmarsatC",                // 0x2000
+        "StoreFwd",                 // 0x1000
+        "HalfDuplex",               // 0x0800
+        "FullDuplex",               // 0x0400
+        "ClosedNetwork",            // 0x0200
+        "FleetNet",                 // 0x0100
+        "PrefixSF",                 // 0x0080
+        "LandMobileAlerting",       // 0x0040
+        "AeroC",                    // 0x0020
+        "ITA2",                     // 0x0010
+        "DATA",                     // 0x0008
+        "BasicX400",                // 0x0004
+        "EnhancedX400",             // 0x0002
+        "LowPowerCMES",             // 0x0001
+    ];
+    (0..16)
+        .filter(|i| iss & (0x8000 >> i) != 0)
+        .map(|i| NAMES[i])
+        .collect()
+}
+
+/// Bulletin-board (0x7D) channel-type name. Values per inmarsatc
+/// decode_7D's channelType switch (the C++ switch omits `break`s, so its
+/// channelTypeName always falls through to "Reserved" — a bug; the
+/// intended per-value names are used here).
+pub fn channel_type_name(channel_type: u8) -> &'static str {
+    match channel_type {
+        1 => "NCS",
+        2 => "LES TDM",
+        3 => "Joint NCS and TDM",
+        4 => "ST-BY NCS",
+        _ => "Reserved",
+    }
+}
+
+/// Decode the bulletin-board (0x7D) status byte into its named boolean
+/// flags. Bit→name mapping verbatim from inmarsatc decode_7D's `status`
+/// string (Bauds600 0x80, Operational 0x40, InService 0x20, Clear 0x10,
+/// LinksOpen 0x08).
+pub fn bulletin_status(status_b: u8) -> serde_json::Value {
+    json!({
+        "bauds_600": status_b & 0x80 != 0,
+        "operational": status_b & 0x40 != 0,
+        "in_service": status_b & 0x20 != 0,
+        "clear": status_b & 0x10 != 0,
+        "links_open": status_b & 0x08 != 0,
+    })
+}
+
+/// Decode a station list (LES directory) of `count` 6-byte records
+/// starting at `recs`. Record layout per inmarsatc `getStations`:
+///   [0]    sat/LES byte (region in bits 7-6, LES id in bits 5-0)
+///   [1]    servicesStart byte
+///   [2..4] 16-bit services bitfield (`getServices`)
+///   [4..6] downlink channel-number word
+/// Returns one JSON object per station; stops early if the slice runs
+/// out. (inmarsatc's downlink formula in getStations reads byte j+4
+/// twice — a transcription slip; the field is the j+4..j+6 word, decoded
+/// here with the oracle-verified downlink formula.)
+pub fn parse_stations(recs: &[u8], count: usize) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for i in 0..count {
+        let off = i * 6;
+        let r = match recs.get(off..off + 6) {
+            Some(r) => r,
+            None => break,
+        };
+        let dw = u16::from_be_bytes([r[4], r[5]]);
+        let iss = u16::from_be_bytes([r[2], r[3]]);
+        out.push(json!({
+            "sat_les": sat_les(r[0]),
+            "services_start": r[1],
+            "services": services_full(iss),
+            "downlink_mhz": round4(downlink_mhz(dw)),
+        }));
+    }
+    out
+}
+
+/// Decode the 28 TDM-slot allocation codes from a 0x6C signalling-channel
+/// descriptor. Per inmarsatc `decode_6C`: 7 bytes carry 28 two-bit slot
+/// codes, 4 per byte packed MSB→LSB (slot n at bits [7-2n .. 6-2n]).
+/// `bytes` must be the 7 TDM-slot bytes (body[4..11]).
+pub fn tdm_slots(bytes: &[u8]) -> Vec<u8> {
+    let mut slots = Vec::with_capacity(28);
+    for &b in bytes.iter().take(7) {
+        slots.push(b >> 6 & 0x3);
+        slots.push(b >> 4 & 0x3);
+        slots.push(b >> 2 & 0x3);
+        slots.push(b & 0x3);
+    }
+    slots
 }
 
 /// IA5 text: one character per byte, top bit masked.
@@ -68,6 +294,41 @@ fn ia5(bytes: &[u8]) -> String {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// ITA2 / Baudot letters (LTRS) shift, indexed by the 5-bit code 0..31.
+/// Standard International Telegraph Alphabet No. 2 (ITU-T); the letters
+/// column is universal. Empty string = shift/control with no glyph.
+const ITA2_LTRS: [&str; 32] = [
+    "\0", "E", "\n", "A", " ", "S", "I", "U", // 0-7  (2=LF, 4=SPACE)
+    "\r", "D", "R", "J", "N", "F", "C", "K", // 8-15 (8=CR)
+    "T", "Z", "L", "W", "H", "Y", "P", "Q", // 16-23
+    "O", "B", "G", "", "M", "X", "V", "", // 24-31 (27=FIGS, 31=LTRS)
+];
+/// ITA2 / Baudot figures (FIGS) shift, ITU-T international variant.
+const ITA2_FIGS: [&str; 32] = [
+    "\0", "3", "\n", "-", " ", "'", "8", "7", //
+    "\r", "\u{5}", "4", "\u{7}", ",", "!", ":", "(", //
+    "5", "+", ")", "2", "\u{a3}", "6", "0", "1", //
+    "9", "?", "&", "", ".", "/", ";", "", //
+];
+
+/// Decode ITA2/Baudot text (EGC presentation code 6). Each on-air byte
+/// carries one 5-bit ITA2 code in its low bits; LTRS (0x1F) / FIGS
+/// (0x1B) select the letters/figures column. Oracle for the alphabet is
+/// the ITU-T ITA2 standard table (deterministic, external reference).
+pub fn ita2_decode(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut figs = false;
+    for &b in bytes {
+        let code = (b & 0x1F) as usize;
+        match code {
+            0x1F => figs = false, // LTRS
+            0x1B => figs = true,  // FIGS
+            _ => out.push_str(if figs { ITA2_FIGS[code] } else { ITA2_LTRS[code] }),
+        }
+    }
+    out
 }
 
 /// EGC address length by service code.
@@ -102,7 +363,271 @@ fn egc_service_name(service: u8) -> &'static str {
     }
 }
 
+/// Canonical operator-friendly EGC service-code long name. Names follow
+/// inmarsatc `getServiceCodeAndAddressName` (IMO SafetyNET manual).
+pub fn egc_service_long_name(service: u8) -> Option<&'static str> {
+    Some(match service {
+        0x00 => "System, All ships (general call)",
+        0x02 => "FleetNET, Group Call",
+        0x04 => "SafetyNET, Navigational, Meteorological or Piracy Warning to a Rectangular Area",
+        0x11 => "System, Inmarsat System Message",
+        0x13 => "SafetyNET, Navigational, Meteorological or Piracy Coastal Warning",
+        0x14 => "SafetyNET, Shore-to-Ship Distress Alert to Circular Area",
+        0x23 => "System, EGC System Message",
+        0x24 => "SafetyNET, Navigational, Meteorological or Piracy Warning to a Circular Area",
+        0x31 => "SafetyNET, NAVAREA/METAREA Warning, MET Forecast or Piracy Warning to NAVAREA/METAREA",
+        0x33 => "System, Download Group Identity",
+        0x34 => "SafetyNET, SAR Coordination to a Rectangular Area",
+        0x44 => "SafetyNET, SAR Coordination to a Circular Area",
+        0x72 => "FleetNET, Chart Correction Service",
+        0x73 => "SafetyNET, Chart Correction Service for Fixed Areas",
+        _ => return None,
+    })
+}
+
+/// STD-C TDM frame number (0..9999) → UTC time-of-day. The frame counter
+/// resets at UTC midnight and one frame is exactly 8.64 s, so the whole
+/// day is 86400 / 8.64 = 10000 frames. seconds_of_day = frame × 8.64,
+/// formatted floored to whole-second "HH:MM:SS". Per docs/notes/STDC.md.
+pub fn frame_to_utc_hms(frame_number: u16) -> Option<String> {
+    if frame_number > 9999 {
+        return None;
+    }
+    let sod = (frame_number as f64 * 8.64).floor() as u32;
+    Some(format!(
+        "{:02}:{:02}:{:02}",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    ))
+}
+
 const PRIORITY: [&str; 4] = ["routine", "safety", "urgency", "distress"];
+
+/// Geographic addressing shape for a SafetyNET C2 service code, per the
+/// IMO International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AreaShape {
+    /// C2 = 04 / 34 — rectangular area, C3 = D1D2 La D3D4D5 Lo D6D7 D8D9D10
+    /// (SW-corner lat/lon in degrees + N and E extent).
+    Rectangular,
+    /// C2 = 14 / 24 / 44 — circular area, C3 = D1D2 La D3D4D5 Lo R1R2R3
+    /// (centre lat/lon in degrees + radius in nautical miles).
+    Circular,
+    /// C2 = 31 — NAVAREA / METAREA number (C3 = two digits X1X2, 01–21).
+    NavMetArea,
+    /// C2 = 13 / 73 — coastal warning area, C3 = X1X2 B1 B2 (NAVAREA
+    /// number + coastal-area letter A–Z + subject indicator A/L).
+    Coastal,
+    /// C2 = 00 — all ships (no geographic addressing).
+    AllShips,
+}
+
+/// Classify a SafetyNET C2 service code into its geographic addressing
+/// shape and the documented C3 address-code layout. Oracle: IMO
+/// International SafetyNET Manual (2019), Annex 4 part A §5.2–5.3 and the
+/// C-code table in §8 (cross-checked against inmarsat-sniffer's
+/// service-name table). The C3 format string is the MSI-provider digit
+/// layout (the manual's worked examples: rectangular `60N010W30025`,
+/// circular `56N034W035`). Returns None for non-geographic service codes.
+pub fn area_shape(c2: u8) -> Option<(AreaShape, &'static str)> {
+    Some(match c2 {
+        0x04 | 0x34 => (AreaShape::Rectangular, "D1D2La D3D4D5Lo D6D7 D8D9D10"),
+        0x14 | 0x24 | 0x44 => (AreaShape::Circular, "D1D2La D3D4D5Lo R1R2R3"),
+        0x31 => (AreaShape::NavMetArea, "X1X2"),
+        0x13 | 0x73 => (AreaShape::Coastal, "X1X2 B1 B2"),
+        0x00 => (AreaShape::AllShips, "00"),
+        _ => return None,
+    })
+}
+
+/// NAVAREA / METAREA coordinator (issuing authority) for area number 1–21.
+/// Table verbatim from Scytale-C `ReturnNavMetAreaCoordinator` (facts only;
+/// re-typed). Scytale-C's cited bibliography is the IMO/USCG SafetyNET
+/// manual and weather.gmdss.org/navareas.html.
+pub fn nav_met_area_coordinator(area: u8) -> Option<&'static str> {
+    Some(match area {
+        1 => "United Kingdom",
+        2 => "France",
+        3 => "Spain",
+        4 => "United States of America (East)",
+        5 => "Brazil",
+        6 => "Argentina",
+        7 => "South Africa",
+        8 => "India",
+        9 => "Pakistan",
+        10 => "Australia",
+        11 => "Japan",
+        12 => "United States of America (West)",
+        13 => "Russian Federation",
+        14 => "New Zealand",
+        15 => "Chile",
+        16 => "Peru",
+        17 | 18 => "Canada",
+        19 => "Norway",
+        20 | 21 => "Russian Federation",
+        _ => return None,
+    })
+}
+
+/// Render a NAVAREA/METAREA number (1–21) as its Roman numeral, the form
+/// used in MSI broadcasts (e.g. "NAVAREA XII"). Supports 1–39, which
+/// covers all defined areas with margin.
+fn area_roman(n: u8) -> String {
+    const TENS: [&str; 4] = ["", "X", "XX", "XXX"];
+    const ONES: [&str; 10] = [
+        "", "I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX",
+    ];
+    if n == 0 || n >= 40 {
+        return n.to_string();
+    }
+    format!("{}{}", TENS[(n / 10) as usize], ONES[(n % 10) as usize])
+}
+
+/// Decode the on-air binary C3 address code into machine-readable geometry.
+///
+/// `payload` is the C3 address field with the leading C2-repeat byte
+/// already stripped (`address[1..]`).
+///
+/// Oracle for the on-air **binary packing**: Scytale-C
+/// `PacketDecoderGeoUtils.cs` (`ReturnRectangularArea` / `ReturnCircularArea`
+/// / `ReturnNavArea`), whose cited bibliography is the IMO/USCG
+/// International SafetyNET Manual. Scytale-C is the upstream origin of the
+/// inmarsatc reference this crate already cross-verifies against; it is the
+/// only open decoder that decodes the C3 binary at all (inmarsatc, SatDump,
+/// sdrangel and inmarsat-sniffer carry the EGC address as raw bytes only —
+/// each marks the area decode "TODO" / `lat = NaN`). Facts only; re-derived.
+///
+/// On-air byte layout (the C2-repeat byte already removed):
+///   Rectangular (04/34): [0] bit7 N(0)/S(1) | bits6-0 SW-corner lat°,
+///     [1] SW-corner lon°, [2] bit7 E(0)/W(1) | bits6-0 north extent (NM),
+///     [3] east extent (NM).
+///   Circular (14/24/44): [0] bit7 N/S | bits6-0 centre lat°, [1] centre
+///     lon°, [2] bit7 E/W | bits6-0 radius hi, [3] radius lo (15-bit NM).
+///   NAVAREA/METAREA (31) and Coastal (13/73): [0] area number (1–21).
+///
+/// Note on units: the manual's *MSI-provider* C3 string states rectangular
+/// extent in degrees (worked example `60N010W30025` = 30°/25°), but the
+/// LES re-encodes the on-air binary field as nautical miles (Scytale-C); the
+/// circular radius is nautical miles in both. Both the raw on-air integer
+/// (`*_extent_nm` / `radius_nm`) and the derived corner/centre degrees are
+/// surfaced so a map layer can plot without re-deriving the packing.
+fn egc_area(service: u8, address: &[u8]) -> Option<serde_json::Value> {
+    let (shape, c3_format) = area_shape(service)?;
+    let shape_name = match shape {
+        AreaShape::Rectangular => "rectangular",
+        AreaShape::Circular => "circular",
+        AreaShape::NavMetArea => "navarea-metarea",
+        AreaShape::Coastal => "coastal",
+        AreaShape::AllShips => "all-ships",
+    };
+    // address[0] repeats the C2 service code; the geographic payload (the
+    // C3 address code) is the remaining bytes.
+    let payload: &[u8] = address.get(1..).unwrap_or(&[]);
+    let mut area = json!({
+        "shape": shape_name,
+        "c2": service,
+        "c3_format": c3_format,
+        "address_payload_hex": hex(payload),
+    });
+    let obj = area.as_object_mut().expect("json object");
+    match shape {
+        AreaShape::Rectangular => {
+            if let Some(geom) = rectangular_geom(payload) {
+                obj.insert("geometry".to_string(), geom);
+            }
+        }
+        AreaShape::Circular => {
+            if let Some(geom) = circular_geom(payload) {
+                obj.insert("geometry".to_string(), geom);
+            }
+        }
+        AreaShape::NavMetArea | AreaShape::Coastal => {
+            if let Some(geom) = nav_met_geom(shape, payload) {
+                obj.insert("geometry".to_string(), geom);
+            }
+        }
+        AreaShape::AllShips => {}
+    }
+    Some(area)
+}
+
+/// Decode the rectangular-area C3 binary (4 payload bytes) into SW-corner
+/// lat/lon degrees + north/east extent in NM. Layout per Scytale-C
+/// `ReturnRectangularArea` (oracle above).
+fn rectangular_geom(p: &[u8]) -> Option<serde_json::Value> {
+    if p.len() < 4 {
+        return None;
+    }
+    let lat = (p[0] & 0x7F) as i32 * if p[0] & 0x80 != 0 { -1 } else { 1 };
+    let lon = p[1] as i32 * if p[2] & 0x80 != 0 { -1 } else { 1 };
+    let north_nm = (p[2] & 0x7F) as i32;
+    let east_nm = p[3] as i32;
+    Some(json!({
+        "sw_corner": { "lat_deg": lat, "lon_deg": lon },
+        "north_extent_nm": north_nm,
+        "east_extent_nm": east_nm,
+        "lat_hemisphere": if p[0] & 0x80 != 0 { "S" } else { "N" },
+        "lon_hemisphere": if p[2] & 0x80 != 0 { "W" } else { "E" },
+    }))
+}
+
+/// Decode the circular-area C3 binary (4 payload bytes) into centre lat/lon
+/// degrees + radius in NM (15-bit). Layout per Scytale-C
+/// `ReturnCircularArea` (oracle above).
+fn circular_geom(p: &[u8]) -> Option<serde_json::Value> {
+    if p.len() < 4 {
+        return None;
+    }
+    let lat = (p[0] & 0x7F) as i32 * if p[0] & 0x80 != 0 { -1 } else { 1 };
+    let lon = p[1] as i32 * if p[2] & 0x80 != 0 { -1 } else { 1 };
+    let radius_nm = ((p[2] & 0x7F) as i32) << 8 | p[3] as i32;
+    Some(json!({
+        "center": { "lat_deg": lat, "lon_deg": lon },
+        "radius_nm": radius_nm,
+        "lat_hemisphere": if p[0] & 0x80 != 0 { "S" } else { "N" },
+        "lon_hemisphere": if p[2] & 0x80 != 0 { "W" } else { "E" },
+    }))
+}
+
+/// Decode the NAVAREA/METAREA (31) or coastal (13/73) C3 binary: the first
+/// payload byte is the area number (1–21). Layout per Scytale-C
+/// `ReturnNavArea` / `ReturnCoastalArea` (oracle above).
+fn nav_met_geom(shape: AreaShape, p: &[u8]) -> Option<serde_json::Value> {
+    let n = *p.first()?;
+    let mut obj = json!({
+        "area_number": n,
+        "area_roman": area_roman(n),
+        "coordinator": nav_met_area_coordinator(n),
+    });
+    if shape == AreaShape::Coastal {
+        // Coastal: X1X2 area number, then B1 = coastal-area letter (A–Z),
+        // B2 = subject indicator (A/L navigational, B/E meteorological).
+        // Per IMO SafetyNET Manual Annex 4 part A §5.3 / part B §3.3.
+        let m = obj.as_object_mut().unwrap();
+        if let Some(&b1) = p.get(1) {
+            let c = b1 & 0x7F;
+            if c.is_ascii_uppercase() {
+                m.insert("coastal_area".to_string(), json!((c as char).to_string()));
+            }
+        }
+        if let Some(&b2) = p.get(2) {
+            let c = (b2 & 0x7F) as char;
+            let subj = match c {
+                'A' => Some("navigational-warnings"),
+                'L' => Some("other-navigational-warnings"),
+                'B' => Some("meteorological-warnings"),
+                'E' => Some("meteorological-forecasts"),
+                _ => None,
+            };
+            if let Some(s) = subj {
+                m.insert("subject_indicator".to_string(), json!(c.to_string()));
+                m.insert("subject".to_string(), json!(s));
+            }
+        }
+    }
+    Some(obj)
+}
 
 /// Parsed EGC packet header + payload, pre-assembly.
 #[derive(Debug, Clone)]
@@ -164,6 +689,8 @@ fn looks_textual(payload: &[u8]) -> bool {
 fn decode_payload(presentation: u8, payload: &[u8]) -> (Option<String>, serde_json::Value) {
     match presentation {
         0 => (Some(ia5(payload)), json!({})),
+        // Presentation 6 = ITA2 / Baudot (5-bit, one code per byte).
+        6 => (Some(ita2_decode(payload)), json!({ "encoding": "ita2" })),
         // Unknown presentation codes: decode as IA5 when the bytes are
         // overwhelmingly printable, otherwise keep hex.
         _ if looks_textual(payload) => (
@@ -189,6 +716,12 @@ struct EgcAssembly {
     presentation: u8,
     address: Vec<u8>,
     parts: Vec<(u16, Vec<u8>)>, // key = pkt_seq*2 + (part==2)
+    /// True if any constituent part used the double-header format
+    /// (descriptors 0xB1/0xB2) rather than the single 0xB0 header. STD-C
+    /// carries long EGC messages as a 0xB1 (header) + 0xB2 (continuation)
+    /// pair; short ones use a single self-contained 0xB0. Surfaced so the
+    /// distinction is observable downstream (VERIFY-6).
+    double_header: bool,
     age: u32,
 }
 
@@ -255,15 +788,46 @@ impl PacketParser {
         let desc = pkt[0];
         let body = &pkt[..pkt.len()];
         let (name, text, details): (&'static str, Option<String>, serde_json::Value) = match desc {
-            0x7D if body.len() >= 4 => (
-                "bulletin-board",
-                None,
-                json!({
+            0x7D if body.len() >= 4 => {
+                // Per inmarsatc decode_7D: networkVersion body[1],
+                // frameNumber body[2..4], signallingChannel body[4]>>2,
+                // count (body[5]>>4)*2, channelType body[6]>>5, local
+                // body[6]>>2&7, sat/les body[7], status byte body[8],
+                // 16-bit services body[9..11], randomInterval body[11].
+                let frame_number = u16::from_be_bytes([body[2], body[3]]);
+                let mut details = json!({
                     "network_version": body.get(1),
-                    "frame_number": u16::from_be_bytes([body[2], body[3]]),
+                    "frame_number": frame_number,
+                    "utc_time": frame_to_utc_hms(frame_number),
                     "channel_type": body.get(6).map(|b| b >> 5),
-                }),
-            ),
+                });
+                if let Some(obj) = details.as_object_mut() {
+                    if let Some(&b) = body.get(4) {
+                        obj.insert("signalling_channel".to_string(), json!(b >> 2));
+                    }
+                    if let Some(&b) = body.get(5) {
+                        obj.insert("count".to_string(), json!((b >> 4 & 0x0F) * 2));
+                    }
+                    if let Some(&b) = body.get(6) {
+                        obj.insert("channel_type_name".to_string(), json!(channel_type_name(b >> 5)));
+                        obj.insert("local".to_string(), json!(b >> 2 & 0x07));
+                    }
+                    if let Some(&b) = body.get(7) {
+                        obj.insert("sat_les".to_string(), sat_les(b));
+                    }
+                    if let Some(&s) = body.get(8) {
+                        obj.insert("status".to_string(), bulletin_status(s));
+                    }
+                    if body.len() >= 11 {
+                        let iss = u16::from_be_bytes([body[9], body[10]]);
+                        obj.insert("services".to_string(), json!(services_full(iss)));
+                    }
+                    if let Some(&ri) = body.get(11) {
+                        obj.insert("random_interval".to_string(), json!(ri));
+                    }
+                }
+                ("bulletin-board", None, details)
+            }
             0x27 if body.len() >= 8 => {
                 // The clear terminates the logical channel: emit any
                 // message-data assembled on that LCN.
@@ -281,10 +845,43 @@ impl PacketParser {
                 "sat_les": sat_les(body[5]),
                 "lcn": body.get(9),
             })),
-            0x83 if body.len() >= 8 => ("logical-channel-assignment", None, json!({
-                "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
-                "lcn": body.get(7),
-            })),
+            0x83 if body.len() >= 8 => {
+                // Per inmarsatc decode_83: mes_id body[2..5], sat/les
+                // body[5], status_bits body[6], lcn body[7], frame_length
+                // body[8], duration body[9], downlink word body[10..12],
+                // uplink word body[12..14], frame_offset body[14],
+                // packetDescriptor1 body[15]. Surface what is present so
+                // the message channel can actually be tuned.
+                let mut details = json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "lcn": body.get(7),
+                });
+                if let Some(obj) = details.as_object_mut() {
+                    obj.insert("sat_les".to_string(), sat_les(body[5]));
+                    obj.insert("status_bits".to_string(), json!(body[6]));
+                    if let Some(&fl) = body.get(8) {
+                        obj.insert("frame_length".to_string(), json!(fl));
+                    }
+                    if let Some(&d) = body.get(9) {
+                        obj.insert("duration".to_string(), json!(d));
+                    }
+                    if body.len() >= 12 {
+                        let dw = u16::from_be_bytes([body[10], body[11]]);
+                        obj.insert("downlink_mhz".to_string(), json!(round4(downlink_mhz(dw))));
+                    }
+                    if body.len() >= 14 {
+                        let uw = u16::from_be_bytes([body[12], body[13]]);
+                        obj.insert("uplink_mhz".to_string(), json!(round4(uplink_mhz(uw))));
+                    }
+                    if let Some(&off) = body.get(14) {
+                        obj.insert("frame_offset".to_string(), json!(off));
+                    }
+                    if let Some(&pd1) = body.get(15) {
+                        obj.insert("packet_descriptor1".to_string(), json!(pd1));
+                    }
+                }
+                ("logical-channel-assignment", None, details)
+            }
             0xAA => {
                 // Message data: assemble per logical channel.
                 if body.len() >= 7 {
@@ -345,19 +942,110 @@ impl PacketParser {
                 }
                 return;
             }
+            0x92 if body.len() >= 8 => {
+                // Per inmarsatc decode_92: body[1] = loginAckLength,
+                // body[2..5] = LES id (3 bytes), body[5..7] = downlink
+                // channel word, body[7] = stationStart; when
+                // loginAckLength > 7 a station list follows (count at
+                // body[8], 6-byte records from body[9]).
+                let login_ack_len = body[1];
+                let dw = u16::from_be_bytes([body[5], body[6]]);
+                let mut details = json!({
+                    "login_ack_len": login_ack_len,
+                    "les": hex(&body[2..5]),
+                    "downlink_mhz": round4(downlink_mhz(dw)),
+                    "station_start": body[7],
+                });
+                if login_ack_len > 7 && body.len() >= 9 {
+                    let count = body[8] as usize;
+                    let stations = parse_stations(&body[9..body.len() - 2], count);
+                    if let Some(obj) = details.as_object_mut() {
+                        obj.insert("station_count".to_string(), json!(body[8]));
+                        obj.insert("stations".to_string(), json!(stations));
+                    }
+                }
+                ("login-ack", None, details)
+            }
             0x92 => ("login-ack", None, json!({})),
+            0xA8 if body.len() >= 11 => {
+                // Per inmarsatc decode_A8: mes_id body[2..5], sat/les
+                // body[5], shortMessageLength body[9]; when that length
+                // is > 2 a short IA5 message runs from body[11] up to the
+                // checksum (body.len() == packetLength).
+                let sm_len = body[9];
+                let mut text = None;
+                if sm_len > 2 && body.len() >= 13 {
+                    text = Some(ia5(&body[11..body.len() - 2]));
+                }
+                ("confirmation", text, json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "sat_les": sat_les(body[5]),
+                    "short_message_len": sm_len,
+                }))
+            }
             0xA8 => ("confirmation", None, json!({})),
+            0xAB if body.len() >= 4 => {
+                // Per inmarsatc decode_AB: body[1] = lesListLength,
+                // body[2] = stationStart, body[3] = stationCount, then
+                // 6-byte station records from body[4].
+                let count = body[3] as usize;
+                let stations = parse_stations(&body[4..body.len().saturating_sub(2)], count);
+                ("les-list", None, json!({
+                    "les_list_len": body[1],
+                    "station_start": body[2],
+                    "station_count": body[3],
+                    "stations": stations,
+                }))
+            }
             0xAB => ("les-list", None, json!({})),
+            0x08 if body.len() >= 5 => {
+                // Per inmarsatc decode_08: sat/les body[1], lcn body[2],
+                // uplink channel word body[3..5] — the routing back to the
+                // ship's uplink channel for the acknowledgement.
+                let uw = u16::from_be_bytes([body[3], body[4]]);
+                ("ack-request", None, json!({
+                    "sat_les": sat_les(body[1]),
+                    "lcn": body[2],
+                    "uplink_mhz": round4(uplink_mhz(uw)),
+                }))
+            }
             0x08 => ("ack-request", None, json!({})),
+            0x6C if body.len() >= 4 => {
+                // Per inmarsatc decode_6C: body[1] = 8-bit services byte
+                // (the high byte of the 7D services word), body[2..4] =
+                // uplink channel-number word, body[4..11] = 28 TDM-slot
+                // codes (4 per byte). Surface whatever the packet carries.
+                let word = u16::from_be_bytes([body[2], body[3]]);
+                let mut details = json!({
+                    "services": services_short(body[1]),
+                    "uplink_mhz": round4(uplink_mhz(word)),
+                });
+                if body.len() >= 11 {
+                    if let Some(obj) = details.as_object_mut() {
+                        obj.insert("tdm_slots".to_string(), json!(tdm_slots(&body[4..11])));
+                    }
+                }
+                ("signalling-channel", None, details)
+            }
             0x6C => ("signalling-channel", None, json!({})),
             0x2A => ("inbound-message-ack", None, json!({})),
             0x91 => ("distress-alert-ack", None, json!({})),
             0x9A => ("enhanced-data-report-ack", None, json!({})),
             0xA0 => ("distress-test-request", None, json!({})),
-            0xA3 if body.len() >= 8 => ("individual-poll", None, json!({
-                "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
-                "sat_les": sat_les(body[5]),
-            })),
+            0xA3 if body.len() >= 8 => {
+                // Per inmarsatc decode_A3: mes_id body[2..5], sat/les
+                // body[5]. When the packet is long enough (inmarsatc:
+                // packetLength >= 38) it carries a short IA5 message from
+                // body[13] up to the checksum. body.len() == packetLength.
+                let mut text = None;
+                if body.len() >= 38 && body.len() >= 15 {
+                    text = Some(ia5(&body[13..body.len() - 2]));
+                }
+                ("individual-poll", text, json!({
+                    "mes_id": format!("{:02X}{:02X}{:02X}", body[2], body[3], body[4]),
+                    "sat_les": sat_les(body[5]),
+                }))
+            }
             0xAC => ("request-status", None, json!({})),
             0xAD => ("test-result", None, json!({})),
             _ => ("unknown", None, json!({ "hex": hex(body) })),
@@ -368,6 +1056,8 @@ impl PacketParser {
             checksum_ok: true,
             text,
             details,
+            fec_corrected: None,
+            uw_ber_ppt: None,
             raw: pkt.to_vec(),
         });
     }
@@ -401,6 +1091,8 @@ impl PacketParser {
             checksum_ok: true,
             text,
             details,
+            fec_corrected: None,
+            uw_ber_ppt: None,
             raw: payload,
         })
     }
@@ -418,12 +1110,15 @@ impl PacketParser {
                     presentation: part.presentation,
                     address: part.address.clone(),
                     parts: Vec::new(),
+                    double_header: false,
                     age: 0,
                 });
                 self.egc.len() - 1
             });
         let a = &mut self.egc[idx];
         a.age = 0;
+        // 0xB0 = single header (part 0); 0xB1/0xB2 = double-header pair.
+        a.double_header |= part.double_header_part != 0;
         let key = part.pkt_seq as u16 * 2 + (part.double_header_part == 2) as u16;
         if !a.parts.iter().any(|(k, _)| *k == key) {
             a.parts.push((key, part.payload.clone()));
@@ -443,23 +1138,36 @@ impl PacketParser {
         let (text, extra) = decode_payload(done.presentation, &payload);
         let mut details = json!({
             "service": egc_service_name(done.service),
+            "service_long": egc_service_long_name(done.service),
             "service_code": done.service,
             "priority": PRIORITY[done.priority as usize],
             "msg_seq": done.msg_seq,
             "address_hex": hex(&done.address),
             "parts": done.parts.len(),
+            // VERIFY-6: distinguish the single 0xB0 header from the
+            // double 0xB1+0xB2 header pair on the assembled message.
+            "header_format": if done.double_header { "double-0xB1+0xB2" } else { "single-0xB0" },
         });
+        if let Some(area) = egc_area(done.service, &done.address) {
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("area".to_string(), area);
+            }
+        }
         if let (Some(obj), Some(eobj)) = (details.as_object_mut(), extra.as_object()) {
             for (k, v) in eobj {
                 obj.insert(k.clone(), v.clone());
             }
         }
         Some(StdcPacket {
-            descriptor: 0xB0,
+            // Reflect the constituent descriptor so the header format is
+            // observable on the packet itself, not just in details.
+            descriptor: if done.double_header { 0xB1 } else { 0xB0 },
             name: "egc-message",
             checksum_ok: true,
             text,
             details,
+            fec_corrected: None,
+            uw_ber_ppt: None,
             raw: payload,
         })
     }
@@ -495,14 +1203,36 @@ mod tests {
         assert!(!checksum_ok(&bad));
     }
 
-    /// Build a medium-format EGC packet (0xB0/B1/B2).
+    /// Build a medium-format EGC packet (0xB0/B1/B2) with IA5 presentation.
     fn egc_packet(desc: u8, service: u8, cont: bool, prio: u8, seq: u16, pkt_no: u8, text: &[u8]) -> Vec<u8> {
+        egc_packet_pres(desc, service, cont, prio, seq, pkt_no, 0, text)
+    }
+
+    /// Build a medium-format EGC packet with an explicit presentation code.
+    #[allow(clippy::too_many_arguments)]
+    fn egc_packet_pres(desc: u8, service: u8, cont: bool, prio: u8, seq: u16, pkt_no: u8, presentation: u8, text: &[u8]) -> Vec<u8> {
         let alen = egc_addr_len(service);
         let mut body = vec![desc, 0u8, service, ((cont as u8) << 7) | (prio << 5) | 1];
         body.extend(seq.to_be_bytes());
         body.push(pkt_no);
-        body.push(0); // IA5
+        body.push(presentation);
         body.extend(std::iter::repeat(0xAB).take(alen));
+        body.extend(text);
+        body[1] = (body.len() + 2 - 2) as u8; // medium length = total-2
+        build_packet(&body)
+    }
+
+    /// Build a medium-format EGC packet with an explicit on-air address
+    /// field (the full address including the leading C2-repeat byte), used
+    /// to exercise the C3 geometry decode end-to-end. IA5 presentation.
+    #[allow(clippy::too_many_arguments)]
+    fn egc_packet_with_address(desc: u8, service: u8, prio: u8, seq: u16, pkt_no: u8, address: &[u8], text: &[u8]) -> Vec<u8> {
+        assert_eq!(address.len(), egc_addr_len(service));
+        let mut body = vec![desc, 0u8, service, (prio << 5) | 1];
+        body.extend(seq.to_be_bytes());
+        body.push(pkt_no);
+        body.push(0u8); // presentation 0 = IA5
+        body.extend_from_slice(address);
         body.extend(text);
         body[1] = (body.len() + 2 - 2) as u8; // medium length = total-2
         build_packet(&body)
@@ -530,6 +1260,108 @@ mod tests {
     }
 
     #[test]
+    fn logical_channel_assignment_full_fields() {
+        // STDC-2. Field layout per inmarsatc decode_83 (spec-derived
+        // packet built to that exact byte map):
+        //   body[2..5]  mes_id              = C1 24 BB
+        //   body[5]     sat/les (0x44)      = AOR-E / les 104
+        //   body[6]     status_bits         = 0x12
+        //   body[7]     lcn                 = 0x21
+        //   body[8]     frame_length        = 0x28
+        //   body[9]     duration            = 0x0A
+        //   body[10..12] downlink word 8400 -> 1531.5 MHz
+        //   body[12..14] uplink word 0x2748 -> 1636.64 MHz
+        //   body[14]    frame_offset        = 0x03
+        //   body[15]    packetDescriptor1   = 0xAA
+        let mut parser = PacketParser::new();
+        let mut body = [
+            0x83, 0x00, 0xC1, 0x24, 0xBB, 0x44, 0x12, 0x21, 0x28, 0x0A, 0x20, 0xD0, 0x27, 0x48,
+            0x03, 0xAA,
+        ];
+        // Medium descriptor: body[1] = total length - 2 (incl. checksum).
+        body[1] = (body.len() + 2 - 2) as u8;
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let a = out
+            .iter()
+            .find(|p| p.name == "logical-channel-assignment")
+            .expect("assignment parses");
+        assert_eq!(a.details["mes_id"], "C124BB");
+        assert_eq!(a.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(a.details["sat_les"]["les"], 104);
+        assert_eq!(a.details["status_bits"], 0x12);
+        assert_eq!(a.details["lcn"], 0x21);
+        assert_eq!(a.details["frame_length"], 0x28);
+        assert_eq!(a.details["duration"], 0x0A);
+        assert_eq!(a.details["downlink_mhz"], 1531.5);
+        assert_eq!(a.details["uplink_mhz"], 1636.64);
+        assert_eq!(a.details["frame_offset"], 0x03);
+        assert_eq!(a.details["packet_descriptor1"], 0xAA);
+    }
+
+    #[test]
+    fn parse_stations_decodes_record_layout() {
+        // STDC-2. Record layout per inmarsatc getStations: 6 bytes each
+        // [sat/les, servicesStart, iss(16-bit), downlink word(16-bit)].
+        // Station 0: sat/les 0x44 (AOR-E les 104), servicesStart 0x01,
+        // iss 0x4020 (SafetyNet+AeroC), downlink word 8400 -> 1531.5 MHz.
+        let recs = [0x44, 0x01, 0x40, 0x20, 0x20, 0xD0];
+        let v = parse_stations(&recs, 1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0]["sat_les"]["region"], "AOR-E");
+        assert_eq!(v[0]["sat_les"]["les"], 104);
+        assert_eq!(v[0]["services_start"], 0x01);
+        assert_eq!(v[0]["services"], json!(["SafetyNet", "AeroC"]));
+        assert_eq!(v[0]["downlink_mhz"], 1531.5);
+        // Short slice → stops early without panicking.
+        assert_eq!(parse_stations(&recs[..4], 2).len(), 0);
+    }
+
+    #[test]
+    fn les_list_fields_and_stations() {
+        // STDC-2. 0xAB layout per inmarsatc decode_AB: body[1] list len,
+        // body[2] stationStart, body[3] stationCount, 6-byte records from
+        // body[4]. Two stations: AOR-E les 104 and POR les 202.
+        let mut parser = PacketParser::new();
+        let mut body = vec![0xAB, 0x00, 0x05, 0x02];
+        body.extend([0x44, 0x01, 0x40, 0x20, 0x20, 0xD0]); // AOR-E les 104
+        body.extend([0x82, 0x02, 0x20, 0x00, 0x20, 0xD0]); // POR les 202
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let l = out.iter().find(|p| p.name == "les-list").expect("les-list parses");
+        assert_eq!(l.details["station_count"], 2);
+        assert_eq!(l.details["station_start"], 0x05);
+        let stations = l.details["stations"].as_array().unwrap();
+        assert_eq!(stations.len(), 2);
+        assert_eq!(stations[0]["sat_les"]["les"], 104);
+        assert_eq!(stations[1]["sat_les"]["region"], "POR");
+        assert_eq!(stations[1]["sat_les"]["les"], 202);
+    }
+
+    #[test]
+    fn login_ack_fields_and_station_list() {
+        // STDC-2. 0x92 layout per inmarsatc decode_92: body[1] ackLen,
+        // body[2..5] LES id, body[5..7] downlink word, body[7] start;
+        // when ackLen > 7, body[8] = count and records follow at body[9].
+        let mut parser = PacketParser::new();
+        let mut body = vec![0x92, 0x00, 0x12, 0x34, 0x56, 0x20, 0xD0, 0x77, 0x01];
+        body.extend([0x44, 0x01, 0x40, 0x20, 0x20, 0xD0]); // one station
+        body[1] = (body.len() + 2 - 2) as u8; // ackLen (= total-2) > 7
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let la = out.iter().find(|p| p.name == "login-ack").expect("login-ack parses");
+        assert_eq!(la.details["les"], "123456");
+        assert_eq!(la.details["downlink_mhz"], 1531.5);
+        assert_eq!(la.details["station_start"], 0x77);
+        assert_eq!(la.details["station_count"], 1);
+        assert_eq!(la.details["stations"][0]["sat_les"]["les"], 104);
+    }
+
+    #[test]
     fn individual_poll_fields() {
         let mut parser = PacketParser::new();
         // Medium format: b[1] = total length - 2.
@@ -539,6 +1371,98 @@ mod tests {
         let out = parser.parse_frame(&padded);
         let p = out.iter().find(|p| p.name == "individual-poll").expect("poll parses");
         assert_eq!(p.details["mes_id"], "C124BB");
+    }
+
+    #[test]
+    fn individual_poll_short_message_text() {
+        // STDC-2. 0xA3 short-message layout per inmarsatc decode_A3:
+        // mes_id body[2..5], sat/les body[5]; when the packet is long
+        // enough (packetLength >= 38) an IA5 message runs from body[13].
+        let mut parser = PacketParser::new();
+        // body[0..13] header (mes_id C1 24 BB at [2..5], sat/les 0x44 at
+        // [5]); message text fills body[13..]; total length lands at 40.
+        let mut body = vec![0xA3, 0x00, 0xC1, 0x24, 0xBB, 0x44, 0, 0, 0, 0, 0, 0, 0];
+        body.extend_from_slice(b"POLL ACK SHORT MESSAGE OK");
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        // Total packet length (incl. checksum) exceeds the inmarsatc
+        // short-message threshold (38), so the message is surfaced.
+        assert!(body.len() + 2 >= 38);
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let p = out.iter().find(|p| p.name == "individual-poll").expect("poll parses");
+        assert_eq!(p.details["mes_id"], "C124BB");
+        assert_eq!(p.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(p.text.as_deref(), Some("POLL ACK SHORT MESSAGE OK"));
+    }
+
+    #[test]
+    fn individual_poll_short_packet_has_no_text() {
+        // A short 0xA3 (below the inmarsatc length threshold) carries no
+        // short message — only the routing fields.
+        let mut parser = PacketParser::new();
+        let poll = build_packet(&[0xA3, 8, 0xC1, 0x24, 0xBB, 0x44, 0x01, 0x03]);
+        let mut frame = poll;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let p = out.iter().find(|p| p.name == "individual-poll").unwrap();
+        assert_eq!(p.text, None);
+        assert_eq!(p.details["mes_id"], "C124BB");
+    }
+
+    #[test]
+    fn confirmation_short_message_text() {
+        // STDC-2. 0xA8 layout per inmarsatc decode_A8: mes_id body[2..5],
+        // sat/les body[5], shortMessageLength body[9]; when > 2 the IA5
+        // message runs from body[11] up to the checksum.
+        let mut parser = PacketParser::new();
+        let msg = b"CONFIRMED";
+        // Header is body[0..11] (mes_id [2..5], sat/les [5], unknown1
+        // [6..9], shortMessageLength [9], unknown2 [10]); message at [11].
+        let mut body = vec![0xA8, 0x00, 0x12, 0x34, 0x56, 0x44, 0, 0, 0, msg.len() as u8, 0];
+        body.extend_from_slice(msg);
+        body[1] = (body.len() + 2 - 2) as u8; // medium length
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let c = out.iter().find(|p| p.name == "confirmation").expect("confirmation parses");
+        assert_eq!(c.details["mes_id"], "123456");
+        assert_eq!(c.details["sat_les"]["les"], 104);
+        assert_eq!(c.details["short_message_len"], msg.len());
+        assert_eq!(c.text.as_deref(), Some("CONFIRMED"));
+    }
+
+    #[test]
+    fn confirmation_no_message_when_len_small() {
+        // shortMessageLength <= 2 → no short message surfaced.
+        let mut parser = PacketParser::new();
+        let mut body = vec![0xA8, 0x00, 0x12, 0x34, 0x56, 0x44, 0, 0, 0, 0x01, 0, 0];
+        body[1] = (body.len() + 2 - 2) as u8;
+        let mut frame = build_packet(&body);
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let c = out.iter().find(|p| p.name == "confirmation").unwrap();
+        assert_eq!(c.text, None);
+        assert_eq!(c.details["short_message_len"], 1);
+    }
+
+    #[test]
+    fn ack_request_routing_fields() {
+        // STDC-2. 0x08 layout per inmarsatc decode_08: sat/les body[1],
+        // lcn body[2], uplink channel word body[3..5]. 0x08 is a short
+        // descriptor (length = (0x08 & 0x0F) + 1 = 9), so the body is
+        // 7 bytes + the 2-byte checksum build_packet appends.
+        let mut parser = PacketParser::new();
+        // sat/les 0x44 (AOR-E les 104), lcn 0x21, uplink word 0x2748.
+        let pkt = build_packet(&[0x08, 0x44, 0x21, 0x27, 0x48, 0x00, 0x00]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let a = out.iter().find(|p| p.name == "ack-request").expect("ack-request parses");
+        assert_eq!(a.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(a.details["sat_les"]["les"], 104);
+        assert_eq!(a.details["lcn"], 0x21);
+        assert_eq!(a.details["uplink_mhz"], 1636.64);
     }
 
     #[test]
@@ -567,6 +1491,30 @@ mod tests {
         assert_eq!(events[0].details["parts"], 2);
     }
 
+    /// VERIFY-6: the single 0xB0 header vs the double 0xB1+0xB2 header pair
+    /// must be distinguishable on the assembled EGC message.
+    #[test]
+    fn egc_header_format_single_vs_double() {
+        // Single 0xB0 self-contained message.
+        let mut p = PacketParser::new();
+        let single = egc_packet(0xB0, 0x31, false, 1, 100, 1, b"SINGLE HEADER MSG");
+        let ev = p.parse_frame(&single);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0].details["header_format"], "single-0xB0");
+        assert_eq!(ev[0].descriptor, 0xB0);
+
+        // Double-header pair: 0xB1 (header/part 1, continues) + 0xB2 (part 2).
+        let mut p2 = PacketParser::new();
+        let h1 = egc_packet(0xB1, 0x31, true, 1, 200, 1, b"DOUBLE ");
+        let h2 = egc_packet(0xB2, 0x31, false, 1, 200, 1, b"HEADER");
+        assert!(p2.parse_frame(&h1).is_empty(), "0xB1 alone does not terminate");
+        let ev2 = p2.parse_frame(&h2);
+        assert_eq!(ev2.len(), 1);
+        assert_eq!(ev2[0].text.as_deref(), Some("DOUBLE HEADER"));
+        assert_eq!(ev2[0].details["header_format"], "double-0xB1+0xB2");
+        assert_eq!(ev2[0].descriptor, 0xB1);
+    }
+
     #[test]
     fn multiple_packets_one_frame_with_padding() {
         let mut p = PacketParser::new();
@@ -579,6 +1527,484 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].name, "bulletin-board");
         assert_eq!(events[1].details["priority"], "distress");
+    }
+
+    #[test]
+    fn frame_to_utc_matches_offair_oracle() {
+        // The vendored off-air capture (tests/offair.rs) carries TDM frame
+        // number 5987. 5987 × 8.64 = 51727.68 s → 14:22:07 UTC-of-day.
+        assert_eq!(frame_to_utc_hms(5987).as_deref(), Some("14:22:07"));
+        // Frame 0 = UTC midnight; the day is exactly 10000 frames.
+        assert_eq!(frame_to_utc_hms(0).as_deref(), Some("00:00:00"));
+        // 9999 is the last valid frame before the next midnight reset.
+        // 9999 × 8.64 = 86391.36 s → 23:59:51.
+        assert_eq!(frame_to_utc_hms(9999).as_deref(), Some("23:59:51"));
+        assert_eq!(frame_to_utc_hms(10000), None);
+        // One-hour boundary: 3600 / 8.64 = 416.66… frames.
+        assert_eq!(frame_to_utc_hms(417).as_deref(), Some("01:00:02"));
+    }
+
+    #[test]
+    fn bulletin_board_surfaces_utc_time() {
+        let mut p = PacketParser::new();
+        // 0x7D short, frame number 5987 = 0x1763 at body[2..4].
+        let bb = build_packet(&[0x7D, 1, 0x17, 0x63, 0, 0, 1, 0x10, 0, 0, 0, 0]);
+        let mut frame = bb;
+        frame.resize(640, 0);
+        let out = p.parse_frame(&frame);
+        let b = out.iter().find(|p| p.name == "bulletin-board").unwrap();
+        assert_eq!(b.details["frame_number"], 5987);
+        assert_eq!(b.details["utc_time"], "14:22:07");
+    }
+
+    #[test]
+    fn channel_type_names_match_inmarsatc() {
+        // STDC-2. Names per inmarsatc decode_7D channelType (the C++
+        // switch's missing breaks are a bug; the per-value names are used).
+        assert_eq!(channel_type_name(1), "NCS");
+        assert_eq!(channel_type_name(2), "LES TDM");
+        assert_eq!(channel_type_name(3), "Joint NCS and TDM");
+        assert_eq!(channel_type_name(4), "ST-BY NCS");
+        assert_eq!(channel_type_name(0), "Reserved");
+        assert_eq!(channel_type_name(7), "Reserved");
+    }
+
+    #[test]
+    fn bulletin_status_flags_match_inmarsatc() {
+        // STDC-2. Bit→name per inmarsatc decode_7D status byte.
+        // 0xE8 = 1110_1000 → Bauds600, Operational, InService, LinksOpen.
+        let s = bulletin_status(0xE8);
+        assert_eq!(s["bauds_600"], true);
+        assert_eq!(s["operational"], true);
+        assert_eq!(s["in_service"], true);
+        assert_eq!(s["clear"], false);
+        assert_eq!(s["links_open"], true);
+        let z = bulletin_status(0x00);
+        assert_eq!(z["bauds_600"], false);
+        assert_eq!(z["links_open"], false);
+    }
+
+    #[test]
+    fn bulletin_board_full_fields() {
+        // STDC-2. Full 0x7D field map per inmarsatc decode_7D:
+        //   body[1]=networkVersion 1
+        //   body[2..4]=frameNumber 5987 (0x1763)
+        //   body[4]=0x08 -> signallingChannel = 0x08>>2 = 2
+        //   body[5]=0x30 -> count = (3)*2 = 6
+        //   body[6]=0x28 -> channelType = 1 (NCS), local = 2
+        //   body[7]=0x44 -> AOR-E les 104
+        //   body[8]=0x60 -> Operational + InService
+        //   body[9..11]=0x4000 -> SafetyNet
+        //   body[11]=0x05 -> randomInterval
+        let mut parser = PacketParser::new();
+        let bb = build_packet(&[
+            0x7D, 0x01, 0x17, 0x63, 0x08, 0x30, 0x28, 0x44, 0x60, 0x40, 0x00, 0x05,
+        ]);
+        let mut frame = bb;
+        frame.resize(640, 0);
+        let out = parser.parse_frame(&frame);
+        let b = out.iter().find(|p| p.name == "bulletin-board").unwrap();
+        assert_eq!(b.details["frame_number"], 5987);
+        assert_eq!(b.details["utc_time"], "14:22:07");
+        assert_eq!(b.details["signalling_channel"], 2);
+        assert_eq!(b.details["count"], 6);
+        assert_eq!(b.details["channel_type"], 1);
+        assert_eq!(b.details["channel_type_name"], "NCS");
+        assert_eq!(b.details["local"], 2);
+        assert_eq!(b.details["sat_les"]["region"], "AOR-E");
+        assert_eq!(b.details["sat_les"]["les"], 104);
+        assert_eq!(b.details["status"]["operational"], true);
+        assert_eq!(b.details["status"]["in_service"], true);
+        assert_eq!(b.details["status"]["clear"], false);
+        assert_eq!(b.details["services"], json!(["SafetyNet"]));
+        assert_eq!(b.details["random_interval"], 5);
+    }
+
+    #[test]
+    fn egc_service_long_names_match_inmarsatc() {
+        // Verbatim from inmarsatc getServiceCodeAndAddressName (oracle).
+        assert_eq!(
+            egc_service_long_name(0x31),
+            Some("SafetyNET, NAVAREA/METAREA Warning, MET Forecast or Piracy Warning to NAVAREA/METAREA")
+        );
+        assert_eq!(
+            egc_service_long_name(0x14),
+            Some("SafetyNET, Shore-to-Ship Distress Alert to Circular Area")
+        );
+        assert_eq!(egc_service_long_name(0x00), Some("System, All ships (general call)"));
+        assert_eq!(egc_service_long_name(0x99), None);
+    }
+
+    #[test]
+    fn egc_message_carries_service_long_name() {
+        let mut p = PacketParser::new();
+        let frame = egc_packet(0xB0, 0x31, false, 1, 777, 1, b"NAVAREA XII WARNING TEST");
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(
+            e.details["service_long"],
+            "SafetyNET, NAVAREA/METAREA Warning, MET Forecast or Piracy Warning to NAVAREA/METAREA"
+        );
+    }
+
+    #[test]
+    fn channel_frequency_formula_matches_oracle() {
+        // STDC-3: formula constants verified against inmarsatc
+        // uplinkChannelMhz/downlinkChannelMhz (docs/notes/STDC.md).
+        // Word 6000 → band edge 1626.5; word 8000 → band edge 1530.5.
+        assert!((uplink_mhz(6000) - 1626.5).abs() < 1e-9);
+        assert!((downlink_mhz(8000) - 1530.5).abs() < 1e-9);
+        // The off-air 0x6C packet carries uplink word 0x2748 = 10056,
+        // which lands at 1636.64 MHz — inside the Inmarsat-C L-band
+        // uplink range 1626.5–1646.5 MHz.
+        let f = uplink_mhz(0x2748);
+        assert!((f - 1636.64).abs() < 1e-6, "got {f}");
+        assert!((1626.5..=1646.5).contains(&f));
+        // A representative downlink word stays in the 1530.5–1545 band.
+        assert!((1530.5..=1545.0).contains(&downlink_mhz(8400)));
+    }
+
+    #[test]
+    fn signalling_channel_surfaces_uplink_mhz() {
+        let mut p = PacketParser::new();
+        // Reproduce the off-air 0x6C body bytes (uplink word 0x2748).
+        let pkt = build_packet(&[0x6C, 0xB4, 0x27, 0x48, 0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = p.parse_frame(&frame);
+        let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
+        assert_eq!(sc.details["uplink_mhz"], 1636.64);
+    }
+
+    #[test]
+    fn services_short_bits_match_inmarsatc() {
+        // STDC-2. Oracle: inmarsatc getServices_short bit→name mapping.
+        // 0xB4 = 1011_0100 → bits 0x80,0x20,0x10,0x04.
+        assert_eq!(
+            services_short(0xB4),
+            vec!["MaritimeDistressAlerting", "InmarsatC", "StoreFwd", "FullDuplex"]
+        );
+        // All bits set → all eight names in MSB→LSB order.
+        assert_eq!(
+            services_short(0xFF),
+            vec![
+                "MaritimeDistressAlerting",
+                "SafetyNet",
+                "InmarsatC",
+                "StoreFwd",
+                "HalfDuplex",
+                "FullDuplex",
+                "ClosedNetwork",
+                "FleetNet",
+            ]
+        );
+        assert!(services_short(0x00).is_empty());
+    }
+
+    #[test]
+    fn services_full_bits_match_inmarsatc() {
+        // STDC-2. Oracle: inmarsatc getServices 16-bit bit→name mapping.
+        // The high byte matches services_short; check a low-byte bit too.
+        // 0x4020 = SafetyNet (0x4000) + AeroC (0x0020).
+        assert_eq!(services_full(0x4020), vec!["SafetyNet", "AeroC"]);
+        // LowPowerCMES is the least significant bit.
+        assert_eq!(services_full(0x0001), vec!["LowPowerCMES"]);
+        // High byte alone resolves identically to services_short.
+        assert_eq!(services_full(0xB400)[..], services_short(0xB4)[..]);
+        assert!(services_full(0x0000).is_empty());
+    }
+
+    #[test]
+    fn tdm_slots_unpacks_two_bit_codes() {
+        // STDC-2. Oracle: inmarsatc decode_6C — 4 two-bit slots per byte,
+        // MSB→LSB. The off-air 0x6C TDM bytes are 02 00 08 00 08 00 02.
+        let slots = tdm_slots(&[0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        assert_eq!(slots.len(), 28);
+        // 0x02 = 0000_0010 → slots 0,0,0,2.
+        assert_eq!(&slots[0..4], &[0, 0, 0, 2]);
+        // 0x08 = 0000_1000 → slots 0,0,2,0 (third byte starts at index 8).
+        assert_eq!(&slots[8..12], &[0, 0, 2, 0]);
+        // Last byte 0x02 → 0,0,0,2.
+        assert_eq!(&slots[24..28], &[0, 0, 0, 2]);
+        // A byte with every bit set yields four code-3 slots.
+        assert_eq!(tdm_slots(&[0xFF])[0..4], [3, 3, 3, 3]);
+    }
+
+    #[test]
+    fn signalling_channel_surfaces_services_and_tdm_slots() {
+        let mut p = PacketParser::new();
+        // Off-air 0x6C body: services 0xB4, uplink word 0x2748, then the
+        // seven TDM-slot bytes.
+        let pkt = build_packet(&[0x6C, 0xB4, 0x27, 0x48, 0x02, 0x00, 0x08, 0x00, 0x08, 0x00, 0x02]);
+        let mut frame = pkt;
+        frame.resize(640, 0);
+        let out = p.parse_frame(&frame);
+        let sc = out.iter().find(|p| p.name == "signalling-channel").unwrap();
+        assert_eq!(
+            sc.details["services"],
+            json!(["MaritimeDistressAlerting", "InmarsatC", "StoreFwd", "FullDuplex"])
+        );
+        // 28 TDM slots; slot 3 = code 2, the rest of the first byte = 0.
+        assert_eq!(sc.details["tdm_slots"].as_array().unwrap().len(), 28);
+        assert_eq!(sc.details["tdm_slots"][3], 2);
+        assert_eq!(sc.details["tdm_slots"][0], 0);
+    }
+
+    #[test]
+    fn les_names_match_inmarsatc_oracle() {
+        // STDC-4: names verbatim from inmarsatc getLesName. The operator
+        // resolves on the full region×100+id code, not the id alone:
+        // id 2 differs between Atlantic and Pacific oceans.
+        assert_eq!(les_name(2), Some("Stratos Global (Burum-2), Netherlands"));
+        assert_eq!(les_name(202), Some("Stratos Global (Aukland), New Zealand"));
+        assert_eq!(les_name(44), Some("NCS"));
+        assert_eq!(les_name(344), Some("NCS"));
+        assert_eq!(les_name(104), Some("Vizada-Telenor, Norway"));
+        assert_eq!(les_name(121), Some("Vizada (FT), France"));
+        // Unknown code → None (kept raw upstream).
+        assert_eq!(les_name(999), None);
+    }
+
+    #[test]
+    fn ocean_region_long_names_match_inmarsatc() {
+        assert_eq!(ocean_region_long(0), "Atlantic Ocean Region West (AOR-W)");
+        assert_eq!(ocean_region_long(1), "Atlantic Ocean Region East (AOR-E)");
+        assert_eq!(ocean_region_long(2), "Pacific Ocean Region (POR)");
+        assert_eq!(ocean_region_long(3), "Indian Ocean Region (IOR)");
+    }
+
+    #[test]
+    fn sat_les_resolves_region_and_operator() {
+        // Off-air 0x81 announcement carries sat/LES byte 0x44:
+        // region 1 (AOR-E, the documented capture region) + id 4 →
+        // code 104 → Vizada-Telenor, Norway.
+        let v = sat_les(0x44);
+        assert_eq!(v["region"], "AOR-E");
+        assert_eq!(v["region_long"], "Atlantic Ocean Region East (AOR-E)");
+        assert_eq!(v["les"], 104);
+        assert_eq!(v["les_name"], "Vizada-Telenor, Norway");
+    }
+
+    #[test]
+    fn area_shape_classification_matches_imo_manual() {
+        // STDC-1: C2 → geographic shape + documented C3 layout. Oracle:
+        // IMO International SafetyNET Manual (2019) Annex 4 part A §5.2-5.3.
+        assert_eq!(
+            area_shape(0x04),
+            Some((AreaShape::Rectangular, "D1D2La D3D4D5Lo D6D7 D8D9D10"))
+        );
+        assert_eq!(area_shape(0x34).map(|x| x.0), Some(AreaShape::Rectangular));
+        assert_eq!(
+            area_shape(0x24),
+            Some((AreaShape::Circular, "D1D2La D3D4D5Lo R1R2R3"))
+        );
+        assert_eq!(area_shape(0x14).map(|x| x.0), Some(AreaShape::Circular));
+        assert_eq!(area_shape(0x44).map(|x| x.0), Some(AreaShape::Circular));
+        assert_eq!(area_shape(0x31), Some((AreaShape::NavMetArea, "X1X2")));
+        assert_eq!(area_shape(0x13), Some((AreaShape::Coastal, "X1X2 B1 B2")));
+        assert_eq!(area_shape(0x73).map(|x| x.0), Some(AreaShape::Coastal));
+        // Non-geographic codes have no area shape.
+        assert_eq!(area_shape(0x02), None);
+        assert_eq!(area_shape(0x11), None);
+    }
+
+    #[test]
+    fn egc_area_structures_address_by_shape() {
+        // Rectangular service: 7-byte address, byte[0] = C2 repeat (0x04),
+        // remaining 6 bytes carry the C3 rectangular area code.
+        let addr = [0x04, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let area = egc_area(0x04, &addr).unwrap();
+        assert_eq!(area["shape"], "rectangular");
+        assert_eq!(area["c2"], 0x04);
+        assert_eq!(area["c3_format"], "D1D2La D3D4D5Lo D6D7 D8D9D10");
+        // Payload is address[1..] — the C2-repeat byte is stripped.
+        assert_eq!(area["address_payload_hex"], "112233445566");
+        // NAVAREA service: 4-byte address.
+        let nav = egc_area(0x31, &[0x31, 0x0C, 0x00, 0x00]).unwrap();
+        assert_eq!(nav["shape"], "navarea-metarea");
+        assert_eq!(nav["c3_format"], "X1X2");
+        // Non-geographic service yields no area object.
+        assert!(egc_area(0x02, &[0x02, 0, 0, 0, 0]).is_none());
+    }
+
+    // ---- STDC-1.1 / STDC-1.2: C3 binary area-geometry decode ----
+    // Oracle for the on-air binary packing: Scytale-C
+    // PacketDecoderGeoUtils.cs (ReturnRectangularArea / ReturnCircularArea /
+    // ReturnNavArea), whose cited bibliography is the IMO/USCG International
+    // SafetyNET Manual. Cross-checked against the SafetyNET Manual 2019
+    // Annex 4 worked examples (which give the MSI-provider digit string):
+    //   rectangular "60N010W30025", circular "56N034W035", and the manual
+    //   body example "14N 66W 300". No other open decoder (inmarsatc,
+    //   SatDump, sdrangel, inmarsat-sniffer) decodes the C3 binary at all.
+
+    #[test]
+    fn rectangular_geometry_matches_manual_worked_example() {
+        // SafetyNET Manual 2019, Annex 4 part A §5.3 example: a rectangle
+        // whose SW corner is 60°N 010°W, extending 30° north and 25° east,
+        // is coded as the C3 string "60N010W30025". Per the Scytale-C
+        // on-air binary layout (C2-repeat byte stripped):
+        //   [0] N(0)<<7 | 60       = 0x3C
+        //   [1] lon 010            = 0x0A
+        //   [2] W(1)<<7 | north 30 = 0x9E
+        //   [3] east 25            = 0x19
+        let p = [0x3C, 0x0A, 0x9E, 0x19];
+        let g = rectangular_geom(&p).unwrap();
+        assert_eq!(g["sw_corner"]["lat_deg"], 60);
+        assert_eq!(g["sw_corner"]["lon_deg"], -10);
+        assert_eq!(g["lat_hemisphere"], "N");
+        assert_eq!(g["lon_hemisphere"], "W");
+        assert_eq!(g["north_extent_nm"], 30);
+        assert_eq!(g["east_extent_nm"], 25);
+    }
+
+    #[test]
+    fn circular_geometry_matches_manual_worked_examples() {
+        // SafetyNET Manual 2019, Annex 4 part B §3.3 example: a circle
+        // centred at 56°N 034°W with radius 35 nm, coded "56N034W035".
+        //   [0] N(0)<<7 | 56     = 0x38
+        //   [1] lon 034          = 0x22
+        //   [2] W(1)<<7 | rad-hi = 0x80
+        //   [3] rad-lo 35        = 0x23
+        let p = [0x38, 0x22, 0x80, 0x23];
+        let g = circular_geom(&p).unwrap();
+        assert_eq!(g["center"]["lat_deg"], 56);
+        assert_eq!(g["center"]["lon_deg"], -34);
+        assert_eq!(g["lat_hemisphere"], "N");
+        assert_eq!(g["lon_hemisphere"], "W");
+        assert_eq!(g["radius_nm"], 35);
+
+        // Manual body example (§10.2): "14N 66W 300" — centre 14°N 66°W,
+        // radius 300 nm. 300 = 0x12C spans the 15-bit field across bytes:
+        //   [2] W(1)<<7 | (300>>8 = 1) = 0x81, [3] 300&0xFF = 0x2C.
+        let p2 = [0x0E, 0x42, 0x81, 0x2C];
+        let g2 = circular_geom(&p2).unwrap();
+        assert_eq!(g2["center"]["lat_deg"], 14);
+        assert_eq!(g2["center"]["lon_deg"], -66);
+        assert_eq!(g2["radius_nm"], 300);
+    }
+
+    #[test]
+    fn navarea_geometry_decodes_number_and_coordinator() {
+        // NAVAREA/METAREA (C2 = 31): payload[0] is the area number. Oracle:
+        // Scytale-C ReturnNavArea + ReturnNavMetAreaCoordinator.
+        let g = nav_met_geom(AreaShape::NavMetArea, &[12]).unwrap();
+        assert_eq!(g["area_number"], 12);
+        assert_eq!(g["area_roman"], "XII");
+        assert_eq!(g["coordinator"], "United States of America (West)");
+        // NAVAREA XXI → Russian Federation.
+        let g21 = nav_met_geom(AreaShape::NavMetArea, &[21]).unwrap();
+        assert_eq!(g21["area_roman"], "XXI");
+        assert_eq!(g21["coordinator"], "Russian Federation");
+        // NAVAREA I → United Kingdom.
+        let g1 = nav_met_geom(AreaShape::NavMetArea, &[1]).unwrap();
+        assert_eq!(g1["area_roman"], "I");
+        assert_eq!(g1["coordinator"], "United Kingdom");
+    }
+
+    #[test]
+    fn coastal_geometry_decodes_area_letter_and_subject() {
+        // Coastal (C2 = 13): X1X2 area number, B1 coastal-area letter A–Z,
+        // B2 subject indicator. Per IMO SafetyNET Manual Annex 4 §5.3/§3.3:
+        // B2 = A navigational warnings, L other-nav, B met-warnings,
+        // E met-forecasts. Area 2 (France), coastal area "C", subject "A".
+        let g = nav_met_geom(AreaShape::Coastal, b"\x02CA").unwrap();
+        assert_eq!(g["area_number"], 2);
+        assert_eq!(g["area_roman"], "II");
+        assert_eq!(g["coordinator"], "France");
+        assert_eq!(g["coastal_area"], "C");
+        assert_eq!(g["subject_indicator"], "A");
+        assert_eq!(g["subject"], "navigational-warnings");
+        // Subject "E" = meteorological forecasts.
+        let gm = nav_met_geom(AreaShape::Coastal, b"\x0bBE").unwrap();
+        assert_eq!(gm["coordinator"], "Japan");
+        assert_eq!(gm["coastal_area"], "B");
+        assert_eq!(gm["subject"], "meteorological-forecasts");
+    }
+
+    #[test]
+    fn area_roman_renders_navarea_numbers() {
+        assert_eq!(area_roman(1), "I");
+        assert_eq!(area_roman(4), "IV");
+        assert_eq!(area_roman(9), "IX");
+        assert_eq!(area_roman(12), "XII");
+        assert_eq!(area_roman(17), "XVII");
+        assert_eq!(area_roman(21), "XXI");
+    }
+
+    #[test]
+    fn southern_eastern_hemispheres_decode_signs() {
+        // Centre 38°S 164°E radius 999 nm (a worked-example style southern,
+        // eastern circle). The S/E hemisphere bits are clear-of-sign on lon
+        // and set on lat: verifies both negative-lat and positive-lon paths.
+        //   [0] S(1)<<7 | 38   = 0xA6
+        //   [1] lon 164        = 0xA4
+        //   [2] E(0)<<7 | rh(3)= 0x03  (999 = 0x3E7)
+        //   [3] rl 0xE7
+        let g = circular_geom(&[0xA6, 0xA4, 0x03, 0xE7]).unwrap();
+        assert_eq!(g["center"]["lat_deg"], -38);
+        assert_eq!(g["center"]["lon_deg"], 164);
+        assert_eq!(g["lat_hemisphere"], "S");
+        assert_eq!(g["lon_hemisphere"], "E");
+        assert_eq!(g["radius_nm"], 999);
+    }
+
+    #[test]
+    fn egc_message_carries_structured_area() {
+        let mut p = PacketParser::new();
+        // Circular distress alert (C2 = 0x14) — egc_packet writes 0xAB as
+        // the address bytes; address[0] is the C2-repeat slot.
+        let frame = egc_packet(0xB0, 0x14, false, 3, 1, 1, b"TEST");
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(e.details["area"]["shape"], "circular");
+        assert_eq!(e.details["area"]["c2"], 0x14);
+    }
+
+    #[test]
+    fn egc_message_carries_decoded_circular_geometry_end_to_end() {
+        // Full EGC assembly path surfaces the decoded geometry in `details`.
+        // Build a circular (C2 = 0x14) packet whose 6-byte C3 address (after
+        // the C2-repeat byte) encodes the manual's "14N 66W 300" circle.
+        let mut p = PacketParser::new();
+        // address = [C2-repeat, p0, p1, p2, p3, pad, pad]; 7 bytes total.
+        let address: [u8; 7] = [0x14, 0x0E, 0x42, 0x81, 0x2C, 0x00, 0x00];
+        let frame = egc_packet_with_address(0xB0, 0x14, 3, 1, 1, &address, b"DISTRESS RELAY");
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(e.name, "egc-message");
+        assert_eq!(e.details["area"]["shape"], "circular");
+        let geom = &e.details["area"]["geometry"];
+        assert_eq!(geom["center"]["lat_deg"], 14);
+        assert_eq!(geom["center"]["lon_deg"], -66);
+        assert_eq!(geom["radius_nm"], 300);
+        assert_eq!(geom["lat_hemisphere"], "N");
+        assert_eq!(geom["lon_hemisphere"], "W");
+    }
+
+    #[test]
+    fn ita2_decode_matches_standard_alphabet() {
+        // STDC-6. Oracle: ITU-T ITA2 standard alphabet (deterministic).
+        // "HELLO": H=0x14 E=0x01 L=0x12 L=0x12 O=0x18 (LTRS shift).
+        assert_eq!(ita2_decode(&[0x14, 0x01, 0x12, 0x12, 0x18]), "HELLO");
+        // FIGS shift (0x1B) then digits "12345":
+        // 1=0x17 2=0x13 3=0x01 4=0x0A 5=0x10.
+        assert_eq!(
+            ita2_decode(&[0x1B, 0x17, 0x13, 0x01, 0x0A, 0x10]),
+            "12345"
+        );
+        // SPACE = 0x04 in both shifts; shifting back to LTRS (0x1F).
+        // "A B": A=0x03 SP=0x04 B(LTRS)=0x19.
+        assert_eq!(ita2_decode(&[0x03, 0x04, 0x19]), "A B");
+        // Returning from FIGS to LTRS mid-stream: FIGS 5 LTRS E.
+        assert_eq!(ita2_decode(&[0x1B, 0x10, 0x1F, 0x01]), "5E");
+    }
+
+    #[test]
+    fn egc_presentation_6_decodes_ita2() {
+        let mut p = PacketParser::new();
+        // Presentation byte 6 selects ITA2; payload encodes "SOS".
+        // S=0x05 O=0x18 S=0x05.
+        let frame = egc_packet_pres(0xB0, 0x00, false, 3, 1, 1, 6, &[0x05, 0x18, 0x05]);
+        let e = &p.parse_frame(&frame)[0];
+        assert_eq!(e.text.as_deref(), Some("SOS"));
+        assert_eq!(e.details["encoding"], "ita2");
     }
 
     #[test]

@@ -1,12 +1,21 @@
 //! STD-C modulator for loopback testing: frame symbols → pulse-shaped
-//! BPSK IQ. Real transmitters shape with RC α=0.6; rectangular pulses
+//! BPSK IQ. Real transmitters shape with RRC α=0.6; rectangular pulses
 //! would push sidelobe energy through the coherent demod's narrow filter
-//! as data-dependent ISI, so the baseband is lowpass-shaped here before
+//! as data-dependent ISI, so the baseband is RRC-shaped here before
 //! the carrier offset is applied (at low rates where it is affordable).
+//!
+//! RRC (transmit half) is paired with the demod's RRC matched filter so
+//! the combined response is a raised-cosine Nyquist pulse (zero ISI at
+//! symbol centres) — the textbook matched-filter setup that maximises
+//! symbol SNR for a given transmit power (Proakis §9, Inmarsat IEC 61097-4
+//! BPSK 1200 sym/s with α=0.6 shaping).
 
 use num_complex::Complex;
 use std::f64::consts::TAU;
-use xng_dsp::{lowpass_taps, Fir};
+use xng_dsp::{rrc_taps, Fir};
+
+/// Inmarsat STD-C RRC roll-off factor (α). IEC 61097-4 specifies 0.6.
+pub const RRC_BETA: f64 = 0.6;
 
 pub fn modulate(
     symbols: &[u8],
@@ -30,9 +39,11 @@ pub fn modulate(
     // Pulse shaping (skipped at wideband rates where the per-sample cost
     // explodes and the receive DDC bandlimits anyway).
     let shaped = if sample_rate <= 96_000.0 {
-        // Windowed sinc at half the symbol rate = Nyquist pulse (zero
-        // ISI at symbol centers), approximating the real RC shaping.
-        let mut f = Fir::new(lowpass_taps(0.5 * symbol_rate / sample_rate, 161));
+        // Transmit half of the matched-filter pair: RRC(α=0.6) at the
+        // configured sps. Paired with the demod's RRC matched filter the
+        // combined response is a raised-cosine Nyquist pulse (zero ISI at
+        // symbol centres) — the real on-air shaping STD-C uses.
+        let mut f = Fir::new(rrc_taps(RRC_BETA, spb, 161));
         let mut out = Vec::with_capacity(base.len());
         f.process(&base, &mut out);
         out

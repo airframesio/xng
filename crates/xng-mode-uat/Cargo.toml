@@ -1,0 +1,16 @@
+[package]
+name = "xng-mode-uat"
+description = "Native UAT (978 MHz, DO-282B) decode core for xng: downlink ADS-B MDB + uplink FIS-B APDU/DLAC, RS(30,18)/(48,34)/(92,72) FEC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono = { workspace = true }
+num-complex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+xng-dsp = { workspace = true }
+xng-types = { workspace = true }

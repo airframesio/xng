@@ -61,12 +61,25 @@ fn offair_ibc_matches_toolkit() {
     assert_eq!(d["acq_channels"], 2);
     assert_eq!(d["info_type"], 0);
     assert_eq!(d["max_uplink_pwr"], 20);
-    // Channel-assignment block(s) decoded.
+    // Sub-block-1 "unknown" bits the toolkit also surfaces (iridium-parser.py
+    // prints the lone `0` after `cell:15` and the trailing `00`). Both are 0
+    // for this burst.
+    assert_eq!(d["unknown01"], 0);
+    assert_eq!(d["unknown02"], 0);
+    // Exactly four 42-bit blocks (descriptor + info + 2 assignments) -> no
+    // {LONG}/{SHORT} block-count anomaly.
+    assert!(d.get("block_trailer").is_none());
+    // Channel-assignment block(s) decoded. iridium-parser.py:
+    //   [111 Rid:153 ts:4 ul_sb:31 dl_sb:22 access:6 dtoa:212 dfoa:17 10] (x2)
+    assert_eq!(d["assignments"].as_array().unwrap().len(), 2);
     let a = &d["assignments"][0];
     assert_eq!(a["random_id"], 153);
     assert_eq!(a["timeslot"], 4);
+    assert_eq!(a["uplink_sub_band"], 31);
     assert_eq!(a["downlink_sub_band"], 22);
     assert_eq!(a["access"], 6);
+    assert_eq!(a["dtoa"], 212);
+    assert_eq!(a["dfoa"], 17);
 }
 
 #[test]
@@ -77,9 +90,24 @@ fn offair_ibc_tmsi_expiry_time() {
     assert_eq!(f.kind, "broadcast");
     let d = &f.details;
     assert_eq!(d["info_type"], 2);
-    // fmt_iritime(32768) = 1399818235 + 32768*0.09 = 1399821184.12
+    // Oracle: iridium-toolkit extracts tmsi_expiry counter == 32768 from this
+    // burst (its bit layout, BCH-corrected). That raw counter is the stable,
+    // re-epoch-independent fact this off-air vector pins.
+    assert_eq!(d["tmsi_expiry"], 32768);
+    // The `_unix` value applies the *currently active* Iridium era (IRID-8:
+    // the counter restarts at each re-epoch, so the era is chosen from the
+    // receive-time clock, not the counter). Decoded live in the ERA2 window it
+    // reproduces toolkit `fmt_iritime(32768)` == 1399821184.12 exactly; under a
+    // later era the same counter maps onto that era's base. Assert it equals
+    // base + 32768*0.09 for whichever era is in force, never the broken
+    // counter-only interpretation.
     let ux = d["tmsi_expiry_unix"].as_f64().unwrap();
-    assert!((ux - 1_399_821_184.12).abs() < 1.0, "tmsi_expiry_unix={ux}");
+    let offset = 32768.0 * 0.09; // 2949.12 s
+    let era_bases = [1_399_821_184.12f64, 1_739_491_200.0 + offset, 1_768_414_080.0 + offset];
+    assert!(
+        era_bases.iter().any(|&b| (ux - b).abs() < 1.0),
+        "tmsi_expiry_unix={ux} matched no known Iridium era base + {offset}"
+    );
 }
 
 #[test]
@@ -90,7 +118,13 @@ fn offair_u3_lcw_handoff() {
     assert_eq!(f.kind, "u3");
     assert_eq!(f.details["frame_ft"], 3);
     assert_eq!(f.details["lcw"]["type"], "hndof");
-    assert_eq!(f.details["lcw"]["code"], "handoff_cand");
+    // iridium-parser.py: LCW(3,T:hndof,C:handoff_cand,34c,120,...). The
+    // handoff candidate carries an 11-bit + a 10-bit lcw3 field that the
+    // toolkit prints as 0x34c / 0x120; surface both rather than dropping them.
+    let code = &f.details["lcw"]["code"];
+    assert_eq!(code["code"], "handoff_cand");
+    assert_eq!(code["cand_a"], 0x34c); // 844
+    assert_eq!(code["cand_b"], 0x120); // 288
     // iridium-parser.py decoded this one as IU3 (RS did not correct).
     assert_eq!(f.details["u3_type"], "IU3");
 }

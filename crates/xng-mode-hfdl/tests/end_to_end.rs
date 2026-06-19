@@ -77,6 +77,129 @@ fn decodes_acars_at_1800bps() {
 }
 
 #[test]
+fn fec_corrected_is_zero_on_a_clean_burst() {
+    // HFDL-5: a noise-free burst carries a valid convolutional codeword,
+    // so the Viterbi has nothing to correct. The corrected-symbol count is
+    // measured as the Hamming distance to the nearest codeword (the FEC's
+    // own definition), which must be exactly 0 here. A constant placeholder
+    // would fail this, and so would a non-zero count on perfect input.
+    let s = &SETTINGS[1]; // 600 bps, rate-1/2
+    let syms = burst_symbols(&acars_mpdu(), s);
+    let mut iq = vec![Complex::new(0.0, 0.0); 3000];
+    iq.extend(modulate(&syms, CHANNEL_RATE, 1440.0, 0.5)); // no CFO, no noise
+    iq.extend(vec![Complex::new(0.0, 0.0); 3000]);
+    let mut dec = HfdlChannelDecoder::new(CHANNEL_RATE, 0.0).unwrap();
+    let mut events = Vec::new();
+    for chunk in iq.chunks(8192) {
+        events.extend(dec.process(chunk));
+    }
+    let e = events
+        .iter()
+        .find(|e| e.kind == "acars" && e.acars.as_ref().unwrap().crc_ok)
+        .expect("clean ACARS decodes");
+    assert_eq!(
+        e.fec_corrected,
+        Some(0),
+        "a clean burst is already a valid codeword: zero corrections"
+    );
+}
+
+#[test]
+fn fec_corrected_is_populated_under_noise() {
+    // The field must always be set on demod-path events (was hardwired to
+    // None before HFDL-5) and stay within the coded-symbol budget.
+    let s = &SETTINGS[1];
+    let events = run(1, &acars_mpdu(), -35.0, 0.0);
+    let e = events.iter().find(|e| e.kind == "acars").expect("ACARS decodes");
+    let n = e.fec_corrected.expect("fec_corrected populated on demod path");
+    assert!(
+        (n as usize) <= s.chips(),
+        "corrected count {n} exceeds coded-symbol budget {}",
+        s.chips()
+    );
+}
+
+/// Like `run`, but runs through the full `HfdlChannelDecoder` (which removes
+/// the +1440 Hz subcarrier, so the recovered `freq_skew_hz` is the residual
+/// CFO) with a controllable noise amplitude. Returns decoded events, which
+/// carry the demod-measured `freq_skew_hz`/`snr_db` (HFDL-5).
+fn run_quality(setting_idx: usize, payload: &[u8], cfo: f64, noise_amp: f32) -> Vec<pdu::HfdlEvent> {
+    let s = &SETTINGS[setting_idx];
+    let syms = burst_symbols(payload, s);
+    // The decoder applies the +1440 Hz subcarrier shift internally, so the
+    // modulated burst sits at 1440 + cfo; the demod then recovers `cfo`.
+    let mut iq = vec![Complex::new(0.0, 0.0); 3000];
+    iq.extend(modulate(&syms, CHANNEL_RATE, 1440.0 + cfo, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 3000]);
+    let mut noise = Noise(0x000a_11ce_5eed_0000 + setting_idx as u64);
+    for x in &mut iq {
+        *x += Complex::new(noise.next() * noise_amp, noise.next() * noise_amp);
+    }
+    let mut dec = HfdlChannelDecoder::new(CHANNEL_RATE, 0.0).unwrap();
+    let mut events = Vec::new();
+    for chunk in iq.chunks(8192) {
+        events.extend(dec.process(chunk));
+    }
+    events
+}
+
+#[test]
+fn freq_skew_tracks_injected_cfo() {
+    // HFDL-5: the demod-reported carrier frequency offset must follow a
+    // known injected CFO (genuine modulate -> demod measurement, no
+    // self-consistency loopback). Test two distinct offsets so a constant
+    // placeholder cannot pass.
+    for cfo in [40.0_f64, -55.0] {
+        let events = run_quality(1, &acars_mpdu(), cfo, 0.01);
+        let e = events.iter().find(|e| e.kind == "acars").expect("ACARS decodes");
+        let skew = e.freq_skew_hz.expect("freq_skew_hz populated on demod path") as f64;
+        // Recovered estimate within a few Hz of truth at this SNR (observed
+        // sub-Hz on these vectors; bound kept loose for noise robustness).
+        assert!(
+            (skew - cfo).abs() < 5.0,
+            "freq_skew_hz {skew} should track injected CFO {cfo}"
+        );
+    }
+}
+
+#[test]
+fn snr_db_is_measured_and_ordered() {
+    // HFDL-5: the EVM-derived SNR must be populated on demod-path events
+    // and must DECREASE as channel noise increases (a fabricated constant
+    // would fail the ordering). Both runs share the same payload/CFO.
+    let clean = run_quality(1, &acars_mpdu(), 0.0, 0.004);
+    let noisy = run_quality(1, &acars_mpdu(), 0.0, 0.05);
+    let ec = clean.iter().find(|e| e.kind == "acars").expect("clean ACARS decodes");
+    let en = noisy.iter().find(|e| e.kind == "acars").expect("noisy ACARS decodes");
+    let snr_clean = ec.snr_db.expect("snr_db populated on demod path");
+    let snr_noisy = en.snr_db.expect("snr_db populated on demod path");
+    assert!(snr_clean.is_finite() && snr_noisy.is_finite());
+    assert!(
+        snr_clean > snr_noisy,
+        "higher noise must lower SNR: clean {snr_clean} dB vs noisy {snr_noisy} dB"
+    );
+}
+
+#[test]
+fn signal_quality_carries_snr_and_freq_skew() {
+    // HFDL-5 wiring: to_message must surface the demod-measured snr_db and
+    // freq_skew_hz on burst-derived events.
+    let events = run(1, &acars_mpdu(), 30.0, 0.0);
+    let e = events.iter().find(|e| e.kind == "acars").expect("ACARS decodes");
+    let prov = xng_types::Provenance {
+        station: xng_types::StationIdentity::new("TEST-HFDL"),
+        app: xng_types::AppInfo::xng(),
+        sdr: None,
+        channel: None,
+    };
+    let msg = xng_mode_hfdl::to_message(e, 21_931_000, -40.0, prov);
+    assert!(msg.signal.snr_db.is_some(), "snr_db surfaced in SignalQuality");
+    assert!(msg.signal.freq_skew_hz.is_some(), "freq_skew_hz surfaced in SignalQuality");
+    // The CFO estimate should be in the ballpark of the injected 30 Hz.
+    assert!((msg.signal.freq_skew_hz.unwrap() - 30.0).abs() < 12.0);
+}
+
+#[test]
 fn decodes_from_wideband_capture() {
     // 240 kHz capture slice; HFDL channel at +30 kHz with 25 Hz CFO.
     let s = &SETTINGS[3];

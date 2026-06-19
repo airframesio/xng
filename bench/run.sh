@@ -81,4 +81,22 @@ else
   echo "skip: bench/data/vdl2_105k_conj.s16 not present (release asset)"
 fi
 
+# Radiosonde: the projecthorus/radiosonde_auto_rx RS41 performance sample
+# (release asset), 96 kS/s cf32 complex float. Oracle-anchored 119/119 vs rs41mod.
+if [ -f bench/data/sonde_96k.cf32 ]; then
+  sonde=$(count bench/data/sonde_96k.cf32 cf32 sonde 96000 404000000 404M)
+  check sonde_offair "$sonde"
+else
+  echo "skip: bench/data/sonde_96k.cf32 not present (release asset)"
+fi
+
+# NAVTEX: SDRplay official navtex.zip IQ demo (release asset), 62.5 kS/s cs16,
+# center 516 kHz, NAVTEX channel at 518 kHz — exercises the narrow-passband DDC.
+if [ -f bench/data/navtex_62500.cs16 ]; then
+  navtex=$(count bench/data/navtex_62500.cs16 cs16 navtex 62500 516000 518000)
+  check navtex_offair "$navtex"
+else
+  echo "skip: bench/data/navtex_62500.cs16 not present (release asset)"
+fi
+
 exit $fail

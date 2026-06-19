@@ -8,7 +8,11 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use xng_types::{Message, MessageBody};
 
-pub async fn run(rx: broadcast::Receiver<Arc<Message>>, addr: String) -> std::io::Result<()> {
+pub async fn run(
+    rx: broadcast::Receiver<Arc<Message>>,
+    addr: String,
+    tag_blocks: bool,
+) -> std::io::Result<()> {
     let listener = TcpListener::bind(&addr).await?;
     tracing::info!("NMEA TCP output on {addr}");
     loop {
@@ -23,9 +27,18 @@ pub async fn run(rx: broadcast::Receiver<Arc<Message>>, addr: String) -> std::io
                         if !msg.decode.crc_ok {
                             continue;
                         }
+                        // Optional per-message provenance/timing prefix.
+                        let prefix = tag_blocks
+                            .then(|| {
+                                xng_mode_ais::nmea::tag_block(
+                                    msg.source.station.ident.as_str(),
+                                    msg.timestamp.timestamp(),
+                                )
+                            })
+                            .unwrap_or_default();
                         for sentence in nmea {
                             if sock
-                                .write_all(format!("{sentence}\r\n").as_bytes())
+                                .write_all(format!("{prefix}{sentence}\r\n").as_bytes())
                                 .await
                                 .is_err()
                             {

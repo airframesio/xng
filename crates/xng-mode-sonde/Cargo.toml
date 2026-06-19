@@ -1,0 +1,16 @@
+[package]
+name = "xng-mode-sonde"
+description = "Native Radiosonde (Vaisala RS41) decode core for xng: RS41 data whitening, CRC16, interleaved RS(255,231) FEC, and the STATUS/GPS/PTU sub-block frame decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+num-complex = { workspace = true }
+xng-dsp = { workspace = true }
+xng-types = { workspace = true }

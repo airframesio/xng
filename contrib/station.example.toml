@@ -12,6 +12,19 @@ http = "0.0.0.0:8080"          # live web dashboard (map + messages)
 # beast = "0.0.0.0:30005"      # Mode S Beast TCP (mlat-client compatible)
 # nmea-tcp = "0.0.0.0:10110"   # AIS NMEA TCP
 
+# Per-mode Airframes feeding (optional). When omitted, `feed-airframes`
+# above governs (ACARS-only, station id used verbatim — the legacy
+# behavior). With this block, each supported mode feeds its own Airframes
+# ingest in that ingest's native format under its own station id; asf-2.0
+# (asf2-grpc/asf2-quic) is fed separately and is unaffected. Modes without
+# a public per-port ingest (IMSL/IRDM/STD-C/Aero-C/ADS-B) feed via asf-2.0.
+# [outputs.airframes]
+# enabled = true
+# station-id = "XX-KSEA"        # base; defaults to the top-level station-id
+# auto-suffix = true            # XX-KSEA -> XX-KSEA-ACARS / -VDL2 / -HFDL
+# [outputs.airframes.hfdl]
+# enabled = false               # decode HFDL locally, do not feed it
+
 [[session]]
 sdr = "driver=rtlsdr,serial=00000001"
 gain = 48
@@ -19,6 +32,8 @@ mode = "acars"
 sample-rate = 2400000
 center = "131.000M"
 channels = ["130.025", "131.125", "131.550", "131.725"]
+# feed = false                          # disable Airframes feed for this decoder
+# airframes-station-id = "XX-KSEA-ACARS2"  # override the station id for it
 
 [[session]]
 sdr = "driver=airspy"          # rate/center/channels derive from the

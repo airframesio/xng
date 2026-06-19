@@ -59,15 +59,39 @@ conventions — invisible to loopback testing — were caught only this way).
 
 | Mode | `--mode` | Band | What you get | Validation |
 |---|---|---|---|---|
-| VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + applications | Live off-air (RTL-SDR), CRC-verified, **fed to production Airframes end-to-end** |
-| VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | ACARS-over-AVLC, AVLC link events, XID handoff parameters (incl. ground-station lists), **ATN-B1: X.25/CLNP/COTP transport (+facilities, ES-IS, IDRP route updates with path attributes and NLRI), protected-mode CPDLC with the full element tables and phraseology, CM logon and ground PDUs**, ground-station naming via `--gs-file` | **44 frames vs dumpvdl2's 41** on the off-air benchmark, CI-fenced |
-| HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons, positions, ACARS, **over-the-air system table**; channel-selectivity filtering (+4.5–5 dB measured sensitivity) | Off-air 21 931 kHz capture, field-exact vs dumphfdl, **97 % of its haul**, CI-fenced |
-| Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels 600/1200 bps + 10.5 kbps, ACARS/ADS-C/CPDLC, **C-channel assignment SUs (voice-circuit frequencies from call setup)**; **C-channel voice circuits (8.4 kbps OQPSK): AMBE voice-frame extraction + call-progress/telephony signal units** | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air; C-channel RF loopback |
+| VHF ACARS (ARINC 618) | `acars` (default) | 118–137 MHz | ACARS + **full application layer** (ARINC 622 ADS-C, **CPDLC rendered as readable text**, MIAM file transfer, OHMA, media advisory, Q-series/OOOI gate-wheels times + airports, free-text positions, 4J winds-aloft met, H1/H2 #CFB/sublabels), parity+CRC bit repair (O(1) syndrome-table FEC), **multi-block reassembly**; many channels from one capture | Live off-air (RTL-SDR), CRC-verified, **fed to production Airframes end-to-end** |
+| VDL Mode 2 (ICAO Annex 10) | `vdl2` | 136.6–137 MHz | ACARS-over-AVLC, AVLC link layer (addresses, I/S/U frames, **FRMR expansion**), XID handoff parameters (frequencies, timers, ground-station lists), **ATN-B1: X.25/CLNP/COTP transport (M-bit + CLNP segment reassembly, cause/diagnostic text, ES-IS, IDRP route updates with path attributes + NLRI), protected-mode CPDLC with the full 238/114 element tables, phraseology and decoded arguments (63 argument types, incl. route clearances), CM logon + full Context Management, ACSE association/release control, plain & protected CPDLC, COTP multi-segment (TSDU) reassembly**, ground-station naming via `--gs-file` | **44 frames vs dumpvdl2's 41** on the off-air benchmark, CI-fenced |
+| HFDL (ARINC 635) | `hfdl` | 2.8–22 MHz | Squitters, logons (with **aircraft-ID → ICAO cache**), **aircraft positions (plotted on the map, merged by ICAO with ADS-B/UAT/ACARS) + per-burst SNR/CFO**, ACARS, **full performance & frequency-data records**, **over-the-air system table (save/load persistence)**; M-PSK 300/600/1200/1800 bps, LMS-equalized + decision-directed demod, channel-selectivity filtering (+4.5–5 dB measured) | Off-air 21 931 kHz capture, field-exact vs dumphfdl, **97 % of its haul**, CI-fenced |
+| Inmarsat Aero L (JAERO port) | `aero` | 1545–1547 MHz | P-channels **600/1200 bps (decision-directed coherent demod) + 10.5 kbps (OQPSK, decodes off-air)**, ACARS/ADS-C/CPDLC; **structured P-channel control SUs**: log-on/log-off session events, C-channel & call-announcement & T-channel assignments (voice-circuit frequencies), AES system-table broadcasts (satellite id/longitude, Psmc/Rsmc carriers), **self-configuring satellite/beam resolution + 16-bit P-channel frame header with a superframe-lock / AFC-DCD state machine**; **C-channel voice circuits (8.4 kbps OQPSK): AMBE voice-frame extraction + call-progress/telephony signal units** | Real Inmarsat recordings: 600 bps + 10.5k both decode off-air; C-channel RF loopback |
 | Inmarsat Aero C bursts | `aero-c` | C-band | R/T-channel signal units | RF loopback |
-| Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS frames, EGC SafetyNET/FleetNET text, logical-channel messages | Off-air EGC capture, field-exact vs reference |
-| Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), broadcasts, **ACARS over SBD (multi-packet Layer-B reassembly for long messages)**, **pager messages (IMS) with multi-part reassembly**, **voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction**, **IP-channel frames (IIP ARQ / IIQ / IIR)**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle; on a shared 300 s off-air capture xng decodes **758 CRC-OK IDA frames vs gr-iridium's 573 (132 %)** — see [Benchmarks](#benchmarks) |
-| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (UDP + TCP servers) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary and safety messages, aids to navigation, **DGNSS, link/channel management, group assignment** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
-| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne, surface via `--receiver-pos`), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, selected altitude, track/turn, heading/speed — pyModeS-validated), single-bit CRC repair, per-aircraft tracking, **SBS + Beast outputs**; any rate ≥ 2 MS/s including **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
+| Inmarsat STD-C / EGC | `std-c` | 1537–1542 MHz | NCS TDM frames (coherent BPSK, **RRC matched filter + per-frame UW BER + mid-frame polarity recovery**), **EGC SafetyNET/FleetNET messages with named services, priority, geographic-area decode (rectangular/circular/NAVAREA·METAREA/coastal → machine-readable coordinates, IMO manual) and ITA2/Baudot + IA5 text**, multi-part EGC + logical-channel reassembly, **named LES/ocean-region routing, MES IDs, TDM frame→UTC, signalling-channel uplink frequency** | Off-air EGC capture, field-exact vs reference |
+| Iridium | `iridium` | 1616–1626.5 MHz | Ring alerts (live satellite positions), **IBC broadcasts + ITL time-location/satellite-ranging**, **ACARS over SBD (two-layer IDA + Layer-B reassembly for long messages)**, pager messages (IMS) with multi-part reassembly, **GSM CC/MM/RR/GMM/SS/SMS signalling (IMSI/IMEI/TMSI, LAI, call-control)**, voice-channel classification (VDA/VO6/VOD/VOZ/VOC) with AMBE extraction, IP-channel frames (IIP ARQ / IIQ / IIR) **with plaintext PPP-PAP + HTTP Basic-Auth credential recovery**, **mobile-terminal positions**, **LCW link control + U3 signalling**, wideband burst hunting across the band | Every layer validated: bit-perfect demod of gr-iridium's reference burst (direct *and* via the wideband hunter) + field-identical decode vs the iridium-toolkit oracle; on a shared 300 s off-air capture xng decodes **758 CRC-OK IDA frames vs gr-iridium's 573 (132 %)** — see [Benchmarks](#benchmarks) |
+| AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (TCP server + UDP push, optional tag-blocks) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary/safety messages, aids to navigation, DGNSS, link/channel management, group assignment, **Inland-AIS ASM (DAC=200: ship static, EMMA, water level, signal strength, ETA/RTA, persons-on-board)**, **regional AtoN-monitoring (DAC 235/250)**, and **IMO DAC=1 ASM (Circ.289: met/hydro, area-notice, route, tidal, …)**, and **SART/MOB/EPIRB-AIS distress tagging**; **own-ship AIVDO Type-1 emit** (periodic from the station receiver-pos) and an **output filter** (type/MMSI keep-drop + per-MMSI rate downsample + content dedup); **weak-signal coherent demod (16-state GMSK MLSE + SIC, +11–12 dB)** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
+| Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne + surface via `--receiver-pos`, speed-gated, **graduated position trust** — global / NIC-contained / receiver-referenced), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, capability 1,0/1,7, **ACAS RA 3,0**, selected-altitude 4,0, track/turn 5,0, heading/speed 6,0, **MRAR/hazard met 4,4/4,5** — pyModeS field-exact), **target state 6,2 + operational status 6,5** (ADS-B version, NACp/SIL/NIC-supp/GVA), emergency/priority status, **DF18 TIS-B/ADS-R source tagging**, single-bit CRC repair, two-sighting phantom rejection, per-aircraft tracking, Mode A/C decode kernel, **SBS + Beast outputs** (Beast carries a monotonic sample-clock 12 MHz MLAT counter, not the wall clock); any rate ≥ 2 MS/s incl. **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
+
+
+### Newer modes (wired to `--mode`; demod maturity varies)
+
+These are full runtime `--mode`s (IQ demod + decode + outputs, selectable on the
+CLI/TUI, scannable, on the dashboard). Their **decode cores** are oracle/spec
+anchored; **demod** validation ranges from live off-air to synthetic depending
+on what real IQ exists. UAT plots as aircraft (and merges with 1090 ADS-B by
+ICAO); radiosonde/ADS-L/SARSAT/DSC positions plot as map beacons.
+
+| Mode | `--mode` | Decodes | Demod validation | Notes |
+|---|---|---|---|---|
+| UAT 978 MHz (DO-282B) | `uat` | ADS-B downlink (state vector) + FIS-B uplink (DLAC products), RS-FEC | **live off-air** (879 CRC-OK frames, real GA aircraft) + dump978 vectors | [UAT.md](docs/notes/UAT.md) |
+| Radiosondes (RS41) | `sonde` | de-whiten + RS(255,231) + STATUS/PTU/GPS | **real off-air, CI-gated** (119/119 vs rs1729 `rs41mod`) | [SONDE.md](docs/notes/SONDE.md) |
+| NAVTEX (CCIR 476) | `navtex` | 4-of-7 + FEC-B time diversity + ZCZC framing | **real off-air, CI-gated** (decodes a real USCG message) | [NAVTEX.md](docs/notes/NAVTEX.md) |
+| COSPAS-SARSAT 406 | `sarsat` | first-gen beacon (C/S T.001) + BCH; ELT/EPIRB/PLB ID + position | oracle vectors; real EPIRB IQ vendored (full decode pending a carrier PLL) | [SARSAT.md](docs/notes/SARSAT.md) |
+| DSC (GMDSS, ITU-R M.493) | `dsc` | distress/all-ships/individual/area, DX/RX diversity + ECC | oracle vectors; demod synthetic (no public IQ) | [DSC.md](docs/notes/DSC.md) |
+| ADS-L (EASA SRD860) | `ads-l` | i-Conspicuity (CRC-24 + XXTEA) + variable-resolution fields | independent vectors; demod synthetic (no public IQ) | [ADSL.md](docs/notes/ADSL.md) |
+| ATCS (rail, AAR Spec-200) | `atcs` | HDLC/LAPB framer + Spec-200 address/header | spec-derived; demod synthetic (no public IQ) | [ATCS.md](docs/notes/ATCS.md) |
+| APRS / AX.25 | `aprs` | AFSK1200 (Bell 202) + AX.25 UI (callsign/SSID/digis, FCS) + APRS position/**Mic-E**/weather/message/status/object/item/bulletin/query/**telemetry (data + PARM/UNIT/EQNS/BITS definitions)** (uncompressed + Base-91 compressed course/speed/alt, PHG/DFS); **all-region 2m channel cluster** (NA 144.39 / EU 144.80 / AU / JP / … / **ISS 145.825**) in one window; **space-reception tagging + satellite ID** (digipeater callsign + TLE/overhead correlation with `receiver-pos`) | AX.25 2.2 + APRS 1.0.1 spec vectors; demod synthetic AWGN-BER (no public IQ) | [APRS.md](docs/notes/APRS.md) |
+| POCSAG paging | `pocsag` | 2-FSK 512/1200/2400 Bd + BCH(31,21) codewords + numeric/alpha/tone | ITU-R M.584-2 spec codewords + BCH-correction test; demod synthetic AWGN-BER | [POCSAG.md](docs/notes/POCSAG.md) |
+| FLEX paging | `flex` | **auto rate-detect** 1600 (2-FSK) / 3200 / 6400 (4-FSK) from the Sync-1 A-code + FIW/BIW + BCH(31,21) + alpha/numeric/tone | FLEX-spec words + synthetic AWGN-BER **and real off-air** (6400 4-level US paging capture: detects 6400, recovers real alpha pages) | [FLEX.md](docs/notes/FLEX.md) |
+| EOT/HOT (rail telemetry) | `eot` | Manchester-FSK + AAR S-9152 (brake-pipe pressure, motion, marker light, BCH) | documented frame layout; demod synthetic (no public IQ) | [EOT.md](docs/notes/EOT.md) |
+| VDES ASM | `vdes` | GMSK 9600 + ASM transport (AIS Msg 6/8 header, source/dest MMSI + DAC/FID) + **7 spec-cited application payloads** (DAC=1 FID 11/16/17/18/31 met-hydro/POB/VTS/clearance/weather, DAC=200 FID 10/55 Inland static-voyage/persons), raw fallback otherwise | DAC=200 vs **pyais** + gpsd field tables; demod synthetic AWGN-BER (sparse public spec) | [VDES.md](docs/notes/VDES.md) |
 
 All multi-channel modes decode any number of channels from one capture.
 Wrapped external decoders (`xng extern`) remain available as a
@@ -105,6 +129,11 @@ hypothesis](docs/notes/BENCHMARKS.md); fenced in CI by
 | Mode S @2 MS/s | dump1090-fa (`--no-fix`) | 162 | **161** | 99 % | 7 |
 | HFDL | dumphfdl | 37 | **36** | 97 % | — |
 | AIS | AIS-catcher | 53 | **48** | 91 % | 0 |
+| Radiosonde (RS41) | rs1729 `rs41mod` | 119 | **119** | **100 %** | — |
+
+CI-gated fixtures also cover NAVTEX (decodes a real USCG message through the
+narrow-passband DDC) and the false-positive ceilings; UAT is validated on a
+live 978 MHz capture (879 CRC-OK frames) but the capture is not vendored.
 
 **†** CRC-OK IDA frames over a shared 300 s off-air capture (Airspy R2,
 1622 MHz, 10 MS/s). That capture is 11 GB — too large to vendor in CI,
@@ -336,6 +365,19 @@ A full example config and a hardened systemd unit live in
 [`contrib/`](contrib/). Sessions can also replay IQ files (`file =`
 instead of `sdr =`) — useful for regression runs over recorded nights.
 
+Airframes feeding is per-decoder. `feed-airframes = true` keeps the
+classic behavior (ACARS to `feed.airframes.io:5550`); an optional
+`[outputs.airframes]` block adds finer control — set a per-mode station id
+(or `auto-suffix = true` to derive `…-ACARS` / `-VDL2` / `-HFDL` / `-AIS`
+from a base id, each routed to that mode's own Airframes ingest in its
+native format), disable feeding for one decoder with `feed = false` on its
+`[[session]]`, or override a decoder's id with `airframes-station-id`.
+Native per-mode serialization now covers **ACARS and VDL2** (VDL2 emits
+dumpvdl2 `decoded:json` to `:5552`, field-verified against dumpvdl2 2.6.0);
+other modes route to Airframes over asf-2.0. The multiplexed **asf-2.0**
+feed carries every mode separately under the canonical station id and is
+independent of this per-port path.
+
 `xng status` prints a live per-session table for a running station
 (querying its dashboard endpoint, default `127.0.0.1:8080`, or
 `--http host:port`):
@@ -357,21 +399,67 @@ instead of `sdr =`) — useful for regression runs over recorded nights.
 
 `--http 0.0.0.0:8080` (any command, or `http =` in the station config)
 serves a built-in live dashboard: a dark map of decoded **aircraft**
-(Mode S positions, callsigns, altitude/speed) and **vessels** (AIS)
-with **position trails** and altitude-colored icons, a click-to-focus
-**entity table**, countries from the ICAO/MID allocation tables,
-registrations/types from an optional `--aircraft-db` CSV
-(tar1090/Mictronics format), and a streaming message panel with
+(Mode S positions, callsigns, altitude/speed — merged across ADS-B / UAT /
+HFDL / ACARS by ICAO) and **vessels** (AIS) with altitude-colored icons, a
+**entity table** with per-type tabs, countries from the ICAO/MID
+allocation tables, registrations/types from an optional `--aircraft-db`
+CSV (tar1090/Mictronics format), and a streaming message panel with
 per-mode **filter chips and live rates**, text search, and
 click-to-expand full decoded JSON for any message — the tar1090 /
 AIS-catcher-viewer experience, for every mode at once, with zero extra
-software. **Pause** freezes only the message list (the map, entity
-table and the open message details keep updating, and resuming catches
-the log up). The header shows the station id, the running **xng
-version**, and uptime, with a collapsible **SDR-status pane** (per
-session: SDR, mode, tuning, and a live/stale "last message" age). The
-page is embedded in the binary (CDN assets are SRI-pinned; RF-sourced
-strings are HTML-escaped).
+software.
+
+The **entity table is tabbed by type** — **All** (everything, generic
+columns) plus a tab per present entity type (**✈️ Aircraft**, **🚢 Ships**,
+**🎈 Beacons**, **🚆 Trains**, **📟 Pagers**, **🛰 Sats**), each with its own
+columns (e.g. Pagers show capcode/function/baud/text; Trains show
+unit/pressure/motion/marker). Tabs appear only for types currently
+present, and the active tab is remembered. Rows expand:
+
+- an **aircraft** expands to a **per-source breakdown** — one indented row
+  per contributing carrier (ADS-B, UAT, HFDL, ACARS), so you can see which
+  modes a merged track is built from (shown on both the All and Aircraft
+  tabs);
+- a **pager** (FLEX / POCSAG) expands to its **message history** — past
+  pages as indented rows that line up under the table's columns. Clicking
+  any pager row (or one of its history rows) opens a **resizable detail
+  pane** below the table showing that message's full text plus a
+  responsive metadata grid (capcode, protocol, function, baud, received,
+  age).
+
+A **position trail** is drawn for the selected entity; a **"Show All
+Trails"** toggle reveals every entity's trail. The map's **layer control
+is mode-aware** — it lists only overlays relevant to the running modes
+(Flights, Ships, Beacons, and the Iridium satellite/spot-beam/
+beam-pattern/terminal layers only when Iridium is decoding). **Pause**
+freezes only the message list (the map, entity table and the open message
+details keep updating, and resuming catches the log up). The header shows
+the station id, the running **xng version**, and uptime, with a
+collapsible **SDR-status pane** — one compact row per receiver
+(rx · mode · frequency · channels · a live/stale/dead status dot for
+last-message age). The side-panel splits (table / detail pane / log) are
+drag-resizable and persisted. The page is embedded in the binary (CDN
+assets are SRI-pinned; RF-sourced strings are HTML-escaped).
+
+The same port also serves the **readsb/tar1090 data API** —
+`GET /data/aircraft.json` (every live aircraft in the readsb field schema:
+`hex`/`flight`/`alt_baro`/`gs`/`track`/`squawk`/`lat`/`lon`/`seen`/…, plus a
+provenance `type` per readsb's convention — `adsb_icao` / `tisb_icao` /
+`adsr_icao` / `mode_s` / …, merged across ADS-B / UAT / HFDL by ICAO) and
+`GET /data/receiver.json` (version + the `receiver-pos` location) — so xng
+is a drop-in source for **tar1090 / graphs1090 / VRS** with no extra
+software. `aircraft.json` accepts `?since=<unix>` for tar1090's incremental
+poll (only aircraft heard at/after that time). The dashboard's
+`GET /api/state` snapshot also carries a cross-mode **`alerts`** array — the
+distress/emergency surface aggregating ADS-B emergency/7500/7600/7700,
+AIS-SART/MOB/EPIRB, STD-C distress, DSC distress, and every COSPAS-SARSAT
+406 beacon, keyed `mode:entity`.
+
+The same data is exportable as geographic files —
+`GET /data/export.geojson` (RFC 7946), `GET /data/export.gpx` (GPX 1.1),
+and `GET /data/export.kml` (OGC KML 2.2) — each carrying the current fix
+plus a track for every positioned aircraft, vessel, beacon, and Iridium
+mobile-terminal position.
 
 For **Iridium** the map adds toggleable overlays (cf. the
 iridium-toolkit live map): satellite positions with ground tracks and
@@ -400,10 +488,12 @@ Every mode and every command shares the same output options:
 --udp host:5550                                # acarsdec-compatible JSON
 --json                                         # raw JSON to stdout
 --jsonl messages.jsonl                         # JSONL file
---metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels)
---sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S)
---beast 0.0.0.0:30005                          # Beast binary TCP (Mode S)
---nmea-tcp 0.0.0.0:10110                       # NMEA AIVDM TCP (AIS)
+--metrics 0.0.0.0:9090                         # Prometheus (frames, CRC, levels, per-label ACARS, FEC-corrected)
+--sbs 0.0.0.0:30003                            # SBS/BaseStation TCP (Mode S + UAT/HFDL positions)
+--beast 0.0.0.0:30005                          # Beast binary TCP (Mode S + synthesized UAT/HFDL)
+--nmea-tcp 0.0.0.0:10110                       # NMEA AIVDM TCP server (AIS)
+--nmea-udp host:10110                          # NMEA AIVDM UDP push (AIS)
+--nmea-tag-blocks                              # prefix NMEA with \s:<station>,c:<ts>*HH\
 --mqtt mqtt://user:pass@broker:1883            # MQTT (JSON to <prefix>/<mode>)
 --mqtt-topic xng                               # MQTT topic prefix
 --asf2-grpc http://ingest:6001                 # asf-2.0 over gRPC
