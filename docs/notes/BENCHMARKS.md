@@ -13,6 +13,49 @@ floor in `bench/baselines.json`. Keys ending in `_max` are ceilings
 separately by exact-result `cargo test` fixtures (their captures are too
 large to vendor).
 
+## Methodology — three gate types (BENCH-4)
+
+xng verifies decode quality with three complementary mechanisms; a mode uses
+whichever its oracle/capture situation allows, and several use more than one:
+
+1. **Off-air count gate** (preferred) — decode a vendored real-RF fixture and
+   fail if the count drops below a committed floor (`bench/run.sh` +
+   `baselines.json`). Requires both a capture small enough to vendor and a way
+   to set an honest floor (an oracle head-to-head, or the decoder's own
+   stable count). This is the strongest gate: it catches real sensitivity loss.
+2. **Synthetic AWGN BER/recovery floor** — for modes with **no public peer
+   decoder** (STD-C, Aero, Iridium) or no vendorable capture, a
+   modulate → complex-AWGN → demod test asserts frame recovery at a target SNR
+   (an explicitly-allowed synthetic oracle, *not* a noiseless loopback). These
+   run as ordinary `#[test]`s, so CI already gates them; they catch demod
+   regressions without a capture but do not establish real-RF performance.
+3. **Field-exact oracle test** — a vendored frame is decoded and every field
+   compared bit/field-for-field against a reference (pyModeS, pyais, dumpvdl2
+   debug, rs41mod, fldigi, iridium-toolkit's parser…). Proves *correctness* of
+   the bit layout; orthogonal to sensitivity.
+
+Per-mode coverage matrix (✓ = present):
+
+| mode | off-air count | synthetic BER | field-exact | oracle |
+|---|---|---|---|---|
+| ADS-B / Mode S | ✓ | — | ✓ | readsb / dump1090-fa / pyModeS |
+| ACARS | ✓ (BENCH-1) | — | ✓ | acarsdec / libacars |
+| VDL2 | ✓ | — | ✓ | dumpvdl2 2.6.0 |
+| HFDL | ✓ | — | ✓ | dumphfdl |
+| AIS | ✓ | ✓ (MLSE) | ✓ | AIS-catcher / pyais |
+| UAT | ✓ (live) | — | ✓ | dump978 |
+| Radiosonde (RS41) | ✓ | — | ✓ | rs1729 rs41mod |
+| NAVTEX | ✓ | — | ✓ | fldigi / YaND |
+| SARSAT | — | ✓ | ✓ | amsa-code fgb-decoder |
+| STD-C | — | ✓ | ✓ | Scytale-C (facts) |
+| Aero | — | ✓ | ✓ | JAERO (facts) |
+| Iridium | — | (follow-up) | ✓ | iridium-toolkit parser |
+| POCSAG/FLEX/DSC/EOT/ADS-L/ATCS/VDES | — | ✓ | ✓ | spec / multimon-ng (facts) |
+
+Sensitivity targets, where measured: ADS-B ≥ 98% of readsb; AIS ~91% of
+AIS-catcher (deep-fade tail); HFDL ~97% of dumphfdl; VDL2 + ACARS *lead* their
+oracle on the vendored captures; Iridium IDA exceeds gr-iridium (+32%).
+
 ## Results
 
 | mode | xng | oracle | capture | CI gate |
