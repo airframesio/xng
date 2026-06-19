@@ -273,3 +273,81 @@
 - [x] **VERIFY-11** New-mode commitments — POCSAG/FLEX airfield usage; AeroMACS/Gatelink demand; 406 MHz front-end reuse; generic-ISM scope desire (= NEW-V) — ⏸ **DEFERRED:** external market/hardware research questions — not code
 - [x] **VERIFY-12** Beast MLAT counter usability — ✅ **resolved 2026-06-18**: confirmed the blocker was the wall-clock-derived (jittery, non-monotonic) Beast timestamps, not GPS absence — then **fixed it**: `PpmDemod` now tracks a drained-samples base, so each frame carries its absolute stream sample offset, converted to a monotonic consistent-rate 12 MHz tick and stamped on the Beast counter (`rx_ticks_12mhz`, wall-clock fallback if absent). The feed is now well-formed for an MLAT client to fit the RTL clock drift. Passive readout — frame counts unchanged (benchmark adsb_modes1 = 323). New Beast unit test. (= ADSB-8 Beast-timestamp item.)
 - [x] **VERIFY-13** Feed — confirm VDL2 ingest format preference (dumpvdl2 `decoded:json` vs vdlm2dec); whether Airframes exposes public IMSL/IRDM/STD-C ports + the settled Iridium feeding mechanism (= FEED-4) — ✅ VDL2 format confirmed = dumpvdl2 decoded:json (FEED-2.1); IMSL/IRDM/STD-C ports + Iridium mechanism remain external (FEED-4.2)
+
+---
+
+# PHASE 2 — next-phase backlog (researched 2026-06-19)
+
+> Added after the v0.21.0 release. Sources for this phase: a 15-angle gap-analysis
+> sweep (per-mode-vs-oracle + outputs/ecosystem + benchmark methodology), a web
+> survey of the reference decoders' current feature sets + emerging protocols, and
+> two real-RF captures contributed by **Opflasher** (Airframes Discord). Same rules
+> as Phase 1: clean-room provenance, **external-oracle** verification (never
+> self-consistency), **skip-don't-fake**, never reduce a benchmark. IDs continue
+> each category's numbering (stable, never renumbered); `BENCH-*` is a new category.
+>
+> **Theme of the phase: accuracy & compatibility first.** Phase 1 reached broad
+> mode coverage (8→20 modes) but most demods are benchmarked only synthetically or
+> field-exact, and several outputs drift from the readsb/acarsdec/AIS-catcher wire
+> formats. Phase 2 closes those gaps and stands up real-RF + sensitivity gates.
+>
+> **Opflasher capture status (2026-06-19, characterized in-session):**
+> - `discord-opflasher-acars1.cf32` — **cracked**: complex-float32, **3.0 MS/s**,
+>   single active ACARS channel ≈ −50 kHz from capture center, real **Korean Air**
+>   traffic (HL8537 / KE0402, YSSY→RKSI, 17JUN26, H1 `#CFB`/`#DFB` maintenance).
+>   xng decodes **15 CRC-OK** over the full 120 s file (sparse — one aircraft).
+>   Authentic and CI-vendorable → unblocks **ACARS-4.3** (see `BENCH-1`).
+> - `discord-opflasher-vdl1.cf32` — complex-float32, 360M samples; **params not yet
+>   pinned**: does NOT decode at 3.0 MS/s across the full 25 kHz VDL2 raster (either
+>   I/Q sense, scaled or not). Either a different sample rate/center or too weak.
+>   **Cheapest unblock: ask Opflasher for the exact rate + center** (see `BENCH-2`).
+
+## BENCH — Benchmark coverage & real-RF captures (highest leverage)
+
+- [ ] **BENCH-1** ★ Vendor the Opflasher ACARS capture as the first **real off-air ACARS** CI fixture + acarsdec head-to-head (unblocks **ACARS-4.3**, `status: now-unblockable`). Cut a representative slice (3.0 MS/s, channel ≈ center −50 kHz; pick a window with the HL8537 traffic), add to `bench/data/` (release-asset if large), run **acarsdec 4.x** on the same IQ as the oracle, add an `acars_offair` row to `BENCHMARKS.md` + a floor in `baselines.json` + a `bench/run.sh` check. ⚑ then re-baseline xng vs acarsdec and treat any sensitivity gap as a correctness finding (differential-MSK + envelope-RSSI should track acarsdec closely). *Oracle: acarsdec (f00b4r0 4.x).*
+- [ ] **BENCH-2** Pin the Opflasher **VDL2** capture parameters → second real-RF VDL2 benchmark vs dumpvdl2. First ask the contributor for sample-rate + center (it did not decode at the ACARS 3.0 MS/s); if a richer offline sweep is preferred, sweep rate × center × I/Q-sense over the full file. Then add a `vdl2_offair2` row + gate and confirm the ~98% dumpvdl2 parity generalizes across a second antenna/path. *Oracle: dumpvdl2 2.6.0.*
+- [ ] **BENCH-3** ◆ Synthetic-AWGN **BER-floor CI gates** for the modes that have no real-RF count gate today (STD-C, Aero, Iridium-IDA, and the synthetic-only new modes). Formalize the existing `matched_filter_recovers_at_lower_snr` (STD-C) and `coherent_beats_discriminator_ber_vs_snr` (Aero) harnesses into **required** floors (e.g. "≥95% frame recovery at SNR=X dB") and wire them into `bench/run.sh` via `cargo test`. Catches demod-sensitivity regressions without a vendorable capture. *Oracle: internal modulate→AWGN→demod (an allowed synthetic oracle).*
+- [ ] **BENCH-4** ★ Publish a unified benchmark methodology + 1-page **gap matrix** in `BENCHMARKS.md`: per mode, which of {real-RF count gate · synthetic BER floor · field-exact oracle test} exists, the per-mode sensitivity target, and how to benchmark a new mode. Makes "what is actually verified" auditable (today: ADS-B/VDL2/HFDL/AIS/RS41/NAVTEX/UAT have count gates; STD-C/Aero/Iridium are field-exact only; ACARS had none until BENCH-1).
+- [ ] **BENCH-5** Capture-sourcing campaign for the capture-gated deferrals (consolidates many `needs-capture` items). Targets + leads found in research: **traffic-bearing HFDL** with HFNPDU positions + LPDU ACARS (KiwiSDR `--kiwi-wav` GNSS-timestamped recording; sigidwiki skip.land 2024-11-05 21931 kHz) → unblocks `FEED-2.2`; **Inmarsat Aero-C 10.5k**; **ACARS media-advisory / MIAM**; **radiosonde RS92/DFM/M10/M20** (radiosonde_auto_rx perf samples); real off-air for **POCSAG/DSC/EOT/ADS-L**. Vendor each as it arrives; each unblocks its mode's deferred decode/feed verification.
+
+## ACARS / VDL2 / HFDL / AIS / ADS-B — accuracy & compatibility (verify-then-fill)
+
+> Several Phase-1 items are marked done at the decode layer but the **serializer /
+> wire-format** path may stop short. Each item below is "audit the emitted output
+> against the live oracle, then fill any gap" — phrased so we confirm before claiming.
+
+- [ ] **ACARS-6** ★ ⚑ acarsdec-JSON field-parity audit vs **acarsdec 4.x** output: confirm `sublabel`, `mfi`, nested `app`/libacars envelope, the 4-char **MIN** (`msg_num`), and `assstat` are all *emitted* on the `:5550` feed (not just carried internally), since aggregators (acars_router, Airframes) key dedup/reassembly on MIN. Fill any field the serializer drops. *Oracle: acarsdec 4.x JSON; acars_router dedup rules.* (extends `ACARS-5.1`/`FEED-2.4`)
+- [ ] **ADSB-9** ★ `aircraft.json` + `receiver.json` schema completeness vs **readsb/dump1090-fa** (drop-in for tar1090/graphs1090/VRS): add the missing precision fields — **GVA, NIC-baro, NACv, SDA**, emitter `category`, `modeac_count` — and receiver fields **uuid** (stable across restarts), **max_range**, **mil**. *Oracle: readsb `aircraft.json`/`receiver.json` schema; pyModeS DO-260B tables.* (extends `ECO-4`/`ADSB-1`)
+- [ ] **ADSB-10** ⚑ Verify the version-aware accuracy fields (TC31 version/NIC/NACp/SIL/GVA, TC5-8 surface, TC29 target-state, DF18 CF source) are actually **serialized into the message JSON + Beast/SBS + feeds**, not only decoded internally — several finders suspected the serializer stops short. (= `VERIFY-16`; ties `ADSB-1`/`ADSB-5`)
+- [ ] **HFDL-7** ★ `--freq-as-squawk` option — **confirmed a real dumphfdl feature** (conveys the HFDL channel freq in the Basestation squawk field); xng lists it not-done. Plus the **AC-ID→ICAO logon cache** wired into the position/feed path so HFDL aircraft carry a real hex for Airframes/SBS identity. *Oracle: dumphfdl `--freq-as-squawk`; `src/ac_cache.c` (facts).* (extends `HFDL-3`/`HFDL-4`)
+- [ ] **AIS-7** Align AIS JSON to **ITU-R M.1371-6** (2026) and match AIS-catcher's recent additions: expose the Msg **25/26** addressed/broadcast ASM envelope + recognised (DAC,FID) bodies, expand Msg **28**, and apply the M.1371-6 field renames (bits previously labelled regional/reserved). Deepen the ASM dispatch (e.g. DAC 366 FID 10 IALA AtoN monitor). *Oracle: AIS-catcher (M.1371-6-aligned JSON) + pyais.* (extends `AIS-1`/`AIS-5`)
+- [ ] **VDL2-9** Emit **non-ACARS AVLC/XID** frames as dumpvdl2 `decoded:json` (dumpvdl2 2.6.0 now emits full JSON for *all* protocols/message types; FEED-2.1 covers only ACARS-over-AVLC today) + the **TCP :5553** feed variant. *Oracle: dumpvdl2 2.6.0 JSON.* (extends `FEED-2.1`/`VDL2-8`)
+- [ ] **AERO-10** Wire **Aero positions → SBS/Beast/map** now that the XM-2.2 `AircraftFix` adapter exists (Aero ADS-C/position SUs decode; the cross-mode entity dependency that blocked `AERO-7` is satisfied). (extends `AERO-7`, ties `XM-2.2`)
+
+## ECO — outputs & ecosystem compatibility
+
+- [ ] **ECO-13** WebSocket/SSE **delta stream** for `aircraft.json` (new/moved/removed) — tar1090/readsb-native live subscription, lower latency + bandwidth than the current 1 Hz poll; the aggregator-facing complement to `ECO-4`.
+- [ ] **ECO-14** First-party **Grafana dashboard JSON** + **acarshub-compatible** Prometheus families (e.g. a `good_loud`/high-SNR counter, per-mode noise-floor + rssi gauges) so xng drops into existing acarshub/Grafana monitoring without schema surgery. (extends `ECO-7`)
+- [ ] **ECO-15** **I/Q-on-stdin** input path (read cf32/cs16 from a pipe) — dumphfdl added this for GNURadio/KiwiSDR interop; lets xng decode KiwiSDR `--kiwi-wav`/GNURadio streams and feeds the BENCH-5 capture work. *Oracle: dumphfdl stdin I/Q + `--read-buffer-size`.*
+
+## VERIFY — Phase-2 correctness audits
+
+- [ ] **VERIFY-14** ⚑ Confirm **version-aware NIC is NOT fed into the position-trust containment gate** (a finder flagged a possible double-use of NIC in `position_quality`); audit the compute path and add a regression test.
+- [ ] **VERIFY-15** ⚑ Iridium **post-ERA4 live decode audit** — with ERA4 (2026-01-14) months-active in production, spot-check IRA/IBC frames for satellite-naming/SGP4/TLE-freshness edge cases (frames decoding to the wrong year, stale TLE). (re-runs the `IRID-8`/`VERIFY-1` check against live traffic)
+- [ ] **VERIFY-16** ⚑ Serializer-reaches-the-wire audit (= `ADSB-10`, generalized): for ADS-B, AIS, VDL2 confirm that every decoded field a finder flagged (TC31/TC5-8/TC29, DF18-CF source, AIS ASM envelope) actually appears in the JSON/Beast/SBS/feed output, with a test per claim. Cheap, high-confidence.
+
+## Big bets (P2 — large, high-leverage)
+
+- [ ] **VDL2-10** ◆ Table/codegen-driven **unaligned-PER ASN.1 core** for the ATN stack — the single highest-leverage VDL2 bet: closes the remaining CPDLC argument shapes, CHOICE-extension/fragmentation completeness, the AARQ/AARE ACSE bodies, and native **ATN-B2 ADS-C** (`VDL2-2.3`) all at once, replacing the hand-written UPER walkers. *Oracle: dumpvdl2's asn1c-generated decoders; ISO PER/ACSE/Session/ADS-C modules. Needs captured PDUs (Opflasher VDL2 capture once pinned, or community samples).* (unifies `VDL2-1`/`VDL2-2`/`VDL2-1.1`/`VDL2-1.3`)
+- [ ] **STDC-9** ◆ Demodulate the **LES message channel** (follow the `0x83` logical-channel-assignment) — the biggest functional gap vs tekmanoid; `STDC-5` re-stated as a Phase-2 bet now that the descriptor decode (STDC-2/3) is in place. *Needs an Inmarsat-C message-channel capture.*
+- [ ] **ADSB-11** ◆ Mode A/C **RF framing-pulse demod** — the decode kernel (octal squawk / SPI / Gillham) is done and dump1090-verified but unwired (`ADSB-6`/`VERIFY-10`); add the pulse-pair acquisition front end. *Oracle: dump1090-fa Mode A/C path.*
+- [ ] **ADSB-12** ◆ Phase-classified **per-phase bit templates** in the 1090 demod — the residual ~3-frame gap to readsb on dense captures (`ADSB-7`). *Oracle: readsb demod; needs a genuinely weak/dense capture to move the count.*
+- [ ] **STDC-10** EGC/area output polish: render rectangular/circular/NAVAREA areas on the dashboard map + full LES/NCS operator-name table + per-frame SNR/noise in `SignalQuality` (envelope-mode noise-floor, ties `XM-1`). (extends `STDC-1`/`STDC-4`/`STDC-8`)
+
+## NEW — new protocols & watch list
+
+- [ ] **NEW-P4-1** COSPAS-SARSAT **SGB (2nd-gen, C/S T.018)** *message* decode — **oracle now exists**: `amsa-code/sgb-decoder` (Java, T.018 Rev.9) + a Python SGB codec, so the 250-bit message/BCH layer is now verifiable (it was deferred "no oracle"). The OQPSK+DSSS *demod* still needs a real SGB capture. Land the message layer against the oracle now; gate the demod on a capture. (unblocks the message half of `NEW-P0-2`) *Oracle: amsa-code/sgb-decoder.*
+- [ ] **NEW-P4-2** VDES **VDE-SAT** (satellite ASM) + **VDE-TER** (π/4-QPSK / 8-PSK / 16-APSK terrestrial data) — the forward-looking AIS-2.0/VDES rollout beyond the ASM channels xng already does (`NEW-P2-5`). ◆ big bet; sparse public spec — watch + prototype as samples appear.
+- [ ] **NEW-P4-3** **LDACS** (L-band Digital Aeronautical Communications System) — **roadmap-watch**: ICAO SARPS 2022, compatibility testing through end-2025, only GNU Radio research code exists (no production decoder). No action yet; track for when an open PHY decoder/spec matures. (companion to the `AERO-9` SB-S watch)
+- [ ] **NEW-P4-4** **DO-260C / ADS-B v3** field expansions — **watch**: no evidence readsb/dump1090-fa implement v3 yet; pre-stage the operational-status/accuracy field additions so xng is ready when traffic appears. (extends `ADSB-1`)
+- [ ] **NEW-SKIP-2** Re-confirmed declines (landscape rechecked 2026-06): **Drone Remote ID** broadcast is BLE/WiFi transport (out of xng's SDR/airband scope) *except* where carried over **ADS-L Issue 2** at 868 MHz — keep that under `NEW-P2-1`, not a separate mode. Open Drone ID parsers (OpenDroneID, open-remote-id-parser) are reference only.
