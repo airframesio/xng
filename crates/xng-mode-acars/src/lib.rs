@@ -15,7 +15,7 @@ pub mod sublabel;
 
 use chrono::Utc;
 use num_complex::Complex;
-use xng_dsp::Ddc;
+use xng_dsp::{Ddc, SharedDdc};
 use xng_types::{
     AcarsCore, DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality,
 };
@@ -83,6 +83,90 @@ impl AcarsChannelDecoder {
     /// Channel noise-floor estimate in dBFS (envelope power over silence).
     pub fn noise_dbfs(&self) -> f32 {
         self.demod.noise_dbfs()
+    }
+}
+
+/// Per-channel demod + deframe back end (the part downstream of the DDC),
+/// shared by both the single-channel and multi-channel decoders.
+struct ChannelBack {
+    demod: demod::MskDemod,
+    deframer: frame::Deframer,
+    bit_buf: Vec<u8>,
+}
+
+impl ChannelBack {
+    fn new() -> Self {
+        Self {
+            demod: demod::MskDemod::new(),
+            deframer: frame::Deframer::new(),
+            bit_buf: Vec::new(),
+        }
+    }
+
+    /// Feed already-downconverted 24 kHz channel IQ; return completed frames.
+    fn process(&mut self, channel: &[Complex<f32>]) -> Vec<frame::AcarsFrame> {
+        self.bit_buf.clear();
+        self.demod.process(channel, &mut self.bit_buf);
+        let mut frames = Vec::new();
+        for &bit in &self.bit_buf {
+            if let Some(f) = self.deframer.push_bit(bit) {
+                frames.push(f);
+            }
+        }
+        frames
+    }
+}
+
+/// Decodes SEVERAL ACARS channels out of one wideband capture with a single
+/// shared downconverter front end ([`xng_dsp::SharedDdc`]): the expensive
+/// full-rate decimation runs once for all channels, then each channel does a
+/// cheap low-rate finish + the usual MSK demod / deframe. Equivalent output
+/// to N independent [`AcarsChannelDecoder`]s, far less CPU when the channel
+/// count is high (the acarsdec-replacement scenario).
+pub struct AcarsMultiChannelDecoder {
+    ddc: SharedDdc,
+    backs: Vec<ChannelBack>,
+    channel_bufs: Vec<Vec<Complex<f32>>>,
+}
+
+impl AcarsMultiChannelDecoder {
+    /// `input_rate` is the wideband capture rate; `offsets` are each channel's
+    /// center relative to the capture center (Hz). Requires `input_rate` ≥ the
+    /// 24 kHz channel rate and wide enough to span every channel.
+    pub fn new(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
+        let ddc = SharedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ)?;
+        let backs = offsets.iter().map(|_| ChannelBack::new()).collect();
+        let channel_bufs = offsets.iter().map(|_| Vec::new()).collect();
+        Ok(Self { ddc, backs, channel_bufs })
+    }
+
+    /// Number of channels.
+    pub fn num_channels(&self) -> usize {
+        self.backs.len()
+    }
+
+    /// Feed wideband IQ; returns the completed frames for channel `i` as
+    /// `(i, frames)` for every channel that produced any.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<(usize, Vec<frame::AcarsFrame>)> {
+        self.ddc.process(input, &mut self.channel_bufs);
+        let mut out = Vec::new();
+        for (i, (back, buf)) in self.backs.iter_mut().zip(self.channel_bufs.iter()).enumerate() {
+            let frames = back.process(buf);
+            if !frames.is_empty() {
+                out.push((i, frames));
+            }
+        }
+        out
+    }
+
+    /// Smoothed envelope level (dBFS) for channel `i`.
+    pub fn level_dbfs(&self, i: usize) -> f32 {
+        self.backs[i].demod.level_dbfs()
+    }
+
+    /// Channel noise-floor estimate (dBFS) for channel `i`.
+    pub fn noise_dbfs(&self, i: usize) -> f32 {
+        self.backs[i].demod.noise_dbfs()
     }
 }
 

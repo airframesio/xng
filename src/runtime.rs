@@ -9,7 +9,7 @@ use num_complex::Complex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use xng_mode_acars::AcarsChannelDecoder;
+use xng_mode_acars::{AcarsChannelDecoder, AcarsMultiChannelDecoder};
 use xng_mode_adsb::AdsbDecoder;
 use xng_mode_aero::{AeroBurstDecoder, AeroChannelDecoder};
 use xng_mode_ais::AisChannelDecoder;
@@ -328,6 +328,20 @@ impl LiveState {
 /// One mode-specific per-channel decoder.
 pub(crate) enum ModeChannel {
     Acars(AcarsChannelDecoder),
+    /// Several ACARS channels sharing one downconverter front end (the CPU
+    /// optimization). Carries the per-channel frequencies so each decoded
+    /// frame is tagged with the right channel. Unlike the single-channel
+    /// variants this one spans MANY channels, so it is special-cased in the
+    /// decode loop (see `process_shared`).
+    //
+    // TODO(perf): the decode loop currently assumes one (freq, ModeChannel)
+    // per channel and tags every message from a ModeChannel with one
+    // Provenance. This shared variant is special-cased in `decode_loop` to
+    // emit its own per-channel-tagged messages. When the shared front end is
+    // rolled out to vdl2/ais/aero/stdc (all use the same per-channel offset
+    // DDC), generalize the loop to natively drive multi-output decoders
+    // instead of special-casing ACARS here.
+    AcarsShared { dec: AcarsMultiChannelDecoder, freqs: Vec<u64> },
     Ais(AisChannelDecoder),
     Adsb(AdsbDecoder),
     Vdl2(Vdl2ChannelDecoder),
@@ -448,7 +462,7 @@ impl ModeChannel {
 
     fn channel_rate(&self) -> f64 {
         match self {
-            Self::Acars(_) => xng_mode_acars::CHANNEL_RATE,
+            Self::Acars(_) | Self::AcarsShared { .. } => xng_mode_acars::CHANNEL_RATE,
             Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
             Self::Vdl2(_) => xng_mode_vdl2::CHANNEL_RATE,
             Self::Aero(_) | Self::AeroBurst(_) => xng_mode_aero::CHANNEL_RATE,
@@ -475,6 +489,12 @@ impl ModeChannel {
     fn level(&self) -> f32 {
         match self {
             Self::Acars(d) => d.level_dbfs(),
+            // Shared ACARS is driven via `process_shared`; this scalar level
+            // accessor reports channel 0 (used only for single-channel
+            // displays, which the shared path does not take).
+            Self::AcarsShared { dec, .. } => {
+                if dec.num_channels() > 0 { dec.level_dbfs(0) } else { f32::NEG_INFINITY }
+            }
             Self::Ais(d) => d.level_dbfs(),
             Self::Adsb(d) => d.level_dbfs(),
             Self::Vdl2(d) => d.level_dbfs(),
@@ -503,6 +523,9 @@ impl ModeChannel {
     /// Returns (messages, frames_seen, frames_crc_ok).
     fn process(&mut self, iq: &[Complex<f32>], freq: u64, prov: &Provenance) -> (Vec<Message>, u64, u64) {
         match self {
+            // Shared ACARS spans many channels and cannot be tagged with one
+            // freq/provenance; the decode loop drives it via `process_shared`.
+            Self::AcarsShared { .. } => (Vec::new(), 0, 0),
             Self::Acars(dec) => {
                 let frames = dec.process(iq);
                 let seen = frames.len() as u64;
@@ -754,6 +777,61 @@ impl ModeChannel {
             }
         }
     }
+
+    /// Decode a capture chunk for a SHARED multi-channel decoder, producing one
+    /// result per channel that actually decoded a frame. Each result is tagged
+    /// with its own channel index, frequency, level, and provenance — the
+    /// per-channel work the decode loop does for single-channel decoders, done
+    /// here because one shared decoder spans many channels.
+    ///
+    /// Returns `(channel_index, freq, level, msgs, seen, ok)` per channel.
+    /// Only `Self::AcarsShared` produces output; other variants return empty.
+    fn process_shared(
+        &mut self,
+        iq: &[Complex<f32>],
+        base_prov: &SharedProvenance,
+    ) -> Vec<(usize, u64, f32, Vec<Message>, u64, u64)> {
+        let Self::AcarsShared { dec, freqs } = self else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (i, frames) in dec.process(iq) {
+            let freq = freqs[i];
+            let (level, noise) = (dec.level_dbfs(i), dec.noise_dbfs(i));
+            let prov = base_prov.for_channel(i, freq, xng_mode_acars::CHANNEL_RATE);
+            let seen = frames.len() as u64;
+            let ok = frames.iter().filter(|f| f.crc_ok).count() as u64;
+            let msgs: Vec<Message> = frames
+                .iter()
+                .map(|f| xng_mode_acars::to_message(f, freq, level, noise, prov.clone()))
+                .collect();
+            out.push((i, freq, level, msgs, seen, ok));
+        }
+        out
+    }
+}
+
+/// The provenance fields common to every channel of a session; the per-channel
+/// `ChannelInfo` is filled in per frame for shared decoders.
+pub(crate) struct SharedProvenance {
+    station: StationIdentity,
+    app: AppInfo,
+    sdr: Option<SdrInfo>,
+}
+
+impl SharedProvenance {
+    fn for_channel(&self, index: usize, freq: u64, channel_rate: f64) -> Provenance {
+        Provenance {
+            station: self.station.clone(),
+            app: self.app.clone(),
+            sdr: self.sdr.clone(),
+            channel: Some(ChannelInfo {
+                index: index as u32,
+                frequency_hz: freq,
+                sample_rate: channel_rate,
+            }),
+        }
+    }
 }
 
 /// Spawn the configured output sinks on the current tokio runtime.
@@ -942,10 +1020,12 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         }
         decoders.push((freq, dec));
     }
+    let n_channels = decoders.len();
+    decoders = collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode);
     tracing::info!(
         "{} session: {} channel(s) from a {:.0} S/s capture centered at {:.3} MHz",
         cfg.mode,
-        decoders.len(),
+        n_channels,
         sample_rate,
         capture_center as f64 / 1e6
     );
@@ -1048,7 +1128,25 @@ pub(crate) fn decode_loop(
     let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
     let mut chunk_count: u64 = 0;
     let mut buf = vec![Complex::new(0.0f32, 0.0f32); READ_CHUNK];
-    let mut stats: Vec<(u64, u64, u64)> = decoders.iter().map(|(f, _)| (*f, 0, 0)).collect();
+    // Per-index stats for single-channel decoders. Shared multi-channel
+    // decoders (one index spanning many channels) are excluded here and
+    // tracked per-frequency in `shared_stats` instead.
+    let mut stats: Vec<(u64, u64, u64)> = decoders
+        .iter()
+        .filter(|(_, d)| !matches!(d, ModeChannel::AcarsShared { .. }))
+        .map(|(f, _)| (*f, 0, 0))
+        .collect();
+    // Per-frequency stats for shared multi-channel decoders, seeded with every
+    // channel so even zero-frame channels appear in the summary.
+    let mut shared_stats: std::collections::BTreeMap<u64, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    for (_, d) in &decoders {
+        if let ModeChannel::AcarsShared { freqs, .. } = d {
+            for &f in freqs {
+                shared_stats.insert(f, (0, 0));
+            }
+        }
+    }
     let mut consecutive_errors: u32 = 0;
     let mut dedup = DedupFilter::new();
     let mut ais_gate = AisGate::default();
@@ -1106,6 +1204,45 @@ pub(crate) fn decode_loop(
             }
         }
         for (i, (freq, dec)) in decoders.iter_mut().enumerate() {
+            // Shared multi-channel decoders (ACARS) emit per-channel results
+            // already tagged with the right freq/provenance; drive them
+            // separately so the single-channel path below stays unchanged.
+            //
+            // TODO(perf): this special-case exists because the shared front
+            // end spans many channels but the loop's stats/provenance are
+            // per-decoder-index. When the shared front end is generalized to
+            // vdl2/ais/aero/stdc, fold this into the main path (a decoder
+            // yielding per-channel (freq, msgs, …) results) rather than
+            // branching on the ACARS variant here.
+            if let ModeChannel::AcarsShared { .. } = dec {
+                let base = SharedProvenance {
+                    station: station.clone(),
+                    app: AppInfo::xng(),
+                    sdr: sdr.clone(),
+                };
+                for (_ci, freq, level, msgs, seen, ok) in dec.process_shared(&buf[..n], &base) {
+                    let entry = shared_stats.entry(freq).or_insert((0, 0));
+                    entry.0 += seen;
+                    entry.1 += ok;
+                    if let Some((state, _, _)) = &live {
+                        let fec: u64 =
+                            msgs.iter().map(|m| m.decode.fec_corrected.unwrap_or(0) as u64).sum();
+                        state.record_fec(freq, fec);
+                    }
+                    for msg in msgs {
+                        publish_msg(
+                            msg, freq, &mut dedup, reasm.as_deref_mut(), &label_filter,
+                            &ais_filter, &mut ais_gate, &live, &bus,
+                        );
+                    }
+                    if let Some((state, _, _)) = &live {
+                        let (s, o) = *entry;
+                        state.record_channel(freq, s, o, level);
+                    }
+                }
+                continue;
+            }
+
             let prov = Provenance {
                 station: station.clone(),
                 app: AppInfo::xng(),
@@ -1123,52 +1260,75 @@ pub(crate) fn decode_loop(
                 let fec: u64 = msgs.iter().map(|m| m.decode.fec_corrected.unwrap_or(0) as u64).sum();
                 state.record_fec(*freq, fec);
             }
-            for mut msg in msgs {
-                if dedup.is_duplicate(&msg) {
-                    continue;
-                }
-                if let Some((r, files)) = reasm.as_deref_mut() {
-                    apply_reassembly(&mut msg, r, files);
-                }
-                // Label Iridium ring alerts with the broadcasting satellite
-                // (no-op unless a TLE satellite map was loaded at startup).
-                crate::satmap::enrich(&mut msg);
-                // Attribute space-based APRS (145.825 / ISS digipeat) to the
-                // satellite(s) overhead (no-op unless init_aprs ran).
-                crate::satmap::enrich_aprs(&mut msg);
-                if !label_filter.allows(&msg) {
-                    continue;
-                }
-                // AIS output shaping (AIS-5h): type/MMSI filter, then rate
-                // downsample + content dedup keyed on the message time.
-                if !ais_filter.allows(&msg)
-                    || !ais_gate.pass(
-                        &msg,
-                        &ais_filter,
-                        msg.timestamp.timestamp_millis() as f64 / 1e3,
-                    )
-                {
-                    continue;
-                }
-                if let (Some((state, _, _)), xng_types::MessageBody::Acars(a)) =
-                    (&live, &msg.body)
-                {
-                    // ACARS-5.2 per-label tally — CRC-valid frames only. A
-                    // bad-CRC frame carries a garbled 2-byte label (raw 7-bit
-                    // bytes); tallying it would spawn an unbounded set of junk
-                    // `label="…"` series and blow up Prometheus cardinality.
-                    if msg.decode.crc_ok {
-                        state.record_acars_label(*freq, &a.label);
-                    }
-                }
-                bus.publish(msg);
+            for msg in msgs {
+                publish_msg(
+                    msg, *freq, &mut dedup, reasm.as_deref_mut(), &label_filter,
+                    &ais_filter, &mut ais_gate, &live, &bus,
+                );
             }
             if let Some((state, _, _)) = &live {
                 state.record_channel(stats[i].0, stats[i].1, stats[i].2, dec_level_after(dec));
             }
         }
     }
+    // Fold any shared per-channel stats into the returned summary.
+    for (freq, (seen, ok)) in shared_stats {
+        stats.push((freq, seen, ok));
+    }
     Ok(stats)
+}
+
+/// Apply the full publish pipeline to one decoded message: cross-channel
+/// dedup, multi-block reassembly, satellite enrichment, label/AIS filtering,
+/// the per-label live tally, then publish to the bus. Shared by the
+/// single-channel and shared-ACARS paths in `decode_loop`.
+#[allow(clippy::too_many_arguments)]
+// The publish pipeline genuinely needs all of this session state; threading
+// it as args keeps decode_loop's borrow checker happy without a context
+// struct (a future cleanup when the loop is generalized — see the perf TODO).
+fn publish_msg(
+    mut msg: Message,
+    freq: u64,
+    dedup: &mut DedupFilter,
+    reasm: Option<&mut (xng_acars::reasm::Reassembler, xng_acars::miam::FileReassembler)>,
+    label_filter: &LabelFilter,
+    ais_filter: &AisFilter,
+    ais_gate: &mut AisGate,
+    live: &Option<(Arc<LiveState>, u64, f64)>,
+    bus: &MessageBus,
+) {
+    if dedup.is_duplicate(&msg) {
+        return;
+    }
+    if let Some((r, files)) = reasm {
+        apply_reassembly(&mut msg, r, files);
+    }
+    // Label Iridium ring alerts with the broadcasting satellite
+    // (no-op unless a TLE satellite map was loaded at startup).
+    crate::satmap::enrich(&mut msg);
+    // Attribute space-based APRS (145.825 / ISS digipeat) to the
+    // satellite(s) overhead (no-op unless init_aprs ran).
+    crate::satmap::enrich_aprs(&mut msg);
+    if !label_filter.allows(&msg) {
+        return;
+    }
+    // AIS output shaping (AIS-5h): type/MMSI filter, then rate
+    // downsample + content dedup keyed on the message time.
+    if !ais_filter.allows(&msg)
+        || !ais_gate.pass(&msg, ais_filter, msg.timestamp.timestamp_millis() as f64 / 1e3)
+    {
+        return;
+    }
+    if let (Some((state, _, _)), xng_types::MessageBody::Acars(a)) = (live, &msg.body) {
+        // ACARS-5.2 per-label tally — CRC-valid frames only. A bad-CRC frame
+        // carries a garbled 2-byte label (raw 7-bit bytes); tallying it would
+        // spawn an unbounded set of junk `label="…"` series and blow up
+        // Prometheus cardinality.
+        if msg.decode.crc_ok {
+            state.record_acars_label(freq, &a.label);
+        }
+    }
+    bus.publish(msg);
 }
 
 /// Run several decode sessions (different modes/SDRs) in one process,
@@ -1209,10 +1369,12 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
             }
             decoders.push((freq, dec));
         }
+        let n_channels = decoders.len();
+        decoders = collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode);
         tracing::info!(
             "station session: {} with {} channel(s) at {:.0} S/s centered {:.3} MHz",
             cfg.mode,
-            decoders.len(),
+            n_channels,
             sample_rate,
             capture_center as f64 / 1e6
         );
@@ -1473,7 +1635,47 @@ pub(crate) fn build_decoders(
         }
         decoders.push((freq, dec));
     }
-    Ok(decoders)
+    Ok(collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode))
+}
+
+/// When an ACARS session has more than one channel, replace the N independent
+/// per-channel `Acars` decoders with a single `AcarsShared` decoder that uses
+/// one shared downconverter front end (the CPU optimization). A single ACARS
+/// channel, or any other mode, is returned unchanged.
+///
+/// On failure to build the shared decoder (e.g. a capture too narrow to span
+/// every channel), the original per-channel decoders are kept — the shared
+/// front end is a pure optimization, never a correctness requirement.
+fn collapse_shared_acars(
+    decoders: Vec<(u64, ModeChannel)>,
+    sample_rate: f64,
+    capture_center: u64,
+    mode: Mode,
+) -> Vec<(u64, ModeChannel)> {
+    if mode != Mode::AcarsPoa || decoders.len() < 2 {
+        return decoders;
+    }
+    // Every entry is a single-channel ACARS decoder at this point.
+    if !decoders.iter().all(|(_, d)| matches!(d, ModeChannel::Acars(_))) {
+        return decoders;
+    }
+    let freqs: Vec<u64> = decoders.iter().map(|(f, _)| *f).collect();
+    let offsets: Vec<f64> = freqs.iter().map(|&f| f as f64 - capture_center as f64).collect();
+    match AcarsMultiChannelDecoder::new(sample_rate, &offsets) {
+        Ok(dec) => {
+            tracing::info!(
+                "ACARS: {} channels share one downconverter front end",
+                freqs.len()
+            );
+            // The shared entry is keyed on the first channel's freq; its own
+            // per-channel freqs live in the variant (the loop reads those).
+            vec![(freqs[0], ModeChannel::AcarsShared { dec, freqs })]
+        }
+        Err(e) => {
+            tracing::warn!("shared ACARS front end unavailable ({e}); using per-channel DDCs");
+            decoders
+        }
+    }
 }
 
 #[cfg(test)]
