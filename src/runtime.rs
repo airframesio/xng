@@ -779,10 +779,11 @@ impl ModeChannel {
     }
 
     /// Decode a capture chunk for a SHARED multi-channel decoder, producing one
-    /// result per channel that actually decoded a frame. Each result is tagged
-    /// with its own channel index, frequency, level, and provenance — the
-    /// per-channel work the decode loop does for single-channel decoders, done
-    /// here because one shared decoder spans many channels.
+    /// result per channel — the per-channel work the decode loop does for
+    /// single-channel decoders, done here because one shared decoder spans many
+    /// channels. EVERY channel is returned each chunk (quiet ones with no
+    /// messages and zero counts) so the caller refreshes live level/count
+    /// metrics for all of them, matching the single-channel path.
     ///
     /// Returns `(channel_index, freq, level, msgs, seen, ok)` per channel.
     /// Only `Self::AcarsShared` produces output; other variants return empty.
@@ -794,9 +795,13 @@ impl ModeChannel {
         let Self::AcarsShared { dec, freqs } = self else {
             return Vec::new();
         };
-        let mut out = Vec::new();
-        for (i, frames) in dec.process(iq) {
-            let freq = freqs[i];
+        // dec.process returns only channels that decoded a frame; collect those
+        // by index so every channel can still be reported below.
+        let mut decoded: std::collections::HashMap<usize, Vec<xng_mode_acars::frame::AcarsFrame>> =
+            dec.process(iq).into_iter().collect();
+        let mut out = Vec::with_capacity(freqs.len());
+        for (i, &freq) in freqs.iter().enumerate() {
+            let frames = decoded.remove(&i).unwrap_or_default();
             let (level, noise) = (dec.level_dbfs(i), dec.noise_dbfs(i));
             let prov = base_prov.for_channel(i, freq, xng_mode_acars::CHANNEL_RATE);
             let seen = frames.len() as u64;
