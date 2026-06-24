@@ -25,6 +25,39 @@ capture drives many channels (the acarsdec-replacement scenario; the
 end-to-end test decodes two simultaneous bursts at ±50/75 kHz from one
 2.4 MS/s stream).
 
+### Shared multi-channel front end (CPU)
+
+A per-channel `Ddc` runs a full-rate anti-alias decimation for **every**
+channel, so N channels do N full-rate convolutions over the same wideband
+stream — the dominant cost (~17× the bit demod, linear in channel count).
+When a session has ≥2 ACARS channels, `runtime.rs::collapse_shared_acars`
+replaces the N independent `AcarsChannelDecoder`s with one
+`AcarsMultiChannelDecoder` that does the wideband-rate work **once** for all
+channels, then runs the usual per-channel `MskDemod`/`Deframer`. Output is
+identical (a `cargo test` asserts both front ends decode the same frames);
+it is purely a CPU optimization.
+
+Two interchangeable front ends (same `(input_rate, output_rate, offsets,
+passband)` contract), selected in `AcarsMultiChannelDecoder::new`:
+
+- **`xng_dsp::ChannelizedDdc`** (default) — a polyphase channelizer: one
+  shared FFT pass produces every channel at once, so cost is **independent
+  of channel count and of how far apart the channels sit**. VHF airband
+  channels are all on a 25 kHz raster, so the bin grid `fs/M` is chosen to
+  land every requested channel on a bin center (no scalloping); a small
+  residual NCO + a gentle resampler land the exact 24 kHz channel rate.
+- **`xng_dsp::SharedDdc`** (fallback, `new_shared`) — one shared full-rate
+  decimation feeds cheap per-channel finishes. Its win shrinks as channels
+  spread across the band (the coarse stage can only decimate as far as the
+  widest channel allows), so the channelizer is preferred; `SharedDdc` is
+  the fallback when the channelizer cannot be built for a rate/offset set.
+
+Both live in `xng-dsp` and are general-purpose: they are intended to be
+adopted by the other narrowband multi-channel modes (VDL2, AIS, Aero,
+STD-C, which all use the same per-channel offset DDC) after the ACARS path
+is validated on live RF. See `bench/cpu.sh` for the per-channel-count
+×-realtime numbers.
+
 ## PHY / demod (`demod.rs`)
 
 ACARS is MSK at **2400 bd** carried as **AM** sidebands; tones 1200 Hz and

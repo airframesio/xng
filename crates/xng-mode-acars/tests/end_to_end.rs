@@ -315,3 +315,55 @@ fn shared_front_end_decodes_many_channels() {
     assert_eq!(got[1], ["CHANNEL TWO PAYLOAD"], "channel 1");
     assert_eq!(got[2], ["CHANNEL TRE PAYLOAD"], "channel 2");
 }
+
+#[test]
+fn both_front_ends_decode_equivalently() {
+    // The channelizer (default) and the shared-decimation fallback must both
+    // decode the same raster channels — the front end is a CPU choice, not a
+    // correctness one. Offsets are on the 25 kHz airband raster.
+    let fs = 2_400_000.0;
+    let offsets = [50_000.0, -75_000.0, 150_000.0];
+    let specs = [
+        downlink("FRONT END ONE", "XG0001"),
+        downlink("FRONT END TWO", "XG0002"),
+        downlink("FRONT END TRE", "XG0003"),
+    ];
+    let bursts: Vec<Vec<Complex<f32>>> = specs
+        .iter()
+        .zip(offsets.iter())
+        .map(|(s, &off)| burst_iq(s, fs, off, 0.4))
+        .collect();
+    let delays = [0usize, 30_000, 60_000];
+    let total =
+        bursts.iter().zip(delays.iter()).map(|(b, &d)| b.len() + d).max().unwrap() + 10_000;
+    let mut iq = vec![Complex::new(0.0f32, 0.0f32); total];
+    for (b, &d) in bursts.iter().zip(delays.iter()) {
+        for (i, s) in b.iter().enumerate() {
+            iq[i + d] += s;
+        }
+    }
+    let mut noise = Noise(0xfeed_face_cafe_d00d);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.01, noise.next() * 0.01);
+    }
+
+    let decode = |mut dec: AcarsMultiChannelDecoder| -> Vec<Vec<String>> {
+        let mut got: Vec<Vec<String>> = vec![Vec::new(); offsets.len()];
+        for chunk in iq.chunks(65_536) {
+            for (i, frames) in dec.process(chunk) {
+                for f in frames {
+                    assert!(f.crc_ok);
+                    got[i].push(f.text.clone());
+                }
+            }
+        }
+        got
+    };
+
+    let channelized = decode(AcarsMultiChannelDecoder::new(fs, &offsets).unwrap());
+    let shared = decode(AcarsMultiChannelDecoder::new_shared(fs, &offsets).unwrap());
+    assert_eq!(channelized, shared, "front ends must decode identically");
+    assert_eq!(channelized[0], ["FRONT END ONE"]);
+    assert_eq!(channelized[1], ["FRONT END TWO"]);
+    assert_eq!(channelized[2], ["FRONT END TRE"]);
+}
