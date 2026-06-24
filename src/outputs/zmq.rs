@@ -149,8 +149,9 @@ mod tests {
     #[tokio::test]
     async fn pub_sub_roundtrip() {
         // Bind a PUB sink on an ephemeral port, connect a SUB, and assert the
-        // [mode, json] frames arrive and the JSON deserializes back into a
-        // Message (the guarantee a consumer relies on).
+        // [mode, json] frames arrive. The contract is that frame 1 is exactly
+        // the shared `serde_json::to_vec(&Message)` bytes the other sinks emit,
+        // so assert byte-equality (not merely that it deserializes).
         let mut pubs = PubSocket::new();
         let endpoint = pubs.bind("tcp://127.0.0.1:0").await.unwrap();
         let addr = endpoint.to_string();
@@ -162,8 +163,10 @@ mod tests {
         // (PUB drops messages with no connected subscribers).
         tokio::time::sleep(Duration::from_millis(200)).await;
 
+        let msg = Arc::new(sample_message());
+        let expected_json = serde_json::to_vec(&*msg).unwrap();
         let (tx, rx) = broadcast::channel(8);
-        tx.send(Arc::new(sample_message())).unwrap();
+        tx.send(msg).unwrap();
         drop(tx); // close the bus so publish_loop returns after draining
 
         publish_loop(rx, &mut pubs).await;
@@ -174,29 +177,25 @@ mod tests {
             .expect("recv failed");
         assert_eq!(frame.len(), 2, "expected [mode, json] multipart");
         assert_eq!(&frame.get(0).unwrap()[..], b"vdl2");
-        let decoded: Message = serde_json::from_slice(frame.get(1).unwrap()).unwrap();
-        assert_eq!(decoded.mode, Mode::Vdl2);
-        assert_eq!(decoded.frequency_hz, 136_975_000);
+        assert_eq!(&frame.get(1).unwrap()[..], &expected_json[..]);
     }
 
     #[tokio::test]
     async fn run_fans_out_to_multiple_endpoints() {
         // `run` with a two-endpoint list binds one PUB socket to both; a SUB
         // connected to each must receive the same message (the fan-out).
-        use std::net::TcpListener;
-        // Grab two free ports by binding then dropping the listeners.
-        let free_port = || {
-            TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        };
-        let (p1, p2) = (free_port(), free_port());
-        let (a1, a2) = (
-            format!("tcp://127.0.0.1:{p1}"),
-            format!("tcp://127.0.0.1:{p2}"),
-        );
+        // Use unique IPC endpoints rather than ephemeral TCP ports: allocating
+        // a port via a throwaway TcpListener and rebinding it later is racy
+        // (the port is free between drop and rebind). A per-test-run temp path
+        // has no such window.
+        let dir = std::env::temp_dir().join(format!(
+            "xng-zmq-fanout-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = |name: &str| format!("ipc://{}", dir.join(name).display());
+        let (a1, a2) = (path("a"), path("b"));
 
         let (tx, rx) = broadcast::channel(8);
         let endpoints = vec![a1.clone(), a2.clone()];
@@ -225,6 +224,7 @@ mod tests {
 
         drop(tx); // close the bus so `run` returns
         handle.await.unwrap().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
