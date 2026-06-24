@@ -76,9 +76,16 @@ impl ChannelizedDdc {
             let bin = k_round.rem_euclid(m as f64) as usize;
             let bin_center = bin_offset_hz(bin, m, input_rate);
             let residual = off - bin_center;
-            if residual.abs() > bin_rate / 2.0 + 1.0 {
+            // The channel must fit inside the selected bin: not just its center
+            // within ±½ bin, but its whole ±passband. A channel whose passband
+            // reaches past the bin edge would be silently attenuated, so reject
+            // it here and let the caller fall back to SharedDdc. `choose_num_bins`
+            // sizes the bins (≥ 2.4·passband) so the real airband raster passes;
+            // this guards pathological rate/offset sets.
+            let max_safe_residual = bin_rate / 2.0 - passband_hz;
+            if residual.abs() > max_safe_residual {
                 return Err(format!(
-                    "channel offset {off} Hz does not map onto the {m}-bin grid"
+                    "channel offset {off} Hz is too close to a {m}-bin channelizer edge"
                 ));
             }
             let resampler = if (bin_rate - output_rate).abs() > 1e-6 {
