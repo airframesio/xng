@@ -12,6 +12,7 @@ pub mod nco;
 pub mod resample;
 pub mod rs;
 pub mod scramble;
+pub mod shared_ddc;
 pub mod viterbi;
 pub mod window;
 
@@ -20,5 +21,6 @@ pub use ddc::Ddc;
 pub use fir::{lowpass_taps, rrc_taps, Fir};
 pub use nco::Nco;
 pub use resample::Resampler;
+pub use shared_ddc::SharedDdc;
 
 pub type IqSample = num_complex::Complex<f32>;
