@@ -169,6 +169,11 @@ struct OutputOpts {
     /// MQTT topic prefix; messages publish to <prefix>/<mode>
     #[arg(long, default_value = "xng")]
     mqtt_topic: String,
+    /// Publish messages as [mode, json] over a ZMQ PUB socket (repeatable; one
+    /// socket fans out to all). Each binds by default (e.g. tcp://0.0.0.0:5555
+    /// or ipc:///tmp/xng.sock); prefix with connect: to connect to a collector
+    #[arg(long)]
+    zmq: Vec<String>,
 }
 
 impl OutputOpts {
@@ -226,6 +231,7 @@ impl OutputOpts {
                 http: self.http.clone(),
                 mqtt: self.mqtt.clone(),
                 mqtt_topic: self.mqtt_topic.clone(),
+                zmq: self.zmq.clone(),
                 // Set per-session by the caller once the mode is known.
                 airframes: None,
                 own_ship_mmsi: None,
@@ -762,6 +768,7 @@ fn main() -> anyhow::Result<()> {
                         http: None,
                         mqtt: None,
                         mqtt_topic: "xng".into(),
+                        zmq: Vec::new(),
                         airframes: None,
                         own_ship_mmsi: None,
                     },
@@ -804,6 +811,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         http: st.outputs.http.clone(),
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
+        zmq: st.outputs.zmq.clone(),
         airframes: Some(commands::station::airframes_router(&st)),
         own_ship_mmsi: st.outputs.own_ship_mmsi,
     };

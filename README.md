@@ -496,6 +496,7 @@ Every mode and every command shares the same output options:
 --nmea-tag-blocks                              # prefix NMEA with \s:<station>,c:<ts>*HH\
 --mqtt mqtt://user:pass@broker:1883            # MQTT (JSON to <prefix>/<mode>)
 --mqtt-topic xng                               # MQTT topic prefix
+--zmq tcp://0.0.0.0:5555                        # ZMQ PUB ([mode, json]; repeatable; connect: to connect)
 --asf2-grpc http://ingest:6001                 # asf-2.0 over gRPC
 --asf2-quic ingest:6011                        # asf-2.0 over QUIC (TLS verified)
 ```

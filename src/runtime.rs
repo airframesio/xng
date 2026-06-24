@@ -68,6 +68,10 @@ pub struct OutputConfig {
     pub mqtt: Option<String>,
     /// MQTT topic prefix (messages publish to `<prefix>/<mode>`).
     pub mqtt_topic: String,
+    /// ZMQ PUB endpoints; emits `[mode, json]` multipart frames. One shared
+    /// PUB socket attaches to every endpoint (fan-out). Each binds by default
+    /// (`tcp://…`/`ipc://…`); prefix `connect:` to connect instead.
+    pub zmq: Vec<String>,
     /// Per-mode Airframes feed router (legacy per-port native-format push;
     /// asf-2.0 multiplexes every mode separately under the canonical ident).
     pub airframes: Option<crate::outputs::airframes::AirframesRouter>,
@@ -857,6 +861,16 @@ fn spawn_outputs(
         output_tasks.push(tokio::spawn(async move {
             if let Err(e) = crate::outputs::mqtt::run(rx, url, topic, ident).await {
                 tracing::error!("mqtt output: {e}");
+            }
+            Ok(())
+        }));
+    }
+    if !outputs.zmq.is_empty() {
+        let rx = bus.subscribe();
+        let endpoints = outputs.zmq.clone();
+        output_tasks.push(tokio::spawn(async move {
+            if let Err(e) = crate::outputs::zmq::run(rx, endpoints).await {
+                tracing::error!("zmq output: {e}");
             }
             Ok(())
         }));

@@ -8,6 +8,10 @@ jsonl = "/var/log/xng/messages.jsonl"
 metrics = "0.0.0.0:9090"
 http = "0.0.0.0:8080"          # live web dashboard (map + messages)
 # mqtt = "mqtt://user:pass@broker:1883"
+# zmq = ["tcp://0.0.0.0:5555"] # ZMQ PUB; [mode, json] frames; one socket fans
+                               # out to every listed endpoint. Each binds by
+                               # default; prefix connect: to connect instead,
+                               # e.g. ["tcp://0.0.0.0:5555", "connect:tcp://collector:5555"]
 # sbs = "0.0.0.0:30003"        # Mode S BaseStation TCP
 # beast = "0.0.0.0:30005"      # Mode S Beast TCP (mlat-client compatible)
 # nmea-tcp = "0.0.0.0:10110"   # AIS NMEA TCP
