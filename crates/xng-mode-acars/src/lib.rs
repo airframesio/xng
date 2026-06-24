@@ -166,9 +166,17 @@ impl AcarsMultiChannelDecoder {
         let front = match ChannelizedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ)
         {
             Ok(c) => Front::Channelized(c),
-            Err(_) => {
-                Front::Shared(SharedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ)?)
-            }
+            // On double failure report BOTH errors so an unusual capture
+            // config shows why the default channelizer was rejected too.
+            Err(chan_err) => Front::Shared(
+                SharedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ).map_err(
+                    |shared_err| {
+                        format!(
+                            "channelizer rejected ({chan_err}); shared-decim also failed ({shared_err})"
+                        )
+                    },
+                )?,
+            ),
         };
         let backs = offsets.iter().map(|_| ChannelBack::new()).collect();
         let channel_bufs = offsets.iter().map(|_| Vec::new()).collect();

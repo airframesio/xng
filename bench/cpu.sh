@@ -27,10 +27,10 @@ run adsb /tmp/bench_modes1_x20.cu8 cu8 adsb 2000000 1090000000 1090 3.57
 # CPU cost is per *requested* channel (the DDC runs whether or not a burst is
 # present), so decode it across 8 VHF ACARS channels — the realistic
 # acarsdec-replacement load that the per-channel front end has to keep up with.
-if [ ! -f /tmp/bench_acars_8ch.cf32 ]; then
-  cargo run --release -q -p xng-mode-acars --example gen_capture -- /tmp/bench_acars_1x.cf32 >/dev/null 2>&1
-  for i in $(seq 5); do cat /tmp/bench_acars_1x.cf32; done > /tmp/bench_acars_8ch.cf32
-fi
+# Regenerate the fixture every run (cheap, ~0.5 s) so a change to gen_capture
+# can never leave a stale /tmp capture skewing the comparison.
+cargo run --release -q -p xng-mode-acars --example gen_capture -- /tmp/bench_acars_1x.cf32 >/dev/null 2>&1
+for _ in $(seq 5); do cat /tmp/bench_acars_1x.cf32; done > /tmp/bench_acars_8ch.cf32
 # gen_capture writes ~0.47 s at 2.4 MS/s; ×5 ≈ 2.36 s. 8 channels across the
 # US ACARS plan around the 131.500 capture center.
 run acars /tmp/bench_acars_8ch.cf32 cf32 acars 2400000 131500000 \
