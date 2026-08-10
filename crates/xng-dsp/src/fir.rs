@@ -77,11 +77,24 @@ pub fn rrc_taps(beta: f64, sps: f64, num_taps: usize) -> Vec<f32> {
 }
 
 /// Streaming FIR filter over complex samples with optional decimation.
+///
+/// The delay line is stored **doubled and time-reversed-friendly**: the most
+/// recent `n` samples always occupy one contiguous run, so the convolution
+/// inner loop is a straight `zip` of two slices. A circular buffer with a
+/// wrapping index (the obvious implementation) defeats vectorisation — the
+/// compiler cannot prove the access pattern is affine, so it emits a
+/// bounds-checked load and a branch per tap. Convolution is the single
+/// largest cost in the decode pipeline, so this layout is deliberate.
 pub struct Fir {
     taps: Vec<f32>,
-    /// Circular delay line, newest sample at `pos`.
-    delay: Vec<IqSample>,
-    pos: usize,
+    /// `2 * n` slots holding the live window contiguously. Samples are stored
+    /// **newest-first** so the convolution walks the window and the taps in
+    /// the same direction the circular-buffer formulation did — the summation
+    /// order is preserved, so the result is bit-identical (asserted in tests).
+    hist: Vec<IqSample>,
+    /// Index of the newest sample within `hist` (always `< n`); the live
+    /// window is `hist[head .. head + n]`, newest first.
+    head: usize,
     decim: usize,
     phase: usize,
 }
@@ -94,23 +107,39 @@ impl Fir {
     pub fn with_decimation(taps: Vec<f32>, decim: usize) -> Self {
         assert!(!taps.is_empty() && decim >= 1);
         let n = taps.len();
-        Self { taps, delay: vec![IqSample::new(0.0, 0.0); n], pos: 0, decim, phase: 0 }
+        Self {
+            taps,
+            hist: vec![IqSample::new(0.0, 0.0); 2 * n],
+            head: 0,
+            decim,
+            phase: 0,
+        }
     }
 
     /// Push input samples; append filtered (and decimated) output to `out`.
     pub fn process(&mut self, input: &[IqSample], out: &mut Vec<IqSample>) {
         let n = self.taps.len();
         for &x in input {
-            self.pos = (self.pos + 1) % n;
-            self.delay[self.pos] = x;
+            // Prepend to the sliding window: `head` walks backwards so the
+            // newest sample is at the LOW end and `hist[head..head + n]` reads
+            // newest-first. Storing each sample at both `head` and `head + n`
+            // keeps that window contiguous across the wrap.
+            self.head = if self.head == 0 { n - 1 } else { self.head - 1 };
+            self.hist[self.head] = x;
+            self.hist[self.head + n] = x;
+
             self.phase += 1;
             if self.phase == self.decim {
                 self.phase = 0;
+                // Newest-first window against taps in natural order — the same
+                // pairing and the same summation order as the circular-buffer
+                // version, so the result is bit-identical. Both slices are
+                // contiguous with statically-equal length, so this vectorises
+                // (no wrapping index, no per-tap bounds check or branch).
+                let win = &self.hist[self.head..self.head + n];
                 let mut acc = IqSample::new(0.0, 0.0);
-                let mut idx = self.pos;
-                for &tap in &self.taps {
-                    acc += self.delay[idx] * tap;
-                    idx = if idx == 0 { n - 1 } else { idx - 1 };
+                for (w, &tap) in win.iter().zip(self.taps.iter()) {
+                    acc += *w * tap;
                 }
                 out.push(acc);
             }
@@ -198,5 +227,86 @@ mod tests {
         let mut out = Vec::new();
         fir.process(&input, &mut out);
         assert_eq!(out.len(), 100);
+    }
+
+    /// Reference implementation: the straightforward circular-delay-line FIR
+    /// this filter replaced. Kept in the tests so the fast contiguous-window
+    /// layout can be held to **bit-exact** equality with the obvious
+    /// formulation — the layout is a performance change, not a maths change.
+    struct RefFir {
+        taps: Vec<f32>,
+        delay: Vec<IqSample>,
+        pos: usize,
+        decim: usize,
+        phase: usize,
+    }
+
+    impl RefFir {
+        fn new(taps: Vec<f32>, decim: usize) -> Self {
+            let n = taps.len();
+            Self { taps, delay: vec![IqSample::new(0.0, 0.0); n], pos: 0, decim, phase: 0 }
+        }
+        fn process(&mut self, input: &[IqSample], out: &mut Vec<IqSample>) {
+            let n = self.taps.len();
+            for &x in input {
+                self.pos = (self.pos + 1) % n;
+                self.delay[self.pos] = x;
+                self.phase += 1;
+                if self.phase == self.decim {
+                    self.phase = 0;
+                    let mut acc = IqSample::new(0.0, 0.0);
+                    let mut idx = self.pos;
+                    for &tap in &self.taps {
+                        acc += self.delay[idx] * tap;
+                        idx = if idx == 0 { n - 1 } else { idx - 1 };
+                    }
+                    out.push(acc);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_circular_reference_bit_exactly() {
+        // Deterministic pseudo-random input; several tap counts and decimation
+        // factors, fed in uneven blocks so window wrap-around is exercised at
+        // arbitrary offsets.
+        let mut s = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+        let input: Vec<IqSample> = (0..20_000).map(|_| IqSample::new(next(), next())).collect();
+
+        for &(ntaps, decim) in &[(9usize, 1usize), (31, 1), (64, 4), (101, 1), (121, 10), (128, 3)]
+        {
+            let taps = lowpass_taps(0.05, ntaps);
+            let mut fast = Fir::with_decimation(taps.clone(), decim);
+            let mut refr = RefFir::new(taps, decim);
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for blk in input.chunks(577) {
+                fast.process(blk, &mut a);
+                refr.process(blk, &mut b);
+            }
+            assert_eq!(a.len(), b.len(), "ntaps={ntaps} decim={decim}: length differs");
+            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+                assert_eq!(
+                    x.re.to_bits(),
+                    y.re.to_bits(),
+                    "ntaps={ntaps} decim={decim} sample {i}: re {} vs {}",
+                    x.re,
+                    y.re
+                );
+                assert_eq!(
+                    x.im.to_bits(),
+                    y.im.to_bits(),
+                    "ntaps={ntaps} decim={decim} sample {i}: im {} vs {}",
+                    x.im,
+                    y.im
+                );
+            }
+        }
     }
 }

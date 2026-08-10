@@ -24,15 +24,11 @@ const BAUD: f64 = 2400.0;
 const SAMPLES_PER_BIT: usize = 10;
 const TONE_MID_HZ: f64 = 1800.0;
 const AUDIO_LPF_CUTOFF: f64 = 1300.0;
-/// This convolution is the single most expensive operation in the decoder
-/// (~40% of pipeline CPU), so the tap count is set to the measured floor
-/// rather than a comfortable round number.
-///
-/// Sizing is NOT set by image rejection: 51 taps already puts the −3000 Hz
-/// mixing image 83 dB down, far below the capture's noise floor. It is set by
-/// **sensitivity** — the discriminator's behaviour in noise degrades with a
-/// looser filter well before the image matters. An AWGN sweep through the real
-/// demod (60 bursts × 5 sigmas) gives CRC-OK yield at σ = 0.18/0.20/0.22:
+/// Sizing here is set by **sensitivity**, not by image rejection: 51 taps
+/// already puts the −3000 Hz mixing image 83 dB down, far below the capture's
+/// noise floor, yet decode yield keeps improving well past that. An AWGN
+/// sweep through the real demod (60 bursts × 5 sigmas) gives CRC-OK yield at
+/// σ = 0.18/0.20/0.22:
 ///
 /// | taps |  0.18 |  0.20 |  0.22 |
 /// |------|-------|-------|-------|
@@ -41,10 +37,13 @@ const AUDIO_LPF_CUTOFF: f64 = 1300.0;
 /// |  101 |    56 |    42 |    21 |
 /// |  121 |    57 |    42 |    23 |
 ///
-/// 101 is the smallest count that holds baseline yield within run-to-run
-/// noise. Do not lower it without re-running that sweep against the real
-/// demod — a reimplemented chain gives misleadingly flat results.
-const AUDIO_LPF_TAPS: usize = 101;
+/// This convolution used to be ~40% of pipeline CPU, which made trimming it
+/// tempting; the contiguous-window `Fir` rewrite made it ~2× cheaper instead,
+/// so the full 121 taps now cost ~0.2 percentage points of one core across 16
+/// channels. Buying back the top of that table for that price is the right
+/// trade. Do not trim it without re-running the sweep against the REAL demod —
+/// a reimplemented chain gives misleadingly flat results.
+const AUDIO_LPF_TAPS: usize = 121;
 /// Envelope DC tracker: fc ≈ alpha·fs/2π ≈ 19 Hz, settles within the pre-key.
 const DC_ALPHA: f32 = 0.005;
 /// Timing loop gain (fraction of the phase error applied per zero crossing).
