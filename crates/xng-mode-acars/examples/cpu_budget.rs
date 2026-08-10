@@ -19,6 +19,7 @@ use num_complex::Complex;
 use std::time::Instant;
 use xng_dsp::{lowpass_taps, ChannelizedDdc, Fir, Nco, PfbChannelizer};
 use xng_mode_acars::demod::MskDemod;
+use xng_mode_acars::modulate::{burst_iq, FrameSpec};
 use xng_mode_acars::{AcarsMultiChannelDecoder, CHANNEL_PASSBAND_HZ, CHANNEL_RATE};
 
 const FS: f64 = 2_400_000.0;
@@ -67,6 +68,40 @@ fn noise(n: usize) -> Vec<Complex<f32>> {
         (s as f32 / u64::MAX as f32) * 2.0 - 1.0
     };
     (0..n).map(|_| Complex::new(nx() * 0.01, nx() * 0.01)).collect()
+}
+
+/// A burst on every channel, filling the whole capture: the pathological
+/// 100%-duty case. Real ACARS never looks like this (see the duty-cycle note
+/// at the end of the run) — it exists to bound the squelch's worst case.
+fn all_channels_busy(n: usize, offs: &[f64]) -> Vec<Complex<f32>> {
+    let mut cap = noise(n);
+    for (c, &off) in offs.iter().enumerate() {
+        let spec = FrameSpec {
+            mode: '2',
+            tail: "N471XG",
+            ack: None,
+            label: "H1",
+            block_id: '3',
+            msg_num: Some("M42A"),
+            flight: Some("XG0042"),
+            text: "CPU BUDGET BUSY-CHANNEL PAYLOAD",
+            etb: false,
+        };
+        let burst = burst_iq(&spec, FS, off, 0.4);
+        // Repeat back to back, staggered per channel so the bursts do not all
+        // start together, until the capture is full.
+        let mut at = c * 4_096;
+        while at < n {
+            for (i, s) in burst.iter().enumerate() {
+                if at + i >= n {
+                    break;
+                }
+                cap[at + i] += s;
+            }
+            at += burst.len();
+        }
+    }
+    cap
 }
 
 fn main() {
@@ -185,5 +220,44 @@ fn main() {
          almost entirely spent on noise. Nothing in this branch acts on that;\n\
          the split is here to size the opportunity and to make the CPU claims\n\
          in the commit messages reproducible."
+    );
+
+    // The squelch's saving is entirely a function of duty cycle, so the single
+    // number above (an all-idle capture) is only half the picture. Measure the
+    // two ends of the range, and at each end measure the gate both active and
+    // pinned open. Pinned open is the pre-squelch pipeline, so comparing
+    // within a column is the saving and comparing the pinned rows across
+    // columns is a sanity check. Timing two different captures against each
+    // other says nothing — the bursts change the deframer's workload too.
+    println!("\n-- squelch: idle vs busy --\n");
+    let busy_cap = all_channels_busy(n, &offs);
+
+    let run = |cap: &[Complex<f32>], hold: bool| -> Option<f64> {
+        let mut d = AcarsMultiChannelDecoder::new(FS, &offs).ok()?;
+        d.hold_squelch_open(hold);
+        Some(best(|| {
+            d.process(cap);
+        }))
+    };
+    let (Some(idle_on), Some(idle_off), Some(busy_on), Some(busy_off)) = (
+        run(&cap, false),
+        run(&cap, true),
+        run(&busy_cap, false),
+        run(&busy_cap, true),
+    ) else {
+        return;
+    };
+
+    println!("{:<24}{:>12}{:>12}", "capture", "gate on", "pinned open");
+    let row = |name: &str, on: f64, off: f64| {
+        println!("{name:<24}{:>11.2}%{:>11.2}%   {:+.0}%", pct(on), pct(off), (on - off) / off * 100.0);
+    };
+    row("all channels idle", idle_on, idle_off);
+    row("all channels busy", busy_on, busy_off);
+    println!(
+        "\n'all channels busy' is every channel transmitting back to back — no\n\
+         real band looks like that; it bounds the worst case. A live receiver\n\
+         sits near the idle row. The pinned-open column is the pre-squelch\n\
+         pipeline, so the last column is what the squelch actually buys."
     );
 }

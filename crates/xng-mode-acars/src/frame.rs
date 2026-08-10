@@ -110,6 +110,16 @@ impl Deframer {
         }
     }
 
+    /// True while a block is part-way through being collected, i.e. sync has
+    /// matched but the BCS has not arrived yet.
+    ///
+    /// The demod's presence gate is held open whenever this is set, so a
+    /// signal that fades part-way through a block is still followed to the end
+    /// of it instead of being cut off by the squelch closing underneath.
+    pub fn is_collecting(&self) -> bool {
+        matches!(self.state, State::Collect { .. })
+    }
+
     /// Push one demodulated bit; returns a frame when one completes.
     pub fn push_bit(&mut self, bit: u8) -> Option<AcarsFrame> {
         self.shift = (self.shift >> 1) | ((bit as u32) << 23);

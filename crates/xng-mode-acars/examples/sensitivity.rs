@@ -33,6 +33,20 @@
 //!
 //! Only sigma 0.18/0.20/0.22 discriminate: 0.15 is saturated and 0.25 is down
 //! in the floor, so those two move for reasons unrelated to the change.
+//!
+//! ## The squelch control
+//!
+//! Both columns use the same capture, the same noise draws and the same
+//! lead-in, and differ in exactly one bit: whether the squelch is active or
+//! pinned open. Pinned open *is* the pre-squelch pipeline, so a consistent gap
+//! between the columns is the gate's doing and nothing else's.
+//!
+//! The lead-in length is load-bearing for that control. At the 400 samples
+//! this harness originally used, the squelch is still seeding its noise floor
+//! (and inside the hangover that follows) when the burst arrives, so the gate
+//! is already open and the comparison is vacuous: a deliberately deaf gate,
+//! open threshold raised to 12x the floor, scored an unchanged full-marks row.
+//! `LEAD` must stay well above the gate's seed plus hangover.
 
 use num_complex::Complex;
 use xng_mode_acars::modulate::{burst_iq, FrameSpec};
@@ -80,8 +94,10 @@ fn spec() -> FrameSpec<'static> {
 }
 
 /// One noisy burst at `sigma`, decoded through the real channel decoder in
-/// streaming chunks. True when the exact payload came back CRC-clean.
-fn decodes(sigma: f32, trial: u64) -> bool {
+/// streaming chunks. `gated` selects the squelch; `false` pins the gate open,
+/// which is the pre-squelch pipeline exactly. True when the exact payload came
+/// back CRC-clean.
+fn decodes(sigma: f32, trial: u64, gated: bool) -> bool {
     let mut g = Gauss(0xC0FF_EE00_1234_5678u64.wrapping_add(trial.wrapping_mul(0x9E37_79B9)));
     let burst = burst_iq(&spec(), CHANNEL_RATE, 0.0, 0.5);
     let mut iq = vec![Complex::new(0.0f32, 0.0f32); LEAD];
@@ -94,6 +110,7 @@ fn decodes(sigma: f32, trial: u64) -> bool {
     let Ok(mut dec) = AcarsChannelDecoder::new(CHANNEL_RATE, 0.0) else {
         return false;
     };
+    dec.hold_squelch_open(!gated);
     let mut frames = Vec::new();
     for chunk in iq.chunks(1024) {
         frames.extend(dec.process(chunk));
@@ -103,18 +120,24 @@ fn decodes(sigma: f32, trial: u64) -> bool {
 
 fn main() {
     println!("ACARS sensitivity — {TRIALS} bursts per sigma, real decoder\n");
-    println!("{:>7}  {:>12}", "sigma", "CRC-OK");
-    let mut row = Vec::new();
+    println!("{:>7}  {:>12}  {:>12}", "sigma", "ungated", "gated");
+    let (mut ungated_row, mut gated_row) = (Vec::new(), Vec::new());
     for &sigma in &SIGMAS {
-        let ok = (0..TRIALS).filter(|&t| decodes(sigma, t)).count();
-        println!("{sigma:>7.2}  {ok:>7}/{TRIALS}");
-        row.push(ok.to_string());
+        let ungated = (0..TRIALS).filter(|&t| decodes(sigma, t, false)).count();
+        let gated = (0..TRIALS).filter(|&t| decodes(sigma, t, true)).count();
+        // Flag only a gap wider than this harness produces by chance.
+        let margin = (TRIALS / 50).max(2) as usize;
+        let flag = if gated + margin < ungated { "  <-- gate cost" } else { "" };
+        println!("{sigma:>7.2}  {ungated:>7}/{TRIALS}  {gated:>7}/{TRIALS}{flag}");
+        ungated_row.push(ungated.to_string());
+        gated_row.push(gated.to_string());
     }
-    println!("\nsummary: {}", row.join(" / "));
+    println!("\nungated (gate pinned open): {}", ungated_row.join(" / "));
+    println!("gated   (squelch active)  : {}", gated_row.join(" / "));
     println!(
-        "\nCompare against a run of the OTHER build on this machine, not against\n\
-         a number recorded elsewhere: absolute yield moves with the seed and\n\
-         with the host. A consistent one-directional shift across the middle\n\
-         three sigmas is a real change; scatter in both directions is not."
+        "\nCompare the two columns against each other, NOT against numbers from\n\
+         a previous run — absolute yield moves with the seed and with the host.\n\
+         A consistent one-directional gap across the middle three sigmas is the\n\
+         squelch eating marginal frames; scatter in both directions is not."
     );
 }

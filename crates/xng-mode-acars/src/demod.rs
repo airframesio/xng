@@ -16,6 +16,7 @@
 //! start-up (the initial state is unknown when we tune in mid-burst), so
 //! the deframer hunts for the sync pattern in both polarities.
 
+use crate::squelch::{Gate, Squelch};
 use crate::CHANNEL_RATE;
 use num_complex::Complex;
 use xng_dsp::{lowpass_taps, Fir, Nco};
@@ -99,6 +100,9 @@ pub struct MskDemod {
     /// Noise-floor estimate: envelope power EMA over inter-burst silence
     /// (gated by `NOISE_GATE`). 0.0 until the first sample seeds it.
     noise: f32,
+    /// Presence gate. Everything from the NCO mix downstream runs only on the
+    /// samples this passes; the envelope and the EMAs above run always.
+    squelch: Squelch,
 }
 
 impl MskDemod {
@@ -117,10 +121,27 @@ impl MskDemod {
             level: 0.0,
             dc: 0.0,
             noise: 0.0,
+            squelch: Squelch::new(),
         }
     }
 
+    /// Hold the presence gate open regardless of signal level.
+    ///
+    /// The decoder asserts this while its deframer is part-way through a block
+    /// so a frame can never be truncated by the gate closing under it, and
+    /// holding it from the first sample disables gating altogether.
+    pub fn hold_squelch_open(&mut self, hold: bool) {
+        self.squelch.hold_open(hold);
+    }
+
     /// Feed channel IQ; append hard bit decisions to `bits`.
+    ///
+    /// The envelope and its EMAs are computed for every sample, but only the
+    /// samples the presence gate passes go on to the mix, the lowpass and the
+    /// bit loop — on an idle channel that is almost none of them, which is
+    /// where the saving comes from. The gate also replays a short pre-roll
+    /// when it opens; see [`crate::squelch`] for why that is belt-and-braces
+    /// rather than load-bearing.
     pub fn process(&mut self, input: &[Complex<f32>], bits: &mut Vec<u8>) {
         // AM envelope → DC block → complex, mixed down by the tone midpoint.
         self.mixed.clear();
@@ -147,7 +168,22 @@ impl MskDemod {
                 // the silence EMA above and only creeps <1 dB on long bursts.
                 self.noise *= 1.0 + NOISE_RECOVER;
             }
-            self.mixed.push(Complex::new(env - self.dc, 0.0));
+            let value = env - self.dc;
+            match self.squelch.step(p, self.level, value) {
+                Gate::Closed => {}
+                Gate::Open => self.mixed.push(Complex::new(value, 0.0)),
+                Gate::Opening(n) => {
+                    // Replay the burst's lead-in so the lowpass is primed and
+                    // the timing loop has something to lock to before the
+                    // frame content arrives, rather than starting from a step.
+                    self.mixed
+                        .extend(self.squelch.preroll(n).iter().map(|&v| Complex::new(v, 0.0)));
+                    self.mixed.push(Complex::new(value, 0.0));
+                }
+            }
+        }
+        if self.mixed.is_empty() {
+            return;
         }
         self.mix.mix(&mut self.mixed);
 

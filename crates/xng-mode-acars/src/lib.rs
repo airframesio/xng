@@ -11,6 +11,7 @@ pub mod demod;
 pub mod fec;
 pub mod frame;
 pub mod modulate;
+mod squelch;
 pub mod sublabel;
 
 use chrono::Utc;
@@ -32,6 +33,9 @@ pub struct AcarsChannelDecoder {
     deframer: frame::Deframer,
     channel_buf: Vec<Complex<f32>>,
     bit_buf: Vec<u8>,
+    /// Squelch disabled (see [`Self::hold_squelch_open`]); keeps the per-chunk
+    /// deframer interlock from clearing the hold underneath it.
+    hold: bool,
 }
 
 impl AcarsChannelDecoder {
@@ -51,6 +55,7 @@ impl AcarsChannelDecoder {
             deframer: frame::Deframer::new(),
             channel_buf: Vec::new(),
             bit_buf: Vec::new(),
+            hold: false,
         })
     }
 
@@ -72,7 +77,20 @@ impl AcarsChannelDecoder {
                 frames.push(f);
             }
         }
+        // If this chunk ended mid-block, hold the presence gate open across
+        // the next one so a fading signal cannot be truncated by the squelch.
+        self.demod.hold_squelch_open(self.hold || self.deframer.is_collecting());
         frames
+    }
+
+    /// Hold the presence gate open, disabling the squelch for this channel.
+    ///
+    /// The gate is a CPU optimisation, not a decode decision, so it must be
+    /// possible to take it out of the path and compare — see
+    /// `examples/sensitivity.rs`, which runs both arms.
+    pub fn hold_squelch_open(&mut self, hold: bool) {
+        self.hold = hold;
+        self.demod.hold_squelch_open(hold);
     }
 
     /// Smoothed channel envelope level in dBFS (rough RSSI for metadata).
@@ -92,6 +110,10 @@ struct ChannelBack {
     demod: demod::MskDemod,
     deframer: frame::Deframer,
     bit_buf: Vec<u8>,
+    /// Squelch disabled for this channel (see
+    /// [`AcarsMultiChannelDecoder::hold_squelch_open`]); keeps the per-chunk
+    /// deframer interlock from clearing the hold underneath it.
+    hold: bool,
 }
 
 impl ChannelBack {
@@ -100,6 +122,7 @@ impl ChannelBack {
             demod: demod::MskDemod::new(),
             deframer: frame::Deframer::new(),
             bit_buf: Vec::new(),
+            hold: false,
         }
     }
 
@@ -113,6 +136,9 @@ impl ChannelBack {
                 frames.push(f);
             }
         }
+        // See `AcarsChannelDecoder::process`: hold the gate open across chunks
+        // that end mid-block so the squelch cannot truncate a frame.
+        self.demod.hold_squelch_open(self.hold || self.deframer.is_collecting());
         frames
     }
 }
@@ -196,6 +222,19 @@ impl AcarsMultiChannelDecoder {
     /// Number of channels.
     pub fn num_channels(&self) -> usize {
         self.backs.len()
+    }
+
+    /// Hold every channel's presence gate open, disabling the squelch.
+    ///
+    /// The gate is a CPU optimisation, not a decode decision, so it has to be
+    /// possible to take it out of the path and compare. Note that per-chunk
+    /// deframer interlocking will re-assert the hold each chunk but never
+    /// clears it while this is set.
+    pub fn hold_squelch_open(&mut self, hold: bool) {
+        for b in &mut self.backs {
+            b.hold = hold;
+            b.demod.hold_squelch_open(hold);
+        }
     }
 
     /// Feed wideband IQ; returns the completed frames for channel `i` as
