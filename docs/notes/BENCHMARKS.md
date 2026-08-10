@@ -253,6 +253,31 @@ traceback-matrix Viterbi (no O(n²) path clones), stride-2 template
 hunting with low-metric span skipping, and the `--demod-effort` knob
 (file decode = max, SDR commands = live).
 
+### ACARS shared multi-channel front end
+
+ACARS runs many narrowband channels from one wideband capture, so the
+per-channel downconverter front end (not the bit demod, which is ~17×
+cheaper) dominates and scales linearly with channel count. A shared front
+end downconverts all channels from one pass; the default is a polyphase
+channelizer whose cost is independent of channel count and channel spacing.
+
+×-realtime on an 8-channel synthetic 2.4 MS/s capture (`bench/cpu.sh`,
+32-core x86 dev box — *not* the M-series machine above, so not directly
+comparable to that table), decoding the front end three ways:
+
+| front end | 8 ch, tight cluster | 16 ch, wide span |
+|---|---|---|
+| per-channel DDC (old) | 3.7× | 1.9× |
+| shared decimation (`SharedDdc`) | 7.7× | 2.5× |
+| polyphase channelizer (`ChannelizedDdc`, default) | 27× | 18× |
+
+The channelizer is span-independent (the shared-decimation win shrinks as
+channels spread, because its coarse stage can only decimate as far as the
+widest channel allows). Both front ends produce byte-identical decodes (a
+`cargo test` asserts it); the choice is purely CPU. The same `xng-dsp`
+front ends are intended for VDL2/AIS/Aero/STD-C next (all use the same
+per-channel offset DDC today).
+
 ## Live-capture authenticity: phantom frames and ICAO confirmation
 
 Dense benchmark captures hide a defect that quiet live RF exposes: with

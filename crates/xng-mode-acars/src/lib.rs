@@ -15,7 +15,7 @@ pub mod sublabel;
 
 use chrono::Utc;
 use num_complex::Complex;
-use xng_dsp::Ddc;
+use xng_dsp::{ChannelizedDdc, Ddc, SharedDdc};
 use xng_types::{
     AcarsCore, DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality,
 };
@@ -83,6 +83,143 @@ impl AcarsChannelDecoder {
     /// Channel noise-floor estimate in dBFS (envelope power over silence).
     pub fn noise_dbfs(&self) -> f32 {
         self.demod.noise_dbfs()
+    }
+}
+
+/// Per-channel demod + deframe back end (the part downstream of the DDC),
+/// shared by both the single-channel and multi-channel decoders.
+struct ChannelBack {
+    demod: demod::MskDemod,
+    deframer: frame::Deframer,
+    bit_buf: Vec<u8>,
+}
+
+impl ChannelBack {
+    fn new() -> Self {
+        Self {
+            demod: demod::MskDemod::new(),
+            deframer: frame::Deframer::new(),
+            bit_buf: Vec::new(),
+        }
+    }
+
+    /// Feed already-downconverted 24 kHz channel IQ; return completed frames.
+    fn process(&mut self, channel: &[Complex<f32>]) -> Vec<frame::AcarsFrame> {
+        self.bit_buf.clear();
+        self.demod.process(channel, &mut self.bit_buf);
+        let mut frames = Vec::new();
+        for &bit in &self.bit_buf {
+            if let Some(f) = self.deframer.push_bit(bit) {
+                frames.push(f);
+            }
+        }
+        frames
+    }
+}
+
+/// Shared multi-channel downconverter front end. Two implementations with the
+/// same `(input_rate, output_rate, offsets, passband) -> process` contract:
+///
+/// * [`Front::Channelized`] — a polyphase channelizer ([`xng_dsp::ChannelizedDdc`]):
+///   one FFT pass produces every channel, cost independent of channel count
+///   and span. The default.
+/// * [`Front::Shared`] — a shared decimation ([`xng_dsp::SharedDdc`]): one
+///   full-rate decimation feeds cheap per-channel finishes. The fallback; its
+///   win shrinks as the channels spread across the band.
+//
+// Reverting the channelizer commit removes the `Channelized` arm and the
+// `Front` indirection, leaving the decoder on `SharedDdc` directly.
+enum Front {
+    Channelized(ChannelizedDdc),
+    Shared(SharedDdc),
+}
+
+impl Front {
+    fn process(&mut self, input: &[Complex<f32>], out: &mut [Vec<Complex<f32>>]) {
+        match self {
+            Self::Channelized(c) => c.process(input, out),
+            Self::Shared(s) => s.process(input, out),
+        }
+    }
+}
+
+/// Decodes SEVERAL ACARS channels out of one wideband capture with a single
+/// shared downconverter front end: the wideband-rate work is done once for all
+/// channels, then each channel does the usual MSK demod / deframe. Equivalent
+/// output to N independent [`AcarsChannelDecoder`]s, far less CPU when the
+/// channel count is high (the acarsdec-replacement scenario).
+pub struct AcarsMultiChannelDecoder {
+    front: Front,
+    backs: Vec<ChannelBack>,
+    channel_bufs: Vec<Vec<Complex<f32>>>,
+}
+
+impl AcarsMultiChannelDecoder {
+    /// `input_rate` is the wideband capture rate; `offsets` are each channel's
+    /// center relative to the capture center (Hz). Requires `input_rate` ≥ the
+    /// 24 kHz channel rate and wide enough to span every channel.
+    ///
+    /// Uses the polyphase channelizer front end (default), falling back to the
+    /// shared-decimation front end if the channelizer cannot be built for this
+    /// rate/offset set.
+    pub fn new(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
+        let front = match ChannelizedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ)
+        {
+            Ok(c) => Front::Channelized(c),
+            // On double failure report BOTH errors so an unusual capture
+            // config shows why the default channelizer was rejected too.
+            Err(chan_err) => Front::Shared(
+                SharedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ).map_err(
+                    |shared_err| {
+                        format!(
+                            "channelizer rejected ({chan_err}); shared-decim also failed ({shared_err})"
+                        )
+                    },
+                )?,
+            ),
+        };
+        let backs = offsets.iter().map(|_| ChannelBack::new()).collect();
+        let channel_bufs = offsets.iter().map(|_| Vec::new()).collect();
+        Ok(Self { front, backs, channel_bufs })
+    }
+
+    /// Build with the shared-decimation front end explicitly (the fallback
+    /// path; used to compare front ends and as the revert target).
+    pub fn new_shared(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
+        let front =
+            Front::Shared(SharedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ)?);
+        let backs = offsets.iter().map(|_| ChannelBack::new()).collect();
+        let channel_bufs = offsets.iter().map(|_| Vec::new()).collect();
+        Ok(Self { front, backs, channel_bufs })
+    }
+
+    /// Number of channels.
+    pub fn num_channels(&self) -> usize {
+        self.backs.len()
+    }
+
+    /// Feed wideband IQ; returns the completed frames for channel `i` as
+    /// `(i, frames)` for every channel that produced any.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<(usize, Vec<frame::AcarsFrame>)> {
+        self.front.process(input, &mut self.channel_bufs);
+        let mut out = Vec::new();
+        for (i, (back, buf)) in self.backs.iter_mut().zip(self.channel_bufs.iter()).enumerate() {
+            let frames = back.process(buf);
+            if !frames.is_empty() {
+                out.push((i, frames));
+            }
+        }
+        out
+    }
+
+    /// Smoothed envelope level (dBFS) for channel `i`.
+    pub fn level_dbfs(&self, i: usize) -> f32 {
+        self.backs[i].demod.level_dbfs()
+    }
+
+    /// Channel noise-floor estimate (dBFS) for channel `i`.
+    pub fn noise_dbfs(&self, i: usize) -> f32 {
+        self.backs[i].demod.noise_dbfs()
     }
 }
 
