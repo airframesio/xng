@@ -1133,13 +1133,18 @@ pub(crate) fn decode_loop(
     let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
     let mut chunk_count: u64 = 0;
     let mut buf = vec![Complex::new(0.0f32, 0.0f32); READ_CHUNK];
-    // Per-index stats for single-channel decoders. Shared multi-channel
-    // decoders (one index spanning many channels) are excluded here and
-    // tracked per-frequency in `shared_stats` instead.
-    let mut stats: Vec<(u64, u64, u64)> = decoders
+    // Per-index stats for single-channel decoders, seeded to the FULL decoder
+    // length so the positional `stats[i]` below stays valid no matter what mix
+    // of decoders the collapse produces. A shared multi-channel decoder's
+    // counts live in `shared_stats` (keyed by frequency, since one index spans
+    // many channels), so its placeholder entry here is never incremented and
+    // is filtered out of the returned summary.
+    let mut stats: Vec<(u64, u64, u64)> = decoders.iter().map(|(f, _)| (*f, 0, 0)).collect();
+    let shared_indices: Vec<usize> = decoders
         .iter()
-        .filter(|(_, d)| !matches!(d, ModeChannel::AcarsShared { .. }))
-        .map(|(f, _)| (*f, 0, 0))
+        .enumerate()
+        .filter(|(_, (_, d))| matches!(d, ModeChannel::AcarsShared { .. }))
+        .map(|(i, _)| i)
         .collect();
     // Per-frequency stats for shared multi-channel decoders, seeded with every
     // channel so even zero-frame channels appear in the summary.
@@ -1276,7 +1281,12 @@ pub(crate) fn decode_loop(
             }
         }
     }
-    // Fold any shared per-channel stats into the returned summary.
+    // Drop the placeholder entries that stood in for shared decoders (they
+    // exist only to keep `stats[i]` positional), then fold in the real
+    // per-frequency shared stats.
+    for &i in shared_indices.iter().rev() {
+        stats.remove(i);
+    }
     for (freq, (seen, ok)) in shared_stats {
         stats.push((freq, seen, ok));
     }

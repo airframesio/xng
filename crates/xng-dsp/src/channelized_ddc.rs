@@ -218,7 +218,6 @@ mod tests {
         let fs = 2_400_000.0;
         let out_rate = 24_000.0;
         let offsets = [50_000.0, 225_000.0, 325_000.0, -75_000.0];
-        let mut cd = ChannelizedDdc::new(fs, out_rate, &offsets, 5_000.0).unwrap();
 
         let n = 720_000;
         // One tone per channel, each 1 kHz inside its channel.
@@ -227,12 +226,11 @@ mod tests {
             let input = tone(off + 1_000.0, fs, n);
             // Decode each channel's tone in isolation to assert per-channel
             // gain without inter-tone leakage masking it.
-            let mut cd1 = ChannelizedDdc::new(fs, out_rate, &offsets, 5_000.0).unwrap();
+            let mut cd = ChannelizedDdc::new(fs, out_rate, &offsets, 5_000.0).unwrap();
             let mut o: Vec<Vec<IqSample>> = vec![Vec::new(); offsets.len()];
-            cd1.process(&input, &mut o);
+            cd.process(&input, &mut o);
             out[k] = std::mem::take(&mut o[k]);
         }
-        let _ = &mut cd;
 
         for (k, ch) in out.iter().enumerate() {
             let settled = &ch[ch.len() / 2..];
@@ -255,6 +253,48 @@ mod tests {
         let settled = &out[0][out[0].len() / 2..];
         let amp = settled.iter().map(|s| s.norm()).sum::<f32>() / settled.len() as f32;
         assert!(amp < 0.2, "neighbor bin should be rejected, got {amp}");
+    }
+
+    #[test]
+    fn streams_in_blocks_seamlessly() {
+        // The PFB buffers a partial block of `M` samples across calls
+        // (`pending`), so feeding the capture in arbitrary block sizes must
+        // yield the same output as one big block — and the same samples.
+        let fs = 2_400_000.0;
+        let out_rate = 24_000.0;
+        let offsets = [50_000.0, -75_000.0];
+        let input = tone(50_000.0 + 1_000.0, fs, 480_000);
+
+        let mut whole = ChannelizedDdc::new(fs, out_rate, &offsets, 5_000.0).unwrap();
+        let mut a: Vec<Vec<IqSample>> = vec![Vec::new(); offsets.len()];
+        whole.process(&input, &mut a);
+
+        // Odd, non-multiple-of-M chunk sizes exercise the pending buffer.
+        let mut chunked = ChannelizedDdc::new(fs, out_rate, &offsets, 5_000.0).unwrap();
+        let mut totals = vec![0usize; offsets.len()];
+        let mut joined: Vec<Vec<IqSample>> = vec![Vec::new(); offsets.len()];
+        let mut b: Vec<Vec<IqSample>> = vec![Vec::new(); offsets.len()];
+        for blk in input.chunks(7919) {
+            chunked.process(blk, &mut b);
+            for (k, v) in b.iter().enumerate() {
+                totals[k] += v.len();
+                joined[k].extend_from_slice(v);
+            }
+        }
+
+        for k in 0..offsets.len() {
+            assert!(
+                (a[k].len() as i64 - totals[k] as i64).abs() <= 4,
+                "channel {k}: {} whole vs {} chunked",
+                a[k].len(),
+                totals[k]
+            );
+            // The streamed samples must match the one-shot ones (same filter
+            // state, just fed in pieces).
+            let n = a[k].len().min(joined[k].len());
+            let worst = (0..n).map(|i| (a[k][i] - joined[k][i]).norm()).fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "channel {k}: streamed output diverged by {worst}");
+        }
     }
 
     #[test]
