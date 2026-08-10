@@ -61,6 +61,7 @@ rcgen = "0.13"
 rustls-pemfile = "2"
 tokio-stream = "0.1"
 webpki-roots = "0.26"
+zeromq = { version = "0.6.0", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
 
 # DSP loopback tests are too slow unoptimized.
 [profile.test]
@@ -134,3 +135,4 @@ rcgen.workspace = true
 rustls-pemfile.workspace = true
 tokio-stream.workspace = true
 webpki-roots.workspace = true
+zeromq.workspace = true

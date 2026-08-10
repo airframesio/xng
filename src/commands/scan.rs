@@ -596,6 +596,7 @@ pub(crate) fn scan_group(
             http: None,
             mqtt: None,
             mqtt_topic: "xng".into(),
+            zmq: Vec::new(),
             airframes: None,
             own_ship_mmsi: None,
         },

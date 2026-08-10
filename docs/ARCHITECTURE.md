@@ -96,7 +96,7 @@ xng/
 │   │                      #   selftest, tui, station, status, ingest, extern, config)
 │   ├── runtime.rs, bus.rs # session supervisor + message bus
 │   ├── outputs/           # console, JSON/JSONL, acarsdec UDP, dumpvdl2 UDP/TCP,
-│   │                      #   Airframes, Prometheus, SBS/Beast, NMEA, MQTT, asf-2.0,
+│   │                      #   Airframes, Prometheus, SBS/Beast, NMEA, MQTT, ZMQ, asf-2.0,
 │   │                      #   and the web dashboard (map + geo export)
 │   ├── tui.rs             # ratatui TUI
 │   ├── beam.rs, satmap.rs # Iridium beam-pattern reconstruction + satellite naming
@@ -124,7 +124,7 @@ serves five carriers.
 
 Every mode and command shares one output set: pretty console, JSON/JSONL,
 acarsdec-compatible UDP, Airframes feeding, Prometheus `/metrics`,
-SBS/Beast (Mode S), NMEA AIVDM (AIS), MQTT, and **asf-2.0** — one
+SBS/Beast (Mode S), NMEA AIVDM (AIS), MQTT, ZMQ, and **asf-2.0** — one
 protobuf schema multiplexing every channel/SDR/mode over a single gRPC
 (tonic/HTTP/2) or QUIC (quinn) connection, with the raw payload always
 preserved for server-side re-decode. `xng ingest` is the reference
