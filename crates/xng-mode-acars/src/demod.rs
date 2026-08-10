@@ -24,7 +24,27 @@ const BAUD: f64 = 2400.0;
 const SAMPLES_PER_BIT: usize = 10;
 const TONE_MID_HZ: f64 = 1800.0;
 const AUDIO_LPF_CUTOFF: f64 = 1300.0;
-const AUDIO_LPF_TAPS: usize = 121;
+/// This convolution is the single most expensive operation in the decoder
+/// (~40% of pipeline CPU), so the tap count is set to the measured floor
+/// rather than a comfortable round number.
+///
+/// Sizing is NOT set by image rejection: 51 taps already puts the −3000 Hz
+/// mixing image 83 dB down, far below the capture's noise floor. It is set by
+/// **sensitivity** — the discriminator's behaviour in noise degrades with a
+/// looser filter well before the image matters. An AWGN sweep through the real
+/// demod (60 bursts × 5 sigmas) gives CRC-OK yield at σ = 0.18/0.20/0.22:
+///
+/// | taps |  0.18 |  0.20 |  0.22 |
+/// |------|-------|-------|-------|
+/// |   51 |    53 |    37 |    18 |
+/// |   81 |    54 |    40 |    22 |
+/// |  101 |    56 |    42 |    21 |
+/// |  121 |    57 |    42 |    23 |
+///
+/// 101 is the smallest count that holds baseline yield within run-to-run
+/// noise. Do not lower it without re-running that sweep against the real
+/// demod — a reimplemented chain gives misleadingly flat results.
+const AUDIO_LPF_TAPS: usize = 101;
 /// Envelope DC tracker: fc ≈ alpha·fs/2π ≈ 19 Hz, settles within the pre-key.
 const DC_ALPHA: f32 = 0.005;
 /// Timing loop gain (fraction of the phase error applied per zero crossing).
@@ -123,8 +143,23 @@ impl MskDemod {
         self.lpf.process(&self.mixed, &mut self.filtered);
 
         for &y in &self.filtered {
-            // Frequency discriminator: phase advance per sample.
-            let disc = (y * self.prev_sample.conj()).arg();
+            // Frequency discriminator: the imaginary part of y·conj(prev) is
+            // |y||prev|·sin(Δφ) — the classic atan2-free discriminator. At the
+            // ACARS channel rate the tones sit at ±600 Hz of the 1800 Hz
+            // midpoint, i.e. only ±9°/sample, where sin(Δφ) tracks Δφ to
+            // within 0.4%: same sign, near-linear, and hundreds of times
+            // cheaper than atan2 on the per-sample hot path.
+            //
+            // The raw cross product is amplitude-weighted where atan2 is not,
+            // and that difference is NOT harmless: under noise |y| fluctuates
+            // sample to sample, so loud-but-noisy samples dominate the bit
+            // accumulator and marginal frames are lost (measured: 27/40 → 13/40
+            // CRC-OK at the sensitivity cliff). Dividing by |d| removes the
+            // weighting, leaving sin(Δφ) — pure phase, like atan2 — and one
+            // divide per sample is still far cheaper than the transcendental.
+            let d = y * self.prev_sample.conj();
+            let mag = d.norm();
+            let disc = if mag > 0.0 { d.im / mag } else { 0.0 };
             self.prev_sample = y;
 
             // Timing: tone transitions cross zero at bit boundaries
