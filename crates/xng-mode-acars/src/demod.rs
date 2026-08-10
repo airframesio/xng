@@ -27,8 +27,10 @@ const AUDIO_LPF_CUTOFF: f64 = 1300.0;
 /// Sizing here is set by **sensitivity**, not by image rejection: 51 taps
 /// already puts the −3000 Hz mixing image 83 dB down, far below the capture's
 /// noise floor, yet decode yield keeps improving well past that. An AWGN
-/// sweep through the real demod (60 bursts × 5 sigmas) gives CRC-OK yield at
-/// σ = 0.18/0.20/0.22:
+/// sweep through the real demod runs 60 bursts at each of five σ values
+/// (0.15/0.18/0.20/0.22/0.25); only the three middle columns discriminate —
+/// σ = 0.15 is saturated (~60/60 for every tap count) and σ = 0.25 is down in
+/// the floor (3–5/60) — so the table reports those:
 ///
 /// | taps |  0.18 |  0.20 |  0.22 |
 /// |------|-------|-------|-------|
