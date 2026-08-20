@@ -93,18 +93,65 @@ fn spec() -> FrameSpec<'static> {
     }
 }
 
+/// What the channel looks like before the burst arrives.
+///
+/// A single burst after a clean noise lead-in is the easy case, and testing
+/// only that shape is how a whole class of gate defects reached review: the
+/// gate went deaf under a DC pedestal and latched shut on a cold start with
+/// signal already on air, and `Clean` could not see either. Both are ordinary
+/// on real hardware — `AcarsChannelDecoder::new(rate, 0.0)` puts the channel
+/// at the capture centre, which is exactly where LO leakage lands.
+#[derive(Clone, Copy, PartialEq)]
+enum Channel {
+    /// Noise, then the burst.
+    Clean,
+    /// Noise plus a steady DC offset 15.6 dB above the burst — LO leakage, or
+    /// a co-channel carrier. The demod's DC blocker removes it entirely, so
+    /// decode must be unaffected; a gate that detects on carrier-inclusive
+    /// power instead sees level and floor rise together, goes deaf, and drops
+    /// every burst.
+    Pedestal,
+    /// Carrier already on air when the decoder starts, so the noise floor is
+    /// seeded from a signal rather than from silence.
+    MidSignalStart,
+}
+
+impl Channel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Pedestal => "dc pedestal",
+            Self::MidSignalStart => "mid-signal start",
+        }
+    }
+}
+
 /// One noisy burst at `sigma`, decoded through the real channel decoder in
 /// streaming chunks. `gated` selects the squelch; `false` pins the gate open,
 /// which is the pre-squelch pipeline exactly. True when the exact payload came
 /// back CRC-clean.
-fn decodes(sigma: f32, trial: u64, gated: bool) -> bool {
+fn decodes(sigma: f32, trial: u64, gated: bool, chan: Channel) -> bool {
     let mut g = Gauss(0xC0FF_EE00_1234_5678u64.wrapping_add(trial.wrapping_mul(0x9E37_79B9)));
     let burst = burst_iq(&spec(), CHANNEL_RATE, 0.0, 0.5);
     let mut iq = vec![Complex::new(0.0f32, 0.0f32); LEAD];
+    if chan == Channel::MidSignalStart {
+        // Unmodulated carrier already up when the process starts, stopping
+        // shortly before the burst keys up.
+        for (k, s) in iq.iter_mut().enumerate().take(LEAD - 4_800) {
+            let ph = std::f64::consts::TAU * 1_800.0 * k as f64 / CHANNEL_RATE;
+            *s += Complex::new(ph.cos() as f32, ph.sin() as f32) * 0.5;
+        }
+    }
     iq.extend(burst);
     iq.extend(vec![Complex::new(0.0f32, 0.0f32); 400]);
+    // A pedestal 15.6 dB above the burst. Sized deliberately: for a detector
+    // that squares the raw envelope, level/floor is ((dc + a) / dc)^2, which
+    // is 1.36 here — below OPEN_RATIO, so such a detector goes deaf and this
+    // arm fails. At 9.5 dB it would be 1.78, still above the threshold, and
+    // the arm would pass against the very defect it exists to catch.
+    let dc = if chan == Channel::Pedestal { 3.0 } else { 0.0 };
     for s in &mut iq {
-        *s += Complex::new(g.z() * sigma, g.z() * sigma);
+        *s += Complex::new(g.z() * sigma + dc, g.z() * sigma);
     }
 
     let Ok(mut dec) = AcarsChannelDecoder::new(CHANNEL_RATE, 0.0) else {
@@ -119,25 +166,44 @@ fn decodes(sigma: f32, trial: u64, gated: bool) -> bool {
 }
 
 fn main() {
-    println!("ACARS sensitivity — {TRIALS} bursts per sigma, real decoder\n");
-    println!("{:>7}  {:>12}  {:>12}", "sigma", "ungated", "gated");
-    let (mut ungated_row, mut gated_row) = (Vec::new(), Vec::new());
-    for &sigma in &SIGMAS {
-        let ungated = (0..TRIALS).filter(|&t| decodes(sigma, t, false)).count();
-        let gated = (0..TRIALS).filter(|&t| decodes(sigma, t, true)).count();
-        // Flag only a gap wider than this harness produces by chance.
-        let margin = (TRIALS / 50).max(2) as usize;
-        let flag = if gated + margin < ungated { "  <-- gate cost" } else { "" };
-        println!("{sigma:>7.2}  {ungated:>7}/{TRIALS}  {gated:>7}/{TRIALS}{flag}");
-        ungated_row.push(ungated.to_string());
-        gated_row.push(gated.to_string());
+    println!("ACARS sensitivity — {TRIALS} bursts per sigma, real decoder");
+    // Flag only a gap wider than this harness produces by chance.
+    let margin = (TRIALS / 50).max(2) as usize;
+    let mut worst: Vec<String> = Vec::new();
+
+    for chan in [Channel::Clean, Channel::Pedestal, Channel::MidSignalStart] {
+        println!("\n-- {} --\n", chan.label());
+        println!("{:>7}  {:>12}  {:>12}", "sigma", "ungated", "gated");
+        let (mut ungated_row, mut gated_row) = (Vec::new(), Vec::new());
+        let mut flagged = false;
+        for &sigma in &SIGMAS {
+            let ungated = (0..TRIALS).filter(|&t| decodes(sigma, t, false, chan)).count();
+            let gated = (0..TRIALS).filter(|&t| decodes(sigma, t, true, chan)).count();
+            let bad = gated + margin < ungated;
+            flagged |= bad;
+            let flag = if bad { "  <-- gate cost" } else { "" };
+            println!("{sigma:>7.2}  {ungated:>7}/{TRIALS}  {gated:>7}/{TRIALS}{flag}");
+            ungated_row.push(ungated.to_string());
+            gated_row.push(gated.to_string());
+        }
+        println!("  ungated: {}", ungated_row.join(" / "));
+        println!("  gated  : {}", gated_row.join(" / "));
+        if flagged {
+            worst.push(chan.label().to_string());
+        }
     }
-    println!("\nungated (gate pinned open): {}", ungated_row.join(" / "));
-    println!("gated   (squelch active)  : {}", gated_row.join(" / "));
+
+    println!();
+    if worst.is_empty() {
+        println!("No scenario shows a gate cost beyond harness scatter.");
+    } else {
+        println!("GATE COST in: {}", worst.join(", "));
+    }
     println!(
-        "\nCompare the two columns against each other, NOT against numbers from\n\
-         a previous run — absolute yield moves with the seed and with the host.\n\
-         A consistent one-directional gap across the middle three sigmas is the\n\
-         squelch eating marginal frames; scatter in both directions is not."
+        "\nCompare the two columns within a block against each other, NOT\n\
+         against numbers from a previous run — absolute yield moves with the\n\
+         seed and with the host. A consistent one-directional gap across the\n\
+         middle three sigmas is the squelch eating marginal frames; scatter in\n\
+         both directions is not."
     );
 }

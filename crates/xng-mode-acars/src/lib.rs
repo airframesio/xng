@@ -29,13 +29,10 @@ pub const CHANNEL_PASSBAND_HZ: f64 = 5_000.0;
 /// Decodes one ACARS channel out of a wideband capture.
 pub struct AcarsChannelDecoder {
     ddc: Option<Ddc>,
-    demod: demod::MskDemod,
-    deframer: frame::Deframer,
+    /// The demod + deframe back end, shared verbatim with the multi-channel
+    /// decoder so the squelch interlock cannot drift between the two paths.
+    back: ChannelBack,
     channel_buf: Vec<Complex<f32>>,
-    bit_buf: Vec<u8>,
-    /// Squelch disabled (see [`Self::hold_squelch_open`]); keeps the per-chunk
-    /// deframer interlock from clearing the hold underneath it.
-    hold: bool,
 }
 
 impl AcarsChannelDecoder {
@@ -49,14 +46,7 @@ impl AcarsChannelDecoder {
         } else {
             Some(Ddc::new(input_rate, CHANNEL_RATE, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
         };
-        Ok(Self {
-            ddc,
-            demod: demod::MskDemod::new(),
-            deframer: frame::Deframer::new(),
-            channel_buf: Vec::new(),
-            bit_buf: Vec::new(),
-            hold: false,
-        })
+        Ok(Self { ddc, back: ChannelBack::new(), channel_buf: Vec::new() })
     }
 
     /// Feed wideband IQ; returns any completed frames.
@@ -69,18 +59,7 @@ impl AcarsChannelDecoder {
             }
             None => input,
         };
-        self.bit_buf.clear();
-        self.demod.process(channel, &mut self.bit_buf);
-        let mut frames = Vec::new();
-        for &bit in &self.bit_buf {
-            if let Some(f) = self.deframer.push_bit(bit) {
-                frames.push(f);
-            }
-        }
-        // If this chunk ended mid-block, hold the presence gate open across
-        // the next one so a fading signal cannot be truncated by the squelch.
-        self.demod.hold_squelch_open(self.hold || self.deframer.is_collecting());
-        frames
+        self.back.process(channel)
     }
 
     /// Hold the presence gate open, disabling the squelch for this channel.
@@ -89,20 +68,35 @@ impl AcarsChannelDecoder {
     /// possible to take it out of the path and compare — see
     /// `examples/sensitivity.rs`, which runs both arms.
     pub fn hold_squelch_open(&mut self, hold: bool) {
-        self.hold = hold;
-        self.demod.hold_squelch_open(hold);
+        self.back.hold = hold;
+        self.back.demod.hold_squelch_open(hold);
     }
 
     /// Smoothed channel envelope level in dBFS (rough RSSI for metadata).
     pub fn level_dbfs(&self) -> f32 {
-        self.demod.level_dbfs()
+        self.back.demod.level_dbfs()
     }
 
     /// Channel noise-floor estimate in dBFS (envelope power over silence).
     pub fn noise_dbfs(&self) -> f32 {
-        self.demod.noise_dbfs()
+        self.back.demod.noise_dbfs()
     }
 }
+
+/// Channel-rate samples processed between deframer-interlock checks.
+///
+/// The interlock can only be evaluated where the deframer has actually seen
+/// the bits, i.e. between demod calls, so this bounds how late it can react.
+/// It has to stay below the squelch's hangover or the gate could shut
+/// mid-block before the interlock gets a say.
+///
+/// Fixing it here rather than inheriting whatever the caller passes is what
+/// makes that guarantee hold at any sample rate. The decode loop reads 65 536
+/// wideband samples at a time, which is 655 channel samples at 2.4 MS/s — but
+/// 65 536 of them when the input is already at the 24 kHz channel rate, i.e.
+/// 2.73 s, twenty-seven times the hangover. At that size the interlock was
+/// inert.
+const INTERLOCK_BLOCK: usize = 1_024;
 
 /// Per-channel demod + deframe back end (the part downstream of the DDC),
 /// shared by both the single-channel and multi-channel decoders.
@@ -127,18 +121,25 @@ impl ChannelBack {
     }
 
     /// Feed already-downconverted 24 kHz channel IQ; return completed frames.
+    ///
+    /// Walked in [`INTERLOCK_BLOCK`] pieces so the deframer interlock is
+    /// re-evaluated on a fixed timebase rather than on whatever the caller
+    /// happened to pass.
     fn process(&mut self, channel: &[Complex<f32>]) -> Vec<frame::AcarsFrame> {
-        self.bit_buf.clear();
-        self.demod.process(channel, &mut self.bit_buf);
         let mut frames = Vec::new();
-        for &bit in &self.bit_buf {
-            if let Some(f) = self.deframer.push_bit(bit) {
-                frames.push(f);
+        for block in channel.chunks(INTERLOCK_BLOCK) {
+            self.bit_buf.clear();
+            self.demod.process(block, &mut self.bit_buf);
+            for &bit in &self.bit_buf {
+                if let Some(f) = self.deframer.push_bit(bit) {
+                    frames.push(f);
+                }
             }
+            // Mid-block at this boundary means the gate must stay open across
+            // the next one, so a fading signal is followed to the end of the
+            // frame instead of being cut off by the squelch closing under it.
+            self.demod.hold_squelch_open(self.hold || self.deframer.is_collecting());
         }
-        // See `AcarsChannelDecoder::process`: hold the gate open across chunks
-        // that end mid-block so the squelch cannot truncate a frame.
-        self.demod.hold_squelch_open(self.hold || self.deframer.is_collecting());
         frames
     }
 }

@@ -169,7 +169,7 @@ impl MskDemod {
                 self.noise *= 1.0 + NOISE_RECOVER;
             }
             let value = env - self.dc;
-            match self.squelch.step(p, self.level, value) {
+            match self.squelch.step(value) {
                 Gate::Closed => {}
                 Gate::Open => self.mixed.push(Complex::new(value, 0.0)),
                 Gate::Opening(n) => {

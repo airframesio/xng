@@ -38,6 +38,21 @@
 //! 4. **The deframer interlock.** While the deframer is mid-frame the caller
 //!    holds the gate open outright (see [`Squelch::hold_open`]), so even a
 //!    signal that genuinely collapses is followed to the end of the block.
+//!
+//! ## The one shape this gate cannot hold open
+//!
+//! A signal that never stops will eventually be learned as the floor. The
+//! creep in [`FLOOR_CREEP`] is deliberately slow, but it is not zero, so a
+//! *continuous* carrier closes the gate after roughly seven seconds.
+//!
+//! That is out of reach for ACARS by construction: the longest legal block is
+//! ~250 characters, ~0.83 s on air, an order of magnitude short of it — and
+//! the deframer interlock holds the gate open across a block regardless. It is
+//! recorded here because it is exactly the property that makes this module
+//! wrong for other modes. STD-C's NCS common channels *are* continuous
+//! carriers; a gate with this behaviour in front of one would drop carrier
+//! lock a few seconds after startup and never recover. See the per-mode table
+//! in the PR description: the presence test does not generalise.
 
 /// Samples of channel history kept so the chain can be fed from *before* the
 /// gate opened. The lowpass needs its 121 taps primed and the timing loop
@@ -59,7 +74,15 @@
 /// represent a real capture where the pre-key is lost to a collision or a
 /// fade. If a future change needs to justify this code, it must first build a
 /// case that fails without it.
-const PREROLL: usize = 512;
+///
+/// Sized to exceed one channel-rate chunk. The decode loop hands the demod
+/// `READ_CHUNK` (65 536) wideband samples at a time, which at 2.4 MS/s is 655
+/// samples of channel rate; the deframer interlock is only re-evaluated at
+/// those boundaries, so if the gate ever does close wrongly mid-burst the
+/// replay has to be able to cover a whole chunk to recover it. 512 was smaller
+/// than that and so could not, which made it the one size that was neither
+/// useful nor honest.
+const PREROLL: usize = 2_048;
 /// Ring capacity. One more slot than [`PREROLL`] so a full-length pre-roll can
 /// be taken from strictly *before* the sample being decided.
 const RING: usize = PREROLL + 1;
@@ -83,32 +106,47 @@ const HANGOVER: usize = 2_400;
 /// lead-in and consequently scored a deliberately-deaf gate as a clean pass.
 /// Give any such test at least a second of lead-in.
 const SEED: usize = 256;
+/// How long the floor seed will wait for samples carrying energy before giving
+/// up and accepting whatever it has. Bounds the gate-held-open period on a
+/// channel that is digitally silent from the start: without it, a source that
+/// never produces a nonzero sample would never finish seeding. One second.
+/// (On such a channel the level is zero too, so the gate simply reads closed.)
+const SEED_TIMEOUT: usize = 24_000;
 /// Level must exceed the floor by this factor to open (2.0 dB).
 ///
-/// The margin is small on purpose. The weakest bursts that still decode are
-/// only a few dB above the floor — the sensitivity sweep still recovers frames
-/// at σ = 0.25, where the burst carries just ~3.7× the noise power — so a
-/// threshold chosen for a comfortable-looking dB figure would gate away
-/// exactly the marginal frames the demod works hardest to keep. It is safe to
-/// sit this close to the floor only because the test runs on the *smoothed*
-/// level, not the instantaneous envelope: an EMA at α = 0.005 has a standard
-/// deviation of ~5% of its mean on noise, so 1.6× is ~10 sigma away and a
-/// false open is a non-event. Testing instantaneous power here instead would
-/// open on 13% of pure-noise samples.
+/// The margin is small on purpose. The weakest bursts that still decode sit
+/// only a few dB above the floor, so a threshold chosen for a
+/// comfortable-looking dB figure would gate away exactly the marginal frames
+/// the demod works hardest to keep. It is safe to sit this close only because
+/// the test runs on the *smoothed* level, not the instantaneous envelope: an
+/// EMA at α = 0.005 has a standard deviation of ~5% of its mean on noise, so
+/// 1.6× is ~12 sigma out and a false open is a non-event. Testing
+/// instantaneous power here would instead open on ~20% of pure-noise samples.
 const OPEN_RATIO: f32 = 1.6;
 /// Level must fall below this multiple of the floor before the hangover starts
 /// (0.8 dB). Lower than [`OPEN_RATIO`] — that gap is the hysteresis.
 const CLOSE_RATIO: f32 = 1.2;
-/// Noise-floor EMA factor, applied only while the channel reads idle.
-const FLOOR_ALPHA: f32 = 0.002;
-/// A sample this far above the floor is an impulse, not the floor, and is kept
-/// out of the EMA even when the channel otherwise reads idle.
-const FLOOR_SPIKE_GATE: f32 = 8.0;
-/// Per-non-idle-sample multiplicative up-creep, so a floor that settled too
-/// low can still recover. Sized like the demod's own `NOISE_RECOVER`: at 2e-5
-/// on the 24 kHz channel rate a ~250 ms burst lifts the floor ~0.5 dB
-/// (harmless), while a genuinely stuck floor re-converges over a few seconds.
-const FLOOR_RECOVER: f32 = 2.0e-5;
+/// Smoothing for the detection level. Same time constant the demod uses for
+/// RSSI (tau ~= 8.3 ms at the 24 kHz channel rate) — fast enough to cross the
+/// open threshold a few ms into a ~53 ms pre-key, slow enough that its
+/// standard deviation on noise is ~5% of its mean.
+const LEVEL_ALPHA: f32 = 0.005;
+/// Noise-floor tracking rate while the channel reads idle (tau ~= 21 ms).
+/// Symmetric, so the floor is an unbiased estimate of the idle level.
+const FLOOR_TRACK: f32 = 0.002;
+/// Noise-floor tracking rate while the channel does NOT read idle, i.e. while
+/// something is transmitting. Not a freeze, because a hard freeze has no way
+/// back from a floor that settled too low — in particular a floor of exactly
+/// zero, which the previous multiplicative creep (`floor *= 1 + eps`) could
+/// never escape, pinning the gate open forever and silently costing the entire
+/// optimisation. Tracking toward the level additively always escapes.
+///
+/// Sized so a transmission cannot pull the floor up onto itself: at 1e-5 on
+/// the 24 kHz channel rate a 250 ms burst closes only 6% of the gap and the
+/// longest possible ACARS block (~0.83 s) only 18%, both far short of the
+/// [`CLOSE_RATIO`] margin. A *continuous* carrier would eventually win — see
+/// the note on sustained signals in the module docs.
+const FLOOR_CREEP: f32 = 1.0e-5;
 
 /// What the demod should do with the sample just offered to [`Squelch::step`].
 pub(crate) enum Gate {
@@ -130,10 +168,16 @@ pub(crate) struct Squelch {
     /// Next write position, always `< RING`; the live window is
     /// `hist[pos .. pos + RING]`, oldest first.
     pos: usize,
-    /// Envelope-power noise floor, tracked over idle samples only.
+    /// Smoothed DC-blocked power — the detection level. Private to the gate:
+    /// the demod's own `level` is carrier-inclusive and is what RSSI reports,
+    /// which is a different quantity and must stay that way.
+    level: f32,
+    /// Noise floor in the same units as [`Self::level`].
     floor: f32,
-    /// Samples folded into the floor seed so far, up to [`SEED`].
+    /// Samples with actual energy folded into the floor seed, up to [`SEED`].
     seeded: usize,
+    /// Samples spent waiting for those, capped by [`SEED_TIMEOUT`].
+    seed_wait: usize,
     open: bool,
     /// Samples of open time remaining once the level has dropped below
     /// [`CLOSE_RATIO`]; refreshed whenever it rises back above it.
@@ -152,8 +196,10 @@ impl Squelch {
         Self {
             hist: vec![0.0; 2 * RING],
             pos: 0,
+            level: 0.0,
             floor: 0.0,
             seeded: 0,
+            seed_wait: 0,
             open: false,
             hangover: 0,
             closed_run: 0,
@@ -169,43 +215,74 @@ impl Squelch {
         self.hold = hold;
     }
 
-    /// Offer one sample. `p` is its instantaneous envelope power, `level` the
-    /// demod's smoothed envelope power (reused rather than recomputed — it is
-    /// already maintained for RSSI and has exactly the right time constant),
-    /// and `value` the DC-blocked envelope sample to buffer for pre-roll.
+    /// Offer one sample. `value` is the DC-blocked envelope sample — exactly
+    /// what the demod feeds its mixer, and what gets buffered for pre-roll.
     ///
-    /// Detection deliberately runs on the *carrier* power `p`, not on the
-    /// DC-blocked `value`: the DC blocker exists to strip the carrier and
-    /// leave the audio, which throws away the very thing that most cleanly
-    /// distinguishes a burst from silence.
-    pub(crate) fn step(&mut self, p: f32, level: f32, value: f32) -> Gate {
+    /// Detection runs on the DC-blocked signal, **not** on raw envelope power.
+    /// An earlier version used the carrier-inclusive power on the reasoning
+    /// that the carrier is the largest thing distinguishing a burst from
+    /// silence. That is true of thermal noise and false of everything else: a
+    /// steady DC offset, LO leakage at the capture centre, or a co-channel
+    /// carrier inflates the level and the floor *equally*, so the ratio test
+    /// goes deaf and the burst is dropped — even though the demod's own DC
+    /// blocker removes that interferer completely and decodes the burst fine
+    /// when the gate is pinned open. Measured before the change, three bursts
+    /// through the real decoder with a pedestal 9.5 dB above the burst: 0/3
+    /// gated against 3/3 pinned open, at every amplitude tried.
+    ///
+    /// Detecting on the DC-blocked signal makes the gate's notion of "present"
+    /// the same as the demod's, and costs nothing: it is *more* sensitive, not
+    /// less, because blocking DC removes more from the silence floor than it
+    /// removes from the burst. Measured ~3.6 dB better across amplitudes.
+    pub(crate) fn step(&mut self, value: f32) -> Gate {
+        // A non-finite sample must not reach the EMAs. `level` is never reset,
+        // so one NaN would poison it permanently and every later comparison
+        // against the floor would be false — the gate would latch shut for the
+        // life of the process. cf32 input is a supported format, so this is
+        // reachable from a malformed file, not just from hardware.
+        if !value.is_finite() {
+            return if self.open { Gate::Open } else { Gate::Closed };
+        }
+
         self.hist[self.pos] = value;
         self.hist[self.pos + RING] = value;
         self.pos = if self.pos + 1 == RING { 0 } else { self.pos + 1 };
 
-        if self.seeded < SEED {
+        let p = value * value;
+        self.level += LEVEL_ALPHA * (p - self.level);
+        let level = self.level;
+
+        if self.seeded < SEED && self.seed_wait < SEED_TIMEOUT {
             // Still measuring the floor: hold open, and accumulate the mean.
-            self.seeded += 1;
-            self.floor += (p - self.floor) / self.seeded as f32;
+            //
+            // Only samples carrying energy count. Digital silence — a muted
+            // source, a zero-padded IQ file, a driver's first buffer — is not
+            // a measurement of the noise floor, and averaging it in yields a
+            // floor of exactly zero that then takes seconds of creep to
+            // escape. Skipping those samples means the estimate starts the
+            // moment real data arrives and completes 256 samples later.
+            self.seed_wait += 1;
+            if p > 0.0 {
+                self.seeded += 1;
+                self.floor += (p - self.floor) / self.seeded as f32;
+            }
             self.open = true;
             self.hangover = HANGOVER;
             return Gate::Open;
         }
 
         // The floor is what the channel reads when nothing is transmitting, so
-        // it must not be allowed to learn from a transmission. Freezing it on
-        // "not idle" rather than on a fixed spike threshold matters for weak
-        // bursts specifically: a burst only a few dB up would otherwise sit
-        // below any sane spike gate and drag the floor towards itself, closing
-        // the squelch part-way through its own signal.
+        // it must not learn from a transmission — but it must never be unable
+        // to learn at all, which is what a hard freeze gets wrong. Track the
+        // smoothed level always, quickly while the channel reads idle and
+        // ~200x slower while it does not. Tracking the *smoothed* level rather
+        // than per-sample power matters: per-sample envelope power is
+        // exponentially distributed, and an asymmetric tracker on it settles
+        // roughly 10 dB below the true mean, which would hold the gate open on
+        // pure noise and cost the entire saving.
         let idle = level < self.floor * CLOSE_RATIO;
-        if idle {
-            if p < self.floor * FLOOR_SPIKE_GATE {
-                self.floor += FLOOR_ALPHA * (p - self.floor);
-            }
-        } else {
-            self.floor *= 1.0 + FLOOR_RECOVER;
-        }
+        let alpha = if idle { FLOOR_TRACK } else { FLOOR_CREEP };
+        self.floor += alpha * (level - self.floor);
 
         if self.hold {
             self.open = true;
@@ -251,31 +328,31 @@ impl Squelch {
 mod tests {
     use super::*;
 
-    /// Drive the gate the way the demod does, with a level EMA matching the
-    /// demod's, over a power sequence. Returns the per-sample open decision
-    /// and the total number of samples the demod would have processed
-    /// (pre-roll included), which is what the CPU saving is measured in.
-    fn run(powers: &[f32]) -> (Vec<bool>, usize) {
+    /// Quiet and loud DC-blocked amplitudes, 6 dB apart in power.
+    const QUIET: f32 = 0.1;
+    const LOUD: f32 = 0.2;
+
+    /// Drive the gate the way the demod does and report, per sample, whether
+    /// it was open, plus the total number of samples the demod would have
+    /// processed (pre-roll included) — which is what the CPU saving is.
+    ///
+    /// Also asserts the pre-roll contract on every opening edge: the replayed
+    /// slice must be exactly the `n` inputs immediately preceding the sample
+    /// that opened the gate, in order. That is checked against the input
+    /// itself rather than against a reimplementation of the ring.
+    fn run(amps: &[f32]) -> (Vec<bool>, usize) {
         let mut sq = Squelch::new();
-        let mut level = 0.0f32;
-        let mut open = Vec::with_capacity(powers.len());
+        let mut open = Vec::with_capacity(amps.len());
         let mut processed = 0usize;
-        for (i, &p) in powers.iter().enumerate() {
-            level += 0.005 * (p - level);
-            match sq.step(p, level, i as f32) {
+        for (i, &a) in amps.iter().enumerate() {
+            match sq.step(a) {
                 Gate::Closed => open.push(false),
                 Gate::Open => {
                     processed += 1;
                     open.push(true);
                 }
                 Gate::Opening(n) => {
-                    // The replayed samples must be the ones that immediately
-                    // preceded this one, in order — that is the whole point of
-                    // the pre-roll, so check it rather than assuming it.
-                    let pre = sq.preroll(n);
-                    for (k, &v) in pre.iter().enumerate() {
-                        assert_eq!(v as usize, i - n + k, "pre-roll out of order");
-                    }
+                    assert_eq!(sq.preroll(n), &amps[i - n..i], "pre-roll at {i} is wrong");
                     processed += n + 1;
                     open.push(true);
                 }
@@ -285,100 +362,79 @@ mod tests {
     }
 
     /// Silence, one burst, silence. The gate must be shut over the bulk of the
-    /// silence, must be open before the burst's own samples arrive, and must
+    /// silence, open before the burst's own frame content could arrive, and
     /// shut again afterwards.
     #[test]
     fn opens_on_a_burst_after_long_silence_and_closes_after_it() {
-        let (quiet, loud) = (0.01f32, 0.04f32); // 6 dB — a weak burst
-        let mut p = vec![quiet; 24_000]; // 1 s of silence
-        p.extend(vec![loud; 6_000]); // 250 ms burst
-        p.extend(vec![quiet; 24_000]);
+        let mut a = vec![QUIET; 24_000];
+        a.extend(vec![LOUD; 6_000]);
+        a.extend(vec![QUIET; 24_000]);
 
-        let (open, _) = run(&p);
+        let (open, _) = run(&a);
 
-        // Shut through the back half of the lead-in silence.
         assert!(open[12_000..24_000].iter().all(|&o| !o), "gate open during silence");
-        // Open well inside the 53 ms (1272-sample) pre-key.
         let opened = 24_000 + open[24_000..].iter().position(|&o| o).expect("never opened");
+        // Well inside the 128-bit (1272-sample) pre-key.
         assert!(opened - 24_000 < 1_272, "took {} samples to open", opened - 24_000);
-        // Continuously open for the whole burst.
         assert!(open[opened..30_000].iter().all(|&o| o), "gate closed mid-burst");
-        // Shut again once the hangover expires.
-        assert!(!open[p.len() - 1], "gate never closed after the burst");
+        assert!(!open[a.len() - 1], "gate never closed after the burst");
     }
 
-    /// The saving is the point: on a channel that is quiet apart from one
-    /// burst, the overwhelming majority of samples must never reach the chain.
+    /// The saving is the point.
     #[test]
     fn idle_channel_skips_almost_everything() {
-        let mut p = vec![0.01f32; 24_000 * 10];
-        for s in p.iter_mut().skip(24_000).take(6_000) {
-            *s = 0.04;
+        let mut a = vec![QUIET; 24_000 * 10];
+        for s in a.iter_mut().skip(24_000).take(6_000) {
+            *s = LOUD;
         }
-        let (_, processed) = run(&p);
-        let duty = processed as f64 / p.len() as f64;
-        // 250 ms burst in 10 s is 2.5%; seed, pre-roll and hangover add a
-        // little. Anything near 1.0 means the gate is not gating.
+        let (_, processed) = run(&a);
+        let duty = processed as f64 / a.len() as f64;
         assert!(duty < 0.10, "processed {:.1}% of an idle channel", duty * 100.0);
     }
 
-    /// A dip in the middle of a burst must not split it: hysteresis plus
-    /// hangover has to ride through a fade far longer than any envelope null
-    /// the modulation itself produces.
+    /// Hysteresis plus hangover must ride through a fade far longer than any
+    /// envelope null the modulation itself produces.
     #[test]
     fn hangover_rides_through_a_mid_burst_fade() {
-        let (quiet, loud) = (0.01f32, 0.04f32);
-        let mut p = vec![quiet; 24_000];
-        p.extend(vec![loud; 3_000]);
-        p.extend(vec![quiet; 1_200]); // 50 ms fade to the noise floor
-        p.extend(vec![loud; 3_000]);
-        p.extend(vec![quiet; 12_000]);
+        let mut a = vec![QUIET; 24_000];
+        a.extend(vec![LOUD; 3_000]);
+        a.extend(vec![QUIET; 1_200]); // 50 ms fade, shorter than HANGOVER
+        a.extend(vec![LOUD; 3_000]);
+        a.extend(vec![QUIET; 12_000]);
 
-        let (open, _) = run(&p);
+        let (open, _) = run(&a);
         assert!(open[25_000..31_200].iter().all(|&o| o), "fade split the burst");
     }
 
-    /// Back-to-back bursts closer together than the pre-roll window. Every
-    /// sample must be handed to the demod at most once — a pre-roll that
-    /// reached back past the previous burst would replay samples that were
-    /// already processed, feeding the deframer a duplicated bit stream.
+    /// Bursts closer together than the pre-roll window: every sample must be
+    /// handed to the demod at most once, or the deframer sees duplicated bits.
     #[test]
     fn back_to_back_bursts_never_replay_processed_samples() {
-        let (quiet, loud) = (0.01f32, 0.04f32);
-        let mut p = vec![quiet; 24_000];
+        let mut a = vec![QUIET; 24_000];
         for _ in 0..3 {
-            p.extend(vec![loud; 6_000]);
-            p.extend(vec![quiet; 3_000]); // shorter than HANGOVER + decay
+            a.extend(vec![LOUD; 6_000]);
+            a.extend(vec![QUIET; 3_000]);
         }
-        p.extend(vec![quiet; 12_000]);
-
-        // `run` asserts pre-roll ordering; here we additionally check that the
-        // total processed count cannot exceed the number of samples that exist.
-        let (_, processed) = run(&p);
-        assert!(processed <= p.len(), "processed {processed} of {} samples", p.len());
+        a.extend(vec![QUIET; 12_000]);
+        let (_, processed) = run(&a);
+        assert!(processed <= a.len(), "processed {processed} of {} samples", a.len());
     }
 
     /// The deframer interlock outranks the level test outright.
     #[test]
     fn hold_open_overrides_the_level_test() {
         let mut sq = Squelch::new();
-        let mut level = 0.0f32;
-        // Settle the floor on silence first.
-        for i in 0..24_000 {
-            level += 0.005 * (0.01 - level);
-            sq.step(0.01, level, i as f32);
+        for _ in 0..24_000 {
+            sq.step(QUIET);
         }
-        assert!(matches!(sq.step(0.01, level, 0.0), Gate::Closed), "should be shut on silence");
+        assert!(matches!(sq.step(QUIET), Gate::Closed), "should be shut on silence");
         sq.hold_open(true);
         for _ in 0..24_000 {
-            assert!(
-                !matches!(sq.step(0.01, level, 0.0), Gate::Closed),
-                "held gate closed anyway"
-            );
+            assert!(!matches!(sq.step(QUIET), Gate::Closed), "held gate closed anyway");
         }
     }
 
-    /// Held open from the first sample, the gate is a no-op: every sample is
+    /// Held open from the first sample the gate is a no-op: every sample is
     /// passed exactly once, in order, with no pre-roll replay. This is what
     /// makes "gating disabled" identical to the pre-squelch demod rather than
     /// merely similar to it.
@@ -386,11 +442,69 @@ mod tests {
     fn held_open_passes_every_sample_exactly_once() {
         let mut sq = Squelch::new();
         sq.hold_open(true);
-        let mut level = 0.0f32;
         for i in 0..50_000 {
-            let p = if (24_000..30_000).contains(&i) { 0.04 } else { 0.01 };
-            level += 0.005 * (p - level);
-            assert!(matches!(sq.step(p, level, i as f32), Gate::Open), "sample {i} not passed");
+            let a = if (24_000..30_000).contains(&i) { LOUD } else { QUIET };
+            assert!(matches!(sq.step(a), Gate::Open), "sample {i} not passed");
         }
+    }
+
+    /// A floor of exactly zero must not be absorbing.
+    ///
+    /// Regression test. The floor used to recover by multiplication
+    /// (`floor *= 1 + eps`), which cannot escape zero — so a source that
+    /// starts with digital silence (a muted input, a zero-padded IQ file, a
+    /// driver's first buffer) seeded the floor to 0, made `idle` false for
+    /// every subsequent sample, and pinned the gate open **forever**. Silent:
+    /// no error, no dropped frame, just the entire CPU saving quietly gone.
+    /// Measured at the time: 100.00% gate duty against 1.11% expected.
+    #[test]
+    fn a_zero_floor_is_not_absorbing() {
+        let mut a = vec![0.0f32; 1_024];
+        a.extend(vec![QUIET; 24_000 * 15]);
+        let (open, _) = run(&a);
+        assert!(!open[a.len() - 1], "gate never recovered from a zero floor");
+        // And it must actually be saving by the end, not merely flickering.
+        let tail = &open[a.len() - 24_000..];
+        let duty = tail.iter().filter(|&&o| o).count() as f64 / tail.len() as f64;
+        assert!(duty < 0.05, "still {:.0}% open after recovery", duty * 100.0);
+    }
+
+    /// One non-finite sample must not permanently latch the gate.
+    ///
+    /// `level` is an EMA that is never reset, so letting a NaN into it makes
+    /// every later `level > floor * RATIO` false and the channel goes deaf for
+    /// the life of the process. cf32 is a supported input format, so this is
+    /// reachable from a malformed file rather than only from hardware.
+    #[test]
+    fn a_non_finite_sample_does_not_latch_the_gate() {
+        for poison in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut sq = Squelch::new();
+            for _ in 0..24_000 {
+                sq.step(QUIET);
+            }
+            sq.step(poison);
+            // A burst after the poison must still open the gate.
+            let mut opened = false;
+            for _ in 0..6_000 {
+                if !matches!(sq.step(LOUD), Gate::Closed) {
+                    opened = true;
+                    break;
+                }
+            }
+            assert!(opened, "gate latched shut after {poison}");
+        }
+    }
+
+    /// A transmission must not be learned as the noise floor on any timescale
+    /// ACARS can produce. The longest legal block is ~0.83 s on air.
+    #[test]
+    fn a_full_length_block_does_not_pull_the_floor_up_onto_itself() {
+        let mut a = vec![QUIET; 24_000];
+        a.extend(vec![LOUD; 20_000]); // ~0.83 s, the longest possible block
+        let (open, _) = run(&a);
+        assert!(
+            open[25_000..44_000].iter().all(|&o| o),
+            "floor learned the transmission and closed the gate on it"
+        );
     }
 }

@@ -232,14 +232,22 @@ fn main() {
     println!("\n-- squelch: idle vs busy --\n");
     let busy_cap = all_channels_busy(n, &offs);
 
-    let run = |cap: &[Complex<f32>], hold: bool| -> Option<f64> {
+    // Count frames as well as time. A timing table alone cannot tell a
+    // genuine saving from a gate that has gone deaf: a squelch that dropped
+    // every burst under sustained traffic would show up here as the fastest
+    // configuration of all. The busy arms are checked for decode below.
+    let run = |cap: &[Complex<f32>], hold: bool| -> Option<(f64, usize)> {
         let mut d = AcarsMultiChannelDecoder::new(FS, &offs).ok()?;
         d.hold_squelch_open(hold);
-        Some(best(|| {
+        let ms = best(|| {
             d.process(cap);
-        }))
+        });
+        let mut fresh = AcarsMultiChannelDecoder::new(FS, &offs).ok()?;
+        fresh.hold_squelch_open(hold);
+        let frames: usize = fresh.process(cap).iter().map(|(_, f)| f.len()).sum();
+        Some((ms, frames))
     };
-    let (Some(idle_on), Some(idle_off), Some(busy_on), Some(busy_off)) = (
+    let (Some((idle_on, _)), Some((idle_off, _)), Some((busy_on, busy_on_f)), Some((busy_off, busy_off_f))) = (
         run(&cap, false),
         run(&cap, true),
         run(&busy_cap, false),
@@ -254,6 +262,19 @@ fn main() {
     };
     row("all channels idle", idle_on, idle_off);
     row("all channels busy", busy_on, busy_off);
+
+    println!("\nframes decoded on the busy capture: {busy_on_f} gated, {busy_off_f} pinned open");
+    if busy_on_f == 0 || busy_off_f == 0 {
+        println!("  *** BROKEN: the busy capture decoded nothing — the timings below it");
+        println!("  *** are measuring a pipeline that is not working, not a saving.");
+    } else if busy_on_f * 10 < busy_off_f * 9 {
+        println!(
+            "  *** GATE IS DEAF: gated decoded {busy_on_f} against {busy_off_f} pinned open."
+        );
+        println!("  *** A faster 'busy' row here is a regression, not an optimisation.");
+    } else {
+        println!("  (within 10% of each other, so the busy timing is a like-for-like saving)");
+    }
     println!(
         "\n'all channels busy' is every channel transmitting back to back — no\n\
          real band looks like that; it bounds the worst case. A live receiver\n\
