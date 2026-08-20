@@ -25,11 +25,16 @@ use std::sync::Arc;
 pub struct PfbChannelizer {
     nch: usize,
     taps_per_branch: usize,
-    /// Polyphase branches: `branches[k][l] = h[k + l*nch]`.
-    branches: Vec<Vec<f32>>,
-    /// Delay line of the last `nch * taps_per_branch` input samples,
-    /// oldest first.
-    delay: Vec<IqSample>,
+    /// Polyphase taps laid out **block-major**: `tap_by_block[l * nch + p]` is
+    /// the tap applied to position `p` of the block `l` steps back from the
+    /// newest. This is the transpose of the natural `branches[k][l]` layout
+    /// and is what makes the hot loop contiguous — see `step`.
+    tap_by_block: Vec<f32>,
+    /// Ring of the last `taps_per_branch` input blocks, each `nch` wide.
+    /// Blocks are overwritten in place; nothing is ever shifted.
+    blocks: Vec<IqSample>,
+    /// Index of the block that will be written next (i.e. one past newest).
+    next_block: usize,
     ifft: Arc<dyn Fft<f32>>,
     /// Scratch for the IFFT (v[k] → channel outputs).
     scratch: Vec<IqSample>,
@@ -46,15 +51,23 @@ impl PfbChannelizer {
         let total = nch * taps_per_branch;
         // Prototype lowpass: passband half-width = half a channel.
         let proto = lowpass_taps(0.5 / nch as f64, total);
-        let branches: Vec<Vec<f32>> = (0..nch)
-            .map(|k| (0..taps_per_branch).map(|l| proto[k + l * nch]).collect())
-            .collect();
+        // Branch k, tap l reads position (nch-1-k) of the block l steps back
+        // from the newest, and multiplies by proto[k + l*nch]. Store that tap
+        // indexed by (block, position) so the inner loop walks positions
+        // contiguously instead of gathering with stride nch.
+        let mut tap_by_block = vec![0.0f32; total];
+        for k in 0..nch {
+            for l in 0..taps_per_branch {
+                tap_by_block[l * nch + (nch - 1 - k)] = proto[k + l * nch];
+            }
+        }
         let ifft = FftPlanner::new().plan_fft(nch, FftDirection::Inverse);
         Self {
             nch,
             taps_per_branch,
-            branches,
-            delay: vec![IqSample::new(0.0, 0.0); total],
+            tap_by_block,
+            blocks: vec![IqSample::new(0.0, 0.0); total],
+            next_block: 0,
             ifft,
             scratch: vec![IqSample::new(0.0, 0.0); nch],
             pending: Vec::with_capacity(nch),
@@ -89,21 +102,41 @@ impl PfbChannelizer {
     }
 
     fn step(&mut self, out: &mut [Vec<IqSample>]) {
-        let total = self.delay.len();
-        // Slide the delay line left by one block, append the new block
-        // (delay is oldest-first; newest sample ends at delay[total-1]).
-        self.delay.copy_within(self.nch.., 0);
-        self.delay[total - self.nch..].copy_from_slice(&self.pending);
-
-        // v[k] = Σ_l p_k[l] · x[n - k - l·M]; x[n - j] = delay[total-1-j]
-        for k in 0..self.nch {
-            let mut acc = IqSample::new(0.0, 0.0);
-            for l in 0..self.taps_per_branch {
-                let j = k + l * self.nch;
-                acc += self.delay[total - 1 - j] * self.branches[k][l];
-            }
-            self.scratch[k] = acc;
+        let nch = self.nch;
+        // Overwrite the oldest block in the ring with the new one — no shift.
+        // (`next_block` points at the oldest, which is what we replace.)
+        let write = self.next_block * nch;
+        self.blocks[write..write + nch].copy_from_slice(&self.pending);
+        self.next_block += 1;
+        if self.next_block == self.taps_per_branch {
+            self.next_block = 0;
         }
+
+        // v[k] = Σ_l p_k[l] · x[n − k − l·M]. Reindexed block-major: tap l
+        // touches position (nch−1−k) of the block l steps back from newest, so
+        // accumulate block by block over CONTIGUOUS positions. The newest
+        // block is the one just written (next_block − 1), and walking l
+        // forward walks the ring backwards.
+        for s in self.scratch.iter_mut() {
+            *s = IqSample::new(0.0, 0.0);
+        }
+        let mut blk = if self.next_block == 0 {
+            self.taps_per_branch - 1
+        } else {
+            self.next_block - 1
+        };
+        for l in 0..self.taps_per_branch {
+            let base = blk * nch;
+            let samples = &self.blocks[base..base + nch];
+            let taps = &self.tap_by_block[l * nch..l * nch + nch];
+            for ((acc, s), &t) in self.scratch.iter_mut().zip(samples.iter()).zip(taps.iter()) {
+                *acc += *s * t;
+            }
+            blk = if blk == 0 { self.taps_per_branch - 1 } else { blk - 1 };
+        }
+        // `scratch[p]` holds branch k = nch−1−p; the IFFT expects v[k] at
+        // index k, so reversing puts the branches back in order.
+        self.scratch.reverse();
 
         self.ifft.process(&mut self.scratch);
         for (ch, sample) in self.scratch.iter().enumerate() {
@@ -192,6 +225,96 @@ mod tests {
         pfb.process(&input, &mut out);
         for c in &out {
             assert_eq!(c.len(), 100); // 7 leftovers buffered as pending
+        }
+    }
+
+    /// Reference implementation: the direct shift-the-delay-line, strided
+    /// gather formulation this channelizer replaced. Kept so the block-major
+    /// layout can be held to **bit-exact** equality — the restructure is a
+    /// performance change, not a maths change.
+    struct RefPfb {
+        nch: usize,
+        taps_per_branch: usize,
+        branches: Vec<Vec<f32>>,
+        delay: Vec<IqSample>,
+        ifft: Arc<dyn Fft<f32>>,
+        scratch: Vec<IqSample>,
+        pending: Vec<IqSample>,
+    }
+
+    impl RefPfb {
+        fn new(nch: usize, taps_per_branch: usize) -> Self {
+            let total = nch * taps_per_branch;
+            let proto = lowpass_taps(0.5 / nch as f64, total);
+            let branches: Vec<Vec<f32>> = (0..nch)
+                .map(|k| (0..taps_per_branch).map(|l| proto[k + l * nch]).collect())
+                .collect();
+            Self {
+                nch,
+                taps_per_branch,
+                branches,
+                delay: vec![IqSample::new(0.0, 0.0); total],
+                ifft: FftPlanner::new().plan_fft(nch, FftDirection::Inverse),
+                scratch: vec![IqSample::new(0.0, 0.0); nch],
+                pending: Vec::with_capacity(nch),
+            }
+        }
+        fn process(&mut self, input: &[IqSample], out: &mut [Vec<IqSample>]) {
+            for &x in input {
+                self.pending.push(x);
+                if self.pending.len() == self.nch {
+                    let total = self.delay.len();
+                    self.delay.copy_within(self.nch.., 0);
+                    self.delay[total - self.nch..].copy_from_slice(&self.pending);
+                    for k in 0..self.nch {
+                        let mut acc = IqSample::new(0.0, 0.0);
+                        for l in 0..self.taps_per_branch {
+                            let j = k + l * self.nch;
+                            acc += self.delay[total - 1 - j] * self.branches[k][l];
+                        }
+                        self.scratch[k] = acc;
+                    }
+                    self.ifft.process(&mut self.scratch);
+                    for (ch, s) in self.scratch.iter().enumerate() {
+                        out[ch].push(*s);
+                    }
+                    self.pending.clear();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn matches_direct_reference_bit_exactly() {
+        let mut s = 0x0bad_c0de_dead_beefu64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s as f32 / u64::MAX as f32) * 2.0 - 1.0
+        };
+        let input: Vec<IqSample> = (0..60_000).map(|_| IqSample::new(next(), next())).collect();
+
+        for &(nch, tpb) in &[(4usize, 3usize), (8, 8), (16, 4), (48, 8), (5, 6)] {
+            let mut fast = PfbChannelizer::new(nch, tpb);
+            let mut refr = RefPfb::new(nch, tpb);
+            let mut a: Vec<Vec<IqSample>> = vec![Vec::new(); nch];
+            let mut b: Vec<Vec<IqSample>> = vec![Vec::new(); nch];
+            // Uneven blocks so the pending buffer and ring wrap at odd offsets.
+            for blk in input.chunks(1013) {
+                fast.process(blk, &mut a);
+                refr.process(blk, &mut b);
+            }
+            for ch in 0..nch {
+                assert_eq!(a[ch].len(), b[ch].len(), "nch={nch} tpb={tpb} ch={ch} len");
+                for (i, (x, y)) in a[ch].iter().zip(b[ch].iter()).enumerate() {
+                    assert_eq!(
+                        (x.re.to_bits(), x.im.to_bits()),
+                        (y.re.to_bits(), y.im.to_bits()),
+                        "nch={nch} tpb={tpb} ch={ch} sample {i}: {x:?} vs {y:?}"
+                    );
+                }
+            }
         }
     }
 

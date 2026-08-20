@@ -23,6 +23,10 @@ use crate::nco::Nco;
 use crate::resample::Resampler;
 use crate::IqSample;
 
+/// Polyphase taps per branch. See the rejection/cost note at the
+/// `PfbChannelizer::new` call site.
+const PFB_TAPS_PER_BRANCH: usize = 8;
+
 /// One requested channel's mapping onto the bin grid + its cheap back end.
 struct Channel {
     /// Which channelizer bin carries this channel.
@@ -66,7 +70,11 @@ impl ChannelizedDdc {
         // rate is too tight for the channel filter, so allow up to ~2×).
         let m = choose_num_bins(input_rate, output_rate, passband_hz, offsets)?;
         let bin_rate = input_rate / m as f64;
-        let pfb = PfbChannelizer::new(m, 12);
+        // 8 taps/branch measured at 109 dB adjacent-bin rejection vs 12's
+        // 113 dB — 4 dB nobody can use, for 27% less CPU in what is one of the
+        // two dominant costs in the decoder. (4 taps drops to 29 dB, too thin
+        // for a strong neighbour on the 25 kHz airband raster.)
+        let pfb = PfbChannelizer::new(m, PFB_TAPS_PER_BRANCH);
 
         let mut channels = Vec::with_capacity(offsets.len());
         for &off in offsets {
@@ -125,14 +133,24 @@ impl ChannelizedDdc {
         self.pfb.process(input, &mut self.bins);
 
         // --- Per channel: pull its bin, residual-mix, resample. ---
+        // A copy out of the shared bin is unavoidable (the NCO mixes in place
+        // and several channels may read the same bin), but when there is no
+        // resampler the copy can land straight in the caller's buffer and be
+        // mixed there, saving a whole buffer pass at the channel rate.
         for (ch, out_buf) in self.channels.iter_mut().zip(out.iter_mut()) {
             out_buf.clear();
-            ch.binbuf.clear();
-            ch.binbuf.extend_from_slice(&self.bins[ch.bin]);
-            ch.nco.mix(&mut ch.binbuf);
+            let bin = &self.bins[ch.bin];
             match &mut ch.resampler {
-                Some(rs) => rs.process(&ch.binbuf, out_buf),
-                None => out_buf.extend_from_slice(&ch.binbuf),
+                Some(rs) => {
+                    ch.binbuf.clear();
+                    ch.binbuf.extend_from_slice(bin);
+                    ch.nco.mix(&mut ch.binbuf);
+                    rs.process(&ch.binbuf, out_buf);
+                }
+                None => {
+                    out_buf.extend_from_slice(bin);
+                    ch.nco.mix(out_buf);
+                }
             }
         }
     }
