@@ -367,3 +367,144 @@ fn both_front_ends_decode_equivalently() {
     assert_eq!(channelized[1], ["FRONT END TWO"]);
     assert_eq!(channelized[2], ["FRONT END TRE"]);
 }
+
+/// A burst arriving after a long idle period must decode identically to one
+/// arriving immediately — the squelch's whole job is to be invisible.
+///
+/// This is the case the gate is most likely to break: the channel has been
+/// shut for seconds, the noise floor has fully settled, and the gate has to
+/// open on the pre-key and hand the demod enough lead-in that the timing loop
+/// locks before the frame content arrives.
+#[test]
+fn squelch_decodes_a_burst_after_long_silence() {
+    let spec = downlink("BURST AFTER LONG SILENCE", "XG0042");
+    // 5 seconds of silence at the channel rate, then the burst.
+    let mut iq = vec![Complex::new(0.0, 0.0); 24_000 * 5];
+    iq.extend(burst_iq(&spec, 24_000.0, 0.0, 0.5));
+    iq.extend(vec![Complex::new(0.0, 0.0); 24_000]);
+    let mut noise = Noise(0x5115_ce00_1234_5678);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.01, noise.next() * 0.01);
+    }
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut frames = Vec::new();
+    for chunk in iq.chunks(1024) {
+        frames.extend(dec.process(chunk));
+    }
+    assert_eq!(frames.len(), 1, "expected exactly one frame after long silence");
+    assert!(frames[0].crc_ok, "CRC failed: {:?}", frames[0]);
+    assert_eq!(frames[0].text, "BURST AFTER LONG SILENCE");
+}
+
+/// Bursts arriving back to back, separated by less than the squelch's
+/// hangover. The gate stays open across the gap, so the demod sees a
+/// continuous stream — every burst must still decode, and none may be
+/// duplicated by a pre-roll replaying samples the demod already consumed.
+#[test]
+fn squelch_decodes_back_to_back_bursts() {
+    let texts = ["BACK TO BACK ONE", "BACK TO BACK TWO", "BACK TO BACK TRE"];
+    let mut iq = vec![Complex::new(0.0, 0.0); 24_000];
+    for t in &texts {
+        iq.extend(burst_iq(&downlink(t, "XG0042"), 24_000.0, 0.0, 0.5));
+        // 40 ms gap — shorter than the 100 ms hangover, so the gate never
+        // closes between them.
+        iq.extend(vec![Complex::new(0.0, 0.0); 960]);
+    }
+    iq.extend(vec![Complex::new(0.0, 0.0); 24_000]);
+    let mut noise = Noise(0xb2b0_0000_dead_beef);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.01, noise.next() * 0.01);
+    }
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut got = Vec::new();
+    for chunk in iq.chunks(1024) {
+        for f in dec.process(chunk) {
+            assert!(f.crc_ok, "CRC failed: {f:?}");
+            got.push(f.text.clone());
+        }
+    }
+    assert_eq!(got, texts, "every back-to-back burst must decode exactly once");
+}
+
+/// Widely-spaced bursts: the gate closes fully between them and must re-open
+/// for each. Catches a gate that latches shut, or a noise floor that creeps up
+/// after the first burst and swallows later ones.
+#[test]
+fn squelch_reopens_for_bursts_separated_by_long_gaps() {
+    let texts = ["SPACED BURST ONE", "SPACED BURST TWO", "SPACED BURST TRE"];
+    let mut iq = vec![Complex::new(0.0, 0.0); 24_000];
+    for t in &texts {
+        iq.extend(burst_iq(&downlink(t, "XG0042"), 24_000.0, 0.0, 0.5));
+        iq.extend(vec![Complex::new(0.0, 0.0); 24_000 * 2]); // 2 s idle
+    }
+    let mut noise = Noise(0x5eed_1234_abcd_0001);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.01, noise.next() * 0.01);
+    }
+
+    let mut dec = AcarsChannelDecoder::new(24_000.0, 0.0).unwrap();
+    let mut got = Vec::new();
+    for chunk in iq.chunks(1024) {
+        for f in dec.process(chunk) {
+            assert!(f.crc_ok, "CRC failed: {f:?}");
+            got.push(f.text.clone());
+        }
+    }
+    assert_eq!(got, texts, "gate must re-open for every burst");
+}
+
+/// The squelch is a CPU optimisation, not a decode decision: gating on and
+/// gating off must produce the same frames from the same capture.
+///
+/// Deliberately at a low amplitude (0.12 against 0.01 noise) so the bursts sit
+/// near the gate's threshold rather than slamming it open — a gate that only
+/// works on loud signals would pass a test run at full scale.
+#[test]
+fn squelch_does_not_change_what_decodes() {
+    let fs = 2_400_000.0;
+    let offsets = [50_000.0, -75_000.0, 150_000.0];
+    let specs = [
+        downlink("EQUIVALENCE ONE", "XG0001"),
+        downlink("EQUIVALENCE TWO", "XG0002"),
+        downlink("EQUIVALENCE TRE", "XG0003"),
+    ];
+    let bursts: Vec<Vec<Complex<f32>>> =
+        specs.iter().zip(offsets.iter()).map(|(s, &off)| burst_iq(s, fs, off, 0.12)).collect();
+    let delays = [240_000usize, 900_000, 1_500_000];
+    let total = bursts.iter().zip(delays.iter()).map(|(b, &d)| b.len() + d).max().unwrap()
+        + 240_000;
+    let mut iq = vec![Complex::new(0.0f32, 0.0f32); total];
+    for (b, &d) in bursts.iter().zip(delays.iter()) {
+        for (i, s) in b.iter().enumerate() {
+            iq[i + d] += s;
+        }
+    }
+    let mut noise = Noise(0xe0e0_5555_aaaa_1111);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * 0.01, noise.next() * 0.01);
+    }
+
+    let decode = |hold: bool| -> Vec<Vec<String>> {
+        let mut dec = AcarsMultiChannelDecoder::new(fs, &offsets).unwrap();
+        dec.hold_squelch_open(hold);
+        let mut got: Vec<Vec<String>> = vec![Vec::new(); offsets.len()];
+        for chunk in iq.chunks(65_536) {
+            for (i, frames) in dec.process(chunk) {
+                for f in frames {
+                    assert!(f.crc_ok, "channel {i} CRC failed: {f:?}");
+                    got[i].push(f.text.clone());
+                }
+            }
+        }
+        got
+    };
+
+    let gated = decode(false);
+    let ungated = decode(true);
+    assert_eq!(gated, ungated, "squelch changed the decoded frame set");
+    assert_eq!(gated[0], ["EQUIVALENCE ONE"]);
+    assert_eq!(gated[1], ["EQUIVALENCE TWO"]);
+    assert_eq!(gated[2], ["EQUIVALENCE TRE"]);
+}
