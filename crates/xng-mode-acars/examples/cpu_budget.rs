@@ -32,6 +32,8 @@ const PLAN_MHZ: [f64; 16] = [
 /// Matches `ChannelizedDdc`'s own choice for this plan; see its `choose_num_bins`.
 const PFB_BINS: usize = 48;
 const PFB_TAPS_PER_BRANCH: usize = 8;
+/// The demod's mix frequency (MSK tone midpoint); see `demod::TONE_MID_HZ`.
+const TONE_MID_HZ: f64 = 1_800.0;
 
 fn pct(ms: f64) -> f64 {
     ms / (DUR_S * 1000.0) * 100.0
@@ -146,22 +148,33 @@ fn main() {
     });
     line("      envelope + EMAs (always on)", env_ms);
 
+    // Both stages below reuse their buffers across repetitions, the way
+    // `MskDemod` does (`self.filtered.clear()` / `self.mixed` in place). An
+    // earlier version allocated a fresh output `Vec` per FIR call and cloned
+    // the whole channel per NCO call, which timed ~12 MB of memcpy and a
+    // realloc chain per repetition as if it were filter cost — these are the
+    // lines the optimisation order is read off, so the setup has to stay out
+    // of them.
     let mut lpfs: Vec<Fir> =
         (0..nch).map(|_| Fir::new(lowpass_taps(1300.0 / CHANNEL_RATE, 121))).collect();
+    let mut lpf_out: Vec<Complex<f32>> = Vec::with_capacity(chan.len());
     let lpf_ms = best(|| {
         for f in lpfs.iter_mut() {
-            let mut o = Vec::new();
-            f.process(&chan, &mut o);
-            std::hint::black_box(o.len());
+            lpf_out.clear();
+            f.process(&chan, &mut lpf_out);
+            std::hint::black_box(lpf_out.len());
         }
     });
     line("      audio LPF (gateable)", lpf_ms);
 
+    // The real demod mixes the buffer it just built, in place, with a
+    // long-lived NCO — so neither the copy nor the `Nco::new` belongs here.
+    let mut ncos: Vec<Nco> = (0..nch).map(|_| Nco::new(TONE_MID_HZ, CHANNEL_RATE)).collect();
+    let mut mixbuf: Vec<Complex<f32>> = chan.clone();
     let nco_ms = best(|| {
-        for _ in 0..nch {
-            let mut m = chan.clone();
-            Nco::new(1800.0, CHANNEL_RATE).mix(&mut m);
-            std::hint::black_box(m.len());
+        for nco in ncos.iter_mut() {
+            nco.mix(&mut mixbuf);
+            std::hint::black_box(mixbuf.len());
         }
     });
     line("      NCO mix (gateable)", nco_ms);
