@@ -85,6 +85,12 @@ pub fn rrc_taps(beta: f64, sps: f64, num_taps: usize) -> Vec<f32> {
 /// compiler cannot prove the access pattern is affine, so it emits a
 /// bounds-checked load and a branch per tap. Convolution is the single
 /// largest cost in the decode pipeline, so this layout is deliberate.
+///
+/// The doubling costs one extra store per **input** sample while the saving is
+/// on **output** samples, so the win narrows as decimation rises: measured
+/// ~2.2× at 121 taps / decim 1, ~2.1× at 121/10, ~1.65× at 101/25, ~1.45× at
+/// 31/8, ~1.3× at 9/1. Still a win everywhere, but "~2×" describes the
+/// undecimated case that dominates this pipeline, not every configuration.
 pub struct Fir {
     taps: Vec<f32>,
     /// `2 * n` slots holding the live window contiguously. Samples are stored
@@ -124,6 +130,12 @@ impl Fir {
             // newest sample is at the LOW end and `hist[head..head + n]` reads
             // newest-first. Storing each sample at both `head` and `head + n`
             // keeps that window contiguous across the wrap.
+            //
+            // The mirror write at `head == n - 1` (i.e. `hist[2n - 1]`) is
+            // never read back: the widest window starting there ends at
+            // `2n - 2`, and no later `head` reaches `n`. It is left in place
+            // deliberately — skipping it would need a branch on every input
+            // sample to save one store, which is the wrong trade in this loop.
             self.head = if self.head == 0 { n - 1 } else { self.head - 1 };
             self.hist[self.head] = x;
             self.hist[self.head + n] = x;
