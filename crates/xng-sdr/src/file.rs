@@ -54,9 +54,9 @@ impl std::str::FromStr for IqFormat {
     }
 }
 
-/// Replays a recorded IQ file as an [`IqSource`].
+/// Replays a recorded IQ file (or a piped IQ stream) as an [`IqSource`].
 pub struct FileIqSource {
-    reader: BufReader<File>,
+    reader: BufReader<Box<dyn Read + Send>>,
     format: IqFormat,
     sample_rate: f64,
     center_freq_hz: u64,
@@ -71,13 +71,34 @@ impl FileIqSource {
         center_freq_hz: u64,
     ) -> Result<Self, SdrError> {
         let file = File::open(path)?;
-        Ok(Self {
-            reader: BufReader::with_capacity(1 << 20, file),
+        Ok(Self::from_reader(Box::new(file), format, sample_rate, center_freq_hz))
+    }
+
+    /// Read IQ samples from standard input (ECO-15) — interop with KiwiSDR
+    /// `--kiwi-wav` extraction, GNU Radio, and `rx_sdr`/`soapy` pipes. The
+    /// format cannot be guessed from a stdin "extension", so the caller must
+    /// pass it explicitly.
+    pub fn open_stdin(
+        format: IqFormat,
+        sample_rate: f64,
+        center_freq_hz: u64,
+    ) -> Self {
+        Self::from_reader(Box::new(std::io::stdin()), format, sample_rate, center_freq_hz)
+    }
+
+    fn from_reader(
+        rd: Box<dyn Read + Send>,
+        format: IqFormat,
+        sample_rate: f64,
+        center_freq_hz: u64,
+    ) -> Self {
+        Self {
+            reader: BufReader::with_capacity(1 << 20, rd),
             format,
             sample_rate,
             center_freq_hz,
             byte_buf: Vec::new(),
-        })
+        }
     }
 }
 

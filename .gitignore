@@ -11,3 +11,5 @@ bench/data/navtex_62500.cs16
 
 # Claude Code session worktrees/artifacts
 .claude/
+bench/data/acars_100k.cs16
+bench/data/vdl2_opflasher_105k.cs16

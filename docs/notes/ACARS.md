@@ -8,9 +8,11 @@ airframes' own `acars-message-documentation` and `acars-decoder-typescript`
 and f00b4r0/acarsdec `label.c`/`syndrom.h` (`xng-acars/PROVENANCE.md`).
 
 This is the live production mode: the test station feeds it to Airframes
-end-to-end, CRC-verified. Not benchmarked against a frame-count oracle (no
-vendored off-air capture); validated by RF loopback, field-exact off-air
-ADS-C/CPDLC vectors, and the live feed.
+end-to-end, CRC-verified. Benchmarked against acarsdec on a real off-air
+capture (the Opflasher 3.0 MS/s capture, slice vendored as
+`bench/data/acars_100k.cs16`): **xng 16 CRC-OK vs acarsdec 3.7 17 clean** on the
+same capture (comparable), CI floor 13 — see [BENCHMARKS.md](BENCHMARKS.md). Also
+validated by RF loopback, field-exact off-air ADS-C/CPDLC vectors, and the live feed.
 
 ## Pipeline
 

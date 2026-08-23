@@ -29,6 +29,7 @@ use xng_mode_pocsag::PocsagChannelDecoder;
 use xng_mode_vdes::VdesChannelDecoder;
 use xng_mode_sarsat::SarsatChannelDecoder;
 use xng_mode_sonde::SondeChannelDecoder;
+use xng_mode_time::TimeChannelDecoder;
 use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
@@ -367,6 +368,7 @@ pub(crate) enum ModeChannel {
     Sonde(SondeChannelDecoder),
     Adsl(AdslChannelDecoder),
     Atcs(AtcsChannelDecoder),
+    Time(TimeChannelDecoder),
 }
 
 impl ModeChannel {
@@ -436,6 +438,13 @@ impl ModeChannel {
             // (1600 2-FSK / 3200 / 6400 4-FSK) — real US paging is 4-level.
             Mode::Flex => Ok(Self::Flex(FlexChannelDecoder::new(sample_rate, offset, 0)?)),
             Mode::Vdes => Ok(Self::Vdes(VdesChannelDecoder::new(sample_rate, offset)?)),
+            // The tuned carrier (capture center + offset) selects CHU vs WWV.
+            Mode::Time => {
+                let carrier = (freq as i64 + offset.round() as i64).max(0) as u64;
+                Ok(Self::Time(
+                    TimeChannelDecoder::new(sample_rate, offset)?.with_carrier(carrier),
+                ))
+            }
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -460,6 +469,7 @@ impl ModeChannel {
             Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
             Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
             Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
+            Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -487,6 +497,7 @@ impl ModeChannel {
             Self::Eot(_) => xng_mode_eot::CHANNEL_RATE,
             Self::Flex(_) => xng_mode_flex::CHANNEL_RATE,
             Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
+            Self::Time(_) => xng_mode_time::CHANNEL_RATE,
         }
     }
 
@@ -520,6 +531,7 @@ impl ModeChannel {
             Self::Eot(d) => d.level_dbfs(),
             Self::Flex(d) => d.level_dbfs(),
             Self::Vdes(d) => d.level_dbfs(),
+            Self::Time(d) => d.level_dbfs(),
         }
     }
 
@@ -778,6 +790,19 @@ impl ModeChannel {
                     .filter_map(|f| xng_mode_vdes::to_message(f, freq, level, prov.clone()))
                     .collect();
                 (msgs, seen, seen)
+            }
+            Self::Time(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                // Only redundancy/sync-validated frames are emitted; count the
+                // valid ones as CRC-ok.
+                let ok = frames.iter().filter(|f| f.valid).count() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_time::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, ok)
             }
         }
     }

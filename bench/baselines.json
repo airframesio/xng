@@ -1,8 +1,10 @@
 {
   "_comment": "Minimum decode counts per fixture. Raise these when a demod improvement lands (they are the new floor); never lower without a documented tradeoff. Calibration history in docs/notes/BENCHMARKS.md. Keys ending in _max are CEILINGS (false-positive gates): fail when the count EXCEEDS the value.",
+  "acars_offair": 13,
   "adsb_modes1": 310,
   "ais_offair": 65,
   "vdl2_offair": 42,
+  "vdl2_offair2": 10,
   "hfdl_offair": 34,
   "sonde_offair": 110,
   "navtex_offair": 25,
