@@ -65,6 +65,8 @@ pub struct OutputsToml {
     pub gsmtap: Option<String>,
     pub iridium_satmap: Option<String>,
     pub http: Option<String>,
+    /// Dashboard basemap (`[outputs.map]`).
+    pub map: Option<MapToml>,
     pub aircraft_db: Option<PathBuf>,
     pub mqtt: Option<String>,
     pub mqtt_topic: Option<String>,
@@ -83,6 +85,19 @@ pub struct OutputsToml {
     /// Per-mode Airframes feeding. When omitted, the legacy `feed-airframes`
     /// boolean governs (ACARS-only, station id verbatim).
     pub airframes: Option<AirframesToml>,
+}
+
+/// Dashboard basemap: an OpenFreeMap style (vector, keyless) by default, any
+/// MapLibre style via `style-url`, or OpenStreetMap raster tiles.
+#[derive(Deserialize, Debug, Default, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct MapToml {
+    /// OpenFreeMap style: dark (default), positron, bright, liberty, fiord.
+    pub style: Option<String>,
+    /// Any MapLibre style URL (e.g. a self-hosted OpenFreeMap); overrides `style`.
+    pub style_url: Option<String>,
+    /// `vector` (default) or `raster` (OpenStreetMap tiles).
+    pub format: Option<String>,
 }
 
 /// Per-mode Airframes feeding configuration. Each supported mode feeds its

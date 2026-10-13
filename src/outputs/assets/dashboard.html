@@ -166,9 +166,69 @@
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
 <script>
 const map = L.map('map', { zoomControl: true }).setView([40, -95], 4);
-L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-  attribution: '&copy; OpenStreetMap, &copy; CARTO · silhouettes &copy; <a href="https://github.com/plane-watch/pw-silhouettes">Plane Watch</a>', maxZoom: 18,
-}).addTo(map);
+map.attributionControl.addAttribution('silhouettes &copy; <a href="https://github.com/plane-watch/pw-silhouettes">Plane Watch</a>');
+
+// Basemap. /map/config.json names a MapLibre style (OpenFreeMap by default:
+// OpenStreetMap vector tiles, no API key) or asks for raster. The vector map
+// renders with MapLibre beneath the Leaflet overlays; OpenStreetMap raster
+// tiles are the fallback (no WebGL, or the style or MapLibre fails to load).
+(function basemap() {
+  const OSM = { tiles: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors', maxZoom: 19 };
+  const raster = fb => L.tileLayer(fb.tiles, { attribution: fb.attribution, maxZoom: fb.maxZoom }).addTo(map);
+  const webgl = () => { try { const c = document.createElement('canvas'); return !!(c.getContext('webgl2') || c.getContext('webgl')); } catch (e) { return false; } };
+  const asset = (tag, url, sri) => new Promise((ok, err) => {
+    const el = document.createElement(tag);
+    if (tag === 'link') { el.rel = 'stylesheet'; el.href = url; } else { el.src = url; }
+    el.integrity = sri; el.crossOrigin = 'anonymous'; el.onload = ok; el.onerror = err;
+    document.head.appendChild(el);
+  });
+  fetch('/map/config.json').then(r => r.json()).catch(() => ({ format: 'raster', fallback: OSM })).then(cfg => {
+    const fallback = cfg.fallback || OSM;
+    if (cfg.format !== 'vector' || !webgl()) return raster(fallback);
+    Promise.all([
+      asset('link', 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css', 'sha384-MinO0mNliZ3vwppuPOUnGa+iq619pfMhLVUXfC4LHwSCvF9H+6P/KO4Q7qBOYV5V'),
+      asset('script', 'https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js', 'sha384-SYKAG6cglRMN0RVvhNeBY0r3FYKNOJtznwA0v7B5Vp9tr31xAHsZC0DqkQ/pZDmj'),
+    ])
+      .then(() => asset('script', 'https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.0.22/leaflet-maplibre-gl.js', 'sha384-4CB9Vtol9LN6lGgBCvmPLbUEZwilrqIvPieSRurgAXAB7FVJaLS9n8WyAIA5wjQ+'))
+      // Fetch the style here so a failure falls back to raster instead of
+      // leaving an empty map.
+      .then(() => fetch(cfg.style).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }))
+      .then(style => {
+        // A style passed as an object has lost its URL, so resolve relative
+        // resource URLs against it here. new URL() percent-encodes the
+        // {z}/{fontstack}-style template braces; put them back.
+        const abs = u => /^[a-z][a-z\d+.-]*:/i.test(u) ? u
+          : new URL(u, cfg.style).href.replace(/%7B/gi, '{').replace(/%7D/gi, '}');
+        if (typeof style.sprite === 'string') style.sprite = abs(style.sprite);
+        else if (Array.isArray(style.sprite)) style.sprite.forEach(s => { if (s && typeof s.url === 'string') s.url = abs(s.url); });
+        if (typeof style.glyphs === 'string') style.glyphs = abs(style.glyphs);
+        for (const src of Object.values(style.sources || {})) {
+          if (typeof src.url === 'string') src.url = abs(src.url);
+          if (Array.isArray(src.tiles)) src.tiles = src.tiles.map(abs);
+        }
+        const layer = L.maplibreGL({ style, attribution: cfg.attribution }).addTo(map);
+        // Fall back to raster if the vector map can't come up: any error
+        // before it first loads, or a whole source failing later. Individual
+        // tile errors are transient and left to MapLibre.
+        const gl = layer.getMaplibreMap();
+        // Tile errors (network, 5xx) only count until a tile has loaded, so a
+        // dead tile host falls back but a stray failure later doesn't. MapLibre
+        // treats tile 404s as empty tiles and reports nothing for them.
+        let loaded = false, fellBack = false, tileLoaded = false, tileErrors = 0;
+        gl.once('load', () => { loaded = true; });
+        gl.on('sourcedata', e => { if (e.tile) tileLoaded = true; });
+        gl.on('error', e => {
+          if (fellBack || (loaded && !e.sourceId && !e.tile)) return;
+          if (e.tile && (tileLoaded || ++tileErrors < 3)) return;
+          fellBack = true;
+          map.removeLayer(layer);
+          raster(fallback);
+        });
+      })
+      .catch(() => raster(fallback));
+  });
+})();
 
 // Entity markers live in per-class layer groups so the layer control can
 // toggle Flights / Ships / Beacons. Visible by default.

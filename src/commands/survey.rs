@@ -472,6 +472,7 @@ fn dwell(
             gsmtap: None,
             iridium_satmap: None,
             http: None,
+            map: Default::default(),
             mqtt: None,
             mqtt_topic: "xng".into(),
             zmq: Vec::new(),

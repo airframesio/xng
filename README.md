@@ -378,6 +378,19 @@ other modes route to Airframes over asf-2.0. The multiplexed **asf-2.0**
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
 
+**Dashboard basemap.** The web dashboard (`http =`) draws
+[OpenFreeMap](https://openfreemap.org) vector tiles by default: OpenStreetMap
+data, no API key or account, and self-hostable. Pick a style under
+`[outputs.map]` (dark, positron, bright, liberty, fiord), point `style-url` at
+any MapLibre style (a self-hosted OpenFreeMap, say), or set
+`format = "raster"` for OpenStreetMap raster tiles, which are also the
+fallback on browsers without WebGL.
+
+```toml
+[outputs.map]
+style = "positron"
+```
+
 `xng status` prints a live per-session table for a running station
 (querying its dashboard endpoint, default `127.0.0.1:8080`, or
 `--http host:port`):
