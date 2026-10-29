@@ -483,7 +483,7 @@ impl ModeChannel {
         match self {
             Self::Acars(_) | Self::AcarsShared(_) => xng_mode_acars::CHANNEL_RATE,
             Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
-            Self::Vdl2(_) => xng_mode_vdl2::CHANNEL_RATE,
+            Self::Vdl2(dec) => dec.channel_rate(),
             Self::Vdl2Shared(dec) => dec.channel_rate(),
             Self::Aero(_) | Self::AeroBurst(_) => xng_mode_aero::CHANNEL_RATE,
             Self::StdC(_) => xng_mode_stdc::CHANNEL_RATE,
@@ -2130,5 +2130,52 @@ mod tests {
                 channel_rate: 100_000.0,
             },
         );
+    }
+
+    #[test]
+    fn vdl2_provenance_reports_true_channel_rate() {
+        const FREQ: u64 = 136_975_000;
+        for (rate, offset, expected) in
+            [(105_000.0, 0.0, 105_000.0), (2_400_000.0, 12_500.0, 100_000.0), (2_048_000.0, 12_500.0, 50_000.0)]
+        {
+            let dec = ModeChannel::new(Mode::Vdl2, rate, offset, FREQ, DemodEffort::Live, None).unwrap();
+            assert!(matches!(dec, ModeChannel::Vdl2(_)));
+            assert_eq!(dec.channel_rate(), expected, "input rate {rate}");
+        }
+
+        // End to end: one RC-shaped burst through a single-channel decoder at 105 kS/s.
+        use xng_mode_vdl2::modulate::burst_iq_shaped;
+        const RATE: f64 = 105_000.0;
+        const LEAD: usize = 2_000;
+        const TAIL: usize = 60_000;
+        let burst = burst_iq_shaped(&[vdl2_aoa_frame(7)], RATE, 0.0, 0.3);
+        let mut iq = vec![Complex::new(0.0f32, 0.0f32); LEAD + burst.len() + TAIL];
+        for (i, s) in burst.iter().enumerate() {
+            iq[LEAD + i] += s;
+        }
+        let dec = ModeChannel::new(Mode::Vdl2, RATE, 0.0, FREQ, DemodEffort::Live, None).unwrap();
+        let groups = vec![ChannelGroup { freqs: vec![FREQ], base_index: 0, dec }];
+        let mut source = MemSource { iq, pos: 0, rate: RATE, center: FREQ };
+        let bus = MessageBus::new();
+        let mut rx = bus.subscribe();
+        let stats = decode_loop(
+            &mut source,
+            groups,
+            StationIdentity::new("XX-TEST"),
+            None,
+            bus,
+            Arc::new(AtomicBool::new(false)),
+            None,
+            None,
+            LabelFilter::default(),
+            AisFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(stats, vec![(FREQ, 1, 1)]);
+        let msg = rx.try_recv().expect("one published message");
+        let ch = msg.source.channel.as_ref().expect("channel provenance");
+        assert_eq!(ch.frequency_hz, FREQ);
+        assert_eq!(ch.sample_rate, 105_000.0);
+        assert!(rx.try_recv().is_err());
     }
 }
