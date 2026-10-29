@@ -16,7 +16,7 @@ use xng_mode_ais::AisChannelDecoder;
 use xng_mode_hfdl::HfdlChannelDecoder;
 use xng_mode_iridium::{IridiumChannelDecoder, IridiumWidebandDecoder};
 use xng_mode_stdc::StdcChannelDecoder;
-use xng_mode_vdl2::Vdl2ChannelDecoder;
+use xng_mode_vdl2::{Vdl2ChannelDecoder, Vdl2MultiChannelDecoder};
 // New-mode decode cores (IQ demod + ChannelDecoder + to_message per crate).
 use xng_mode_adsl::AdslChannelDecoder;
 use xng_mode_atcs::AtcsChannelDecoder;
@@ -361,6 +361,9 @@ pub(crate) enum ModeChannel {
     Ais(AisChannelDecoder),
     Adsb(AdsbDecoder),
     Vdl2(Vdl2ChannelDecoder),
+    /// Several VDL2 channels sharing one downconverter front end; same shape
+    /// as `AcarsShared`.
+    Vdl2Shared(Vdl2MultiChannelDecoder),
     Aero(AeroChannelDecoder),
     AeroBurst(AeroBurstDecoder),
     StdC(StdcChannelDecoder),
@@ -481,6 +484,7 @@ impl ModeChannel {
             Self::Acars(_) | Self::AcarsShared(_) => xng_mode_acars::CHANNEL_RATE,
             Self::Ais(_) => xng_mode_ais::CHANNEL_RATE,
             Self::Vdl2(_) => xng_mode_vdl2::CHANNEL_RATE,
+            Self::Vdl2Shared(dec) => dec.channel_rate(),
             Self::Aero(_) | Self::AeroBurst(_) => xng_mode_aero::CHANNEL_RATE,
             Self::StdC(_) => xng_mode_stdc::CHANNEL_RATE,
             Self::Hfdl(_) => xng_mode_hfdl::CHANNEL_RATE,
@@ -513,6 +517,10 @@ impl ModeChannel {
             Self::Ais(d) => d.level_dbfs(),
             Self::Adsb(d) => d.level_dbfs(),
             Self::Vdl2(d) => d.level_dbfs(),
+            // Same as `AcarsShared`: not reached via `run`; channel 0 only.
+            Self::Vdl2Shared(dec) => {
+                if dec.num_channels() > 0 { dec.level_dbfs(0) } else { f32::NEG_INFINITY }
+            }
             Self::Aero(d) => d.level_dbfs(),
             Self::AeroBurst(d) => d.level_dbfs(),
             Self::StdC(d) => d.level_dbfs(),
@@ -538,9 +546,9 @@ impl ModeChannel {
     /// Returns (messages, frames_seen, frames_crc_ok).
     fn process(&mut self, iq: &[Complex<f32>], freq: u64, prov: &Provenance) -> (Vec<Message>, u64, u64) {
         match self {
-            // Shared ACARS spans many channels and cannot be tagged with one
+            // Shared ACARS/VDL2 spans many channels and cannot be tagged with one
             // freq/provenance; `run` drives it directly and never gets here.
-            Self::AcarsShared(_) => (Vec::new(), 0, 0),
+            Self::AcarsShared(_) | Self::Vdl2Shared(_) => (Vec::new(), 0, 0),
             Self::Acars(dec) => {
                 let frames = dec.process(iq);
                 let seen = frames.len() as u64;
@@ -828,6 +836,29 @@ impl ModeChannel {
             }
             return;
         }
+        if let Self::Vdl2Shared(dec) = self {
+            // Same walk as `AcarsShared` above.
+            let mut decoded = dec.process(iq).into_iter().peekable();
+            for (k, &freq) in freqs.iter().enumerate() {
+                let frames = match decoded.peek() {
+                    Some((ci, _)) if *ci == k => decoded.next().map(|(_, f)| f).unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                let level = dec.level_dbfs(k);
+                let prov = base.for_channel(base_index + k, freq, dec.channel_rate());
+                let seen = frames.len() as u64;
+                let ok = frames
+                    .iter()
+                    .filter(|f| f.acars.as_ref().map(|a| a.crc_ok).unwrap_or(true))
+                    .count() as u64;
+                let msgs: Vec<Message> = frames
+                    .iter()
+                    .map(|f| xng_mode_vdl2::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                out.push(ChannelOut { freq, level, msgs, seen, ok });
+            }
+            return;
+        }
         let freq = freqs[0];
         let prov = base.for_channel(base_index, freq, self.channel_rate());
         let (msgs, seen, ok) = self.process(iq, freq, &prov);
@@ -1055,7 +1086,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
         decoders.push(ChannelGroup { freqs: vec![freq], base_index: decoders.len(), dec });
     }
     let n_channels = decoders.len();
-    decoders = collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode);
+    decoders = collapse_shared_front_ends(decoders, sample_rate, capture_center, cfg.mode, cfg.max_ppm);
     tracing::info!(
         "{} session: {} channel(s) from a {:.0} S/s capture centered at {:.3} MHz",
         cfg.mode,
@@ -1353,7 +1384,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
             decoders.push(ChannelGroup { freqs: vec![freq], base_index: decoders.len(), dec });
         }
         let n_channels = decoders.len();
-        decoders = collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode);
+        decoders = collapse_shared_front_ends(decoders, sample_rate, capture_center, cfg.mode, cfg.max_ppm);
         tracing::info!(
             "station session: {} with {} channel(s) at {:.0} S/s centered {:.3} MHz",
             cfg.mode,
@@ -1614,13 +1645,15 @@ pub(crate) fn build_decoders(
         }
         decoders.push(ChannelGroup { freqs: vec![freq], base_index: decoders.len(), dec });
     }
-    Ok(collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode))
+    Ok(collapse_shared_front_ends(decoders, sample_rate, capture_center, cfg.mode, cfg.max_ppm))
 }
 
-/// When an ACARS session has more than one channel, replace the N independent
-/// per-channel `Acars` groups with a single `AcarsShared` group that uses one
-/// shared downconverter front end (the CPU optimization). A single ACARS
-/// channel, or any other mode, is returned unchanged.
+/// When an ACARS or VDL2 session has more than one channel, replace the N
+/// independent per-channel groups with a single shared group
+/// (`AcarsShared` / `Vdl2Shared`) that uses one shared downconverter front end
+/// (the CPU optimization). A single channel, or any other mode, is returned
+/// unchanged. `max_ppm` is the session's VDL2 carrier-search limit, applied to
+/// the shared VDL2 decoder exactly as `ModeChannel::new` applies it per channel.
 ///
 /// On failure to build the shared decoder (e.g. a capture too narrow to span
 /// every channel), the original per-channel decoders are kept — the shared
@@ -1629,33 +1662,53 @@ pub(crate) fn build_decoders(
 /// Other modes plug in here: add a multi-channel `ModeChannel` variant (handled
 /// in `ModeChannel::run`) and a collapse rule for that mode; `decode_loop`
 /// needs no changes.
-fn collapse_shared_acars(
+fn collapse_shared_front_ends(
     decoders: Vec<ChannelGroup>,
     sample_rate: f64,
     capture_center: u64,
     mode: Mode,
+    max_ppm: Option<f64>,
 ) -> Vec<ChannelGroup> {
-    if mode != Mode::AcarsPoa || decoders.len() < 2 {
+    if decoders.len() < 2 {
         return decoders;
     }
-    // Every entry is a single-channel ACARS decoder at this point.
-    if !decoders.iter().all(|g| g.freqs.len() == 1 && matches!(g.dec, ModeChannel::Acars(_))) {
-        return decoders;
-    }
+    let single = |pred: fn(&ModeChannel) -> bool| decoders.iter().all(|g| g.freqs.len() == 1 && pred(&g.dec));
     let freqs: Vec<u64> = decoders.iter().map(|g| g.freqs[0]).collect();
     let offsets: Vec<f64> = freqs.iter().map(|&f| f as f64 - capture_center as f64).collect();
-    match AcarsMultiChannelDecoder::new(sample_rate, &offsets) {
-        Ok(dec) => {
-            tracing::info!(
-                "ACARS: {} channels share one downconverter front end",
-                freqs.len()
-            );
-            vec![ChannelGroup { freqs, base_index: 0, dec: ModeChannel::AcarsShared(dec) }]
+    match mode {
+        // Every entry is a single-channel ACARS decoder at this point.
+        Mode::AcarsPoa if single(|d| matches!(d, ModeChannel::Acars(_))) => {
+            match AcarsMultiChannelDecoder::new(sample_rate, &offsets) {
+                Ok(dec) => {
+                    tracing::info!(
+                        "ACARS: {} channels share one downconverter front end",
+                        freqs.len()
+                    );
+                    vec![ChannelGroup { freqs, base_index: 0, dec: ModeChannel::AcarsShared(dec) }]
+                }
+                Err(e) => {
+                    tracing::warn!("shared ACARS front end unavailable ({e}); using per-channel DDCs");
+                    decoders
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!("shared ACARS front end unavailable ({e}); using per-channel DDCs");
-            decoders
+        Mode::Vdl2 if single(|d| matches!(d, ModeChannel::Vdl2(_))) => {
+            match Vdl2MultiChannelDecoder::new(sample_rate, &offsets) {
+                Ok(mut dec) => {
+                    dec.set_max_ppm(max_ppm);
+                    tracing::info!(
+                        "VDL2: {} channels share one downconverter front end",
+                        freqs.len()
+                    );
+                    vec![ChannelGroup { freqs, base_index: 0, dec: ModeChannel::Vdl2Shared(dec) }]
+                }
+                Err(e) => {
+                    tracing::warn!("shared VDL2 front end unavailable ({e}); using per-channel DDCs");
+                    decoders
+                }
+            }
         }
+        _ => decoders,
     }
 }
 
@@ -1908,12 +1961,21 @@ mod tests {
             .collect()
     }
 
+    /// One end-to-end `decode_loop` scenario: a capture plus the channels it
+    /// carries (config order) and the frames expected on each.
+    struct Scenario<'a> {
+        iq: Vec<Complex<f32>>,
+        center: u64,
+        channels: &'a [u64],
+        expected: &'a [u64],
+        channel_rate: f64,
+    }
+
     /// Drive `decode_loop` end to end and check the per-channel invariants:
     /// provenance index/freq/rate, one stats row per channel in config order,
     /// and a live row for every channel (quiet included).
-    fn run_and_check(groups: Vec<ChannelGroup>) {
-        let mut source =
-            MemSource { iq: synthetic_acars_capture(), pos: 0, rate: TEST_RATE, center: TEST_CENTER };
+    fn run_and_check(groups: Vec<ChannelGroup>, sc: Scenario<'_>) {
+        let mut source = MemSource { iq: sc.iq, pos: 0, rate: TEST_RATE, center: sc.center };
         let bus = MessageBus::new();
         let mut rx = bus.subscribe();
         let live = LiveState::new();
@@ -1924,7 +1986,7 @@ mod tests {
             None,
             bus,
             Arc::new(AtomicBool::new(false)),
-            Some((live.clone(), TEST_CENTER, TEST_RATE)),
+            Some((live.clone(), sc.center, TEST_RATE)),
             None,
             LabelFilter::default(),
             AisFilter::default(),
@@ -1932,42 +1994,141 @@ mod tests {
         .unwrap();
 
         let expected: Vec<(u64, u64, u64)> =
-            TEST_CHANNELS.iter().zip(TEST_EXPECTED).map(|(&f, n)| (f, n, n)).collect();
+            sc.channels.iter().zip(sc.expected).map(|(&f, &n)| (f, n, n)).collect();
         assert_eq!(stats, expected);
 
-        let mut per_channel = [0u64; TEST_CHANNELS.len()];
+        let mut per_channel = vec![0u64; sc.channels.len()];
         while let Ok(msg) = rx.try_recv() {
             let ch = msg.source.channel.as_ref().expect("channel provenance");
             let idx = ch.index as usize;
-            assert_eq!(ch.frequency_hz, TEST_CHANNELS[idx]);
-            assert_eq!(msg.frequency_hz, TEST_CHANNELS[idx]);
-            assert_eq!(ch.sample_rate, xng_mode_acars::CHANNEL_RATE);
+            assert_eq!(ch.frequency_hz, sc.channels[idx]);
+            assert_eq!(msg.frequency_hz, sc.channels[idx]);
+            assert_eq!(ch.sample_rate, sc.channel_rate);
             per_channel[idx] += 1;
         }
-        assert_eq!(per_channel, TEST_EXPECTED);
+        assert_eq!(per_channel, sc.expected);
 
         let rows = live.stats.lock().unwrap().clone();
-        assert_eq!(rows.len(), TEST_CHANNELS.len());
-        for (i, &f) in TEST_CHANNELS.iter().enumerate() {
+        assert_eq!(rows.len(), sc.channels.len());
+        for (i, &f) in sc.channels.iter().enumerate() {
             let row = rows.iter().find(|r| r.0 == f).expect("live row for every channel");
-            assert_eq!((row.1, row.2), (TEST_EXPECTED[i], TEST_EXPECTED[i]));
+            assert_eq!((row.1, row.2), (sc.expected[i], sc.expected[i]));
             assert!(row.3.is_finite(), "level for {f}");
+        }
+    }
+
+    fn acars_scenario() -> Scenario<'static> {
+        Scenario {
+            iq: synthetic_acars_capture(),
+            center: TEST_CENTER,
+            channels: &TEST_CHANNELS,
+            expected: &TEST_EXPECTED,
+            channel_rate: xng_mode_acars::CHANNEL_RATE,
         }
     }
 
     #[test]
     fn decode_loop_shared_acars_tags_channels_in_config_order() {
-        let groups = collapse_shared_acars(per_channel_groups(), TEST_RATE, TEST_CENTER, Mode::AcarsPoa);
+        let groups = collapse_shared_front_ends(per_channel_groups(), TEST_RATE, TEST_CENTER, Mode::AcarsPoa, None);
         assert_eq!(groups.len(), 1);
         assert!(matches!(groups[0].dec, ModeChannel::AcarsShared(_)));
         assert_eq!(groups[0].freqs, TEST_CHANNELS);
-        run_and_check(groups);
+        run_and_check(groups, acars_scenario());
     }
 
     #[test]
     fn decode_loop_per_channel_acars_tags_channels_in_config_order() {
         let groups = per_channel_groups();
         assert!(groups.iter().all(|g| matches!(g.dec, ModeChannel::Acars(_))));
-        run_and_check(groups);
+        run_and_check(groups, acars_scenario());
+    }
+
+    const VDL2_CENTER: u64 = 136_812_500;
+    /// Config order deliberately unsorted; 136.775 is quiet.
+    const VDL2_CHANNELS: [u64; 4] = [136_825_000, 136_775_000, 136_650_000, 136_975_000];
+    const VDL2_EXPECTED: [u64; 4] = [1, 0, 1, 1];
+
+    /// Valid downlink AVLC UI frame carrying an ACARS block, unique per `n`.
+    fn vdl2_aoa_frame(n: u32) -> Vec<u8> {
+        use xng_mode_vdl2::avlc::{encode_address, AddressType};
+        let mut f = Vec::new();
+        f.extend(encode_address(AddressType::GroundIcao, 0x10A234, false, false));
+        f.extend(encode_address(AddressType::Aircraft, 0xA0_0000 + n, false, true));
+        f.push(0x03); // UI
+        f.push(0xFF); // AOA IPI
+        f.extend(xng_acars::block::build(
+            '2',
+            &format!("N70{n}XG"),
+            None,
+            "H1",
+            '3',
+            Some("M42A"),
+            Some(&format!("XG070{n}")),
+            "SHARED FRONT END",
+            false,
+        ));
+        f
+    }
+
+    /// Synthetic 2.4 MS/s VDL2 capture: one distinct RC-shaped burst on each
+    /// of 136.825 / 136.650 / 136.975 MHz, nothing on 136.775 MHz.
+    fn synthetic_vdl2_capture() -> Vec<Complex<f32>> {
+        use xng_mode_vdl2::modulate::burst_iq_shaped;
+        // ~5 ms noise lead, staggered bursts, then a long tail: the decoder
+        // can hold a burst back until more samples arrive.
+        const LEAD: usize = 12_000;
+        const TAIL: usize = 1_200_000;
+        let bursts: Vec<(Vec<Complex<f32>>, usize)> = [(0usize, 0usize), (2, 30_000), (3, 60_000)]
+            .iter()
+            .map(|&(ch, at)| {
+                let off = VDL2_CHANNELS[ch] as f64 - VDL2_CENTER as f64;
+                (burst_iq_shaped(&[vdl2_aoa_frame(ch as u32)], TEST_RATE, off, 0.3), LEAD + at)
+            })
+            .collect();
+        let total = bursts.iter().map(|(b, d)| b.len() + d).max().unwrap() + TAIL;
+        let mut iq = vec![Complex::new(0.0f32, 0.0f32); total];
+        for (b, d) in &bursts {
+            for (i, s) in b.iter().enumerate() {
+                iq[i + d] += s;
+            }
+        }
+        let mut state = 0x0bad_cafe_dead_beefu64;
+        for s in &mut iq {
+            let mut n = || {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state as f32 / u64::MAX as f32) * 2.0 - 1.0
+            };
+            *s += Complex::new(n() * 0.01, n() * 0.01);
+        }
+        iq
+    }
+
+    #[test]
+    fn decode_loop_shared_vdl2_tags_channels_in_config_order() {
+        let per_channel: Vec<ChannelGroup> = VDL2_CHANNELS
+            .iter()
+            .enumerate()
+            .map(|(i, &f)| {
+                let offset = f as f64 - VDL2_CENTER as f64;
+                let dec = ModeChannel::new(Mode::Vdl2, TEST_RATE, offset, f, DemodEffort::Live, None).unwrap();
+                ChannelGroup { freqs: vec![f], base_index: i, dec }
+            })
+            .collect();
+        let groups = collapse_shared_front_ends(per_channel, TEST_RATE, VDL2_CENTER, Mode::Vdl2, None);
+        assert_eq!(groups.len(), 1);
+        assert!(matches!(groups[0].dec, ModeChannel::Vdl2Shared(_)));
+        assert_eq!(groups[0].freqs, VDL2_CHANNELS);
+        run_and_check(
+            groups,
+            Scenario {
+                iq: synthetic_vdl2_capture(),
+                center: VDL2_CENTER,
+                channels: &VDL2_CHANNELS,
+                expected: &VDL2_EXPECTED,
+                channel_rate: 100_000.0,
+            },
+        );
     }
 }
