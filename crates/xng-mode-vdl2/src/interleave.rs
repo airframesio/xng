@@ -149,9 +149,10 @@ pub fn deinterleave_soft(
         })
         .collect();
 
+    // Row-major c × 255 grids, flat (row r is `[r * 255..(r + 1) * 255]`).
     let c = lay.rows.len();
-    let mut grid: Vec<Vec<u8>> = vec![vec![0u8; 255]; c];
-    let mut cgrid: Vec<Vec<f32>> = vec![vec![0.0f32; 255]; c];
+    let mut grid = vec![0u8; c * 255];
+    let mut cgrid = vec![0.0f32; c * 255];
     let mut it = octets.iter().zip(&octet_conf);
     for col in 0..255 {
         for r in 0..c {
@@ -161,28 +162,35 @@ pub fn deinterleave_soft(
                 (col < n) || (col >= ROW_DATA_OCTETS && col < ROW_DATA_OCTETS + k);
             if transmitted {
                 let (&o, &cf) = it.next()?;
-                grid[r][col] = o;
-                cgrid[r][col] = cf;
+                grid[r * 255 + col] = o;
+                cgrid[r * 255 + col] = cf;
             }
         }
     }
 
     let mut corrected = 0usize;
     let mut soft_assisted = false;
-    let mut data_octets = Vec::new();
-    for (r, row) in grid.iter_mut().enumerate() {
+    let mut data_octets = Vec::with_capacity(tl_bits.div_ceil(8));
+    let mut ranked: Vec<usize> = Vec::with_capacity(255);
+    let mut erasures: Vec<usize> = Vec::with_capacity(NPAR);
+    let (grid_rows, _) = grid.as_chunks_mut::<255>();
+    let (conf_rows, _) = cgrid.as_chunks::<255>();
+    for (r, (row, crow)) in grid_rows.iter_mut().zip(conf_rows).enumerate() {
         let n = lay.rows[r];
         let k = lay.checks[r];
         if k > 0 {
             // Untransmitted check octets are always erasures.
-            let base: Vec<usize> = (ROW_DATA_OCTETS + k..255).collect();
+            let base = ROW_DATA_OCTETS + k..255;
             let budget = 6usize.saturating_sub(base.len());
             // Transmitted positions ranked least-confident first.
-            let mut ranked: Vec<usize> = (0..255)
-                .filter(|&col| (col < n) || (col >= ROW_DATA_OCTETS && col < ROW_DATA_OCTETS + k))
-                .collect();
+            ranked.clear();
+            ranked.extend(
+                (0..255).filter(|&col| {
+                    (col < n) || (col >= ROW_DATA_OCTETS && col < ROW_DATA_OCTETS + k)
+                }),
+            );
             ranked.sort_by(|&a, &b| {
-                cgrid[r][b].partial_cmp(&cgrid[r][a]).unwrap_or(std::cmp::Ordering::Equal)
+                crow[b].partial_cmp(&crow[a]).unwrap_or(std::cmp::Ordering::Equal)
             });
 
             let mut done = false;
@@ -193,14 +201,13 @@ pub fn deinterleave_soft(
                 if extra > budget {
                     break;
                 }
-                let mut attempt = row.clone();
-                let mut erasures = base.clone();
+                let mut attempt = *row;
+                erasures.clear();
+                erasures.extend(base.clone());
                 if extra > 0 {
                     // Only erase genuinely doubtful decisions (residual
                     // beyond ~half the decision region).
-                    if ranked.len() < extra
-                        || ranked.iter().take(extra).any(|&p| cgrid[r][p] < 0.20)
-                    {
+                    if ranked.len() < extra || ranked.iter().take(extra).any(|&p| crow[p] < 0.20) {
                         break;
                     }
                     erasures.extend(ranked.iter().take(extra).copied());

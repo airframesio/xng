@@ -105,6 +105,17 @@ pub struct Vdl2Demod {
     /// Optional CFO reject: candidates whose preamble-fit carrier offset
     /// exceeds this many ppm (relative to the VDL2 band) are skipped (VDL2-7).
     max_ppm: Option<f64>,
+    /// Conjugated expected UW phasor per Δφ (index 0 unused).
+    uw_ref_conj: [Complex<f32>; 16],
+    /// Cumulative UW phase ramp for the preamble fit.
+    uw_ramp: [f32; 16],
+    /// Bit / confidence buffers of the last finished collection, reused by
+    /// the next one so steady-state bursts do not reallocate.
+    spare: (Vec<u8>, Vec<f32>),
+    /// `VDL2_DEBUG` set (read once at construction).
+    debug: bool,
+    /// `VDL2_DUMP_BITS` directory (read once at construction).
+    dump_dir: Option<String>,
 }
 
 /// A demodulated, descrambled, RS-corrected burst: the AVLC bit stream.
@@ -119,7 +130,18 @@ pub struct Burst {
 
 impl Vdl2Demod {
     pub fn new(channel_rate: f64) -> Self {
+        let mut uw_ref_conj = [Complex::new(0.0f32, 0.0); 16];
+        let mut uw_ramp = [0.0f32; 16];
+        for k in 1..16 {
+            uw_ref_conj[k] = Complex::from_polar(1.0, UW_DELTAS[k] as f32 * PI / 4.0).conj();
+            uw_ramp[k] = uw_ramp[k - 1] + UW_DELTAS[k] as f32 * PI / 4.0;
+        }
         Self {
+            uw_ref_conj,
+            uw_ramp,
+            spare: (Vec::new(), Vec::new()),
+            debug: std::env::var("VDL2_DEBUG").is_ok(),
+            dump_dir: std::env::var("VDL2_DUMP_BITS").ok(),
             sps: channel_rate / SYMBOL_RATE,
             buf: Vec::new(),
             start_abs: 0.0,
@@ -162,14 +184,14 @@ impl Vdl2Demod {
         let mut norm = 0.0f32;
         let mut min_d = f32::MAX;
         let mut prev = self.sample(pos)?;
-        for (j, &delta) in UW_DELTAS.iter().enumerate().skip(1) {
+        for (j, &expected_conj) in self.uw_ref_conj.iter().enumerate().skip(1) {
             let s = self.sample(pos + j as f64 * self.sps)?;
             let d = s * prev.conj();
             prev = s;
-            let expected = Complex::from_polar(1.0, delta as f32 * PI / 4.0);
-            corr += d * expected.conj();
-            norm += d.norm();
-            min_d = min_d.min(d.norm());
+            corr += d * expected_conj;
+            let dn = d.norm();
+            norm += dn;
+            min_d = min_d.min(dn);
         }
         if norm < 1e-9 {
             return None;
@@ -200,10 +222,7 @@ impl Vdl2Demod {
     /// Returns (uw_pos, theta) or None when the buffer cannot cover the
     /// search window yet.
     fn preamble_fit(&self, pos: f64) -> Option<(f64, f32, f32)> {
-        let mut pr = [0.0f32; 16];
-        for k in 1..16 {
-            pr[k] = pr[k - 1] + UW_DELTAS[k] as f32 * PI / 4.0;
-        }
+        let pr = &self.uw_ramp;
         let mut best: Option<(f32, f64, f32)> = None; // (cost, pos, theta)
         // Search ±0.7 symbol (at least ±3 samples): the differential
         // trigger localizes the UW no better than a fraction of a symbol,
@@ -334,7 +353,13 @@ impl Vdl2Demod {
                     .filter(|&tl| tl <= 16_000)
                     .and_then(|tl| interleave::layout(tl as usize))
                 {
-                    Some(lay) => c.needed = Some(HEADER_BITS + lay.total_tx_bits),
+                    Some(lay) => {
+                        let n = HEADER_BITS + lay.total_tx_bits;
+                        c.needed = Some(n);
+                        // Whole symbols: up to 2 bits past `n`.
+                        c.bits.reserve((n + 2).saturating_sub(c.bits.len()));
+                        c.conf.reserve((n / 3 + 1).saturating_sub(c.conf.len()));
+                    }
                     None => return Some(Err(())),
                 }
             }
@@ -362,6 +387,14 @@ impl Vdl2Demod {
         }
     }
 
+    /// Keep a finished collection's buffers (emptied) for the next one.
+    fn recycle(&mut self, c: Collecting) {
+        let Collecting { mut bits, mut conf, .. } = c;
+        bits.clear();
+        conf.clear();
+        self.spare = (bits, conf);
+    }
+
     pub fn process(&mut self, input: &[Complex<f32>], rs: &ReedSolomon) -> Vec<Burst> {
         self.buf.extend_from_slice(input);
         for x in input {
@@ -386,8 +419,8 @@ impl Vdl2Demod {
                             theta,
                             cfo: theta, // preamble-fit CFO, kept undrifted
                             prev,
-                            bits: Vec::new(),
-                            conf: Vec::new(),
+                            bits: std::mem::take(&mut self.spare.0),
+                            conf: std::mem::take(&mut self.spare.1),
                             scr: Scrambler::new(),
                             needed: None,
                         }));
@@ -402,6 +435,7 @@ impl Vdl2Demod {
                     Some(Err(())) => {
                         STAT_HDR_FAIL.fetch_add(1, AOrd::Relaxed);
                         // Bad header: resume hunting just past this UW.
+                        self.recycle(*c);
                         self.state = State::Hunt;
                     }
                     Some(Ok(())) => {
@@ -416,7 +450,7 @@ impl Vdl2Demod {
                             rs,
                         ) {
                             Some((avlc_bits, fixed, soft)) => {
-                                if std::env::var("VDL2_DEBUG").is_ok() {
+                                if self.debug {
                                     eprintln!("RSOK   tl_bits={tl_bits} syms={} soft={soft}", n / 3);
                                 }
                                 STAT_BURST_OK.fetch_add(1, AOrd::Relaxed);
@@ -444,10 +478,10 @@ impl Vdl2Demod {
                                 }
                             }
                             None => {
-                                if std::env::var("VDL2_DEBUG").is_ok() {
+                                if self.debug {
                                     eprintln!("RSFAIL tl_bits={tl_bits} syms={}", n / 3);
                                 }
-                                if let Ok(dir) = std::env::var("VDL2_DUMP_BITS") {
+                                if let Some(dir) = &self.dump_dir {
                                     use std::sync::atomic::AtomicU32;
                                     static N: AtomicU32 = AtomicU32::new(0);
                                     let k = N.fetch_add(1, AOrd::Relaxed);
@@ -482,6 +516,7 @@ impl Vdl2Demod {
                                 self.cursor = c.uw_start + 1.0;
                             }
                         }
+                        self.recycle(*c);
                         self.state = State::Hunt;
                     }
                 },
