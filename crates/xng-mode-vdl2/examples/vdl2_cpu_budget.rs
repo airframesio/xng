@@ -3,7 +3,8 @@
 //! Regenerates the budget table VDL2 optimisation work is prioritised from:
 //! the real 7-channel plan inside one 2.4 MS/s capture, each channel a
 //! `Vdl2ChannelDecoder` with its own full-rate DDC, exactly as the runtime
-//! builds it. Measure before deciding what to optimise.
+//! builds it. Measure before deciding what to optimise. The `multi` rows run
+//! the same plan through one `Vdl2MultiChannelDecoder` per front end.
 //!
 //! ```bash
 //! cargo run --release -p xng-mode-vdl2 --example vdl2_cpu_budget
@@ -20,7 +21,9 @@ use xng_dsp::Ddc;
 use xng_mode_vdl2::avlc::{encode_address, AddressType};
 use xng_mode_vdl2::demod::Vdl2Demod;
 use xng_mode_vdl2::modulate::burst_iq_shaped;
-use xng_mode_vdl2::{interleave, Vdl2ChannelDecoder, CHANNEL_PASSBAND_HZ, CHANNEL_RATE_HI};
+use xng_mode_vdl2::{
+    interleave, Vdl2ChannelDecoder, Vdl2MultiChannelDecoder, CHANNEL_PASSBAND_HZ, CHANNEL_RATE_HI,
+};
 
 const FS: f64 = 2_400_000.0;
 const DUR_S: f64 = 4.0;
@@ -139,6 +142,32 @@ fn run_all(decs: &mut [Vdl2ChannelDecoder], cap: &[Complex<f32>]) -> usize {
     frames
 }
 
+/// Which multi-channel front end to build.
+#[derive(Clone, Copy)]
+enum MultiFront {
+    Channelized,
+    Shared,
+}
+
+fn multi(offs: &[f64], front: MultiFront) -> Vdl2MultiChannelDecoder {
+    match front {
+        MultiFront::Channelized => Vdl2MultiChannelDecoder::new_channelized(FS, offs),
+        MultiFront::Shared => Vdl2MultiChannelDecoder::new_shared(FS, offs),
+    }
+    .expect("build VDL2 multi-channel decoder")
+}
+
+/// Feed the capture through a multi-channel decoder in runtime-sized chunks.
+fn run_multi(dec: &mut Vdl2MultiChannelDecoder, cap: &[Complex<f32>]) -> usize {
+    let mut frames = 0;
+    for chunk in cap.chunks(READ_CHUNK) {
+        for (_, f) in dec.process(chunk) {
+            frames += f.len();
+        }
+    }
+    frames
+}
+
 fn main() {
     let n = (FS * DUR_S) as usize;
     let cap = noise(n);
@@ -204,11 +233,36 @@ fn main() {
     });
     line("TOTAL end-to-end (busy)", busy);
 
+    let fronts = [
+        (MultiFront::Channelized, "channelized"),
+        (MultiFront::Shared, "shared"),
+    ];
+    let mut multi_frames = Vec::new();
+    for (front, name) in fronts {
+        let mut dec = multi(&offs, front);
+        let idle = best(|| {
+            run_multi(&mut dec, &cap);
+        });
+        line(&format!("TOTAL multi ({name}, idle)"), idle);
+        let mut dec = multi(&offs, front);
+        let busy = best(|| {
+            run_multi(&mut dec, &busy_cap);
+        });
+        line(&format!("TOTAL multi ({name}, busy)"), busy);
+        multi_frames.push((name, run_multi(&mut multi(&offs, front), &busy_cap)));
+    }
+
     // A timing alone cannot tell a fast pipeline from a deaf one, so decode
     // the busy capture once with fresh decoders and count.
     let frames = run_all(&mut decoders(&offs), &busy_cap);
     println!("\nframes decoded on the busy capture: {frames} of {placed} bursts placed");
     if frames == 0 {
         println!("*** BROKEN: busy capture decoded 0 frames");
+    }
+    for (name, n) in multi_frames {
+        println!("frames decoded by multi ({name}): {n} of {placed} bursts placed");
+        if n == 0 {
+            println!("*** BROKEN: multi ({name}) decoded 0 frames");
+        }
     }
 }

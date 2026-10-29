@@ -2,8 +2,11 @@
 //! burst inside a 2.4 MS/s capture, decoded by `Vdl2ChannelDecoder` with its
 //! full-rate DDC, at a near-center and a plan-edge channel offset. The
 //! reference column is the same burst at 105 kS/s through the no-DDC path
-//! (what the bench fixtures exercise), at the same in-channel SNR. Use it to
-//! A/B front-end changes.
+//! (what the bench fixtures exercise), at the same in-channel SNR. The `ch`
+//! and `sh` columns run the same burst through `Vdl2MultiChannelDecoder`
+//! configured with the whole 7-channel plan (channelizer and shared-decimation
+//! front ends; the burst on the tested channel, the rest quiet). Use it to A/B
+//! front-end changes.
 //!
 //! ```bash
 //! cargo run --release -p xng-mode-vdl2 --example sensitivity_wide
@@ -13,11 +16,15 @@ use num_complex::Complex;
 use xng_mode_vdl2::avlc::{encode_address, AddressType};
 use xng_mode_vdl2::demod::SYMBOL_RATE;
 use xng_mode_vdl2::modulate::burst_iq_shaped;
-use xng_mode_vdl2::Vdl2ChannelDecoder;
+use xng_mode_vdl2::{Vdl2ChannelDecoder, Vdl2MultiChannelDecoder};
 
 const FS: f64 = 2_400_000.0;
 const REF_RATE: f64 = 105_000.0;
 const OFFSETS: [f64; 2] = [12_500.0, 162_500.0];
+/// The live 7-channel plan around 136.8125 MHz; `OFFSETS` are members.
+const PLAN_OFFSETS: [f64; 7] = [
+    -162_500.0, -87_500.0, -37_500.0, 12_500.0, 62_500.0, 112_500.0, 162_500.0,
+];
 /// Target in-channel SNR per sweep point; see `main` for the definition.
 const SNR_DB: [f64; 9] = [26.0, 24.0, 23.0, 22.0, 21.0, 20.0, 19.0, 18.0, 16.0];
 const TRIALS: u64 = 100;
@@ -54,6 +61,17 @@ fn aoa_frame() -> Vec<u8> {
     f
 }
 
+/// Which decoder a trial runs.
+#[derive(Clone, Copy)]
+enum Path {
+    /// `Vdl2ChannelDecoder` with its own DDC.
+    PerChannel,
+    /// `Vdl2MultiChannelDecoder::new_channelized` over the whole plan.
+    MultiChannelized,
+    /// `Vdl2MultiChannelDecoder::new_shared` over the whole plan.
+    MultiShared,
+}
+
 /// One trial: `lead` noise, burst, `tail` noise, uniform ±`amp` on I/Q,
 /// decoded in `CHUNK`s by a fresh decoder.
 struct Trial<'a> {
@@ -65,6 +83,7 @@ struct Trial<'a> {
     rate: f64,
     off: f64,
     truth: &'a [u8],
+    path: Path,
 }
 
 impl Trial<'_> {
@@ -88,13 +107,30 @@ impl Trial<'_> {
         for x in &mut iq {
             *x += Complex::new(nx() * self.amp, nx() * self.amp);
         }
-        let mut dec =
-            Vdl2ChannelDecoder::new(self.rate, self.off).expect("build VDL2 channel decoder");
         let truth = self.truth;
+        let hit = |f: &xng_mode_vdl2::Vdl2Frame| {
+            f.avlc.raw.len() == truth.len() + 2 && f.avlc.raw[..truth.len()] == *truth
+        };
+        let multi = match self.path {
+            Path::PerChannel => {
+                let mut dec = Vdl2ChannelDecoder::new(self.rate, self.off)
+                    .expect("build VDL2 channel decoder");
+                return iq.chunks(CHUNK).any(|c| dec.process(c).iter().any(hit));
+            }
+            Path::MultiChannelized => {
+                Vdl2MultiChannelDecoder::new_channelized(self.rate, &PLAN_OFFSETS)
+            }
+            Path::MultiShared => Vdl2MultiChannelDecoder::new_shared(self.rate, &PLAN_OFFSETS),
+        };
+        let mut dec = multi.expect("build VDL2 multi-channel decoder");
+        let ch = PLAN_OFFSETS
+            .iter()
+            .position(|&o| o == self.off)
+            .expect("tested offset is a plan channel");
         iq.chunks(CHUNK).any(|c| {
             dec.process(c)
                 .iter()
-                .any(|f| f.avlc.raw.len() == truth.len() + 2 && f.avlc.raw[..truth.len()] == *truth)
+                .any(|(i, frames)| *i == ch && frames.iter().any(hit))
         })
     }
 }
@@ -133,27 +169,39 @@ fn main() {
          amp = per-sample uniform noise ±amp on I/Q at {FS:.0} S/s\n"
     );
     println!(
-        "{:>7}{:>9}{:>10}{:>10}{:>12}",
-        "SNR dB", "amp", "+12.5k", "+162.5k", "ref 105k"
+        "{:>7}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
+        "SNR dB",
+        "amp",
+        "+12.5k",
+        "+162.5k",
+        "ch+12.5k",
+        "ch+162.5k",
+        "sh+12.5k",
+        "sh+162.5k",
+        "ref 105k"
     );
     for (si, &snr) in SNR_DB.iter().enumerate() {
         let amp = (1.5 * sig_pow * FS / (SYMBOL_RATE * 10f64.powf(snr / 10.0))).sqrt() as f32;
-        let mut ok = [0u32; 3];
+        let mut ok = [0u32; 7];
         for t in 0..TRIALS {
             let seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t + 1) ^ ((si as u64 + 1) << 40);
-            for (i, (&off, burst)) in OFFSETS.iter().zip(&wide).enumerate() {
-                let tr = Trial {
-                    burst,
-                    lead: LEAD,
-                    tail: TAIL,
-                    amp,
-                    seed,
-                    rate: FS,
-                    off,
-                    truth: &frame,
-                };
-                if tr.run() {
-                    ok[i] += 1;
+            let paths = [Path::PerChannel, Path::MultiChannelized, Path::MultiShared];
+            for (p, &path) in paths.iter().enumerate() {
+                for (i, (&off, burst)) in OFFSETS.iter().zip(&wide).enumerate() {
+                    let tr = Trial {
+                        burst,
+                        lead: LEAD,
+                        tail: TAIL,
+                        amp,
+                        seed,
+                        rate: FS,
+                        off,
+                        truth: &frame,
+                        path,
+                    };
+                    if tr.run() {
+                        ok[2 * p + i] += 1;
+                    }
                 }
             }
             let tr = Trial {
@@ -165,14 +213,15 @@ fn main() {
                 rate: REF_RATE,
                 off: 0.0,
                 truth: &frame,
+                path: Path::PerChannel,
             };
             if tr.run() {
-                ok[2] += 1;
+                ok[6] += 1;
             }
         }
         println!(
-            "{snr:>7.1}{amp:>9.3}{:>10}{:>10}{:>12}",
-            ok[0], ok[1], ok[2]
+            "{snr:>7.1}{amp:>9.3}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
+            ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]
         );
     }
 }
