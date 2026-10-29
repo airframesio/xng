@@ -368,6 +368,71 @@ fn both_front_ends_decode_equivalently() {
     assert_eq!(channelized[2], ["FRONT END TRE"]);
 }
 
+/// On the real 16-channel US plan the channelizer's bins are 50 kHz — twice
+/// the 24 kHz channel rate — so its per-channel back end has to decimate, and
+/// without an anti-alias stage that decimation folds the rest of the bin
+/// (half of it outside the channel) into the passband: ~2.7 dB of extra noise
+/// at the decode threshold. The front end is a CPU choice, not a sensitivity
+/// one, so at a marginal SNR the default (channelizer) front end must decode
+/// as well as the shared-decimation one on the same captures.
+#[test]
+fn channelizer_matches_shared_sensitivity_on_us_plan() {
+    const PLAN_MHZ: [f64; 16] = [
+        130.425, 130.45, 130.55, 130.825, 130.85, 131.125, 131.25, 131.425, 131.45, 131.475,
+        131.525, 131.55, 131.65, 131.725, 131.825, 131.85,
+    ];
+    const TRIALS: u64 = 20;
+    let fs = 2_400_000.0;
+    let offsets: Vec<f64> = PLAN_MHZ.iter().map(|f| f * 1e6 - 131_137_500.0).collect();
+    // Channel 0 sits 12.5 kHz below its bin center, so the bin's wide side
+    // (where the folded noise comes from) is fully populated with noise.
+    let ch = 0;
+    let text = "SENSITIVITY TRIAL PAYLOAD";
+    let burst = burst_iq(&downlink(text, "XG0042"), fs, offsets[ch], 0.5);
+    let lead = (0.3 * fs) as usize;
+    let tail = (0.1 * fs) as usize;
+
+    // There is no public way to ask which front end `new` picked (`Front` is
+    // private), so this test cannot assert it directly; it relies on the
+    // xng-dsp `ChannelizedDdc` tests, which build this exact plan and would
+    // fail if the channelizer refused it (and `new` silently fell back).
+    let decoded = |mut dec: AcarsMultiChannelDecoder, iq: &[Complex<f32>]| -> bool {
+        dec.hold_squelch_open(true);
+        let mut ok = false;
+        for chunk in iq.chunks(65_536) {
+            for (i, frames) in dec.process(chunk) {
+                ok |= i == ch && frames.iter().any(|f| f.crc_ok && f.text == text);
+            }
+        }
+        ok
+    };
+
+    let (mut channelized, mut shared) = (0u32, 0u32);
+    for trial in 0..TRIALS {
+        let mut iq = vec![Complex::new(0.0f32, 0.0f32); lead + burst.len() + tail];
+        for (i, s) in burst.iter().enumerate() {
+            iq[lead + i] += s;
+        }
+        let mut noise =
+            Noise(0x9e37_79b9_7f4a_7c15 ^ (trial + 1).wrapping_mul(0x2545_f491_4f6c_dd1d));
+        for s in &mut iq {
+            *s += Complex::new(noise.next() * 3.0, noise.next() * 3.0);
+        }
+        channelized +=
+            u32::from(decoded(AcarsMultiChannelDecoder::new(fs, &offsets).unwrap(), &iq));
+        shared +=
+            u32::from(decoded(AcarsMultiChannelDecoder::new_shared(fs, &offsets).unwrap(), &iq));
+    }
+
+    eprintln!("channelized {channelized}/{TRIALS}, shared {shared}/{TRIALS}");
+    assert!(
+        channelized >= 16 && channelized + 2 >= shared,
+        "channelizer front end decoded {channelized}/{TRIALS} vs shared-decimation \
+         {shared}/{TRIALS}: the front end must not cost sensitivity (needs >= 16 and \
+         within 2 of shared)"
+    );
+}
+
 /// A burst arriving after a long idle period must decode identically to one
 /// arriving immediately — the squelch's whole job is to be invisible.
 ///

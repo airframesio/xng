@@ -32,7 +32,8 @@ const PLAN_MHZ: [f64; 16] = [
 ];
 /// Matches `ChannelizedDdc`'s own choice for this plan; see its `choose_num_bins`.
 const PFB_BINS: usize = 48;
-const PFB_TAPS_PER_BRANCH: usize = 8;
+/// Matches `PFB_TAPS_PER_BRANCH` in xng-dsp's `channelized_ddc.rs`.
+const PFB_TAPS_PER_BRANCH: usize = 16;
 /// The demod's mix frequency (MSK tone midpoint); see `demod::TONE_MID_HZ`.
 const TONE_MID_HZ: f64 = 1_800.0;
 
