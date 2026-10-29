@@ -22,17 +22,26 @@ use crate::IqSample;
 use rustfft::{Fft, FftDirection, FftPlanner};
 use std::sync::Arc;
 
+/// Interleaved `f32` lanes (re, im) accumulated per register-resident pass of
+/// the polyphase sum: 8 complex branches.
+const LANES: usize = 16;
+
 pub struct PfbChannelizer {
     nch: usize,
     taps_per_branch: usize,
-    /// Polyphase taps laid out **block-major**: `tap_by_block[l * nch + p]` is
-    /// the tap applied to position `p` of the block `l` steps back from the
-    /// newest. This is the transpose of the natural `branches[k][l]` layout
-    /// and is what makes the hot loop contiguous — see `step`.
+    /// Polyphase taps laid out **block-major** and duplicated per re/im lane:
+    /// `tap_by_block[2 * (l * nch + k) + {0, 1}]` is branch `k`'s tap applied
+    /// to the block `l` steps back from the newest. This is the transpose of
+    /// the natural `branches[k][l]` layout and is what makes the hot loop
+    /// contiguous — see `step`.
     tap_by_block: Vec<f32>,
-    /// Ring of the last `taps_per_branch` input blocks, each `nch` wide.
-    /// Blocks are overwritten in place; nothing is ever shifted.
-    blocks: Vec<IqSample>,
+    /// Ring of the last `taps_per_branch` input blocks, each `nch` complex
+    /// samples stored position-reversed (ring position k holds input position
+    /// nch−1−k, the sample branch k reads) as interleaved (re, im) `f32`, and
+    /// kept twice back to back (slot `b` and `b + taps_per_branch` hold the
+    /// same block) so the taps' window is always contiguous. Blocks are
+    /// overwritten in place; nothing is ever shifted.
+    blocks: Vec<f32>,
     /// Index of the block that will be written next (i.e. one past newest).
     next_block: usize,
     ifft: Arc<dyn Fft<f32>>,
@@ -51,14 +60,17 @@ impl PfbChannelizer {
         let total = nch * taps_per_branch;
         // Prototype lowpass: passband half-width = half a channel.
         let proto = lowpass_taps(0.5 / nch as f64, total);
-        // Branch k, tap l reads position (nch-1-k) of the block l steps back
-        // from the newest, and multiplies by proto[k + l*nch]. Store that tap
-        // indexed by (block, position) so the inner loop walks positions
-        // contiguously instead of gathering with stride nch.
-        let mut tap_by_block = vec![0.0f32; total];
+        // Branch k, tap l reads input position (nch-1-k) of the block l steps
+        // back from the newest, and multiplies by proto[k + l*nch]. Blocks are
+        // stored position-reversed (see `step`), so that sample sits at ring
+        // position k; store the tap indexed by (block, k) so the inner loop
+        // walks branches contiguously instead of gathering with stride nch.
+        let mut tap_by_block = vec![0.0f32; 2 * total];
         for k in 0..nch {
             for l in 0..taps_per_branch {
-                tap_by_block[l * nch + (nch - 1 - k)] = proto[k + l * nch];
+                let i = 2 * (l * nch + k);
+                tap_by_block[i] = proto[k + l * nch];
+                tap_by_block[i + 1] = proto[k + l * nch];
             }
         }
         let ifft = FftPlanner::new().plan_fft(nch, FftDirection::Inverse);
@@ -66,7 +78,7 @@ impl PfbChannelizer {
             nch,
             taps_per_branch,
             tap_by_block,
-            blocks: vec![IqSample::new(0.0, 0.0); total],
+            blocks: vec![0.0; 4 * total],
             next_block: 0,
             ifft,
             scratch: vec![IqSample::new(0.0, 0.0); nch],
@@ -90,10 +102,12 @@ impl PfbChannelizer {
     /// sample per channel is appended to `out[ch]`.
     ///
     /// `out` must contain `nch` vectors.
-    pub fn process(&mut self, input: &[IqSample], out: &mut [Vec<IqSample>]) {
+    pub fn process(&mut self, mut input: &[IqSample], out: &mut [Vec<IqSample>]) {
         assert_eq!(out.len(), self.nch);
-        for &x in input {
-            self.pending.push(x);
+        while !input.is_empty() {
+            let take = (self.nch - self.pending.len()).min(input.len());
+            self.pending.extend_from_slice(&input[..take]);
+            input = &input[take..];
             if self.pending.len() == self.nch {
                 self.step(out);
                 self.pending.clear();
@@ -103,40 +117,72 @@ impl PfbChannelizer {
 
     fn step(&mut self, out: &mut [Vec<IqSample>]) {
         let nch = self.nch;
+        let tpb = self.taps_per_branch;
+        let width = 2 * nch;
         // Overwrite the oldest block in the ring with the new one — no shift.
-        // (`next_block` points at the oldest, which is what we replace.)
-        let write = self.next_block * nch;
-        self.blocks[write..write + nch].copy_from_slice(&self.pending);
+        // (`next_block` points at the oldest, which is what we replace.) The
+        // ring is stored twice back to back, so the block written at slot b is
+        // also written at slot b + tpb, and position-reversed so ring position
+        // k is the sample branch k reads.
+        let slot = self.next_block;
+        for copy in [slot, slot + tpb] {
+            let write = copy * width;
+            let dst = self.blocks[write..write + width].as_chunks_mut::<2>().0;
+            for (d, s) in dst.iter_mut().zip(self.pending.iter().rev()) {
+                *d = [s.re, s.im];
+            }
+        }
         self.next_block += 1;
-        if self.next_block == self.taps_per_branch {
+        if self.next_block == tpb {
             self.next_block = 0;
         }
 
         // v[k] = Σ_l p_k[l] · x[n − k − l·M]. Reindexed block-major: tap l
-        // touches position (nch−1−k) of the block l steps back from newest, so
-        // accumulate block by block over CONTIGUOUS positions. The newest
-        // block is the one just written (next_block − 1), and walking l
-        // forward walks the ring backwards.
-        for s in self.scratch.iter_mut() {
-            *s = IqSample::new(0.0, 0.0);
-        }
-        let mut blk = if self.next_block == 0 {
-            self.taps_per_branch - 1
-        } else {
-            self.next_block - 1
-        };
-        for l in 0..self.taps_per_branch {
-            let base = blk * nch;
-            let samples = &self.blocks[base..base + nch];
-            let taps = &self.tap_by_block[l * nch..l * nch + nch];
-            for ((acc, s), &t) in self.scratch.iter_mut().zip(samples.iter()).zip(taps.iter()) {
-                *acc += *s * t;
+        // touches ring position k of the block l steps back from newest, so
+        // accumulate over CONTIGUOUS branches. With the doubled ring, the
+        // blocks for l = tpb−1 … 0 are the contiguous slots slot+1 … slot+tpb
+        // (newest last), so walking that window backwards walks l forwards
+        // with no wraparound.
+        //
+        // Branches are summed LANES f32 lanes (8 branches) at a time with the
+        // accumulators held in registers across all taps, instead of
+        // re-loading and re-storing every accumulator once per tap.
+        // Bit-identical to the per-tap pass: each lane still starts at +0.0
+        // and adds `s · t` for l = 0, 1, … in the same order, and
+        // `Complex<f32> * f32` / `+=` are exactly the per-component `re·t`,
+        // `im·t` and adds done here (no FMA contraction, no reassociation).
+        let window = &self.blocks[(slot + 1) * width..(slot + 1 + tpb) * width];
+        let full = width / LANES;
+        for ci in 0..full {
+            let mut acc = [0.0f32; LANES];
+            for (s_blk, t_blk) in window
+                .chunks_exact(width)
+                .rev()
+                .zip(self.tap_by_block.chunks_exact(width))
+            {
+                let s = &s_blk.as_chunks::<LANES>().0[ci];
+                let t = &t_blk.as_chunks::<LANES>().0[ci];
+                for ((a, &s), &t) in acc.iter_mut().zip(s.iter()).zip(t.iter()) {
+                    *a += s * t;
+                }
             }
-            blk = if blk == 0 { self.taps_per_branch - 1 } else { blk - 1 };
+            store(&mut self.scratch[ci * LANES / 2..], &acc);
         }
-        // `scratch[p]` holds branch k = nch−1−p; the IFFT expects v[k] at
-        // index k, so reversing puts the branches back in order.
-        self.scratch.reverse();
+        let tail = full * LANES;
+        if tail < width {
+            let mut acc = [0.0f32; LANES];
+            let n = width - tail;
+            for (s_blk, t_blk) in window
+                .chunks_exact(width)
+                .rev()
+                .zip(self.tap_by_block.chunks_exact(width))
+            {
+                for ((a, &s), &t) in acc[..n].iter_mut().zip(&s_blk[tail..]).zip(&t_blk[tail..]) {
+                    *a += s * t;
+                }
+            }
+            store(&mut self.scratch[tail / 2..], &acc[..n]);
+        }
 
         self.ifft.process(&mut self.scratch);
         for (ch, sample) in self.scratch.iter().enumerate() {
@@ -145,6 +191,13 @@ impl PfbChannelizer {
             // across branches).
             out[ch].push(*sample);
         }
+    }
+}
+
+/// Write interleaved (re, im) branch sums into consecutive `v[k]` slots.
+fn store(dst: &mut [IqSample], acc: &[f32]) {
+    for (d, &[re, im]) in dst.iter_mut().zip(acc.as_chunks::<2>().0) {
+        *d = IqSample::new(re, im);
     }
 }
 
@@ -313,6 +366,58 @@ mod tests {
                         (y.re.to_bits(), y.im.to_bits()),
                         "nch={nch} tpb={tpb} ch={ch} sample {i}: {x:?} vs {y:?}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn polyphase_bit_exact_across_block_sizes() {
+        let mut s = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let input: Vec<IqSample> = (0..9_000).map(|_| IqSample::new(next(), next())).collect();
+        // Block-size cycles: all 1-sample, small primes, sizes that are not a
+        // multiple of any tested M, and a large irregular mix.
+        let sequences: &[&[usize]] = &[&[1], &[3, 5, 7], &[13, 1, 97, 2], &[1000, 1, 47, 333]];
+
+        // 12 and 13 exercise a full 8-branch pass plus a partial tail pass.
+        for &nch in &[2usize, 3, 8, 12, 13, 24, 48] {
+            for &tpb in &[2usize, 8, 16] {
+                for seq in sequences {
+                    let mut fast = PfbChannelizer::new(nch, tpb);
+                    let mut refr = RefPfb::new(nch, tpb);
+                    let mut a: Vec<Vec<IqSample>> = vec![Vec::new(); nch];
+                    let mut b: Vec<Vec<IqSample>> = vec![Vec::new(); nch];
+                    let mut pos = 0;
+                    for &len in seq.iter().cycle() {
+                        if pos >= input.len() {
+                            break;
+                        }
+                        let end = (pos + len).min(input.len());
+                        fast.process(&input[pos..end], &mut a);
+                        refr.process(&input[pos..end], &mut b);
+                        pos = end;
+                    }
+                    for ch in 0..nch {
+                        assert_eq!(
+                            a[ch].len(),
+                            b[ch].len(),
+                            "nch={nch} tpb={tpb} {seq:?} ch={ch}"
+                        );
+                        assert_eq!(a[ch].len(), input.len() / nch);
+                        for (i, (x, y)) in a[ch].iter().zip(b[ch].iter()).enumerate() {
+                            assert_eq!(
+                                (x.re.to_bits(), x.im.to_bits()),
+                                (y.re.to_bits(), y.im.to_bits()),
+                                "nch={nch} tpb={tpb} {seq:?} ch={ch} sample {i}"
+                            );
+                        }
+                    }
                 }
             }
         }
