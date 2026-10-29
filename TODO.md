@@ -247,7 +247,7 @@
 - [ ] **PERF-10** ⚑ `ModeChannel::channel_rate()` reports 50 kS/s for VDL2 while the decoder runs at 100/105 kS/s; the wrong rate reaches the provenance
 - [ ] **PERF-11** `Resampler::process` allocates on every call (`mem::take(carry)` + `extend`)
 - [ ] **PERF-12** Re-measure the channelizer bin-edge skirt on 25 kHz bins (8-ch on-raster plan: ±20 kHz was −39 dB at 8 taps/branch; 16 taps should improve it)
-- [ ] **PERF-13** Wire the existing release fixtures into `bench/run.sh` + `baselines.json`: `vdl2_opflasher_105k.cs16` (136.800, currently 13) and `acars_100k.cs16` (131.500, currently 15 CRC-OK) — today only the unmerged `feat/phase-2-accuracy-compat` branch gates them
+- [x] **PERF-13** Wire the existing release fixtures into `bench/run.sh` + `baselines.json`: `vdl2_opflasher_105k.cs16` (136.800, currently 13) and `acars_100k.cs16` (131.500, currently 15 CRC-OK) — today only the unmerged `feat/phase-2-accuracy-compat` branch gates them — ✅ gated (floors acars_offair 13, vdl2_offair2 12; CI now downloads both)
 - [ ] **PERF-14** Validate PERF-2/PERF-3/PERF-5 on real multi-channel RF (needs an SDR; synthetic + up-converted off-air only so far)
 - [ ] **PERF-15** Fan the shared front end out to other narrowband modes (after PERF-4) — HFDL, Aero (two `Ddc`s per channel today), Sonde, FLEX, POCSAG (+ squelch for its idle auto-baud lanes), AIS/VDES; each needs a fixture/CPU row first
   - [ ] **PERF-15.1** Verify-then-fix reported per-mode issues: NAVTEX and EOT bit/chip history never trimmed (cost grows with session length); APRS demod ring buffer with `% win`; Iridium designs a new `Ddc` per burst and hand-rolls its matched filter
