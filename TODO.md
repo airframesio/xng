@@ -9,7 +9,7 @@
 - **Checkbox** — `- [ ]` open · `- [x]` done. Check a parent only when all its subtasks are done.
 - **Item ID** — `CATEGORY-N` (top-level) and `CATEGORY-N.M` / `CATEGORY-N.M.K` (subtasks, tree). IDs are **stable** — never renumber; if an item is dropped, mark it `~~struck~~ (dropped: reason)` rather than deleting.
 - **Tags** — `★ quick win` (high value / low, clean-room effort) · `◆ big bet` (large, high-leverage) · `⚑ correctness` (possible live bug, verify first) · `(A1)`/`(B)`/`(C)`/`(D)` = source section in the research doc.
-- **Categories:** `FEED` feeding feature · `XM` cross-mode foundations · `ACARS` `VDL2` `HFDL` `AERO` `STDC` `IRID` `AIS` `ADSB` per-mode · `ECO` ecosystem/tooling · `NEW` new modes · `VERIFY` research/correctness checks.
+- **Categories:** `FEED` feeding feature · `XM` cross-mode foundations · `ACARS` `VDL2` `HFDL` `AERO` `STDC` `IRID` `AIS` `ADSB` per-mode · `ECO` ecosystem/tooling · `PERF` CPU/front-end performance · `NEW` new modes · `VERIFY` research/correctness checks.
 
 ## Suggested sequencing (recommended order, not binding)
 
@@ -228,6 +228,29 @@
 - [x] **ECO-10** Enrichment data — bundled/auto-updating aircraft DB + dbFlags; route/airline/operator/airport enrichment on dashboard; persistent vessel registry across restarts — ⏸ **DEFERRED:** enrichment needs a bundled/auto-updating aircraft+vessel DB (data dependency); partial dbinfo (country/db lookup) exists — deferred
 - [x] **ECO-11** Smaller dashboard/quality — per-mode entity expiry (not flat 300 s); message-stream scrollback backed by ring file; dark/light/scale controls; verify non-Iridium trail antimeridian wrapping (VERIFY-7) — ⏸ **DEFERRED:** per-mode expiry is design-ambiguous for multi-source entities; scrollback-ring + theme controls are UI — deferred (flat 300 s works; antimeridian wrap done in VERIFY-7)
 - [x] **ECO-12** Aggregator-network targets — feed/dedup against airplanes.live / adsb.lol (ODbL) / adsb.fi / OpenSky; study BelugaProject (air+sea fusion prior art) — ⏸ **DEFERRED:** aggregator-network feeds need each network's endpoint/protocol + accounts (external) — deferred
+
+---
+
+## PERF — CPU / front-end performance (branch `perf/vdl2`)
+
+> VDL2-focused CPU work following the ACARS campaign (#178/#181/#182). Measure on the target machine before and after (`bench/cpu.sh`, `crates/xng-mode-vdl2/examples/vdl2_cpu_budget.rs`, `crates/xng-mode-acars/examples/cpu_budget.rs`); decode-count gates (`bench/run.sh`) must not regress. Repo-wide rustfmt/clippy cleanup is explicitly out of scope here (it would bury the diff).
+
+- [x] **PERF-1** VDL2 live-path measurement harness — `gen_vdl2_capture` (7-channel 2.4 MS/s plan capture), `upconvert` (real 105 kS/s off-air into a wide capture), `vdl2_cpu_budget`, `sensitivity_wide`, and a `vdl2_7ch` row in `bench/cpu.sh`
+- [x] **PERF-2** ⚑ VDL2 live path lost ~2 dB — the DDC's final stage is an anti-alias filter, not a channel filter; the 101-tap channel lowpass now runs after the DDC too (50%-decode SNR 20.8 → 18.6 dB; opflasher up-converted 10 → 12 frames)
+- [x] **PERF-3** ⚑ `ChannelizedDdc` folded adjacent channels into the passband on the real US ACARS plan (50 kHz bins, unfiltered 50k→24k resample, 8-tap critically-sampled bank) — per-channel decimating anti-alias stage, 16 taps/branch, bin-rate ≤ 4× output-rate cap (16-ch all-busy capture 85 → 227 frames; ~2.7 dB sensitivity recovered)
+- [ ] **PERF-4** Generalize `decode_loop` so any mode can drive a shared multi-channel front end (removes the ACARS-only `AcarsShared` special case and its two `TODO(perf)` notes in `src/runtime.rs`); ACARS behaviour unchanged
+- [ ] **PERF-5** VDL2 shared multi-channel front end (channelizer with the PERF-3 per-channel stage vs tuned `SharedDdc` — pick by measurement); must recover PERF-2's +3.5% and cut the 7 per-channel DDCs (~75% of idle cost)
+- [ ] **PERF-6** VDL2 decode hot-path trims with bit-identical output (constant UW table, `preamble_fit` table built once, `with_capacity` bit buffers, cache `VDL2_DEBUG`, bit-packed LFSR, fewer deinterleave/RS allocations)
+- [ ] **PERF-7** Shared ingest costs — dashboard spectrum FFT runs every 4th chunk with no subscriber, CU8→CF32 conversion, per-chunk allocation
+- [ ] **PERF-8** ⚑ VDL2 decoder holds a burst back until ~0.3–0.5 s more samples arrive (likely a false lock on noise collecting a fake frame before rewinding) — delays frames live, drops them at end of file, wastes CPU
+- [ ] **PERF-9** ⚑ VDL2 synthetic capture: 136.725 burst seq 29 (weak, high SNR) decodes without the PERF-2 channel lowpass and is missed with it — not SNR-limited; investigate (possibly PERF-8)
+- [ ] **PERF-10** ⚑ `ModeChannel::channel_rate()` reports 50 kS/s for VDL2 while the decoder runs at 100/105 kS/s; the wrong rate reaches the provenance
+- [ ] **PERF-11** `Resampler::process` allocates on every call (`mem::take(carry)` + `extend`)
+- [ ] **PERF-12** Re-measure the channelizer bin-edge skirt on 25 kHz bins (8-ch on-raster plan: ±20 kHz was −39 dB at 8 taps/branch; 16 taps should improve it)
+- [ ] **PERF-13** Wire the existing release fixtures into `bench/run.sh` + `baselines.json`: `vdl2_opflasher_105k.cs16` (136.800, currently 13) and `acars_100k.cs16` (131.500, currently 15 CRC-OK) — today only the unmerged `feat/phase-2-accuracy-compat` branch gates them
+- [ ] **PERF-14** Validate PERF-2/PERF-3/PERF-5 on real multi-channel RF (needs an SDR; synthetic + up-converted off-air only so far)
+- [ ] **PERF-15** Fan the shared front end out to other narrowband modes (after PERF-4) — HFDL, Aero (two `Ddc`s per channel today), Sonde, FLEX, POCSAG (+ squelch for its idle auto-baud lanes), AIS/VDES; each needs a fixture/CPU row first
+  - [ ] **PERF-15.1** Verify-then-fix reported per-mode issues: NAVTEX and EOT bit/chip history never trimmed (cost grows with session length); APRS demod ring buffer with `% win`; Iridium designs a new `Ddc` per burst and hand-rolls its matched filter
 
 ---
 
