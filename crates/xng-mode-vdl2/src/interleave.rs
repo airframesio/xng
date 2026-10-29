@@ -205,7 +205,15 @@ pub fn deinterleave_soft(
                     }
                     erasures.extend(ranked.iter().take(extra).copied());
                 }
-                if let Ok(fixed) = rs.correct(&mut attempt, &erasures) {
+                // Shortened code: columns n..249 are virtual zero fill and
+                // must stay zero. A "correction" landing there is not a
+                // valid shortened codeword — accepting it turns ~16% of
+                // random rows into RS passes (false locks).
+                let result = rs
+                    .correct(&mut attempt, &erasures)
+                    .ok()
+                    .filter(|_| attempt[n..ROW_DATA_OCTETS].iter().all(|&o| o == 0));
+                if let Some(fixed) = result {
                     corrected += fixed.saturating_sub(base.len());
                     if extra > 0 {
                         soft_assisted = true;
@@ -268,6 +276,119 @@ mod tests {
         let (back, fixed) = deinterleave(&tx, 5000, &rs).expect("must correct");
         assert_eq!(back, data);
         assert!(fixed >= 1);
+    }
+
+    /// Single-row TX bits: for one row, column-major readout is just
+    /// the real octets followed by the transmitted checks.
+    fn single_row_tx(real: &[u8], checks: &[u8]) -> Vec<u8> {
+        let k = checks_for(real.len());
+        let mut tx = real.to_vec();
+        tx.extend_from_slice(&checks[..k]);
+        octets_to_bits(&tx, tx.len() * 8)
+    }
+
+    fn pattern_octets(n: usize, seed: u64) -> Vec<u8> {
+        bits_to_octets(&pattern_bits(n * 8, seed))
+    }
+
+    #[test]
+    fn rejects_correction_into_virtual_fill() {
+        let rs = vdl2_rs();
+        // Deterministic: a full-length codeword whose fill column n is
+        // non-zero. RX zero-fills that column, so the received row is one
+        // symbol away from this codeword (and ≥6 from any other); the
+        // decoder "fixes" the fill octet. That is not a valid shortened
+        // codeword and must be rejected.
+        let n = 100;
+        let real = pattern_octets(n, 7);
+        let mut full = vec![0u8; ROW_DATA_OCTETS];
+        full[..n].copy_from_slice(&real);
+        full[n] = 0x5a;
+        let checks = rs.encode(&full);
+        let tx = single_row_tx(&real, &checks);
+        assert!(deinterleave(&tx, n * 8, &rs).is_none());
+
+        // Random sweep. With all 6 checks sent (n ≥ 68) and t = 3
+        // corrections confined to the n+6 real positions, a random row
+        // passes with probability ≈ C(n+6,3)·255³/256⁶ (≈0.6% at n=80,
+        // ≈1.1% at n=100, ≈2.3% at n=127). Before the fix any of the 255
+        // positions could be "corrected": ~16%.
+        let mut s = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let mut passes = 0;
+        let mut total = 0;
+        for n in [80usize, 100, 127] {
+            let tl = n * 8;
+            let nbits = layout(tl).unwrap().total_tx_bits;
+            for _ in 0..1000 {
+                let tx: Vec<u8> = (0..nbits).map(|_| (next() & 1) as u8).collect();
+                total += 1;
+                if deinterleave(&tx, tl, &rs).is_some() {
+                    passes += 1;
+                }
+            }
+        }
+        assert!(
+            passes * 100 <= total * 3,
+            "random pass rate {passes}/{total}"
+        );
+
+        // Short rows (n=30: 2 checks sent, 4 erased → 1 correction left):
+        // the [32,30] effective code accepts ≈ 32·255/256² ≈ 12.5% of
+        // random rows inherently; unrestricted it was ≈ 98%.
+        let mut passes = 0;
+        let nbits = layout(30 * 8).unwrap().total_tx_bits;
+        for _ in 0..1000 {
+            let tx: Vec<u8> = (0..nbits).map(|_| (next() & 1) as u8).collect();
+            if deinterleave(&tx, 30 * 8, &rs).is_some() {
+                passes += 1;
+            }
+        }
+        assert!(passes <= 200, "n=30 random pass rate {passes}/1000");
+    }
+
+    #[test]
+    fn still_corrects_real_errors() {
+        let rs = vdl2_rs();
+        let n = 100;
+        let real = pattern_octets(n, 11);
+        let mut full = vec![0u8; ROW_DATA_OCTETS];
+        full[..n].copy_from_slice(&real);
+        let checks = rs.encode(&full);
+        let want = octets_to_bits(&real, n * 8);
+
+        // Three octet errors in real data positions: plain path.
+        let mut bad = real.clone();
+        for p in [3usize, 40, 99] {
+            bad[p] ^= 0xa5;
+        }
+        let tx = single_row_tx(&bad, &checks);
+        let (back, fixed) = deinterleave(&tx, n * 8, &rs).expect("3 errors correctable");
+        assert_eq!(back, want);
+        assert_eq!(fixed, 3);
+
+        // Four errors (beyond t=3); two flagged low-confidence → the
+        // erasure rung (2 erasures + 2 errors = 6) recovers the row.
+        let mut bad = real.clone();
+        for p in [10usize, 50, 70, 90] {
+            bad[p] ^= 0x3c;
+        }
+        let tx = single_row_tx(&bad, &checks);
+        assert!(deinterleave(&tx, n * 8, &rs).is_none());
+        let mut conf = vec![0.0f32; tx.len() / 3 + 1];
+        for o in [10usize, 50] {
+            // A symbol wholly inside octet o, so neighbours stay at 0.
+            conf[(o * 8 + 3) / 3] = 0.5;
+        }
+        let (back, _, soft) =
+            deinterleave_soft(&tx, &conf, 0, n * 8, &rs).expect("erasure-assisted");
+        assert_eq!(back, want);
+        assert!(soft);
     }
 
     #[test]
