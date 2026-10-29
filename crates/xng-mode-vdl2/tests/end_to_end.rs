@@ -175,6 +175,65 @@ fn decodes_from_wideband_capture_with_cfo() {
     assert_eq!(acars.core.text.len(), 79);
 }
 
+/// The live path (2.4 MS/s capture → DDC → channel rate) must be as
+/// channel-selective as the no-DDC channel-rate path. The DDC's final stage
+/// is only an anti-alias filter, so without the channel lowpass after it
+/// out-of-channel noise reaches the demod and costs ~2 dB: at 20 dB
+/// in-channel SNR the live path decoded ~10% of bursts before the fix and
+/// ~95% after.
+#[test]
+fn wideband_path_matches_channel_rate_sensitivity() {
+    use xng_mode_vdl2::demod::SYMBOL_RATE;
+    use xng_mode_vdl2::modulate::burst_iq_shaped;
+    const FS: f64 = 2_400_000.0;
+    const SNR_DB: f64 = 20.0;
+    const TRIALS: u64 = 8;
+    const LEAD: usize = 20_000;
+    // The decoder can hold a burst back until more samples arrive (a known
+    // issue, tracked separately); a long tail keeps that from looking like
+    // a sensitivity miss.
+    const TAIL: usize = 1_200_000;
+
+    let frame = aoa_frame();
+    let frames = [frame.clone()];
+    let burst = burst_iq_shaped(&frames, FS, 12_500.0, 0.5);
+    // In-channel SNR as in examples/sensitivity_wide.rs: signal power over
+    // the uniform ±a noise PSD integrated across one symbol-rate bandwidth.
+    let reference = burst_iq_shaped(&frames, 105_000.0, 0.0, 0.5);
+    let sig_pow = reference
+        .iter()
+        .map(|c| f64::from(c.norm_sqr()))
+        .sum::<f64>()
+        / reference.len() as f64;
+    let amp = (1.5 * sig_pow * FS / (SYMBOL_RATE * 10f64.powf(SNR_DB / 10.0))).sqrt() as f32;
+
+    let mut successes = 0;
+    for t in 0..TRIALS {
+        let mut iq = vec![Complex::new(0.0f32, 0.0); LEAD];
+        iq.extend_from_slice(&burst);
+        iq.resize(iq.len() + TAIL, Complex::new(0.0, 0.0));
+        let mut noise = Noise(0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t + 1) | 1);
+        for s in &mut iq {
+            *s += Complex::new(noise.next() * amp, noise.next() * amp);
+        }
+        let mut dec = Vdl2ChannelDecoder::new(FS, 12_500.0).unwrap();
+        let ok = iq.chunks(65_536).any(|c| {
+            dec.process(c).iter().any(|f| {
+                f.avlc.raw.len() == frame.len() + 2 && f.avlc.raw[..frame.len()] == frame[..]
+            })
+        });
+        if ok {
+            successes += 1;
+        }
+    }
+    assert!(
+        successes >= 6,
+        "live 2.4 MS/s path decoded {successes}/{TRIALS} at {SNR_DB} dB in-channel SNR; \
+         it must be as selective as the channel-rate path (~95% here; ~10% without \
+         the channel lowpass after the DDC)"
+    );
+}
+
 /// The pulse-shaped (RC α=0.6) modulator is the realistic loopback: RC
 /// is Nyquist, so the existing symbol-center demod must decode it
 /// cleanly at both channel rates and survive moderate noise.

@@ -46,12 +46,11 @@ pub struct Vdl2Frame {
 
 pub struct Vdl2ChannelDecoder {
     ddc: Option<Ddc>,
-    /// Channel-selectivity lowpass for the no-DDC path. The RC(α=0.6)
+    /// Channel-selectivity lowpass at the channel rate. The RC(α=0.6)
     /// TX pulse occupies ±(1+α)·Rs/2 = ±8.4 kHz; a flat lowpass there
     /// keeps the signal spectrum (and its Nyquist zero-ISI property)
-    /// untouched while removing all out-of-band noise. When a DDC runs
-    /// its decimation filter already provides this.
-    selectivity: Option<xng_dsp::fir::Fir>,
+    /// untouched while removing all out-of-band noise.
+    selectivity: xng_dsp::fir::Fir,
     select_buf: Vec<Complex<f32>>,
     demod: demod::Vdl2Demod,
     rs: ReedSolomon,
@@ -88,15 +87,17 @@ impl Vdl2ChannelDecoder {
         } else {
             Some(Ddc::new(input_rate, channel_rate, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
         };
-        let selectivity = if ddc.is_none() {
-            // -6 dB point at the symbol rate so the filter is flat
-            // through the RC band edge (8.4 kHz) and the windowed-sinc
-            // transition lives entirely in the noise-only region.
-            let taps = xng_dsp::fir::lowpass_taps(demod::SYMBOL_RATE / channel_rate, 101);
-            Some(xng_dsp::fir::Fir::new(taps))
-        } else {
-            None
-        };
+        // -6 dB point at the symbol rate so the filter is flat through the
+        // RC band edge (8.4 kHz) and the windowed-sinc transition lives
+        // entirely in the noise-only region. This runs after the DDC too:
+        // the DDC's final stage is sized as an anti-alias filter, not a
+        // channel filter (≈−2 dB at 12 kHz for 2.4 MS/s → 100 kS/s), so
+        // this FIR is the channel filter on every path. On the live path
+        // it moved the 50%-decode SNR from 20.8 to 18.6 dB.
+        let selectivity = xng_dsp::fir::Fir::new(xng_dsp::fir::lowpass_taps(
+            demod::SYMBOL_RATE / channel_rate,
+            101,
+        ));
         Ok(Self {
             ddc,
             selectivity,
@@ -121,17 +122,12 @@ impl Vdl2ChannelDecoder {
                 ddc.process(input, &mut self.channel_buf);
                 &self.channel_buf
             }
-            None => match &mut self.selectivity {
-                Some(fir) => {
-                    self.select_buf.clear();
-                    fir.process(input, &mut self.select_buf);
-                    &self.select_buf
-                }
-                None => input,
-            },
+            None => input,
         };
+        self.select_buf.clear();
+        self.selectivity.process(channel, &mut self.select_buf);
         let mut out = Vec::new();
-        for burst in self.demod.process(channel, &self.rs) {
+        for burst in self.demod.process(&self.select_buf, &self.rs) {
             for frame in avlc::scan(&burst.bits) {
                 let acars = match frame.payload {
                     avlc::Payload::Acars => {
