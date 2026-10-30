@@ -12,10 +12,16 @@
 //!  2. Each requested channel snaps to its nearest bin (within ±½ bin).
 //!  3. A small residual NCO removes the leftover offset (channel center − bin
 //!     center) at the low bin rate.
-//!  4. When the bin is wide enough that resampling it would fold out-of-channel
-//!     content into the passband, an anti-alias lowpass (decimating by the
-//!     integer part of `bin rate / channel rate`) runs first.
+//!  4. A channel filter lowpasses to ±passband (decimating by the integer
+//!     part of `bin rate / channel rate`), sized like
+//!     [`SharedDdc`](crate::SharedDdc)'s per-channel stage.
 //!  5. A resampler corrects the remaining rate to the exact channel rate.
+//!
+//! So the output contract is `SharedDdc`'s: every channel is filtered to
+//! ±passband, not just anti-aliased. A bin is far wider than the channel
+//! (±12.5 kHz or more around a ±5 kHz ACARS channel), and a back end that
+//! takes the raw channel stream's envelope would otherwise see a strong
+//! neighbour 5–12 kHz away as if it were in-channel (PERF-20).
 //!
 //! `M` is chosen so each bin comfortably carries the channel passband and the
 //! bin rate is a small integer-ish multiple of the output rate (cheap final
@@ -42,7 +48,7 @@ const PFB_TAPS_PER_BRANCH: usize = 16;
 const TAPS_PER_TRANSITION: f64 = 5.5;
 
 /// Largest admissible bin rate as a multiple of the output rate. Bounds the
-/// per-channel decimation the anti-alias stage must do (and so its tap count
+/// per-channel decimation the channel filter must do (and so its tap count
 /// and per-channel cost); beyond it, [`SharedDdc`](crate::SharedDdc) is the
 /// better front end.
 const MAX_BIN_TO_OUTPUT_RATIO: f64 = 4.0;
@@ -55,15 +61,18 @@ const OVERSAMPLED_TAPS_PER_TRANSITION: f64 = 8.0;
 /// Fewest / most taps per branch for the oversampled prototype.
 const OVERSAMPLED_MIN_TAPS: usize = 4;
 const OVERSAMPLED_MAX_TAPS: usize = 16;
-/// Anti-alias stage sizing behind an oversampled bank, whose bins pass far
+/// Channel filter sizing behind an oversampled bank, whose bins pass far
 /// more out-of-channel content than a critically sampled one (≈ −100 dB vs
 /// ≈ −70 dB for [`TAPS_PER_TRANSITION`]).
-const OVERSAMPLED_AA_TAPS_PER_TRANSITION: f64 = 8.0;
+const OVERSAMPLED_FILTER_TAPS_PER_TRANSITION: f64 = 8.0;
 /// Largest rate (as a multiple of the output rate) an oversampled bin may
-/// hand the cubic resampler after the optional anti-alias decimation. An
-/// oversampled bin still carries content well past the passband (out to the
-/// prototype's cutoff one bin spacing away), and the Catmull-Rom resampler
-/// only keeps its images out of the passband close to unity ratio.
+/// hand the cubic resampler after the channel filter's decimation. It was
+/// introduced when the bin reached the resampler only anti-aliased, still
+/// carrying content well past the passband that the Catmull-Rom resampler
+/// folded in away from unity ratio. The channel filter now removes that
+/// content first, so the guard no longer stands between a tone and the
+/// passband (see `oversampled_resample_guard`); it is kept as a bound on the
+/// resampler's working range and on which bin counts the chooser considers.
 const MAX_RESAMPLE_RATIO: f64 = 1.25;
 
 /// One requested channel's mapping onto the bin grid + its cheap back end.
@@ -72,14 +81,13 @@ struct Channel {
     bin: usize,
     /// Residual NCO removing (channel center − bin center) at the bin rate.
     nco: Nco,
-    /// Anti-alias lowpass (with integer decimation) at the bin rate, present
-    /// when resampling the raw bin would fold content into the passband.
-    aa: Option<Fir>,
+    /// ±passband channel filter (with integer decimation) at the bin rate.
+    filter: Fir,
     resampler: Option<Resampler>,
     /// The selected bin's samples for this block (NCO-mixed in place).
     binbuf: Vec<IqSample>,
-    /// Anti-alias output, fed to the resampler.
-    aabuf: Vec<IqSample>,
+    /// Channel filter output, fed to the resampler.
+    filtbuf: Vec<IqSample>,
 }
 
 pub struct ChannelizedDdc {
@@ -91,6 +99,8 @@ pub struct ChannelizedDdc {
     /// active, so the other vectors stay empty.
     bins: Vec<Vec<IqSample>>,
     channels: Vec<Channel>,
+    /// Channel filter length (the same for every channel), for `describe`.
+    filter_taps: usize,
 }
 
 impl ChannelizedDdc {
@@ -140,7 +150,7 @@ impl ChannelizedDdc {
         // a small multiple of output_rate so the final resample is gentle.
         // Target a bin rate of ~output_rate (critically sampled at the channel
         // rate is too tight for the channel filter, so allow up to ~2×).
-        let (mut pfb, max_safe_residual, aa_taps_per_transition) = match oversample {
+        let (mut pfb, max_safe_residual, filter_taps_per_transition) = match oversample {
             Oversample::Critical => {
                 let m = choose_num_bins(input_rate, output_rate, passband_hz, offsets)?;
                 let spacing = input_rate / m as f64;
@@ -167,12 +177,15 @@ impl ChannelizedDdc {
                 // The prototype is sized for the worst residual, so any
                 // nearest-bin snap (≤ ½ spacing, plus rounding) fits.
                 let pfb = PfbChannelizer::with_oversample(m, tpb, oversample);
-                (pfb, spacing / 2.0 + 1e-6, OVERSAMPLED_AA_TAPS_PER_TRANSITION)
+                (pfb, spacing / 2.0 + 1e-6, OVERSAMPLED_FILTER_TAPS_PER_TRANSITION)
             }
         };
         let m = pfb.num_channels();
         let spacing = input_rate / m as f64;
         let bin_rate = input_rate / pfb.decimation() as f64;
+        let (filter_taps, filter_decim, post_rate) =
+            channel_filter_size(bin_rate, output_rate, passband_hz, filter_taps_per_transition)?;
+        let filter_coeffs = lowpass_taps(passband_hz / bin_rate, filter_taps);
 
         let mut channels = Vec::with_capacity(offsets.len());
         for &off in offsets {
@@ -193,8 +206,7 @@ impl ChannelizedDdc {
                     "channel offset {off} Hz is too close to a {m}-bin channelizer edge"
                 ));
             }
-            let (aa, post_rate) =
-                anti_alias(bin_rate, output_rate, passband_hz, aa_taps_per_transition)?;
+            let filter = Fir::with_decimation(filter_coeffs.clone(), filter_decim);
             let resampler = if (post_rate - output_rate).abs() > 1e-6 {
                 Some(Resampler::new(post_rate, output_rate))
             } else {
@@ -203,16 +215,16 @@ impl ChannelizedDdc {
             channels.push(Channel {
                 bin,
                 nco: Nco::new(residual, bin_rate),
-                aa,
+                filter,
                 resampler,
                 binbuf: Vec::new(),
-                aabuf: Vec::new(),
+                filtbuf: Vec::new(),
             });
         }
         // Only the snapped bins are read downstream; skip pushing the rest.
         pfb.set_active_bins(&channels.iter().map(|c| c.bin).collect::<Vec<_>>());
 
-        Ok(Self { pfb, bin_rate, bins: vec![Vec::new(); m], channels })
+        Ok(Self { pfb, bin_rate, bins: vec![Vec::new(); m], channels, filter_taps })
     }
 
     /// Number of channels.
@@ -221,17 +233,17 @@ impl ChannelizedDdc {
     }
 
     /// Bank geometry, for benches and logs: bin count, prototype taps per
-    /// branch, bin output rate, and whether channels need an anti-alias
-    /// stage / resampler.
+    /// branch, bin output rate, channel filter length, and whether channels
+    /// need a resampler.
     pub fn describe(&self) -> String {
-        let aa = self.channels.iter().any(|c| c.aa.is_some());
         let rs = self.channels.iter().any(|c| c.resampler.is_some());
         format!(
-            "M={} {:?} tpb={} bin_rate={:.0} aa={aa} resample={rs}",
+            "M={} {:?} tpb={} bin_rate={:.0} filter={} resample={rs}",
             self.pfb.num_channels(),
             self.pfb.oversample(),
             self.pfb.taps_per_branch(),
-            self.bin_rate
+            self.bin_rate,
+            self.filter_taps
         )
     }
 
@@ -246,36 +258,21 @@ impl ChannelizedDdc {
         }
         self.pfb.process(input, &mut self.bins);
 
-        // --- Per channel: pull its bin, residual-mix, anti-alias, resample. ---
-        // A copy out of the shared bin is unavoidable (the NCO mixes in place
-        // and several channels may read the same bin), but when there is no
-        // back-end stage the copy can land straight in the caller's buffer and
-        // be mixed there, saving a whole buffer pass at the channel rate.
+        // --- Per channel: pull its bin, residual-mix, filter, resample. ---
+        // A copy out of the shared bin is unavoidable: the NCO mixes in place
+        // and several channels may read the same bin.
         for (ch, out_buf) in self.channels.iter_mut().zip(out.iter_mut()) {
             out_buf.clear();
-            let bin = &self.bins[ch.bin];
-            if ch.aa.is_none() && ch.resampler.is_none() {
-                out_buf.extend_from_slice(bin);
-                ch.nco.mix(out_buf);
-                continue;
-            }
             ch.binbuf.clear();
-            ch.binbuf.extend_from_slice(bin);
+            ch.binbuf.extend_from_slice(&self.bins[ch.bin]);
             ch.nco.mix(&mut ch.binbuf);
-            let staged: &[IqSample] = match &mut ch.aa {
-                Some(aa) if ch.resampler.is_none() => {
-                    aa.process(&ch.binbuf, out_buf);
-                    continue;
+            match &mut ch.resampler {
+                Some(rs) => {
+                    ch.filtbuf.clear();
+                    ch.filter.process(&ch.binbuf, &mut ch.filtbuf);
+                    rs.process(&ch.filtbuf, out_buf);
                 }
-                Some(aa) => {
-                    ch.aabuf.clear();
-                    aa.process(&ch.binbuf, &mut ch.aabuf);
-                    &ch.aabuf
-                }
-                None => &ch.binbuf,
-            };
-            if let Some(rs) = &mut ch.resampler {
-                rs.process(staged, out_buf);
+                None => ch.filter.process(&ch.binbuf, out_buf),
             }
         }
     }
@@ -288,35 +285,30 @@ fn bin_offset_hz(i: usize, m: usize, sample_rate: f64) -> f64 {
     idx * sample_rate / m as f64
 }
 
-/// Build a channel's anti-alias stage, if its bin needs one. Returns the stage
-/// and the rate it hands to the resampler (`bin_rate` when there is none).
-fn anti_alias(
+/// Size a channel's ±passband filter at the bin rate, the same way
+/// [`SharedDdc`](crate::SharedDdc) sizes its per-channel stage at its
+/// intermediate rate: cutoff at the passband edge, long enough both to bring
+/// the transition inside `post_rate − 2·passband` (so nothing folds into
+/// the passband on decimation) and to make the skirt as narrow as the
+/// passband itself. Returns `(taps, decimation, rate handed to the
+/// resampler)`.
+fn channel_filter_size(
     bin_rate: f64,
     output_rate: f64,
     passband_hz: f64,
     taps_per_transition: f64,
-) -> Result<(Option<Fir>, f64), String> {
-    // The bin carries content up to ±bin_rate/2, and resampling to
-    // output_rate folds f onto f − output_rate; that lands inside ±passband
-    // only for f > output_rate − passband, which exists only if this holds.
-    if bin_rate <= 2.0 * (output_rate - passband_hz) {
-        return Ok((None, bin_rate));
-    }
+) -> Result<(usize, usize, f64), String> {
     let decim = (bin_rate / output_rate).floor().max(1.0) as usize;
     let post_rate = bin_rate / decim as f64;
-    // Anything below the stopband edge folds (about post_rate ≥ output_rate in
-    // the decimation, then about output_rate in the resample) to at least
-    // ±passband from DC, so only content beyond it must be suppressed.
-    let stop_hz = output_rate - passband_hz;
-    let transition = stop_hz - passband_hz;
+    let transition = post_rate - 2.0 * passband_hz;
     if transition <= 0.0 {
         return Err(format!(
-            "output rate {output_rate} leaves no anti-alias transition for ±{passband_hz} Hz"
+            "bin rate {bin_rate} leaves no channel filter transition for ±{passband_hz} Hz"
         ));
     }
-    let ntaps = ((taps_per_transition * bin_rate / transition).ceil() as usize | 1).max(9);
-    let cutoff = 0.5 * (passband_hz + stop_hz);
-    Ok((Some(Fir::with_decimation(lowpass_taps(cutoff / bin_rate, ntaps), decim)), post_rate))
+    let alias = ((taps_per_transition * bin_rate / transition).ceil() as usize | 1).max(9);
+    let sharp = ((taps_per_transition * bin_rate / passband_hz).ceil() as usize | 1).max(9);
+    Ok((alias.max(sharp), decim, post_rate))
 }
 
 /// Pick the bin count `M` (= channelizer bin grid `fs/M`).
@@ -328,7 +320,7 @@ fn anti_alias(
 /// for the `M` whose grid `fs/M` best lands every offset on a bin center,
 /// subject to the bin rate carrying the passband, staying ≥ the output rate
 /// (the resampler only trims down), and staying ≤ `MAX_BIN_TO_OUTPUT_RATIO` ×
-/// the output rate (bounded per-channel anti-alias decimation).
+/// the output rate (bounded per-channel filter decimation).
 fn choose_num_bins(
     input_rate: f64,
     output_rate: f64,
@@ -386,7 +378,7 @@ fn choose_num_bins(
 /// prototype cutoff sits at `S`, the transition is `2·(S − fp)`, and its
 /// length follows from that. Candidates are the even `M` whose bin rate is
 /// within `[output, MAX_BIN_TO_OUTPUT_RATIO·output]` and whose rate after
-/// the anti-alias decimation stays ≤ `max_resample_ratio`·output (see
+/// the channel filter's decimation stays ≤ `max_resample_ratio`·output (see
 /// [`MAX_RESAMPLE_RATIO`]); among them, take the shortest prototype, then the
 /// largest `M` (lowest bin rate: cheapest per-channel finish).
 fn choose_oversampled_bins(
@@ -415,8 +407,7 @@ fn choose_oversampled_bins(
         if tpb > OVERSAMPLED_MAX_TAPS {
             continue;
         }
-        // Same decimation `anti_alias` would pick (none when it is skipped:
-        // then the bin rate is below 2·output and floor() gives 1).
+        // Same decimation `channel_filter_size` picks.
         let bin_rate = 2.0 * spacing;
         let post_rate = bin_rate / (bin_rate / output_rate).floor().max(1.0);
         if post_rate > max_resample_ratio * output_rate {
@@ -757,10 +748,57 @@ mod tests {
     }
 
     #[test]
+    fn channel_filter_rejects_near_neighbours_in_total_power() {
+        // The output contract is a ±passband channel, not a raw bin: a back
+        // end that takes the envelope of the whole stream (ACARS) sees every
+        // out-of-channel tone the front end lets through. 8-channel plan,
+        // ACARS rates, every channel, tones one 8.33 kHz raster step and more
+        // outside the channel, measured in TOTAL output power relative to an
+        // on-channel tone — on the raster (131.500 MHz) and 5 kHz off it.
+        const PLAN_MHZ: [f64; 8] =
+            [131.425, 131.450, 131.475, 131.525, 131.550, 131.575, 131.725, 131.825];
+        const RELS: [f64; 6] = [8_333.0, -8_333.0, 12_500.0, -12_500.0, 16_667.0, -16_667.0];
+        let (fs, out_rate, pb) = (2_400_000.0, 24_000.0, 5_000.0);
+        // (bank, center, regression floor dB): measured worst − ~3 dB. The
+        // requirement is ≥ 40 dB; a raw 25 kHz bin passed these at ~0 dB.
+        let cases = [
+            (Oversample::Critical, 131_500_000.0, -94.0),
+            (Oversample::Critical, 131_505_000.0, -94.0),
+            (Oversample::Twice, 131_500_000.0, -121.0),
+            (Oversample::Twice, 131_505_000.0, -121.0),
+        ];
+        let mut bad = Vec::new();
+        for (os, center, floor) in cases {
+            let offsets: Vec<f64> = PLAN_MHZ.iter().map(|f| f * 1e6 - center).collect();
+            let build = || ChannelizedDdc::with_oversample(fs, out_rate, &offsets, pb, os).unwrap();
+            let mut worst = (f64::NEG_INFINITY, 0usize, 0.0f64);
+            for ch in 0..offsets.len() {
+                let (_, ref_tot) = tone_power_db(build(), &offsets, ch, 0.0);
+                for &rel in &RELS {
+                    let tot = tone_power_db(build(), &offsets, ch, rel).1 - ref_tot;
+                    if tot > worst.0 {
+                        worst = (tot, ch, rel);
+                    }
+                }
+            }
+            let (db, ch, rel) = worst;
+            eprintln!(
+                "{os:?} @ {center:.0} ({}): worst {db:+.1} dB (ch {ch}, {rel:+.0} Hz)",
+                build().describe()
+            );
+            if db > floor {
+                bad.push(format!("{os:?} @ {center:.0}: ch {ch} tone {rel:+.0} Hz at {db:+.1} dB"));
+            }
+        }
+        assert!(bad.is_empty(), "near neighbours not rejected:\n{}", bad.join("\n"));
+    }
+
+    #[test]
     fn oversampled_resample_guard() {
         // On this plan, without the guard, the chooser's shortest prototype
-        // (6 taps) comes with M = 74: 64.9 kS/s bins → anti-alias decimation
-        // by 2 → 32.4 kS/s, 1.35× the output rate, into the cubic resampler.
+        // (6 taps) comes with M = 74: 64.9 kS/s bins → channel filter
+        // decimation by 2 → 32.4 kS/s, 1.35× the output rate, into the cubic
+        // resampler.
         let (fs, out_rate, pb) = (2_400_000.0, 24_000.0, 5_000.0);
         let offsets = [-100_000.0, 37_500.0, 162_500.0];
         let ratio = |m: usize| {
@@ -795,8 +833,10 @@ mod tests {
         let (free, safe) = (worst(f64::INFINITY), worst(MAX_RESAMPLE_RATIO));
         eprintln!("worst in-band: unguarded {free:+.1} dB, guarded {safe:+.1} dB");
         assert!(safe < -60.0, "guarded: tone in-band at {safe:+.1} dB");
-        // The fold the guard exists for (measured ≈ −20 dB).
-        assert!(free > -60.0, "unguarded config no longer folds ({free:+.1} dB): pick a new plan");
+        // With only an anti-alias stage in front of the resampler the
+        // unguarded config folded these tones in at ≈ −20 dB; the ±passband
+        // channel filter now removes them first (measured ≈ −131 dB).
+        assert!(free < -60.0, "unguarded: tone in-band at {free:+.1} dB");
     }
 
     #[test]

@@ -71,16 +71,29 @@ fn channel_rate_for(input_rate: f64) -> f64 {
     }
 }
 
+/// Where a channel's selectivity (its channel filter) comes from.
+#[derive(Clone, Copy)]
+enum Selectivity {
+    /// The front end only anti-aliases ([`Ddc`], [`SharedDdc`] at
+    /// [`shared_front_passband_hz`]), so the back end runs its own FIR.
+    BackEnd,
+    /// The front end already filters every channel to
+    /// ±[`CHANNELIZER_PASSBAND_HZ`] ([`ChannelizedDdc`]); a second filter
+    /// would only add cost.
+    FrontEnd,
+}
+
 /// Per-channel back end: everything downstream of the front-end
 /// downconverter (channel filter, demod, AVLC scan, ACARS/ATN decode). Shared
 /// verbatim by the single- and multi-channel decoders so the two paths cannot
 /// drift.
 struct ChannelBack {
-    /// Channel-selectivity lowpass at the channel rate. The RC(α=0.6)
+    /// Channel-selectivity lowpass at the channel rate, when the front end
+    /// does not provide one ([`Selectivity::BackEnd`]). The RC(α=0.6)
     /// TX pulse occupies ±(1+α)·Rs/2 = ±8.4 kHz; a flat lowpass there
     /// keeps the signal spectrum (and its Nyquist zero-ISI property)
     /// untouched while removing all out-of-band noise.
-    selectivity: xng_dsp::fir::Fir,
+    selectivity: Option<xng_dsp::fir::Fir>,
     select_buf: Vec<Complex<f32>>,
     demod: demod::Vdl2Demod,
     rs: ReedSolomon,
@@ -90,18 +103,21 @@ struct ChannelBack {
 }
 
 impl ChannelBack {
-    fn new(channel_rate: f64) -> Self {
+    fn new(channel_rate: f64, source: Selectivity) -> Self {
         // -6 dB point at the symbol rate so the filter is flat through the
         // RC band edge (8.4 kHz) and the windowed-sinc transition lives
-        // entirely in the noise-only region. This runs after the front end
-        // too: the DDC's final stage is sized as an anti-alias filter, not a
-        // channel filter (≈−2 dB at 12 kHz for 2.4 MS/s → 100 kS/s), so
-        // this FIR is the channel filter on every path. On the live path
-        // it moved the 50%-decode SNR from 20.8 to 18.6 dB.
-        let selectivity = xng_dsp::fir::Fir::new(xng_dsp::fir::lowpass_taps(
-            demod::SYMBOL_RATE / channel_rate,
-            101,
-        ));
+        // entirely in the noise-only region. This runs after the `Ddc` and
+        // `SharedDdc` front ends: their final stage is sized as an
+        // anti-alias filter, not a channel filter (≈−2 dB at 12 kHz for
+        // 2.4 MS/s → 100 kS/s), so this FIR is their channel filter. On the
+        // live path it moved the 50%-decode SNR from 20.8 to 18.6 dB.
+        let selectivity = match source {
+            Selectivity::BackEnd => Some(xng_dsp::fir::Fir::new(xng_dsp::fir::lowpass_taps(
+                demod::SYMBOL_RATE / channel_rate,
+                101,
+            ))),
+            Selectivity::FrontEnd => None,
+        };
         Self {
             selectivity,
             select_buf: Vec::new(),
@@ -116,10 +132,16 @@ impl ChannelBack {
     /// Feed channel-rate IQ; `now` is the wideband timebase (seconds of
     /// capture consumed) used by the ATN reassemblers' timeouts.
     fn process(&mut self, channel: &[Complex<f32>], now: f64) -> Vec<Vdl2Frame> {
-        self.select_buf.clear();
-        self.selectivity.process(channel, &mut self.select_buf);
+        let selected: &[Complex<f32>] = match &mut self.selectivity {
+            Some(fir) => {
+                self.select_buf.clear();
+                fir.process(channel, &mut self.select_buf);
+                &self.select_buf
+            }
+            None => channel,
+        };
         let mut out = Vec::new();
-        for burst in self.demod.process(&self.select_buf, &self.rs) {
+        for burst in self.demod.process(selected, &self.rs) {
             for frame in burst.frames {
                 let acars = match frame.payload {
                     avlc::Payload::Acars => {
@@ -171,7 +193,7 @@ impl Vdl2ChannelDecoder {
         Ok(Self {
             ddc,
             channel_buf: Vec::new(),
-            back: ChannelBack::new(channel_rate),
+            back: ChannelBack::new(channel_rate, Selectivity::BackEnd),
             samples_seen: 0,
             input_rate,
             channel_rate,
@@ -208,12 +230,12 @@ impl Vdl2ChannelDecoder {
     }
 }
 
-/// One-sided passband the channelizer front end must keep clear of its bin
-/// edge. VDL2's channel filter is the per-channel selectivity FIR in the back
-/// end, so the front end is only an anti-alias stage around the RC band edge
-/// (±8.4 kHz); the extra 2.1 kHz keeps that edge off the bin edge. The
-/// channelizer's residual-vs-bin-edge rule and its anti-alias stage are both
-/// sized from it. Passing that rule does not make a critically sampled bin
+/// One-sided passband of the channelizer front end, which filters every
+/// channel to it: this is VDL2's channel filter on the channelized path
+/// (the back end's own selectivity FIR is skipped there). 10.5 kHz is the
+/// symbol rate, the same cutoff as that FIR — flat through the RC band edge
+/// (±8.4 kHz), the transition in the noise-only region. The channelizer's
+/// residual-vs-bin-edge rule is sized from it too. Passing that rule does not make a critically sampled bin
 /// flat there: a channel 37.5 kHz off a 100 kHz bin center still sits in the
 /// prototype's roll-off; the 2× bank the default uses is flat there (see
 /// [`Vdl2MultiChannelDecoder::new`]).
@@ -250,7 +272,9 @@ impl Front {
 /// Decodes SEVERAL VDL2 channels out of one wideband capture with a single
 /// shared downconverter front end: the wideband-rate work is done once for all
 /// channels, then each channel runs the same back end as
-/// [`Vdl2ChannelDecoder`] (selectivity FIR, demod, AVLC, ACARS/ATN).
+/// [`Vdl2ChannelDecoder`] (demod, AVLC, ACARS/ATN; plus the selectivity FIR
+/// behind the shared decimation, whereas the channelizer is itself the
+/// channel filter).
 ///
 /// Two front ends with the same contract:
 /// * a polyphase channelizer ([`xng_dsp::ChannelizedDdc`]): one FFT pass
@@ -350,9 +374,13 @@ impl Vdl2MultiChannelDecoder {
     }
 
     fn with_front(front: Front, input_rate: f64, channel_rate: f64, channels: usize) -> Self {
+        let source = match front {
+            Front::Channelized(_) => Selectivity::FrontEnd,
+            Front::Shared(_) => Selectivity::BackEnd,
+        };
         Self {
             front,
-            backs: (0..channels).map(|_| ChannelBack::new(channel_rate)).collect(),
+            backs: (0..channels).map(|_| ChannelBack::new(channel_rate, source)).collect(),
             channel_bufs: vec![Vec::new(); channels],
             samples_seen: 0,
             input_rate,

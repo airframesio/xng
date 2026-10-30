@@ -186,12 +186,29 @@ impl AcarsMultiChannelDecoder {
     /// center relative to the capture center (Hz). Requires `input_rate` ≥ the
     /// 24 kHz channel rate and wide enough to span every channel.
     ///
-    /// Uses the polyphase channelizer front end (default), falling back to the
-    /// shared-decimation front end if the channelizer cannot be built for this
-    /// rate/offset set.
+    /// Uses the 2× oversampled channelizer front end ([`Oversample::Twice`]),
+    /// falling back to the shared-decimation front end if the channelizer
+    /// cannot be built for this rate/offset set.
+    ///
+    /// Either bank filters each channel to ±[`CHANNEL_PASSBAND_HZ`] before
+    /// the demod, which takes the envelope of whatever it is handed: with
+    /// only the bin's anti-alias stage, a strong neighbour 5–12 kHz away
+    /// swamped a weak channel the shared decimation still decoded (PERF-20).
+    /// Oversampled because a critically sampled bank folds everything ½–1½
+    /// bins from a bin center into that bin: with a capture centered off the
+    /// 25 kHz raster, channels sit off their bin centers and a neighbour
+    /// 20–25 kHz away lands inside the weak channel's passband, where no
+    /// channel filter can remove it. The 2× bank matched the shared
+    /// decimation on every neighbour/offset case of the `acars_interf`
+    /// harness.
     pub fn new(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
-        let front = match ChannelizedDdc::new(input_rate, CHANNEL_RATE, offsets, CHANNEL_PASSBAND_HZ)
-        {
+        let front = match ChannelizedDdc::with_oversample(
+            input_rate,
+            CHANNEL_RATE,
+            offsets,
+            CHANNEL_PASSBAND_HZ,
+            Oversample::Twice,
+        ) {
             Ok(c) => Front::Channelized(c),
             // On double failure report BOTH errors so an unusual capture
             // config shows why the default channelizer was rejected too.
