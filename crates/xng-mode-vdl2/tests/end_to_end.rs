@@ -1,6 +1,7 @@
 //! RF loopback: AVLC/AOA frames → D8PSK burst → decoder.
 
 use num_complex::Complex;
+use xng_dsp::Oversample;
 use xng_mode_vdl2::avlc::{encode_address, AddressType};
 use xng_mode_vdl2::modulate::burst_iq;
 use xng_mode_vdl2::{Vdl2ChannelDecoder, Vdl2MultiChannelDecoder};
@@ -314,7 +315,35 @@ fn multi_fronts(fs: f64, offsets: &[f64]) -> Vec<(&'static str, Vdl2MultiChannel
     if let Ok(d) = Vdl2MultiChannelDecoder::new_channelized(fs, offsets) {
         v.push(("new_channelized", d));
     }
+    if let Ok(d) =
+        Vdl2MultiChannelDecoder::new_channelized_with_oversample(fs, offsets, Oversample::Twice)
+    {
+        v.push(("new_channelized_2x", d));
+    }
     v
+}
+
+/// The default front end on the live 7-channel plan is the 2× oversampled
+/// channelizer (PERF-20).
+#[test]
+fn multi_channel_default_front_is_oversampled_channelizer() {
+    let dec = Vdl2MultiChannelDecoder::new(2_400_000.0, &PLAN_OFFSETS).unwrap();
+    let front = dec.describe_front();
+    assert!(front.starts_with("channelized ") && front.contains("Twice"), "got {front}");
+}
+
+/// A plan the 2× channelizer cannot serve falls back to the shared
+/// decimation: at 130 kS/s (50 kS/s channel rate) the only oversampled bin
+/// count hands the resampler 65 kS/s, past its 1.25× limit.
+#[test]
+fn multi_channel_default_falls_back_to_shared() {
+    const FS: f64 = 130_000.0;
+    const OFFSETS: [f64; 2] = [-12_500.0, 12_500.0];
+    let twice =
+        Vdl2MultiChannelDecoder::new_channelized_with_oversample(FS, &OFFSETS, Oversample::Twice);
+    assert!(twice.is_err(), "2x channelizer unexpectedly serves {FS} S/s");
+    let dec = Vdl2MultiChannelDecoder::new(FS, &OFFSETS).unwrap();
+    assert_eq!(dec.describe_front(), "shared");
 }
 
 #[test]
@@ -421,7 +450,7 @@ fn multi_channel_matches_per_channel_sensitivity() {
 }
 
 /// A strong burst 50 kHz away must not mask a ~20 dB weaker one on its own
-/// channel, through either front end.
+/// channel, through every front end.
 #[test]
 fn multi_channel_rejects_adjacent_channel() {
     use xng_mode_vdl2::modulate::burst_iq_shaped;

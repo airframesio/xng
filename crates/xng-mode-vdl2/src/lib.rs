@@ -213,9 +213,10 @@ impl Vdl2ChannelDecoder {
 /// end, so the front end is only an anti-alias stage around the RC band edge
 /// (±8.4 kHz); the extra 2.1 kHz keeps that edge off the bin edge. The
 /// channelizer's residual-vs-bin-edge rule and its anti-alias stage are both
-/// sized from it. Passing that rule does not make the bin flat there: a
-/// channel 37.5 kHz off a 100 kHz bin center still sits in the prototype's
-/// roll-off (see [`Vdl2MultiChannelDecoder::new`]).
+/// sized from it. Passing that rule does not make a critically sampled bin
+/// flat there: a channel 37.5 kHz off a 100 kHz bin center still sits in the
+/// prototype's roll-off; the 2× bank the default uses is flat there (see
+/// [`Vdl2MultiChannelDecoder::new`]).
 pub const CHANNELIZER_PASSBAND_HZ: f64 = 10_500.0;
 
 /// One-sided passband for the shared-decimation front end at `channel_rate`.
@@ -252,10 +253,10 @@ impl Front {
 /// [`Vdl2ChannelDecoder`] (selectivity FIR, demod, AVLC, ACARS/ATN).
 ///
 /// Two front ends with the same contract:
-/// * a shared decimation ([`xng_dsp::SharedDdc`]): one full-rate decimation
-///   feeds cheap per-channel finishes; the default (see [`Self::new`]).
 /// * a polyphase channelizer ([`xng_dsp::ChannelizedDdc`]): one FFT pass
-///   produces every channel; the fallback.
+///   produces every channel; the default, 2× oversampled (see [`Self::new`]).
+/// * a shared decimation ([`xng_dsp::SharedDdc`]): one full-rate decimation
+///   feeds cheap per-channel finishes; the fallback.
 pub struct Vdl2MultiChannelDecoder {
     front: Front,
     backs: Vec<ChannelBack>,
@@ -269,33 +270,42 @@ impl Vdl2MultiChannelDecoder {
     /// `input_rate` is the wideband capture rate; `offsets` are each channel's
     /// center relative to the capture center (Hz).
     ///
-    /// Uses the shared-decimation front end, falling back to the channelizer
-    /// if it cannot be built for this rate/offset set.
+    /// Uses the 2× oversampled channelizer front end ([`Oversample::Twice`]),
+    /// falling back to the shared decimation if the channelizer cannot be
+    /// built for this rate/offset set.
     ///
-    /// Shared-first, unlike ACARS: the channelizer's bins must be at least the
+    /// Not the critically sampled channelizer: its bins must be at least the
     /// 100 kS/s channel rate, so on the 25 kHz VDL2 raster (e.g. the 7-channel
     /// plan around 136.8125 MHz) four of seven channels sit 37.5 kHz off a
-    /// 100 kHz bin center, in the prototype's roll-off. There it decoded 36
-    /// of the 42 frames the per-channel DDC gets from the off-air fixture;
-    /// the shared decimation decoded 44.
+    /// 100 kHz bin center, in the prototype's roll-off, and it decoded 35 of
+    /// the 44 off-air frames the shared decimation gets. The 2× bank is flat
+    /// wherever a channel falls in its bin: on that plan it matched the shared
+    /// decimation (44/44 off-air at every tuning offset, the same 50%-decode
+    /// SNR) at about half its CPU (PERF-20).
     pub fn new(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
         let channel_rate = channel_rate_for(input_rate);
-        let front = match SharedDdc::new(
+        let front = match ChannelizedDdc::with_oversample(
             input_rate,
             channel_rate,
             offsets,
-            shared_front_passband_hz(channel_rate),
+            CHANNELIZER_PASSBAND_HZ,
+            Oversample::Twice,
         ) {
-            Ok(s) => Front::Shared(s),
+            Ok(c) => Front::Channelized(c),
             // On double failure report BOTH errors so an unusual capture
-            // config shows why the default front end was rejected too.
-            Err(shared_err) => Front::Channelized(
-                ChannelizedDdc::new(input_rate, channel_rate, offsets, CHANNELIZER_PASSBAND_HZ)
-                    .map_err(|chan_err| {
-                        format!(
-                            "shared-decim rejected ({shared_err}); channelizer also failed ({chan_err})"
-                        )
-                    })?,
+            // config shows why the default channelizer was rejected too.
+            Err(chan_err) => Front::Shared(
+                SharedDdc::new(
+                    input_rate,
+                    channel_rate,
+                    offsets,
+                    shared_front_passband_hz(channel_rate),
+                )
+                .map_err(|shared_err| {
+                    format!(
+                        "channelizer rejected ({chan_err}); shared-decim also failed ({shared_err})"
+                    )
+                })?,
             ),
         };
         Ok(Self::with_front(front, input_rate, channel_rate, offsets.len()))
@@ -353,6 +363,15 @@ impl Vdl2MultiChannelDecoder {
     /// Number of channels.
     pub fn num_channels(&self) -> usize {
         self.backs.len()
+    }
+
+    /// Which front end was built, for benches, logs and tests:
+    /// `"channelized <bank geometry>"` or `"shared"`.
+    pub fn describe_front(&self) -> String {
+        match &self.front {
+            Front::Channelized(c) => format!("channelized {}", c.describe()),
+            Front::Shared(_) => "shared".to_string(),
+        }
     }
 
     /// Internal channel rate the demods run at (S/s).
