@@ -61,6 +61,129 @@ const FIT_COST_MAX: f32 = 0.25;
 const ENERGY_FACTOR: f32 = 12.0;
 const NOISE_ALPHA: f32 = 1e-4;
 const PHASE_GAIN: f32 = 0.1;
+/// Channel samples per noise-floor block (0.64 ms at 100 kS/s): short
+/// enough that a 5 ms inter-burst gap holds several noise-only blocks.
+const FLOOR_BLOCK: usize = 64;
+/// Floor subsampling stride: the channel is oversampled ~5× against its
+/// noise bandwidth, so every 4th sample keeps the block statistics.
+const FLOOR_STEP: usize = 4;
+/// Sliding window of block means the reference floor is a percentile of.
+const FLOOR_WINDOW_S: f64 = 1.0;
+/// Percentile of the window's block means taken as the reference floor: it
+/// stays on noise while more than 5% of the window's blocks are idle.
+const FLOOR_PERCENTILE: f64 = 0.05;
+/// Ceiling on the tracking floor as a multiple of the reference. On
+/// stationary noise the tracking floor sits ~1.75× the reference (2–6× on
+/// the non-stationary vdl2_105k fixture), so the ceiling only engages when
+/// the tracking floor has been dragged toward signal power (occupancy ×
+/// burst power, a second stable state of the below-gate EMA).
+const FLOOR_CEILING_RATIO: f32 = 8.0;
+/// Blocks whose minimum seeds the tracking floor (replacing the 1e-6 start,
+/// which left the gate open on noise for seconds after every cold start).
+const FLOOR_SEED_BLOCKS: usize = 8;
+/// Floor histogram: 0.25 dB bins over [-160, +40] dB.
+const FLOOR_BINS_PER_DB: f32 = 4.0;
+const FLOOR_DB_MIN: f32 = -160.0;
+const FLOOR_BINS: usize = 800;
+
+/// Dip-robust reference noise floor: a low percentile of block mean powers
+/// over the last `FLOOR_WINDOW_S`. Averaging over a block removes the deep
+/// single-sample noise dips that make a window minimum useless as a gate
+/// reference; the percentile ignores bursts. Block means live in a ring
+/// (arrival order) and a log histogram, so a completed block costs one
+/// increment and one decrement, and the percentile is read once per chunk.
+/// Exactly zero samples (zero-padded file starts) are skipped.
+struct NoiseFloor {
+    block_sum: f32,
+    block_len: usize,
+    /// Input position modulo `FLOOR_STEP`, keeping the subsample grid
+    /// continuous across chunks.
+    phase: usize,
+    /// Histogram bin of each completed block, in arrival order.
+    ring: Box<[u16]>,
+    next: usize,
+    filled: usize,
+    hist: Box<[u32]>,
+    /// Minimum of the first `FLOOR_SEED_BLOCKS` block means.
+    seed_min: f32,
+    /// Seed for the tracking floor, until taken.
+    seed: Option<f32>,
+    /// The percentile (linear power), once `FLOOR_SEED_BLOCKS` blocks exist.
+    value: Option<f32>,
+}
+
+impl NoiseFloor {
+    fn new(channel_rate: f64) -> Self {
+        let blocks = (FLOOR_WINDOW_S * channel_rate / FLOOR_BLOCK as f64).ceil().max(1.0) as usize;
+        Self {
+            block_sum: 0.0,
+            block_len: 0,
+            phase: 0,
+            ring: vec![0; blocks].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            hist: vec![0; FLOOR_BINS].into_boxed_slice(),
+            seed_min: f32::MAX,
+            seed: None,
+            value: None,
+        }
+    }
+
+    fn push(&mut self, input: &[Complex<f32>]) {
+        let start = (FLOOR_STEP - self.phase) % FLOOR_STEP;
+        for x in input.iter().skip(start).step_by(FLOOR_STEP) {
+            let p = x.norm_sqr();
+            if p == 0.0 {
+                continue;
+            }
+            self.block_sum += p;
+            self.block_len += 1;
+            if self.block_len == FLOOR_BLOCK / FLOOR_STEP {
+                self.complete_block();
+            }
+        }
+        self.phase = (self.phase + input.len()) % FLOOR_STEP;
+        self.refresh();
+    }
+
+    fn complete_block(&mut self) {
+        let mean = self.block_sum / (FLOOR_BLOCK / FLOOR_STEP) as f32;
+        self.block_sum = 0.0;
+        self.block_len = 0;
+        if self.filled < FLOOR_SEED_BLOCKS {
+            self.seed_min = self.seed_min.min(mean);
+            if self.filled + 1 == FLOOR_SEED_BLOCKS {
+                self.seed = Some(self.seed_min);
+            }
+        }
+        let bin = ((10.0 * mean.log10() - FLOOR_DB_MIN) * FLOOR_BINS_PER_DB)
+            .clamp(0.0, (FLOOR_BINS - 1) as f32) as usize;
+        if self.filled == self.ring.len() {
+            self.hist[usize::from(self.ring[self.next])] -= 1;
+        } else {
+            self.filled += 1;
+        }
+        self.ring[self.next] = bin as u16;
+        self.next = (self.next + 1) % self.ring.len();
+        self.hist[bin] += 1;
+    }
+
+    fn refresh(&mut self) {
+        if self.filled < FLOOR_SEED_BLOCKS {
+            return;
+        }
+        let target = ((self.filled - 1) as f64 * FLOOR_PERCENTILE).round() as u32;
+        let mut acc = 0u32;
+        for (b, &n) in self.hist.iter().enumerate() {
+            acc += n;
+            if acc > target {
+                let db = FLOOR_DB_MIN + (b as f32 + 0.5) / FLOOR_BINS_PER_DB;
+                self.value = Some(10f32.powf(db / 10.0));
+                return;
+            }
+        }
+    }
+}
 
 struct Collecting {
     /// Start of the UW that began this collection (+1 sample is the
@@ -102,7 +225,10 @@ pub struct Vdl2Demod {
     start_abs: f64,
     /// Hunt cursor (absolute).
     cursor: f64,
+    /// Tracking noise floor: below-gate EMA with a slow up-creep, seeded
+    /// from and capped by `floor`.
     noise: f32,
+    floor: NoiseFloor,
     state: State,
     level: f32,
     /// Optional CFO reject: candidates whose preamble-fit carrier offset
@@ -152,6 +278,7 @@ impl Vdl2Demod {
             start_abs: 0.0,
             cursor: 0.0,
             noise: 1e-6,
+            floor: NoiseFloor::new(channel_rate),
             state: State::Hunt,
             last_rs_fail: f64::NEG_INFINITY,
             level: 0.0,
@@ -404,6 +531,13 @@ impl Vdl2Demod {
         self.buf.extend_from_slice(input);
         for x in input {
             self.level += NOISE_ALPHA * (x.norm_sqr() - self.level);
+        }
+        self.floor.push(input);
+        if let Some(seed) = self.floor.seed.take() {
+            self.noise = self.noise.max(seed);
+        }
+        if let Some(f) = self.floor.value {
+            self.noise = self.noise.min(f * FLOOR_CEILING_RATIO);
         }
         let mut out = Vec::new();
 
