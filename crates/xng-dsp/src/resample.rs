@@ -20,31 +20,32 @@ pub struct Resampler {
     /// Input samples consumed per output sample (`in_rate / out_rate`).
     step: f64,
     /// Read position of the next output sample, in samples from the start of
-    /// `carry`. Kept in `[1, 2)` between calls so index `i-1` always exists.
+    /// `buf`. Kept in `[1, 2)` between calls so index `i-1` always exists.
     pos: f64,
-    /// Tail of the previous block needed for continuity (the 4-point kernel
-    /// reaches one sample back and two forward).
-    carry: Vec<IqSample>,
+    /// Persistent working buffer. Between calls it holds only the retained
+    /// tail of the previous block needed for continuity (the 4-point kernel
+    /// reaches one sample back and two forward); each call appends the new
+    /// block, so its capacity is reused and steady state never allocates.
+    buf: Vec<IqSample>,
 }
 
 impl Resampler {
     /// Resample from `in_rate` to `out_rate` (both Hz, `in_rate >= out_rate`
     /// in practice, though any positive ratio works).
     pub fn new(in_rate: f64, out_rate: f64) -> Self {
-        Self { step: in_rate / out_rate, pos: 1.0, carry: Vec::new() }
+        Self { step: in_rate / out_rate, pos: 1.0, buf: Vec::new() }
     }
 
     /// Resample `input`, appending output samples to `out`.
     pub fn process(&mut self, input: &[IqSample], out: &mut Vec<IqSample>) {
-        // Work on the carried tail followed by the new block.
-        let mut buf = std::mem::take(&mut self.carry);
-        buf.extend_from_slice(input);
-        let n = buf.len();
+        // Work on the retained tail followed by the new block.
+        self.buf.extend_from_slice(input);
+        let n = self.buf.len();
         // Need indices i-1 .. i+2, with i = floor(pos): require pos < n-2.
         if n < 4 {
-            self.carry = buf;
             return;
         }
+        let buf = &self.buf;
         let mut pos = self.pos;
         while pos < (n - 2) as f64 {
             let i = pos.floor() as usize;
@@ -53,9 +54,9 @@ impl Resampler {
             pos += self.step;
         }
         // Retain from one sample before the next read position so the kernel's
-        // `i-1` tap survives into the next call; rebase `pos` onto the carry.
+        // `i-1` tap survives into the next call; rebase `pos` onto the tail.
         let keep_from = (pos.floor() as usize).saturating_sub(1).min(n);
-        self.carry = buf.split_off(keep_from);
+        self.buf.drain(..keep_from);
         self.pos = pos - keep_from as f64;
     }
 }
