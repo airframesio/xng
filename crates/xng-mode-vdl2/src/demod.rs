@@ -28,6 +28,12 @@ pub static STAT_SOFT_OK: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_BURST_OK: AtomicUsize = AtomicUsize::new(0);
 /// RS-corrected bursts that carried no FCS-valid AVLC frame (RS miscorrection).
 pub static STAT_FCS_FAIL: AtomicUsize = AtomicUsize::new(0);
+/// Collections abandoned mid-burst by the energy-dropout gate (PERF-21):
+/// the header passed FEC, but received power fell near the noise floor for
+/// several consecutive blocks before the declared length was reached — a
+/// false lock whose tail decayed into silence (or a pure noise lock with a
+/// large bogus declared length), not a real transmission.
+pub static STAT_COLLECT_DROPOUT: AtomicUsize = AtomicUsize::new(0);
 use xng_dsp::rs::ReedSolomon;
 
 pub const SYMBOL_RATE: f64 = 10_500.0;
@@ -58,6 +64,30 @@ const CORR_THRESHOLD: f32 = 0.6;
 /// fit for a candidate to count as a UW (true preambles on the off-air
 /// capture fit below ~0.11; random data above ~0.5).
 const FIT_COST_MAX: f32 = 0.25;
+/// `Collect`'s energy-dropout gate (PERF-21): block size in symbols. Short
+/// enough that a false lock whose tail decays into silence (or that locks
+/// on a dip between bursts) is caught within a block or two instead of
+/// running up to the header-declared length; 32 symbols is ≈3 ms at
+/// 100 kS/s, far shorter than any real inter-burst gap this matters for.
+const DROPOUT_BLOCK_SYMS: usize = 32;
+/// Reject (abandon) a `Collect` once `DROPOUT_BLOCKS` consecutive blocks
+/// average below this multiple of the hunt's noise-floor estimate at lock
+/// time (`Collecting::lock_noise`, a snapshot of `Vdl2Demod::noise` — the
+/// same value the hunt's energy gate uses). Chosen from measured
+/// block-power/floor ratios (measured with `examples/vdl2_late.rs`, PERF-21);
+/// every genuine decode across two off-air fixtures and a synthetic sweep (30/20 dB
+/// in-channel SNR, isolated and busy-channel) had a worst-case block ratio
+/// of 29.3 (and otherwise ≥41); `DROPOUT_RATIO = 8.0` leaves a 3.7× margin
+/// below that floor while still catching the great majority of tail/noise
+/// locks, whose blocks sit within ~1–2× the floor once they're off any real
+/// signal.
+const DROPOUT_RATIO: f32 = 8.0;
+/// Consecutive low blocks required before abandoning (PERF-21): no observed
+/// genuine decode ever had even a single block below `DROPOUT_RATIO` (so
+/// `DROPOUT_BLOCKS = 1` was also zero-false-positive on every measured
+/// corpus), but requiring two independent confirmations costs nothing in
+/// practice and guards against a one-off noisy reading mid-burst.
+const DROPOUT_BLOCKS: u32 = 2;
 const ENERGY_FACTOR: f32 = 12.0;
 const NOISE_ALPHA: f32 = 1e-4;
 const PHASE_GAIN: f32 = 0.1;
@@ -206,6 +236,29 @@ struct Collecting {
     scr: Scrambler,
     /// Total bits to collect once the header is decoded.
     needed: Option<usize>,
+    /// Energy-dropout gate (PERF-21): running power sum of the current
+    /// `DROPOUT_BLOCK_SYMS`-symbol block, and how many symbols it holds.
+    dropout_energy: f32,
+    dropout_syms: u32,
+    /// Consecutive blocks whose mean power fell below the gate.
+    dropout_low_run: u32,
+    /// The hunt's noise-floor estimate (`Vdl2Demod::noise`) at the moment
+    /// this lock was accepted, not re-read live: the floor is also updated
+    /// once per `process()` call from the chunk's own samples (including,
+    /// once a long collection has run a while, this very burst's own
+    /// power), so a live read could end up comparing the burst to itself.
+    /// A snapshot at lock time is also truer to "the hunt's noise floor":
+    /// what the gate saw when it accepted this candidate, not whatever it
+    /// has drifted to since.
+    lock_noise: f32,
+}
+
+/// Why a `Collect` ended without a decoded burst.
+enum CollectFail {
+    /// The header-declared length failed its FEC check.
+    Header,
+    /// The energy-dropout gate fired (PERF-21): see `DROPOUT_RATIO`.
+    Dropout,
 }
 
 enum State {
@@ -472,8 +525,9 @@ impl Vdl2Demod {
     }
 
     /// Advance a collection; returns Some(result) when the burst ends.
-    /// `Ok(bits)` = complete, `Err(())` = header failure.
-    fn collect(&self, c: &mut Collecting) -> Option<Result<(), ()>> {
+    /// `Ok(bits)` = complete, `Err(CollectFail)` = abandoned (header FEC
+    /// failure, or the PERF-21 energy-dropout gate).
+    fn collect(&self, c: &mut Collecting) -> Option<Result<(), CollectFail>> {
         loop {
             if c.needed.is_none() && c.bits.len() >= HEADER_BITS {
                 let hdr: [u8; HEADER_BITS] = c.bits[..HEADER_BITS].try_into().unwrap();
@@ -492,7 +546,7 @@ impl Vdl2Demod {
                         c.bits.reserve((n + 2).saturating_sub(c.bits.len()));
                         c.conf.reserve((n / 3 + 1).saturating_sub(c.conf.len()));
                     }
-                    None => return Some(Err(())),
+                    None => return Some(Err(CollectFail::Header)),
                 }
             }
             if let Some(n) = c.needed {
@@ -503,6 +557,28 @@ impl Vdl2Demod {
             let Some(s) = self.sample(c.next_pos) else {
                 return None; // wait for more samples
             };
+            // Energy-dropout gate (PERF-21), post-header only: a false lock
+            // whose tail decays into silence (or a pure noise lock that
+            // happened to pass the header FEC with a large bogus declared
+            // length) shows received power near the hunt's own noise-floor
+            // estimate within a block or two; a real transmission holds
+            // signal power for its whole length. This costs one
+            // multiply-accumulate per symbol and nothing extra on the
+            // common, fast-resolving path.
+            if c.needed.is_some() {
+                c.dropout_energy += s.norm_sqr();
+                c.dropout_syms += 1;
+                if c.dropout_syms as usize == DROPOUT_BLOCK_SYMS {
+                    let mean = c.dropout_energy / DROPOUT_BLOCK_SYMS as f32;
+                    c.dropout_low_run =
+                        if mean < DROPOUT_RATIO * c.lock_noise { c.dropout_low_run + 1 } else { 0 };
+                    c.dropout_energy = 0.0;
+                    c.dropout_syms = 0;
+                    if c.dropout_low_run >= DROPOUT_BLOCKS {
+                        return Some(Err(CollectFail::Dropout));
+                    }
+                }
+            }
             let d = s * c.prev.conj();
             c.prev = s;
             c.next_pos += self.sps;
@@ -562,6 +638,10 @@ impl Vdl2Demod {
                             conf: std::mem::take(&mut self.spare.1),
                             scr: Scrambler::new(),
                             needed: None,
+                            dropout_energy: 0.0,
+                            dropout_syms: 0,
+                            dropout_low_run: 0,
+                            lock_noise: self.noise,
                         }));
                     }
                     None => break, // need more samples
@@ -571,9 +651,23 @@ impl Vdl2Demod {
                         self.state = State::Collect(c);
                         break; // need more samples
                     }
-                    Some(Err(())) => {
+                    Some(Err(CollectFail::Header)) => {
                         STAT_HDR_FAIL.fetch_add(1, AOrd::Relaxed);
                         // Bad header: resume hunting just past this UW.
+                        self.recycle(*c);
+                        self.state = State::Hunt;
+                    }
+                    Some(Err(CollectFail::Dropout)) => {
+                        if self.debug {
+                            eprintln!("DROPOUT uw={}", c.uw_start);
+                        }
+                        STAT_COLLECT_DROPOUT.fetch_add(1, AOrd::Relaxed);
+                        // Same rewind as an RS/FCS failure: the header
+                        // passed FEC on this lock, so it is deterministic
+                        // and would immediately re-dropout if re-hunted
+                        // from the same position.
+                        self.last_rs_fail = c.uw_start;
+                        self.cursor = c.uw_start + 1.0;
                         self.recycle(*c);
                         self.state = State::Hunt;
                     }
