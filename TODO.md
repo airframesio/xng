@@ -251,7 +251,7 @@
 - [ ] **PERF-14** Validate PERF-2/PERF-3/PERF-5 on real multi-channel RF (needs an SDR; synthetic + up-converted off-air only so far)
 - [ ] **PERF-15** Fan the shared front end out to other narrowband modes (after PERF-4) — HFDL, Aero (two `Ddc`s per channel today), Sonde, FLEX, POCSAG (+ squelch for its idle auto-baud lanes), AIS/VDES; each needs a fixture/CPU row first
   - [ ] **PERF-15.1** Verify-then-fix reported per-mode issues: NAVTEX and EOT bit/chip history never trimmed (cost grows with session length); APRS demod ring buffer with `% win`; Iridium designs a new `Ddc` per burst and hand-rolls its matched filter
-- [ ] **PERF-16** `bench.yml` never downloads `sonde_96k.cf32` or `navtex_62500.cs16`, so the `sonde_offair` and `navtex_offair` gates silently skip in CI
+- [x] **PERF-16** `bench.yml` never downloads `sonde_96k.cf32` or `navtex_62500.cs16`, so the `sonde_offair` and `navtex_offair` gates silently skip in CI — ✅ both added to the release download step
 - [ ] **PERF-17** VDL2 busy 7-channel capture (5 ms gaps): channel 136.725 loses ~9 bursts mid-capture on HEAD as well — not the end-of-capture hold-back; investigate
 - [x] **PERF-18** Generic `Fir`: four outputs per pass (independent accumulators, same summation order) — bit-identical, −31…−72% per output across the decoders' configs; VDL2 7-ch idle 14.6% → 9.2% of one core
 - [x] **PERF-19** `PfbChannelizer` polyphase loop: try the same multi-accumulator treatment (ACARS 16-ch cost is now dominated by the PFB, doubled by PERF-3's 16 taps/branch) — ✅ register-resident 8-branch sums, interleaved f32, doubled reversed ring; bit-identical; polyphase+FFT −30%, ACARS 16-ch idle ~2.6% → ~2.1%
