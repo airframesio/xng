@@ -49,6 +49,9 @@ pub struct PfbChannelizer {
     scratch: Vec<IqSample>,
     /// Partial input block buffered until `nch` samples are available.
     pending: Vec<IqSample>,
+    /// Bins `process` appends output to (ascending, deduplicated); `None` =
+    /// all bins.
+    active: Option<Vec<usize>>,
 }
 
 impl PfbChannelizer {
@@ -83,11 +86,31 @@ impl PfbChannelizer {
             ifft,
             scratch: vec![IqSample::new(0.0, 0.0); nch],
             pending: Vec::with_capacity(nch),
+            active: None,
         }
     }
 
     pub fn num_channels(&self) -> usize {
         self.nch
+    }
+
+    /// Restrict output to the listed bins: from now on `process` appends
+    /// samples only to `out[i]` for each listed `i`. Inactive bins receive no
+    /// samples — their `out` vectors are left untouched. The polyphase sum and
+    /// IFFT still compute every bin, so active bins' outputs are identical to
+    /// an unrestricted channelizer's; this only skips the per-bin pushes
+    /// nobody reads. Duplicates are ignored, and out-of-range indices
+    /// (`≥ num_channels()`) are dropped. Without a call, all bins are active.
+    pub fn set_active_bins(&mut self, bins: &[usize]) {
+        debug_assert!(
+            bins.iter().all(|&b| b < self.nch),
+            "active bins {bins:?} out of range for {} channels",
+            self.nch
+        );
+        let mut active: Vec<usize> = bins.iter().copied().filter(|&b| b < self.nch).collect();
+        active.sort_unstable();
+        active.dedup();
+        self.active = Some(active);
     }
 
     /// Center frequency of channel `i` relative to the capture center, given
@@ -99,7 +122,8 @@ impl PfbChannelizer {
     }
 
     /// Feed input samples; for every full block of `nch` inputs, one output
-    /// sample per channel is appended to `out[ch]`.
+    /// sample per channel is appended to `out[ch]` (only for active channels
+    /// when [`set_active_bins`](Self::set_active_bins) has been called).
     ///
     /// `out` must contain `nch` vectors.
     pub fn process(&mut self, mut input: &[IqSample], out: &mut [Vec<IqSample>]) {
@@ -185,11 +209,20 @@ impl PfbChannelizer {
         }
 
         self.ifft.process(&mut self.scratch);
-        for (ch, sample) in self.scratch.iter().enumerate() {
-            // Scale so a full-scale input tone yields ~unit channel output
-            // (IDFT is unnormalized; prototype has unity DC gain split
-            // across branches).
-            out[ch].push(*sample);
+        match &self.active {
+            Some(bins) => {
+                for &ch in bins {
+                    out[ch].push(self.scratch[ch]);
+                }
+            }
+            None => {
+                for (ch, sample) in self.scratch.iter().enumerate() {
+                    // Scale so a full-scale input tone yields ~unit channel output
+                    // (IDFT is unnormalized; prototype has unity DC gain split
+                    // across branches).
+                    out[ch].push(*sample);
+                }
+            }
         }
     }
 }
@@ -418,6 +451,51 @@ mod tests {
                             );
                         }
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_bins_bit_exact_and_inactive_untouched() {
+        let mut s = 0xfeed_face_cafe_f00du64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let input: Vec<IqSample> = (0..20_000).map(|_| IqSample::new(next(), next())).collect();
+
+        // Unsorted, with a duplicate; 13 has a partial tail pass.
+        for &(nch, active) in &[(48usize, &[47usize, 0, 5, 5, 24, 30][..]), (13, &[12, 1][..])] {
+            let mut all = PfbChannelizer::new(nch, 16);
+            let mut some = PfbChannelizer::new(nch, 16);
+            some.set_active_bins(active);
+            let mut a: Vec<Vec<IqSample>> = vec![Vec::new(); nch];
+            let mut b: Vec<Vec<IqSample>> = vec![Vec::new(); nch];
+            let mut pos = 0;
+            for &len in [1usize, 97, 1000, 3, 4801, 47].iter().cycle() {
+                if pos >= input.len() {
+                    break;
+                }
+                let end = (pos + len).min(input.len());
+                all.process(&input[pos..end], &mut a);
+                some.process(&input[pos..end], &mut b);
+                pos = end;
+            }
+            for ch in 0..nch {
+                if !active.contains(&ch) {
+                    assert!(b[ch].is_empty(), "nch={nch} inactive ch={ch} got samples");
+                    continue;
+                }
+                assert_eq!(b[ch].len(), input.len() / nch, "nch={nch} ch={ch} len");
+                for (i, (x, y)) in a[ch].iter().zip(b[ch].iter()).enumerate() {
+                    assert_eq!(
+                        (x.re.to_bits(), x.im.to_bits()),
+                        (y.re.to_bits(), y.im.to_bits()),
+                        "nch={nch} ch={ch} sample {i}"
+                    );
                 }
             }
         }

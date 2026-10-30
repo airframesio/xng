@@ -15,6 +15,9 @@
 //! The "ifft" column times the same rustfft inverse plan alone, once per
 //! output block, so "rest" (total − ifft) is the polyphase sum plus the
 //! buffering / output-push overhead.
+//!
+//! The "M/act" rows (e.g. `48/16`) restrict output to that many evenly spread
+//! bins with `set_active_bins`, as `ChannelizedDdc` does for its channels.
 
 use rustfft::{FftDirection, FftPlanner};
 use std::hint::black_box;
@@ -26,7 +29,8 @@ const RATE: usize = 2_400_000;
 const BLOCK: usize = 65_536;
 const RUNS: usize = 7;
 const TAPS_PER_BRANCH: usize = 16;
-const CHANNELS: &[usize] = &[24, 48, 96];
+/// (bins, active bins); active == bins means all active (the default).
+const CHANNELS: &[(usize, usize)] = &[(24, 24), (24, 7), (48, 48), (48, 16), (96, 96)];
 
 fn noise(len: usize) -> Vec<IqSample> {
     let mut s = 0x9e37_79b9_7f4a_7c15u64;
@@ -39,8 +43,11 @@ fn noise(len: usize) -> Vec<IqSample> {
     (0..len).map(|_| IqSample::new(next(), next())).collect()
 }
 
-fn run_pfb(nch: usize, input: &[IqSample], out: &mut [Vec<IqSample>]) -> Duration {
+fn run_pfb(nch: usize, active: usize, input: &[IqSample], out: &mut [Vec<IqSample>]) -> Duration {
     let mut pfb = PfbChannelizer::new(nch, TAPS_PER_BRANCH);
+    if active < nch {
+        pfb.set_active_bins(&(0..active).map(|i| i * nch / active).collect::<Vec<_>>());
+    }
     let start = Instant::now();
     for blk in input.chunks(BLOCK) {
         for o in out.iter_mut() {
@@ -70,14 +77,14 @@ fn best_of(mut f: impl FnMut() -> Duration) -> Duration {
 fn main() {
     let input = noise(RATE * SECONDS);
     println!(
-        "{:>4} {:>9} {:>9} {:>9} {:>11} {:>8}",
-        "M", "total ms", "ifft ms", "rest ms", "ns/in samp", "% core"
+        "{:>6} {:>9} {:>9} {:>9} {:>11} {:>8}",
+        "M/act", "total ms", "ifft ms", "rest ms", "ns/in samp", "% core"
     );
-    for &nch in CHANNELS {
+    for &(nch, active) in CHANNELS {
         let mut out: Vec<Vec<IqSample>> = (0..nch)
             .map(|_| Vec::with_capacity(BLOCK / nch + 1))
             .collect();
-        let total = best_of(|| run_pfb(nch, &input, &mut out));
+        let total = best_of(|| run_pfb(nch, active, &input, &mut out));
         // Repeated unnormalized IDFTs overflow to inf/NaN, which (unlike
         // subnormals) costs nothing extra on SSE/AVX, so no rescaling.
         let mut buf = noise(nch);
@@ -86,8 +93,9 @@ fn main() {
         let ifft_ms = ifft.as_secs_f64() * 1e3;
         let ns = total.as_secs_f64() * 1e9 / input.len() as f64;
         let core = total.as_secs_f64() / SECONDS as f64 * 100.0;
+        let label = if active < nch { format!("{nch}/{active}") } else { nch.to_string() };
         println!(
-            "{nch:>4} {ms:>9.3} {ifft_ms:>9.3} {:>9.3} {ns:>11.3} {core:>7.3}%",
+            "{label:>6} {ms:>9.3} {ifft_ms:>9.3} {:>9.3} {ns:>11.3} {core:>7.3}%",
             ms - ifft_ms
         );
     }

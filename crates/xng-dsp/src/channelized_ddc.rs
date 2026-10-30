@@ -59,8 +59,9 @@ struct Channel {
 
 pub struct ChannelizedDdc {
     pfb: PfbChannelizer,
-    /// All `M` bin outputs (only the selected bins are consumed downstream,
-    /// but the polyphase step fills every bin — that is the shared work).
+    /// One output vector per bin. The polyphase step computes every bin (that
+    /// is the shared work), but only the bins channels are snapped to are
+    /// active, so the other vectors stay empty.
     bins: Vec<Vec<IqSample>>,
     channels: Vec<Channel>,
 }
@@ -96,7 +97,7 @@ impl ChannelizedDdc {
         // ACARS plan) gets that fold on top of its own spectrum, where no
         // downstream filter can remove it. Prototype response at 0.75 bin:
         // 8 taps −30 dB, 12 taps −57 dB, 16 taps −111 dB.
-        let pfb = PfbChannelizer::new(m, PFB_TAPS_PER_BRANCH);
+        let mut pfb = PfbChannelizer::new(m, PFB_TAPS_PER_BRANCH);
 
         let mut channels = Vec::with_capacity(offsets.len());
         for &off in offsets {
@@ -133,6 +134,8 @@ impl ChannelizedDdc {
                 aabuf: Vec::new(),
             });
         }
+        // Only the snapped bins are read downstream; skip pushing the rest.
+        pfb.set_active_bins(&channels.iter().map(|c| c.bin).collect::<Vec<_>>());
 
         Ok(Self {
             pfb,
@@ -151,7 +154,7 @@ impl ChannelizedDdc {
     pub fn process(&mut self, input: &[IqSample], out: &mut [Vec<IqSample>]) {
         assert_eq!(out.len(), self.channels.len(), "out must have one vec per channel");
 
-        // --- Shared polyphase + FFT: fills every bin once. ---
+        // --- Shared polyphase + FFT: computes every bin, fills the active ones. ---
         for b in &mut self.bins {
             b.clear();
         }

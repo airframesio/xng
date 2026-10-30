@@ -132,6 +132,15 @@ fn main() {
     line("  front end (ChannelizedDdc)", front);
 
     let mut pfb = PfbChannelizer::new(PFB_BINS, PFB_TAPS_PER_BRANCH);
+    // `ChannelizedDdc` only pushes the bins its channels snap to, so restrict
+    // this bank the same way (same nearest-bin rule as `ChannelizedDdc::new`)
+    // or the subtraction below charges the front end for pushes it skips.
+    let bin_rate = FS / PFB_BINS as f64;
+    let mut active: Vec<usize> =
+        offs.iter().map(|off| (off / bin_rate).round().rem_euclid(PFB_BINS as f64) as usize).collect();
+    active.sort_unstable();
+    active.dedup();
+    pfb.set_active_bins(&active);
     let mut bins: Vec<Vec<Complex<f32>>> = vec![Vec::new(); PFB_BINS];
     let pfb_ms = best(|| {
         for b in bins.iter_mut() {
@@ -139,7 +148,7 @@ fn main() {
         }
         pfb.process(&cap, &mut bins);
     });
-    line("    polyphase + FFT", pfb_ms);
+    line(&format!("    polyphase + FFT ({}/{PFB_BINS} bins)", active.len()), pfb_ms);
     line("    per-channel finish", front - pfb_ms);
     line("  back end (demod + deframe)", total - front);
 
