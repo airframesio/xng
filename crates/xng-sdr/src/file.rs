@@ -179,6 +179,94 @@ mod tests {
         assert!((buf[0].im + 1.0).abs() < 0.01);
     }
 
+    /// Writes `bytes` to a temp file, then reads it back in `chunk`-sample
+    /// reads until end of stream. Returns the samples and each read's count.
+    fn read_all(bytes: &[u8], format: IqFormat, chunk: usize) -> (Vec<Complex<f32>>, Vec<usize>) {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+
+        let mut src = FileIqSource::open(tmp.path(), format, 2_400_000.0, 0).unwrap();
+        let mut buf = vec![Complex::new(0.0, 0.0); chunk];
+        let mut out = Vec::new();
+        let mut counts = Vec::new();
+        loop {
+            match src.read(&mut buf) {
+                Ok(n) => {
+                    counts.push(n);
+                    out.extend_from_slice(&buf[..n]);
+                }
+                Err(SdrError::EndOfStream) => break,
+                Err(e) => panic!("unexpected read error: {e}"),
+            }
+        }
+        (out, counts)
+    }
+
+    #[test]
+    fn reads_cu8_all_values_bit_exact() {
+        let bytes: Vec<u8> = (0..=255u8).flat_map(|x| [x, 255 - x]).collect();
+        let (out, counts) = read_all(&bytes, IqFormat::Cu8, 100);
+        assert_eq!(counts, [100, 100, 56]);
+        assert_eq!(out.len(), 256);
+        for (x, s) in (0..=255u8).zip(&out) {
+            let q = 255 - x;
+            assert_eq!(s.re.to_bits(), ((x as f32 - 127.5) / 127.5).to_bits(), "I={x}");
+            assert_eq!(s.im.to_bits(), ((q as f32 - 127.5) / 127.5).to_bits(), "Q={q}");
+        }
+    }
+
+    #[test]
+    fn reads_cs16_bit_exact() {
+        let mut values = vec![i16::MIN, -1, 0, 1, i16::MAX];
+        values.extend((i16::MIN..=i16::MAX).step_by(257));
+        // Pair each value with its bitwise complement so I and Q differ.
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|&v| {
+                let mut b = [0u8; 4];
+                b[0..2].copy_from_slice(&v.to_le_bytes());
+                b[2..4].copy_from_slice(&(!v).to_le_bytes());
+                b
+            })
+            .collect();
+        let (out, counts) = read_all(&bytes, IqFormat::Cs16, 64);
+        assert_eq!(counts.iter().sum::<usize>(), values.len());
+        assert_eq!(*counts.last().unwrap(), values.len() % 64);
+        assert_eq!(out.len(), values.len());
+        for (&v, s) in values.iter().zip(&out) {
+            assert_eq!(s.re.to_bits(), (v as f32 / 32768.0).to_bits(), "I={v}");
+            assert_eq!(s.im.to_bits(), ((!v) as f32 / 32768.0).to_bits(), "Q={}", !v);
+        }
+    }
+
+    #[test]
+    fn reads_cs8_bit_exact() {
+        let bytes: Vec<u8> =
+            (i8::MIN..=i8::MAX).flat_map(|v| [v as u8, v.wrapping_neg() as u8]).collect();
+        let (out, counts) = read_all(&bytes, IqFormat::Cs8, 100);
+        assert_eq!(counts, [100, 100, 56]);
+        assert_eq!(out.len(), 256);
+        for (v, s) in (i8::MIN..=i8::MAX).zip(&out) {
+            let q = v.wrapping_neg();
+            assert_eq!(s.re.to_bits(), (v as f32 / 128.0).to_bits(), "I={v}");
+            assert_eq!(s.im.to_bits(), (q as f32 / 128.0).to_bits(), "Q={q}");
+        }
+    }
+
+    #[test]
+    fn partial_trailing_sample_is_dropped() {
+        // 3 full Cs16 samples plus 2 stray bytes: the incomplete sample is ignored.
+        let mut bytes = Vec::new();
+        for v in [100i16, -200, 300, -400, 500, -600] {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+        let (out, counts) = read_all(&bytes, IqFormat::Cs16, 2);
+        assert_eq!(counts, [2, 1]);
+        assert_eq!(out[2], Complex::new(500.0 / 32768.0, -600.0 / 32768.0));
+    }
+
     #[test]
     fn format_from_extension() {
         assert_eq!(IqFormat::from_extension(Path::new("x.cf32")), Some(IqFormat::Cf32));
