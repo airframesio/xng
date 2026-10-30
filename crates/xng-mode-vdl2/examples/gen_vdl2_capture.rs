@@ -3,10 +3,14 @@
 //! VDL2 plan, with RC-shaped D8PSK bursts on every channel.
 //!
 //! ```bash
-//! cargo run --release -p xng-mode-vdl2 --example gen_vdl2_capture -- /tmp/vdl2.cf32 2.0
+//! cargo run --release -p xng-mode-vdl2 --example gen_vdl2_capture -- /tmp/vdl2.cf32 2.0 [gap_ms]
 //! xng decode /tmp/vdl2.cf32 -f cf32 -m vdl2 -r 2400000 -c 136812500 \
 //!   --channels 136.650,136.725,136.775,136.825,136.875,136.925,136.975
 //! ```
+//!
+//! Arguments: output path, duration in seconds (default 2.0), and an optional
+//! inter-burst gap per channel in milliseconds (default ≈20.8 ms; use 5 for the
+//! busy-channel capture).
 //!
 //! Bursts alternate between strong (0.4) and weak (0.1) amplitude. Every burst
 //! carries a distinct ACARS message: the runtime drops byte-identical frames
@@ -31,6 +35,7 @@ const PLAN_HZ: [f64; 7] = [
     136_975_000.0,
 ];
 const STAGGER: usize = 20_000;
+/// Default inter-burst gap (samples, ≈20.8 ms).
 const GAP: usize = 50_000;
 const AMPS: [f32; 2] = [0.4, 0.1];
 /// Idle (noise-only) tail after the last burst. The decoder can currently
@@ -80,6 +85,10 @@ fn main() -> std::io::Result<()> {
         Some(s) => s.parse().expect("seconds must be a number"),
         None => 2.0,
     };
+    let gap: usize = match args.next() {
+        Some(s) => (s.parse::<f64>().expect("gap_ms must be a number") * FS / 1000.0) as usize,
+        None => GAP,
+    };
     let n = (FS * seconds) as usize;
     let last_end = n.saturating_sub((TAIL_S * FS) as usize);
 
@@ -116,7 +125,7 @@ fn main() -> std::io::Result<()> {
                     if tx.send((c, at, burst)).is_err() {
                         break;
                     }
-                    at += len + GAP;
+                    at += len + gap;
                     seq += 1;
                 }
             });
