@@ -392,10 +392,11 @@ fn channelizer_matches_shared_sensitivity_on_us_plan() {
     let lead = (0.3 * fs) as usize;
     let tail = (0.1 * fs) as usize;
 
-    // There is no public way to ask which front end `new` picked (`Front` is
-    // private), so this test cannot assert it directly; it relies on the
-    // xng-dsp `ChannelizedDdc` tests, which build this exact plan and would
-    // fail if the channelizer refused it (and `new` silently fell back).
+    // This test only means something if `new` actually built the channelizer;
+    // it falls back to the shared front end otherwise.
+    let front = AcarsMultiChannelDecoder::new(fs, &offsets).unwrap().describe_front();
+    assert!(front.starts_with("channelized"), "`new` fell back to the shared front end: {front}");
+
     let decoded = |mut dec: AcarsMultiChannelDecoder, iq: &[Complex<f32>]| -> bool {
         dec.hold_squelch_open(true);
         let mut ok = false;
