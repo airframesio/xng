@@ -282,6 +282,9 @@ pub struct LiveState {
     /// Cumulative FEC-corrected octets/bits per channel freq (ECO-7).
     pub fec: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
     pub spectrum: std::sync::Mutex<Option<SpectrumFrame>>,
+    /// Set by consumers that read `spectrum` — currently only the TUI;
+    /// `decode_loop` skips the spectrum FFT while false.
+    pub spectrum_wanted: AtomicBool,
     pub samples: std::sync::atomic::AtomicU64,
 }
 
@@ -300,6 +303,7 @@ impl LiveState {
             acars_labels: std::sync::Mutex::new(std::collections::HashMap::new()),
             fec: std::sync::Mutex::new(std::collections::HashMap::new()),
             spectrum: std::sync::Mutex::new(None),
+            spectrum_wanted: AtomicBool::new(false),
             samples: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1190,7 +1194,8 @@ pub(crate) fn decode_loop(
     ais_filter: AisFilter,
 ) -> anyhow::Result<Vec<(u64, u64, u64)>> {
     use std::sync::atomic::Ordering as AtomOrd;
-    let mut spectrum_fft: Option<std::sync::Arc<dyn rustfft::Fft<f32>>> = None;
+    let mut spectrum_fft: Option<(std::sync::Arc<dyn rustfft::Fft<f32>>, Vec<f32>)> = None;
+    let mut fbuf: Vec<Complex<f32>> = Vec::with_capacity(512);
     let mut chunk_count: u64 = 0;
     let mut buf = vec![Complex::new(0.0f32, 0.0f32); READ_CHUNK];
     // One stats row per CHANNEL in global (config) index order, whatever mix
@@ -1233,22 +1238,15 @@ pub(crate) fn decode_loop(
         if let Some((state, center_hz, sample_rate)) = &live {
             state.samples.fetch_add(n as u64, AtomOrd::Relaxed);
             chunk_count += 1;
-            if chunk_count % 4 == 1 && n >= 512 {
-                let fft = spectrum_fft
-                    .get_or_insert_with(|| {
-                        rustfft::FftPlanner::new().plan_fft_forward(512)
-                    })
-                    .clone();
-                let mut fbuf: Vec<Complex<f32>> = buf[..512]
-                    .iter()
-                    .enumerate()
-                    .map(|(k, &x)| {
-                        let w = 0.54
-                            - 0.46
-                                * (std::f32::consts::TAU * k as f32 / 511.0).cos();
-                        x * w
-                    })
-                    .collect();
+            if chunk_count % 4 == 1 && n >= 512 && state.spectrum_wanted.load(AtomOrd::Relaxed) {
+                let (fft, window) = spectrum_fft.get_or_insert_with(|| {
+                    let window = (0..512)
+                        .map(|k| 0.54 - 0.46 * (std::f32::consts::TAU * k as f32 / 511.0).cos())
+                        .collect();
+                    (rustfft::FftPlanner::new().plan_fft_forward(512), window)
+                });
+                fbuf.clear();
+                fbuf.extend(buf[..512].iter().zip(window.iter()).map(|(&x, &w)| x * w));
                 fft.process(&mut fbuf);
                 // FFT-shift and convert to dB.
                 let bins_db: Vec<f32> = (0..512)
@@ -2041,6 +2039,41 @@ mod tests {
         let groups = per_channel_groups();
         assert!(groups.iter().all(|g| matches!(g.dec, ModeChannel::Acars(_))));
         run_and_check(groups, acars_scenario());
+    }
+
+    /// The spectrum FFT only runs when a consumer has asked for it.
+    #[test]
+    fn decode_loop_spectrum_only_when_wanted() {
+        for wanted in [false, true] {
+            // Several READ_CHUNK reads so the every-4th-chunk spectrum tick fires.
+            let iq = vec![Complex::new(0.01f32, -0.01f32); READ_CHUNK * 5];
+            let mut source = MemSource { iq, pos: 0, rate: TEST_RATE, center: TEST_CENTER };
+            let live = LiveState::new();
+            live.spectrum_wanted.store(wanted, Ordering::Relaxed);
+            decode_loop(
+                &mut source,
+                per_channel_groups(),
+                StationIdentity::new("XX-TEST"),
+                None,
+                MessageBus::new(),
+                Arc::new(AtomicBool::new(false)),
+                Some((live.clone(), TEST_CENTER, TEST_RATE)),
+                None,
+                LabelFilter::default(),
+                AisFilter::default(),
+            )
+            .unwrap();
+            assert_eq!(live.samples.load(Ordering::Relaxed), (READ_CHUNK * 5) as u64);
+            let frame = live.spectrum.lock().unwrap().take();
+            if wanted {
+                let frame = frame.expect("spectrum frame when wanted");
+                assert_eq!(frame.bins_db.len(), 512);
+                assert!(frame.bins_db.iter().all(|b| b.is_finite()));
+                assert_eq!(frame.center_hz, TEST_CENTER);
+            } else {
+                assert!(frame.is_none(), "no spectrum when not wanted");
+            }
+        }
     }
 
     const VDL2_CENTER: u64 = 136_812_500;
