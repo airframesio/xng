@@ -505,6 +505,59 @@ mod tests {
     }
 
     #[test]
+    fn bin_edge_skirt_25khz_bins() {
+        // The 8-channel bench plan centered on-raster at 131.500 MHz: every
+        // offset is a 25 kHz multiple, so M = 96 (25 kHz bins) puts each
+        // channel dead on a bin center. ACARS rates (24 kHz out, ±5 kHz).
+        // A bin is critically sampled, so a tone at Δ lands at Δ mod 25 kHz
+        // inside it: ±20 kHz folds to ∓5 kHz, the passband edge.
+        const PLAN_MHZ: [f64; 8] =
+            [131.425, 131.450, 131.475, 131.525, 131.550, 131.575, 131.725, 131.825];
+        const RELS: [f64; 15] = [
+            0.0, 10e3, -10e3, 12.5e3, -12.5e3, 15e3, -15e3, 20e3, -20e3, 25e3, -25e3, 30e3, -30e3,
+            37.5e3, -37.5e3,
+        ];
+        let (fs, out_rate, pb, ch) = (2_400_000.0, 24_000.0, 5_000.0, 3);
+        let offsets: Vec<f64> = PLAN_MHZ.iter().map(|f| f * 1e6 - 131_500_000.0).collect();
+        let n_in = ((INBAND_SKIP + INBAND_N + 64) as f64 * fs / out_rate).ceil() as usize;
+        // (in-band dB, total dB) of channel `ch` for a tone at center + rel,
+        // with the channel moved `res` Hz off its bin center (the residual NCO
+        // the constructor would build; the constructor itself would re-snap M).
+        let measure = |res: f64, rel: f64| {
+            let mut cd = ChannelizedDdc::new(fs, out_rate, &offsets, pb).unwrap();
+            let bin_rate = fs / cd.bins.len() as f64;
+            assert_eq!(bin_rate, 25_000.0);
+            assert_eq!(bin_offset_hz(cd.channels[ch].bin, cd.bins.len(), fs), offsets[ch]);
+            cd.channels[ch].nco = Nco::new(res, bin_rate);
+            let mut out: Vec<Vec<IqSample>> = vec![Vec::new(); offsets.len()];
+            cd.process(&tone(offsets[ch] + res + rel, fs, n_in), &mut out);
+            let s = &out[ch][INBAND_SKIP..INBAND_SKIP + INBAND_N];
+            let total = s.iter().map(|x| f64::from(x.norm_sqr())).sum::<f64>() / s.len() as f64;
+            (inband_db(&out[ch], out_rate, pb, INBAND_SKIP), 10.0 * total.max(1e-30).log10())
+        };
+        // (residual, [(tone Δ, in-band regression floor dB)]): measured − ~3 dB.
+        // Off center, −20 kHz sits 0.6 bin from the bin center (15 kHz) and
+        // folds onto the channel's passband edge — the prototype's own skirt.
+        let on = [(20e3, -130.0), (-20e3, -130.0), (25e3, -109.0), (-25e3, -109.0)];
+        let off = [(20e3, -112.0), (-20e3, -22.0), (25e3, -117.0), (-25e3, -128.0)];
+        for (res, floors) in [(0.0, on), (5e3, off)] {
+            let (ref_in, ref_tot) = measure(res, 0.0);
+            eprintln!("channel {:+.0} Hz from bin center:", res);
+            eprintln!("  tone Δ     in-band(±5k)   total");
+            for &rel in &RELS {
+                let (inb, tot) = measure(res, rel);
+                let (inb, tot) = (inb - ref_in, tot - ref_tot);
+                eprintln!("  {:+8.1}k  {inb:+9.1} dB  {tot:+7.1} dB", rel / 1e3);
+                for &(at, floor) in &floors {
+                    if rel == at {
+                        assert!(inb <= floor, "res {res} tone {rel}: {inb:+.1} dB > {floor} dB");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bin_rate_ratio_is_bounded() {
         // AIS-like: two channels ±25 kHz, 48 kHz out, ±8 kHz passband. With
         // no bound on bin rate vs output rate the bin search picks 1.2 MHz
