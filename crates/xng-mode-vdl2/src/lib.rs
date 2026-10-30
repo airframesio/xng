@@ -120,7 +120,7 @@ impl ChannelBack {
         self.selectivity.process(channel, &mut self.select_buf);
         let mut out = Vec::new();
         for burst in self.demod.process(&self.select_buf, &self.rs) {
-            for frame in avlc::scan(&burst.bits) {
+            for frame in burst.frames {
                 let acars = match frame.payload {
                     avlc::Payload::Acars => {
                         let start = frame.info.iter().position(|&b| b != 0xFF).unwrap_or(0);

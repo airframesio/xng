@@ -12,6 +12,7 @@
 //! transmission length, and the burst completes through deinterleave/RS
 //! into an AVLC bit stream.
 
+use crate::avlc;
 use crate::header::{self, HEADER_BITS};
 use crate::interleave;
 use crate::scramble::Scrambler;
@@ -25,6 +26,8 @@ pub static STAT_HDR_FAIL: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_RS_FAIL: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_SOFT_OK: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_BURST_OK: AtomicUsize = AtomicUsize::new(0);
+/// RS-corrected bursts that carried no FCS-valid AVLC frame (RS miscorrection).
+pub static STAT_FCS_FAIL: AtomicUsize = AtomicUsize::new(0);
 use xng_dsp::rs::ReedSolomon;
 
 pub const SYMBOL_RATE: f64 = 10_500.0;
@@ -121,6 +124,8 @@ pub struct Vdl2Demod {
 /// A demodulated, descrambled, RS-corrected burst: the AVLC bit stream.
 pub struct Burst {
     pub bits: Vec<u8>,
+    /// FCS-valid AVLC frames scanned from `bits` (never empty).
+    pub frames: Vec<avlc::AvlcFrame>,
     pub rs_corrected: usize,
     /// Carrier frequency offset (Hz) measured from the preamble fit (VDL2-7).
     pub freq_skew_hz: f32,
@@ -448,8 +453,12 @@ impl Vdl2Demod {
                             HEADER_BITS,
                             tl_bits,
                             rs,
-                        ) {
-                            Some((avlc_bits, fixed, soft)) => {
+                        )
+                        .map(|(avlc_bits, fixed, soft)| {
+                            let frames = avlc::scan(&avlc_bits);
+                            (avlc_bits, fixed, soft, frames)
+                        }) {
+                            Some((avlc_bits, fixed, soft, frames)) if !frames.is_empty() => {
                                 if self.debug {
                                     eprintln!("RSOK   tl_bits={tl_bits} syms={} soft={soft}", n / 3);
                                 }
@@ -461,6 +470,7 @@ impl Vdl2Demod {
                                     (c.cfo as f64 * SYMBOL_RATE / std::f64::consts::TAU) as f32;
                                 out.push(Burst {
                                     bits: avlc_bits,
+                                    frames,
                                     rs_corrected: fixed,
                                     freq_skew_hz,
                                     snr_db: evm_snr_db(&c.conf),
@@ -476,6 +486,20 @@ impl Vdl2Demod {
                                 } else {
                                     self.cursor = c.next_pos; // skip past the burst
                                 }
+                            }
+                            Some(_) => {
+                                // RS passed but no frame has a valid FCS. RS
+                                // alone can miscorrect a false lock (e.g. on a
+                                // burst's decaying tail); skipping its
+                                // header-declared length would swallow the
+                                // real bursts inside it, so rewind like an RS
+                                // failure.
+                                if self.debug {
+                                    eprintln!("FCSFAIL tl_bits={tl_bits} syms={}", n / 3);
+                                }
+                                STAT_FCS_FAIL.fetch_add(1, AOrd::Relaxed);
+                                self.last_rs_fail = c.uw_start;
+                                self.cursor = c.uw_start + 1.0;
                             }
                             None => {
                                 if self.debug {
