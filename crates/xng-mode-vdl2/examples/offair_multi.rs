@@ -26,7 +26,9 @@
 //! off a bin center (in the prototype roll-off), the worst-case residual,
 //! while +12.5 kHz sits 12.5 kHz off a bin center, the near-centered control.
 //! Comparing the two classes shows how much of a front end's frame count
-//! depends on bin-center residual rather than on the signal.
+//! depends on bin-center residual rather than on the signal. The
+//! `channelized-2x` row is the 2× oversampled bank, which serves every
+//! channel flat wherever it falls in its bin.
 //!
 //! Only frames from the channel the fixture was placed on are counted; the
 //! `other` column counts frames from any other plan channel (leakage — it
@@ -36,6 +38,7 @@
 use num_complex::Complex;
 use std::f64::consts::{PI, TAU};
 use std::time::{Duration, Instant};
+use xng_dsp::Oversample;
 use xng_mode_vdl2::{Vdl2ChannelDecoder, Vdl2MultiChannelDecoder};
 
 const IN_RATE: f64 = 105_000.0;
@@ -222,6 +225,17 @@ fn main() {
                 Under::Multi(Box::new(
                     Vdl2MultiChannelDecoder::new_channelized(FS, &PLAN_OFFSETS)
                         .expect("channelized"),
+                )),
+            ),
+            row(
+                "channelized-2x",
+                Under::Multi(Box::new(
+                    Vdl2MultiChannelDecoder::new_channelized_with_oversample(
+                        FS,
+                        &PLAN_OFFSETS,
+                        Oversample::Twice,
+                    )
+                    .expect("channelized-2x"),
                 )),
             ),
         ];

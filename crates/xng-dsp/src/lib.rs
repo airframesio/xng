@@ -18,7 +18,7 @@ pub mod viterbi;
 pub mod window;
 
 pub use channelized_ddc::ChannelizedDdc;
-pub use channelizer::PfbChannelizer;
+pub use channelizer::{Oversample, PfbChannelizer};
 pub use ddc::Ddc;
 pub use fir::{lowpass_taps, rrc_taps, Fir};
 pub use nco::Nco;

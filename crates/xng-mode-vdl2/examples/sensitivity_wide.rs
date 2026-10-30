@@ -5,14 +5,16 @@
 //! (what the bench fixtures exercise), at the same in-channel SNR. The `ch`
 //! and `sh` columns run the same burst through `Vdl2MultiChannelDecoder`
 //! configured with the whole 7-channel plan (channelizer and shared-decimation
-//! front ends; the burst on the tested channel, the rest quiet). Use it to A/B
-//! front-end changes.
+//! front ends; the burst on the tested channel, the rest quiet), and the `x2`
+//! columns through the 2× oversampled channelizer. Use it to A/B front-end
+//! changes.
 //!
 //! ```bash
 //! cargo run --release -p xng-mode-vdl2 --example sensitivity_wide
 //! ```
 
 use num_complex::Complex;
+use xng_dsp::Oversample;
 use xng_mode_vdl2::avlc::{encode_address, AddressType};
 use xng_mode_vdl2::demod::SYMBOL_RATE;
 use xng_mode_vdl2::modulate::burst_iq_shaped;
@@ -70,6 +72,8 @@ enum Path {
     MultiChannelized,
     /// `Vdl2MultiChannelDecoder::new_shared` over the whole plan.
     MultiShared,
+    /// The 2× oversampled channelizer over the whole plan.
+    MultiChannelized2x,
 }
 
 /// One trial: `lead` noise, burst, `tail` noise, uniform ±`amp` on I/Q,
@@ -121,6 +125,11 @@ impl Trial<'_> {
                 Vdl2MultiChannelDecoder::new_channelized(self.rate, &PLAN_OFFSETS)
             }
             Path::MultiShared => Vdl2MultiChannelDecoder::new_shared(self.rate, &PLAN_OFFSETS),
+            Path::MultiChannelized2x => Vdl2MultiChannelDecoder::new_channelized_with_oversample(
+                self.rate,
+                &PLAN_OFFSETS,
+                Oversample::Twice,
+            ),
         };
         let mut dec = multi.expect("build VDL2 multi-channel decoder");
         let ch = PLAN_OFFSETS
@@ -169,7 +178,7 @@ fn main() {
          amp = per-sample uniform noise ±amp on I/Q at {FS:.0} S/s\n"
     );
     println!(
-        "{:>7}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
+        "{:>7}{:>9}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
         "SNR dB",
         "amp",
         "+12.5k",
@@ -178,14 +187,21 @@ fn main() {
         "ch+162.5k",
         "sh+12.5k",
         "sh+162.5k",
+        "x2+12.5k",
+        "x2+162.5k",
         "ref 105k"
     );
     for (si, &snr) in SNR_DB.iter().enumerate() {
         let amp = (1.5 * sig_pow * FS / (SYMBOL_RATE * 10f64.powf(snr / 10.0))).sqrt() as f32;
-        let mut ok = [0u32; 7];
+        let mut ok = [0u32; 9];
         for t in 0..TRIALS {
             let seed = 0x9e37_79b9_7f4a_7c15u64.wrapping_mul(t + 1) ^ ((si as u64 + 1) << 40);
-            let paths = [Path::PerChannel, Path::MultiChannelized, Path::MultiShared];
+            let paths = [
+                Path::PerChannel,
+                Path::MultiChannelized,
+                Path::MultiShared,
+                Path::MultiChannelized2x,
+            ];
             for (p, &path) in paths.iter().enumerate() {
                 for (i, (&off, burst)) in OFFSETS.iter().zip(&wide).enumerate() {
                     let tr = Trial {
@@ -216,12 +232,12 @@ fn main() {
                 path: Path::PerChannel,
             };
             if tr.run() {
-                ok[6] += 1;
+                ok[8] += 1;
             }
         }
         println!(
-            "{snr:>7.1}{amp:>9.3}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
-            ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], ok[6]
+            "{snr:>7.1}{amp:>9.3}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>10}{:>12}",
+            ok[0], ok[1], ok[2], ok[3], ok[4], ok[5], ok[6], ok[7], ok[8]
         );
     }
 }

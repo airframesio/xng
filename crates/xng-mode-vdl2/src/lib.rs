@@ -21,7 +21,7 @@ pub mod scramble;
 use chrono::Utc;
 use num_complex::Complex;
 use xng_dsp::rs::ReedSolomon;
-use xng_dsp::{ChannelizedDdc, Ddc, SharedDdc};
+use xng_dsp::{ChannelizedDdc, Ddc, Oversample, SharedDdc};
 use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality};
 
 /// Internal channel rate (≈4.76 samples/symbol).
@@ -313,14 +313,28 @@ impl Vdl2MultiChannelDecoder {
         Ok(Self::with_front(front, input_rate, channel_rate, offsets.len()))
     }
 
-    /// Build with the channelizer front end explicitly (no fallback).
+    /// Build with the critically sampled channelizer front end explicitly
+    /// (no fallback).
     pub fn new_channelized(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
+        Self::new_channelized_with_oversample(input_rate, offsets, Oversample::Critical)
+    }
+
+    /// Build with the channelizer front end explicitly (no fallback), with
+    /// the bank's oversampling chosen: [`Oversample::Twice`] serves every
+    /// channel flat wherever it falls in its bin (no roll-off for channels
+    /// off a bin center) at about twice the shared bank cost.
+    pub fn new_channelized_with_oversample(
+        input_rate: f64,
+        offsets: &[f64],
+        oversample: Oversample,
+    ) -> Result<Self, String> {
         let channel_rate = channel_rate_for(input_rate);
-        let front = Front::Channelized(ChannelizedDdc::new(
+        let front = Front::Channelized(ChannelizedDdc::with_oversample(
             input_rate,
             channel_rate,
             offsets,
             CHANNELIZER_PASSBAND_HZ,
+            oversample,
         )?);
         Ok(Self::with_front(front, input_rate, channel_rate, offsets.len()))
     }

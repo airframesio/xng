@@ -17,7 +17,7 @@
 
 use num_complex::Complex;
 use std::time::Instant;
-use xng_dsp::Ddc;
+use xng_dsp::{Ddc, Oversample};
 use xng_mode_vdl2::avlc::{encode_address, AddressType};
 use xng_mode_vdl2::demod::Vdl2Demod;
 use xng_mode_vdl2::modulate::burst_iq_shaped;
@@ -146,12 +146,17 @@ fn run_all(decs: &mut [Vdl2ChannelDecoder], cap: &[Complex<f32>]) -> usize {
 #[derive(Clone, Copy)]
 enum MultiFront {
     Channelized,
+    /// The 2× oversampled channelizer bank.
+    Channelized2x,
     Shared,
 }
 
 fn multi(offs: &[f64], front: MultiFront) -> Vdl2MultiChannelDecoder {
     match front {
         MultiFront::Channelized => Vdl2MultiChannelDecoder::new_channelized(FS, offs),
+        MultiFront::Channelized2x => {
+            Vdl2MultiChannelDecoder::new_channelized_with_oversample(FS, offs, Oversample::Twice)
+        }
         MultiFront::Shared => Vdl2MultiChannelDecoder::new_shared(FS, offs),
     }
     .expect("build VDL2 multi-channel decoder")
@@ -235,6 +240,7 @@ fn main() {
 
     let fronts = [
         (MultiFront::Channelized, "channelized"),
+        (MultiFront::Channelized2x, "channelized-2x"),
         (MultiFront::Shared, "shared"),
     ];
     let mut multi_frames = Vec::new();

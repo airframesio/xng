@@ -18,11 +18,15 @@
 //!
 //! The "M/act" rows (e.g. `48/16`) restrict output to that many evenly spread
 //! bins with `set_active_bins`, as `ChannelizedDdc` does for its channels.
+//!
+//! The second table runs the 2× oversampled bank (`Oversample::Twice`, one
+//! output per `M/2` inputs) at the taps per branch `ChannelizedDdc` picks for
+//! it; its "ifft" column times twice as many transforms.
 
 use rustfft::{FftDirection, FftPlanner};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
-use xng_dsp::{IqSample, PfbChannelizer};
+use xng_dsp::{IqSample, Oversample, PfbChannelizer};
 
 const SECONDS: usize = 4;
 const RATE: usize = 2_400_000;
@@ -31,6 +35,17 @@ const RUNS: usize = 7;
 const TAPS_PER_BRANCH: usize = 16;
 /// (bins, active bins); active == bins means all active (the default).
 const CHANNELS: &[(usize, usize)] = &[(24, 24), (24, 7), (48, 48), (48, 16), (96, 96)];
+/// 2× oversampled: (bins, taps per branch, active bins).
+const OVERSAMPLED: &[(usize, usize, usize)] = &[
+    (48, 8, 48),
+    (48, 8, 7),
+    (96, 6, 96),
+    (96, 6, 8),
+    (96, 7, 96),
+    (96, 7, 8),
+    (192, 7, 192),
+    (192, 7, 8),
+];
 
 fn noise(len: usize) -> Vec<IqSample> {
     let mut s = 0x9e37_79b9_7f4a_7c15u64;
@@ -44,7 +59,16 @@ fn noise(len: usize) -> Vec<IqSample> {
 }
 
 fn run_pfb(nch: usize, active: usize, input: &[IqSample], out: &mut [Vec<IqSample>]) -> Duration {
-    let mut pfb = PfbChannelizer::new(nch, TAPS_PER_BRANCH);
+    run_pfb_with(PfbChannelizer::new(nch, TAPS_PER_BRANCH), active, input, out)
+}
+
+fn run_pfb_with(
+    mut pfb: PfbChannelizer,
+    active: usize,
+    input: &[IqSample],
+    out: &mut [Vec<IqSample>],
+) -> Duration {
+    let nch = pfb.num_channels();
     if active < nch {
         pfb.set_active_bins(&(0..active).map(|i| i * nch / active).collect::<Vec<_>>());
     }
@@ -96,6 +120,31 @@ fn main() {
         let label = if active < nch { format!("{nch}/{active}") } else { nch.to_string() };
         println!(
             "{label:>6} {ms:>9.3} {ifft_ms:>9.3} {:>9.3} {ns:>11.3} {core:>7.3}%",
+            ms - ifft_ms
+        );
+    }
+
+    println!("\n2x oversampled:");
+    println!(
+        "{:>7} {:>4} {:>9} {:>9} {:>9} {:>11} {:>8}",
+        "M/act", "tpb", "total ms", "ifft ms", "rest ms", "ns/in samp", "% core"
+    );
+    for &(nch, tpb, active) in OVERSAMPLED {
+        let mut out: Vec<Vec<IqSample>> =
+            (0..nch).map(|_| Vec::with_capacity(2 * BLOCK / nch + 1)).collect();
+        let total = best_of(|| {
+            let pfb = PfbChannelizer::with_oversample(nch, tpb, Oversample::Twice);
+            run_pfb_with(pfb, active, &input, &mut out)
+        });
+        let mut buf = noise(nch);
+        let ifft = best_of(|| run_ifft(nch, 2 * input.len() / nch, &mut buf));
+        let ms = total.as_secs_f64() * 1e3;
+        let ifft_ms = ifft.as_secs_f64() * 1e3;
+        let ns = total.as_secs_f64() * 1e9 / input.len() as f64;
+        let core = total.as_secs_f64() / SECONDS as f64 * 100.0;
+        let label = if active < nch { format!("{nch}/{active}") } else { nch.to_string() };
+        println!(
+            "{label:>7} {tpb:>4} {ms:>9.3} {ifft_ms:>9.3} {:>9.3} {ns:>11.3} {core:>7.3}%",
             ms - ifft_ms
         );
     }
