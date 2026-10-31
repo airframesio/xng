@@ -12,6 +12,7 @@
 //! transmission length, and the burst completes through deinterleave/RS
 //! into an AVLC bit stream.
 
+use crate::avlc;
 use crate::header::{self, HEADER_BITS};
 use crate::interleave;
 use crate::scramble::Scrambler;
@@ -25,6 +26,14 @@ pub static STAT_HDR_FAIL: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_RS_FAIL: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_SOFT_OK: AtomicUsize = AtomicUsize::new(0);
 pub static STAT_BURST_OK: AtomicUsize = AtomicUsize::new(0);
+/// RS-corrected bursts that carried no FCS-valid AVLC frame (RS miscorrection).
+pub static STAT_FCS_FAIL: AtomicUsize = AtomicUsize::new(0);
+/// Collections abandoned mid-burst by the energy-dropout gate (PERF-21):
+/// the header passed FEC, but received power fell near the noise floor for
+/// several consecutive blocks before the declared length was reached — a
+/// false lock whose tail decayed into silence (or a pure noise lock with a
+/// large bogus declared length), not a real transmission.
+pub static STAT_COLLECT_DROPOUT: AtomicUsize = AtomicUsize::new(0);
 use xng_dsp::rs::ReedSolomon;
 
 pub const SYMBOL_RATE: f64 = 10_500.0;
@@ -55,9 +64,156 @@ const CORR_THRESHOLD: f32 = 0.6;
 /// fit for a candidate to count as a UW (true preambles on the off-air
 /// capture fit below ~0.11; random data above ~0.5).
 const FIT_COST_MAX: f32 = 0.25;
+/// `Collect`'s energy-dropout gate (PERF-21): block size in symbols. Short
+/// enough that a false lock whose tail decays into silence (or that locks
+/// on a dip between bursts) is caught within a block or two instead of
+/// running up to the header-declared length; 32 symbols is ≈3 ms at
+/// 100 kS/s, far shorter than any real inter-burst gap this matters for.
+const DROPOUT_BLOCK_SYMS: usize = 32;
+/// Reject (abandon) a `Collect` once `DROPOUT_BLOCKS` consecutive blocks
+/// average below this multiple of the hunt's noise-floor estimate at lock
+/// time (`Collecting::lock_noise`, a snapshot of `Vdl2Demod::noise` — the
+/// same value the hunt's energy gate uses). Chosen from measured
+/// block-power/floor ratios (measured with `examples/vdl2_late.rs`, PERF-21);
+/// every genuine decode across two off-air fixtures and a synthetic sweep (30/20 dB
+/// in-channel SNR, isolated and busy-channel) had a worst-case block ratio
+/// of 29.3 (and otherwise ≥41); `DROPOUT_RATIO = 8.0` leaves a 3.7× margin
+/// below that floor while still catching the great majority of tail/noise
+/// locks, whose blocks sit within ~1–2× the floor once they're off any real
+/// signal.
+const DROPOUT_RATIO: f32 = 8.0;
+/// Consecutive low blocks required before abandoning (PERF-21): no observed
+/// genuine decode ever had even a single block below `DROPOUT_RATIO` (so
+/// `DROPOUT_BLOCKS = 1` was also zero-false-positive on every measured
+/// corpus), but requiring two independent confirmations costs nothing in
+/// practice and guards against a one-off noisy reading mid-burst.
+const DROPOUT_BLOCKS: u32 = 2;
 const ENERGY_FACTOR: f32 = 12.0;
 const NOISE_ALPHA: f32 = 1e-4;
 const PHASE_GAIN: f32 = 0.1;
+/// Channel samples per noise-floor block (0.64 ms at 100 kS/s): short
+/// enough that a 5 ms inter-burst gap holds several noise-only blocks.
+const FLOOR_BLOCK: usize = 64;
+/// Floor subsampling stride: the channel is oversampled ~5× against its
+/// noise bandwidth, so every 4th sample keeps the block statistics.
+const FLOOR_STEP: usize = 4;
+/// Sliding window of block means the reference floor is a percentile of.
+const FLOOR_WINDOW_S: f64 = 1.0;
+/// Percentile of the window's block means taken as the reference floor: it
+/// stays on noise while more than 5% of the window's blocks are idle.
+const FLOOR_PERCENTILE: f64 = 0.05;
+/// Ceiling on the tracking floor as a multiple of the reference. On
+/// stationary noise the tracking floor sits ~1.75× the reference (2–6× on
+/// the non-stationary vdl2_105k fixture), so the ceiling only engages when
+/// the tracking floor has been dragged toward signal power (occupancy ×
+/// burst power, a second stable state of the below-gate EMA).
+const FLOOR_CEILING_RATIO: f32 = 8.0;
+/// Blocks whose minimum seeds the tracking floor (replacing the 1e-6 start,
+/// which left the gate open on noise for seconds after every cold start).
+const FLOOR_SEED_BLOCKS: usize = 8;
+/// Floor histogram: 0.25 dB bins over [-160, +40] dB.
+const FLOOR_BINS_PER_DB: f32 = 4.0;
+const FLOOR_DB_MIN: f32 = -160.0;
+const FLOOR_BINS: usize = 800;
+
+/// Dip-robust reference noise floor: a low percentile of block mean powers
+/// over the last `FLOOR_WINDOW_S`. Averaging over a block removes the deep
+/// single-sample noise dips that make a window minimum useless as a gate
+/// reference; the percentile ignores bursts. Block means live in a ring
+/// (arrival order) and a log histogram, so a completed block costs one
+/// increment and one decrement, and the percentile is read once per chunk.
+/// Exactly zero samples (zero-padded file starts) are skipped.
+struct NoiseFloor {
+    block_sum: f32,
+    block_len: usize,
+    /// Input position modulo `FLOOR_STEP`, keeping the subsample grid
+    /// continuous across chunks.
+    phase: usize,
+    /// Histogram bin of each completed block, in arrival order.
+    ring: Box<[u16]>,
+    next: usize,
+    filled: usize,
+    hist: Box<[u32]>,
+    /// Minimum of the first `FLOOR_SEED_BLOCKS` block means.
+    seed_min: f32,
+    /// Seed for the tracking floor, until taken.
+    seed: Option<f32>,
+    /// The percentile (linear power), once `FLOOR_SEED_BLOCKS` blocks exist.
+    value: Option<f32>,
+}
+
+impl NoiseFloor {
+    fn new(channel_rate: f64) -> Self {
+        let blocks = (FLOOR_WINDOW_S * channel_rate / FLOOR_BLOCK as f64).ceil().max(1.0) as usize;
+        Self {
+            block_sum: 0.0,
+            block_len: 0,
+            phase: 0,
+            ring: vec![0; blocks].into_boxed_slice(),
+            next: 0,
+            filled: 0,
+            hist: vec![0; FLOOR_BINS].into_boxed_slice(),
+            seed_min: f32::MAX,
+            seed: None,
+            value: None,
+        }
+    }
+
+    fn push(&mut self, input: &[Complex<f32>]) {
+        let start = (FLOOR_STEP - self.phase) % FLOOR_STEP;
+        for x in input.iter().skip(start).step_by(FLOOR_STEP) {
+            let p = x.norm_sqr();
+            if p == 0.0 {
+                continue;
+            }
+            self.block_sum += p;
+            self.block_len += 1;
+            if self.block_len == FLOOR_BLOCK / FLOOR_STEP {
+                self.complete_block();
+            }
+        }
+        self.phase = (self.phase + input.len()) % FLOOR_STEP;
+        self.refresh();
+    }
+
+    fn complete_block(&mut self) {
+        let mean = self.block_sum / (FLOOR_BLOCK / FLOOR_STEP) as f32;
+        self.block_sum = 0.0;
+        self.block_len = 0;
+        if self.filled < FLOOR_SEED_BLOCKS {
+            self.seed_min = self.seed_min.min(mean);
+            if self.filled + 1 == FLOOR_SEED_BLOCKS {
+                self.seed = Some(self.seed_min);
+            }
+        }
+        let bin = ((10.0 * mean.log10() - FLOOR_DB_MIN) * FLOOR_BINS_PER_DB)
+            .clamp(0.0, (FLOOR_BINS - 1) as f32) as usize;
+        if self.filled == self.ring.len() {
+            self.hist[usize::from(self.ring[self.next])] -= 1;
+        } else {
+            self.filled += 1;
+        }
+        self.ring[self.next] = bin as u16;
+        self.next = (self.next + 1) % self.ring.len();
+        self.hist[bin] += 1;
+    }
+
+    fn refresh(&mut self) {
+        if self.filled < FLOOR_SEED_BLOCKS {
+            return;
+        }
+        let target = ((self.filled - 1) as f64 * FLOOR_PERCENTILE).round() as u32;
+        let mut acc = 0u32;
+        for (b, &n) in self.hist.iter().enumerate() {
+            acc += n;
+            if acc > target {
+                let db = FLOOR_DB_MIN + (b as f32 + 0.5) / FLOOR_BINS_PER_DB;
+                self.value = Some(10f32.powf(db / 10.0));
+                return;
+            }
+        }
+    }
+}
 
 struct Collecting {
     /// Start of the UW that began this collection (+1 sample is the
@@ -80,6 +236,29 @@ struct Collecting {
     scr: Scrambler,
     /// Total bits to collect once the header is decoded.
     needed: Option<usize>,
+    /// Energy-dropout gate (PERF-21): running power sum of the current
+    /// `DROPOUT_BLOCK_SYMS`-symbol block, and how many symbols it holds.
+    dropout_energy: f32,
+    dropout_syms: u32,
+    /// Consecutive blocks whose mean power fell below the gate.
+    dropout_low_run: u32,
+    /// The hunt's noise-floor estimate (`Vdl2Demod::noise`) at the moment
+    /// this lock was accepted, not re-read live: the floor is also updated
+    /// once per `process()` call from the chunk's own samples (including,
+    /// once a long collection has run a while, this very burst's own
+    /// power), so a live read could end up comparing the burst to itself.
+    /// A snapshot at lock time is also truer to "the hunt's noise floor":
+    /// what the gate saw when it accepted this candidate, not whatever it
+    /// has drifted to since.
+    lock_noise: f32,
+}
+
+/// Why a `Collect` ended without a decoded burst.
+enum CollectFail {
+    /// The header-declared length failed its FEC check.
+    Header,
+    /// The energy-dropout gate fired (PERF-21): see `DROPOUT_RATIO`.
+    Dropout,
 }
 
 enum State {
@@ -99,17 +278,33 @@ pub struct Vdl2Demod {
     start_abs: f64,
     /// Hunt cursor (absolute).
     cursor: f64,
+    /// Tracking noise floor: below-gate EMA with a slow up-creep, seeded
+    /// from and capped by `floor`.
     noise: f32,
+    floor: NoiseFloor,
     state: State,
     level: f32,
     /// Optional CFO reject: candidates whose preamble-fit carrier offset
     /// exceeds this many ppm (relative to the VDL2 band) are skipped (VDL2-7).
     max_ppm: Option<f64>,
+    /// Conjugated expected UW phasor per Δφ (index 0 unused).
+    uw_ref_conj: [Complex<f32>; 16],
+    /// Cumulative UW phase ramp for the preamble fit.
+    uw_ramp: [f32; 16],
+    /// Bit / confidence buffers of the last finished collection, reused by
+    /// the next one so steady-state bursts do not reallocate.
+    spare: (Vec<u8>, Vec<f32>),
+    /// `VDL2_DEBUG` set (read once at construction).
+    debug: bool,
+    /// `VDL2_DUMP_BITS` directory (read once at construction).
+    dump_dir: Option<String>,
 }
 
 /// A demodulated, descrambled, RS-corrected burst: the AVLC bit stream.
 pub struct Burst {
     pub bits: Vec<u8>,
+    /// FCS-valid AVLC frames scanned from `bits` (never empty).
+    pub frames: Vec<avlc::AvlcFrame>,
     pub rs_corrected: usize,
     /// Carrier frequency offset (Hz) measured from the preamble fit (VDL2-7).
     pub freq_skew_hz: f32,
@@ -119,12 +314,24 @@ pub struct Burst {
 
 impl Vdl2Demod {
     pub fn new(channel_rate: f64) -> Self {
+        let mut uw_ref_conj = [Complex::new(0.0f32, 0.0); 16];
+        let mut uw_ramp = [0.0f32; 16];
+        for k in 1..16 {
+            uw_ref_conj[k] = Complex::from_polar(1.0, UW_DELTAS[k] as f32 * PI / 4.0).conj();
+            uw_ramp[k] = uw_ramp[k - 1] + UW_DELTAS[k] as f32 * PI / 4.0;
+        }
         Self {
+            uw_ref_conj,
+            uw_ramp,
+            spare: (Vec::new(), Vec::new()),
+            debug: std::env::var("VDL2_DEBUG").is_ok(),
+            dump_dir: std::env::var("VDL2_DUMP_BITS").ok(),
             sps: channel_rate / SYMBOL_RATE,
             buf: Vec::new(),
             start_abs: 0.0,
             cursor: 0.0,
             noise: 1e-6,
+            floor: NoiseFloor::new(channel_rate),
             state: State::Hunt,
             last_rs_fail: f64::NEG_INFINITY,
             level: 0.0,
@@ -162,14 +369,14 @@ impl Vdl2Demod {
         let mut norm = 0.0f32;
         let mut min_d = f32::MAX;
         let mut prev = self.sample(pos)?;
-        for (j, &delta) in UW_DELTAS.iter().enumerate().skip(1) {
+        for (j, &expected_conj) in self.uw_ref_conj.iter().enumerate().skip(1) {
             let s = self.sample(pos + j as f64 * self.sps)?;
             let d = s * prev.conj();
             prev = s;
-            let expected = Complex::from_polar(1.0, delta as f32 * PI / 4.0);
-            corr += d * expected.conj();
-            norm += d.norm();
-            min_d = min_d.min(d.norm());
+            corr += d * expected_conj;
+            let dn = d.norm();
+            norm += dn;
+            min_d = min_d.min(dn);
         }
         if norm < 1e-9 {
             return None;
@@ -200,10 +407,7 @@ impl Vdl2Demod {
     /// Returns (uw_pos, theta) or None when the buffer cannot cover the
     /// search window yet.
     fn preamble_fit(&self, pos: f64) -> Option<(f64, f32, f32)> {
-        let mut pr = [0.0f32; 16];
-        for k in 1..16 {
-            pr[k] = pr[k - 1] + UW_DELTAS[k] as f32 * PI / 4.0;
-        }
+        let pr = &self.uw_ramp;
         let mut best: Option<(f32, f64, f32)> = None; // (cost, pos, theta)
         // Search ±0.7 symbol (at least ±3 samples): the differential
         // trigger localizes the UW no better than a fraction of a symbol,
@@ -321,8 +525,9 @@ impl Vdl2Demod {
     }
 
     /// Advance a collection; returns Some(result) when the burst ends.
-    /// `Ok(bits)` = complete, `Err(())` = header failure.
-    fn collect(&self, c: &mut Collecting) -> Option<Result<(), ()>> {
+    /// `Ok(bits)` = complete, `Err(CollectFail)` = abandoned (header FEC
+    /// failure, or the PERF-21 energy-dropout gate).
+    fn collect(&self, c: &mut Collecting) -> Option<Result<(), CollectFail>> {
         loop {
             if c.needed.is_none() && c.bits.len() >= HEADER_BITS {
                 let hdr: [u8; HEADER_BITS] = c.bits[..HEADER_BITS].try_into().unwrap();
@@ -334,8 +539,14 @@ impl Vdl2Demod {
                     .filter(|&tl| tl <= 16_000)
                     .and_then(|tl| interleave::layout(tl as usize))
                 {
-                    Some(lay) => c.needed = Some(HEADER_BITS + lay.total_tx_bits),
-                    None => return Some(Err(())),
+                    Some(lay) => {
+                        let n = HEADER_BITS + lay.total_tx_bits;
+                        c.needed = Some(n);
+                        // Whole symbols: up to 2 bits past `n`.
+                        c.bits.reserve((n + 2).saturating_sub(c.bits.len()));
+                        c.conf.reserve((n / 3 + 1).saturating_sub(c.conf.len()));
+                    }
+                    None => return Some(Err(CollectFail::Header)),
                 }
             }
             if let Some(n) = c.needed {
@@ -346,6 +557,28 @@ impl Vdl2Demod {
             let Some(s) = self.sample(c.next_pos) else {
                 return None; // wait for more samples
             };
+            // Energy-dropout gate (PERF-21), post-header only: a false lock
+            // whose tail decays into silence (or a pure noise lock that
+            // happened to pass the header FEC with a large bogus declared
+            // length) shows received power near the hunt's own noise-floor
+            // estimate within a block or two; a real transmission holds
+            // signal power for its whole length. This costs one
+            // multiply-accumulate per symbol and nothing extra on the
+            // common, fast-resolving path.
+            if c.needed.is_some() {
+                c.dropout_energy += s.norm_sqr();
+                c.dropout_syms += 1;
+                if c.dropout_syms as usize == DROPOUT_BLOCK_SYMS {
+                    let mean = c.dropout_energy / DROPOUT_BLOCK_SYMS as f32;
+                    c.dropout_low_run =
+                        if mean < DROPOUT_RATIO * c.lock_noise { c.dropout_low_run + 1 } else { 0 };
+                    c.dropout_energy = 0.0;
+                    c.dropout_syms = 0;
+                    if c.dropout_low_run >= DROPOUT_BLOCKS {
+                        return Some(Err(CollectFail::Dropout));
+                    }
+                }
+            }
             let d = s * c.prev.conj();
             c.prev = s;
             c.next_pos += self.sps;
@@ -362,10 +595,25 @@ impl Vdl2Demod {
         }
     }
 
+    /// Keep a finished collection's buffers (emptied) for the next one.
+    fn recycle(&mut self, c: Collecting) {
+        let Collecting { mut bits, mut conf, .. } = c;
+        bits.clear();
+        conf.clear();
+        self.spare = (bits, conf);
+    }
+
     pub fn process(&mut self, input: &[Complex<f32>], rs: &ReedSolomon) -> Vec<Burst> {
         self.buf.extend_from_slice(input);
         for x in input {
             self.level += NOISE_ALPHA * (x.norm_sqr() - self.level);
+        }
+        self.floor.push(input);
+        if let Some(seed) = self.floor.seed.take() {
+            self.noise = self.noise.max(seed);
+        }
+        if let Some(f) = self.floor.value {
+            self.noise = self.noise.min(f * FLOOR_CEILING_RATIO);
         }
         let mut out = Vec::new();
 
@@ -386,10 +634,14 @@ impl Vdl2Demod {
                             theta,
                             cfo: theta, // preamble-fit CFO, kept undrifted
                             prev,
-                            bits: Vec::new(),
-                            conf: Vec::new(),
+                            bits: std::mem::take(&mut self.spare.0),
+                            conf: std::mem::take(&mut self.spare.1),
                             scr: Scrambler::new(),
                             needed: None,
+                            dropout_energy: 0.0,
+                            dropout_syms: 0,
+                            dropout_low_run: 0,
+                            lock_noise: self.noise,
                         }));
                     }
                     None => break, // need more samples
@@ -399,9 +651,24 @@ impl Vdl2Demod {
                         self.state = State::Collect(c);
                         break; // need more samples
                     }
-                    Some(Err(())) => {
+                    Some(Err(CollectFail::Header)) => {
                         STAT_HDR_FAIL.fetch_add(1, AOrd::Relaxed);
                         // Bad header: resume hunting just past this UW.
+                        self.recycle(*c);
+                        self.state = State::Hunt;
+                    }
+                    Some(Err(CollectFail::Dropout)) => {
+                        if self.debug {
+                            eprintln!("DROPOUT uw={}", c.uw_start);
+                        }
+                        STAT_COLLECT_DROPOUT.fetch_add(1, AOrd::Relaxed);
+                        // Same rewind as an RS/FCS failure: the header
+                        // passed FEC on this lock, so it is deterministic
+                        // and would immediately re-dropout if re-hunted
+                        // from the same position.
+                        self.last_rs_fail = c.uw_start;
+                        self.cursor = c.uw_start + 1.0;
+                        self.recycle(*c);
                         self.state = State::Hunt;
                     }
                     Some(Ok(())) => {
@@ -414,9 +681,13 @@ impl Vdl2Demod {
                             HEADER_BITS,
                             tl_bits,
                             rs,
-                        ) {
-                            Some((avlc_bits, fixed, soft)) => {
-                                if std::env::var("VDL2_DEBUG").is_ok() {
+                        )
+                        .map(|(avlc_bits, fixed, soft)| {
+                            let frames = avlc::scan(&avlc_bits);
+                            (avlc_bits, fixed, soft, frames)
+                        }) {
+                            Some((avlc_bits, fixed, soft, frames)) if !frames.is_empty() => {
+                                if self.debug {
                                     eprintln!("RSOK   tl_bits={tl_bits} syms={} soft={soft}", n / 3);
                                 }
                                 STAT_BURST_OK.fetch_add(1, AOrd::Relaxed);
@@ -427,6 +698,7 @@ impl Vdl2Demod {
                                     (c.cfo as f64 * SYMBOL_RATE / std::f64::consts::TAU) as f32;
                                 out.push(Burst {
                                     bits: avlc_bits,
+                                    frames,
                                     rs_corrected: fixed,
                                     freq_skew_hz,
                                     snr_db: evm_snr_db(&c.conf),
@@ -443,11 +715,25 @@ impl Vdl2Demod {
                                     self.cursor = c.next_pos; // skip past the burst
                                 }
                             }
+                            Some(_) => {
+                                // RS passed but no frame has a valid FCS. RS
+                                // alone can miscorrect a false lock (e.g. on a
+                                // burst's decaying tail); skipping its
+                                // header-declared length would swallow the
+                                // real bursts inside it, so rewind like an RS
+                                // failure.
+                                if self.debug {
+                                    eprintln!("FCSFAIL tl_bits={tl_bits} syms={}", n / 3);
+                                }
+                                STAT_FCS_FAIL.fetch_add(1, AOrd::Relaxed);
+                                self.last_rs_fail = c.uw_start;
+                                self.cursor = c.uw_start + 1.0;
+                            }
                             None => {
-                                if std::env::var("VDL2_DEBUG").is_ok() {
+                                if self.debug {
                                     eprintln!("RSFAIL tl_bits={tl_bits} syms={}", n / 3);
                                 }
-                                if let Ok(dir) = std::env::var("VDL2_DUMP_BITS") {
+                                if let Some(dir) = &self.dump_dir {
                                     use std::sync::atomic::AtomicU32;
                                     static N: AtomicU32 = AtomicU32::new(0);
                                     let k = N.fetch_add(1, AOrd::Relaxed);
@@ -482,6 +768,7 @@ impl Vdl2Demod {
                                 self.cursor = c.uw_start + 1.0;
                             }
                         }
+                        self.recycle(*c);
                         self.state = State::Hunt;
                     }
                 },

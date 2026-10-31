@@ -40,6 +40,7 @@ pub fn run(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<
     let bus = MessageBus::new();
     let mut rx = bus.subscribe();
     let live = LiveState::new();
+    live.spectrum_wanted.store(true, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
     let station = StationIdentity::new(cfg.station_ident.clone());
 
