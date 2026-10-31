@@ -16,7 +16,6 @@
         "x86_64-linux"
         "aarch64-linux"
         "aarch64-darwin"
-        "x86_64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
@@ -43,6 +42,7 @@
               pkgs.cargo-machete
               pkgs.pkg-config
               pkgs.soapysdr
+              pkgs.soapyrtlsdr
               pkgs.airspy
               pkgs.airspyhf
               pkgs.protobuf
@@ -51,6 +51,9 @@
 
             LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             PROTOC = "${pkgs.protobuf}/bin/protoc";
+            SOAPY_SDR_PLUGIN_PATH = pkgs.lib.makeSearchPath pkgs.soapysdr.passthru.searchPath [
+              pkgs.soapyrtlsdr
+            ];
           };
         }
       );
