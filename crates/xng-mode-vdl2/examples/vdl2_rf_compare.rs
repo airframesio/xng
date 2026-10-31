@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use xng_dsp::Oversample;
 use xng_mode_vdl2::{Vdl2ChannelDecoder, Vdl2Frame, Vdl2MultiChannelDecoder};
-use xng_sdr::{FileIqSource, IqFormat, IqSource};
+use xng_sdr::{FileIqSource, IqFormat, IqSource, SdrError};
 
 const BLOCK: usize = 65_536;
 /// Up to this many example frames are kept per direction of a set diff.
@@ -190,13 +190,37 @@ fn print_examples(label: &str, ch_mhz: &[f64], examples: &[FrameRec]) {
     }
 }
 
+/// The exact `(negative rail, positive rail)` a full-scale ADC sample
+/// converts to for `fmt`, straight out of `FileIqSource`'s conversion
+/// (`crates/xng-sdr/src/file.rs`): `None` when the format has no meaningful
+/// clipping rail.
+///
+/// * cu8: `(byte - 127.5) / 127.5` lands on exactly +/-1.0 for byte 0/255.
+/// * cs8: `byte as i8 as f32 / 128.0` is asymmetric — `i8::MIN / 128.0 =
+///   -1.0` but `i8::MAX / 128.0 = 127.0 / 128.0 = 0.9921875`, not 1.0, so a
+///   fixed +/-1.0 compare never flags cs8's positive rail.
+/// * cs16: `i16 as f32 / 32768.0` is the same shape — `-1.0` and `32767.0 /
+///   32768.0`, not 1.0.
+/// * cf32: arbitrary floats with no fixed full-scale value; clipping is not
+///   a meaningful concept here, so this returns `None`.
+///
+/// Every rail below is an exact power-of-two-denominator division of an
+/// integer that fits the mantissa, so it reproduces the conversion's float
+/// bit-for-bit and an exact compare is safe (no epsilon needed).
+fn clip_rails(fmt: IqFormat) -> Option<(f32, f32)> {
+    match fmt {
+        IqFormat::Cu8 => Some((-1.0, 1.0)),
+        IqFormat::Cs8 => Some((-1.0, 127.0 / 128.0)),
+        IqFormat::Cs16 => Some((-1.0, 32_767.0 / 32_768.0)),
+        IqFormat::Cf32 => None,
+    }
+}
+
 /// Wideband-stream capture health: mean power (dBFS), DC spike, and ADC
-/// clipping. For cu8, byte 0 and byte 255 convert to exactly -1.0 and +1.0
-/// (`(0 - 127.5) / 127.5` and `(255 - 127.5) / 127.5` are exact in f32), so
-/// clipping is detected straight off the converted samples without a second
-/// raw-byte pass.
+/// clipping against the format's full-scale rails (see [`clip_rails`]); not
+/// meaningful for cf32.
 struct Health {
-    fmt: IqFormat,
+    rails: Option<(f32, f32)>,
     sum_sq: f64,
     n: u64,
     clip_lo: u64,
@@ -207,7 +231,15 @@ struct Health {
 
 impl Health {
     fn new(fmt: IqFormat) -> Self {
-        Self { fmt, sum_sq: 0.0, n: 0, clip_lo: 0, clip_hi: 0, dc_sum_re: 0.0, dc_sum_im: 0.0 }
+        Self {
+            rails: clip_rails(fmt),
+            sum_sq: 0.0,
+            n: 0,
+            clip_lo: 0,
+            clip_hi: 0,
+            dc_sum_re: 0.0,
+            dc_sum_im: 0.0,
+        }
     }
 
     fn update(&mut self, block: &[Complex<f32>]) {
@@ -215,11 +247,11 @@ impl Health {
             self.sum_sq += (s.re as f64).powi(2) + (s.im as f64).powi(2);
             self.dc_sum_re += s.re as f64;
             self.dc_sum_im += s.im as f64;
-            if self.fmt == IqFormat::Cu8 {
-                if s.re == -1.0 || s.im == -1.0 {
+            if let Some((neg, pos)) = self.rails {
+                if s.re <= neg || s.im <= neg {
                     self.clip_lo += 1;
                 }
-                if s.re == 1.0 || s.im == 1.0 {
+                if s.re >= pos || s.im >= pos {
                     self.clip_hi += 1;
                 }
             }
@@ -233,9 +265,17 @@ impl Health {
         let dc_re = self.dc_sum_re / self.n.max(1) as f64;
         let dc_im = self.dc_sum_im / self.n.max(1) as f64;
         let dc_mag_db = 10.0 * (dc_re * dc_re + dc_im * dc_im).log10();
+        let clip = match self.rails {
+            Some((neg, pos)) => {
+                format!(
+                    "clip_lo(<={neg:+.6})={}  clip_hi(>={pos:+.6})={}",
+                    self.clip_lo, self.clip_hi
+                )
+            }
+            None => "clip=n/a (cf32)".to_string(),
+        };
         format!(
-            "rms={rms_dbfs:>6.1} dBFS  dc=({dc_re:+.4},{dc_im:+.4}) |dc|={dc_mag_db:>6.1} dBFS  clip0={}  clip255={}",
-            self.clip_lo, self.clip_hi
+            "rms={rms_dbfs:>6.1} dBFS  dc=({dc_re:+.4},{dc_im:+.4}) |dc|={dc_mag_db:>6.1} dBFS  {clip}"
         )
     }
 }
@@ -287,29 +327,40 @@ fn main() {
     let shared =
         FrontEnd::new("shared", shared_describe, Under::Multi(Box::new(shared_multi)), n_ch);
 
-    let explicit_2x =
-        Vdl2MultiChannelDecoder::new_channelized_with_oversample(rate, &offsets, Oversample::Twice)
-            .expect("explicit channelized-2x decoder");
-    let explicit_2x_describe = explicit_2x.describe_front();
-    let explicit_2x_distinct = explicit_2x_describe != default_describe;
+    // The explicit 2x bank is a row of interest, not a precondition for the
+    // rest of the comparison: some rate/offset sets the default's fallback
+    // (`SharedDdc`) serves fine are rejected by the 2x channelizer outright
+    // (see `ChannelizedDdc::build`'s per-channel edge check). Skip the row
+    // rather than aborting the whole run when that happens.
     let mut fronts = vec![per_channel, default, shared];
-    if explicit_2x_distinct {
-        fronts.push(FrontEnd::new(
-            "channelized-2x",
-            explicit_2x_describe.clone(),
-            Under::Multi(Box::new(explicit_2x)),
-            n_ch,
-        ));
+    match Vdl2MultiChannelDecoder::new_channelized_with_oversample(
+        rate,
+        &offsets,
+        Oversample::Twice,
+    ) {
+        Ok(explicit_2x) => {
+            let explicit_2x_describe = explicit_2x.describe_front();
+            if explicit_2x_describe == default_describe {
+                println!(
+                    "  (new_channelized_with_oversample(Twice) == default's front end: {explicit_2x_describe:?}; not run separately)"
+                );
+            } else {
+                fronts.push(FrontEnd::new(
+                    "channelized-2x",
+                    explicit_2x_describe,
+                    Under::Multi(Box::new(explicit_2x)),
+                    n_ch,
+                ));
+            }
+        }
+        Err(e) => {
+            println!("  (new_channelized_with_oversample(Twice) skipped: {e})");
+        }
     }
 
     println!("\nfront ends under test:");
     for f in &fronts {
         println!("  {:<14} describe_front() = {}", f.name, f.describe);
-    }
-    if !explicit_2x_distinct {
-        println!(
-            "  (new_channelized_with_oversample(Twice) == default's front end: {explicit_2x_describe:?}; not run separately)"
-        );
     }
 
     let mut src = FileIqSource::open(&path, fmt, rate, center_hz as u64).expect("open capture");
@@ -319,7 +370,12 @@ fn main() {
     let io_t0 = Instant::now();
     let mut blocks = 0usize;
 
-    while let Ok(n) = src.read(&mut block) {
+    loop {
+        let n = match src.read(&mut block) {
+            Ok(n) => n,
+            Err(SdrError::EndOfStream) => break,
+            Err(e) => panic!("capture read failed: {e}"),
+        };
         let chunk = &block[..n];
         samples_seen += n as u64;
         let now = samples_seen as f64 / rate;

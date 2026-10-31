@@ -279,18 +279,42 @@ fn run_front_end(
     })
 }
 
-/// ADC/DC health scan: a plain streaming pass over the converted samples
-/// (no decode), counting full-scale (clipped) samples and the DC bias in I
-/// and Q. Clipping only applies to 8-bit formats; `(byte - 127.5) / 127.5`
-/// (cu8) or `byte as i8 as f32 / 128.0` (cs8) land on exactly +/-1.0 only
-/// for the two extreme byte values, so an exact float compare is safe.
+/// The exact `(negative rail, positive rail)` a full-scale ADC sample
+/// converts to for `fmt`, straight out of [`xng_sdr::file::FileIqSource`]'s
+/// conversion (`crates/xng-sdr/src/file.rs`): `None` when the format has no
+/// meaningful clipping rail.
+///
+/// * cu8: `(byte - 127.5) / 127.5` lands on exactly +/-1.0 for byte 0/255.
+/// * cs8: `byte as i8 as f32 / 128.0` is asymmetric — `i8::MIN / 128.0 =
+///   -1.0` but `i8::MAX / 128.0 = 127.0 / 128.0 = 0.9921875`, not 1.0, so a
+///   fixed +/-1.0 compare never flags cs8's positive rail.
+/// * cs16: `i16 as f32 / 32768.0` is the same shape — `-1.0` and `32767.0 /
+///   32768.0`, not 1.0.
+/// * cf32: arbitrary floats with no fixed full-scale value; clipping is not
+///   a meaningful concept here, so this returns `None`.
+///
+/// Every rail below is an exact power-of-two-denominator division of an
+/// integer that fits the mantissa, so it reproduces the conversion's float
+/// bit-for-bit and an exact `==` compare is safe (no epsilon needed).
+fn clip_rails(fmt: IqFormat) -> Option<(f32, f32)> {
+    match fmt {
+        IqFormat::Cu8 => Some((-1.0, 1.0)),
+        IqFormat::Cs8 => Some((-1.0, 127.0 / 128.0)),
+        IqFormat::Cs16 => Some((-1.0, 32_767.0 / 32_768.0)),
+        IqFormat::Cf32 => None,
+    }
+}
+
+/// ADC/DC health scan: a plain streaming pass over the converted samples (no
+/// decode), counting full-scale (clipped) samples and the DC bias in I and Q.
+/// Clipping is only meaningful for fixed-point formats; see [`clip_rails`].
 struct HealthScan {
     samples: u64,
     dc_re_sum: f64,
     dc_im_sum: f64,
     clip_re: u64,
     clip_im: u64,
-    clip_applicable: bool,
+    clip_rails: Option<(f32, f32)>,
 }
 
 fn health_scan(
@@ -301,14 +325,14 @@ fn health_scan(
 ) -> Result<HealthScan, String> {
     let mut src = FileIqSource::open(path, fmt, rate, center_hz).map_err(|e| e.to_string())?;
     let mut buf = vec![Complex::new(0.0f32, 0.0); CHUNK];
-    let clip_applicable = matches!(fmt, IqFormat::Cu8 | IqFormat::Cs8);
+    let rails = clip_rails(fmt);
     let mut scan = HealthScan {
         samples: 0,
         dc_re_sum: 0.0,
         dc_im_sum: 0.0,
         clip_re: 0,
         clip_im: 0,
-        clip_applicable,
+        clip_rails: rails,
     };
     loop {
         let n = match src.read(&mut buf) {
@@ -319,11 +343,11 @@ fn health_scan(
         for s in &buf[..n] {
             scan.dc_re_sum += f64::from(s.re);
             scan.dc_im_sum += f64::from(s.im);
-            if clip_applicable {
-                if s.re >= 1.0 || s.re <= -1.0 {
+            if let Some((neg, pos)) = rails {
+                if s.re <= neg || s.re >= pos {
                     scan.clip_re += 1;
                 }
-                if s.im >= 1.0 || s.im <= -1.0 {
+                if s.im <= neg || s.im >= pos {
                     scan.clip_im += 1;
                 }
             }
@@ -446,8 +470,6 @@ fn print_capture_health(
     scan: &HealthScan,
 ) {
     println!("\n-- capture health --\n");
-    let full_scale =
-        if scan.clip_applicable { "8-bit full-scale (byte 0 or 255)" } else { "n/a (not 8-bit)" };
     println!("samples scanned: {}", scan.samples);
     println!(
         "DC bias: I mean {:+.5} ({:+.1} dBFS), Q mean {:+.5} ({:+.1} dBFS)",
@@ -456,16 +478,17 @@ fn print_capture_health(
         scan.dc_im_sum / scan.samples as f64,
         20.0 * (scan.dc_im_sum.abs() / scan.samples as f64).log10(),
     );
-    if scan.clip_applicable {
-        println!(
-            "ADC clipping ({full_scale}): I {} ({:.4}%), Q {} ({:.4}%)",
-            scan.clip_re,
-            100.0 * scan.clip_re as f64 / scan.samples as f64,
-            scan.clip_im,
-            100.0 * scan.clip_im as f64 / scan.samples as f64,
-        );
-    } else {
-        println!("ADC clipping: {full_scale}");
+    match scan.clip_rails {
+        Some((neg, pos)) => {
+            println!(
+                "ADC clipping (full-scale rails {neg:+.6}/{pos:+.6}): I {} ({:.4}%), Q {} ({:.4}%)",
+                scan.clip_re,
+                100.0 * scan.clip_re as f64 / scan.samples as f64,
+                scan.clip_im,
+                100.0 * scan.clip_im as f64 / scan.samples as f64,
+            );
+        }
+        None => println!("ADC clipping: not meaningful for cf32 (arbitrary-range floats)"),
     }
 
     let Some(health) = &default_result.health else {
