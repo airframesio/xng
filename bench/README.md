@@ -17,7 +17,7 @@ fixtures and fails if any count drops below its baseline
 
 ```bash
 cargo build --release
-gh release download bench-fixtures-v1 -p ais_96k.cs16 -p sonde_96k.cf32 -p navtex_62500.cs16 -D bench/data/
+gh release download bench-fixtures-v1 -p ais_96k.cs16 -p vdl2_105k_conj.s16 -p hfdl_48k.cs16 -p adsb_quiet_24m.cu8 -p acars_100k.cs16 -p vdl2_opflasher_105k.cs16 -p sonde_96k.cf32 -p navtex_62500.cs16 -D bench/data/
 bench/run.sh
 ```
 
