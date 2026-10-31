@@ -17,7 +17,7 @@
 
 use num_complex::Complex;
 use std::time::Instant;
-use xng_dsp::{lowpass_taps, ChannelizedDdc, Fir, Nco, PfbChannelizer};
+use xng_dsp::{lowpass_taps, ChannelizedDdc, Fir, Nco, Oversample, PfbChannelizer};
 use xng_mode_acars::demod::MskDemod;
 use xng_mode_acars::modulate::{burst_iq, FrameSpec};
 use xng_mode_acars::{AcarsMultiChannelDecoder, CHANNEL_PASSBAND_HZ, CHANNEL_RATE};
@@ -30,10 +30,6 @@ const PLAN_MHZ: [f64; 16] = [
     130.425, 130.45, 130.55, 130.825, 130.85, 131.125, 131.25, 131.425, 131.45, 131.475, 131.525,
     131.55, 131.65, 131.725, 131.825, 131.85,
 ];
-/// Matches `ChannelizedDdc`'s own choice for this plan; see its `choose_num_bins`.
-const PFB_BINS: usize = 48;
-/// Matches `PFB_TAPS_PER_BRANCH` in xng-dsp's `channelized_ddc.rs`.
-const PFB_TAPS_PER_BRANCH: usize = 16;
 /// The demod's mix frequency (MSK tone midpoint); see `demod::TONE_MID_HZ`.
 const TONE_MID_HZ: f64 = 1_800.0;
 
@@ -58,6 +54,22 @@ fn best<F: FnMut()>(mut f: F) -> f64 {
 
 fn line(label: &str, ms: f64) {
     println!("{label:<34}{ms:8.1} ms  {:5.2}%", pct(ms));
+}
+
+/// Extracts `(M, taps_per_branch)` out of `ChannelizedDdc::describe()`'s
+/// `"M={m} {Oversample:?} tpb={tpb} bin_rate=... filter=... resample=..."`
+/// text — its only public accessor for the bank geometry a from-scratch
+/// `PfbChannelizer` needs to replicate to time the polyphase + FFT stage in
+/// isolation. Panics if the format ever changes shape.
+fn parse_bank_geometry(desc: &str) -> (usize, usize) {
+    let field = |key: &str| -> usize {
+        desc.split(key)
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|tok| tok.parse().ok())
+            .unwrap_or_else(|| panic!("could not parse {key:?} out of describe() {desc:?}"))
+    };
+    (field("M="), field("tpb="))
 }
 
 fn noise(n: usize) -> Vec<Complex<f32>> {
@@ -121,34 +133,72 @@ fn main() {
     });
     line("TOTAL end-to-end", total);
 
-    let Ok(mut cd) = ChannelizedDdc::new(FS, CHANNEL_RATE, &offs, CHANNEL_PASSBAND_HZ) else {
+    // `AcarsMultiChannelDecoder::new` builds a 2x oversampled `ChannelizedDdc`
+    // (falling back to `SharedDdc` only if that bank is rejected). The rows
+    // below have to time THAT bank, not a critically sampled one, or "back
+    // end = total - front" is charging the wrong stage for the oversample's
+    // extra polyphase/FFT work.
+    let front_desc = full.describe_front();
+    assert!(
+        front_desc.starts_with("channelized "),
+        "this plan's decoder picked {front_desc:?}, not the channelizer; the front-end/polyphase \
+         rows below assume the channelizer front end"
+    );
+    let Ok(mut cd) = ChannelizedDdc::with_oversample(
+        FS,
+        CHANNEL_RATE,
+        &offs,
+        CHANNEL_PASSBAND_HZ,
+        Oversample::Twice,
+    ) else {
         eprintln!("could not build the channelizer front end");
         return;
     };
+    let cd_desc = cd.describe();
+    assert_eq!(
+        format!("channelized {cd_desc}"),
+        front_desc,
+        "this ChannelizedDdc must match AcarsMultiChannelDecoder::new's front end exactly"
+    );
     let mut chans: Vec<Vec<Complex<f32>>> = vec![Vec::new(); nch];
     let front = best(|| {
         cd.process(&cap, &mut chans);
     });
-    line("  front end (ChannelizedDdc)", front);
+    line(&format!("  front end (ChannelizedDdc, {cd_desc})"), front);
 
-    let mut pfb = PfbChannelizer::new(PFB_BINS, PFB_TAPS_PER_BRANCH);
+    // `cd`'s bin count/taps-per-branch, parsed out of `describe()` (its only
+    // public accessor for them): this bank has to match the geometry
+    // `ChannelizedDdc::new` actually chose above (2x oversampled) — the old
+    // hardcoded PFB_BINS/PFB_TAPS_PER_BRANCH matched the CRITICALLY sampled
+    // chooser, a different bank the decoder never builds here, which
+    // misattributed its cost to the front end instead of the back end.
+    let (pfb_bins, pfb_taps_per_branch) = parse_bank_geometry(&cd_desc);
+    let mut pfb = PfbChannelizer::with_oversample(pfb_bins, pfb_taps_per_branch, Oversample::Twice);
     // `ChannelizedDdc` only pushes the bins its channels snap to, so restrict
-    // this bank the same way (same nearest-bin rule as `ChannelizedDdc::new`)
+    // this bank the same way (same nearest-bin rule as `ChannelizedDdc::build`)
     // or the subtraction below charges the front end for pushes it skips.
-    let bin_rate = FS / PFB_BINS as f64;
-    let mut active: Vec<usize> =
-        offs.iter().map(|off| (off / bin_rate).round().rem_euclid(PFB_BINS as f64) as usize).collect();
+    let spacing = FS / pfb_bins as f64;
+    let mut active: Vec<usize> = offs
+        .iter()
+        .map(|off| (off / spacing).round().rem_euclid(pfb_bins as f64) as usize)
+        .collect();
     active.sort_unstable();
     active.dedup();
     pfb.set_active_bins(&active);
-    let mut bins: Vec<Vec<Complex<f32>>> = vec![Vec::new(); PFB_BINS];
+    let mut bins: Vec<Vec<Complex<f32>>> = vec![Vec::new(); pfb_bins];
     let pfb_ms = best(|| {
         for b in bins.iter_mut() {
             b.clear();
         }
         pfb.process(&cap, &mut bins);
     });
-    line(&format!("    polyphase + FFT ({}/{PFB_BINS} bins)", active.len()), pfb_ms);
+    line(
+        &format!(
+            "    polyphase + FFT ({}/{pfb_bins} bins, 2x, tpb={pfb_taps_per_branch})",
+            active.len()
+        ),
+        pfb_ms,
+    );
     line("    per-channel finish", front - pfb_ms);
     line("  back end (demod + deframe)", total - front);
 
