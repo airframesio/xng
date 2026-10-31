@@ -69,7 +69,7 @@ fn decodes(frame_bytes: &[u8], snr_db: f64, seed: u64) -> bool {
     let mut iq = vec![Complex::new(0.0f32, 0.0); LEAD];
     iq.extend_from_slice(&burst);
     iq.resize(iq.len() + TAIL, Complex::new(0.0, 0.0));
-    let mut noise = Noise((seed * 0x9e37_79b9_7f4a_7c15u64) | 1);
+    let mut noise = Noise(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
     for s in &mut iq {
         *s += Complex::new(noise.next() * amp, noise.next() * amp);
     }
@@ -86,7 +86,7 @@ fn decodes(frame_bytes: &[u8], snr_db: f64, seed: u64) -> bool {
 fn n1_sized_burst_decodes_at_clean_and_noisy_snr() {
     let frame = long_frame(N1_INFO_LEN);
     assert_eq!(
-        xng_mode_vdl2::avlc::build(&[frame.clone()]).len(),
+        xng_mode_vdl2::avlc::build(std::slice::from_ref(&frame)).len(),
         N1_TL_BITS,
         "fixture drifted off its target TL; re-bisect info_len"
     );
@@ -108,7 +108,7 @@ fn n1_sized_burst_decodes_at_clean_and_noisy_snr() {
 fn half_n1_sized_burst_decodes_at_clean_and_noisy_snr() {
     let frame = long_frame(HALF_INFO_LEN);
     assert_eq!(
-        xng_mode_vdl2::avlc::build(&[frame.clone()]).len(),
+        xng_mode_vdl2::avlc::build(std::slice::from_ref(&frame)).len(),
         HALF_TL_BITS,
         "fixture drifted off its target TL; re-bisect info_len"
     );
