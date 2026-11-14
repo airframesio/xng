@@ -10,6 +10,8 @@
   let showAdvanced = $state(false);
   let plan = $state<ResolvedTune | null>(null);
   let planError = $state<string | null>(null);
+  /** A tuning preview for the current settings is on its way. */
+  let resolving = $state(false);
 
   const available = $derived(new Set(app.info?.modes.map((m) => m.id) ?? MODES.map((m) => m.id)));
   const isFile = $derived(settings.sourceKind === "file");
@@ -24,23 +26,21 @@
     // The old plan describes the old settings: drop it, and ignore an
     // answer that comes back after the settings have moved on again.
     plan = null;
+    planError = null;
+    resolving = !(isFile && !settings.filePath);
     let current = true;
     const t = setTimeout(async () => {
       saveSettings();
-      if (isFile && !settings.filePath) {
-        planError = null;
-        return;
-      }
+      if (!resolving) return;
       try {
         const resolved = await app.resolve();
         if (!current) return;
         plan = resolved;
-        planError = null;
       } catch (e) {
         if (!current) return;
-        plan = null;
         planError = String(e);
       }
+      resolving = false;
     }, 250);
     return () => {
       current = false;
@@ -181,6 +181,8 @@
           channel{plan.channelsHz.length === 1 ? "" : "s"}
         </span>
         <span class="chans mono">{plan.channelsHz.slice(0, 8).map((c) => mhz(c)).join("  ")}{plan.channelsHz.length > 8 ? "  …" : ""}</span>
+      {:else if resolving}
+        <span class="hint">Working out the tuning…</span>
       {:else if isFile}
         <span class="hint">Choose a recording to continue.</span>
       {/if}
