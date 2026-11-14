@@ -5,6 +5,60 @@
 //! both a native backend and a Soapy module installed appears in both lists —
 //! the native line shows the exact `--sdr` args that select the native path.
 
+/// One SDR device xng can open.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DeviceEntry {
+    /// The exact `--sdr` selector that opens this device.
+    pub selector: String,
+    /// Human-readable name (the device's label, or its driver).
+    pub label: String,
+    /// Backend that serves it: "airspy", "airspyhf" or "soapysdr".
+    pub backend: &'static str,
+}
+
+/// Enumerate every device the compiled-in backends can see. Native
+/// backends come first; SoapySDR results honour `filter` (e.g.
+/// "driver=rtlsdr").
+#[cfg(any(feature = "soapy", feature = "airspy", feature = "airspyhf"))]
+pub fn list(filter: &str) -> anyhow::Result<Vec<DeviceEntry>> {
+    let mut out = Vec::new();
+    #[cfg(feature = "airspy")]
+    for sn in xng_sdr::airspy::enumerate()? {
+        out.push(DeviceEntry {
+            selector: format!("driver=airspy,serial={sn:016X}"),
+            label: format!("Airspy {sn:016X}"),
+            backend: "airspy",
+        });
+    }
+    #[cfg(feature = "airspyhf")]
+    for sn in xng_sdr::airspyhf::enumerate()? {
+        out.push(DeviceEntry {
+            selector: format!("driver=airspyhf,serial={sn:016X}"),
+            label: format!("Airspy HF+ {sn:016X}"),
+            backend: "airspyhf",
+        });
+    }
+    #[cfg(feature = "soapy")]
+    for d in xng_sdr::soapy::enumerate(filter)? {
+        let label = if d.label.is_empty() { d.driver.clone() } else { d.label.clone() };
+        // `backend=soapy` pins the SoapySDR path, so an Airspy that Soapy
+        // enumerates is opened by the backend this entry names rather than
+        // being rerouted to the native one. (xng strips the key before the
+        // args reach SoapySDR.)
+        let selector = if d.args.is_empty() { "backend=soapy".to_owned() } else { format!("{},backend=soapy", d.args) };
+        out.push(DeviceEntry { selector, label, backend: "soapysdr" });
+    }
+    #[cfg(not(feature = "soapy"))]
+    let _ = filter;
+    Ok(out)
+}
+
+/// Built without any SDR backend: nothing to list.
+#[cfg(not(any(feature = "soapy", feature = "airspy", feature = "airspyhf")))]
+pub fn list(_filter: &str) -> anyhow::Result<Vec<DeviceEntry>> {
+    Ok(Vec::new())
+}
+
 #[cfg(not(any(feature = "soapy", feature = "airspy", feature = "airspyhf")))]
 pub fn run(_filter: &str) -> anyhow::Result<()> {
     anyhow::bail!("xng was built without SDR device support; rebuild with --features soapy")

@@ -13,7 +13,7 @@ use xng_types::{Mode, StationIdentity};
 
 /// Built-in frequency plans (kHz). Curated, worldwide-common channels;
 /// the HFDL list follows the public system table.
-pub(crate) fn plan(mode: Mode) -> (f64, Vec<u64>) {
+pub fn plan(mode: Mode) -> (f64, Vec<u64>) {
     let k = |v: &[u32]| v.iter().map(|&f| f as u64 * 1_000).collect::<Vec<u64>>();
     match mode {
         Mode::AcarsPoa => (
@@ -94,7 +94,7 @@ pub(crate) fn plan(mode: Mode) -> (f64, Vec<u64>) {
 /// the worldwide/primary frequencies where traffic eventually shows up.
 /// (A 90 s dwell routinely undersells a site — observed first-hand: the
 /// channels busiest over 30 minutes had been scored quiet.)
-pub(crate) fn core_channels(mode: Mode) -> Vec<u64> {
+pub fn core_channels(mode: Mode) -> Vec<u64> {
     let k = |v: &[u32]| v.iter().map(|&f| f as u64 * 1_000).collect::<Vec<u64>>();
     match mode {
         // Worldwide primary + the common US/EU secondaries.
@@ -123,7 +123,7 @@ pub(crate) fn core_channels(mode: Mode) -> Vec<u64> {
 }
 
 /// Per-channel passband the DDC must preserve, by mode.
-pub(crate) fn passband(mode: Mode) -> f64 {
+pub fn passband(mode: Mode) -> f64 {
     match mode {
         Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
         Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
@@ -149,7 +149,7 @@ pub(crate) fn passband(mode: Mode) -> f64 {
 
 /// Per-channel decoder input rate, by mode: an acceptable capture rate
 /// must be an integer multiple of this (the DDC decimates by integers).
-pub(crate) fn channel_rate(mode: Mode) -> f64 {
+pub fn channel_rate(mode: Mode) -> f64 {
     match mode {
         Mode::Ais => xng_mode_ais::CHANNEL_RATE,
         Mode::Vdl2 => xng_mode_vdl2::CHANNEL_RATE,
@@ -179,7 +179,7 @@ pub(crate) fn channel_rate(mode: Mode) -> f64 {
 /// report inclusive ranges; `Unknown` when we couldn't ask — callers then
 /// trust the mode's plan rate.
 #[derive(Debug, Clone)]
-pub(crate) enum RateCaps {
+pub enum RateCaps {
     Discrete(Vec<u32>),
     /// `(min, max, step)` Hz; `step == 0.0` means continuous.
     Ranges(Vec<(f64, f64, f64)>),
@@ -193,7 +193,7 @@ pub(crate) enum RateCaps {
 /// menu (e.g. RTL-SDR's 0.25–3.2 MS/s) from stranding a mode at a too-narrow
 /// capture. Falls back to the plan rate when nothing fits or support is
 /// unknown.
-pub(crate) fn choose_rate(caps: &RateCaps, mode: Mode, plan_rate: f64) -> f64 {
+pub fn choose_rate(caps: &RateCaps, mode: Mode, plan_rate: f64) -> f64 {
     match caps {
         RateCaps::Unknown => plan_rate,
         RateCaps::Discrete(rates) => pick_auto_rate(rates, mode, plan_rate),
@@ -306,7 +306,7 @@ pub(crate) fn pick_auto_rate(advertised: &[u32], mode: Mode, plan_rate: f64) -> 
 /// reasonably prefer a different one. Currently: Mode S on a device whose
 /// fast integer-path rate sits well above the plan (an Airspy), where a
 /// lighter fractional capture is a sensible alternative via an explicit `-r`.
-pub(crate) fn rate_choice_hint(mode: Mode, chosen: f64, plan_rate: f64) -> Option<String> {
+pub fn rate_choice_hint(mode: Mode, chosen: f64, plan_rate: f64) -> Option<String> {
     if prefers_even_integer_rate(mode) && chosen > plan_rate * 1.5 {
         Some(format!(
             "ADS-B at {:.1} MS/s uses the high-resolution integer demod path; \
@@ -358,7 +358,7 @@ pub(crate) fn group_channels(channels: &[u64], sample_rate: f64, passband: f64) 
 /// Pick the capture window and channel set for zero-config tuning: the
 /// densest window of the mode's plan, trimmed to a CPU budget with the
 /// core (worldwide-primary) channels kept first, then nearest-to-center.
-pub(crate) fn auto_window(mode: Mode, rate: f64, max_channels: usize) -> Option<(u64, Vec<u64>)> {
+pub fn auto_window(mode: Mode, rate: f64, max_channels: usize) -> Option<(u64, Vec<u64>)> {
     let (_, plan_channels) = plan(mode);
     if plan_channels.is_empty() {
         return None;
@@ -422,7 +422,7 @@ pub fn run(
     // Probe once: pick each mode's rate from what this device actually
     // supports (Airspy's fixed list, a SoapySDR device's ranges), preferring
     // the plan rate.
-    let caps = crate::probe_rate_caps(sdr);
+    let caps = crate::sdr_open::probe_rate_caps(sdr);
     for &mode in modes {
         let (plan_rate, channels) = plan(mode);
         if channels.is_empty() {
@@ -585,7 +585,7 @@ pub(crate) fn scan_group(
     channels: &[u64],
     dwell_secs: u64,
 ) -> anyhow::Result<(Vec<ChannelResult>, Vec<serde_json::Value>)> {
-    let (mut source, _) = crate::open_sdr(sdr, rate, center, gain)?;
+    let (mut source, _) = crate::sdr_open::open_sdr(sdr, rate, center, gain)?;
     let cfg = SessionConfig {
         mode,
         center_hz: center,

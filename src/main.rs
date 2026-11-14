@@ -3,18 +3,12 @@
 //! M1: native ACARS decoding from SDR hardware or IQ recordings, with
 //! console/JSONL outputs and acarsdec-compatible Airframes feeding.
 
-mod beam;
-mod bus;
-mod commands;
-mod tui;
-mod freq;
-mod outputs;
-mod runtime;
-mod satmap;
-mod sdr_args;
 
 use clap::{Args, Parser, Subcommand};
-use outputs::console::ConsoleFormat;
+use xng::sdr_open::open_sdr;
+use xng::tuning::{self, parse_receiver_pos, parse_tune, resolve_tune_auto};
+use xng::{commands, freq, outputs, runtime, satmap, sdr_args, tui};
+use xng::outputs::console::ConsoleFormat;
 use std::path::PathBuf;
 use xng_sdr::{FileIqSource, IqFormat};
 
@@ -78,15 +72,19 @@ struct TuneOpts {
     max_ppm: Option<f64>,
 }
 
-/// Parse `--receiver-pos` / `receiver-pos` ("lat,lon").
-fn parse_receiver_pos(s: &Option<String>) -> anyhow::Result<Option<(f64, f64)>> {
-    match s {
-        None => Ok(None),
-        Some(v) => {
-            let (a, b) = v
-                .split_once(',')
-                .ok_or_else(|| anyhow::anyhow!("--receiver-pos wants lat,lon"))?;
-            Ok(Some((a.trim().parse()?, b.trim().parse()?)))
+impl TuneOpts {
+    /// The library-level tune request these flags describe.
+    fn tune(&self) -> tuning::Tune {
+        tuning::Tune {
+            mode: self.mode.clone(),
+            sample_rate: self.sample_rate,
+            center_freq: self.center_freq.clone(),
+            channels: self.channels.clone(),
+            receiver_pos: self.receiver_pos.clone(),
+            filter_labels: self.filter_labels.clone(),
+            exclude_labels: self.exclude_labels.clone(),
+            demod_effort: self.demod_effort,
+            max_ppm: self.max_ppm,
         }
     }
 }
@@ -449,151 +447,6 @@ fn init_logging(verbose: u8) {
     tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
 }
 
-/// Strict tune parsing for decode/listen: everything must be explicit.
-fn parse_tune(tune: &TuneOpts) -> anyhow::Result<(xng_types::Mode, f64, u64, Vec<u64>)> {
-    let mode: xng_types::Mode = tune.mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let rate = tune
-        .sample_rate
-        .ok_or_else(|| anyhow::anyhow!("missing -r/--sample-rate"))?;
-    let center = tune
-        .center_freq
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("missing -c/--center-freq"))?;
-    let center = freq::parse_hz(center)?;
-    anyhow::ensure!(!tune.channels.is_empty(), "missing --channels");
-    let channels = tune
-        .channels
-        .iter()
-        .map(|c| freq::parse_hz(c))
-        .collect::<anyhow::Result<Vec<u64>>>()?;
-    Ok((mode, rate, center, channels))
-}
-
-/// Zero-config tuning for the tui: anything omitted is derived from the
-/// mode's built-in frequency plan — sample rate from the plan (checked
-/// against the device's advertised rates where a native backend can
-/// tell us), channels from the densest capture window that fits it
-/// (trimmed to a CPU budget, core channels first), center from the
-/// chosen channels.
-fn resolve_tune_auto(
-    tune: &TuneOpts,
-    sdr: &str,
-) -> anyhow::Result<(xng_types::Mode, f64, u64, Vec<u64>)> {
-    let mode: xng_types::Mode = tune.mode.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-    let (plan_rate, plan_channels) = commands::scan::plan(mode);
-    let rate = match tune.sample_rate {
-        Some(r) => r,
-        None => {
-            let caps = probe_rate_caps(sdr);
-            let r = commands::scan::choose_rate(&caps, mode, plan_rate);
-            if r != plan_rate {
-                tracing::info!(
-                    "auto-tune: using {} S/s (device does not offer the plan's {} S/s)",
-                    r as u64,
-                    plan_rate as u64
-                );
-            }
-            if let Some(hint) = commands::scan::rate_choice_hint(mode, r, plan_rate) {
-                tracing::info!("auto-tune: {hint}");
-            }
-            r
-        }
-    };
-
-    // Explicit channels: only the center may need deriving.
-    if !tune.channels.is_empty() {
-        let channels = tune
-            .channels
-            .iter()
-            .map(|c| freq::parse_hz(c))
-            .collect::<anyhow::Result<Vec<u64>>>()?;
-        let center = match &tune.center_freq {
-            Some(c) => freq::parse_hz(c)?,
-            None => centroid_off_dc(&channels, commands::scan::passband(mode) > 0.0),
-        };
-        return Ok((mode, rate, center, channels));
-    }
-
-    // Explicit center, channels from the plan: keep plan channels that
-    // fit the capture around that center.
-    if let Some(c) = &tune.center_freq {
-        let center = freq::parse_hz(c)?;
-        let half = (rate * 0.4) as i64; // 80% usable width, half each side
-        let channels: Vec<u64> = plan_channels
-            .iter()
-            .copied()
-            .filter(|f| (*f as i64 - center as i64).abs() <= half)
-            .collect();
-        anyhow::ensure!(
-            !channels.is_empty(),
-            "no {mode} plan channels within the capture around {:.3} MHz; pass --channels",
-            center as f64 / 1e6
-        );
-        return Ok((mode, rate, center, channels));
-    }
-
-    // Fully automatic. DDC-per-channel is cheap, but a small box should
-    // not be saddled with a worldwide plan: budget ~4 channels per core.
-    let budget = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) * 4;
-    let (center, channels) = commands::scan::auto_window(mode, rate, budget)
-        .ok_or_else(|| {
-            anyhow::anyhow!("mode {mode} has no built-in frequency plan; pass --channels")
-        })?;
-    tracing::info!(
-        "auto-tune: {} channel(s) around {:.3} MHz at {} S/s (budget {budget})",
-        channels.len(),
-        center as f64 / 1e6,
-        rate as u64
-    );
-    Ok((mode, rate, center, channels))
-}
-
-/// Probe what sample rates the device `--sdr` selects can do. Native backends
-/// report an exact discrete set; SoapySDR devices (RTL-SDR, HackRF, SDRplay…)
-/// report advertised ranges; otherwise [`RateCaps::Unknown`] so callers fall
-/// back to the mode's plan rate.
-pub(crate) fn probe_rate_caps(sdr: &str) -> commands::scan::RateCaps {
-    use commands::scan::RateCaps;
-    let args = sdr_args::SdrArgs::parse(sdr);
-    let serial = || args.serial.as_deref().and_then(|s| sdr_args::parse_airspy_serial(s).ok());
-    let _ = &serial; // used only by the cfg'd arms below
-    if !args.force_soapy {
-        match args.driver.as_deref() {
-            #[cfg(feature = "airspy")]
-            Some("airspy") => {
-                if let Ok(r) = xng_sdr::airspy::device_rates(serial()) {
-                    return RateCaps::Discrete(r);
-                }
-            }
-            #[cfg(feature = "airspyhf")]
-            Some("airspyhf") => {
-                if let Ok(r) = xng_sdr::airspyhf::device_rates(serial()) {
-                    return RateCaps::Discrete(r);
-                }
-            }
-            _ => {}
-        }
-    }
-    #[cfg(feature = "soapy")]
-    {
-        let ranges = xng_sdr::soapy::sample_rate_ranges(&args.soapy);
-        if !ranges.is_empty() {
-            return RateCaps::Ranges(ranges);
-        }
-    }
-    RateCaps::Unknown
-}
-
-/// Midpoint of a channel set. For DDC modes (`avoid_dc`) the midpoint is
-/// nudged off any exact channel so no carrier sits at DC; whole-capture
-/// modes (Mode S) require the channel AT the center, so they pass
-/// `avoid_dc = false`.
-fn centroid_off_dc(channels: &[u64], avoid_dc: bool) -> u64 {
-    let center =
-        (channels.iter().min().unwrap() + channels.iter().max().unwrap()) / 2;
-    if avoid_dc && channels.contains(&center) { center + 25_000 } else { center }
-}
-
 /// Parse the command line, set up logging and the decode pool, and run the
 /// chosen subcommand.
 fn main() -> anyhow::Result<()> {
@@ -606,9 +459,8 @@ fn main() -> anyhow::Result<()> {
     // --decode-threads pins the count. build_global is one-shot, so only
     // call it when overriding.
     if let Some(n) = cli.decode_threads {
-        let n = n.max(1);
-        if rayon::ThreadPoolBuilder::new().num_threads(n).build_global().is_ok() {
-            tracing::info!("decode worker threads: {n}");
+        if runtime::set_decode_threads(n) {
+            tracing::info!("decode worker threads: {}", n.max(1));
         }
     } else {
         let auto = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
@@ -629,7 +481,7 @@ fn main() -> anyhow::Result<()> {
                     anyhow::anyhow!("cannot guess IQ format; pass --format (cf32|cs16|cs8|cu8)")
                 })?,
             };
-            let (mode, rate, center_hz, channels_hz) = parse_tune(&tune)?;
+            let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
             let (mut outputs, station_ident) = output.build()?;
             outputs.airframes =
                 Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
@@ -734,7 +586,7 @@ fn main() -> anyhow::Result<()> {
             commands::scan::run(&sdr, gain, &modes, dwell, out.as_deref())
         }
         Command::Tui { sdr, gain, file, format, tune } => {
-            let (mode, rate, center_hz, channels_hz) = resolve_tune_auto(&tune, &sdr)?;
+            let (mode, rate, center_hz, channels_hz) = resolve_tune_auto(&tune.tune(), &sdr)?;
             let source: Box<dyn xng_sdr::IqSource> = match file {
                 Some(path) => {
                     let fmt = match format.as_deref() {
@@ -800,10 +652,7 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Open an SDR from `--sdr` args, returning the source and the backend that
-/// served it. `driver=airspy` / `driver=airspyhf` use the native backends
-/// when compiled in (falling through to SoapySDR otherwise, where a
-/// SoapyAirspy module may exist); `backend=soapy` forces the fallthrough.
+/// `xng station`: load a station TOML and run every session it names.
 fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
     let st = commands::station::load(config)?;
 
@@ -868,7 +717,7 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         let label = format!("session {} ({})", i + 1, sess.mode);
         // Tuning: explicit values, or the mode plan via the same
         // derivation the TUI uses.
-        let tune = TuneOpts {
+        let tune = tuning::Tune {
             mode: sess.mode.clone(),
             sample_rate: sess.sample_rate,
             center_freq: sess.center.clone(),
@@ -1082,72 +931,8 @@ fn print_table(headers: &[&str], rows: &[[String; 5]]) {
     println!("  {}", line("└", "┴", "┘"));
 }
 
-fn open_sdr(
-    sdr: &str,
-    sample_rate: f64,
-    center_hz: u64,
-    gain: Option<f64>,
-) -> anyhow::Result<(Box<dyn xng_sdr::IqSource>, &'static str)> {
-    let args = sdr_args::SdrArgs::parse(sdr);
-    match args.driver.as_deref() {
-        Some("airspy") if !args.force_soapy => {
-            #[cfg(feature = "airspy")]
-            {
-                let serial =
-                    args.serial.as_deref().map(sdr_args::parse_airspy_serial).transpose()?;
-                let src = xng_sdr::airspy::AirspyIqSource::open(
-                    serial,
-                    sample_rate,
-                    center_hz,
-                    gain,
-                    args.bias,
-                )?;
-                return Ok((Box::new(src), "airspy"));
-            }
-        }
-        Some("airspyhf") if !args.force_soapy => {
-            #[cfg(feature = "airspyhf")]
-            {
-                let serial =
-                    args.serial.as_deref().map(sdr_args::parse_airspy_serial).transpose()?;
-                let src = xng_sdr::airspyhf::AirspyHfIqSource::open(
-                    serial,
-                    sample_rate,
-                    center_hz,
-                    gain,
-                    args.bias,
-                )?;
-                return Ok((Box::new(src), "airspyhf"));
-            }
-        }
-        _ => {}
-    }
-    open_soapy(&args.soapy, sample_rate, center_hz, gain)
-}
-
-#[cfg(feature = "soapy")]
-fn open_soapy(
-    args: &str,
-    sample_rate: f64,
-    center_hz: u64,
-    gain: Option<f64>,
-) -> anyhow::Result<(Box<dyn xng_sdr::IqSource>, &'static str)> {
-    let src = xng_sdr::soapy::SoapyIqSource::open(args, sample_rate, center_hz, gain)?;
-    Ok((Box::new(src), "soapysdr"))
-}
-
-#[cfg(not(feature = "soapy"))]
-fn open_soapy(
-    _args: &str,
-    _sample_rate: f64,
-    _center_hz: u64,
-    _gain: Option<f64>,
-) -> anyhow::Result<(Box<dyn xng_sdr::IqSource>, &'static str)> {
-    anyhow::bail!("built without SDR support; use --file or rebuild with --features soapy")
-}
-
 fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
-    let (mode, rate, center_hz, channels_hz) = parse_tune(tune)?;
+    let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
     let (mut outputs, station_ident) = output.build()?;
     outputs.airframes =
         Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
