@@ -25,7 +25,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             deb: true
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           # No SDR backend on Windows yet: IQ files and stdin work.
           - os: windows-latest
@@ -124,9 +124,10 @@ jobs:
           | `xng-desktop-*-aarch64-apple-darwin.dmg` | Desktop app, macOS Apple Silicon |
           | `xng-desktop-*-x86_64-pc-windows-msvc.exe` | Desktop app installer, Windows x86_64 (IQ recordings; no SDR backend yet) |
 
-          The desktop installers are not code-signed yet. macOS: right-click
-          the app and choose Open the first time. Windows: choose "More info"
-          then "Run anyway" on the SmartScreen prompt.
+          The desktop installers are not code-signed yet. macOS: open the
+          app once, then allow it under System Settings > Privacy & Security >
+          Open Anyway. Windows: choose "More info" then "Run anyway" on the
+          SmartScreen prompt.
 
           Intel macOS: build from source (GitHub retired its free Intel
           macOS runners) — `brew install soapysdr airspy airspyhf protobuf

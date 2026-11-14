@@ -58,9 +58,9 @@ installers to each tagged release:
 | macOS Apple Silicon | `.dmg` | SoapySDR, native Airspy and Airspy HF+ (`brew install soapysdr airspy airspyhf`) |
 | Windows x86_64 | `.exe` setup | IQ recordings only for now |
 
-The installers are not code-signed yet. On macOS, right-click the app and
-choose Open the first time. On Windows, choose "More info" then "Run anyway"
-on the SmartScreen prompt.
+The installers are not code-signed yet. On macOS, open the app once, then
+allow it under System Settings > Privacy & Security > Open Anyway. On Windows,
+choose "More info" then "Run anyway" on the SmartScreen prompt.
 
 ## How it stays fast
 
