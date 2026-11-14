@@ -10,5 +10,7 @@ export default defineConfig({
     strictPort: true,
     watch: { ignored: ["**/src-tauri/**"] },
   },
+  // maplibre-gl's worker is an ES module that imports a shared chunk.
+  worker: { format: "es" },
   build: { target: "es2022", chunkSizeWarningLimit: 1200 },
 });
