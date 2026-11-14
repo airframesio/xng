@@ -157,7 +157,9 @@ Prometheus endpoint emits `xng_frames_total` / `xng_frames_crc_ok_total`
 mode, `xng_acars_messages_total{mode,freq,label}` for per-ACARS-label
 volume (CRC-valid frames only — a garbled bad-CRC label would otherwise
 spawn unbounded junk series), and `xng_fec_corrected_total{mode,freq}` for
-FEC-corrected units per channel. In station mode all sessions feed one shared `LiveState`
+FEC-corrected units per channel. A first-party starter Grafana dashboard built
+on these series ships at [`docs/grafana/xng-dashboard.json`](grafana/xng-dashboard.json).
+In station mode all sessions feed one shared `LiveState`
 counter set (previously the served state was a never-updated copy, so
 station `/metrics` read all zeros).
 

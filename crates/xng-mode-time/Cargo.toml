@@ -1,0 +1,16 @@
+[package]
+name = "xng-mode-time"
+description = "Native multi-band radio time-signal decode core for xng: station catalog + capability auto-scan (WWV/WWVH/CHU/WWVB/DCF77/MSF/JJY/BPM/RWM/TDF/RBU/YVTO), CHU AFSK (Bell-103) and WWV/WWVH 100 Hz BCD time-code decoders"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+num-complex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+xng-dsp.workspace = true
+xng-types.workspace = true

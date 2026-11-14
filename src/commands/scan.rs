@@ -77,6 +77,15 @@ pub(crate) fn plan(mode: Mode) -> (f64, Vec<u64>) {
         Mode::Flex => (2_400_000.0, k(&[929_000, 931_000])),
         // VDES ASM 1/2 (the former AIS 27/28 region): 161.950 / 162.000 MHz.
         Mode::Vdes => (2_400_000.0, k(&[161_950, 162_000])),
+        // Multi-band radio time signals — the DECODABLE HF stations: CHU
+        // (3330/7850/14670 kHz) and WWV/WWVH (2.5/5/10/15/20 MHz). The full
+        // catalog (incl. LF WWVB/DCF77/MSF/JJY) lives in xng_mode_time::catalog
+        // and is auto-pruned to the SDR's tunable range via receivable(); this
+        // is the worked HF channel plan. (Each is its own narrow HF capture.)
+        Mode::Time => (
+            768_000.0,
+            k(&[2_500, 3_330, 5_000, 7_850, 10_000, 14_670, 15_000, 20_000]),
+        ),
         _ => (2_400_000.0, vec![]),
     }
 }
@@ -106,6 +115,9 @@ pub(crate) fn core_channels(mode: Mode) -> Vec<u64> {
         Mode::Eot => k(&[457_937]),
         Mode::Flex => k(&[929_000]),
         Mode::Vdes => k(&[161_950]),
+        // CHU 7850 kHz + WWV 10 MHz are the most-reliable round-the-clock HF
+        // time channels.
+        Mode::Time => k(&[7_850, 10_000]),
         _ => Vec::new(),
     }
 }
@@ -130,6 +142,7 @@ pub(crate) fn passband(mode: Mode) -> f64 {
         Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
         Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
         Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
+        Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
         _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
     }
 }
@@ -156,6 +169,7 @@ pub(crate) fn channel_rate(mode: Mode) -> f64 {
         Mode::Eot => xng_mode_eot::CHANNEL_RATE,
         Mode::Flex => xng_mode_flex::CHANNEL_RATE,
         Mode::Vdes => xng_mode_vdes::CHANNEL_RATE,
+        Mode::Time => xng_mode_time::CHANNEL_RATE,
         _ => xng_mode_acars::CHANNEL_RATE,
     }
 }

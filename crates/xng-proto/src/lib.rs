@@ -154,6 +154,13 @@ impl From<&Message> for asf2::DecodedMessage {
                     details_json: details.to_string(),
                 }))
             }
+            // Time signal: carry the station as the generic `kind`.
+            MessageBody::Time { station, details } => {
+                Some(asf2::decoded_message::Body::Generic(asf2::GenericBody {
+                    kind: station.clone(),
+                    details_json: details.to_string(),
+                }))
+            }
             MessageBody::Undecoded => Some(asf2::decoded_message::Body::Undecoded(true)),
         };
         asf2::DecodedMessage {

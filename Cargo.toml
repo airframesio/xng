@@ -52,6 +52,7 @@ xng-mode-pocsag = { path = "crates/xng-mode-pocsag" }
 xng-mode-eot = { path = "crates/xng-mode-eot" }
 xng-mode-flex = { path = "crates/xng-mode-flex" }
 xng-mode-vdes = { path = "crates/xng-mode-vdes" }
+xng-mode-time = { path = "crates/xng-mode-time" }
 prost = "0.13"
 tonic = "0.12"
 quinn = "0.11"
@@ -126,6 +127,7 @@ xng-mode-pocsag.workspace = true
 xng-mode-eot.workspace = true
 xng-mode-flex.workspace = true
 xng-mode-vdes.workspace = true
+xng-mode-time.workspace = true
 prost.workspace = true
 tonic.workspace = true
 quinn.workspace = true

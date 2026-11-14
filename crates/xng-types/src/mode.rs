@@ -50,6 +50,9 @@ pub enum Mode {
     /// VDES ASM — VHF Data Exchange System Application-Specific Messages
     /// (the AIS 27/28 → ASM1/2 channels; ITU-R M.2092).
     Vdes,
+    /// Multi-band radio time signals (WWV/WWVH/CHU on HF; WWVB/DCF77/MSF/JJY
+    /// on LF). The decodable HF stations carry CHU AFSK or WWV 100 Hz BCD.
+    Time,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -78,6 +81,7 @@ impl Mode {
             Mode::Eot => "eot",
             Mode::Flex => "flex",
             Mode::Vdes => "vdes",
+            Mode::Time => "time",
             Mode::Extern => "extern",
         }
     }
@@ -106,6 +110,7 @@ impl Mode {
             Mode::Eot,
             Mode::Flex,
             Mode::Vdes,
+            Mode::Time,
         ]
     }
 }
@@ -142,6 +147,7 @@ impl std::str::FromStr for Mode {
             "eot" | "hot" | "eotd" | "dpu" => Ok(Mode::Eot),
             "flex" | "flex-next" | "flexnext" => Ok(Mode::Flex),
             "vdes" | "vdes-asm" | "asm" => Ok(Mode::Vdes),
+            "time" | "timesignal" | "time-signal" | "wwv" | "chu" => Ok(Mode::Time),
             other => Err(format!("unknown mode: {other}")),
         }
     }

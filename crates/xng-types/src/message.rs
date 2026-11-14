@@ -242,6 +242,13 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// Radio time signal (WWV/WWVH/CHU on HF; LF stations catalogued).
+    /// `station` = call sign; `details` = decoded UTC (ISO-8601) + fields
+    /// (year/doy/h/m/s), DUT1, flags, and sync confidence.
+    Time {
+        station: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 

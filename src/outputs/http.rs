@@ -476,6 +476,13 @@ fn update(d: &mut Dash, m: &Message) {
                 ("adsb_version", adsb_status.as_ref().and_then(|s| s.get("version").cloned())),
                 ("nacp", adsb_status.as_ref().and_then(|s| s.get("nac_p").cloned())),
                 ("sil", adsb_status.as_ref().and_then(|s| s.get("sil").cloned())),
+                // Remaining readsb accuracy/integrity fields (ADSB-9): velocity
+                // accuracy, baro-altitude integrity, geometric VA, system design
+                // assurance — all already on adsb_status from TC19/TC29/TC31.
+                ("nac_v", adsb_status.as_ref().and_then(|s| s.get("nac_v").cloned())),
+                ("nic_baro", adsb_status.as_ref().and_then(|s| s.get("nic_baro").cloned())),
+                ("gva", adsb_status.as_ref().and_then(|s| s.get("gva").cloned())),
+                ("sda", adsb_status.as_ref().and_then(|s| s.get("sda").cloned())),
                 // TC29 target-state selected altitude; BDS 4,4 wind/temp.
                 ("sel_alt", adsb_status.as_ref().and_then(|s| s.get("selected_altitude").cloned())),
                 ("wind_kt", comm_b.as_ref().and_then(|s| s.get("wind_speed").cloned())),
@@ -998,6 +1005,10 @@ fn aircraft_json(d: &Dash, since: Option<u64>) -> String {
             copy(&mut o, a, "squawk", "squawk");
             copy(&mut o, a, "nacp", "nac_p");
             copy(&mut o, a, "sil", "sil");
+            copy(&mut o, a, "nac_v", "nac_v");
+            copy(&mut o, a, "nic_baro", "nic_baro");
+            copy(&mut o, a, "gva", "gva");
+            copy(&mut o, a, "sda", "sda");
             copy(&mut o, a, "adsb_version", "version");
             copy(&mut o, a, "sel_alt", "nav_altitude_mcp");
             if a.get("lat").is_some() && a.get("lon").is_some() {

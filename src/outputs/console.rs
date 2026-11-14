@@ -621,6 +621,29 @@ pub fn format_message(msg: &Message, fmt: ConsoleFormat) -> String {
                     }
                     s
                 }
+                MessageBody::Time { station, details } => {
+                    let mut s = format!("TIME {station}");
+                    if let Some(utc) = details.get("utc").and_then(|v| v.as_str()) {
+                        s.push_str(&format!(" {utc}"));
+                    } else {
+                        // Format-B / partial: surface whatever fields decoded.
+                        for (key, label) in [("year", "yr"), ("day_of_year", "doy"), ("hour", "h"), ("minute", "m"), ("second", "s")] {
+                            if let Some(v) = details.get(key) {
+                                s.push_str(&format!(" {label}={v}"));
+                            }
+                        }
+                    }
+                    if let Some(dut1) = details.get("dut1_s").and_then(|v| v.as_f64()) {
+                        s.push_str(&format!(" DUT1={dut1:+.1}s"));
+                    }
+                    if details.get("leap_pending").and_then(|v| v.as_bool()) == Some(true) {
+                        s.push_str(" LEAP");
+                    }
+                    if details.get("valid").and_then(|v| v.as_bool()) == Some(false) {
+                        s.push_str(" [unverified]");
+                    }
+                    s
+                }
                 MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
             };
             format!(
