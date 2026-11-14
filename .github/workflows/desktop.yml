@@ -1,0 +1,116 @@
+name: Desktop
+
+# Builds, tests and packages the desktop app (desktop/) on every platform it
+# ships for. Pull requests and master pushes keep the installers as workflow
+# artifacts; the Release workflow calls this one and attaches them to the
+# GitHub release.
+#
+# Installers are unsigned: macOS gets an ad-hoc signature (Gatekeeper asks on
+# first open), Windows shows SmartScreen. Signing needs the project's
+# certificates and is not wired up here.
+
+on:
+  push:
+    branches: [ "master" ]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    branches: [ "master" ]
+    paths:
+      - "desktop/**"
+      - "src/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/desktop.yml"
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: Desktop ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04 so the .deb installs on current Debian and Ubuntu releases.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: deb
+            cargo_args: --features airspy,airspyhf
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            bundles: deb
+            cargo_args: --features airspy,airspyhf
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bundles: app,dmg
+            cargo_args: --features airspy,airspyhf
+          # No SDR backend on Windows yet (same as the CLI's Windows build):
+          # the app decodes IQ recordings there.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: nsis
+            cargo_args: --no-default-features
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+          key: ${{ matrix.target }}
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt update
+          sudo apt install -y libsoapysdr-dev libairspy-dev libairspyhf-dev protobuf-compiler \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install soapysdr airspy airspyhf protobuf
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y --no-progress
+      - name: Install UI dependencies
+        run: npm ci
+      - name: Type-check UI
+        run: npm run check
+      - name: Build UI
+        run: npm run build
+      - name: Run tests
+        working-directory: desktop/src-tauri
+        run: cargo test ${{ matrix.cargo_args }}
+      - name: Build installers
+        run: npx tauri build --bundles ${{ matrix.bundles }} -- ${{ matrix.cargo_args }}
+      - name: Collect installers
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          OUT="xng-desktop-${VERSION}-${{ matrix.target }}"
+          mkdir -p ../dist-desktop
+          shopt -s nullglob
+          for f in src-tauri/target/release/bundle/*/*.{deb,dmg,exe}; do
+            cp "$f" "../dist-desktop/${OUT}.${f##*.}"
+          done
+          ls -l ../dist-desktop
+          test -n "$(ls ../dist-desktop)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-desktop-${{ matrix.target }}
+          path: dist-desktop/*
+          if-no-files-found: error
