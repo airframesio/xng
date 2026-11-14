@@ -82,7 +82,9 @@ pub enum Event {
     #[serde(rename_all = "camelCase")]
     Started { station: String, sessions: Vec<SessionSummary> },
     #[serde(rename_all = "camelCase")]
-    Messages { items: Vec<MessageItem>, skipped: u64 },
+    /// `skipped` messages were left out of `items`; `lagged` of those
+    /// were lost to this reader altogether, so the map missed them too.
+    Messages { items: Vec<MessageItem>, skipped: u64, lagged: u64 },
     #[serde(rename_all = "camelCase")]
     Live { sessions: Vec<SessionLive>, elapsed_ms: u64 },
     #[serde(rename_all = "camelCase")]
@@ -222,7 +224,7 @@ fn pump(
     let started = Instant::now();
     let (mut last_msgs, mut last_live, mut last_ents) = (started, started, started);
     let mut batch: Vec<MessageItem> = Vec::new();
-    let mut skipped: u64 = 0;
+    let (mut skipped, mut lagged): (u64, u64) = (0, 0);
     let mut next_id: u64 = 0;
     let mut closed = false;
 
@@ -239,7 +241,12 @@ fn pump(
                         skipped += 1;
                     }
                 }
-                Err(TryRecvError::Lagged(n)) => skipped += n,
+                // The bus overwrote these before the pump read them: they
+                // never reached the dashboard, so report them apart.
+                Err(TryRecvError::Lagged(n)) => {
+                    skipped += n;
+                    lagged += n;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Closed) => {
                     closed = true;
@@ -249,11 +256,14 @@ fn pump(
         }
 
         let now = Instant::now();
-        let finished = closed || engine.is_finished();
+        // Only a closed bus ends the session. The engine closes it before
+        // it reports itself finished, so going by `is_finished` alone could
+        // leave the last messages unread.
+        let finished = closed;
         if (now - last_msgs >= MESSAGE_EVERY || finished) && (!batch.is_empty() || skipped > 0) {
             let items = std::mem::take(&mut batch);
-            let _ = ch.send(Event::Messages { items, skipped });
-            skipped = 0;
+            let _ = ch.send(Event::Messages { items, skipped, lagged });
+            (skipped, lagged) = (0, 0);
             last_msgs = now;
         }
         if now - last_live >= LIVE_EVERY || finished {

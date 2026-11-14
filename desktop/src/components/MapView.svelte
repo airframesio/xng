@@ -84,6 +84,9 @@
   }
 
   function addLayers(m: maplibregl.Map) {
+    // Runs for the first style and again for the offline fallback style;
+    // both `load` and `styledata` can report the same one.
+    if (m.getSource("points")) return;
     const ink = css("--ink");
     const bg = css("--bg");
     const colour: maplibregl.ExpressionSpecification = [

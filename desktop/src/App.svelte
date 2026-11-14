@@ -29,7 +29,12 @@
   {/if}
   {#if active && app.dropped > 0}
     <div class="banner">
-      {app.dropped.toLocaleString()} messages arrived faster than the list can show and were left out of it. Outputs, feeds and the map still received every one.
+      {app.dropped.toLocaleString()} messages arrived faster than the list can show and were left out of it.
+      {#if app.lagged > 0}
+        Outputs and feeds still received every one; the map missed {app.lagged.toLocaleString()} of them.
+      {:else}
+        Outputs, feeds and the map still received every one.
+      {/if}
     </div>
   {/if}
 

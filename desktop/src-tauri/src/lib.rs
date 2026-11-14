@@ -17,6 +17,9 @@ use tauri::State;
 #[derive(Default)]
 struct AppState {
     running: Mutex<Option<Running>>,
+    /// Set once the window is gone, so a session still opening its radio
+    /// is stopped as soon as it comes up instead of being kept.
+    closing: std::sync::atomic::AtomicBool,
 }
 
 /// SoapySDR loads its driver modules on first use and that is not safe to
@@ -131,7 +134,13 @@ async fn start_session(
         .await
         .map_err(err)?
         .map_err(err)?;
-    *state.running.lock().unwrap() = Some(running);
+    let mut slot = state.running.lock().unwrap();
+    if state.closing.load(std::sync::atomic::Ordering::Relaxed) {
+        drop(slot);
+        running.stop();
+        return Err("The window was closed".into());
+    }
+    *slot = Some(running);
     Ok(())
 }
 
@@ -193,6 +202,7 @@ pub fn run() {
             if let tauri::WindowEvent::Destroyed = event {
                 use tauri::Manager;
                 if let Some(state) = window.try_state::<AppState>() {
+                    state.closing.store(true, std::sync::atomic::Ordering::Relaxed);
                     if let Some(r) = state.running.lock().unwrap().take() {
                         r.stop();
                     }

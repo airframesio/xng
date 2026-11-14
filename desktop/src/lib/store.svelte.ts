@@ -99,9 +99,16 @@ export function saveSettings() {
 }
 
 export function resetAdvanced() {
-  const keep = {
+  const keep: Partial<Settings> = {
     sourceKind: settings.sourceKind, device: settings.device, filePath: settings.filePath, mode: settings.mode,
   };
+  // For a recording these describe the capture and live on the Setup
+  // screen, not in the Advanced panel.
+  if (settings.sourceKind === "file") {
+    Object.assign(keep, {
+      sampleRate: settings.sampleRate, centerFreq: settings.centerFreq, fileFormat: settings.fileFormat,
+    });
+  }
   Object.assign(settings, DEFAULTS, keep);
   saveSettings();
 }
@@ -184,6 +191,8 @@ class AppState {
   messages = $state.raw<MessageItem[]>([]);
   total = $state(0);
   dropped = $state(0);
+  /** Of `dropped`, how many the map missed as well. */
+  lagged = $state(0);
   channels = $state.raw<ChannelStat[]>([]);
   samples = $state(0);
   elapsedMs = $state(0);
@@ -245,6 +254,7 @@ class AppState {
     this.messages = [];
     this.total = 0;
     this.dropped = 0;
+    this.lagged = 0;
     this.channels = [];
     this.samples = 0;
     this.elapsedMs = 0;
@@ -289,6 +299,7 @@ class AppState {
         const n = e.items.length + e.skipped;
         this.total += n;
         this.dropped += e.skipped;
+        this.lagged += e.lagged ?? 0;
         const now = performance.now();
         this.rateWindow.push({ t: now, n });
         while (this.rateWindow.length && now - this.rateWindow[0].t > 5000) this.rateWindow.shift();

@@ -138,7 +138,7 @@ export interface EntityState {
 
 export type BackendEvent =
   | { type: "started"; station: string; sessions: SessionSummary[] }
-  | { type: "messages"; items: MessageItem[]; skipped: number }
+  | { type: "messages"; items: MessageItem[]; skipped: number; lagged?: number }
   | { type: "live"; sessions: SessionLive[]; elapsedMs: number }
   | { type: "entities"; state: EntityState }
   | { type: "ended"; error: string | null };
