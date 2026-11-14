@@ -62,9 +62,16 @@ The app is named XNG everywhere. Its Debian package is `xng-desktop`
 (set in `src-tauri/tauri.linux.conf.json`) so it installs next to the CLI's
 `xng` package.
 
-The installers are not code-signed yet. On macOS, open the app once, then
-allow it under System Settings > Privacy & Security > Open Anyway. On Windows,
-choose "More info" then "Run anyway" on the SmartScreen prompt.
+macOS builds are signed with the project's Developer ID certificate and
+notarized when the `APPLE_*` repository secrets listed at the top of
+`.github/workflows/desktop.yml` are set, on master pushes, releases and manual
+runs. Without them (and on pull requests) the app gets an ad-hoc signature:
+open it once, then allow it under System Settings > Privacy & Security > Open
+Anyway. `src-tauri/entitlements.plist` lets the signed app load Homebrew's
+SoapySDR and Airspy libraries.
+
+The Windows installer is not code-signed yet: choose "More info" then "Run
+anyway" on the SmartScreen prompt.
 
 ## How it stays fast
 

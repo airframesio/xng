@@ -5,9 +5,18 @@ name: Desktop
 # artifacts; the Release workflow calls this one and attaches them to the
 # GitHub release.
 #
-# Installers are unsigned: macOS gets an ad-hoc signature (Gatekeeper asks on
-# first open), Windows shows SmartScreen. Signing needs the project's
-# certificates and is not wired up here.
+# macOS signing: with the APPLE_* secrets below set, master pushes, releases
+# and manual runs sign the app with the Developer ID certificate and, when
+# the notarization secrets are there too, notarize it. Pull requests and
+# repositories without the secrets get an ad-hoc signature (Gatekeeper asks
+# on first open).
+#
+#   APPLE_CERTIFICATE           base64 of the Developer ID Application .p12
+#   APPLE_CERTIFICATE_PASSWORD  its export password (omit if it has none)
+#   APPLE_SIGNING_IDENTITY      "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID   notarization (app-specific password)
+#
+# Windows installers are unsigned (SmartScreen warns).
 
 on:
   push:
@@ -29,6 +38,7 @@ on:
       - "Cargo.lock"
       - ".github/workflows/desktop.yml"
   workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -105,6 +115,42 @@ jobs:
       - name: Run tests
         working-directory: desktop/src-tauri
         run: cargo test ${{ matrix.cargo_args }}
+      # Tauri signs and notarizes from these variables. They are only set
+      # when the secrets exist, so an empty value never replaces the ad-hoc
+      # identity in tauri.conf.json.
+      - name: Set up macOS signing
+        if: runner.os == 'macOS' && github.event_name != 'pull_request'
+        shell: bash
+        env:
+          CERT: ${{ secrets.APPLE_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NOTARY_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          if [ -z "$CERT" ] || [ -z "$IDENTITY" ]; then
+            echo "No signing certificate configured: building with an ad-hoc signature."
+            exit 0
+          fi
+          {
+            echo "APPLE_CERTIFICATE<<XNG_EOF"
+            echo "$CERT"
+            echo "XNG_EOF"
+            echo "APPLE_CERTIFICATE_PASSWORD=$CERT_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$IDENTITY"
+          } >> "$GITHUB_ENV"
+          echo "Signing with the configured Developer ID certificate."
+          if [ -n "$NOTARY_ID" ] && [ -n "$NOTARY_PASSWORD" ] && [ -n "$NOTARY_TEAM" ]; then
+            {
+              echo "APPLE_ID=$NOTARY_ID"
+              echo "APPLE_PASSWORD=$NOTARY_PASSWORD"
+              echo "APPLE_TEAM_ID=$NOTARY_TEAM"
+            } >> "$GITHUB_ENV"
+            echo "Notarizing with the configured Apple ID."
+          else
+            echo "No notarization credentials configured: the app will be signed but not notarized."
+          fi
       - name: Build installers
         run: npx tauri build --bundles ${{ matrix.bundles }} -- ${{ matrix.cargo_args }}
       - name: Collect installers
@@ -119,6 +165,11 @@ jobs:
           done
           ls -l ../dist-desktop
           test -n "$(ls ../dist-desktop)"
+      - name: Show macOS signature
+        if: runner.os == 'macOS'
+        run: |
+          codesign -dvv src-tauri/target/release/bundle/macos/XNG.app 2>&1 | grep -E "Authority|TeamIdentifier|Signature|flags" || true
+          spctl -a -vv src-tauri/target/release/bundle/macos/XNG.app 2>&1 || true
       - uses: actions/upload-artifact@v4
         with:
           name: dist-desktop-${{ matrix.target }}

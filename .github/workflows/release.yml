@@ -80,6 +80,7 @@ jobs:
   # Desktop app installers, built by the Desktop workflow.
   desktop:
     uses: ./.github/workflows/desktop.yml
+    secrets: inherit
 
   release:
     name: Publish release
@@ -124,10 +125,10 @@ jobs:
           | `xng-desktop-*-aarch64-apple-darwin.dmg` | Desktop app, macOS Apple Silicon |
           | `xng-desktop-*-x86_64-pc-windows-msvc.exe` | Desktop app installer, Windows x86_64 (IQ recordings; no SDR backend yet) |
 
-          The desktop installers are not code-signed yet. macOS: open the
-          app once, then allow it under System Settings > Privacy & Security >
-          Open Anyway. Windows: choose "More info" then "Run anyway" on the
-          SmartScreen prompt.
+          Windows: the desktop installer is not code-signed yet; choose
+          "More info" then "Run anyway" on the SmartScreen prompt. macOS: if
+          the app is blocked on first open, allow it under System Settings >
+          Privacy & Security > Open Anyway.
 
           Intel macOS: build from source (GitHub retired its free Intel
           macOS runners) — `brew install soapysdr airspy airspyhf protobuf
