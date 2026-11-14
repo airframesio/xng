@@ -29,3 +29,23 @@ jobs:
         name: xng-debian-package-latest
         path: |
           ./build/*.deb
+
+  # Windows: the decode core, CLI and every output build and test natively.
+  # SDR hardware backends are left out here (SoapySDR on Windows comes from
+  # a PothosSDR install); IQ files and stdin work.
+  windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install protoc
+      run: choco install protoc -y --no-progress
+    - name: Build
+      run: cargo build --verbose --release --no-default-features
+    - name: Run tests
+      run: cargo test --workspace --no-default-features --verbose
+    - name: Self-test
+      run: ./target/release/xng.exe selftest
+    - uses: actions/upload-artifact@v4
+      with:
+        name: xng-windows-x86_64-latest
+        path: ./target/release/xng.exe

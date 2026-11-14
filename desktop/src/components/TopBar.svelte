@@ -35,7 +35,7 @@
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
       <path d="M4 19v-6M8 19V9M12 19V5M16 19v-8M20 19v-4" />
     </svg>
-    <span>xng</span>
+    <span>XNG</span>
   </div>
 
   {#if active && s}

@@ -43,7 +43,28 @@ npm run tauri build        # installers for the current OS
 
 SDR backends are Cargo features, as in the CLI: `soapy` (default), `airspy`,
 `airspyhf`. For example `npm run tauri build -- --features airspy,airspyhf`,
-or `-- --no-default-features` for a build that only decodes recordings.
+or `npm run tauri build -- -- --no-default-features` for a build that only
+decodes recordings.
+
+## Installers
+
+The `Desktop` workflow builds, tests and packages the app on every pull
+request that touches it, and the `Release` workflow attaches the same
+installers to each tagged release:
+
+| Platform | Installer | SDR support |
+|---|---|---|
+| Debian/Ubuntu x86_64 and arm64 | `.deb` | SoapySDR, native Airspy and Airspy HF+ |
+| macOS Apple Silicon | `.dmg` | SoapySDR, native Airspy and Airspy HF+ (`brew install soapysdr airspy airspyhf`) |
+| Windows x86_64 | `.exe` setup | IQ recordings only for now |
+
+The app is named XNG everywhere. Its Debian package is `xng-desktop`
+(set in `src-tauri/tauri.linux.conf.json`) so it installs next to the CLI's
+`xng` package.
+
+The installers are not code-signed yet. On macOS, open the app once, then
+allow it under System Settings > Privacy & Security > Open Anyway. On Windows,
+choose "More info" then "Run anyway" on the SmartScreen prompt.
 
 ## How it stays fast
 
