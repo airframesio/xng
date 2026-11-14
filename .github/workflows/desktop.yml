@@ -78,8 +78,15 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt update
-          sudo apt install -y libsoapysdr-dev libairspy-dev libairspyhf-dev protobuf-compiler \
+          sudo apt install -y libsoapysdr-dev libairspy-dev libairspyhf-dev \
             libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
+      # 22.04's protoc predates proto3 optional fields, which asf2.proto uses.
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "29.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install soapysdr airspy airspyhf protobuf
