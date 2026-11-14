@@ -14,6 +14,7 @@ pub mod dumpvdl2_json;
 pub mod gsmtap;
 pub mod http;
 pub mod jsonl;
+pub mod map;
 pub mod metrics;
 pub mod mqtt;
 pub mod nmea_tcp;

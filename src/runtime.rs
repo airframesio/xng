@@ -64,6 +64,8 @@ pub struct OutputConfig {
     pub iridium_satmap: Option<String>,
     /// Web dashboard listen address (live map + message stream).
     pub http: Option<String>,
+    /// Dashboard basemap (MapLibre style or raster).
+    pub map: crate::outputs::map::MapConfig,
     /// MQTT broker URL (mqtt://[user:pass@]host[:port]).
     pub mqtt: Option<String>,
     /// MQTT topic prefix (messages publish to `<prefix>/<mode>`).
@@ -880,6 +882,8 @@ fn parse_serial(selector: &str) -> Option<String> {
     })
 }
 
+/// Spawn the configured output sinks (console, files, feeds, servers,
+/// dashboard) on the current tokio runtime, each subscribed to `bus`.
 fn spawn_outputs(
     bus: &MessageBus,
     outputs: &OutputConfig,
@@ -935,7 +939,8 @@ fn spawn_outputs(
         let rx = bus.subscribe();
         let ident = station.ident.clone();
         let sessions = sessions.to_vec();
-        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr, ident, sessions)));
+        let map = outputs.map.clone();
+        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr, ident, sessions, map)));
     }
     if let Some(url) = outputs.mqtt.clone() {
         let rx = bus.subscribe();

@@ -16,6 +16,15 @@ http = "0.0.0.0:8080"          # live web dashboard (map + messages)
 # beast = "0.0.0.0:30005"      # Mode S Beast TCP (mlat-client compatible)
 # nmea-tcp = "0.0.0.0:10110"   # AIS NMEA TCP
 
+# Dashboard basemap (optional). Default: OpenFreeMap "dark" — OpenStreetMap
+# vector tiles, no API key (openfreemap.org). Styles: dark, positron, bright,
+# liberty, fiord. style-url takes any MapLibre style (e.g. a self-hosted
+# OpenFreeMap); format = "raster" draws OpenStreetMap raster tiles instead.
+# [outputs.map]
+# style = "dark"
+# style-url = "https://tiles.example.org/styles/dark"
+# format = "vector"
+
 # Per-mode Airframes feeding (optional). When omitted, `feed-airframes`
 # above governs (ACARS-only, station id used verbatim — the legacy
 # behavior). With this block, each supported mode feeds its own Airframes

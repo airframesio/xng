@@ -393,6 +393,8 @@ fn systable_freqs(table: &serde_json::Value) -> Vec<u64> {
         .collect()
 }
 
+/// `xng scan`: dwell on each mode's capture groups in turn, report which
+/// channels are active, and propose a decode config (optionally as JSON).
 pub fn run(
     sdr: &str,
     gain: Option<f64>,
@@ -557,6 +559,9 @@ pub fn run(
     Ok(())
 }
 
+/// Open `sdr` on one capture group, decode `channels` of `mode` for
+/// `dwell_secs`, and return per-channel frame counts plus any HFDL system
+/// tables heard. Outputs are console-only (no feeds, no dashboard map).
 pub(crate) fn scan_group(
     sdr: &str,
     gain: Option<f64>,
@@ -594,6 +599,7 @@ pub(crate) fn scan_group(
             gsmtap: None,
             iridium_satmap: None,
             http: None,
+            map: Default::default(),
             mqtt: None,
             mqtt_topic: "xng".into(),
             zmq: Vec::new(),

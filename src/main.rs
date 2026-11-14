@@ -77,6 +77,7 @@ struct TuneOpts {
     max_ppm: Option<f64>,
 }
 
+/// Parse `--receiver-pos` / `receiver-pos` ("lat,lon").
 fn parse_receiver_pos(s: &Option<String>) -> anyhow::Result<Option<(f64, f64)>> {
     match s {
         None => Ok(None),
@@ -177,6 +178,8 @@ struct OutputOpts {
 }
 
 impl OutputOpts {
+    /// Turn the CLI output flags into an output config (default basemap) and
+    /// the station identity they name.
     fn build(&self) -> anyhow::Result<(runtime::OutputConfig, String)> {
         anyhow::ensure!(
             !(self.asf2_quic_insecure && self.asf2_quic_ca.is_some()),
@@ -229,6 +232,7 @@ impl OutputOpts {
                 gsmtap: self.gsmtap.clone(),
                 iridium_satmap: self.iridium_satmap.clone(),
                 http: self.http.clone(),
+                map: Default::default(),
                 mqtt: self.mqtt.clone(),
                 mqtt_topic: self.mqtt_topic.clone(),
                 zmq: self.zmq.clone(),
@@ -588,6 +592,8 @@ fn centroid_off_dc(channels: &[u64], avoid_dc: bool) -> u64 {
     if avoid_dc && channels.contains(&center) { center + 25_000 } else { center }
 }
 
+/// Parse the command line, set up logging and the decode pool, and run the
+/// chosen subcommand.
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -766,6 +772,7 @@ fn main() -> anyhow::Result<()> {
                         gsmtap: None,
                         iridium_satmap: None,
                         http: None,
+                        map: Default::default(),
                         mqtt: None,
                         mqtt_topic: "xng".into(),
                         zmq: Vec::new(),
@@ -809,6 +816,10 @@ fn run_station_cmd(config: &std::path::Path) -> anyhow::Result<()> {
         gsmtap: st.outputs.gsmtap.clone(),
         iridium_satmap: st.outputs.iridium_satmap.clone(),
         http: st.outputs.http.clone(),
+        map: match &st.outputs.map {
+            Some(m) => outputs::map::MapConfig::new(m.style.as_deref(), m.style_url.as_deref(), m.format.as_deref())?,
+            None => Default::default(),
+        },
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
         zmq: st.outputs.zmq.clone(),

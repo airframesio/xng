@@ -1204,11 +1204,15 @@ fn export_kml(d: &Dash) -> String {
     s
 }
 
+/// Serve the web dashboard on `addr`: the page, its JSON/GeoJSON/GPX/KML
+/// endpoints and `/map/config.json` (what basemap `map` says to draw), fed
+/// from the message bus until it closes.
 pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     addr: String,
     station: String,
     sessions: Vec<Value>,
+    map: crate::outputs::map::MapConfig,
 ) -> std::io::Result<()> {
     let mut dash = Dash { station, started: now_s(), sessions, ..Dash::default() };
     // Resume the accumulated 48-beam pattern across restarts.
@@ -1219,10 +1223,12 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("dashboard on http://{addr}/");
     let http_state = state.clone();
+    let map_json = Arc::new(map.client_json());
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { break };
             let state = http_state.clone();
+            let map_json = map_json.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
@@ -1238,6 +1244,8 @@ pub async fn run(
                     ("application/geo+json", export_geojson(&state.lock().unwrap()))
                 } else if path.starts_with("/data/export.gpx") {
                     ("application/gpx+xml", export_gpx(&state.lock().unwrap()))
+                } else if path.starts_with("/map/config.json") {
+                    ("application/json", map_json.to_string())
                 } else if path.starts_with("/data/export.kml") {
                     ("application/vnd.google-earth.kml+xml", export_kml(&state.lock().unwrap()))
                 } else {
