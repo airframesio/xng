@@ -181,10 +181,10 @@ impl Engine {
                         runtime::spawn_interrupt_handler(stop.clone(), "engine");
                     }
 
-                    let mut decode_tasks = Vec::new();
+                    let mut decode_tasks = tokio::task::JoinSet::new();
                     for mut prep in prepared {
                         let (bus, stop, station) = (bus.clone(), stop.clone(), station.clone());
-                        decode_tasks.push(tokio::task::spawn_blocking(move || {
+                        decode_tasks.spawn_blocking(move || {
                             let mut reasm = (
                                 xng_acars::reasm::Reassembler::new(runtime::reasm_timeout_s(prep.cfg.mode)),
                                 xng_acars::miam::FileReassembler::new(),
@@ -202,11 +202,13 @@ impl Engine {
                                 prep.cfg.label_filter.clone(),
                                 prep.cfg.ais_filter.clone(),
                             )
-                        }));
+                        });
                     }
+                    // Join in completion order, so a fault in any session
+                    // is seen at once, wherever it sits in the list.
                     let mut first_err = None;
-                    for t in decode_tasks {
-                        match t.await {
+                    while let Some(joined) = decode_tasks.join_next().await {
+                        match joined {
                             Ok(Ok(stats)) => summary.lock().unwrap().extend(stats),
                             Ok(Err(e)) => {
                                 tracing::warn!("session ended with error: {e}");
@@ -456,24 +458,27 @@ mod tests {
                 self.0.store(true, Ordering::Relaxed);
             }
         }
-        let closed = Arc::new(AtomicBool::new(false));
-        let engine = Engine::start(
-            vec![
+        // The fault must be noticed wherever the failing session sits.
+        for panics_first in [true, false] {
+            let closed = Arc::new(AtomicBool::new(false));
+            let mut sessions: Vec<(Box<dyn IqSource>, SessionConfig)> = vec![
                 (Box::new(Panics), cfg(Mode::AcarsPoa, 131_500_000, vec![131_550_000])),
                 (Box::new(Endless(closed.clone())), cfg(Mode::AcarsPoa, 131_500_000, vec![131_725_000])),
-            ],
-            EngineOptions::default(),
-        )
-        .unwrap();
-        let (tx, done) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(engine.join());
-        });
-        let result = done
-            .recv_timeout(std::time::Duration::from_secs(30))
-            .expect("engine must finish after a decoder panic");
-        assert!(result.unwrap_err().to_string().contains("decode task failed"));
-        assert!(closed.load(Ordering::Relaxed), "the surviving source must be closed");
+            ];
+            if !panics_first {
+                sessions.reverse();
+            }
+            let engine = Engine::start(sessions, EngineOptions::default()).unwrap();
+            let (tx, done) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(engine.join());
+            });
+            let result = done
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("engine must finish after a decoder panic");
+            assert!(result.unwrap_err().to_string().contains("decode task failed"));
+            assert!(closed.load(Ordering::Relaxed), "the surviving source must be closed");
+        }
     }
 
     #[test]
