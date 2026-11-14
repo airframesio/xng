@@ -18,7 +18,7 @@
 //! # Ok(()) }
 //! ```
 
-use crate::bus::MessageBus;
+use crate::bus::{MessageBus, WeakBus};
 use crate::runtime::{self, LiveState, SessionConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,15 +27,12 @@ use xng_sdr::IqSource;
 use xng_types::{Message, Mode, StationIdentity};
 
 /// How the engine runs.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct EngineOptions {
     /// Stop on Ctrl-C / SIGTERM (a second signal force-quits the process),
     /// as the CLI does. Embedders that own their own lifecycle leave this
     /// off and call [`Engine::stop`].
     pub handle_signals: bool,
-    /// Publish into this bus instead of a fresh one, so the caller can
-    /// subscribe before the first message is decoded.
-    pub bus: Option<MessageBus>,
 }
 
 /// One running decode session, as the engine resolved it.
@@ -72,7 +69,13 @@ pub type ChannelSummary = (u64, u64, u64);
 /// outputs (taken from the first session's [`runtime::OutputConfig`], as in
 /// `xng station`).
 pub struct Engine {
-    bus: MessageBus,
+    /// Weak on purpose: the worker owns the only strong bus handle, so
+    /// dropping it closes the channel and lets every output drain and exit
+    /// no matter how long the `Engine` itself lives.
+    bus: WeakBus,
+    /// Subscribed before decoding began, so the first subscriber misses
+    /// nothing.
+    first_rx: Mutex<Option<broadcast::Receiver<Arc<Message>>>>,
     stop: Arc<AtomicBool>,
     sessions: Vec<SessionInfo>,
     state: Arc<Mutex<EngineState>>,
@@ -134,7 +137,9 @@ impl Engine {
             prepared.push(Prepared { source, decoders, cfg, capture_center, live });
         }
 
-        let bus = opts.bus.unwrap_or_default();
+        let bus = MessageBus::new();
+        let weak_bus = bus.downgrade();
+        let first_rx = Mutex::new(Some(bus.subscribe()));
         let stop = Arc::new(AtomicBool::new(false));
         let state = Arc::new(Mutex::new(EngineState::Running));
         let summary = Arc::new(Mutex::new(Vec::new()));
@@ -147,7 +152,7 @@ impl Engine {
             if multi { "station".to_string() } else { infos[0].mode.as_str().to_string() };
 
         let thread = std::thread::Builder::new().name("xng-engine".into()).spawn({
-            let (bus, stop, state, summary) = (bus.clone(), stop.clone(), state.clone(), summary.clone());
+            let (stop, state, summary) = (stop.clone(), state.clone(), summary.clone());
             move || {
                 let rt = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
@@ -201,11 +206,19 @@ impl Engine {
                     }
                     let mut first_err = None;
                     for t in decode_tasks {
-                        match t.await? {
-                            Ok(stats) => summary.lock().unwrap().extend(stats),
-                            Err(e) => {
+                        match t.await {
+                            Ok(Ok(stats)) => summary.lock().unwrap().extend(stats),
+                            Ok(Err(e)) => {
                                 tracing::warn!("session ended with error: {e}");
                                 first_err.get_or_insert(e);
+                            }
+                            // A decoder panicked. Stop the others and keep
+                            // joining, so no source is left streaming
+                            // behind an engine that reports itself done.
+                            Err(e) => {
+                                tracing::error!("decode task failed: {e}");
+                                stop.store(true, Ordering::Relaxed);
+                                first_err.get_or_insert(anyhow::anyhow!("decode task failed: {e}"));
                             }
                         }
                     }
@@ -215,8 +228,10 @@ impl Engine {
                     stop.store(true, Ordering::Relaxed);
                     drop(bus);
                     for t in output_tasks {
-                        if let Err(e) = t.await? {
-                            tracing::warn!("output error: {e}");
+                        match t.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!("output error: {e}"),
+                            Err(e) => tracing::warn!("output task failed: {e}"),
                         }
                     }
                     first_err.map_or(Ok(()), Err)
@@ -232,18 +247,21 @@ impl Engine {
             }
         })?;
 
-        Ok(Self { bus, stop, sessions: infos, state, summary, thread: Some(thread) })
+        Ok(Self { bus: weak_bus, first_rx, stop, sessions: infos, state, summary, thread: Some(thread) })
     }
 
-    /// Subscribe to every decoded message. Slow subscribers lag (dropping
-    /// the oldest) rather than back-pressuring the decoders.
+    /// Subscribe to decoded messages. The first call returns a receiver
+    /// that was attached before decoding began, so it sees every message
+    /// from the start; later calls see messages from then on. Slow
+    /// subscribers lag (dropping the oldest) rather than back-pressuring
+    /// the decoders. Once the engine has finished, the receiver reports
+    /// `Closed` after any messages still queued.
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Message>> {
-        self.bus.subscribe()
-    }
-
-    /// The bus the sessions publish into.
-    pub fn bus(&self) -> &MessageBus {
-        &self.bus
+        if let Some(rx) = self.first_rx.lock().unwrap().take() {
+            return rx;
+        }
+        // Finished: hand back a receiver on an already-closed channel.
+        self.bus.subscribe().unwrap_or_else(|| broadcast::channel(1).1)
     }
 
     /// The running sessions, in the order they were given.
@@ -379,6 +397,83 @@ mod tests {
         assert!(live.samples.load(Ordering::Relaxed) > 0);
         engine.join().unwrap();
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With a real output attached (the console), the engine must still
+    /// finish and join: outputs only exit when the bus closes, so nothing
+    /// that outlives decoding may hold it open.
+    #[test]
+    fn finishes_with_an_output_enabled_while_a_subscriber_is_held() {
+        let dir = tempdir();
+        let path = silent_file(&dir, 2_400_000 / 8);
+        let src = FileIqSource::open(&path, IqFormat::Cf32, 2_400_000.0, 131_500_000).unwrap();
+        let mut c = cfg(Mode::AcarsPoa, 131_500_000, vec![131_550_000]);
+        c.outputs.console = ConsoleFormat::Pretty;
+        let engine = Engine::start(vec![(Box::new(src), c)], EngineOptions::default()).unwrap();
+        let mut rx = engine.subscribe();
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(engine.join());
+        });
+        done.recv_timeout(std::time::Duration::from_secs(30))
+            .expect("engine must finish with an output enabled")
+            .unwrap();
+        // The held receiver sees the close rather than keeping it open.
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Closed)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_panicking_decoder_stops_the_other_sessions() {
+        struct Panics;
+        impl IqSource for Panics {
+            fn read(&mut self, _: &mut [num_complex::Complex<f32>]) -> Result<usize, xng_sdr::SdrError> {
+                panic!("simulated device fault");
+            }
+            fn sample_rate(&self) -> f64 {
+                2_400_000.0
+            }
+            fn center_freq_hz(&self) -> u64 {
+                131_500_000
+            }
+        }
+        struct Endless(Arc<AtomicBool>);
+        impl IqSource for Endless {
+            fn read(&mut self, buf: &mut [num_complex::Complex<f32>]) -> Result<usize, xng_sdr::SdrError> {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                buf.fill(num_complex::Complex::new(0.0, 0.0));
+                Ok(buf.len())
+            }
+            fn sample_rate(&self) -> f64 {
+                2_400_000.0
+            }
+            fn center_freq_hz(&self) -> u64 {
+                131_500_000
+            }
+        }
+        impl Drop for Endless {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Relaxed);
+            }
+        }
+        let closed = Arc::new(AtomicBool::new(false));
+        let engine = Engine::start(
+            vec![
+                (Box::new(Panics), cfg(Mode::AcarsPoa, 131_500_000, vec![131_550_000])),
+                (Box::new(Endless(closed.clone())), cfg(Mode::AcarsPoa, 131_500_000, vec![131_725_000])),
+            ],
+            EngineOptions::default(),
+        )
+        .unwrap();
+        let (tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(engine.join());
+        });
+        let result = done
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("engine must finish after a decoder panic");
+        assert!(result.unwrap_err().to_string().contains("decode task failed"));
+        assert!(closed.load(Ordering::Relaxed), "the surviving source must be closed");
     }
 
     #[test]

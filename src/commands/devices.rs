@@ -41,7 +41,12 @@ pub fn list(filter: &str) -> anyhow::Result<Vec<DeviceEntry>> {
     #[cfg(feature = "soapy")]
     for d in xng_sdr::soapy::enumerate(filter)? {
         let label = if d.label.is_empty() { d.driver.clone() } else { d.label.clone() };
-        out.push(DeviceEntry { selector: d.args, label, backend: "soapysdr" });
+        // `backend=soapy` pins the SoapySDR path, so an Airspy that Soapy
+        // enumerates is opened by the backend this entry names rather than
+        // being rerouted to the native one. (xng strips the key before the
+        // args reach SoapySDR.)
+        let selector = if d.args.is_empty() { "backend=soapy".to_owned() } else { format!("{},backend=soapy", d.args) };
+        out.push(DeviceEntry { selector, label, backend: "soapysdr" });
     }
     #[cfg(not(feature = "soapy"))]
     let _ = filter;

@@ -28,6 +28,26 @@ impl MessageBus {
     pub fn subscribe(&self) -> broadcast::Receiver<Arc<Message>> {
         self.tx.subscribe()
     }
+
+    /// A handle that can subscribe while the bus is open but does not keep
+    /// it open. Outputs exit when the last [`MessageBus`] is dropped, so a
+    /// long-lived observer must hold one of these rather than a bus clone.
+    pub fn downgrade(&self) -> WeakBus {
+        WeakBus { tx: self.tx.downgrade() }
+    }
+}
+
+/// See [`MessageBus::downgrade`].
+#[derive(Clone)]
+pub struct WeakBus {
+    tx: broadcast::WeakSender<Arc<Message>>,
+}
+
+impl WeakBus {
+    /// Subscribe, or `None` once the bus has closed.
+    pub fn subscribe(&self) -> Option<broadcast::Receiver<Arc<Message>>> {
+        self.tx.upgrade().map(|tx| tx.subscribe())
+    }
 }
 
 impl Default for MessageBus {
