@@ -91,7 +91,7 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     let rate = match opts.sample_rate {
         Some(r) => r,
         None => {
-            let caps = crate::probe_rate_caps(&opts.sdr);
+            let caps = crate::sdr_open::probe_rate_caps(&opts.sdr);
             let r = scan::choose_rate(&caps, mode, plan_rate);
             if r != plan_rate {
                 println!("using {} S/s (device does not offer the plan's {} S/s)", r as u64, plan_rate as u64);
@@ -444,7 +444,7 @@ fn dwell(
     abort: &Arc<AtomicBool>,
     bus: &MessageBus,
 ) -> anyhow::Result<Vec<(u64, u64, u64, f32)>> {
-    let (mut source, _) = crate::open_sdr(sdr, rate, center, gain)?;
+    let (mut source, _) = crate::sdr_open::open_sdr(sdr, rate, center, gain)?;
     let cfg = SessionConfig {
         mode,
         center_hz: center,

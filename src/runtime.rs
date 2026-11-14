@@ -872,7 +872,7 @@ impl SharedProvenance {
 
 /// Spawn the configured output sinks on the current tokio runtime.
 /// JSON descriptor of one decode session for the dashboard / `xng status`.
-fn session_descriptor(
+pub(crate) fn session_descriptor(
     sdr: &Option<SdrInfo>,
     mode: Mode,
     center_hz: u64,
@@ -909,21 +909,23 @@ fn parse_serial(selector: &str) -> Option<String> {
 
 /// Spawn the configured output sinks (console, files, feeds, servers,
 /// dashboard) on the current tokio runtime, each subscribed to `bus`.
-fn spawn_outputs(
+pub(crate) fn spawn_outputs(
     bus: &MessageBus,
     outputs: &OutputConfig,
     station: &StationIdentity,
     sessions: &[serde_json::Value],
 ) -> Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> {
     let mut output_tasks = Vec::new();
-    output_tasks.push(tokio::spawn({
-        let rx = bus.subscribe();
-        let fmt = outputs.console;
-        async move {
-            console::run(rx, fmt).await;
-            Ok::<(), std::io::Error>(())
-        }
-    }));
+    if outputs.console != ConsoleFormat::Off {
+        output_tasks.push(tokio::spawn({
+            let rx = bus.subscribe();
+            let fmt = outputs.console;
+            async move {
+                console::run(rx, fmt).await;
+                Ok::<(), std::io::Error>(())
+            }
+        }));
+    }
     if let Some(path) = outputs.jsonl.clone() {
         let rx = bus.subscribe();
         output_tasks.push(tokio::spawn(async move { jsonl::run(rx, &path).await }));
@@ -1034,7 +1036,7 @@ async fn shutdown_signal() {
 /// signal forces an immediate exit. The escape hatch matters when the decode
 /// loop is blocked in a device read that never observes `stop` — without it a
 /// wedged SDR traps the process until SIGKILL/SIGQUIT.
-fn spawn_interrupt_handler(stop: Arc<AtomicBool>, what: &'static str) {
+pub(crate) fn spawn_interrupt_handler(stop: Arc<AtomicBool>, what: &'static str) {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!("interrupt received, stopping {what} (signal again to force quit)");
@@ -1477,25 +1479,11 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         // and some session has a receiver-pos, inject a position report every
         // 30 s so it reaches the NMEA sinks / map like any AIS fix. Polls the
         // stop flag each second so it never keeps the bus open past shutdown.
-        if let (Some(mmsi), Some((lat, lon))) = (
+        if let (Some(mmsi), Some(pos)) = (
             prepared[0].cfg.outputs.own_ship_mmsi,
             prepared.iter().find_map(|p| p.cfg.receiver_pos),
         ) {
-            let (bus, stop, station) = (bus.clone(), stop.clone(), station.clone());
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                let mut n: u64 = 0;
-                loop {
-                    tick.tick().await;
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if n % 30 == 0 {
-                        bus.publish(own_ship_message(mmsi, lat, lon, &station));
-                    }
-                    n += 1;
-                }
-            });
+            spawn_own_ship_beacon(&bus, &stop, &station, mmsi, pos);
         }
 
         spawn_interrupt_handler(stop.clone(), "station");
@@ -1557,6 +1545,50 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+/// Size the global decode worker pool (parallel channelization / burst
+/// demod) to `threads` (min 1). The pool can only be sized before its first
+/// use, so this returns false when it is already running.
+pub fn set_decode_threads(threads: usize) -> bool {
+    rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build_global().is_ok()
+}
+
+/// Own-ship AIVDO beacon (AIS-5c): inject a position report for `mmsi` at
+/// `pos` every 30 s so it reaches the NMEA sinks / map like any AIS fix.
+/// Polls `stop` each second so it never keeps the bus open past shutdown.
+/// Must be called on a tokio runtime.
+pub(crate) fn spawn_own_ship_beacon(
+    bus: &MessageBus,
+    stop: &Arc<AtomicBool>,
+    station: &StationIdentity,
+    mmsi: u32,
+    (lat, lon): (f64, f64),
+) {
+    let (bus, stop, station) = (bus.clone(), stop.clone(), station.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut n: u64 = 0;
+        loop {
+            tick.tick().await;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if n % 30 == 0 {
+                bus.publish(own_ship_message(mmsi, lat, lon, &station));
+            }
+            n += 1;
+        }
+    });
+}
+
+/// ACARS reassembly timeout for a mode: satellite/HF ACARS blocks arrive
+/// minutes apart; VHF bearers are quick (libacars timeout profiles).
+pub(crate) fn reasm_timeout_s(mode: Mode) -> f64 {
+    match mode {
+        Mode::AcarsPoa | Mode::Vdl2 => 120.0,
+        _ => 660.0,
+    }
 }
 
 /// Suppresses cross-channel duplicates: the same transmission decoded

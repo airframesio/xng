@@ -1,6 +1,8 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["legacy"]
+# desktop/ is its own workspace (Tauri app): keeps webkit2gtk & co. out of
+# `cargo test --workspace` and the CLI's lockfile.
+exclude = ["legacy", "desktop"]
 resolver = "2"
 
 [workspace.package]

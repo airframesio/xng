@@ -88,6 +88,67 @@ struct Dash {
     sessions: Vec<Value>,
 }
 
+impl Dash {
+    fn new(station: String, sessions: Vec<Value>) -> Self {
+        let mut dash = Dash { station, started: now_s(), sessions, ..Dash::default() };
+        // Resume the accumulated 48-beam pattern across restarts.
+        dash.beams =
+            crate::beam::BeamReconstructor::load(&crate::beam::BeamReconstructor::default_path());
+        dash
+    }
+}
+
+/// The dashboard's live picture of what's been heard — aircraft (merged
+/// across ADS-B, ACARS, VDL2, HFDL, UAT …), vessels, beacons, Iridium
+/// satellites/beams, pagers, trains and the cross-mode distress surface —
+/// built from the message stream. The web dashboard serves it over HTTP;
+/// other front ends (the desktop app) embed it directly so every UI shows
+/// the same merged entities.
+pub struct Dashboard(Dash);
+
+impl Dashboard {
+    /// An empty picture for `station` running `sessions` (descriptors as
+    /// [`crate::engine::SessionInfo::descriptor`]).
+    pub fn new(station: String, sessions: Vec<Value>) -> Self {
+        Self(Dash::new(station, sessions))
+    }
+
+    /// Fold one decoded message into the picture.
+    pub fn update(&mut self, msg: &Message) {
+        update(&mut self.0, msg)
+    }
+
+    /// The full `/api/state` JSON document (entities + recent messages).
+    pub fn state_json(&mut self) -> String {
+        snapshot(&mut self.0)
+    }
+
+    /// The `/api/state` document without the recent-message log.
+    pub fn entities(&mut self) -> Value {
+        snapshot_value(&mut self.0, false)
+    }
+
+    /// readsb/tar1090-compatible `aircraft.json`.
+    pub fn aircraft_json(&self) -> String {
+        aircraft_json(&self.0, None)
+    }
+
+    /// Every positioned entity as RFC 7946 GeoJSON.
+    pub fn export_geojson(&self) -> String {
+        export_geojson(&self.0)
+    }
+
+    /// Every positioned entity (with trails) as GPX.
+    pub fn export_gpx(&self) -> String {
+        export_gpx(&self.0)
+    }
+
+    /// Every positioned entity (with trails) as KML.
+    pub fn export_kml(&self) -> String {
+        export_kml(&self.0)
+    }
+}
+
 /// Append to the entity's position trail (decimated: only when moved
 /// meaningfully; capped length).
 fn push_trail(o: &mut serde_json::Map<String, Value>, lat: f64, lon: f64) {
@@ -914,6 +975,13 @@ fn update(d: &mut Dash, m: &Message) {
 }
 
 fn snapshot(d: &mut Dash) -> String {
+    snapshot_value(d, true).to_string()
+}
+
+/// Expire stale entities and build the `/api/state` document. With
+/// `include_messages` false the (large) recent-message log is left out —
+/// embedders that stream messages separately poll only the entities.
+fn snapshot_value(d: &mut Dash, include_messages: bool) -> Value {
     let cutoff = now_s().saturating_sub(EXPIRE_S);
     d.aircraft.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     // Drop identifier-index entries whose master aircraft has expired.
@@ -953,12 +1021,15 @@ fn snapshot(d: &mut Dash) -> String {
         "iridium_devices": d.iridium_devices.values().collect::<Vec<_>>(),
         "iridium_terminals": d.iridium_terminals.values().collect::<Vec<_>>(),
         "iridium_beam_cells": d.beams.project(now_s() as f64, SAT_EXPIRE_S as f64),
-        "messages": d.recent.iter().rev().take(RECENT_SENT).collect::<Vec<_>>(),
+        "messages": if include_messages {
+            d.recent.iter().rev().take(RECENT_SENT).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
         "totals": d.totals,
         "last_seen": d.last_seen,
         "now": now_s(),
     })
-    .to_string()
 }
 
 /// Parse a `since=<unix>` value from a request path's query string (ECO-4).
@@ -1225,10 +1296,7 @@ pub async fn run(
     sessions: Vec<Value>,
     map: crate::outputs::map::MapConfig,
 ) -> std::io::Result<()> {
-    let mut dash = Dash { station, started: now_s(), sessions, ..Dash::default() };
-    // Resume the accumulated 48-beam pattern across restarts.
-    dash.beams = crate::beam::BeamReconstructor::load(&crate::beam::BeamReconstructor::default_path());
-    let state = Arc::new(Mutex::new(dash));
+    let state = Arc::new(Mutex::new(Dash::new(station, sessions)));
 
     // HTTP listener.
     let listener = tokio::net::TcpListener::bind(&addr).await?;
