@@ -84,9 +84,15 @@
   }
 
   function addLayers(m: maplibregl.Map) {
-    // Runs for the first style and again for the offline fallback style;
-    // both `load` and `styledata` can report the same one.
-    if (m.getSource("points")) return;
+    // Runs for the first style and again for the offline fallback style,
+    // and both `load` and `styledata` can report the same one. So add only
+    // what the current style lacks: a style swap may keep some pieces.
+    const source = (id: string) => {
+      if (!m.getSource(id)) m.addSource(id, { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+    };
+    const layer = (spec: maplibregl.AddLayerObject) => {
+      if (!m.getLayer(spec.id)) m.addLayer(spec);
+    };
     const ink = css("--ink");
     const bg = css("--bg");
     const colour: maplibregl.ExpressionSpecification = [
@@ -96,27 +102,27 @@
     for (const fam of ["air", "sea", "sat", "ground"]) {
       if (!m.hasImage(`arrow-${fam}`)) m.addImage(`arrow-${fam}`, arrow(css(`--${fam}`), bg), { pixelRatio: 2 });
     }
-    m.addSource("trails", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-    m.addSource("points", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-    m.addSource("home", { type: "geojson", data: { type: "FeatureCollection", features: [] } });
-    m.addLayer({
+    source("trails");
+    source("points");
+    source("home");
+    layer({
       id: "trails", type: "line", source: "trails",
       paint: { "line-color": colour, "line-width": 1.4, "line-opacity": 0.55 },
     });
-    m.addLayer({
+    layer({
       id: "home", type: "circle", source: "home",
       paint: {
         "circle-radius": 6, "circle-color": bg, "circle-stroke-color": css("--accent"), "circle-stroke-width": 2.5,
       },
     });
-    m.addLayer({
+    layer({
       id: "dots", type: "circle", source: "points", filter: ["!", ["has", "hdg"]],
       paint: {
         "circle-radius": ["case", ["get", "picked"], 7, 4.5],
         "circle-color": colour, "circle-stroke-color": bg, "circle-stroke-width": 1.5,
       },
     });
-    m.addLayer({
+    layer({
       id: "arrows", type: "symbol", source: "points", filter: ["has", "hdg"],
       layout: {
         "icon-image": ["concat", "arrow-", ["get", "family"]],
@@ -128,7 +134,7 @@
       },
     });
     if (m.getStyle().glyphs) {
-      m.addLayer({
+      layer({
         id: "labels", type: "symbol", source: "points", minzoom: 6.5,
         layout: {
           "text-field": ["get", "label"],
@@ -141,13 +147,17 @@
         paint: { "text-color": ink, "text-halo-color": bg, "text-halo-width": 1.4 },
       });
     }
-    for (const layer of ["dots", "arrows"]) {
-      m.on("click", layer, (e) => {
-        const p = e.features?.[0]?.properties;
-        if (p) picked = { kind: String(p.kind), id: String(p.id) };
-      });
-      m.on("mouseenter", layer, () => (m.getCanvas().style.cursor = "pointer"));
-      m.on("mouseleave", layer, () => (m.getCanvas().style.cursor = ""));
+    // Layer-scoped listeners are keyed by layer id and outlive a style
+    // swap, so wire them once.
+    if (!ready) {
+      for (const id of ["dots", "arrows"]) {
+        m.on("click", id, (e) => {
+          const p = e.features?.[0]?.properties;
+          if (p) picked = { kind: String(p.kind), id: String(p.id) };
+        });
+        m.on("mouseenter", id, () => (m.getCanvas().style.cursor = "pointer"));
+        m.on("mouseleave", id, () => (m.getCanvas().style.cursor = ""));
+      }
     }
     ready = true;
   }
@@ -230,8 +240,10 @@
       const msg = String((e as { error?: Error }).error?.message ?? "");
       if (!/style|fetch|load|network|404|403/i.test(msg)) return;
       offline = true;
-      m.setStyle(blank);
-      m.once("styledata", () => {
+      // Replace the style outright (no diff against the half-loaded one),
+      // and add the layers once the new one is in place.
+      m.setStyle(blank, { diff: false });
+      m.once("style.load", () => {
         styled = true;
         addLayers(m);
         render(app.entities);
