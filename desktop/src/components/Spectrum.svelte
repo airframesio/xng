@@ -51,6 +51,7 @@
     const row = new ImageData(BINS, 1);
     let smooth: Float32Array | null = null;
     let latest: number[] | null = null;
+    let drawn: number[] | null = null;
     let raf = 0;
     const colours = { line: css("--accent"), grid: css("--line"), text: css("--faint"), mark: css("--muted") };
 
@@ -61,6 +62,12 @@
         fall.width = BINS;
         fall.height = Math.max(1, Math.round(fall.clientHeight));
       }
+      // Resizing a canvas clears it: put the last frame back, which matters
+      // once the session has ended and no new frame is coming.
+      if (drawn && !latest) {
+        latest = drawn;
+        if (!raf) raf = requestAnimationFrame(draw);
+      }
     }
 
     function draw() {
@@ -68,6 +75,7 @@
       const bins = latest;
       if (!bins) return;
       latest = null;
+      drawn = bins;
       const n = Math.min(bins.length, BINS);
       if (!smooth) smooth = Float32Array.from(bins.slice(0, n));
       for (let i = 0; i < n; i++) smooth[i] += (bins[i] - smooth[i]) * 0.35;

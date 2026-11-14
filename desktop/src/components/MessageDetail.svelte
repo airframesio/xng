@@ -32,7 +32,7 @@
           {#if m.snr != null}· SNR {m.snr.toFixed(1)} dB{/if}
         </p>
       </div>
-      <button class="btn sm quiet" onclick={() => (app.selectedId = null)} aria-label="Close detail">
+      <button class="btn sm quiet" onclick={() => app.select(null)} aria-label="Close detail">
         <Icon name="close" size={15} />
       </button>
     </header>

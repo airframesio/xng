@@ -27,13 +27,15 @@
     );
   });
   const shown = $derived(frozen ?? filtered);
-  const pending = $derived(
-    frozen && filtered.length && frozen.length
-      ? Math.max(0, filtered[filtered.length - 1].id - frozen[frozen.length - 1].id)
-      : frozen
-        ? filtered.length
-        : 0,
-  );
+  /** Matching messages that arrived after the list froze. */
+  const pending = $derived.by(() => {
+    if (!frozen) return 0;
+    const lastSeen = frozen.length ? frozen[frozen.length - 1].id : -1;
+    // Ids only grow, so the newer ones are a run at the end.
+    let n = 0;
+    for (let i = filtered.length - 1; i >= 0 && filtered[i].id > lastSeen; i--) n++;
+    return n;
+  });
 
   // Newest first: row i shows shown[len - 1 - i].
   const first = $derived(Math.max(0, Math.floor(scrollTop / ROW) - OVERSCAN));
@@ -52,7 +54,7 @@
   }
 
   function select(m: MessageItem) {
-    app.selectedId = app.selectedId === m.id ? null : m.id;
+    app.select(app.selectedId === m.id ? null : m);
     if (app.selectedId != null && !frozen) frozen = filtered;
   }
 
@@ -69,7 +71,7 @@
     // Down the screen is older, which is a lower index.
     let next = cur < 0 ? shown.length - 1 : cur + (e.key === "ArrowDown" ? -1 : 1);
     next = Math.max(0, Math.min(shown.length - 1, next));
-    app.selectedId = shown[next].id;
+    app.select(shown[next]);
     if (!frozen) frozen = filtered;
     const y = (shown.length - 1 - next) * ROW;
     if (scroller) {

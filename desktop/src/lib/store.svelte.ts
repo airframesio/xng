@@ -198,15 +198,33 @@ class AppState {
   elapsedMs = $state(0);
   entities = $state.raw<EntityState | null>(null);
   selectedId = $state<number | null>(null);
+  /** The selected message itself, kept so it outlives the rolling list. */
+  private selectedItem = $state.raw<MessageItem | null>(null);
   /** Messages per second, smoothed. */
   rate = $state(0);
 
   private spectrumListeners = new Set<(bins: number[]) => void>();
   private rateWindow: { t: number; n: number }[] = [];
+  private lastSpectrum: number[] | null = null;
 
+  /** Subscribe to spectrum frames; the latest one is replayed at once. */
   onSpectrum(fn: (bins: number[]) => void): () => void {
     this.spectrumListeners.add(fn);
+    if (this.lastSpectrum) fn(this.lastSpectrum);
     return () => this.spectrumListeners.delete(fn);
+  }
+
+  select(m: MessageItem | null) {
+    this.selectedItem = m;
+    this.selectedId = m?.id ?? null;
+  }
+
+  /** Age out the rate window; called on every update so silence reads 0. */
+  private updateRate(added = 0) {
+    const now = performance.now();
+    if (added) this.rateWindow.push({ t: now, n: added });
+    while (this.rateWindow.length && now - this.rateWindow[0].t > 5000) this.rateWindow.shift();
+    this.rate = this.rateWindow.reduce((a, w) => a + w.n, 0) / 5;
   }
 
   get session(): SessionSummary | null {
@@ -214,8 +232,7 @@ class AppState {
   }
 
   get selected(): MessageItem | null {
-    const id = this.selectedId;
-    return id == null ? null : (this.messages.find((m) => m.id === id) ?? null);
+    return this.selectedId == null ? null : this.selectedItem;
   }
 
   async init() {
@@ -259,7 +276,8 @@ class AppState {
     this.samples = 0;
     this.elapsedMs = 0;
     this.entities = null;
-    this.selectedId = null;
+    this.select(null);
+    this.lastSpectrum = null;
     this.rate = 0;
     this.rateWindow = [];
     try {
@@ -278,6 +296,8 @@ class AppState {
       await (await backend()).stop();
     } finally {
       if (this.phase === "running" || this.phase === "starting") this.phase = "ended";
+      this.rateWindow = [];
+      this.rate = 0;
     }
   }
 
@@ -300,10 +320,7 @@ class AppState {
         this.total += n;
         this.dropped += e.skipped;
         this.lagged += e.lagged ?? 0;
-        const now = performance.now();
-        this.rateWindow.push({ t: now, n });
-        while (this.rateWindow.length && now - this.rateWindow[0].t > 5000) this.rateWindow.shift();
-        this.rate = this.rateWindow.reduce((a, w) => a + w.n, 0) / 5;
+        this.updateRate(n);
         if (e.items.length) {
           const next = this.messages.concat(e.items);
           this.messages = next.length > MAX_MESSAGES ? next.slice(next.length - MAX_MESSAGES) : next;
@@ -316,7 +333,11 @@ class AppState {
         this.elapsedMs = e.elapsedMs;
         this.samples = s.samples;
         this.channels = s.channels;
-        if (s.spectrum) for (const fn of this.spectrumListeners) fn(s.spectrum);
+        if (s.spectrum) {
+          this.lastSpectrum = s.spectrum;
+          for (const fn of this.spectrumListeners) fn(s.spectrum);
+        }
+        this.updateRate();
         break;
       }
       case "entities":
@@ -325,6 +346,8 @@ class AppState {
       case "ended":
         if (e.error) this.error = e.error;
         if (this.phase !== "idle") this.phase = "ended";
+        this.rateWindow = [];
+        this.rate = 0;
         break;
     }
   }

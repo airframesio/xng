@@ -17,6 +17,9 @@ use tauri::State;
 #[derive(Default)]
 struct AppState {
     running: Mutex<Option<Running>>,
+    /// The map picture of the current or most recent session. It is kept
+    /// after Stop so the final state can still be exported.
+    dashboard: Mutex<Option<std::sync::Arc<Mutex<xng::outputs::http::Dashboard>>>>,
     /// Set once the window is gone, so a session still opening its radio
     /// is stopped as soon as it comes up instead of being kept.
     closing: std::sync::atomic::AtomicBool,
@@ -140,6 +143,7 @@ async fn start_session(
         running.stop();
         return Err("The window was closed".into());
     }
+    *state.dashboard.lock().unwrap() = Some(running.dashboard());
     *slot = Some(running);
     Ok(())
 }
@@ -157,16 +161,16 @@ async fn stop_session(state: State<'_, AppState>) -> CmdResult<()> {
 /// Write the current map picture to `path` as GeoJSON, GPX or KML.
 #[tauri::command]
 async fn export_entities(state: State<'_, AppState>, format: String, path: String) -> CmdResult<()> {
+    let dashboard = state.dashboard.lock().unwrap().clone().ok_or("Start a session before exporting")?;
     let body = {
-        let guard = state.running.lock().unwrap();
-        let running = guard.as_ref().ok_or("Nothing is running to export")?;
-        running.with_dashboard(|d| match format.as_str() {
-            "geojson" => Ok(d.export_geojson()),
-            "gpx" => Ok(d.export_gpx()),
-            "kml" => Ok(d.export_kml()),
-            "aircraft" => Ok(d.aircraft_json()),
-            other => Err(format!("Unknown export format {other}")),
-        })?
+        let d = dashboard.lock().unwrap();
+        match format.as_str() {
+            "geojson" => d.export_geojson(),
+            "gpx" => d.export_gpx(),
+            "kml" => d.export_kml(),
+            "aircraft" => d.aircraft_json(),
+            other => return Err(format!("Unknown export format {other}")),
+        }
     };
     std::fs::write(&path, body).map_err(err)
 }

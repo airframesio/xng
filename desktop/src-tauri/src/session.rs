@@ -184,9 +184,10 @@ impl Running {
         // Dropping the last engine handle joins its threads.
     }
 
-    /// Run `f` over the live dashboard (exports).
-    pub fn with_dashboard<T>(&self, f: impl FnOnce(&mut Dashboard) -> T) -> T {
-        f(&mut self.dashboard.lock().unwrap())
+    /// A handle to the dashboard that outlives the session, so the final
+    /// picture can still be exported after decoding has stopped.
+    pub fn dashboard(&self) -> Arc<Mutex<Dashboard>> {
+        self.dashboard.clone()
     }
 }
 
@@ -229,8 +230,16 @@ fn pump(
     let mut closed = false;
 
     loop {
-        // Drain whatever arrived since the last tick.
+        // Drain whatever arrived since the last tick, but not for longer
+        // than a tick: a sustained burst must not hold up the timed
+        // updates below. What is left stays queued for the next pass.
+        let drain_started = Instant::now();
+        let mut drained = 0u32;
         loop {
+            drained += 1;
+            if drained % 64 == 0 && drain_started.elapsed() >= TICK {
+                break;
+            }
             match rx.try_recv() {
                 Ok(m) => {
                     next_id += 1;
@@ -413,7 +422,7 @@ mod tests {
         assert_eq!(summaries.len(), 1, "{summaries:?}");
         assert!(summaries[0].contains("N471XG XG0042 lbl=H1 ok"), "{summaries:?}");
         // The shared dashboard saw the same message.
-        let state = running.with_dashboard(|d| d.entities());
+        let state = running.dashboard().lock().unwrap().entities();
         assert_eq!(state["totals"]["acars"], 1);
         running.stop();
         let _ = std::fs::remove_file(path);

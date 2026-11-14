@@ -21,28 +21,37 @@
   // Preview what Listen will tune to, a beat after the form settles.
   $effect(() => {
     void JSON.stringify($state.snapshot(settings));
+    // The old plan describes the old settings: drop it, and ignore an
+    // answer that comes back after the settings have moved on again.
+    plan = null;
+    let current = true;
     const t = setTimeout(async () => {
       saveSettings();
       if (isFile && !settings.filePath) {
-        plan = null;
         planError = null;
         return;
       }
       try {
-        plan = await app.resolve();
+        const resolved = await app.resolve();
+        if (!current) return;
+        plan = resolved;
         planError = null;
       } catch (e) {
+        if (!current) return;
         plan = null;
         planError = String(e);
       }
     }, 250);
-    return () => clearTimeout(t);
+    return () => {
+      current = false;
+      clearTimeout(t);
+    };
   });
 
   async function chooseFile() {
     const b = await backend();
     const p = await b.pickFile("Open an IQ recording", [
-      { name: "IQ recordings", extensions: ["cf32", "cs16", "cs8", "cu8", "iq", "raw", "bin", "wav"] },
+      { name: "IQ recordings", extensions: ["cf32", "cs16", "cs8", "cu8", "iq", "raw", "bin"] },
     ]);
     if (p) settings.filePath = p;
   }

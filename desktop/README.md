@@ -22,7 +22,7 @@ CLI build never needs a webview toolchain.
 
 ## Develop
 
-Prerequisites: Rust, Node 20+, the CLI's native dependencies (SoapySDR,
+Prerequisites: Rust, Node 20.19+ or 22.12+, the CLI's native dependencies (SoapySDR,
 protoc), and Tauri's system dependencies for your OS
 (<https://tauri.app/start/prerequisites/>). On Debian/Ubuntu:
 

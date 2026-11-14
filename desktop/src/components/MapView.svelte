@@ -55,7 +55,7 @@
     const order = ["flight", "reg", "icao", "actype", "name", "mmsi", "country", "alt", "spd", "trk", "sog", "cog", "squawk", "msgs"];
     const names: Record<string, string> = {
       flight: "Flight", reg: "Registration", icao: "ICAO", actype: "Type", name: "Name", mmsi: "MMSI",
-      country: "Flag", alt: "Altitude (ft)", spd: "Speed (kt)", trk: "Track (°)", sog: "Speed (kt)",
+      country: "Flag", alt: picked?.kind === "Iridium satellite" ? "Altitude (km)" : "Altitude (ft)", spd: "Speed (kt)", trk: "Track (°)", sog: "Speed (kt)",
       cog: "Course (°)", squawk: "Squawk", msgs: "Messages",
     };
     return order.filter((k) => e[k] != null && e[k] !== "").map((k) => [names[k], String(e[k])] as const);
