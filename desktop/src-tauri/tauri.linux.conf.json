@@ -1,0 +1,10 @@
+{
+  "productName": "xng-desktop",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "desktopTemplate": "packaging/xng.desktop"
+      }
+    }
+  }
+}
