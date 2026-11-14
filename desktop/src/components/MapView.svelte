@@ -1,10 +1,16 @@
 <script lang="ts">
   import type { Feature } from "geojson";
-  import maplibregl from "maplibre-gl";
+  import * as maplibregl from "maplibre-gl";
+  import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
   import { onMount } from "svelte";
   import { app } from "../lib/store.svelte";
   import type { Entity, EntityState } from "../lib/types";
   import Icon from "./Icon.svelte";
+
+  // maplibre-gl 6 ships its worker as a separate module and looks for it
+  // next to its own file, which a bundled app no longer has. Point it at the
+  // copy Vite bundles.
+  maplibregl.setWorkerUrl(workerUrl);
 
   let el: HTMLDivElement;
   let map: maplibregl.Map | undefined;
@@ -237,7 +243,7 @@
     // No network (or the tile host is down): keep plotting on a plain ground.
     m.on("error", (e) => {
       if (styled || offline) return;
-      const msg = String((e as { error?: Error }).error?.message ?? "");
+      const msg = String(e.error?.message ?? "");
       if (!/style|fetch|load|network|404|403/i.test(msg)) return;
       offline = true;
       // Replace the style outright (no diff against the half-loaded one),
