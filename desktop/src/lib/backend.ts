@@ -1,4 +1,4 @@
-import type { Backend, BackendEvent } from "./types";
+import type { Backend, BackendEvent, ToolEvent } from "./types";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -17,6 +17,13 @@ async function tauriBackend(): Promise<Backend> {
       return invoke("start_session", { request, onEvent: onEventChannel });
     },
     stop: () => invoke("stop_session"),
+    startTool: (request, onEvent) => {
+      const onEventChannel = new Channel<ToolEvent>();
+      onEventChannel.onmessage = onEvent;
+      return invoke("start_tool", { request, onEvent: onEventChannel });
+    },
+    stopTool: () => invoke("stop_tool"),
+    writeText: (path, contents) => invoke("write_text", { path, contents }),
     exportEntities: (format, path) => invoke("export_entities", { format, path }),
     setDecodeThreads: (threads) => invoke("set_decode_threads", { threads }),
     pickFile: async (title, filters) => {

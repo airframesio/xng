@@ -17,6 +17,8 @@
     sliders: "M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6",
     alert: "M12 4 2.5 20h19L12 4zM12 10v5M12 17.5h.01",
     back: "M15 6l-6 6 6 6",
+    scan: "M12 12l6-6M21 12a9 9 0 1 1-9-9M17 12a5 5 0 1 1-5-5",
+    gauge: "M4 18a8 8 0 1 1 16 0M12 18l4-6",
   };
   let { name, size = 16 }: { name: string; size?: number } = $props();
 </script>

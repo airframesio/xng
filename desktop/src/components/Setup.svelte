@@ -65,7 +65,7 @@
   <div class="col">
     <header>
       <h1>What do you want to hear?</h1>
-      <p>Pick a radio and a signal. xng tunes itself; every setting is under Advanced if you need it.</p>
+      <p>Pick a radio and a signal. XNG tunes itself; every setting is under Advanced if you need it.</p>
     </header>
 
     <section aria-labelledby="src-h">
@@ -102,9 +102,20 @@
               {/if}
             </div>
           {/each}
-          <button class="btn sm quiet" onclick={() => app.refreshDevices()} disabled={app.devicesLoading}>
-            <Icon name="refresh" size={14} /> Refresh radios
-          </button>
+          <div class="devtools">
+            <button class="btn sm quiet" onclick={() => app.refreshDevices()} disabled={app.devicesLoading}>
+              <Icon name="refresh" size={14} /> Refresh radios
+            </button>
+            {#if app.devices.length}
+              <span class="sep">Not sure what you can receive here?</span>
+              <button class="btn sm" onclick={() => app.openTool("scan")}>
+                <Icon name="scan" size={14} /> Scan for signals
+              </button>
+              <button class="btn sm" onclick={() => app.openTool("survey")}>
+                <Icon name="gauge" size={14} /> Survey reception
+              </button>
+            {/if}
+          </div>
         </div>
       {:else}
         <div class="filebox">
@@ -318,6 +329,18 @@
   .device:has(:focus-visible) {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
+  }
+  .devtools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+  }
+  .sep {
+    margin-left: auto;
+    color: var(--faint);
+    font-size: 13px;
   }
   .dot {
     width: 14px;

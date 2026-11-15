@@ -6,10 +6,12 @@
 
 mod request;
 mod session;
+mod tools;
 
 use request::{ResolvedTune, SessionRequest};
 use serde::Serialize;
 use session::{Event, Running};
+use tools::{ToolEvent, ToolRequest, ToolTask};
 use std::sync::Mutex;
 use tauri::ipc::Channel;
 use tauri::State;
@@ -20,6 +22,8 @@ struct AppState {
     /// The map picture of the current or most recent session. It is kept
     /// after Stop so the final state can still be exported.
     dashboard: Mutex<Option<std::sync::Arc<Mutex<xng::outputs::http::Dashboard>>>>,
+    /// A scan or survey in progress. It owns the radio while it runs.
+    tool: Mutex<Option<ToolTask>>,
     /// Set once the window is gone, so a session still opening its radio
     /// is stopped as soon as it comes up instead of being kept.
     closing: std::sync::atomic::AtomicBool,
@@ -130,6 +134,7 @@ async fn start_session(
     if let Some(prev) = prev {
         tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
     }
+    stop_tool_task(&state).await?;
     let running = tauri::async_runtime::spawn_blocking(move || {
         let _sdr = sdr_lock();
         Running::start(&request, on_event)
@@ -158,6 +163,53 @@ async fn stop_session(state: State<'_, AppState>) -> CmdResult<()> {
     Ok(())
 }
 
+/// Stop any scan or survey and wait for it to let go of the radio.
+async fn stop_tool_task(state: &State<'_, AppState>) -> CmdResult<()> {
+    let prev = state.tool.lock().unwrap().take();
+    if let Some(prev) = prev {
+        tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Run `xng scan` or `xng survey`. Progress and the final report arrive on
+/// `on_event`. A running session or tool is stopped first: they would be
+/// holding the radio.
+#[tauri::command]
+async fn start_tool(
+    state: State<'_, AppState>,
+    request: ToolRequest,
+    on_event: Channel<ToolEvent>,
+) -> CmdResult<()> {
+    let prev = state.running.lock().unwrap().take();
+    if let Some(prev) = prev {
+        tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
+    }
+    stop_tool_task(&state).await?;
+    let task = ToolTask::start(request, on_event, sdr_lock).map_err(err)?;
+    let mut slot = state.tool.lock().unwrap();
+    if state.closing.load(std::sync::atomic::Ordering::Relaxed) {
+        drop(slot);
+        task.stop();
+        return Err("The window was closed".into());
+    }
+    *slot = Some(task);
+    Ok(())
+}
+
+/// Ask the running scan or survey to finish early. It reports what it has
+/// measured so far through its event channel; this returns at once.
+#[tauri::command]
+fn stop_tool(state: State<'_, AppState>) {
+    let mut slot = state.tool.lock().unwrap();
+    if let Some(task) = slot.as_ref() {
+        task.cancel();
+        if task.finished() {
+            *slot = None;
+        }
+    }
+}
+
 /// Write the current map picture to `path` as GeoJSON, GPX or KML.
 #[tauri::command]
 async fn export_entities(state: State<'_, AppState>, format: String, path: String) -> CmdResult<()> {
@@ -173,6 +225,13 @@ async fn export_entities(state: State<'_, AppState>, format: String, path: Strin
         }
     };
     std::fs::write(&path, body).map_err(err)
+}
+
+/// Save text the UI produced (a scan or survey report) to a path the user
+/// picked in a save dialog.
+#[tauri::command]
+async fn write_text(path: String, contents: String) -> CmdResult<()> {
+    std::fs::write(&path, contents).map_err(err)
 }
 
 /// Size the decode worker pool (as `--decode-threads`). Only the first
@@ -198,7 +257,10 @@ pub fn run() {
             resolve_tune,
             start_session,
             stop_session,
+            start_tool,
+            stop_tool,
             export_entities,
+            write_text,
             set_decode_threads,
         ])
         .on_window_event(|window, event| {
@@ -209,6 +271,9 @@ pub fn run() {
                     state.closing.store(true, std::sync::atomic::Ordering::Relaxed);
                     if let Some(r) = state.running.lock().unwrap().take() {
                         r.stop();
+                    }
+                    if let Some(t) = state.tool.lock().unwrap().take() {
+                        t.stop();
                     }
                 }
             }
