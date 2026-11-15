@@ -16,6 +16,26 @@ pub struct DeviceEntry {
     pub backend: &'static str,
 }
 
+/// SoapySDR's devices. When SoapySDR cannot be used (not installed on
+/// Windows, say) and a native backend already found devices, those are
+/// kept: the problem is reported and SoapySDR contributes nothing. With
+/// no native devices the error is the answer.
+#[cfg(feature = "soapy")]
+fn soapy_devices(filter: &str, have_native: bool) -> anyhow::Result<Vec<xng_sdr::soapy::DeviceSummary>> {
+    soapy_or_native(xng_sdr::soapy::enumerate(filter).map_err(anyhow::Error::from), have_native)
+}
+
+#[cfg(feature = "soapy")]
+fn soapy_or_native<T>(found: anyhow::Result<Vec<T>>, have_native: bool) -> anyhow::Result<Vec<T>> {
+    match found {
+        Err(e) if have_native => {
+            tracing::warn!("SoapySDR devices not listed: {e}");
+            Ok(Vec::new())
+        }
+        other => other,
+    }
+}
+
 /// Enumerate every device the compiled-in backends can see. Native
 /// backends come first; SoapySDR results honour `filter` (e.g.
 /// "driver=rtlsdr").
@@ -39,7 +59,7 @@ pub fn list(filter: &str) -> anyhow::Result<Vec<DeviceEntry>> {
         });
     }
     #[cfg(feature = "soapy")]
-    for d in xng_sdr::soapy::enumerate(filter)? {
+    for d in soapy_devices(filter, !out.is_empty())? {
         let label = if d.label.is_empty() { d.driver.clone() } else { d.label.clone() };
         // `backend=soapy` pins the SoapySDR path, so an Airspy that Soapy
         // enumerates is opened by the backend this entry names rather than
@@ -77,7 +97,7 @@ pub fn run(filter: &str) -> anyhow::Result<()> {
         lines.push(format!("driver=airspyhf,serial={sn:016X} (native libairspyhf)"));
     }
     #[cfg(feature = "soapy")]
-    for d in xng_sdr::soapy::enumerate(filter)? {
+    for d in soapy_devices(filter, !lines.is_empty())? {
         let label = if d.label.is_empty() { &d.args } else { &d.label };
         lines.push(format!("driver={} {} (soapysdr)", d.driver, label));
     }
@@ -96,4 +116,17 @@ pub fn run(filter: &str) -> anyhow::Result<()> {
         println!("  [{i}] {line}");
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "soapy"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_soapy_failure_keeps_native_devices_but_is_the_answer_without_them() {
+        let fail = || -> anyhow::Result<Vec<u8>> { Err(anyhow::anyhow!("SoapySDR is not installed")) };
+        assert!(soapy_or_native(fail(), true).unwrap().is_empty());
+        assert!(soapy_or_native(fail(), false).unwrap_err().to_string().contains("not installed"));
+        assert_eq!(soapy_or_native(Ok(vec![1u8]), true).unwrap(), vec![1]);
+    }
 }

@@ -1,0 +1,31 @@
+name: Install PothosSDR
+description: >
+  SoapySDR for Windows builds: the headers and import library xng links
+  against, and the runtime and driver modules its tests load. Unpacked to
+  C:\PothosSDR with its bin folder added to PATH.
+runs:
+  using: composite
+  steps:
+    - name: Install PothosSDR
+      shell: pwsh
+      run: |
+        $url = "https://downloads.myriadrf.org/builds/PothosSDR/PothosSDR-2021.07.25-vc16-x64.exe"
+        $sha256 = "705d962f578a9595a31d00e71ac68eb5ca951f3d3cb6091bf99bd13368960da9"
+        $exe = Join-Path $env:RUNNER_TEMP "PothosSDR.exe"
+        curl.exe -fsSL --retry 4 --retry-delay 5 -o $exe $url
+        if ($LASTEXITCODE -ne 0) { throw "PothosSDR download failed" }
+        $got = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+        if ($got -ne $sha256) { throw "PothosSDR checksum mismatch: $got" }
+        # The installer is an NSIS archive; unpacking it gives the same tree
+        # as installing, without a system-wide install.
+        7z x $exe -oC:\PothosSDR -y | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "PothosSDR unpack failed" }
+        foreach ($f in "bin\SoapySDR.dll", "lib\SoapySDR.lib", "include\SoapySDR\Device.h") {
+          if (!(Test-Path "C:\PothosSDR\$f")) { throw "PothosSDR is missing $f" }
+        }
+        "C:\PothosSDR\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        # bindgen (soapysdr-sys) needs libclang.
+        $llvm = "C:\Program Files\LLVM\bin"
+        if (Test-Path "$llvm\libclang.dll") {
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        }

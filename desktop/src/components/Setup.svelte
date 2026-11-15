@@ -144,7 +144,7 @@
                 <strong>Couldn't list radios.</strong> <span class="selectable">{app.devicesError}</span>
               {:else}
                 <strong>No radio found.</strong> Plug in an SDR and refresh, or open a recording instead.
-                {#if app.info?.os === "windows"}SoapySDR devices need the PothosSDR drivers installed.{/if}
+                {#if app.info?.os === "windows"}On Windows, an RTL-SDR also needs the WinUSB driver, which Zadig installs.{/if}
               {/if}
             </div>
           {/each}

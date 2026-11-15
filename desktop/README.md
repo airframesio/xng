@@ -56,7 +56,12 @@ installers to each tagged release:
 |---|---|---|
 | Debian/Ubuntu x86_64 and arm64 | `.deb` | SoapySDR, native Airspy and Airspy HF+ |
 | macOS Apple Silicon | `.dmg` | SoapySDR, native Airspy and Airspy HF+ (`brew install soapysdr airspy airspyhf`) |
-| Windows x86_64 | `.exe` setup | IQ recordings only for now |
+| Windows x86_64 | `.exe` setup | SoapySDR, once [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/) is installed |
+
+On Windows the app does not bundle SoapySDR. It starts without it and
+decodes recordings; install PothosSDR to use a radio (an RTL-SDR also needs
+the WinUSB driver from Zadig). The radio list says so when SoapySDR is
+missing.
 
 The app is named XNG everywhere. Its Debian package is `xng-desktop`
 (set in `src-tauri/tauri.linux.conf.json`) so it installs next to the CLI's

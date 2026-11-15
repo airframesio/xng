@@ -27,7 +27,9 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "build.rs"
       - ".github/workflows/desktop.yml"
+      - ".github/actions/**"
   pull_request:
     branches: [ "master" ]
     paths:
@@ -36,7 +38,9 @@ on:
       - "crates/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "build.rs"
       - ".github/workflows/desktop.yml"
+      - ".github/actions/**"
   workflow_call:
   workflow_dispatch:
 
@@ -67,12 +71,13 @@ jobs:
             target: aarch64-apple-darwin
             bundles: app,dmg
             cargo_args: --features airspy,airspyhf
-          # No SDR backend on Windows yet (same as the CLI's Windows build):
-          # the app decodes IQ recordings there.
+          # SoapySDR on Windows comes from PothosSDR. It is linked
+          # delay-loaded and not bundled: the app starts without it and
+          # finds radios once PothosSDR is installed.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             bundles: nsis
-            cargo_args: --no-default-features
+            cargo_args: ""
     defaults:
       run:
         working-directory: desktop
@@ -106,6 +111,9 @@ jobs:
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
         run: choco install protoc -y --no-progress
+      - name: Install PothosSDR (Windows)
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/pothossdr
       - name: Install UI dependencies
         run: npm ci
       - name: Type-check UI

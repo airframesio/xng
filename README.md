@@ -167,6 +167,13 @@ sudo apt install ./xng-0.21.0-arm64.deb    # pulls runtime deps
 tar xzf xng-v0.21.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
 ```
 
+On Windows, unzip the `x86_64-pc-windows-msvc` release. To use a radio,
+install [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/), which
+provides SoapySDR and its RTL-SDR, Airspy, HackRF and SDRplay modules; xng
+finds it on `PATH`, in its default install folder, or under
+`SOAPY_SDR_ROOT`. An RTL-SDR also needs the WinUSB driver (Zadig). Without
+PothosSDR, `xng.exe` still runs and decodes IQ recordings.
+
 Multi-arch Docker images (amd64/arm64/armv7) are published per tag:
 
 ```bash
@@ -184,6 +191,9 @@ sudo apt install protobuf-compiler libsoapysdr-dev soapysdr-module-all
 
 # macOS
 brew install protobuf soapysdr
+
+# Windows: install PothosSDR and put its bin folder on PATH, then
+#   choco install protoc llvm
 
 # Build (binary at ./target/release/xng)
 cargo build --release
