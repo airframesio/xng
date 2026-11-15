@@ -209,6 +209,27 @@ pub fn load(path: &Path) -> anyhow::Result<StationFile> {
     Ok(f)
 }
 
+impl StationFile {
+    /// Read the file's relative paths (recordings, the JSONL log, the
+    /// aircraft database) from `dir` instead of the working directory. A
+    /// front end started from anywhere passes the station file's own
+    /// folder; `xng station` keeps the shell's working directory.
+    pub fn resolve_paths(&mut self, dir: &Path) {
+        let fix = |p: &mut Option<PathBuf>| {
+            if let Some(path) = p {
+                if path.is_relative() {
+                    *path = dir.join(&*path);
+                }
+            }
+        };
+        fix(&mut self.outputs.jsonl);
+        fix(&mut self.outputs.aircraft_db);
+        for s in &mut self.sessions {
+            fix(&mut s.file);
+        }
+    }
+}
+
 /// Turn a loaded station file into the sessions it describes, opening each
 /// SDR or recording, exactly as `xng station` runs them. The shared outputs
 /// ride on every session's config (the first one's are used). `console` is
@@ -471,6 +492,28 @@ mod tests {
         assert!(f.outputs.feed_airframes);
         assert_eq!(f.sessions[1].mode, "vdl2");
         assert!(f.sessions[1].channels.is_empty()); // plan-derived
+    }
+
+    #[test]
+    fn relative_paths_resolve_against_a_given_folder() {
+        let toml = r#"
+station-id = "X"
+[outputs]
+jsonl = "log/out.jsonl"
+aircraft-db = "/abs/db.csv"
+[[session]]
+file = "rec/a.cf32"
+mode = "acars"
+[[session]]
+sdr = "driver=rtlsdr"
+mode = "vdl2"
+"#;
+        let mut f: StationFile = toml::from_str(toml).unwrap();
+        f.resolve_paths(Path::new("/stations/home"));
+        assert_eq!(f.outputs.jsonl.as_deref(), Some(Path::new("/stations/home/log/out.jsonl")));
+        assert_eq!(f.outputs.aircraft_db.as_deref(), Some(Path::new("/abs/db.csv")));
+        assert_eq!(f.sessions[0].file.as_deref(), Some(Path::new("/stations/home/rec/a.cf32")));
+        assert!(f.sessions[1].file.is_none());
     }
 
     #[test]

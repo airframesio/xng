@@ -254,18 +254,51 @@ async fn pump_lines<R: tokio::io::AsyncRead + Unpin>(
 
 /// Start the decoder. `windowless` keeps Windows from opening a console
 /// window for it when the caller is a GUI app.
+/// A GUI caller also has no terminal for the decoder's own messages, so
+/// its stderr is piped for [`stderr_tail`] instead of inherited.
 fn spawn_child(command: &[String], windowless: bool) -> anyhow::Result<tokio::process::Child> {
     tracing::info!("spawning: {}", command.join(" "));
     let mut cmd = tokio::process::Command::new(&command[0]);
     cmd.args(&command[1..]).stdout(std::process::Stdio::piped()).kill_on_drop(true);
+    if windowless {
+        cmd.stderr(std::process::Stdio::piped());
+    }
     #[cfg(windows)]
     if windowless {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    #[cfg(not(windows))]
-    let _ = windowless;
     cmd.spawn().map_err(|e| anyhow::anyhow!("could not start {:?}: {e}", command[0]))
+}
+
+/// How many of the decoder's last stderr lines an error message carries.
+const STDERR_TAIL_LINES: usize = 6;
+
+/// Follow a piped stderr in the background, logging each line and keeping
+/// the last few: they are what says why a decoder gave up.
+type StderrTail = Arc<Mutex<std::collections::VecDeque<String>>>;
+
+fn stderr_tail(child: &mut tokio::process::Child) -> (StderrTail, Option<tokio::task::JoinHandle<()>>) {
+    let tail: StderrTail = Arc::default();
+    let reader = child.stderr.take().map(|stderr| {
+        let tail = tail.clone();
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let line = line.trim_end().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                tracing::info!("decoder: {line}");
+                let mut t = tail.lock().unwrap();
+                if t.len() == STDERR_TAIL_LINES {
+                    t.pop_front();
+                }
+                t.push_back(line);
+            }
+        })
+    });
+    (tail, reader)
 }
 
 /// Pump a spawned decoder until it exits or `stop` is set (then it is
@@ -359,13 +392,14 @@ impl ExternSession {
                     }
                 };
                 let result: anyhow::Result<()> = rt.block_on(async {
-                    let child = match spawn_child(&command, true) {
+                    let mut child = match spawn_child(&command, true) {
                         Ok(c) => c,
                         Err(e) => {
                             let _ = ready_tx.send(Err(e));
                             return Ok(());
                         }
                     };
+                    let (said, said_reader) = stderr_tail(&mut child);
                     let bus = MessageBus::new();
                     let _ = ready_tx.send(Ok((bus.downgrade(), bus.subscribe())));
                     let tasks = spawn_outputs(&bus, &outputs, &station);
@@ -375,7 +409,19 @@ impl ExternSession {
                     tracing::info!("extern session: {count} message(s) normalized");
                     match status {
                         Some(s) if !s.success() => {
-                            anyhow::bail!("{} stopped ({s}) after {count} message(s)", command[0])
+                            // The reader ends when the decoder's stderr
+                            // closes; give it a moment to take in the
+                            // last lines.
+                            if let Some(r) = said_reader {
+                                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), r).await;
+                            }
+                            let said: Vec<String> = said.lock().unwrap().iter().cloned().collect();
+                            let why = if said.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", said.join(" | "))
+                            };
+                            anyhow::bail!("{} stopped ({s}) after {count} message(s){why}", command[0])
                         }
                         _ => Ok(()),
                     }
@@ -527,11 +573,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failing_decoder_is_reported() {
-        let cmd = vec!["sh".to_string(), "-c".to_string(), "exit 3".to_string()];
+        let script = "echo 'unable to open device 0' >&2; exit 3";
+        let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
         let s = ExternSession::start(ExternFormat::Acarsdec, cmd, "XX-TEST".into(), quiet()).unwrap();
         wait(&s);
         let EngineState::Failed(e) = s.state() else { panic!("expected a failure") };
         assert!(e.contains("stopped"), "{e}");
+        // What the decoder said on stderr is the reason the user needs.
+        assert!(e.contains("unable to open device 0"), "{e}");
     }
 
     #[cfg(unix)]

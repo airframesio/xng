@@ -274,7 +274,12 @@ fn station_source(s: &station::SessionToml) -> String {
 
 /// Every session a station file names, with the file's outputs.
 fn start_station(path: &std::path::Path) -> anyhow::Result<Started> {
-    let st = station::load(path)?;
+    let mut st = station::load(path)?;
+    // The app's working directory is wherever it was launched from, so
+    // the file's relative paths are read from its own folder.
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        st.resolve_paths(dir);
+    }
     let sessions = station::build(&st, console::ConsoleFormat::Off)?;
     let engine = Engine::start(sessions, EngineOptions { handle_signals: false })?;
     let sources: Vec<String> = st.sessions.iter().map(station_source).collect();
