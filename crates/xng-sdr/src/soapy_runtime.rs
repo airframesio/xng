@@ -4,7 +4,8 @@
 //! xng was built against it. On Windows it comes from a separate install
 //! (PothosSDR), so xng links it delay-loaded: the program starts without it,
 //! and [`ensure`] loads it on first use or explains what to install. The
-//! lookup never includes the working directory.
+//! lookup does not search the working directory, unless that folder is
+//! itself listed on `PATH` by its absolute path.
 
 /// Where to get SoapySDR for Windows.
 pub const INSTALL_HINT: &str = "SoapySDR is not installed. Install PothosSDR \
@@ -30,7 +31,8 @@ pub fn ensure() -> Result<(), String> {
 /// folder and the system folder: every absolute `PATH` entry, an explicit
 /// `SOAPY_SDR_ROOT`, then PothosSDR's default install locations.
 ///
-/// The working directory is never searched as such. Relative entries,
+/// The working directory is not searched unless one of these names it
+/// by its absolute path, which is the user's own choice. Relative entries,
 /// in `PATH` or in any of the variables, are left out for the same
 /// reason: they would be read from wherever xng was started.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -142,7 +144,7 @@ mod tests {
                 _ => None,
             }
         };
-        // Relative PATH entries and the working directory are never searched.
+        // Relative entries, "." included, are never searched.
         assert_eq!(
             candidate_dirs(env),
             [abs("opt/sdr"), abs("tools"), root.join("bin"), pf.join("PothosSDR").join("bin")]
