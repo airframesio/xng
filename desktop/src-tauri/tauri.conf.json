@@ -33,7 +33,8 @@
     "copyright": "xng contributors",
     "license": "MIT OR Apache-2.0",
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "entitlements": "entitlements.plist"
     },
     "linux": {
       "deb": {
