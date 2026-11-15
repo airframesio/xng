@@ -4,8 +4,9 @@
 //! xng was built against it. On Windows it comes from a separate install
 //! (PothosSDR), so xng links it delay-loaded: the program starts without it,
 //! and [`ensure`] loads it on first use or explains what to install. The
-//! lookup does not search the working directory, unless that folder is
-//! itself listed on `PATH` by its absolute path.
+//! lookup has no implicit working-directory search: only folders named
+//! by an absolute path are searched, though one of those can happen to be
+//! the working directory.
 
 /// Where to get SoapySDR for Windows.
 pub const INSTALL_HINT: &str = "SoapySDR is not installed. Install PothosSDR \
@@ -31,8 +32,9 @@ pub fn ensure() -> Result<(), String> {
 /// folder and the system folder: every absolute `PATH` entry, an explicit
 /// `SOAPY_SDR_ROOT`, then PothosSDR's default install locations.
 ///
-/// The working directory is not searched unless one of these names it
-/// by its absolute path, which is the user's own choice. Relative entries,
+/// There is no implicit working-directory search: the working directory
+/// is searched only when one of these names it by its absolute path,
+/// which is the user's own choice. Relative entries,
 /// in `PATH` or in any of the variables, are left out for the same
 /// reason: they would be read from wherever xng was started.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -86,8 +88,8 @@ mod windows {
     /// Load SoapySDR, so the delay-loaded imports resolve to it.
     ///
     /// The DLL is never looked up through the default search order, which
-    /// includes the working directory: a `SoapySDR.dll` dropped in the
-    /// folder xng happens to be started from must not be loaded.
+    /// includes the working directory: a `SoapySDR.dll` must not be loaded
+    /// just because it is in the folder xng happens to be started from.
     pub fn load() -> bool {
         // By name, from the program's folder and the system folder only.
         if load_library(Path::new(DLL), LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32) {
