@@ -10,12 +10,15 @@ import type {
   ChannelStat,
   DeviceEntry,
   EntityState,
+  IngestReport,
   MessageItem,
   ProposedConfig,
   ResolvedTune,
   ScanReport,
   SessionRequest,
+  SessionLive,
   SessionSummary,
+  Source,
   SurveyReport,
   ToolEvent,
   ToolRequest,
@@ -25,13 +28,18 @@ const MAX_MESSAGES = 5000;
 const MAX_TOOL_LINES = 2000;
 const SETTINGS_KEY = "xng.settings.v1";
 
+export type SourceKind = "device" | "file" | "station" | "extern";
+
 /** Everything the setup form holds, as the strings the user typed. */
 export interface Settings {
-  sourceKind: "device" | "file";
+  sourceKind: SourceKind;
   device: string;
   gain: string;
   filePath: string;
   fileFormat: string;
+  stationPath: string;
+  externFormat: string;
+  externCommand: string;
   mode: string;
   sampleRate: string;
   centerFreq: string;
@@ -75,6 +83,7 @@ export interface Settings {
 
 const DEFAULTS: Settings = {
   sourceKind: "device", device: "", gain: "", filePath: "", fileFormat: "",
+  stationPath: "", externFormat: "dumpvdl2", externCommand: "",
   mode: "acars", sampleRate: "", centerFreq: "", channels: "", receiverPos: "",
   demodEffort: "", maxPpm: "", decodeThreads: "", filterLabels: "", excludeLabels: "",
   aisIncludeTypes: "", aisExcludeTypes: "", aisIncludeMmsi: "", aisExcludeMmsi: "",
@@ -107,6 +116,7 @@ export function saveSettings() {
 export function resetAdvanced() {
   const keep: Partial<Settings> = {
     sourceKind: settings.sourceKind, device: settings.device, filePath: settings.filePath, mode: settings.mode,
+    stationPath: settings.stationPath, externFormat: settings.externFormat, externCommand: settings.externCommand,
   };
   // For a recording these describe the capture and live on the Setup
   // screen, not in the Advanced panel.
@@ -121,18 +131,29 @@ export function resetAdvanced() {
 
 /** How many advanced fields differ from their defaults. */
 export function advancedCount(): number {
-  const skip = new Set(["sourceKind", "device", "filePath", "mode"]);
+  const skip = new Set(["sourceKind", "device", "filePath", "mode", "stationPath", "externFormat", "externCommand"]);
   if (settings.sourceKind === "file") ["sampleRate", "centerFreq", "fileFormat"].forEach((k) => skip.add(k));
   return (Object.keys(DEFAULTS) as (keyof Settings)[]).filter((k) => !skip.has(k) && settings[k] !== DEFAULTS[k]).length;
+}
+
+function buildSource(): Source {
+  const s = settings;
+  switch (s.sourceKind) {
+    case "device":
+      return { kind: "device", selector: s.device, gain: num(s.gain) };
+    case "file":
+      return { kind: "file", path: s.filePath, format: text(s.fileFormat) };
+    case "station":
+      return { kind: "station", path: s.stationPath };
+    case "extern":
+      return { kind: "extern", format: s.externFormat, command: s.externCommand };
+  }
 }
 
 export function buildRequest(): SessionRequest {
   const s = settings;
   return {
-    source:
-      s.sourceKind === "device"
-        ? { kind: "device", selector: s.device, gain: num(s.gain) }
-        : { kind: "file", path: s.filePath, format: text(s.fileFormat) },
+    source: buildSource(),
     mode: s.mode,
     sampleRate: num(s.sampleRate),
     centerFreq: text(s.centerFreq),
@@ -179,7 +200,7 @@ export function buildRequest(): SessionRequest {
 }
 
 export type Phase = "idle" | "starting" | "running" | "ended";
-export type ToolKind = "scan" | "survey";
+export type ToolKind = "scan" | "survey" | "ingest";
 /** idle: choosing options. stopping: asked to finish, report on its way. */
 export type ToolPhase = "idle" | "running" | "stopping" | "done" | "failed";
 
@@ -218,7 +239,9 @@ class AppState {
   dropped = $state(0);
   /** Of `dropped`, how many the map missed as well. */
   lagged = $state(0);
-  channels = $state.raw<ChannelStat[]>([]);
+  /** Which of `sessions` the signal views show. */
+  activeSession = $state(0);
+  private lives = $state.raw<SessionLive[]>([]);
   samples = $state(0);
   elapsedMs = $state(0);
   entities = $state.raw<EntityState | null>(null);
@@ -232,7 +255,7 @@ class AppState {
   tool = $state<ToolKind | null>(null);
   toolPhase = $state<ToolPhase>("idle");
   toolLines = $state.raw<string[]>([]);
-  toolReport = $state.raw<ScanReport | SurveyReport | null>(null);
+  toolReport = $state.raw<ScanReport | SurveyReport | IngestReport | null>(null);
   /** Which tool produced `toolReport`. */
   toolReportKind = $state<ToolKind | null>(null);
   toolStopped = $state(false);
@@ -242,13 +265,29 @@ class AppState {
 
   private spectrumListeners = new Set<(bins: number[]) => void>();
   private rateWindow: { t: number; n: number }[] = [];
-  private lastSpectrum: number[] | null = null;
+  /** The newest spectrum frame of each session. */
+  private lastSpectrum: (number[] | null)[] = [];
 
-  /** Subscribe to spectrum frames; the latest one is replayed at once. */
+  /** Subscribe to the shown session's spectrum frames; the latest one is
+   *  replayed at once. */
   onSpectrum(fn: (bins: number[]) => void): () => void {
     this.spectrumListeners.add(fn);
-    if (this.lastSpectrum) fn(this.lastSpectrum);
+    const last = this.lastSpectrum[this.activeSession];
+    if (last) fn(last);
     return () => this.spectrumListeners.delete(fn);
+  }
+
+  /** Point the signal views at another session of a station. */
+  showSession(i: number) {
+    if (i < 0 || i >= this.sessions.length) return;
+    this.activeSession = i;
+    const last = this.lastSpectrum[i];
+    if (last) for (const fn of this.spectrumListeners) fn(last);
+  }
+
+  /** Per-channel stats of the shown session. */
+  get channels(): ChannelStat[] {
+    return this.lives[this.activeSession]?.channels ?? [];
   }
 
   select(m: MessageItem | null) {
@@ -265,7 +304,7 @@ class AppState {
   }
 
   get session(): SessionSummary | null {
-    return this.sessions[0] ?? null;
+    return this.sessions[this.activeSession] ?? null;
   }
 
   get selected(): MessageItem | null {
@@ -310,12 +349,13 @@ class AppState {
     this.total = 0;
     this.dropped = 0;
     this.lagged = 0;
-    this.channels = [];
+    this.lives = [];
+    this.activeSession = 0;
     this.samples = 0;
     this.elapsedMs = 0;
     this.entities = null;
     this.select(null);
-    this.lastSpectrum = null;
+    this.lastSpectrum = [];
     this.rate = 0;
     this.rateWindow = [];
     try {
@@ -430,14 +470,15 @@ class AppState {
         break;
       }
       case "live": {
-        const s = e.sessions[0];
-        if (!s) break;
         this.elapsedMs = e.elapsedMs;
-        this.samples = s.samples;
-        this.channels = s.channels;
-        if (s.spectrum) {
-          this.lastSpectrum = s.spectrum;
-          for (const fn of this.spectrumListeners) fn(s.spectrum);
+        this.lives = e.sessions;
+        e.sessions.forEach((s, i) => {
+          if (s.spectrum) this.lastSpectrum[i] = s.spectrum;
+        });
+        const s = e.sessions[this.activeSession];
+        if (s) {
+          this.samples = s.samples;
+          if (s.spectrum) for (const fn of this.spectrumListeners) fn(s.spectrum);
         }
         this.updateRate();
         break;

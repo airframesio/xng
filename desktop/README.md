@@ -13,7 +13,7 @@ The UI is Svelte 5 with MapLibre GL, rendered by the system webview.
 
 | Path | What |
 |---|---|
-| `src-tauri/` | Rust side: commands, the request to `SessionConfig` mapping, the pump that batches engine output for the UI, and the scan/survey runner |
+| `src-tauri/` | Rust side: commands, the request to `SessionConfig` mapping, the pump that batches engine output for the UI, and the scan/survey/ingest runner |
 | `src/` | Svelte UI |
 | `src/lib/demo.ts` | Simulated backend used only when the UI runs in a plain browser |
 
@@ -98,5 +98,21 @@ a log and the report as tables. Each suggested setup has a "Use this setup"
 button that fills in the signal, sample rate, center, channels and gain, and
 the report can be saved as the JSON that `--out` writes.
 
-Not in the app yet: multi-session stations, `ingest` and `extern`. Use the
-CLI for those.
+The Source row on the setup screen has two more choices besides a radio and
+a recording:
+
+- **Station** opens a station file (the one `xng station` takes) and runs
+  every session in it: several radios, each on its own signal, sharing one
+  set of outputs. The file sets the tuning, filters and outputs, so the
+  Advanced panel does not apply. While it runs, a picker in the top bar
+  chooses which radio the spectrum and channel table show; messages and the
+  map combine all of them. Stations are opened from a file, not built in the
+  app.
+- **Other decoder** is `xng extern`: XNG starts dumpvdl2, dumphfdl or
+  acarsdec with the command line you give, reads its JSON from standard
+  output and shows the messages, with JSONL, UDP and asf-2.0 outputs. There
+  is no spectrum, since the other decoder owns the radio.
+
+**Receive feeds** at the bottom of the setup screen is `xng ingest`, the
+reference asf-2.0 server, on gRPC, QUIC or both. Received messages are listed
+as they arrive.

@@ -131,6 +131,12 @@ async fn resolve_tune(request: SessionRequest) -> CmdResult<ResolvedTune> {
     .map_err(err)?
 }
 
+/// Read a station file and say what it would run, without starting it.
+#[tauri::command]
+async fn station_preview(path: String) -> CmdResult<session::StationPreview> {
+    session::station_preview(std::path::Path::new(&path)).map_err(err)
+}
+
 /// Start decoding. Any running session is stopped first.
 #[tauri::command]
 async fn start_session(
@@ -299,6 +305,7 @@ pub fn run() {
             app_info,
             list_devices,
             resolve_tune,
+            station_preview,
             start_session,
             stop_session,
             start_tool,

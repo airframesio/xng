@@ -11,6 +11,7 @@ async function tauriBackend(): Promise<Backend> {
     appInfo: () => invoke("app_info"),
     listDevices: () => invoke("list_devices", { filter: null }),
     resolveTune: (request) => invoke("resolve_tune", { request }),
+    stationPreview: (path) => invoke("station_preview", { path }),
     start: (request, onEvent) => {
       const onEventChannel = new Channel<BackendEvent>();
       onEventChannel.onmessage = onEvent;

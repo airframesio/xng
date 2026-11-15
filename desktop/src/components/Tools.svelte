@@ -3,7 +3,7 @@
   import { mhz, num, list, rate } from "../lib/format";
   import { FAMILIES, MODES, modeMeta } from "../lib/modes";
   import { app, applyProposal, settings, type ToolKind } from "../lib/store.svelte";
-  import type { ProposedConfig, ScanReport, SurveyReport, ToolRequest } from "../lib/types";
+  import type { IngestReport, ProposedConfig, ScanReport, SurveyReport, ToolRequest } from "../lib/types";
   import Icon from "./Icon.svelte";
 
   const TITLES: Record<ToolKind, { name: string; lead: string }> = {
@@ -14,6 +14,10 @@
     survey: {
       name: "Survey reception",
       lead: "Listens to one signal for a sustained period and reports how well each channel is received, with advice on gain.",
+    },
+    ingest: {
+      name: "Receive feeds",
+      lead: "Runs the reference asf-2.0 ingest server, so other XNG stations can feed this computer. Received messages are listed here as they arrive.",
     },
   };
 
@@ -33,6 +37,11 @@
   let rotateDwell = $state("60");
   let scanDwell = $state("90");
   let tuneDwell = $state("20");
+  let grpcOn = $state(true);
+  let grpcAddr = $state("0.0.0.0:6001");
+  let quicOn = $state(false);
+  let quicAddr = $state("0.0.0.0:6011");
+  let quicCert = $state("");
   let saved = $state<string | null>(null);
   let showLog = $state(false);
   let logEl = $state<HTMLElement | null>(null);
@@ -43,6 +52,8 @@
   const gain = $derived(num(settings.gain));
   const scanReport = $derived(app.toolReportKind === "scan" ? (app.toolReport as ScanReport | null) : null);
   const surveyReport = $derived(app.toolReportKind === "survey" ? (app.toolReport as SurveyReport | null) : null);
+  const ingestReport = $derived(app.toolReportKind === "ingest" ? (app.toolReport as IngestReport | null) : null);
+  const radioTool = $derived(kind !== "ingest");
   const heard = $derived(scanReport?.results.filter((r) => r.verdict !== "quiet") ?? []);
   const quiet = $derived((scanReport?.results.length ?? 0) - heard.length);
   const proposals = $derived<ProposedConfig[]>(scanReport?.configs ?? (surveyReport?.config ? [surveyReport.config] : []));
@@ -67,7 +78,20 @@
     scanModes = scanModes.includes(id) ? scanModes.filter((m) => m !== id) : [...scanModes, id];
   }
 
+  async function chooseCert() {
+    const p = await (await backend()).pickSave("Save the QUIC certificate", "xng-ingest-cert.pem");
+    if (p) quicCert = p;
+  }
+
   function request(): ToolRequest {
+    if (kind === "ingest") {
+      return {
+        kind: "ingest",
+        grpc: grpcOn ? grpcAddr.trim() : null,
+        quic: quicOn ? quicAddr.trim() : null,
+        quicCertOut: quicOn && quicCert ? quicCert : null,
+      };
+    }
     if (kind === "scan") {
       return { kind: "scan", sdr: settings.device, gain, modes: scanModes, dwellSecs: seconds(dwell, 20) };
     }
@@ -127,6 +151,7 @@
       </button>
       <div class="titlerow">
         <h1>{TITLES[kind].name}</h1>
+        {#if radioTool}
         <div class="seg" role="tablist" aria-label="Tool">
           {#each ["scan", "survey"] as const as k (k)}
             <button role="tab" aria-selected={kind === k} class:on={kind === k} disabled={busy} onclick={() => app.openTool(k)}>
@@ -134,6 +159,7 @@
             </button>
           {/each}
         </div>
+        {/if}
       </div>
       <p>{TITLES[kind].lead}</p>
     </header>
@@ -143,6 +169,42 @@
         <div class="note bad selectable"><Icon name="alert" size={15} /> {app.toolError}</div>
       {/if}
 
+      {#if kind === "ingest"}
+        <section class="checks" aria-label="Listeners">
+          <label class="check">
+            <input type="checkbox" bind:checked={grpcOn} />
+            <span><b>gRPC</b> for feeders using an asf-2.0 gRPC address</span>
+          </label>
+          {#if grpcOn}
+            <label class="field indent">
+              <span>Listen on</span>
+              <input class="input mono" bind:value={grpcAddr} placeholder="0.0.0.0:6001" spellcheck="false" />
+            </label>
+          {/if}
+          <label class="check">
+            <input type="checkbox" bind:checked={quicOn} />
+            <span><b>QUIC</b> for feeders using an asf-2.0 QUIC address</span>
+          </label>
+          {#if quicOn}
+            <label class="field indent">
+              <span>Listen on</span>
+              <input class="input mono" bind:value={quicAddr} placeholder="0.0.0.0:6011" spellcheck="false" />
+            </label>
+            <div class="field indent">
+              <span>Certificate for feeders to trust</span>
+              <div class="certrow">
+                <button class="btn" onclick={chooseCert}><Icon name="download" size={15} /> Choose where to save it</button>
+                {#if quicCert}<span class="mono dim selectable">{quicCert}</span>{/if}
+              </div>
+              <small>QUIC uses a new self-signed certificate each run. Feeders point their asf-2.0 QUIC CA file setting at this file.</small>
+            </div>
+          {/if}
+        </section>
+        <div class="note">
+          0.0.0.0 accepts feeders from other computers on your network; use 127.0.0.1 to accept only this one.
+          Received messages are shown here and not stored.
+        </div>
+      {:else}
       <section aria-labelledby="radio-h">
         <h2 id="radio-h">Radio</h2>
         {#if device}
@@ -239,20 +301,28 @@
           <div class="note">Using the channels and sample rate you set under Advanced for {modeMeta(surveyMode).name}.</div>
         {/if}
       {/if}
+      {/if}
     {:else}
       {#if busy}
         <div class="progress" aria-live="polite">
           <span class="pulse"></span>
-          {app.toolPhase === "stopping" ? "Finishing up and writing the report…" : kind === "scan" ? "Scanning…" : "Surveying…"}
+          {app.toolPhase === "stopping" ? kind === "ingest" ? "Closing the listeners…" : "Finishing up and writing the report…" : kind === "ingest" ? "Listening for feeders…" : kind === "scan" ? "Scanning…" : "Surveying…"}
         </div>
       {/if}
 
       {#if app.toolPhase === "done"}
-        {#if app.toolStopped}
+        {#if ingestReport}
+          <div class="note">
+            Received {ingestReport.messages.toLocaleString()} message{ingestReport.messages === 1 ? "" : "s"} from
+            {ingestReport.feeders.toLocaleString()} feeder connection{ingestReport.feeders === 1 ? "" : "s"}.
+          </div>
+        {:else if app.toolStopped}
           <div class="note">Stopped early. This report covers what was measured up to that point.</div>
         {/if}
 
-        {#if proposals.length}
+        {#if ingestReport}
+          <!-- The log below is the whole result. -->
+        {:else if proposals.length}
           <section aria-labelledby="prop-h">
             <h2 id="prop-h">Suggested setup</h2>
             <div class="props">
@@ -349,7 +419,7 @@
         {/if}
       {/if}
 
-      {#if busy || showLog}
+      {#if busy || showLog || ingestReport}
         <pre class="log mono selectable" bind:this={logEl}>{app.toolLines.join("\n")}</pre>
       {/if}
     {/if}
@@ -362,22 +432,38 @@
     {#if busy}
       <button class="btn danger lg" disabled={app.toolPhase === "stopping"} onclick={() => app.stopTool()}>
         <Icon name="stop" size={16} />
-        {app.toolPhase === "stopping" ? "Stopping…" : "Stop and report"}
+        {app.toolPhase === "stopping" ? "Stopping…" : kind === "ingest" ? "Stop receiving" : "Stop and report"}
       </button>
     {:else if app.toolPhase === "done"}
-      <button class="btn quiet" onclick={() => (showLog = !showLog)}>{showLog ? "Hide log" : "Show log"}</button>
-      <button class="btn" onclick={save}><Icon name="download" size={15} /> Save report</button>
+      {#if !ingestReport}
+        <button class="btn quiet" onclick={() => (showLog = !showLog)}>{showLog ? "Hide log" : "Show log"}</button>
+        <button class="btn" onclick={save}><Icon name="download" size={15} /> Save report</button>
+      {/if}
       <button class="btn" onclick={() => (app.toolPhase = "idle")}>Run again</button>
     {:else}
-      <button class="btn primary lg" disabled={!device || (kind === "scan" && scanModes.length === 0)} onclick={start}>
+      <button
+        class="btn primary lg"
+        disabled={kind === "ingest" ? !(grpcOn && grpcAddr.trim()) && !(quicOn && quicAddr.trim()) : !device || (kind === "scan" && scanModes.length === 0)}
+        onclick={start}
+      >
         <Icon name="play" size={16} />
-        {kind === "scan" ? "Start scan" : "Start survey"}
+        {kind === "ingest" ? "Start receiving" : kind === "scan" ? "Start scan" : "Start survey"}
       </button>
     {/if}
   </footer>
 </div>
 
 <style>
+  .indent {
+    margin-left: 28px;
+    max-width: 420px;
+  }
+  .certrow {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+  }
   .tools {
     display: grid;
     grid-template-rows: 1fr auto;
