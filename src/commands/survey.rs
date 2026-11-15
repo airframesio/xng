@@ -158,7 +158,7 @@ pub fn run_with(rep: &Reporter, opts: SurveyOpts) -> anyhow::Result<SurveyReport
         // Stopped before the pre-pass heard anything: that is an empty
         // survey, not a bad channel selection.
         say!(rep, "stopped before any channel was surveyed");
-        return Ok(SurveyReport {
+        return write_report(rep, &opts, SurveyReport {
             mode: mode.as_str().to_string(),
             duration_secs: 0.0,
             sample_rate: rate,
@@ -330,6 +330,11 @@ pub fn run_with(rep: &Reporter, opts: SurveyOpts) -> anyhow::Result<SurveyReport
         proposal,
         config,
     };
+    write_report(rep, &opts, report)
+}
+
+/// Write the report to `--out` when asked, then hand it back.
+fn write_report(rep: &Reporter, opts: &SurveyOpts, report: SurveyReport) -> anyhow::Result<SurveyReport> {
     if let Some(path) = &opts.out_json {
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
         say!(rep, "\nreport written to {}", path.display());
@@ -814,6 +819,39 @@ mod tests {
         assert_eq!(cfg.sample_rate, 2_400_000.0);
         // A lone channel must not sit on DC.
         assert_eq!(cfg.center_hz, 131_575_000);
+    }
+
+    /// A scan-first survey stopped before its pre-pass hears anything is an
+    /// empty survey, and `--out` still gets its report.
+    #[test]
+    fn stopped_before_the_prepass_still_writes_the_report() {
+        let out = std::env::temp_dir().join(format!("xng-survey-stopped-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let opts = |out_json| SurveyOpts {
+            sdr: "driver=xng-test-no-such-radio".into(),
+            gain: None,
+            mode: Mode::StdC,
+            sample_rate: Some(2_400_000.0),
+            channels: Vec::new(),
+            duration_secs: 60,
+            interim_secs: 30,
+            scan_first: true,
+            scan_dwell_secs: 5,
+            tune_gain: false,
+            tune_dwell_secs: 5,
+            rotate_dwell_secs: 30,
+            show_messages: false,
+            jsonl: None,
+            out_json,
+        };
+        let stopped = Reporter::new(|_| {}, Arc::new(AtomicBool::new(true)));
+        let report = run_with(&stopped, opts(Some(out.clone()))).unwrap();
+        assert!(report.channels.is_empty() && report.config.is_none());
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(written["mode"], report.mode);
+        assert!(written["channels"].as_array().unwrap().is_empty());
     }
 
     #[test]

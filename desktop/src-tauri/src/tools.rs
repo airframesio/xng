@@ -66,13 +66,17 @@ pub struct ToolTask {
 impl ToolTask {
     /// Validate `request` and run it on its own thread, holding `lock`
     /// (the app's SDR lock) for as long as it has a device open.
+    ///
+    /// `cancel` is the tool's stop flag. The caller makes it, so a stop
+    /// asked for before the tool exists is already set when its thread
+    /// starts: the tool then ends at its first check and still reports.
     pub fn start<G: 'static>(
         request: ToolRequest,
         events: Channel<ToolEvent>,
         lock: fn() -> G,
+        cancel: Arc<AtomicBool>,
     ) -> anyhow::Result<Self> {
         let job = Job::parse(request)?;
-        let cancel = Arc::new(AtomicBool::new(false));
         let thread = {
             let cancel = cancel.clone();
             std::thread::Builder::new().name("xng-tool".into()).spawn(move || {
@@ -276,13 +280,43 @@ mod tests {
             modes: vec!["ais".into()],
             dwell_secs: 1,
         };
-        ToolTask::start(request, events, || ()).unwrap().wait();
+        ToolTask::start(request, events, || (), Arc::default()).unwrap().wait();
         let seen = seen.lock().unwrap();
         assert!(seen.iter().any(|e| e["type"] == "line"), "{seen:?}");
         let done = seen.last().unwrap();
         assert_eq!(done["type"], "done", "{seen:?}");
         assert_eq!(done["stopped"], false);
         assert!(done["report"]["configs"].as_array().unwrap().is_empty());
+    }
+
+    /// A stop asked for before the tool exists is in force from its first
+    /// check: no capture group is tried and the report says it was stopped.
+    #[test]
+    fn a_stop_set_before_the_start_ends_the_tool_at_once() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = {
+            let seen = seen.clone();
+            Channel::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                    seen.lock().unwrap().push(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+                }
+                Ok(())
+            })
+        };
+        let request = ToolRequest::Scan {
+            sdr: "driver=xng-test-no-such-radio".into(),
+            gain: None,
+            modes: vec!["ais".into(), "acars".into()],
+            dwell_secs: 1,
+        };
+        let stop = Arc::new(AtomicBool::new(true));
+        ToolTask::start(request, events, || (), stop).unwrap().wait();
+        let seen = seen.lock().unwrap();
+        let done = seen.last().unwrap();
+        assert_eq!(done["type"], "done", "{seen:?}");
+        assert_eq!(done["stopped"], true);
+        let skipped = |e: &serde_json::Value| e["text"].as_str().is_some_and(|t| t.contains("skipped"));
+        assert!(!seen.iter().any(skipped), "{seen:?}");
     }
 
     #[test]
