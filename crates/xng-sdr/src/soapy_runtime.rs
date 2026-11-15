@@ -30,23 +30,19 @@ pub fn ensure() -> Result<(), String> {
 /// folder and the system folder: every absolute `PATH` entry, an explicit
 /// `SOAPY_SDR_ROOT`, then PothosSDR's default install locations.
 ///
-/// The working directory is never one of them. Relative `PATH` entries
-/// are left out for the same reason: they would be read from wherever
-/// xng was started.
+/// The working directory is never searched as such. Relative entries,
+/// in `PATH` or in any of the variables, are left out for the same
+/// reason: they would be read from wherever xng was started.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn candidate_dirs(env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Vec<std::path::PathBuf> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     let mut add = |dir: std::path::PathBuf| {
-        if !dirs.contains(&dir) {
+        if dir.is_absolute() && !dirs.contains(&dir) {
             dirs.push(dir);
         }
     };
     if let Some(path) = env("PATH") {
-        for dir in std::env::split_paths(&path) {
-            if dir.is_absolute() {
-                add(dir);
-            }
-        }
+        std::env::split_paths(&path).for_each(&mut add);
     }
     if let Some(root) = env("SOAPY_SDR_ROOT") {
         add(std::path::PathBuf::from(root).join("bin"));
@@ -151,6 +147,17 @@ mod tests {
             candidate_dirs(env),
             [abs("opt/sdr"), abs("tools"), root.join("bin"), pf.join("PothosSDR").join("bin")]
         );
+    }
+
+    #[test]
+    fn leaves_out_relative_roots() {
+        let env = |k: &str| match k {
+            "SOAPY_SDR_ROOT" => Some(std::ffi::OsString::from("sdr")),
+            "ProgramFiles" => Some(std::ffi::OsString::from(".")),
+            "ProgramW6432" => Some(std::ffi::OsString::from("")),
+            _ => None,
+        };
+        assert!(candidate_dirs(env).is_empty());
     }
 
     #[cfg(not(windows))]
