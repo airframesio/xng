@@ -108,10 +108,10 @@
             </button>
             {#if app.devices.length}
               <span class="sep">Not sure what you can receive here?</span>
-              <button class="btn sm" onclick={() => app.openTool("scan")}>
+              <button class="btn sm" disabled={app.phase === "starting"} onclick={() => app.openTool("scan")}>
                 <Icon name="scan" size={14} /> Scan for signals
               </button>
-              <button class="btn sm" onclick={() => app.openTool("survey")}>
+              <button class="btn sm" disabled={app.phase === "starting"} onclick={() => app.openTool("survey")}>
                 <Icon name="gauge" size={14} /> Survey reception
               </button>
             {/if}

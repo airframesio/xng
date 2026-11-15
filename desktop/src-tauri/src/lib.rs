@@ -24,6 +24,10 @@ struct AppState {
     dashboard: Mutex<Option<std::sync::Arc<Mutex<xng::outputs::http::Dashboard>>>>,
     /// A scan or survey in progress. It owns the radio while it runs.
     tool: Mutex<Option<ToolTask>>,
+    /// Set while a session is opening its source. It is not in `running`
+    /// yet, so a tool started now could not stop it and would end up
+    /// sharing the radio with it.
+    starting: std::sync::atomic::AtomicBool,
     /// Set once the window is gone, so a session still opening its radio
     /// is stopped as soon as it comes up instead of being kept.
     closing: std::sync::atomic::AtomicBool,
@@ -135,14 +139,26 @@ async fn start_session(
         tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
     }
     stop_tool_task(&state).await?;
-    let running = tauri::async_runtime::spawn_blocking(move || {
+    state.starting.store(true, std::sync::atomic::Ordering::SeqCst);
+    let opened = tauri::async_runtime::spawn_blocking(move || {
         let _sdr = sdr_lock();
         Running::start(&request, on_event)
     })
-        .await
-        .map_err(err)?
-        .map_err(err)?;
+    .await;
+    // Publish the session (or the failure) before tools are let in again.
+    let running = match opened {
+        Ok(Ok(running)) => running,
+        failed => {
+            state.starting.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(match failed {
+                Ok(Err(e)) => err(e),
+                Err(e) => err(e),
+                Ok(Ok(_)) => unreachable!(),
+            });
+        }
+    };
     let mut slot = state.running.lock().unwrap();
+    state.starting.store(false, std::sync::atomic::Ordering::SeqCst);
     if state.closing.load(std::sync::atomic::Ordering::Relaxed) {
         drop(slot);
         running.stop();
@@ -181,6 +197,9 @@ async fn start_tool(
     request: ToolRequest,
     on_event: Channel<ToolEvent>,
 ) -> CmdResult<()> {
+    if state.starting.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("A session is still starting. Wait for it, then stop it to run this.".into());
+    }
     let prev = state.running.lock().unwrap().take();
     if let Some(prev) = prev {
         tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;

@@ -340,6 +340,8 @@ class AppState {
   }
 
   openTool(kind: ToolKind) {
+    // A session that is still opening the radio can't be stopped yet.
+    if (this.phase === "starting") return;
     this.tool = kind;
     if (this.toolPhase !== "running" && this.toolPhase !== "stopping") this.toolPhase = "idle";
   }
