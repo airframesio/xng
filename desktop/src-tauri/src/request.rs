@@ -26,6 +26,59 @@ pub enum Source {
         /// cf32 / cs16 / cs8 / cu8; guessed from the extension when absent.
         format: Option<String>,
     },
+    /// A station file (`xng station`): several radios or recordings run
+    /// together. The file sets the tuning and outputs.
+    #[serde(rename_all = "camelCase")]
+    Station { path: PathBuf },
+    /// Another decoder's JSON output (`xng extern`).
+    #[serde(rename_all = "camelCase")]
+    Extern {
+        /// dumphfdl / dumpvdl2 / acarsdec
+        format: String,
+        /// The decoder's command line.
+        command: String,
+    },
+}
+
+/// Split a command line into arguments. Single and double quotes group
+/// words; a backslash outside single quotes keeps the next character.
+pub fn split_command(line: &str) -> anyhow::Result<Vec<String>> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut started = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            // Windows paths are full of backslashes: only treat one as an
+            // escape before a quote or a space.
+            (q, '\\') if q != Some('\'') && chars.peek().is_some_and(|n| matches!(n, '"' | '\'' | ' ')) => {
+                cur.push(chars.next().unwrap());
+                started = true;
+            }
+            (Some(_), c) => cur.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                started = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if started {
+                    args.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                started = true;
+            }
+        }
+    }
+    anyhow::ensure!(quote.is_none(), "The decoder command has an unclosed quote");
+    if started {
+        args.push(cur);
+    }
+    Ok(args)
 }
 
 /// AIS-only filters (`xng station` session keys).
@@ -224,6 +277,8 @@ pub fn resolve(req: &SessionRequest) -> anyhow::Result<(xng_types::Mode, f64, u6
         return xng::tuning::parse_tune(&tune);
     }
     match &req.source {
+        Source::Station { .. } => anyhow::bail!("A station file sets its own tuning"),
+        Source::Extern { .. } => anyhow::bail!("An external decoder does its own tuning"),
         Source::Device { selector, .. } => xng::tuning::resolve_tune_auto(&tune, selector),
         Source::File { .. } => {
             anyhow::ensure!(
@@ -233,5 +288,22 @@ pub fn resolve(req: &SessionRequest) -> anyhow::Result<(xng_types::Mode, f64, u6
             // Rate is set, so nothing probes a device.
             xng::tuning::resolve_tune_auto(&tune, "")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_command;
+
+    #[test]
+    fn commands_split_like_a_shell() {
+        assert_eq!(split_command("dumpvdl2 --rtlsdr 0  136.975").unwrap(), ["dumpvdl2", "--rtlsdr", "0", "136.975"]);
+        assert_eq!(
+            split_command(r#""/opt/my tools/dumphfdl" --output 'decoded:json:file:path=-' """#).unwrap(),
+            ["/opt/my tools/dumphfdl", "--output", "decoded:json:file:path=-", ""]
+        );
+        assert_eq!(split_command(r"C:\tools\acarsdec.exe -j a\ b").unwrap(), [r"C:\tools\acarsdec.exe", "-j", "a b"]);
+        assert!(split_command("   ").unwrap().is_empty());
+        assert!(split_command("dumpvdl2 'oops").is_err());
     }
 }

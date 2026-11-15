@@ -19,6 +19,9 @@
     back: "M15 6l-6 6 6 6",
     scan: "M12 12l6-6M21 12a9 9 0 1 1-9-9M17 12a5 5 0 1 1-5-5",
     gauge: "M4 18a8 8 0 1 1 16 0M12 18l4-6",
+    stack: "M12 3 3 8l9 5 9-5-9-5zM3 13l9 5 9-5M3 17.5l9 5 9-5",
+    terminal: "M3 5h18v14H3zM7 10l3 2.5L7 15M12 15h5",
+    inbox: "M3 13l3-8h12l3 8v6H3zM3 13h5l1.5 3h5L16 13h5",
   };
   let { name, size = 16 }: { name: string; size?: number } = $props();
 </script>

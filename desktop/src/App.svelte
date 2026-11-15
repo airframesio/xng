@@ -50,7 +50,7 @@
       <div class="live" class:detail={app.selected}>
         <section class="mapcol">
           <MapView />
-          <div class="strip"><Spectrum waterfall={false} /></div>
+          {#if app.session?.signal}<div class="strip"><Spectrum waterfall={false} /></div>{/if}
         </section>
         <section class="side">
           {#if app.selected}
@@ -107,11 +107,12 @@
   }
   .mapcol {
     display: grid;
-    grid-template-rows: minmax(0, 1fr) 132px;
+    grid-template-rows: minmax(0, 1fr) auto;
     min-height: 0;
     min-width: 0;
   }
   .strip {
+    height: 132px;
     border-top: 1px solid var(--line);
     min-height: 0;
   }

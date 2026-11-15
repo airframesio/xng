@@ -1,16 +1,16 @@
-//! Site tools: `xng scan` and `xng survey` run from the app.
+//! Tools: `xng scan`, `xng survey` and `xng ingest` run from the app.
 //!
-//! Both are the CLI's own code (`xng::commands::{scan, survey}`), driven
+//! All are the CLI's own code (`xng::commands::{scan, survey}`), driven
 //! through a [`Reporter`] that forwards their progress lines to the UI and
 //! lets Stop wind them down early. The report they return is the same
-//! structure the CLI writes with `--out`.
+//! structure the CLI writes with `--out` (ingest reports what it received).
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use tauri::ipc::Channel;
-use xng::commands::{scan, survey, Reporter};
+use xng::commands::{ingest, scan, survey, Reporter};
 use xng_types::Mode;
 
 /// What the UI asks a tool to do. Fields mirror the CLI flags.
@@ -43,6 +43,16 @@ pub enum ToolRequest {
         rotate_dwell_secs: u64,
         show_messages: bool,
     },
+    /// `xng ingest`: the reference asf-2.0 server.
+    #[serde(rename_all = "camelCase")]
+    Ingest {
+        /// gRPC listen address, e.g. `0.0.0.0:6001`.
+        grpc: Option<String>,
+        /// QUIC listen address, e.g. `0.0.0.0:6011`.
+        quic: Option<String>,
+        /// Where to write the QUIC certificate for feeders to pin.
+        quic_cert_out: Option<String>,
+    },
 }
 
 /// What a running tool tells the UI.
@@ -65,7 +75,8 @@ pub struct ToolTask {
 
 impl ToolTask {
     /// Validate `request` and run it on its own thread, holding `lock`
-    /// (the app's SDR lock) for as long as it has a device open.
+    /// (the app's SDR lock) for as long as it has a device open. A tool
+    /// that uses no radio never takes the lock.
     ///
     /// `cancel` is the tool's stop flag. The caller makes it, so a stop
     /// asked for before the tool exists is already set when its thread
@@ -80,7 +91,7 @@ impl ToolTask {
         let thread = {
             let cancel = cancel.clone();
             std::thread::Builder::new().name("xng-tool".into()).spawn(move || {
-                let _held = lock();
+                let _held = job.uses_radio().then(lock);
                 run(&job, &events, &cancel);
             })?
         };
@@ -114,6 +125,7 @@ impl ToolTask {
 enum Job {
     Scan { sdr: String, gain: Option<f64>, modes: Vec<Mode>, dwell_secs: u64 },
     Survey(SurveyJob),
+    Ingest { grpc: Option<String>, quic: Option<String>, quic_cert_out: Option<std::path::PathBuf> },
 }
 
 /// `SurveyOpts` holds file paths and is not `Clone`; keep the pieces.
@@ -137,9 +149,26 @@ fn parse_mode(s: &str) -> anyhow::Result<Mode> {
     s.parse().map_err(|e: String| anyhow::anyhow!(e))
 }
 
+fn filled(v: Option<String>) -> Option<String> {
+    v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+}
+
 impl Job {
+    fn uses_radio(&self) -> bool {
+        !matches!(self, Job::Ingest { .. })
+    }
+
     fn parse(request: ToolRequest) -> anyhow::Result<Self> {
         Ok(match request {
+            ToolRequest::Ingest { grpc, quic, quic_cert_out } => {
+                let (grpc, quic) = (filled(grpc), filled(quic));
+                anyhow::ensure!(grpc.is_some() || quic.is_some(), "Turn on gRPC, QUIC or both");
+                for addr in grpc.iter().chain(&quic) {
+                    addr.parse::<std::net::SocketAddr>()
+                        .map_err(|_| anyhow::anyhow!("{addr} is not an address like 0.0.0.0:6001"))?;
+                }
+                Job::Ingest { grpc, quic, quic_cert_out: filled(quic_cert_out).map(Into::into) }
+            }
             ToolRequest::Scan { sdr, gain, modes, dwell_secs } => {
                 anyhow::ensure!(!modes.is_empty(), "Pick at least one signal to scan for");
                 anyhow::ensure!(dwell_secs > 0, "The dwell time must be at least one second");
@@ -225,6 +254,10 @@ fn run(job: &Job, events: &Channel<ToolEvent>, cancel: &Arc<AtomicBool>) {
             },
         )
         .and_then(|r| Ok(serde_json::to_value(r)?)),
+        Job::Ingest { grpc, quic, quic_cert_out } => {
+            ingest::run_with(&reporter, grpc.clone(), quic.clone(), quic_cert_out.as_deref())
+                .and_then(|r| Ok(serde_json::to_value(r)?))
+        }
     };
     let _ = events.send(match report {
         Ok(report) => ToolEvent::Done { report, stopped: cancel.load(Ordering::Relaxed) },
@@ -317,6 +350,40 @@ mod tests {
         assert_eq!(done["stopped"], true);
         let skipped = |e: &serde_json::Value| e["text"].as_str().is_some_and(|t| t.contains("skipped"));
         assert!(!seen.iter().any(skipped), "{seen:?}");
+    }
+
+    /// Ingest needs no radio: it must run while something else holds the
+    /// SDR lock, and stop when asked.
+    #[test]
+    fn ingest_runs_without_the_radio_and_stops() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let tx = std::sync::Mutex::new(tx);
+        let events = Channel::new(move |body| {
+            if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                let _ = tx.lock().unwrap().send(serde_json::from_str::<serde_json::Value>(&json).unwrap());
+            }
+            Ok(())
+        });
+        let request = ToolRequest::Ingest { grpc: Some("127.0.0.1:0".into()), quic: None, quic_cert_out: None };
+        fn never() {
+            panic!("ingest must not take the SDR lock");
+        }
+        let task = ToolTask::start(request, events, never, Arc::default()).unwrap();
+        let first = rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
+        assert_eq!(first["type"], "line", "{first}");
+        task.stop();
+        let last = rx.iter().last().unwrap();
+        assert_eq!(last["type"], "done", "{last}");
+        assert_eq!(last["stopped"], true);
+        assert_eq!(last["report"]["messages"], 0);
+    }
+
+    #[test]
+    fn ingest_addresses_are_checked_up_front() {
+        let bad = ToolRequest::Ingest { grpc: Some("localhost".into()), quic: None, quic_cert_out: None };
+        assert!(Job::parse(bad).is_err());
+        let none = ToolRequest::Ingest { grpc: Some("  ".into()), quic: None, quic_cert_out: None };
+        assert!(Job::parse(none).is_err());
     }
 
     #[test]

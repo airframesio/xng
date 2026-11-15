@@ -3,12 +3,16 @@
 //! so wrapped decoders get every xng output (asf-2.0, feeds, JSONL,
 //! console) and the xng-acars application layer.
 
-use crate::bus::MessageBus;
+use crate::bus::{MessageBus, WeakBus};
+use crate::engine::EngineState;
 use crate::outputs::console;
 use crate::outputs::{acarsdec_json, jsonl};
 use crate::runtime::OutputConfig;
 use chrono::{DateTime, TimeZone, Utc};
 use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::broadcast;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use xng_types::{
     AcarsCore, AppInfo, DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality,
@@ -164,6 +168,126 @@ pub fn parse_line(line: &str, format: ExternFormat, station: &StationIdentity) -
     })
 }
 
+type OutputTask = tokio::task::JoinHandle<Result<(), std::io::Error>>;
+
+/// Start the outputs a wrapped decoder supports: console, JSONL, UDP and
+/// the asf-2.0 feeds.
+fn spawn_outputs(bus: &MessageBus, outputs: &OutputConfig, station: &StationIdentity) -> Vec<OutputTask> {
+    let mut tasks = Vec::new();
+    if outputs.console != console::ConsoleFormat::Off {
+        tasks.push(tokio::spawn({
+            let rx = bus.subscribe();
+            let fmt = outputs.console;
+            async move {
+                console::run(rx, fmt).await;
+                Ok::<(), std::io::Error>(())
+            }
+        }));
+    }
+    if let Some(path) = outputs.jsonl.clone() {
+        let rx = bus.subscribe();
+        tasks.push(tokio::spawn(async move { jsonl::run(rx, &path).await }));
+    }
+    for target in outputs.udp.clone() {
+        tasks.push(tokio::spawn(acarsdec_json::run(bus.subscribe(), target)));
+    }
+    if let Some(url) = outputs.asf2_grpc.clone() {
+        let (id, ident) = (station.id.to_string(), station.ident.clone());
+        tasks.push(tokio::spawn(crate::outputs::asf2_grpc::run(bus.subscribe(), url, id, ident)));
+    }
+    if let Some(target) = outputs.asf2_quic.clone() {
+        let (id, ident) = (station.id.to_string(), station.ident.clone());
+        tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(
+            bus.subscribe(),
+            target,
+            outputs.asf2_quic_trust.clone(),
+            id,
+            ident,
+        )));
+    }
+    tasks
+}
+
+/// Close the bus and let every output drain.
+async fn finish_outputs(bus: MessageBus, tasks: Vec<OutputTask>) {
+    drop(bus);
+    for t in tasks {
+        match t.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("output error: {e}"),
+            Err(e) => tracing::warn!("output task failed: {e}"),
+        }
+    }
+}
+
+/// Read decoder JSON lines from `reader` onto the bus until it ends or
+/// `stop` is set. Returns how many messages were normalized.
+async fn pump_lines<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    format: ExternFormat,
+    station: &StationIdentity,
+    bus: &MessageBus,
+    stop: &AtomicBool,
+) -> std::io::Result<u64> {
+    let mut lines = BufReader::new(reader).lines();
+    let mut poll = tokio::time::interval(std::time::Duration::from_millis(100));
+    let mut count = 0;
+    loop {
+        tokio::select! {
+            line = lines.next_line() => match line? {
+                Some(line) => {
+                    if let Some(msg) = parse_line(&line, format, station) {
+                        bus.publish(msg);
+                        count += 1;
+                    }
+                }
+                None => return Ok(count),
+            },
+            _ = poll.tick() => {
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(count);
+                }
+            }
+        }
+    }
+}
+
+/// Start the decoder. `windowless` keeps Windows from opening a console
+/// window for it when the caller is a GUI app.
+fn spawn_child(command: &[String], windowless: bool) -> anyhow::Result<tokio::process::Child> {
+    tracing::info!("spawning: {}", command.join(" "));
+    let mut cmd = tokio::process::Command::new(&command[0]);
+    cmd.args(&command[1..]).stdout(std::process::Stdio::piped()).kill_on_drop(true);
+    #[cfg(windows)]
+    if windowless {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = windowless;
+    cmd.spawn().map_err(|e| anyhow::anyhow!("could not start {:?}: {e}", command[0]))
+}
+
+/// Pump a spawned decoder until it exits or `stop` is set (then it is
+/// killed). Returns the message count and, when the decoder ended on its
+/// own, how it exited.
+async fn pump_child(
+    mut child: tokio::process::Child,
+    format: ExternFormat,
+    station: &StationIdentity,
+    bus: &MessageBus,
+    stop: &AtomicBool,
+) -> std::io::Result<(u64, Option<std::process::ExitStatus>)> {
+    let stdout = child.stdout.take().expect("piped stdout");
+    let count = pump_lines(stdout, format, station, bus, stop).await;
+    if stop.load(Ordering::Relaxed) || count.is_err() {
+        let _ = child.kill().await;
+        return Ok((count?, None));
+    }
+    let status = child.wait().await.ok();
+    Ok((count?, status))
+}
+
 pub fn run(
     format: ExternFormat,
     command: &[String],
@@ -174,88 +298,132 @@ pub fn run(
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async {
         let bus = MessageBus::new();
-        let mut tasks = Vec::new();
-        tasks.push(tokio::spawn({
-            let rx = bus.subscribe();
-            let fmt = outputs.console;
+        let tasks = spawn_outputs(&bus, &outputs, &station);
+        let stop = Arc::new(AtomicBool::new(false));
+        tokio::spawn({
+            let stop = stop.clone();
             async move {
-                console::run(rx, fmt).await;
-                Ok::<(), std::io::Error>(())
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    stop.store(true, Ordering::Relaxed);
+                }
             }
-        }));
-        if let Some(path) = outputs.jsonl.clone() {
-            let rx = bus.subscribe();
-            tasks.push(tokio::spawn(async move { jsonl::run(rx, &path).await }));
-        }
-        for target in outputs.udp.clone() {
-            tasks.push(tokio::spawn(acarsdec_json::run(bus.subscribe(), target)));
-        }
-        if let Some(url) = outputs.asf2_grpc.clone() {
-            let (id, ident) = (station.id.to_string(), station.ident.clone());
-            tasks.push(tokio::spawn(crate::outputs::asf2_grpc::run(
-                bus.subscribe(),
-                url,
-                id,
-                ident,
-            )));
-        }
-        if let Some(target) = outputs.asf2_quic.clone() {
-            let (id, ident) = (station.id.to_string(), station.ident.clone());
-            tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(
-                bus.subscribe(),
-                target,
-                outputs.asf2_quic_trust.clone(),
-                id,
-                ident,
-            )));
-        }
-
-        let mut count: u64 = 0;
-        if command.is_empty() {
+        });
+        let count = if command.is_empty() {
             tracing::info!("reading external decoder JSON from stdin");
-            let mut lines = BufReader::new(tokio::io::stdin()).lines();
-            while let Some(line) = lines.next_line().await? {
-                if let Some(msg) = parse_line(&line, format, &station) {
-                    bus.publish(msg);
-                    count += 1;
-                }
-            }
+            pump_lines(tokio::io::stdin(), format, &station, &bus, &stop).await?
         } else {
-            tracing::info!("spawning: {}", command.join(" "));
-            let mut child = tokio::process::Command::new(&command[0])
-                .args(&command[1..])
-                .stdout(std::process::Stdio::piped())
-                .spawn()?;
-            let stdout = child.stdout.take().expect("piped stdout");
-            let mut lines = BufReader::new(stdout).lines();
-            loop {
-                tokio::select! {
-                    line = lines.next_line() => match line? {
-                        Some(line) => {
-                            if let Some(msg) = parse_line(&line, format, &station) {
-                                bus.publish(msg);
-                                count += 1;
-                            }
-                        }
-                        None => break,
-                    },
-                    _ = tokio::signal::ctrl_c() => {
-                        let _ = child.kill().await;
-                        break;
-                    }
-                }
-            }
-            let _ = child.wait().await;
-        }
-        drop(bus);
-        for t in tasks {
-            if let Err(e) = t.await? {
-                tracing::warn!("output error: {e}");
-            }
-        }
+            pump_child(spawn_child(command, false)?, format, &station, &bus, &stop).await?.0
+        };
+        finish_outputs(bus, tasks).await;
         tracing::info!("extern session: {count} message(s) normalized");
         Ok(())
     })
+}
+
+/// A wrapped external decoder running in the background, for front ends
+/// that show its messages themselves: the same normalization and outputs
+/// as `xng extern`, without the CLI's console or Ctrl-C handling.
+pub struct ExternSession {
+    bus: WeakBus,
+    first_rx: Mutex<Option<broadcast::Receiver<Arc<Message>>>>,
+    stop: Arc<AtomicBool>,
+    state: Arc<Mutex<EngineState>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ExternSession {
+    /// Spawn `command` and start normalizing its JSON output. Fails if the
+    /// command cannot be started.
+    pub fn start(
+        format: ExternFormat,
+        command: Vec<String>,
+        station_ident: String,
+        outputs: OutputConfig,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(!command.is_empty(), "no decoder command given");
+        let station = StationIdentity::new(station_ident);
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(EngineState::Running));
+        // The worker reports whether the decoder started, with the bus
+        // handles when it did.
+        type Ready = anyhow::Result<(WeakBus, broadcast::Receiver<Arc<Message>>)>;
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Ready>();
+        let thread = std::thread::Builder::new().name("xng-extern".into()).spawn({
+            let (stop, state) = (stop.clone(), state.clone());
+            move || {
+                let rt = match tokio::runtime::Runtime::new() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e.into()));
+                        return;
+                    }
+                };
+                let result: anyhow::Result<()> = rt.block_on(async {
+                    let child = match spawn_child(&command, true) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(e));
+                            return Ok(());
+                        }
+                    };
+                    let bus = MessageBus::new();
+                    let _ = ready_tx.send(Ok((bus.downgrade(), bus.subscribe())));
+                    let tasks = spawn_outputs(&bus, &outputs, &station);
+                    let pumped = pump_child(child, format, &station, &bus, &stop).await;
+                    finish_outputs(bus, tasks).await;
+                    let (count, status) = pumped?;
+                    tracing::info!("extern session: {count} message(s) normalized");
+                    match status {
+                        Some(s) if !s.success() => {
+                            anyhow::bail!("{} stopped ({s}) after {count} message(s)", command[0])
+                        }
+                        _ => Ok(()),
+                    }
+                });
+                *state.lock().unwrap() = match result {
+                    Ok(()) => EngineState::Finished,
+                    Err(e) => EngineState::Failed(format!("{e:#}")),
+                };
+                rt.shutdown_background();
+            }
+        })?;
+        let (bus, rx) = ready_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("the decoder worker ended before starting"))??;
+        Ok(Self { bus, first_rx: Mutex::new(Some(rx)), stop, state, thread: Some(thread) })
+    }
+
+    /// Subscribe to normalized messages. The first call returns a receiver
+    /// attached before the decoder produced anything.
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<Message>> {
+        if let Some(rx) = self.first_rx.lock().unwrap().take() {
+            return rx;
+        }
+        self.bus.subscribe().unwrap_or_else(|| broadcast::channel(1).1)
+    }
+
+    /// Ask the decoder to stop; it is killed and the outputs drain.
+    pub fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+
+    pub fn state(&self) -> EngineState {
+        self.state.lock().unwrap().clone()
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().is_none_or(|t| t.is_finished())
+    }
+}
+
+impl Drop for ExternSession {
+    /// Never leave the wrapped decoder running behind a dropped session.
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -306,5 +474,80 @@ mod tests {
         let line = r#"{"hfdl":{"t":{"sec":1717000300},"freq":10063000,"spdu":{"gs":{"id":7}}}}"#;
         let m = parse_line(line, ExternFormat::Dumphfdl, &station()).unwrap();
         assert!(matches!(m.body, MessageBody::Hfdl { .. }));
+    }
+
+    fn quiet() -> OutputConfig {
+        OutputConfig {
+            console: console::ConsoleFormat::Off,
+            jsonl: None,
+            udp: vec![],
+            asf2_grpc: None,
+            asf2_quic: None,
+            asf2_quic_trust: crate::outputs::asf2_quic::TrustMode::SystemRoots,
+            metrics: None,
+            sbs: None,
+            beast: None,
+            nmea_tcp: None,
+            nmea_udp: None,
+            nmea_tag_blocks: false,
+            gsmtap: None,
+            iridium_satmap: None,
+            http: None,
+            map: Default::default(),
+            mqtt: None,
+            mqtt_topic: "xng".into(),
+            zmq: vec![],
+            airframes: None,
+            own_ship_mmsi: None,
+        }
+    }
+
+    fn wait(s: &ExternSession) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !s.is_finished() {
+            assert!(std::time::Instant::now() < deadline, "session should finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_normalizes_a_decoder_and_finishes() {
+        let line = r#"{"timestamp":1717000123.4,"freq":131.550,"mode":"2","label":"H1","block_id":"4","tail":"N1","text":"HI"}"#;
+        let cmd = vec!["sh".to_string(), "-c".to_string(), format!("echo '{line}'; echo junk")];
+        let s = ExternSession::start(ExternFormat::Acarsdec, cmd, "XX-TEST".into(), quiet()).unwrap();
+        let mut rx = s.subscribe();
+        wait(&s);
+        assert_eq!(s.state(), EngineState::Finished);
+        let m = rx.try_recv().expect("one message");
+        assert_eq!(m.frequency_hz, 131_550_000);
+        assert!(matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Closed)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_decoder_is_reported() {
+        let cmd = vec!["sh".to_string(), "-c".to_string(), "exit 3".to_string()];
+        let s = ExternSession::start(ExternFormat::Acarsdec, cmd, "XX-TEST".into(), quiet()).unwrap();
+        wait(&s);
+        let EngineState::Failed(e) = s.state() else { panic!("expected a failure") };
+        assert!(e.contains("stopped"), "{e}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_kills_a_decoder_that_never_ends() {
+        let cmd = vec!["sh".to_string(), "-c".to_string(), "exec sleep 600".to_string()];
+        let s = ExternSession::start(ExternFormat::Acarsdec, cmd, "XX-TEST".into(), quiet()).unwrap();
+        s.stop();
+        wait(&s);
+        assert_eq!(s.state(), EngineState::Finished);
+    }
+
+    #[test]
+    fn a_missing_decoder_is_refused() {
+        let cmd = vec!["xng-test-no-such-decoder".to_string()];
+        let err = ExternSession::start(ExternFormat::Acarsdec, cmd, "XX-TEST".into(), quiet()).err().unwrap();
+        assert!(err.to_string().contains("could not start"), "{err}");
     }
 }

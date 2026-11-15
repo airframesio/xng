@@ -23,7 +23,19 @@ export interface DeviceEntry {
 
 export type Source =
   | { kind: "device"; selector: string; gain: number | null }
-  | { kind: "file"; path: string; format: string | null };
+  | { kind: "file"; path: string; format: string | null }
+  /** A station file: several radios or recordings run together. */
+  | { kind: "station"; path: string }
+  /** Another decoder's JSON output (dumphfdl, dumpvdl2, acarsdec). */
+  | { kind: "extern"; format: string; command: string };
+
+/** What a station file would run. */
+export interface StationPreview {
+  stationId: string;
+  sessions: { mode: string; source: string; live: boolean; channels: string[] }[];
+  /** Outputs the file turns on, by config key. */
+  outputs: string[];
+}
 
 export interface SessionRequest {
   source: Source;
@@ -109,6 +121,8 @@ export interface SessionSummary {
   sampleRate: number;
   channelsHz: number[];
   source: string;
+  /** False for an external decoder: no spectrum or channel stats. */
+  signal: boolean;
 }
 
 /** One thing on the map or in an entity list (the dashboard's JSON). */
@@ -161,7 +175,14 @@ export type ToolRequest =
       tuneDwellSecs: number;
       rotateDwellSecs: number;
       showMessages: boolean;
-    };
+    }
+  | { kind: "ingest"; grpc: string | null; quic: string | null; quicCertOut: string | null };
+
+/** What `xng ingest` received by the time it was stopped. */
+export interface IngestReport {
+  feeders: number;
+  messages: number;
+}
 
 /** A decode setup worked out from what a tool heard. */
 export interface ProposedConfig {
@@ -218,7 +239,7 @@ export interface SurveyReport {
 
 export type ToolEvent =
   | { type: "line"; text: string }
-  | { type: "done"; report: ScanReport | SurveyReport; stopped: boolean }
+  | { type: "done"; report: ScanReport | SurveyReport | IngestReport; stopped: boolean }
   | { type: "failed"; message: string };
 
 export interface Backend {
@@ -227,6 +248,8 @@ export interface Backend {
   appInfo(): Promise<AppInfo>;
   listDevices(): Promise<DeviceEntry[]>;
   resolveTune(req: SessionRequest): Promise<ResolvedTune>;
+  /** Read and check a station file without starting it. */
+  stationPreview(path: string): Promise<StationPreview>;
   start(req: SessionRequest, onEvent: (e: BackendEvent) => void): Promise<void>;
   stop(): Promise<void>;
   /** Run a scan or survey; a running session is stopped first. */

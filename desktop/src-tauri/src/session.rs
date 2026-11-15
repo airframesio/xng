@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::Channel;
 use tokio::sync::broadcast::error::TryRecvError;
+use xng::commands::extern_cmd::{ExternFormat, ExternSession};
+use xng::commands::station;
 use xng::engine::{Engine, EngineOptions, EngineState};
 use xng::outputs::console;
 use xng::outputs::http::Dashboard;
@@ -73,6 +75,47 @@ pub struct SessionSummary {
     pub sample_rate: f64,
     pub channels_hz: Vec<u64>,
     pub source: String,
+    /// False for an external decoder: it has no spectrum or channel stats.
+    pub signal: bool,
+}
+
+/// What is producing messages: xng's own decoders, or a wrapped one.
+enum Core {
+    Engine(Engine),
+    Extern(ExternSession),
+}
+
+impl Core {
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<Arc<Message>> {
+        match self {
+            Core::Engine(e) => e.subscribe(),
+            Core::Extern(e) => e.subscribe(),
+        }
+    }
+    fn sessions(&self) -> &[xng::engine::SessionInfo] {
+        match self {
+            Core::Engine(e) => e.sessions(),
+            Core::Extern(_) => &[],
+        }
+    }
+    fn stop(&self) {
+        match self {
+            Core::Engine(e) => e.stop(),
+            Core::Extern(e) => e.stop(),
+        }
+    }
+    fn is_finished(&self) -> bool {
+        match self {
+            Core::Engine(e) => e.is_finished(),
+            Core::Extern(e) => e.is_finished(),
+        }
+    }
+    fn state(&self) -> EngineState {
+        match self {
+            Core::Engine(e) => e.state(),
+            Core::Extern(e) => e.state(),
+        }
+    }
 }
 
 /// Everything the pump tells the UI.
@@ -95,7 +138,7 @@ pub enum Event {
 
 /// A session the app is running.
 pub struct Running {
-    engine: Arc<Engine>,
+    engine: Arc<Core>,
     quit: Arc<AtomicBool>,
     pump: Option<std::thread::JoinHandle<()>>,
     dashboard: Arc<Mutex<Dashboard>>,
@@ -104,66 +147,14 @@ pub struct Running {
 impl Running {
     /// Open the source, build the engine and start pumping events to `ch`.
     pub fn start(req: &SessionRequest, ch: Channel<Event>) -> anyhow::Result<Self> {
-        let (mode, rate, center_hz, channels_hz) = request::resolve(req)?;
-        let tune = req.tune()?;
-        let outputs = req.output_config(mode)?;
-        let station_ident = req.station_ident();
-
-        let (source, sdr, source_label): (Box<dyn IqSource>, SdrInfo, String) = match &req.source {
-            Source::Device { selector, gain } => {
-                let (src, backend) = xng::sdr_open::open_sdr(selector, rate, center_hz, *gain)?;
-                let serial = xng::sdr_args::SdrArgs::parse(selector).serial;
-                let info = SdrInfo { id: selector.clone(), driver: backend.into(), serial };
-                (src, info, if selector.is_empty() { "first SDR found".into() } else { selector.clone() })
-            }
-            Source::File { path, format } => {
-                let fmt = match request::nonempty(format) {
-                    Some(f) => f.parse::<IqFormat>().map_err(|e| anyhow::anyhow!(e))?,
-                    None => IqFormat::from_extension(path).ok_or_else(|| {
-                        anyhow::anyhow!("Can't tell this recording's sample format; choose cf32, cs16, cs8 or cu8")
-                    })?,
-                };
-                let src = FileIqSource::open(path, fmt, rate, center_hz)?;
-                let info = SdrInfo { id: "file".into(), driver: "file".into(), serial: None };
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                (Box::new(src), info, name)
-            }
+        let (core, station_ident, summaries, descriptors) = match &req.source {
+            Source::Station { path } => start_station(path)?,
+            Source::Extern { format, command } => start_extern(req, format, command)?,
+            Source::Device { .. } | Source::File { .. } => start_single(req)?,
         };
-
-        let demod_default = match req.source {
-            Source::Device { .. } => xng::runtime::DemodEffort::Live,
-            Source::File { .. } => xng::runtime::DemodEffort::Max,
-        };
-        let cfg = SessionConfig {
-            mode,
-            center_hz,
-            channels_hz,
-            station_ident: station_ident.clone(),
-            sdr: Some(sdr),
-            outputs,
-            receiver_pos: xng::tuning::parse_receiver_pos(&tune.receiver_pos)?,
-            label_filter: tune.label_filter(),
-            ais_filter: req.ais_filter(),
-            demod_effort: tune.demod_effort.unwrap_or(demod_default),
-            max_ppm: tune.max_ppm,
-        };
-
-        let engine = Arc::new(Engine::start(vec![(source, cfg)], EngineOptions { handle_signals: false })?);
+        let engine = Arc::new(core);
         // The first subscription was attached before decoding began.
         let rx = engine.subscribe();
-
-        let summaries: Vec<SessionSummary> = engine
-            .sessions()
-            .iter()
-            .map(|s| SessionSummary {
-                mode: s.mode.as_str(),
-                center_hz: s.center_hz,
-                sample_rate: s.sample_rate,
-                channels_hz: s.channels_hz.clone(),
-                source: source_label.clone(),
-            })
-            .collect();
-        let descriptors = engine.sessions().iter().map(|s| s.descriptor.clone()).collect();
         let dashboard = Arc::new(Mutex::new(Dashboard::new(station_ident.clone(), descriptors)));
         let _ = ch.send(Event::Started { station: station_ident, sessions: summaries });
 
@@ -201,6 +192,192 @@ impl Drop for Running {
     }
 }
 
+type Started = (Core, String, Vec<SessionSummary>, Vec<serde_json::Value>);
+
+fn summaries(engine: &Engine, sources: &[String]) -> (Vec<SessionSummary>, Vec<serde_json::Value>) {
+    let sessions = engine.sessions();
+    let summaries = sessions
+        .iter()
+        .enumerate()
+        .map(|(i, s)| SessionSummary {
+            mode: s.mode.as_str(),
+            center_hz: s.center_hz,
+            sample_rate: s.sample_rate,
+            channels_hz: s.channels_hz.clone(),
+            source: sources.get(i).cloned().unwrap_or_default(),
+            signal: true,
+        })
+        .collect();
+    (summaries, sessions.iter().map(|s| s.descriptor.clone()).collect())
+}
+
+/// One radio or one recording, tuned from the request.
+fn start_single(req: &SessionRequest) -> anyhow::Result<Started> {
+    let (mode, rate, center_hz, channels_hz) = request::resolve(req)?;
+    let tune = req.tune()?;
+    let outputs = req.output_config(mode)?;
+    let station_ident = req.station_ident();
+
+    let (source, sdr, source_label): (Box<dyn IqSource>, SdrInfo, String) = match &req.source {
+        Source::Device { selector, gain } => {
+            let (src, backend) = xng::sdr_open::open_sdr(selector, rate, center_hz, *gain)?;
+            let serial = xng::sdr_args::SdrArgs::parse(selector).serial;
+            let info = SdrInfo { id: selector.clone(), driver: backend.into(), serial };
+            (src, info, if selector.is_empty() { "first SDR found".into() } else { selector.clone() })
+        }
+        Source::File { path, format } => {
+            let fmt = match request::nonempty(format) {
+                Some(f) => f.parse::<IqFormat>().map_err(|e| anyhow::anyhow!(e))?,
+                None => IqFormat::from_extension(path).ok_or_else(|| {
+                    anyhow::anyhow!("Can't tell this recording's sample format; choose cf32, cs16, cs8 or cu8")
+                })?,
+            };
+            let src = FileIqSource::open(path, fmt, rate, center_hz)?;
+            let info = SdrInfo { id: "file".into(), driver: "file".into(), serial: None };
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            (Box::new(src), info, name)
+        }
+        Source::Station { .. } | Source::Extern { .. } => unreachable!("handled by Running::start"),
+    };
+
+    let demod_default = match req.source {
+        Source::Device { .. } => xng::runtime::DemodEffort::Live,
+        _ => xng::runtime::DemodEffort::Max,
+    };
+    let cfg = SessionConfig {
+        mode,
+        center_hz,
+        channels_hz,
+        station_ident: station_ident.clone(),
+        sdr: Some(sdr),
+        outputs,
+        receiver_pos: xng::tuning::parse_receiver_pos(&tune.receiver_pos)?,
+        label_filter: tune.label_filter(),
+        ais_filter: req.ais_filter(),
+        demod_effort: tune.demod_effort.unwrap_or(demod_default),
+        max_ppm: tune.max_ppm,
+    };
+
+    let engine = Engine::start(vec![(source, cfg)], EngineOptions { handle_signals: false })?;
+    let (summaries, descriptors) = summaries(&engine, &[source_label]);
+    Ok((Core::Engine(engine), station_ident, summaries, descriptors))
+}
+
+/// What a station session reads from, for display.
+fn station_source(s: &station::SessionToml) -> String {
+    match (&s.sdr, &s.file) {
+        (Some(sdr), _) => sdr.clone(),
+        (_, Some(file)) => file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Every session a station file names, with the file's outputs.
+fn start_station(path: &std::path::Path) -> anyhow::Result<Started> {
+    let st = station::load(path)?;
+    let sessions = station::build(&st, console::ConsoleFormat::Off)?;
+    let engine = Engine::start(sessions, EngineOptions { handle_signals: false })?;
+    let sources: Vec<String> = st.sessions.iter().map(station_source).collect();
+    let (summaries, descriptors) = summaries(&engine, &sources);
+    Ok((Core::Engine(engine), st.station_id, summaries, descriptors))
+}
+
+/// Another decoder's output, normalized as `xng extern` does.
+fn start_extern(req: &SessionRequest, format: &str, command: &str) -> anyhow::Result<Started> {
+    let fmt: ExternFormat = format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+    let mode = match fmt {
+        ExternFormat::Dumphfdl => xng_types::Mode::Hfdl,
+        ExternFormat::Dumpvdl2 => xng_types::Mode::Vdl2,
+        ExternFormat::Acarsdec => xng_types::Mode::AcarsPoa,
+    };
+    let argv = request::split_command(command)?;
+    anyhow::ensure!(!argv.is_empty(), "Enter the decoder's command line");
+    let station_ident = req.station_ident();
+    // `xng extern` feeds through asf-2.0 and UDP only; the per-mode Airframes
+    // router is not part of it, so its station-ID requirement doesn't apply.
+    let mut req = req.clone();
+    req.outputs.feed_airframes = false;
+    let outputs = req.output_config(mode)?;
+    let program = std::path::Path::new(&argv[0])
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| argv[0].clone());
+    let session = ExternSession::start(fmt, argv, station_ident.clone(), outputs)?;
+    let summary = SessionSummary {
+        mode: mode.as_str(),
+        center_hz: 0,
+        sample_rate: 0.0,
+        channels_hz: Vec::new(),
+        source: program,
+        signal: false,
+    };
+    Ok((Core::Extern(session), station_ident, vec![summary], Vec::new()))
+}
+
+/// What a station file would run, for the setup screen.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StationPreview {
+    pub station_id: String,
+    pub sessions: Vec<StationPreviewSession>,
+    /// The outputs the file turns on, by their config key.
+    pub outputs: Vec<&'static str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StationPreviewSession {
+    pub mode: String,
+    pub source: String,
+    pub live: bool,
+    /// Channels listed in the file; empty means the mode's own plan.
+    pub channels: Vec<String>,
+}
+
+/// Read and check a station file without opening any device.
+pub fn station_preview(path: &std::path::Path) -> anyhow::Result<StationPreview> {
+    let st = station::load(path)?;
+    for (i, s) in st.sessions.iter().enumerate() {
+        s.mode
+            .parse::<xng_types::Mode>()
+            .map_err(|e| anyhow::anyhow!("session {}: {e}", i + 1))?;
+    }
+    let o = &st.outputs;
+    let outputs = [
+        ("feed-airframes", o.feed_airframes || o.airframes.as_ref().is_some_and(|a| a.enabled)),
+        ("jsonl", o.jsonl.is_some()),
+        ("udp", !o.udp.is_empty()),
+        ("asf2-grpc", o.asf2_grpc.is_some()),
+        ("asf2-quic", o.asf2_quic.is_some()),
+        ("http", o.http.is_some()),
+        ("metrics", o.metrics.is_some()),
+        ("sbs", o.sbs.is_some()),
+        ("beast", o.beast.is_some()),
+        ("nmea-tcp", o.nmea_tcp.is_some()),
+        ("nmea-udp", o.nmea_udp.is_some()),
+        ("gsmtap", o.gsmtap.is_some()),
+        ("mqtt", o.mqtt.is_some()),
+        ("zmq", !o.zmq.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(name, on)| on.then_some(name))
+    .collect();
+    Ok(StationPreview {
+        station_id: st.station_id.clone(),
+        sessions: st
+            .sessions
+            .iter()
+            .map(|s| StationPreviewSession {
+                mode: s.mode.clone(),
+                source: station_source(s),
+                live: s.sdr.is_some(),
+                channels: s.channels.clone(),
+            })
+            .collect(),
+        outputs,
+    })
+}
+
 fn item(id: u64, m: &Message) -> MessageItem {
     MessageItem {
         id,
@@ -216,7 +393,7 @@ fn item(id: u64, m: &Message) -> MessageItem {
 }
 
 fn pump(
-    engine: Arc<Engine>,
+    engine: Arc<Core>,
     mut rx: tokio::sync::broadcast::Receiver<Arc<Message>>,
     ch: Channel<Event>,
     quit: Arc<AtomicBool>,
@@ -332,7 +509,7 @@ mod tests {
 
     /// A 2.4 MS/s capture centred on 131.500 MHz with one ACARS burst on
     /// 131.550 MHz, written as cf32.
-    fn capture() -> std::path::PathBuf {
+    fn capture(name: &str) -> std::path::PathBuf {
         let fs = 2_400_000.0;
         let burst = burst_iq(
             &FrameSpec {
@@ -359,7 +536,7 @@ mod tests {
             bytes.extend_from_slice(&s.re.to_le_bytes());
             bytes.extend_from_slice(&s.im.to_le_bytes());
         }
-        let path = std::env::temp_dir().join(format!("xng-desktop-test-{}.cf32", std::process::id()));
+        let path = std::env::temp_dir().join(format!("xng-desktop-test-{}-{name}.cf32", std::process::id()));
         std::fs::write(&path, bytes).unwrap();
         path
     }
@@ -368,7 +545,7 @@ mod tests {
     /// through the real engine, back out as the events the UI renders.
     #[test]
     fn decodes_a_recording_end_to_end() {
-        let path = capture();
+        let path = capture("single");
         let req: SessionRequest = serde_json::from_value(serde_json::json!({
             "source": { "kind": "file", "path": path, "format": null },
             "mode": "acars",
@@ -426,6 +603,117 @@ mod tests {
         assert_eq!(state["totals"]["acars"], 1);
         running.stop();
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Run a request to its end and return every event it produced.
+    fn run_to_end(req: serde_json::Value) -> Vec<serde_json::Value> {
+        let req: SessionRequest = serde_json::from_value(req).unwrap();
+        let (tx, rx) = mpsc::channel::<serde_json::Value>();
+        let tx = std::sync::Mutex::new(tx);
+        let ch: Channel<Event> = Channel::new(move |body| {
+            if let InvokeResponseBody::Json(s) = body {
+                let _ = tx.lock().unwrap().send(serde_json::from_str(&s).unwrap());
+            }
+            Ok(())
+        });
+        let running = Running::start(&req, ch).unwrap();
+        let mut events = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let ev = rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("session should end");
+            let ended = ev["type"] == "ended";
+            events.push(ev);
+            if ended {
+                break;
+            }
+        }
+        running.stop();
+        events
+    }
+
+    fn messages(events: &[serde_json::Value]) -> Vec<&serde_json::Value> {
+        events
+            .iter()
+            .filter(|e| e["type"] == "messages")
+            .flat_map(|e| e["items"].as_array().unwrap())
+            .collect()
+    }
+
+    /// A station file with two sessions runs both, under the file's id.
+    #[test]
+    fn runs_every_session_of_a_station_file() {
+        let iq = capture("station");
+        let toml = std::env::temp_dir().join(format!("xng-desktop-test-{}.toml", std::process::id()));
+        let session = |channel: &str| {
+            format!(
+                "[[session]]\nfile = {:?}\nmode = \"acars\"\nsample-rate = 2400000\ncenter = \"131.500M\"\nchannels = [\"{channel}\"]\n",
+                iq.to_string_lossy()
+            )
+        };
+        std::fs::write(&toml, format!("station-id = \"XX-TEST-1\"\n{}{}", session("131.550"), session("131.725"))).unwrap();
+
+        let preview = station_preview(&toml).unwrap();
+        assert_eq!(preview.station_id, "XX-TEST-1");
+        assert_eq!(preview.sessions.len(), 2);
+        assert!(!preview.sessions[0].live);
+        assert!(preview.outputs.is_empty());
+
+        let events = run_to_end(serde_json::json!({ "source": { "kind": "station", "path": toml }, "mode": "acars" }));
+        assert_eq!(events[0]["type"], "started");
+        assert_eq!(events[0]["station"], "XX-TEST-1");
+        let sessions = events[0]["sessions"].as_array().unwrap();
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[1]["channelsHz"][0], 131_725_000u64);
+        // Live stats arrive for both sessions.
+        assert!(events.iter().any(|e| e["type"] == "live" && e["sessions"].as_array().unwrap().len() == 2));
+        let msgs = messages(&events);
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0]["freq"], 131_550_000u64);
+        assert!(events.last().unwrap()["error"].is_null());
+        let _ = std::fs::remove_file(iq);
+        let _ = std::fs::remove_file(toml);
+    }
+
+    #[test]
+    fn a_broken_station_file_is_refused_with_its_reason() {
+        let toml = std::env::temp_dir().join(format!("xng-desktop-test-bad-{}.toml", std::process::id()));
+        std::fs::write(&toml, "station-id = \"X\"\n[[session]]\nsdr = \"driver=rtlsdr\"\nmode = \"nope\"\n").unwrap();
+        let err = station_preview(&toml).err().expect("unknown mode").to_string();
+        assert!(err.contains("session 1"), "{err}");
+        let _ = std::fs::remove_file(toml);
+    }
+
+    /// A wrapped decoder's lines come through as messages, and its exit
+    /// ends the session.
+    #[cfg(unix)]
+    #[test]
+    fn shows_an_external_decoders_messages() {
+        let line = r#"{"timestamp":1717000123.4,"freq":131.550,"mode":"2","label":"H1","block_id":"4","tail":"N471XG","flight":"XG0042","text":"HI"}"#;
+        let events = run_to_end(serde_json::json!({
+            "source": { "kind": "extern", "format": "acarsdec", "command": format!("sh -c \"echo '{}'\"", line.replace('"', "\\\"")) },
+            "mode": "acars",
+        }));
+        assert_eq!(events[0]["type"], "started");
+        assert_eq!(events[0]["sessions"][0]["signal"], false);
+        assert_eq!(events[0]["sessions"][0]["source"], "sh");
+        let msgs = messages(&events);
+        assert_eq!(msgs.len(), 1, "{events:?}");
+        assert_eq!(msgs[0]["detail"]["body"]["tail"], "N471XG");
+        assert!(events.last().unwrap()["error"].is_null());
+    }
+
+    #[test]
+    fn an_external_decoder_that_cannot_start_is_refused() {
+        let req: SessionRequest = serde_json::from_value(serde_json::json!({
+            "source": { "kind": "extern", "format": "acarsdec", "command": "xng-test-no-such-decoder -j" },
+            "mode": "acars",
+        }))
+        .unwrap();
+        let ch: Channel<Event> = Channel::new(|_| Ok(()));
+        let err = Running::start(&req, ch).err().expect("must fail").to_string();
+        assert!(err.contains("could not start"), "{err}");
     }
 
     #[test]

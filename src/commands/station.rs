@@ -209,6 +209,166 @@ pub fn load(path: &Path) -> anyhow::Result<StationFile> {
     Ok(f)
 }
 
+/// Turn a loaded station file into the sessions it describes, opening each
+/// SDR or recording, exactly as `xng station` runs them. The shared outputs
+/// ride on every session's config (the first one's are used). `console` is
+/// the caller's choice: the CLI prints, an embedding front end shows its own
+/// views.
+pub fn build(
+    st: &StationFile,
+    console: crate::outputs::console::ConsoleFormat,
+) -> anyhow::Result<Vec<(Box<dyn xng_sdr::IqSource>, crate::runtime::SessionConfig)>> {
+    use crate::sdr_open::open_sdr;
+    use crate::tuning::{parse_receiver_pos, parse_tune, resolve_tune_auto};
+    use xng_sdr::{FileIqSource, IqFormat};
+
+    // Shared outputs (the first session's SessionConfig carries them).
+    // Airframes feeding is routed per-mode/per-session by the router below,
+    // not appended to the generic `udp` sinks.
+    let udp = st.outputs.udp.clone();
+    let outputs = crate::runtime::OutputConfig {
+        console,
+        jsonl: st.outputs.jsonl.clone(),
+        udp,
+        asf2_grpc: st.outputs.asf2_grpc.clone(),
+        asf2_quic: st.outputs.asf2_quic.clone(),
+        asf2_quic_trust: crate::outputs::asf2_quic::TrustMode::SystemRoots,
+        metrics: st.outputs.metrics.clone(),
+        sbs: st.outputs.sbs.clone(),
+        beast: st.outputs.beast.clone(),
+        nmea_tcp: st.outputs.nmea_tcp.clone(),
+        nmea_udp: st.outputs.nmea_udp.clone(),
+        nmea_tag_blocks: st.outputs.nmea_tag_blocks.unwrap_or(false),
+        gsmtap: st.outputs.gsmtap.clone(),
+        iridium_satmap: st.outputs.iridium_satmap.clone(),
+        http: st.outputs.http.clone(),
+        map: match &st.outputs.map {
+            Some(m) => crate::outputs::map::MapConfig::new(m.style.as_deref(), m.style_url.as_deref(), m.format.as_deref())?,
+            None => Default::default(),
+        },
+        mqtt: st.outputs.mqtt.clone(),
+        mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
+        zmq: st.outputs.zmq.clone(),
+        airframes: Some(airframes_router(&st)),
+        own_ship_mmsi: st.outputs.own_ship_mmsi,
+    };
+
+    if let Some(p) = &st.outputs.aircraft_db {
+        let n = crate::outputs::dbinfo::AircraftDb::load(p)?;
+        tracing::info!("aircraft db: {n} entries");
+    }
+    if let Some(src) = &st.outputs.iridium_satmap {
+        match crate::satmap::init(src) {
+            Ok(n) => tracing::info!("iridium satmap: {n} satellites ({src})"),
+            Err(e) => tracing::warn!("iridium satmap disabled: {e}"),
+        }
+    }
+    // APRS satellite (TLE) overhead correlation: if an APRS session carries a
+    // receiver position, fetch the amateur-satellite TLEs so a space-based APRS
+    // reception (145.825 MHz / ISS digipeat) can be attributed to the
+    // satellite(s) in view. Best-effort (network) — failure just leaves it off.
+    if let Some(pos) = st
+        .sessions
+        .iter()
+        .filter(|s| s.mode.eq_ignore_ascii_case("aprs"))
+        .find_map(|s| parse_receiver_pos(&s.receiver_pos).ok().flatten())
+    {
+        match crate::satmap::init_aprs("auto", pos) {
+            Ok(n) => tracing::info!("APRS satellite map: {n} amateur sats (space-reception correlation on)"),
+            Err(e) => tracing::warn!("APRS satellite correlation disabled: {e}"),
+        }
+    }
+    let mut sessions = Vec::new();
+    for (i, sess) in st.sessions.iter().enumerate() {
+        let label = format!("session {} ({})", i + 1, sess.mode);
+        // Tuning: explicit values, or the mode plan via the same
+        // derivation the TUI uses.
+        let tune = crate::tuning::Tune {
+            mode: sess.mode.clone(),
+            sample_rate: sess.sample_rate,
+            center_freq: sess.center.clone(),
+            channels: sess.channels.clone(),
+            receiver_pos: sess.receiver_pos.clone(),
+            filter_labels: Vec::new(),
+            exclude_labels: Vec::new(),
+            demod_effort: sess
+                .demod_effort
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|e: String| anyhow::anyhow!("{label}: {e}"))?,
+            max_ppm: sess.max_ppm,
+        };
+        let (mode, rate, center_hz, channels) = if tune.sample_rate.is_some()
+            && tune.center_freq.is_some()
+            && !tune.channels.is_empty()
+        {
+            parse_tune(&tune)?
+        } else if let Some(sdr) = &sess.sdr {
+            resolve_tune_auto(&tune, sdr)?
+        } else {
+            anyhow::bail!("{label}: file sessions need sample-rate, center, and channels");
+        };
+
+        let (source, sdr_info): (Box<dyn xng_sdr::IqSource>, Option<xng_types::SdrInfo>) =
+            match (&sess.sdr, &sess.file) {
+                (Some(sdr), None) => {
+                    let (src, backend) = open_sdr(sdr, rate, center_hz, sess.gain)?;
+                    let info = xng_types::SdrInfo {
+                        id: sdr.clone(),
+                        driver: backend.to_string(),
+                        serial: None,
+                    };
+                    (src, Some(info))
+                }
+                (None, Some(path)) => {
+                    let fmt = match &sess.format {
+                        Some(f) => f
+                            .parse::<IqFormat>()
+                            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?,
+                        None => IqFormat::from_extension(path)
+                            .ok_or_else(|| anyhow::anyhow!("{label}: pass `format`"))?,
+                    };
+                    let src = FileIqSource::open(path, fmt, rate, center_hz)?;
+                    (
+                        Box::new(src),
+                        Some(xng_types::SdrInfo {
+                            id: "file".into(),
+                            driver: "file".into(),
+                            serial: None,
+                        }),
+                    )
+                }
+                _ => unreachable!("validated in station::load"),
+            };
+
+        sessions.push((
+            source,
+            crate::runtime::SessionConfig {
+                mode,
+                center_hz,
+                channels_hz: channels,
+                station_ident: st.station_id.clone(),
+                sdr: sdr_info,
+                outputs: outputs.clone(),
+                receiver_pos: parse_receiver_pos(&sess.receiver_pos)?,
+                label_filter: Default::default(),
+                ais_filter: crate::runtime::AisFilter {
+                    include_types: sess.ais_include_types.clone(),
+                    exclude_types: sess.ais_exclude_types.clone(),
+                    include_mmsi: sess.ais_include_mmsi.clone(),
+                    exclude_mmsi: sess.ais_exclude_mmsi.clone(),
+                    min_interval_s: sess.ais_min_interval,
+                    dedup_window_s: sess.ais_dedup_window,
+                },
+                demod_effort: tune.demod_effort.unwrap_or(crate::runtime::DemodEffort::Live),
+                max_ppm: tune.max_ppm,
+            },
+        ));
+    }
+    Ok(sessions)
+}
+
 /// Build the per-session Airframes feed router from a station config.
 ///
 /// Precedence for a session's feed: a session `feed = false` disables it;

@@ -12,6 +12,9 @@
   ];
   const s = $derived(app.session);
   const active = $derived(app.phase === "running" || app.phase === "ended");
+  // An external decoder has no spectrum to show.
+  const tabs = $derived(TABS.filter((t) => t.id !== "signal" || s?.signal));
+  const shortSource = (src: string) => (src.length > 28 ? src.slice(0, 27) + "…" : src);
   let exporting = $state(false);
   let exportNote = $state<string | null>(null);
 
@@ -40,7 +43,7 @@
 
   {#if active && s}
     <nav aria-label="Views">
-      {#each TABS as t (t.id)}
+      {#each tabs as t (t.id)}
         <button class:on={app.view === t.id} aria-current={app.view === t.id ? "page" : undefined} onclick={() => (app.view = t.id)}>
           <Icon name={t.icon} size={15} />
           {t.name}
@@ -52,8 +55,25 @@
       <span class="live" class:ended={app.phase === "ended"}>
         <i></i>{app.phase === "running" ? "Listening" : "Stopped"}
       </span>
-      <span class="what">{modeMeta(s.mode).name}</span>
-      <span class="mono dim">{mhz(s.centerHz)} MHz · {rate(s.sampleRate)}</span>
+      {#if app.sessions.length > 1}
+        <select
+          class="pick"
+          aria-label="Radio shown in the signal views"
+          value={app.activeSession}
+          onchange={(e) => app.showSession(Number(e.currentTarget.value))}
+        >
+          {#each app.sessions as ss, i (i)}
+            <option value={i}>{modeMeta(ss.mode).name} · {shortSource(ss.source)}</option>
+          {/each}
+        </select>
+      {:else}
+        <span class="what">{modeMeta(s.mode).name}</span>
+      {/if}
+      {#if s.signal}
+        <span class="mono dim">{mhz(s.centerHz)} MHz · {rate(s.sampleRate)}</span>
+      {:else}
+        <span class="mono dim">via {s.source}</span>
+      {/if}
       <span class="mono dim">{elapsed(app.elapsedMs)}</span>
       <span class="mono"><b>{count(app.total)}</b> <span class="dim">msgs · {app.rate.toFixed(1)}/s</span></span>
     </div>
@@ -86,6 +106,16 @@
 </header>
 
 <style>
+  .pick {
+    height: 26px;
+    max-width: 260px;
+    padding: 0 8px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r);
+    background: var(--surface-2, var(--surface));
+    color: var(--ink);
+    font: 500 13px/1 var(--sans);
+  }
   .bar {
     display: flex;
     align-items: center;

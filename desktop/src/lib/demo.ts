@@ -107,9 +107,24 @@ export function demoBackend(): Backend {
     async resolveTune(req) {
       return resolve(req);
     },
+    async stationPreview() {
+      return {
+        stationId: "XX-KSFO-1",
+        sessions: [
+          { mode: "acars", source: "driver=rtlsdr,serial=00000001", live: true, channels: ["131.550", "131.725", "130.025"] },
+          { mode: "vdl2", source: "driver=airspy", live: true, channels: [] },
+        ],
+        outputs: ["feed-airframes", "jsonl", "http"],
+      };
+    },
     async start(req, onEvent: (e: BackendEvent) => void) {
       stopAll();
-      const tune = resolve(req);
+      const station = req.source.kind === "station";
+      const external = req.source.kind === "extern";
+      const tune = resolve(station || external ? { ...req, mode: external ? "vdl2" : "acars", channels: [], sampleRate: null } : req);
+      // A station's second radio, so the session switcher has something to show.
+      const tune2 = station ? resolve({ ...req, mode: "vdl2", channels: [], sampleRate: null }) : null;
+      const stats2: ChannelStat[] = (tune2?.channelsHz ?? []).map((freq) => ({ freq, frames: 0, crcOk: 0, levelDb: -48 }));
       const t0 = performance.now();
       const home = { lat: 37.62, lon: -122.38 };
       const planes: Plane[] = Array.from({ length: 28 }, () => ({
@@ -140,16 +155,25 @@ export function demoBackend(): Backend {
 
       onEvent({
         type: "started",
-        station: req.stationId || "XNG-DESKTOP",
-        sessions: [
-          {
-            mode: tune.mode,
-            centerHz: tune.centerHz,
-            sampleRate: tune.sampleRate,
-            channelsHz: tune.channelsHz,
-            source: req.source.kind === "device" ? req.source.selector : req.source.path,
-          },
-        ],
+        station: station ? "XX-KSFO-1" : req.stationId || "XNG-DESKTOP",
+        sessions: external
+          ? [{ mode: tune.mode, centerHz: 0, sampleRate: 0, channelsHz: [], source: "dumpvdl2", signal: false }]
+          : [
+              {
+                mode: tune.mode,
+                centerHz: tune.centerHz,
+                sampleRate: tune.sampleRate,
+                channelsHz: tune.channelsHz,
+                source:
+                  req.source.kind === "device" ? req.source.selector
+                  : req.source.kind === "file" ? req.source.path
+                  : "driver=rtlsdr,serial=00000001",
+                signal: true,
+              },
+              ...(tune2
+                ? [{ mode: tune2.mode, centerHz: tune2.centerHz, sampleRate: tune2.sampleRate, channelsHz: tune2.channelsHz, source: "driver=airspy", signal: true }]
+                : []),
+            ],
       });
 
       const message = (): MessageItem => {
@@ -195,25 +219,34 @@ export function demoBackend(): Backend {
         }, 140),
       );
 
+      const spectrumOf = (tn: ResolvedTune, st: ChannelStat[]) => {
+        const span = tn.sampleRate;
+        const t = performance.now() / 1000;
+        return Array.from({ length: 512 }, (_, k) => {
+          const f = tn.centerHz - span / 2 + (k / 512) * span;
+          let db = -78 + rnd(-3, 3) + 2 * Math.sin(k / 40 + t / 3);
+          for (const c of st) {
+            const d = Math.abs(f - c.freq) / 9000;
+            const burst = 0.5 + 0.5 * Math.sin(t * 1.7 + c.freq / 1e5);
+            db = Math.max(db, -30 - d * d * 14 - (1 - burst) * 30 + rnd(-2, 2));
+          }
+          return db;
+        });
+      };
+      const liveOf = (tn: ResolvedTune, st: ChannelStat[]) => {
+        for (const c of st) c.levelDb = -40 + rnd(-6, 12);
+        return {
+          samples: Math.round(((performance.now() - t0) / 1000) * tn.sampleRate),
+          channels: st.map((c) => ({ ...c })),
+          spectrum: spectrumOf(tn, st),
+        };
+      };
       timers.push(
         window.setInterval(() => {
-          const span = tune.sampleRate;
-          const t = performance.now() / 1000;
-          const spectrum = Array.from({ length: 512 }, (_, k) => {
-            const f = tune.centerHz - span / 2 + (k / 512) * span;
-            let db = -78 + rnd(-3, 3) + 2 * Math.sin(k / 40 + t / 3);
-            for (const c of stats) {
-              const d = Math.abs(f - c.freq) / 9000;
-              const burst = 0.5 + 0.5 * Math.sin(t * 1.7 + c.freq / 1e5);
-              db = Math.max(db, -30 - d * d * 14 - (1 - burst) * 30 + rnd(-2, 2));
-            }
-            return db;
-          });
-          for (const c of stats) c.levelDb = -40 + rnd(-6, 12);
           onEvent({
             type: "live",
             elapsedMs: performance.now() - t0,
-            sessions: [{ samples: Math.round(((performance.now() - t0) / 1000) * span), channels: stats.map((s) => ({ ...s })), spectrum }],
+            sessions: external ? [] : [liveOf(tune, stats), ...(tune2 ? [liveOf(tune2, stats2)] : [])],
           });
         }, 100),
       );
@@ -281,6 +314,7 @@ let toolStop: (() => void) | null = null;
 /** Play a scan or survey at about 20x speed. Returns a stop function that
  *  ends it early and still delivers the report, as the real tools do. */
 function simulateTool(req: ToolRequest, onEvent: (e: ToolEvent) => void): () => void {
+  if (req.kind === "ingest") return simulateIngest(req, onEvent);
   const modes = req.kind === "scan" ? req.modes : [req.mode];
   const heard = modes.flatMap((mode) =>
     plan(mode).channels.map((f, i) => {
@@ -344,4 +378,29 @@ function simulateTool(req: ToolRequest, onEvent: (e: ToolEvent) => void): () => 
     else finish(false);
   }, 450);
   return () => finish(true);
+}
+
+/** A feeder connecting to the ingest server and sending a trickle. */
+function simulateIngest(req: Extract<ToolRequest, { kind: "ingest" }>, onEvent: (e: ToolEvent) => void): () => void {
+  let messages = 0;
+  if (req.grpc) onEvent({ type: "line", text: `Listening for gRPC feeds on ${req.grpc}` });
+  if (req.quic) onEvent({ type: "line", text: `Listening for QUIC feeds on ${req.quic} (self-signed certificate)` });
+  const transport = req.grpc ? "grpc" : "quic";
+  const hello = window.setTimeout(
+    () => onEvent({ type: "line", text: `[${transport}] hello from XX-KSFO-1 (demo) — xng v0.21.0 (proto v2)` }),
+    700,
+  );
+  const timer = window.setInterval(() => {
+    messages++;
+    const text = `[${transport}] XX-KSFO-1 acars 131.550 MHz ACARS N${Math.floor(rnd(100, 999))}UA ${pick(AIRLINES)}${Math.floor(rnd(10, 2400))} lbl=${pick(LABELS)}`;
+    onEvent({ type: "line", text });
+  }, 900);
+  let finished = false;
+  return () => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(hello);
+    clearInterval(timer);
+    onEvent({ type: "done", report: { feeders: 1, messages }, stopped: true });
+  };
 }
