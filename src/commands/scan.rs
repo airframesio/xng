@@ -4,6 +4,7 @@
 //! (Foundation for Airwaves OS site surveys.)
 
 use crate::bus::MessageBus;
+use crate::commands::{say, Reporter};
 use crate::runtime::{self, SessionConfig};
 use serde::Serialize;
 use std::sync::atomic::AtomicBool;
@@ -386,14 +387,76 @@ pub struct ChannelResult {
     pub verdict: &'static str,
 }
 
-#[derive(Serialize)]
-struct ScanReport<'a> {
-    dwell_secs: u64,
-    results: &'a [ChannelResult],
-    proposals: Vec<String>,
+/// A decode configuration worked out from what was heard: the same thing
+/// as the `xng listen` command line in `command`, as data.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProposedConfig {
+    pub mode: String,
+    pub sample_rate: f64,
+    pub center_hz: u64,
+    pub channels_hz: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain_db: Option<f64>,
+    pub command: String,
+}
+
+/// A frequency in MHz for a command line: three decimals as a rule, more
+/// when the frequency needs them, so the command names the exact channel.
+fn mhz_arg(hz: u64) -> String {
+    let s = format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000);
+    let keep = s.trim_end_matches('0').len().max(s.len() - 3);
+    s[..keep].to_string()
+}
+
+impl ProposedConfig {
+    /// One configuration per capture window that `active` channels of
+    /// `mode` need at `rate`, lowest window first. Channels too far apart
+    /// to share a capture are never put in the same configuration.
+    pub fn for_channels(
+        sdr: &str,
+        mode: Mode,
+        rate: f64,
+        gain: Option<f64>,
+        active: &[u64],
+    ) -> Vec<Self> {
+        let gain_arg = gain.map(|g| format!(" --gain {g}")).unwrap_or_default();
+        // The grouping keeps whole-capture modes (Mode S) centered on
+        // their channel and steps the rest off a channel sitting on DC.
+        group_channels(active, rate, passband(mode))
+            .into_iter()
+            .map(|(center, channels)| {
+                let chans: Vec<String> = channels.iter().map(|&f| mhz_arg(f)).collect();
+                Self {
+                    mode: mode.as_str().to_string(),
+                    sample_rate: rate,
+                    center_hz: center,
+                    gain_db: gain,
+                    command: format!(
+                        "xng listen --sdr '{sdr}'{gain_arg} --mode {mode} -r {} -c {}M --channels {}",
+                        rate as u64,
+                        mhz_arg(center),
+                        chans.join(",")
+                    ),
+                    channels_hz: channels,
+                }
+            })
+            .collect()
+    }
+}
+
+/// Everything a scan found. Serializes to the `--out` report.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanReport {
+    pub dwell_secs: u64,
+    pub results: Vec<ChannelResult>,
+    /// One `xng listen` command line per capture window with active
+    /// channels (a mode whose active channels span several gets several).
+    pub proposals: Vec<String>,
+    /// The same proposals as data.
+    pub configs: Vec<ProposedConfig>,
     /// HFDL system tables decoded over the air during the scan.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    systables: Vec<serde_json::Value>,
+    pub systables: Vec<serde_json::Value>,
 }
 
 /// Frequencies advertised in a decoded HFDL system table (Hz).
@@ -416,6 +479,25 @@ pub fn run(
     dwell_secs: u64,
     out_json: Option<&std::path::Path>,
 ) -> anyhow::Result<()> {
+    let rep = Reporter::stdout();
+    let report = run_with(&rep, sdr, gain, modes, dwell_secs)?;
+    if let Some(path) = out_json {
+        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
+        println!("\nreport written to {}", path.display());
+    }
+    Ok(())
+}
+
+/// The scan behind `xng scan`, reporting progress through `rep` and
+/// returning the report. Cancelling `rep` stops after the current capture
+/// group and reports what was measured up to then.
+pub fn run_with(
+    rep: &Reporter,
+    sdr: &str,
+    gain: Option<f64>,
+    modes: &[Mode],
+    dwell_secs: u64,
+) -> anyhow::Result<ScanReport> {
     let mut results: Vec<ChannelResult> = Vec::new();
     let mut groups_total = 0usize;
     let mut plans = Vec::new();
@@ -426,18 +508,18 @@ pub fn run(
     for &mode in modes {
         let (plan_rate, channels) = plan(mode);
         if channels.is_empty() {
-            tracing::warn!("no built-in frequency plan for mode {mode}; skipping");
+            say!(rep, "no built-in frequency plan for mode {mode}; skipping");
             continue;
         }
         let rate = choose_rate(&caps, mode, plan_rate);
         if rate != plan_rate {
-            tracing::info!("{mode}: using {} S/s (device does not offer the plan's {} S/s)", rate as u64, plan_rate as u64);
+            say!(rep, "{mode}: using {} S/s (device does not offer the plan's {} S/s)", rate as u64, plan_rate as u64);
         }
         let groups = group_channels(&channels, rate, passband(mode));
         groups_total += groups.len();
         plans.push((mode, rate, groups));
     }
-    println!(
+    say!(rep, 
         "scanning {} group(s) across {} mode(s), {dwell_secs}s dwell each (~{}s total)",
         groups_total,
         plans.len(),
@@ -450,10 +532,13 @@ pub fn run(
             groups.iter().flat_map(|(_, g)| g.iter().copied()).collect();
         let mut queue: std::collections::VecDeque<(u64, Vec<u64>)> = groups.into();
         while let Some((center, channels)) = queue.pop_front() {
+            if rep.cancelled() {
+                break;
+            }
             let span: Vec<String> =
                 channels.iter().map(|&c| format!("{:.3}", c as f64 / 1e6)).collect();
-            println!("→ {mode} @ {:.3} MHz: {}", center as f64 / 1e6, span.join(", "));
-            match scan_group(sdr, gain, mode, rate, center, &channels, dwell_secs) {
+            say!(rep, "→ {mode} @ {:.3} MHz: {}", center as f64 / 1e6, span.join(", "));
+            match scan_group(sdr, gain, mode, rate, center, &channels, dwell_secs, rep.cancel_flag()) {
                 Ok((mut group_results, tables)) => {
                     results.append(&mut group_results);
                     // A decoded system table extends the plan with any
@@ -464,7 +549,7 @@ pub fn run(
                             .into_iter()
                             .filter(|f| *f > 0 && known.insert(*f))
                             .collect();
-                        println!(
+                        say!(rep, 
                             "  system table v{}: {} station(s), {} new frequency(ies)",
                             table["version"],
                             table["stations"].as_array().map_or(0, |s| s.len()),
@@ -477,7 +562,7 @@ pub fn run(
                         systables.push(table);
                     }
                 }
-                Err(e) => println!("  group skipped: {e}"),
+                Err(e) => say!(rep, "  group skipped: {e}"),
             }
         }
     }
@@ -509,12 +594,12 @@ pub fn run(
     }
 
     // Report.
-    println!("\n{:<8} {:<12} {:>7} {:>7} {:>8}  verdict", "mode", "freq MHz", "frames", "ok", "dBFS");
+    say!(rep, "\n{:<8} {:<12} {:>7} {:>7} {:>8}  verdict", "mode", "freq MHz", "frames", "ok", "dBFS");
     for r in &results {
         if r.verdict == "quiet" {
             continue;
         }
-        println!(
+        say!(rep, 
             "{:<8} {:<12.3} {:>7} {:>7} {:>8.1}  {}",
             r.mode,
             r.frequency_hz as f64 / 1e6,
@@ -525,52 +610,30 @@ pub fn run(
         );
     }
     let quiet = results.iter().filter(|r| r.verdict == "quiet").count();
-    println!("({quiet} quiet channel(s) omitted)");
+    say!(rep, "({quiet} quiet channel(s) omitted)");
 
-    // Proposals: one listen command per mode with active channels.
-    let mut proposals = Vec::new();
+    // Proposals: one listen command per capture window with active channels.
+    let mut configs = Vec::new();
     for &mode in modes {
-        let active: Vec<&ChannelResult> = results
+        let active: Vec<u64> = results
             .iter()
             .filter(|r| r.mode == mode.as_str() && r.verdict == "ACTIVE")
+            .map(|r| r.frequency_hz)
             .collect();
-        if active.is_empty() {
-            continue;
-        }
         let rate = choose_rate(&caps, mode, plan(mode).0);
-        let freqs: Vec<u64> = active.iter().map(|r| r.frequency_hz).collect();
-        let center = (freqs.iter().min().unwrap() + freqs.iter().max().unwrap()) / 2;
-        // Whole-capture modes (passband 0) must keep the channel at center.
-        let center = if passband(mode) > 0.0 && freqs.contains(&center) {
-            center + 25_000
-        } else {
-            center
-        };
-        let chans: Vec<String> =
-            freqs.iter().map(|&f| format!("{:.3}", f as f64 / 1e6)).collect();
-        proposals.push(format!(
-            "xng listen --sdr '{sdr}' --mode {} -r {} -c {:.3}M --channels {}",
-            mode,
-            rate as u64,
-            center as f64 / 1e6,
-            chans.join(",")
-        ));
+        configs.extend(ProposedConfig::for_channels(sdr, mode, rate, gain, &active));
     }
+    let proposals: Vec<String> = configs.iter().map(|c| c.command.clone()).collect();
     if proposals.is_empty() {
-        println!("\nno active channels found — try a longer dwell or check the antenna");
+        say!(rep, "\nno active channels found — try a longer dwell or check the antenna");
     } else {
-        println!("\nproposed configuration:");
+        say!(rep, "\nproposed configuration:");
         for p in &proposals {
-            println!("  {p}");
+            say!(rep, "  {p}");
         }
     }
 
-    if let Some(path) = out_json {
-        let report = ScanReport { dwell_secs, results: &results, proposals, systables };
-        std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
-        println!("\nreport written to {}", path.display());
-    }
-    Ok(())
+    Ok(ScanReport { dwell_secs, results, proposals, configs, systables })
 }
 
 /// Open `sdr` on one capture group, decode `channels` of `mode` for
@@ -584,6 +647,7 @@ pub(crate) fn scan_group(
     center: u64,
     channels: &[u64],
     dwell_secs: u64,
+    cancel: &Arc<AtomicBool>,
 ) -> anyhow::Result<(Vec<ChannelResult>, Vec<serde_json::Value>)> {
     let (mut source, _) = crate::sdr_open::open_sdr(sdr, rate, center, gain)?;
     let cfg = SessionConfig {
@@ -631,8 +695,9 @@ pub(crate) fn scan_group(
     let deadline = Instant::now() + Duration::from_secs(dwell_secs);
     let stop_thread = {
         let stop = stop.clone();
+        let cancel = cancel.clone();
         std::thread::spawn(move || {
-            while Instant::now() < deadline {
+            while Instant::now() < deadline && !cancel.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(100));
             }
             stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -822,6 +887,30 @@ mod tests {
         // A DDC mode whose only channel is the midpoint still nudges off DC.
         let groups = group_channels(&[131_550_000], 2_400_000.0, passband(Mode::AcarsPoa));
         assert_eq!(groups[0].0, 131_575_000);
+    }
+
+    #[test]
+    fn proposals_name_exact_frequencies_one_window_each() {
+        // 4209.5 kHz needs a fourth decimal; three would move the channel.
+        assert_eq!(mhz_arg(4_209_500), "4.2095");
+        assert_eq!(mhz_arg(131_550_000), "131.550");
+        assert_eq!(mhz_arg(1_090_000_000), "1090.000");
+        let cfgs = ProposedConfig::for_channels(
+            "driver=sdrplay",
+            Mode::Hfdl,
+            768_000.0,
+            Some(30.0),
+            &[8_825_000, 5_502_000],
+        );
+        assert_eq!(cfgs.len(), 2);
+        assert_eq!(cfgs[0].channels_hz, vec![5_502_000]);
+        assert_eq!(cfgs[1].channels_hz, vec![8_825_000]);
+        for c in &cfgs {
+            assert!(c.channels_hz.iter().all(|f| f.abs_diff(c.center_hz) < 384_000));
+            assert_eq!(c.gain_db, Some(30.0));
+            assert!(c.command.contains("--gain 30"), "{}", c.command);
+        }
+        assert!(ProposedConfig::for_channels("x", Mode::Hfdl, 768_000.0, None, &[]).is_empty());
     }
 
     #[test]

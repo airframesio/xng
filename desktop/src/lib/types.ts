@@ -143,6 +143,84 @@ export type BackendEvent =
   | { type: "entities"; state: EntityState }
   | { type: "ended"; error: string | null };
 
+/** `xng scan` / `xng survey`, with the CLI's flags as fields. */
+export type ToolRequest =
+  | { kind: "scan"; sdr: string; gain: number | null; modes: string[]; dwellSecs: number }
+  | {
+      kind: "survey";
+      sdr: string;
+      gain: number | null;
+      mode: string;
+      sampleRate: number | null;
+      channels: string[];
+      durationSecs: number;
+      interimSecs: number;
+      scanFirst: boolean;
+      scanDwellSecs: number;
+      tuneGain: boolean;
+      tuneDwellSecs: number;
+      rotateDwellSecs: number;
+      showMessages: boolean;
+    };
+
+/** A decode setup worked out from what a tool heard. */
+export interface ProposedConfig {
+  mode: string;
+  sample_rate: number;
+  center_hz: number;
+  channels_hz: number[];
+  gain_db?: number;
+  command: string;
+}
+
+export interface ScanResult {
+  mode: string;
+  frequency_hz: number;
+  frames: number;
+  crc_ok: number;
+  level_dbfs: number;
+  verdict: string;
+}
+
+/** The report `xng scan --out` writes. */
+export interface ScanReport {
+  dwell_secs: number;
+  results: ScanResult[];
+  proposals: string[];
+  configs: ProposedConfig[];
+  systables?: unknown[];
+}
+
+export interface SurveyChannel {
+  frequency_hz: number;
+  listen_secs: number;
+  frames: number;
+  crc_ok: number;
+  crc_bad: number;
+  ok_pct: number;
+  frames_per_min: number;
+  level_dbfs: number;
+  verdict: string;
+}
+
+/** The report `xng survey --out` writes. */
+export interface SurveyReport {
+  mode: string;
+  duration_secs: number;
+  sample_rate: number;
+  gain: string;
+  sweep?: { gain_db: number; frames: number; crc_ok: number; mean_level_dbfs: number }[];
+  channels: SurveyChannel[];
+  advice: string[];
+  proposal?: string;
+  config?: ProposedConfig;
+}
+
+export type ToolEvent =
+  | { type: "line"; text: string }
+  | { type: "done"; report: ScanReport | SurveyReport; stopped: boolean }
+  | { type: "failed"; message: string };
+
 export interface Backend {
   /** False when running in a plain browser with simulated data. */
   native: boolean;
@@ -151,6 +229,11 @@ export interface Backend {
   resolveTune(req: SessionRequest): Promise<ResolvedTune>;
   start(req: SessionRequest, onEvent: (e: BackendEvent) => void): Promise<void>;
   stop(): Promise<void>;
+  /** Run a scan or survey; a running session is stopped first. */
+  startTool(req: ToolRequest, onEvent: (e: ToolEvent) => void): Promise<void>;
+  /** Ask the running tool to finish early; its report still arrives. */
+  stopTool(): Promise<void>;
+  writeText(path: string, contents: string): Promise<void>;
   exportEntities(format: string, path: string): Promise<void>;
   setDecodeThreads(n: number): Promise<boolean>;
   pickFile(title: string, filters?: { name: string; extensions: string[] }[]): Promise<string | null>;

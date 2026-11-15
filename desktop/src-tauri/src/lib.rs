@@ -6,10 +6,12 @@
 
 mod request;
 mod session;
+mod tools;
 
 use request::{ResolvedTune, SessionRequest};
 use serde::Serialize;
 use session::{Event, Running};
+use tools::{ToolEvent, ToolRequest, ToolTask};
 use std::sync::Mutex;
 use tauri::ipc::Channel;
 use tauri::State;
@@ -20,6 +22,16 @@ struct AppState {
     /// The map picture of the current or most recent session. It is kept
     /// after Stop so the final state can still be exported.
     dashboard: Mutex<Option<std::sync::Arc<Mutex<xng::outputs::http::Dashboard>>>>,
+    /// A scan or survey in progress. It owns the radio while it runs.
+    tool: Mutex<Option<ToolTask>>,
+    /// The stop flag of a tool that `start_tool` is still clearing the way
+    /// for. It is not in `tool` yet, so a stop asked for now is set here
+    /// and the tool starts with it already in force.
+    tool_pending: Mutex<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// Set while a session is opening its source. It is not in `running`
+    /// yet, so a tool started now could not stop it and would end up
+    /// sharing the radio with it.
+    starting: std::sync::atomic::AtomicBool,
     /// Set once the window is gone, so a session still opening its radio
     /// is stopped as soon as it comes up instead of being kept.
     closing: std::sync::atomic::AtomicBool,
@@ -130,14 +142,27 @@ async fn start_session(
     if let Some(prev) = prev {
         tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
     }
-    let running = tauri::async_runtime::spawn_blocking(move || {
+    stop_tool_task(&state).await?;
+    state.starting.store(true, std::sync::atomic::Ordering::SeqCst);
+    let opened = tauri::async_runtime::spawn_blocking(move || {
         let _sdr = sdr_lock();
         Running::start(&request, on_event)
     })
-        .await
-        .map_err(err)?
-        .map_err(err)?;
+    .await;
+    // Publish the session (or the failure) before tools are let in again.
+    let running = match opened {
+        Ok(Ok(running)) => running,
+        failed => {
+            state.starting.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(match failed {
+                Ok(Err(e)) => err(e),
+                Err(e) => err(e),
+                Ok(Ok(_)) => unreachable!(),
+            });
+        }
+    };
     let mut slot = state.running.lock().unwrap();
+    state.starting.store(false, std::sync::atomic::Ordering::SeqCst);
     if state.closing.load(std::sync::atomic::Ordering::Relaxed) {
         drop(slot);
         running.stop();
@@ -158,6 +183,77 @@ async fn stop_session(state: State<'_, AppState>) -> CmdResult<()> {
     Ok(())
 }
 
+/// Stop any scan or survey and wait for it to let go of the radio.
+async fn stop_tool_task(state: &State<'_, AppState>) -> CmdResult<()> {
+    let prev = state.tool.lock().unwrap().take();
+    if let Some(prev) = prev {
+        tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
+    }
+    Ok(())
+}
+
+/// Run `xng scan` or `xng survey`. Progress and the final report arrive on
+/// `on_event`. A running session or tool is stopped first: they would be
+/// holding the radio.
+#[tauri::command]
+async fn start_tool(
+    state: State<'_, AppState>,
+    request: ToolRequest,
+    on_event: Channel<ToolEvent>,
+) -> CmdResult<()> {
+    if state.starting.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("A session is still starting. Wait for it, then stop it to run this.".into());
+    }
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *state.tool_pending.lock().unwrap() = Some(cancel.clone());
+    let started = async {
+        let prev = state.running.lock().unwrap().take();
+        if let Some(prev) = prev {
+            tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
+        }
+        stop_tool_task(&state).await?;
+        ToolTask::start(request, on_event, sdr_lock, cancel).map_err(err)
+    }
+    .await;
+    // Publish the task and retire the pending flag under one lock, so a
+    // stop always finds one of the two.
+    let mut slot = state.tool.lock().unwrap();
+    *state.tool_pending.lock().unwrap() = None;
+    let task = started?;
+    if state.closing.load(std::sync::atomic::Ordering::Relaxed) {
+        drop(slot);
+        task.stop();
+        return Err("The window was closed".into());
+    }
+    *slot = Some(task);
+    Ok(())
+}
+
+/// Ask the running scan or survey to finish early. It reports what it has
+/// measured so far through its event channel; this returns at once.
+#[tauri::command]
+fn stop_tool(state: State<'_, AppState>) {
+    state.request_tool_stop();
+}
+
+impl AppState {
+    /// Stop the tool in the slot and any tool still on its way up.
+    fn request_tool_stop(&self) {
+        let mut slot = self.tool.lock().unwrap();
+        if let Some(task) = slot.as_ref() {
+            task.cancel();
+            if task.finished() {
+                *slot = None;
+            }
+        }
+        // A tool on its way up is stopped too, whether or not an earlier
+        // one is still in the slot.
+        if let Some(cancel) = self.tool_pending.lock().unwrap().as_ref() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
 /// Write the current map picture to `path` as GeoJSON, GPX or KML.
 #[tauri::command]
 async fn export_entities(state: State<'_, AppState>, format: String, path: String) -> CmdResult<()> {
@@ -173,6 +269,13 @@ async fn export_entities(state: State<'_, AppState>, format: String, path: Strin
         }
     };
     std::fs::write(&path, body).map_err(err)
+}
+
+/// Save text the UI produced (a scan or survey report) to a path the user
+/// picked in a save dialog.
+#[tauri::command]
+async fn write_text(path: String, contents: String) -> CmdResult<()> {
+    std::fs::write(&path, contents).map_err(err)
 }
 
 /// Size the decode worker pool (as `--decode-threads`). Only the first
@@ -198,7 +301,10 @@ pub fn run() {
             resolve_tune,
             start_session,
             stop_session,
+            start_tool,
+            stop_tool,
             export_entities,
+            write_text,
             set_decode_threads,
         ])
         .on_window_event(|window, event| {
@@ -210,9 +316,60 @@ pub fn run() {
                     if let Some(r) = state.running.lock().unwrap().take() {
                         r.stop();
                     }
+                    if let Some(t) = state.tool.lock().unwrap().take() {
+                        t.stop();
+                    }
                 }
             }
         })
         .run(tauri::generate_context!())
         .expect("error while running xng desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn scan_task(cancel: Arc<AtomicBool>) -> ToolTask {
+        let request: ToolRequest = serde_json::from_value(serde_json::json!({
+            "kind": "scan", "sdr": "driver=xng-test-no-such-radio", "gain": null,
+            "modes": ["ais"], "dwellSecs": 1,
+        }))
+        .unwrap();
+        ToolTask::start(request, Channel::new(|_| Ok(())), || (), cancel).unwrap()
+    }
+
+    /// Stop pressed while a new tool is on its way up and an earlier one is
+    /// still in the slot: the stop must reach the new tool as well.
+    #[test]
+    fn a_stop_reaches_a_pending_tool_behind_an_installed_one() {
+        let state = AppState::default();
+        let earlier = Arc::new(AtomicBool::new(false));
+        *state.tool.lock().unwrap() = Some(scan_task(earlier.clone()));
+        let pending = Arc::new(AtomicBool::new(false));
+        *state.tool_pending.lock().unwrap() = Some(pending.clone());
+
+        state.request_tool_stop();
+
+        assert!(earlier.load(Ordering::Relaxed), "the installed tool is stopped");
+        assert!(pending.load(Ordering::Relaxed), "the pending tool is stopped");
+        // The tool that then starts with that flag ends at its first check.
+        scan_task(pending).wait();
+        let earlier = state.tool.lock().unwrap().take();
+        if let Some(t) = earlier {
+            t.wait();
+        }
+    }
+
+    /// With nothing in the slot, the stop still lands on the pending tool.
+    #[test]
+    fn a_stop_reaches_a_pending_tool_with_an_empty_slot() {
+        let state = AppState::default();
+        let pending = Arc::new(AtomicBool::new(false));
+        *state.tool_pending.lock().unwrap() = Some(pending.clone());
+        state.request_tool_stop();
+        assert!(pending.load(Ordering::Relaxed));
+    }
 }

@@ -11,12 +11,18 @@ import type {
   DeviceEntry,
   EntityState,
   MessageItem,
+  ProposedConfig,
   ResolvedTune,
+  ScanReport,
   SessionRequest,
   SessionSummary,
+  SurveyReport,
+  ToolEvent,
+  ToolRequest,
 } from "./types";
 
 const MAX_MESSAGES = 5000;
+const MAX_TOOL_LINES = 2000;
 const SETTINGS_KEY = "xng.settings.v1";
 
 /** Everything the setup form holds, as the strings the user typed. */
@@ -173,6 +179,25 @@ export function buildRequest(): SessionRequest {
 }
 
 export type Phase = "idle" | "starting" | "running" | "ended";
+export type ToolKind = "scan" | "survey";
+/** idle: choosing options. stopping: asked to finish, report on its way. */
+export type ToolPhase = "idle" | "running" | "stopping" | "done" | "failed";
+
+/** Take a tool's proposal as the setup for listening. */
+export function applyProposal(c: ProposedConfig) {
+  settings.sourceKind = "device";
+  settings.mode = c.mode;
+  settings.sampleRate = String(c.sample_rate);
+  settings.centerFreq = `${mhzExact(c.center_hz)}M`;
+  settings.channels = c.channels_hz.map(mhzExact).join(", ");
+  if (c.gain_db != null) settings.gain = String(c.gain_db);
+  saveSettings();
+}
+
+/** Hz as MHz without rounding away any digits (131550000 to "131.55"). */
+function mhzExact(hz: number): string {
+  return String(hz / 1e6);
+}
 export type View = "live" | "messages" | "signal";
 
 class AppState {
@@ -202,6 +227,18 @@ class AppState {
   private selectedItem = $state.raw<MessageItem | null>(null);
   /** Messages per second, smoothed. */
   rate = $state(0);
+
+  /** The scan/survey screen, when open. */
+  tool = $state<ToolKind | null>(null);
+  toolPhase = $state<ToolPhase>("idle");
+  toolLines = $state.raw<string[]>([]);
+  toolReport = $state.raw<ScanReport | SurveyReport | null>(null);
+  /** Which tool produced `toolReport`. */
+  toolReportKind = $state<ToolKind | null>(null);
+  toolStopped = $state(false);
+  toolError = $state<string | null>(null);
+  /** Guards against events from a run that was superseded. */
+  private toolRun = 0;
 
   private spectrumListeners = new Set<(bins: number[]) => void>();
   private rateWindow: { t: number; n: number }[] = [];
@@ -267,6 +304,7 @@ class AppState {
     if (this.phase === "starting" || this.phase === "running") return;
     saveSettings();
     this.error = null;
+    this.tool = null;
     this.phase = "starting";
     this.messages = [];
     this.total = 0;
@@ -298,6 +336,70 @@ class AppState {
       if (this.phase === "running" || this.phase === "starting") this.phase = "ended";
       this.rateWindow = [];
       this.rate = 0;
+    }
+  }
+
+  openTool(kind: ToolKind) {
+    // A session that is still opening the radio can't be stopped yet.
+    if (this.phase === "starting") return;
+    this.tool = kind;
+    if (this.toolPhase !== "running" && this.toolPhase !== "stopping") this.toolPhase = "idle";
+  }
+
+  /** Leave the tool screen. A running tool is stopped first. */
+  async closeTool() {
+    if (this.toolPhase === "running" || this.toolPhase === "stopping") await this.stopTool();
+    this.tool = null;
+  }
+
+  async startTool(req: ToolRequest) {
+    if (this.toolPhase === "running" || this.toolPhase === "stopping") return;
+    const run = ++this.toolRun;
+    this.toolPhase = "running";
+    this.toolLines = [];
+    this.toolReport = null;
+    this.toolReportKind = null;
+    this.toolStopped = false;
+    this.toolError = null;
+    try {
+      await (await backend()).startTool(req, (e) => this.handleTool(run, req.kind, e));
+    } catch (e) {
+      if (run !== this.toolRun) return;
+      this.toolError = String(e);
+      this.toolPhase = "failed";
+    }
+  }
+
+  async stopTool() {
+    if (this.toolPhase !== "running") return;
+    this.toolPhase = "stopping";
+    try {
+      await (await backend()).stopTool();
+    } catch (e) {
+      this.toolError = String(e);
+      this.toolPhase = "failed";
+    }
+  }
+
+  private handleTool(run: number, kind: ToolKind, e: ToolEvent) {
+    if (run !== this.toolRun) return;
+    switch (e.type) {
+      case "line": {
+        // A line may hold several (the CLI prints blank separators).
+        const next = this.toolLines.concat(e.text.split("\n"));
+        this.toolLines = next.length > MAX_TOOL_LINES ? next.slice(next.length - MAX_TOOL_LINES) : next;
+        break;
+      }
+      case "done":
+        this.toolReport = e.report;
+        this.toolReportKind = kind;
+        this.toolStopped = e.stopped;
+        this.toolPhase = "done";
+        break;
+      case "failed":
+        this.toolError = e.message;
+        this.toolPhase = "failed";
+        break;
     }
   }
 

@@ -10,7 +10,11 @@ import type {
   EntityState,
   MessageItem,
   ResolvedTune,
+  ScanReport,
   SessionRequest,
+  SurveyReport,
+  ToolEvent,
+  ToolRequest,
 } from "./types";
 
 const PLANS: Record<string, { rate: number; channels: number[] }> = {
@@ -246,6 +250,16 @@ export function demoBackend(): Backend {
     async stop() {
       stopAll();
     },
+    async startTool(req, onEvent) {
+      stopAll();
+      toolStop?.();
+      toolStop = simulateTool(req, onEvent);
+    },
+    async stopTool() {
+      toolStop?.();
+      toolStop = null;
+    },
+    async writeText() {},
     async exportEntities() {},
     async setDecodeThreads() {
       return true;
@@ -260,4 +274,74 @@ export function demoBackend(): Backend {
       window.open(url, "_blank", "noopener");
     },
   };
+}
+
+let toolStop: (() => void) | null = null;
+
+/** Play a scan or survey at about 20x speed. Returns a stop function that
+ *  ends it early and still delivers the report, as the real tools do. */
+function simulateTool(req: ToolRequest, onEvent: (e: ToolEvent) => void): () => void {
+  const modes = req.kind === "scan" ? req.modes : [req.mode];
+  const heard = modes.flatMap((mode) =>
+    plan(mode).channels.map((f, i) => {
+      const active = i % 3 !== 2;
+      const frames = active ? Math.round(rnd(4, 60)) : 0;
+      return { mode, f, frames, ok: Math.round(frames * rnd(0.8, 1)), level: active ? rnd(-45, -30) : rnd(-72, -64) };
+    }),
+  );
+  const config = (mode: string) => {
+    const chans = heard.filter((h) => h.mode === mode && h.ok > 0).map((h) => h.f);
+    if (!chans.length) return null;
+    const center = Math.round((Math.min(...chans) + Math.max(...chans)) / 2) + 25_000;
+    const rate = plan(mode).rate;
+    const command = `xng listen --sdr '${req.sdr}' --mode ${mode} -r ${rate} -c ${(center / 1e6).toFixed(3)}M --channels ${chans.map((c) => (c / 1e6).toFixed(3)).join(",")}`;
+    return { mode, sample_rate: rate, center_hz: center, channels_hz: chans, command };
+  };
+  const report = (): ScanReport | SurveyReport => {
+    if (req.kind === "scan") {
+      const configs = modes.map(config).filter((c) => c !== null);
+      return {
+        dwell_secs: req.dwellSecs,
+        results: heard.map((h) => ({
+          mode: h.mode, frequency_hz: h.f, frames: h.frames, crc_ok: h.ok, level_dbfs: h.level,
+          verdict: h.ok > 0 ? "ACTIVE" : "quiet",
+        })),
+        proposals: configs.map((c) => c.command),
+        configs,
+      };
+    }
+    const c = config(req.mode);
+    return {
+      mode: req.mode,
+      duration_secs: req.durationSecs,
+      sample_rate: plan(req.mode).rate,
+      gain: req.tuneGain ? "30 dB (swept)" : req.gain == null ? "hardware AGC" : `${req.gain} dB (fixed)`,
+      sweep: req.tuneGain
+        ? [12, 21, 30, 39, 48].map((g) => ({ gain_db: g, frames: Math.round(rnd(0, 20)), crc_ok: Math.round(rnd(0, 15)), mean_level_dbfs: -70 + g }))
+        : undefined,
+      channels: heard.map((h) => ({
+        frequency_hz: h.f, listen_secs: req.durationSecs, frames: h.frames, crc_ok: h.ok, crc_bad: h.frames - h.ok,
+        ok_pct: h.frames ? (100 * h.ok) / h.frames : 0, frames_per_min: (60 * h.frames) / req.durationSecs,
+        level_dbfs: h.level, verdict: h.ok > 0 ? "ACTIVE" : "quiet",
+      })),
+      advice: ["Levels look healthy. A fixed gain usually beats hardware AGC for bursty signals."],
+      proposal: c?.command,
+      config: c ?? undefined,
+    };
+  };
+  const steps = heard.map((h) => `→ ${h.mode} @ ${(h.f / 1e6).toFixed(3)} MHz: ${h.frames} frames, ${h.ok} ok, ${h.level.toFixed(1)} dBFS`);
+  steps.unshift(req.kind === "scan" ? `scanning ${heard.length} channel(s) across ${modes.length} mode(s)` : `surveying ${heard.length} channel(s), ${req.durationSecs}s total`);
+  let i = 0;
+  let finished = false;
+  const finish = (stopped: boolean) => {
+    if (finished) return;
+    finished = true;
+    clearInterval(timer);
+    onEvent({ type: "done", report: report(), stopped });
+  };
+  const timer = window.setInterval(() => {
+    if (i < steps.length) onEvent({ type: "line", text: steps[i++] });
+    else finish(false);
+  }, 450);
+  return () => finish(true);
 }

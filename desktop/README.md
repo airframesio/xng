@@ -13,7 +13,7 @@ The UI is Svelte 5 with MapLibre GL, rendered by the system webview.
 
 | Path | What |
 |---|---|
-| `src-tauri/` | Rust side: commands, the request to `SessionConfig` mapping, and the pump that batches engine output for the UI |
+| `src-tauri/` | Rust side: commands, the request to `SessionConfig` mapping, the pump that batches engine output for the UI, and the scan/survey runner |
 | `src/` | Svelte UI |
 | `src/lib/demo.ts` | Simulated backend used only when the UI runs in a plain browser |
 
@@ -92,5 +92,11 @@ Airframes feeding, asf-2.0 gRPC/QUIC, UDP, MQTT, ZMQ, JSONL, the web
 dashboard, Prometheus, SBS, Beast, NMEA TCP/UDP, GSMTAP, the Iridium
 satellite map, ground-station names and the aircraft database.
 
-Not in the app yet: multi-session stations, `scan`, `survey`, `ingest` and
-`extern`. Use the CLI for those.
+**Scan for signals** and **Survey reception** on the setup screen are
+`xng scan` and `xng survey`: the same code, with the CLI's progress output in
+a log and the report as tables. Each suggested setup has a "Use this setup"
+button that fills in the signal, sample rate, center, channels and gain, and
+the report can be saved as the JSON that `--out` writes.
+
+Not in the app yet: multi-session stations, `ingest` and `extern`. Use the
+CLI for those.

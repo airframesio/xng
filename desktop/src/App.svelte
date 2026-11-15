@@ -7,6 +7,7 @@
   import MessageList from "./components/MessageList.svelte";
   import Setup from "./components/Setup.svelte";
   import Spectrum from "./components/Spectrum.svelte";
+  import Tools from "./components/Tools.svelte";
   import TopBar from "./components/TopBar.svelte";
   import { app } from "./lib/store.svelte";
 
@@ -40,7 +41,9 @@
 
   <main>
     {#if bootError}
-      <div class="fatal selectable"><h1>xng couldn't start</h1><p>{bootError}</p></div>
+      <div class="fatal selectable"><h1>XNG couldn't start</h1><p>{bootError}</p></div>
+    {:else if !active && app.tool}
+      <Tools />
     {:else if !active}
       <Setup />
     {:else if app.view === "live"}
