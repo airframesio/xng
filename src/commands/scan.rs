@@ -400,41 +400,47 @@ pub struct ProposedConfig {
     pub command: String,
 }
 
+/// A frequency in MHz for a command line: three decimals as a rule, more
+/// when the frequency needs them, so the command names the exact channel.
+fn mhz_arg(hz: u64) -> String {
+    let s = format!("{}.{:06}", hz / 1_000_000, hz % 1_000_000);
+    let keep = s.trim_end_matches('0').len().max(s.len() - 3);
+    s[..keep].to_string()
+}
+
 impl ProposedConfig {
-    /// Center a capture on `active` channels of `mode`. `None` when there
-    /// is nothing active to tune to.
+    /// One configuration per capture window that `active` channels of
+    /// `mode` need at `rate`, lowest window first. Channels too far apart
+    /// to share a capture are never put in the same configuration.
     pub fn for_channels(
         sdr: &str,
         mode: Mode,
         rate: f64,
         gain: Option<f64>,
         active: &[u64],
-    ) -> Option<Self> {
-        let (min, max) = (*active.iter().min()?, *active.iter().max()?);
-        let center = (min + max) / 2;
-        // Whole-capture modes (passband 0: Mode S) keep the channel at
-        // center; the rest step off a channel sitting exactly on DC.
-        let center = if passband(mode) > 0.0 && active.contains(&center) {
-            center + 25_000
-        } else {
-            center
-        };
-        let chans: Vec<String> =
-            active.iter().map(|&f| format!("{:.3}", f as f64 / 1e6)).collect();
+    ) -> Vec<Self> {
         let gain_arg = gain.map(|g| format!(" --gain {g}")).unwrap_or_default();
-        Some(Self {
-            mode: mode.as_str().to_string(),
-            sample_rate: rate,
-            center_hz: center,
-            channels_hz: active.to_vec(),
-            gain_db: gain,
-            command: format!(
-                "xng listen --sdr '{sdr}'{gain_arg} --mode {mode} -r {} -c {:.3}M --channels {}",
-                rate as u64,
-                center as f64 / 1e6,
-                chans.join(",")
-            ),
-        })
+        // The grouping keeps whole-capture modes (Mode S) centered on
+        // their channel and steps the rest off a channel sitting on DC.
+        group_channels(active, rate, passband(mode))
+            .into_iter()
+            .map(|(center, channels)| {
+                let chans: Vec<String> = channels.iter().map(|&f| mhz_arg(f)).collect();
+                Self {
+                    mode: mode.as_str().to_string(),
+                    sample_rate: rate,
+                    center_hz: center,
+                    gain_db: gain,
+                    command: format!(
+                        "xng listen --sdr '{sdr}'{gain_arg} --mode {mode} -r {} -c {}M --channels {}",
+                        rate as u64,
+                        mhz_arg(center),
+                        chans.join(",")
+                    ),
+                    channels_hz: channels,
+                }
+            })
+            .collect()
     }
 }
 
@@ -443,7 +449,8 @@ impl ProposedConfig {
 pub struct ScanReport {
     pub dwell_secs: u64,
     pub results: Vec<ChannelResult>,
-    /// One `xng listen` command line per mode with active channels.
+    /// One `xng listen` command line per capture window with active
+    /// channels (a mode whose active channels span several gets several).
     pub proposals: Vec<String>,
     /// The same proposals as data.
     pub configs: Vec<ProposedConfig>,
@@ -605,7 +612,7 @@ pub fn run_with(
     let quiet = results.iter().filter(|r| r.verdict == "quiet").count();
     say!(rep, "({quiet} quiet channel(s) omitted)");
 
-    // Proposals: one listen command per mode with active channels.
+    // Proposals: one listen command per capture window with active channels.
     let mut configs = Vec::new();
     for &mode in modes {
         let active: Vec<u64> = results
@@ -614,7 +621,7 @@ pub fn run_with(
             .map(|r| r.frequency_hz)
             .collect();
         let rate = choose_rate(&caps, mode, plan(mode).0);
-        configs.extend(ProposedConfig::for_channels(sdr, mode, rate, None, &active));
+        configs.extend(ProposedConfig::for_channels(sdr, mode, rate, gain, &active));
     }
     let proposals: Vec<String> = configs.iter().map(|c| c.command.clone()).collect();
     if proposals.is_empty() {
@@ -880,6 +887,30 @@ mod tests {
         // A DDC mode whose only channel is the midpoint still nudges off DC.
         let groups = group_channels(&[131_550_000], 2_400_000.0, passband(Mode::AcarsPoa));
         assert_eq!(groups[0].0, 131_575_000);
+    }
+
+    #[test]
+    fn proposals_name_exact_frequencies_one_window_each() {
+        // 4209.5 kHz needs a fourth decimal; three would move the channel.
+        assert_eq!(mhz_arg(4_209_500), "4.2095");
+        assert_eq!(mhz_arg(131_550_000), "131.550");
+        assert_eq!(mhz_arg(1_090_000_000), "1090.000");
+        let cfgs = ProposedConfig::for_channels(
+            "driver=sdrplay",
+            Mode::Hfdl,
+            768_000.0,
+            Some(30.0),
+            &[8_825_000, 5_502_000],
+        );
+        assert_eq!(cfgs.len(), 2);
+        assert_eq!(cfgs[0].channels_hz, vec![5_502_000]);
+        assert_eq!(cfgs[1].channels_hz, vec![8_825_000]);
+        for c in &cfgs {
+            assert!(c.channels_hz.iter().all(|f| f.abs_diff(c.center_hz) < 384_000));
+            assert_eq!(c.gain_db, Some(30.0));
+            assert!(c.command.contains("--gain 30"), "{}", c.command);
+        }
+        assert!(ProposedConfig::for_channels("x", Mode::Hfdl, 768_000.0, None, &[]).is_empty());
     }
 
     #[test]

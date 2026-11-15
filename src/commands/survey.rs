@@ -154,6 +154,25 @@ pub fn run_with(rep: &Reporter, opts: SurveyOpts) -> anyhow::Result<SurveyReport
     } else {
         plan_channels.clone()
     };
+    if channels.is_empty() && abort.load(Ordering::Relaxed) {
+        // Stopped before the pre-pass heard anything: that is an empty
+        // survey, not a bad channel selection.
+        say!(rep, "stopped before any channel was surveyed");
+        return Ok(SurveyReport {
+            mode: mode.as_str().to_string(),
+            duration_secs: 0.0,
+            sample_rate: rate,
+            gain: match opts.gain {
+                Some(g) => format!("{g} dB (fixed)"),
+                None => "hardware AGC".to_string(),
+            },
+            sweep: Vec::new(),
+            channels: Vec::new(),
+            advice: Vec::new(),
+            proposal: None,
+            config: None,
+        });
+    }
     anyhow::ensure!(
         !channels.is_empty(),
         "no channels to survey: mode {mode} has no built-in plan; pass --channels"
@@ -691,7 +710,19 @@ fn proposed_config(
         .filter(|r| r.verdict == "ACTIVE")
         .map(|r| r.frequency_hz)
         .collect();
-    ProposedConfig::for_channels(sdr, mode, rate, gain, &active)
+    // One capture cannot hold channels from different windows: propose the
+    // window that decoded the most.
+    let frames = |c: &ProposedConfig| -> u64 {
+        results.iter().filter(|r| c.channels_hz.contains(&r.frequency_hz)).map(|r| r.crc_ok).sum()
+    };
+    let mut best: Option<(u64, ProposedConfig)> = None;
+    for c in ProposedConfig::for_channels(sdr, mode, rate, gain, &active) {
+        let n = frames(&c);
+        if best.as_ref().is_none_or(|(b, _)| n > *b) {
+            best = Some((n, c));
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 #[cfg(test)]
@@ -783,5 +814,21 @@ mod tests {
         assert_eq!(cfg.sample_rate, 2_400_000.0);
         // A lone channel must not sit on DC.
         assert_eq!(cfg.center_hz, 131_575_000);
+    }
+
+    #[test]
+    fn proposal_stays_inside_one_capture_window() {
+        // HFDL channels megahertz apart cannot share a 768 kS/s capture:
+        // the proposal takes the window that decoded the most.
+        let results = vec![
+            chan(5_502_000, 4, 3, -40.0),
+            chan(8_825_000, 30, 28, -38.0),
+            chan(8_834_000, 10, 9, -39.0),
+        ];
+        let cfg = proposed_config("driver=sdrplay", Mode::Hfdl, 768_000.0, None, &results).unwrap();
+        assert_eq!(cfg.channels_hz, vec![8_825_000, 8_834_000]);
+        let half = 768_000 / 2;
+        assert!(cfg.channels_hz.iter().all(|f| f.abs_diff(cfg.center_hz) < half));
+        assert!(!cfg.command.contains("5.502"), "{}", cfg.command);
     }
 }

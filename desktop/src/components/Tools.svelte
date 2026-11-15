@@ -256,7 +256,7 @@
           <section aria-labelledby="prop-h">
             <h2 id="prop-h">Suggested setup</h2>
             <div class="props">
-              {#each proposals as c (c.mode)}
+              {#each proposals as c (c.command)}
                 <div class="prop">
                   <div class="pmain">
                     <span class="pname">{modeMeta(c.mode).name}</span>

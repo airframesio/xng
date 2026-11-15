@@ -24,6 +24,10 @@ struct AppState {
     dashboard: Mutex<Option<std::sync::Arc<Mutex<xng::outputs::http::Dashboard>>>>,
     /// A scan or survey in progress. It owns the radio while it runs.
     tool: Mutex<Option<ToolTask>>,
+    /// `Some` while `start_tool` is clearing the way for a tool that is not
+    /// in `tool` yet; `Some(true)` once the user has asked for that tool to
+    /// stop, so the request is not lost before the tool exists.
+    tool_pending: Mutex<Option<bool>>,
     /// Set while a session is opening its source. It is not in `running`
     /// yet, so a tool started now could not stop it and would end up
     /// sharing the radio with it.
@@ -200,17 +204,28 @@ async fn start_tool(
     if state.starting.load(std::sync::atomic::Ordering::SeqCst) {
         return Err("A session is still starting. Wait for it, then stop it to run this.".into());
     }
-    let prev = state.running.lock().unwrap().take();
-    if let Some(prev) = prev {
-        tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
+    *state.tool_pending.lock().unwrap() = Some(false);
+    let started = async {
+        let prev = state.running.lock().unwrap().take();
+        if let Some(prev) = prev {
+            tauri::async_runtime::spawn_blocking(move || prev.stop()).await.map_err(err)?;
+        }
+        stop_tool_task(&state).await?;
+        ToolTask::start(request, on_event, sdr_lock).map_err(err)
     }
-    stop_tool_task(&state).await?;
-    let task = ToolTask::start(request, on_event, sdr_lock).map_err(err)?;
+    .await;
     let mut slot = state.tool.lock().unwrap();
+    let stop_asked = state.tool_pending.lock().unwrap().take() == Some(true);
+    let task = started?;
     if state.closing.load(std::sync::atomic::Ordering::Relaxed) {
         drop(slot);
         task.stop();
         return Err("The window was closed".into());
+    }
+    if stop_asked {
+        // Stop was pressed while the way was being cleared: the tool ends
+        // at its first check and still sends its (empty) report.
+        task.cancel();
     }
     *slot = Some(task);
     Ok(())
@@ -226,6 +241,8 @@ fn stop_tool(state: State<'_, AppState>) {
         if task.finished() {
             *slot = None;
         }
+    } else if let Some(stop) = state.tool_pending.lock().unwrap().as_mut() {
+        *stop = true;
     }
 }
 
