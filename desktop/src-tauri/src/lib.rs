@@ -233,17 +233,24 @@ async fn start_tool(
 /// measured so far through its event channel; this returns at once.
 #[tauri::command]
 fn stop_tool(state: State<'_, AppState>) {
-    let mut slot = state.tool.lock().unwrap();
-    if let Some(task) = slot.as_ref() {
-        task.cancel();
-        if task.finished() {
-            *slot = None;
+    state.request_tool_stop();
+}
+
+impl AppState {
+    /// Stop the tool in the slot and any tool still on its way up.
+    fn request_tool_stop(&self) {
+        let mut slot = self.tool.lock().unwrap();
+        if let Some(task) = slot.as_ref() {
+            task.cancel();
+            if task.finished() {
+                *slot = None;
+            }
         }
-    }
-    // A tool on its way up is stopped too, whether or not an earlier one
-    // is still in the slot.
-    if let Some(cancel) = state.tool_pending.lock().unwrap().as_ref() {
-        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        // A tool on its way up is stopped too, whether or not an earlier
+        // one is still in the slot.
+        if let Some(cancel) = self.tool_pending.lock().unwrap().as_ref() {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -317,4 +324,52 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running xng desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    fn scan_task(cancel: Arc<AtomicBool>) -> ToolTask {
+        let request: ToolRequest = serde_json::from_value(serde_json::json!({
+            "kind": "scan", "sdr": "driver=xng-test-no-such-radio", "gain": null,
+            "modes": ["ais"], "dwellSecs": 1,
+        }))
+        .unwrap();
+        ToolTask::start(request, Channel::new(|_| Ok(())), || (), cancel).unwrap()
+    }
+
+    /// Stop pressed while a new tool is on its way up and an earlier one is
+    /// still in the slot: the stop must reach the new tool as well.
+    #[test]
+    fn a_stop_reaches_a_pending_tool_behind_an_installed_one() {
+        let state = AppState::default();
+        let earlier = Arc::new(AtomicBool::new(false));
+        *state.tool.lock().unwrap() = Some(scan_task(earlier.clone()));
+        let pending = Arc::new(AtomicBool::new(false));
+        *state.tool_pending.lock().unwrap() = Some(pending.clone());
+
+        state.request_tool_stop();
+
+        assert!(earlier.load(Ordering::Relaxed), "the installed tool is stopped");
+        assert!(pending.load(Ordering::Relaxed), "the pending tool is stopped");
+        // The tool that then starts with that flag ends at its first check.
+        scan_task(pending).wait();
+        let earlier = state.tool.lock().unwrap().take();
+        if let Some(t) = earlier {
+            t.wait();
+        }
+    }
+
+    /// With nothing in the slot, the stop still lands on the pending tool.
+    #[test]
+    fn a_stop_reaches_a_pending_tool_with_an_empty_slot() {
+        let state = AppState::default();
+        let pending = Arc::new(AtomicBool::new(false));
+        *state.tool_pending.lock().unwrap() = Some(pending.clone());
+        state.request_tool_stop();
+        assert!(pending.load(Ordering::Relaxed));
+    }
 }
