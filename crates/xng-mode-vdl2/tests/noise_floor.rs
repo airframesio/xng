@@ -178,3 +178,48 @@ fn floor_survives_long_continuous_signal() {
     let (missed, first) = occupancy_trial(300_000, 8, 2_000);
     assert!(missed.is_empty(), "post-gap bursts not decoded: {missed:?} (first at {first:?})");
 }
+
+/// A stream that starts on a transmission (a capture, stdin, or a restart
+/// with the first burst's preamble at sample 0) must decode that burst,
+/// however the input is chunked. The floor seed is the minimum of the
+/// first few block means, all signal here; it used to be applied as soon
+/// as it existed, so with blocks of 512+ samples the hunt gate stood ~10 dB
+/// above the burst before the preamble was hunted, while smaller chunks
+/// locked before the seed arrived.
+#[test]
+fn burst_at_stream_start_decodes_for_any_chunking() {
+    use xng_mode_vdl2::demod::{Vdl2Demod, SYMBOL_RATE};
+    use xng_mode_vdl2::interleave::vdl2_rs;
+    use xng_mode_vdl2::modulate::burst_iq_shaped;
+    const FS: f64 = 105_000.0;
+    const SNR_DB: f64 = 30.0;
+    const TAIL: usize = 20_000;
+
+    let frame = aoa_frame();
+    // Drop the pulse shaper's 6-symbol lead-in: the stream opens at full
+    // burst power on the first ramp-up symbol.
+    let lead_in = (6.0 * FS / SYMBOL_RATE).round() as usize;
+    let mut iq = burst_iq_shaped(std::slice::from_ref(&frame), FS, 0.0, 0.5).split_off(lead_in);
+    let sig_pow = iq.iter().map(|c| f64::from(c.norm_sqr())).sum::<f64>() / iq.len() as f64;
+    let amp = (1.5 * sig_pow * FS / (SYMBOL_RATE * 10f64.powf(SNR_DB / 10.0))).sqrt() as f32;
+    iq.resize(iq.len() + TAIL, Complex::new(0.0, 0.0));
+    let mut noise = Noise(0x5eed_5747_a770_0001);
+    for s in &mut iq {
+        *s += Complex::new(noise.next() * amp, noise.next() * amp);
+    }
+
+    let rs = vdl2_rs();
+    let missed: Vec<usize> = [64, 256, 512, 1024, 2048, 4096, iq.len()]
+        .into_iter()
+        .filter(|&chunk| {
+            let mut demod = Vdl2Demod::new(FS);
+            let hit = iq.chunks(chunk).any(|c| {
+                demod.process(c, &rs).iter().any(|b| {
+                    b.frames.iter().any(|f| f.raw.len() == frame.len() + 2 && f.raw.starts_with(&frame))
+                })
+            });
+            !hit
+        })
+        .collect();
+    assert!(missed.is_empty(), "first burst lost at chunk sizes {missed:?}");
+}

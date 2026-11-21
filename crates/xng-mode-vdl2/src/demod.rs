@@ -111,6 +111,15 @@ const FLOOR_CEILING_RATIO: f32 = 8.0;
 /// Blocks whose minimum seeds the tracking floor (replacing the 1e-6 start,
 /// which left the gate open on noise for seconds after every cold start).
 const FLOOR_SEED_BLOCKS: usize = 8;
+/// A seed this far above the later reference floor was taken on a
+/// transmission, not on noise: the stream opened on a burst. On noise the
+/// seed (a minimum of block means) sits at or below the reference (a low
+/// percentile of them).
+const STARTUP_SIGNAL_RATIO: f32 = 4.0;
+/// How long the startup samples are kept for a re-hunt while the seed might
+/// still prove to be signal: past the longest burst the header gate accepts
+/// (16 000 bits ≈ 0.51 s), the reference floor has seen idle blocks.
+const STARTUP_RETAIN_S: f64 = 0.6;
 /// Floor histogram: 0.25 dB bins over [-160, +40] dB.
 const FLOOR_BINS_PER_DB: f32 = 4.0;
 const FLOOR_DB_MIN: f32 = -160.0;
@@ -266,6 +275,18 @@ enum State {
     Collect(Box<Collecting>),
 }
 
+/// Whether samples hunted against the startup floor seed may need hunting
+/// again with a corrected floor.
+enum Startup {
+    /// The floor seed does not exist yet (the gate is still open).
+    Seeding,
+    /// Seeded while the hunt stood at absolute position `from`: samples from
+    /// there on are kept until the seed proves to be noise (or ages out) or
+    /// signal (hunt them again). Earlier samples met the open gate.
+    Watching { seed: f32, from: f64 },
+    Settled,
+}
+
 pub struct Vdl2Demod {
     /// Refined UW position of the last collection that failed RS: a
     /// re-hunt that refines back to the same position is skipped past
@@ -282,6 +303,9 @@ pub struct Vdl2Demod {
     /// from and capped by `floor`.
     noise: f32,
     floor: NoiseFloor,
+    startup: Startup,
+    /// Samples retained for a startup re-hunt (`STARTUP_RETAIN_S`).
+    startup_retain: f64,
     state: State,
     level: f32,
     /// Optional CFO reject: candidates whose preamble-fit carrier offset
@@ -332,6 +356,8 @@ impl Vdl2Demod {
             cursor: 0.0,
             noise: 1e-6,
             floor: NoiseFloor::new(channel_rate),
+            startup: Startup::Seeding,
+            startup_retain: STARTUP_RETAIN_S * channel_rate,
             state: State::Hunt,
             last_rs_fail: f64::NEG_INFINITY,
             level: 0.0,
@@ -611,7 +637,12 @@ impl Vdl2Demod {
         self.floor.push(input);
         if let Some(seed) = self.floor.seed.take() {
             self.noise = self.noise.max(seed);
+            self.startup = Startup::Watching { seed, from: self.active() };
         }
+        let settled = match self.startup {
+            Startup::Watching { seed, from } => self.watch_startup(seed, from),
+            Startup::Seeding | Startup::Settled => false,
+        };
         if let Some(f) = self.floor.value {
             self.noise = self.noise.min(f * FLOOR_CEILING_RATIO);
         }
@@ -703,6 +734,11 @@ impl Vdl2Demod {
                                     freq_skew_hz,
                                     snr_db: evm_snr_db(&c.conf),
                                 });
+                                // A burst got through: nothing at the start
+                                // to re-hunt, and re-hunting would repeat it.
+                                if matches!(self.startup, Startup::Watching { .. }) {
+                                    self.startup = Startup::Settled;
+                                }
                                 // An erasure-assisted pass may be a
                                 // miscorrection (the AVLC FCS arbitrates);
                                 // never let it swallow a later burst —
@@ -782,16 +818,55 @@ impl Vdl2Demod {
         // any real burst inside the consumed span must still be in the
         // buffer. Worst case (max TL ≈ 6240 symbols) this holds ~150 KB
         // of samples at the 50 kHz channel rate.
-        let active = match &self.state {
-            State::Collect(c) => c.uw_start.min(c.next_pos),
-            State::Hunt => self.cursor,
+        let active = match self.startup {
+            Startup::Watching { from, .. } => self.active().min(from),
+            Startup::Seeding | Startup::Settled => self.active(),
         };
         let keep_from = (active - self.start_abs - 4.0 * self.sps).max(0.0) as usize;
         if keep_from > 0 && keep_from <= self.buf.len() {
             self.buf.drain(..keep_from);
             self.start_abs += keep_from as f64;
         }
+        if settled {
+            // Release the startup retention's capacity once.
+            self.buf.shrink_to_fit();
+        }
         out
+    }
+
+    /// Earliest absolute sample the demod still needs: the hunt cursor, or
+    /// the UW of the burst being collected.
+    fn active(&self) -> f64 {
+        match &self.state {
+            State::Collect(c) => c.uw_start.min(c.next_pos),
+            State::Hunt => self.cursor,
+        }
+    }
+
+    /// While the post-seed samples are retained: if the reference floor has
+    /// fallen far below the seed, the stream opened on a transmission whose
+    /// preamble the seeded gate may have hidden. Hunt again from where the
+    /// seed took effect, against the reference floor. Returns true when
+    /// retention ended.
+    fn watch_startup(&mut self, seed: f32, from: f64) -> bool {
+        if let Some(f) = self.floor.value.filter(|&f| seed > f * STARTUP_SIGNAL_RATIO) {
+            // A collection in progress is redone from its UW: either it
+            // began on the open gate before the seed, or it is re-found.
+            let from = from.min(self.active());
+            if let State::Collect(c) = std::mem::replace(&mut self.state, State::Hunt) {
+                self.recycle(*c);
+            }
+            self.noise = f;
+            self.cursor = from;
+            self.last_rs_fail = f64::NEG_INFINITY;
+            self.startup = Startup::Settled;
+            return true;
+        }
+        if self.buf.len() as f64 > self.startup_retain {
+            self.startup = Startup::Settled;
+            return true;
+        }
+        false
     }
 
     pub fn level_dbfs(&self) -> f32 {
