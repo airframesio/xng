@@ -24,9 +24,10 @@
 //! | `shared`     | `new_shared` (shared-decimation front end)               |
 //! | `channelized`| `new_channelized` (critically sampled channelizer)       |
 //!
-//! A CRC-OK frame is identified by `(channel, tail, msg_num, label, text)`;
-//! frames found under that key by only one front end are reported as
-//! "unique" to it, with channel/time/level for a handful of examples. CPU is
+//! A CRC-OK frame is identified by `(channel, tail, msg_num, label, text)`
+//! and every occurrence counts (a repeated transmission is a separate
+//! reception); occurrences of a key beyond what every other front end
+//! decoded are reported as "unique" to it, with channel/time/level for a handful of examples. CPU is
 //! wall time spent inside `process()` only (file I/O and cu8 conversion are
 //! excluded, and are identical cost across front ends regardless).
 
@@ -388,24 +389,34 @@ fn print_per_channel_table(mhz: &[f64], results: &[FrontEndResult]) {
     println!();
 }
 
-fn crc_ok_keys(r: &FrontEndResult) -> HashMap<FrameKey, &FrameRec> {
-    let mut m = HashMap::new();
+/// CRC-OK frames by key, every occurrence kept (a repeated transmission is
+/// a separate reception): the front ends are compared as multisets.
+fn crc_ok_keys(r: &FrontEndResult) -> HashMap<FrameKey, Vec<&FrameRec>> {
+    let mut m: HashMap<FrameKey, Vec<&FrameRec>> = HashMap::new();
     for f in &r.frames {
         if f.crc_ok {
-            m.entry(f.key()).or_insert(f);
+            m.entry(f.key()).or_default().push(f);
         }
     }
     m
 }
 
-fn print_examples(
-    keys: &[&FrameKey],
-    recs: &HashMap<FrameKey, &FrameRec>,
-    mhz: &[f64],
-    limit: usize,
-) {
-    for k in keys.iter().take(limit) {
-        let f = recs[*k];
+/// Occurrences in `mine` beyond `others` copies of the same key, for every
+/// key: the receptions only `mine` made.
+fn excess<'a>(
+    mine: &HashMap<FrameKey, Vec<&'a FrameRec>>,
+    others: impl Fn(&FrameKey) -> usize,
+) -> Vec<&'a FrameRec> {
+    let mut out: Vec<&FrameRec> = mine
+        .iter()
+        .flat_map(|(k, v)| v.iter().skip(others(k)).copied())
+        .collect();
+    out.sort_by(|a, b| a.channel.cmp(&b.channel).then(a.time_s.total_cmp(&b.time_s)));
+    out
+}
+
+fn print_examples(frames: &[&FrameRec], mhz: &[f64], limit: usize) {
+    for f in frames.iter().take(limit) {
         let ch_mhz = mhz.get(f.channel).copied().unwrap_or(f64::NAN);
         let tail = f.tail.as_deref().unwrap_or("-");
         let msg = f.msg_num.as_deref().unwrap_or("-");
@@ -416,51 +427,49 @@ fn print_examples(
             f.channel, f.time_s, f.level_dbfs, f.noise_dbfs, f.label
         );
     }
-    if keys.len() > limit {
-        println!("    ... and {} more", keys.len() - limit);
+    if frames.len() > limit {
+        println!("    ... and {} more", frames.len() - limit);
     }
 }
 
 fn unique_frame_analysis(results: &[FrontEndResult], mhz: &[f64]) {
-    let sets: Vec<HashMap<FrameKey, &FrameRec>> = results.iter().map(crc_ok_keys).collect();
+    let sets: Vec<HashMap<FrameKey, Vec<&FrameRec>>> = results.iter().map(crc_ok_keys).collect();
+    let count = |s: &HashMap<FrameKey, Vec<&FrameRec>>, k: &FrameKey| s.get(k).map_or(0, Vec::len);
 
     println!("\n-- frames unique to one front end (CRC-OK only) --\n");
     for (i, r) in results.iter().enumerate() {
         let mine = &sets[i];
-        let mut unique: Vec<&FrameKey> = mine
-            .keys()
-            .filter(|k| sets.iter().enumerate().all(|(j, s)| j == i || !s.contains_key(*k)))
-            .collect();
-        unique.sort_by(|a, b| a.0.cmp(&b.0).then(mine[*a].time_s.total_cmp(&mine[*b].time_s)));
-        println!("{} ({} unique of {} CRC-OK):", r.fe.label(), unique.len(), mine.len());
-        print_examples(&unique, mine, mhz, 20);
+        let unique = excess(mine, |k| {
+            sets.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, s)| count(s, k)).max().unwrap_or(0)
+        });
+        let total: usize = mine.values().map(Vec::len).sum();
+        println!("{} ({} unique of {total} CRC-OK):", r.fe.label(), unique.len());
+        print_examples(&unique, mhz, 20);
     }
 
-    // The case called out explicitly: frames the default misses that at
-    // least one of the other three front ends decodes.
+    // The case called out explicitly: receptions the default misses that at
+    // least one of the other three front ends makes (per key, the most
+    // copies any of them decoded, less the default's).
     let default_idx = results.iter().position(|r| r.fe == Fe::Default).expect("default present");
     let default_set = &sets[default_idx];
-    let mut missed: Vec<&FrameKey> = Vec::new();
-    let mut missed_recs: HashMap<FrameKey, &FrameRec> = HashMap::new();
+    let mut most: HashMap<FrameKey, Vec<&FrameRec>> = HashMap::new();
     for (i, s) in sets.iter().enumerate() {
         if i == default_idx {
             continue;
         }
-        for (k, f) in s {
-            if !default_set.contains_key(k) && !missed_recs.contains_key(k) {
-                missed_recs.insert(k.clone(), f);
+        for (k, v) in s {
+            let best = most.entry(k.clone()).or_default();
+            if v.len() > best.len() {
+                best.clone_from(v);
             }
         }
     }
-    missed.extend(missed_recs.keys());
-    missed.sort_by(|a, b| {
-        a.0.cmp(&b.0).then(missed_recs[*a].time_s.total_cmp(&missed_recs[*b].time_s))
-    });
+    let missed = excess(&most, |k| count(default_set, k));
     println!(
         "\ndefault misses ({} frames CRC-OK under per-channel/shared/channelized but not default):",
         missed.len()
     );
-    print_examples(&missed, &missed_recs, mhz, 20);
+    print_examples(&missed, mhz, 20);
 }
 
 fn print_capture_health(
