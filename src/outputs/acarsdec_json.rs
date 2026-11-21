@@ -72,6 +72,18 @@ pub fn format_acarsdec_with_station(
     if let Some(s) = &a.assstat {
         obj.insert("assstat".into(), s.clone().into());
     }
+    // H1/H2 sublabel + MFI and the decoded application layer (ADS-C, CPDLC,
+    // OOOI, position, met...), matching acarsdec's `sublabel`/`mfi` fields and
+    // its nested libacars envelope so aggregators get the full decode.
+    if let Some(sl) = &a.sublabel {
+        obj.insert("sublabel".into(), sl.clone().into());
+    }
+    if let Some(m) = &a.mfi {
+        obj.insert("mfi".into(), m.clone().into());
+    }
+    if let Some(app) = &a.app {
+        obj.insert("libacars".into(), app.clone());
+    }
     Some(v)
 }
 

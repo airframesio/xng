@@ -29,3 +29,40 @@ jobs:
         name: xng-debian-package-latest
         path: |
           ./build/*.deb
+
+  # Windows: built against SoapySDR from PothosSDR, linked delay-loaded so
+  # xng.exe also starts on a machine that has no PothosSDR.
+  windows:
+    runs-on: windows-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install protoc
+      run: choco install protoc -y --no-progress
+    - uses: ./.github/actions/pothossdr
+    - name: Build
+      run: cargo build --verbose --release
+    - name: Run tests
+      run: cargo test --workspace --verbose
+    - name: Self-test
+      run: ./target/release/xng.exe selftest
+    - name: List devices (SoapySDR loads)
+      run: ./target/release/xng.exe devices
+    - name: Run without SoapySDR
+      shell: pwsh
+      run: |
+        # As on a machine without PothosSDR: everything that needs no radio
+        # must still work, and asking for a radio must say what to install.
+        $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notlike '*PothosSDR*' }) -join ';'
+        ./target/release/xng.exe selftest
+        if ($LASTEXITCODE -ne 0) { throw "selftest failed without SoapySDR" }
+        $out = (cmd /c "target\release\xng.exe devices 2>&1" | Out-String)
+        Write-Host $out
+        if ($out -notmatch 'SoapySDR is not installed') { throw "expected the install hint" }
+        # An install that is not on PATH is found through SOAPY_SDR_ROOT.
+        $env:SOAPY_SDR_ROOT = 'C:\PothosSDR'
+        ./target/release/xng.exe devices
+        if ($LASTEXITCODE -ne 0) { throw "SOAPY_SDR_ROOT was not honoured" }
+    - uses: actions/upload-artifact@v4
+      with:
+        name: xng-windows-x86_64-latest
+        path: ./target/release/xng.exe

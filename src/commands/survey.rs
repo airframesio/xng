@@ -9,7 +9,8 @@
 //! gain sweep that picks the best setting empirically.
 
 use crate::bus::MessageBus;
-use crate::commands::scan;
+use crate::commands::scan::{self, ProposedConfig};
+use crate::commands::{say, Reporter};
 use crate::outputs::console::{ConsoleFormat, format_message};
 use crate::runtime::{self, SessionConfig};
 use serde::Serialize;
@@ -42,38 +43,43 @@ pub struct SurveyOpts {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SurveyChannel {
-    frequency_hz: u64,
-    listen_secs: f64,
-    frames: u64,
-    crc_ok: u64,
-    crc_bad: u64,
-    ok_pct: f64,
-    frames_per_min: f64,
-    level_dbfs: f32,
-    verdict: &'static str,
+pub struct SurveyChannel {
+    pub frequency_hz: u64,
+    pub listen_secs: f64,
+    pub frames: u64,
+    pub crc_ok: u64,
+    pub crc_bad: u64,
+    pub ok_pct: f64,
+    pub frames_per_min: f64,
+    pub level_dbfs: f32,
+    pub verdict: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SweepRow {
-    gain_db: f64,
-    frames: u64,
-    crc_ok: u64,
-    mean_level_dbfs: f32,
+pub struct SweepRow {
+    pub gain_db: f64,
+    pub frames: u64,
+    pub crc_ok: u64,
+    pub mean_level_dbfs: f32,
 }
 
-#[derive(Serialize)]
-struct SurveyReport {
-    mode: String,
-    duration_secs: f64,
-    sample_rate: f64,
-    gain: String,
+/// Everything a survey measured. Serializes to the `--out` report.
+#[derive(Debug, Clone, Serialize)]
+pub struct SurveyReport {
+    pub mode: String,
+    pub duration_secs: f64,
+    pub sample_rate: f64,
+    pub gain: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    sweep: Vec<SweepRow>,
-    channels: Vec<SurveyChannel>,
-    advice: Vec<String>,
+    pub sweep: Vec<SweepRow>,
+    pub channels: Vec<SurveyChannel>,
+    pub advice: Vec<String>,
+    /// `xng listen` command line for the channels that decoded.
     #[serde(skip_serializing_if = "Option::is_none")]
-    proposal: Option<String>,
+    pub proposal: Option<String>,
+    /// The same proposal as data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<ProposedConfig>,
 }
 
 /// Accumulated per-channel state across rotation visits.
@@ -85,25 +91,9 @@ struct ChanAcc {
     level_dbfs: f32,
 }
 
+/// `xng survey`: run the survey, printing progress, and stop early but
+/// still report on Ctrl-C.
 pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
-    let mode = opts.mode;
-    let (plan_rate, plan_channels) = scan::plan(mode);
-    let rate = match opts.sample_rate {
-        Some(r) => r,
-        None => {
-            let caps = crate::probe_rate_caps(&opts.sdr);
-            let r = scan::choose_rate(&caps, mode, plan_rate);
-            if r != plan_rate {
-                println!("using {} S/s (device does not offer the plan's {} S/s)", r as u64, plan_rate as u64);
-            }
-            if let Some(hint) = scan::rate_choice_hint(mode, r, plan_rate) {
-                println!("note: {hint}");
-            }
-            r
-        }
-    };
-    let passband = scan::passband(mode);
-
     // Ctrl-C ends the survey early but still produces the report. A second
     // Ctrl-C forces an immediate exit: if a device open or stream read is
     // wedged and never observes `abort`, the first signal can't get us out,
@@ -129,20 +119,66 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
         });
     }
 
+    let rep = Reporter::new(|line| println!("{line}"), abort);
+    run_with(&rep, opts).map(|_| ())
+}
+
+/// The survey behind `xng survey`, reporting progress through `rep` and
+/// returning the report. Cancelling `rep` ends the survey early; the report
+/// then covers what was measured up to that point.
+pub fn run_with(rep: &Reporter, opts: SurveyOpts) -> anyhow::Result<SurveyReport> {
+    let abort = rep.cancel_flag().clone();
+    let mode = opts.mode;
+    let (plan_rate, plan_channels) = scan::plan(mode);
+    let rate = match opts.sample_rate {
+        Some(r) => r,
+        None => {
+            let caps = crate::sdr_open::probe_rate_caps(&opts.sdr);
+            let r = scan::choose_rate(&caps, mode, plan_rate);
+            if r != plan_rate {
+                say!(rep, "using {} S/s (device does not offer the plan's {} S/s)", r as u64, plan_rate as u64);
+            }
+            if let Some(hint) = scan::rate_choice_hint(mode, r, plan_rate) {
+                say!(rep, "note: {hint}");
+            }
+            r
+        }
+    };
+    let passband = scan::passband(mode);
+
     // ── Channel set ────────────────────────────────────────────────────
     let channels: Vec<u64> = if !opts.channels.is_empty() {
         opts.channels.clone()
     } else if opts.scan_first {
-        scan_prepass(&opts, mode, rate, &plan_channels, passband, &abort)?
+        scan_prepass(rep, &opts, mode, rate, &plan_channels, passband, &abort)?
     } else {
         plan_channels.clone()
     };
+    if channels.is_empty() && abort.load(Ordering::Relaxed) {
+        // Stopped before the pre-pass heard anything: that is an empty
+        // survey, not a bad channel selection.
+        say!(rep, "stopped before any channel was surveyed");
+        return write_report(rep, &opts, SurveyReport {
+            mode: mode.as_str().to_string(),
+            duration_secs: 0.0,
+            sample_rate: rate,
+            gain: match opts.gain {
+                Some(g) => format!("{g} dB (fixed)"),
+                None => "hardware AGC".to_string(),
+            },
+            sweep: Vec::new(),
+            channels: Vec::new(),
+            advice: Vec::new(),
+            proposal: None,
+            config: None,
+        });
+    }
     anyhow::ensure!(
         !channels.is_empty(),
         "no channels to survey: mode {mode} has no built-in plan; pass --channels"
     );
     let groups = scan::group_channels(&channels, rate, passband);
-    println!(
+    say!(rep, 
         "surveying {} channel(s) in {} capture window(s), {}s total",
         channels.len(),
         groups.len(),
@@ -161,13 +197,13 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     let (gain, gain_desc) = if opts.tune_gain && !abort.load(Ordering::Relaxed) {
         // A failed, empty, or interrupted sweep must NOT sink the survey or
         // its report — fall back to the requested gain / AGC and carry on.
-        match sweep_gain(&opts, mode, rate, &groups, &abort, deadline) {
+        match sweep_gain(rep, &opts, mode, rate, &groups, &abort, deadline) {
             Ok((g, rows)) => {
                 sweep_rows = rows;
                 (Some(g), format!("{g} dB (swept)"))
             }
             Err(e) => {
-                println!("gain sweep did not complete ({e}); continuing");
+                say!(rep, "gain sweep did not complete ({e}); continuing");
                 match opts.gain {
                     Some(g) => (Some(g), format!("{g} dB (fixed)")),
                     None => (None, "hardware AGC".to_string()),
@@ -238,15 +274,15 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
                 if !ever_ok && consec_fail >= groups.len().max(2) {
                     anyhow::bail!("every capture window is failing (last error: {e})");
                 }
-                println!("window @ {:.3} MHz skipped: {e}", *center as f64 / 1e6);
+                say!(rep, "window @ {:.3} MHz skipped: {e}", *center as f64 / 1e6);
                 std::thread::sleep(Duration::from_secs(2));
             }
         }
-        drain_messages(&mut rx, opts.show_messages, jsonl.as_mut());
+        drain_messages(rep, &mut rx, opts.show_messages, jsonl.as_mut());
         if Instant::now() >= next_interim && Instant::now() < deadline {
             let elapsed = started.elapsed().as_secs();
-            println!("\n── interim @ {elapsed}s ──");
-            print_table(&summarize(&acc));
+            say!(rep, "\n── interim @ {elapsed}s ──");
+            print_table(rep, &summarize(&acc));
             next_interim += Duration::from_secs(opts.interim_secs);
         }
     }
@@ -257,52 +293,60 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     // ── Report ─────────────────────────────────────────────────────────
     let results = summarize(&acc);
     let actual = started.elapsed().as_secs_f64();
-    println!("\n══ survey report: {mode}, {:.0}s, gain {gain_desc} ══", actual);
+    say!(rep, "\n══ survey report: {mode}, {:.0}s, gain {gain_desc} ══", actual);
     if !sweep_rows.is_empty() {
-        println!("gain sweep:");
+        say!(rep, "gain sweep:");
         for r in &sweep_rows {
-            println!(
+            say!(rep, 
                 "  {:>5.1} dB: {:>4} frames, {:>4} ok, mean level {:>6.1} dBFS",
                 r.gain_db, r.frames, r.crc_ok, r.mean_level_dbfs
             );
         }
     }
-    print_table(&results);
+    print_table(rep, &results);
 
     let advice = advise(opts.gain.is_none() && !opts.tune_gain, &results);
     if !advice.is_empty() {
-        println!("\nsuggestions:");
+        say!(rep, "\nsuggestions:");
         for a in &advice {
-            println!("  • {a}");
+            say!(rep, "  • {a}");
         }
     }
 
-    let proposal = proposal_command(&opts.sdr, mode, rate, gain, &results);
+    let config = proposed_config(&opts.sdr, mode, rate, gain, &results);
+    let proposal = config.as_ref().map(|c| c.command.clone());
     if let Some(p) = &proposal {
-        println!("\nproposed configuration:\n  {p}");
+        say!(rep, "\nproposed configuration:\n  {p}");
     }
 
+    let report = SurveyReport {
+        mode: mode.as_str().to_string(),
+        duration_secs: actual,
+        sample_rate: rate,
+        gain: gain_desc,
+        sweep: sweep_rows,
+        channels: results,
+        advice,
+        proposal,
+        config,
+    };
+    write_report(rep, &opts, report)
+}
+
+/// Write the report to `--out` when asked, then hand it back.
+fn write_report(rep: &Reporter, opts: &SurveyOpts, report: SurveyReport) -> anyhow::Result<SurveyReport> {
     if let Some(path) = &opts.out_json {
-        let report = SurveyReport {
-            mode: mode.as_str().to_string(),
-            duration_secs: actual,
-            sample_rate: rate,
-            gain: gain_desc,
-            sweep: sweep_rows,
-            channels: results,
-            advice,
-            proposal,
-        };
         std::fs::write(path, serde_json::to_string_pretty(&report)?)?;
-        println!("\nreport written to {}", path.display());
+        say!(rep, "\nreport written to {}", path.display());
     }
-    Ok(())
+    Ok(report)
 }
 
 /// Scan pre-pass: short dwell over the full plan, then survey the channels
 /// that showed life **plus** the mode's core tier — the worldwide/primary
 /// frequencies a short dwell routinely undersells.
 fn scan_prepass(
+    rep: &Reporter,
     opts: &SurveyOpts,
     mode: Mode,
     rate: f64,
@@ -311,7 +355,7 @@ fn scan_prepass(
     abort: &Arc<AtomicBool>,
 ) -> anyhow::Result<Vec<u64>> {
     let groups = scan::group_channels(plan_channels, rate, passband);
-    println!(
+    say!(rep, 
         "scan pre-pass: {} group(s), {}s dwell each",
         groups.len(),
         opts.scan_dwell_secs
@@ -321,11 +365,11 @@ fn scan_prepass(
         if abort.load(Ordering::Relaxed) {
             break;
         }
-        println!("→ {:.3} MHz", *center as f64 / 1e6);
-        match scan::scan_group(&opts.sdr, opts.gain, mode, rate, *center, group, opts.scan_dwell_secs)
+        say!(rep, "→ {:.3} MHz", *center as f64 / 1e6);
+        match scan::scan_group(&opts.sdr, opts.gain, mode, rate, *center, group, opts.scan_dwell_secs, abort)
         {
             Ok((mut r, _)) => results.append(&mut r),
-            Err(e) => println!("  group skipped: {e}"),
+            Err(e) => say!(rep, "  group skipped: {e}"),
         }
     }
     let mut levels: Vec<f32> = results.iter().map(|r| r.level_dbfs).collect();
@@ -344,9 +388,9 @@ fn scan_prepass(
         .collect();
     if !core.is_empty() {
         let list: Vec<String> = core.iter().map(|&f| format!("{:.3}", f as f64 / 1e6)).collect();
-        println!("including {} quiet-but-core channel(s) anyway: {}", core.len(), list.join(", "));
+        say!(rep, "including {} quiet-but-core channel(s) anyway: {}", core.len(), list.join(", "));
     }
-    println!("pre-pass kept {} channel(s) ({active} with signal + {} core)", keep.len(), core.len());
+    say!(rep, "pre-pass kept {} channel(s) ({active} with signal + {} core)", keep.len(), core.len());
     Ok(keep.into_iter().collect())
 }
 
@@ -355,6 +399,7 @@ fn scan_prepass(
 /// healthiest mean level (closest to −35 dBFS — strong but far from
 /// clipping).
 fn sweep_gain(
+    rep: &Reporter,
     opts: &SurveyOpts,
     mode: Mode,
     rate: f64,
@@ -365,7 +410,7 @@ fn sweep_gain(
     const LADDER: [f64; 5] = [12.0, 21.0, 30.0, 39.0, 48.0];
     let (center, group) =
         groups.iter().max_by_key(|(_, g)| g.len()).expect("at least one group");
-    println!(
+    say!(rep, 
         "gain sweep on {:.3} MHz window: {:?} dB, up to {}s each",
         *center as f64 / 1e6,
         LADDER,
@@ -393,16 +438,16 @@ fn sweep_gain(
                 let frames: u64 = stats.iter().map(|s| s.1).sum();
                 let ok: u64 = stats.iter().map(|s| s.2).sum();
                 let mean = stats.iter().map(|s| s.3).sum::<f32>() / stats.len().max(1) as f32;
-                println!("  {g:>5.1} dB: {frames} frames, {ok} ok, mean {mean:.1} dBFS");
+                say!(rep, "  {g:>5.1} dB: {frames} frames, {ok} ok, mean {mean:.1} dBFS");
                 rows.push(SweepRow { gain_db: g, frames, crc_ok: ok, mean_level_dbfs: mean });
             }
-            Err(e) => println!("  {g:>5.1} dB: failed ({e})"),
+            Err(e) => say!(rep, "  {g:>5.1} dB: failed ({e})"),
         }
-        drain_messages(&mut rx, false, None);
+        drain_messages(rep, &mut rx, false, None);
     }
     anyhow::ensure!(!rows.is_empty(), "gain sweep collected no data");
     let best = pick_gain(&rows);
-    println!("→ using {best} dB");
+    say!(rep, "→ using {best} dB");
     Ok((best, rows))
 }
 
@@ -444,7 +489,7 @@ fn dwell(
     abort: &Arc<AtomicBool>,
     bus: &MessageBus,
 ) -> anyhow::Result<Vec<(u64, u64, u64, f32)>> {
-    let (mut source, _) = crate::open_sdr(sdr, rate, center, gain)?;
+    let (mut source, _) = crate::sdr_open::open_sdr(sdr, rate, center, gain)?;
     let cfg = SessionConfig {
         mode,
         center_hz: center,
@@ -472,6 +517,7 @@ fn dwell(
             gsmtap: None,
             iridium_satmap: None,
             http: None,
+            map: Default::default(),
             mqtt: None,
             mqtt_topic: "xng".into(),
             zmq: Vec::new(),
@@ -517,6 +563,7 @@ fn dwell(
 }
 
 fn drain_messages(
+    rep: &Reporter,
     rx: &mut tokio::sync::broadcast::Receiver<Arc<xng_types::Message>>,
     show: bool,
     mut jsonl: Option<&mut std::io::BufWriter<std::fs::File>>,
@@ -526,7 +573,7 @@ fn drain_messages(
         match rx.try_recv() {
             Ok(msg) => {
                 if show {
-                    println!("{}", format_message(&msg, ConsoleFormat::Pretty));
+                    say!(rep, "{}", format_message(&msg, ConsoleFormat::Pretty));
                 }
                 if let Some(w) = jsonl.as_deref_mut() {
                     if let Ok(line) = serde_json::to_string(&*msg) {
@@ -575,13 +622,13 @@ fn summarize(acc: &std::collections::BTreeMap<u64, ChanAcc>) -> Vec<SurveyChanne
         .collect()
 }
 
-fn print_table(results: &[SurveyChannel]) {
-    println!(
+fn print_table(rep: &Reporter, results: &[SurveyChannel]) {
+    say!(rep, 
         "{:<10} {:>8} {:>7} {:>6} {:>6} {:>6} {:>7} {:>8}  verdict",
         "freq MHz", "listen s", "frames", "ok", "bad", "ok%", "fr/min", "dBFS"
     );
     for r in results {
-        println!(
+        say!(rep, 
             "{:<10.3} {:>8.0} {:>7} {:>6} {:>6} {:>6.0} {:>7.2} {:>8.1}  {}",
             r.frequency_hz as f64 / 1e6,
             r.listen_secs,
@@ -596,7 +643,7 @@ fn print_table(results: &[SurveyChannel]) {
     }
     let frames: u64 = results.iter().map(|r| r.frames).sum();
     let ok: u64 = results.iter().map(|r| r.crc_ok).sum();
-    println!(
+    say!(rep, 
         "{:<10} {:>8} {:>7} {:>6} {:>6} {:>6.0}",
         "total",
         "",
@@ -656,36 +703,31 @@ fn advise(used_agc: bool, results: &[SurveyChannel]) -> Vec<String> {
     advice
 }
 
-fn proposal_command(
+fn proposed_config(
     sdr: &str,
     mode: Mode,
     rate: f64,
     gain: Option<f64>,
     results: &[SurveyChannel],
-) -> Option<String> {
+) -> Option<ProposedConfig> {
     let active: Vec<u64> = results
         .iter()
         .filter(|r| r.verdict == "ACTIVE")
         .map(|r| r.frequency_hz)
         .collect();
-    if active.is_empty() {
-        return None;
-    }
-    let center = (active.iter().min().unwrap() + active.iter().max().unwrap()) / 2;
-    // Whole-capture modes (passband 0: Mode S) keep the channel at center.
-    let center = if scan::passband(mode) > 0.0 && active.contains(&center) {
-        center + 25_000
-    } else {
-        center
+    // One capture cannot hold channels from different windows: propose the
+    // window that decoded the most.
+    let frames = |c: &ProposedConfig| -> u64 {
+        results.iter().filter(|r| c.channels_hz.contains(&r.frequency_hz)).map(|r| r.crc_ok).sum()
     };
-    let chans: Vec<String> = active.iter().map(|&f| format!("{:.3}", f as f64 / 1e6)).collect();
-    let gain_arg = gain.map(|g| format!(" --gain {g}")).unwrap_or_default();
-    Some(format!(
-        "xng listen --sdr '{sdr}'{gain_arg} --mode {mode} -r {} -c {:.3}M --channels {}",
-        rate as u64,
-        center as f64 / 1e6,
-        chans.join(",")
-    ))
+    let mut best: Option<(u64, ProposedConfig)> = None;
+    for c in ProposedConfig::for_channels(sdr, mode, rate, gain, &active) {
+        let n = frames(&c);
+        if best.as_ref().is_none_or(|(b, _)| n > *b) {
+            best = Some((n, c));
+        }
+    }
+    best.map(|(_, c)| c)
 }
 
 #[cfg(test)]
@@ -765,10 +807,66 @@ mod tests {
     fn proposal_only_from_active_channels() {
         let results =
             vec![chan(131_550_000, 40, 36, -38.0), chan(130_025_000, 0, 0, -60.0)];
-        let p = proposal_command("driver=rtlsdr", Mode::AcarsPoa, 2_400_000.0, Some(28.0), &results)
+        let cfg = proposed_config("driver=rtlsdr", Mode::AcarsPoa, 2_400_000.0, Some(28.0), &results)
             .unwrap();
+        let p = &cfg.command;
         assert!(p.contains("--channels 131.550"), "{p}");
         assert!(!p.contains("130.025"), "{p}");
         assert!(p.contains("--gain 28"), "{p}");
+        // The same proposal as data, for front ends that apply it directly.
+        assert_eq!(cfg.channels_hz, vec![131_550_000]);
+        assert_eq!(cfg.gain_db, Some(28.0));
+        assert_eq!(cfg.sample_rate, 2_400_000.0);
+        // A lone channel must not sit on DC.
+        assert_eq!(cfg.center_hz, 131_575_000);
+    }
+
+    /// A scan-first survey stopped before its pre-pass hears anything is an
+    /// empty survey, and `--out` still gets its report.
+    #[test]
+    fn stopped_before_the_prepass_still_writes_the_report() {
+        let out = std::env::temp_dir().join(format!("xng-survey-stopped-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let opts = |out_json| SurveyOpts {
+            sdr: "driver=xng-test-no-such-radio".into(),
+            gain: None,
+            mode: Mode::StdC,
+            sample_rate: Some(2_400_000.0),
+            channels: Vec::new(),
+            duration_secs: 60,
+            interim_secs: 30,
+            scan_first: true,
+            scan_dwell_secs: 5,
+            tune_gain: false,
+            tune_dwell_secs: 5,
+            rotate_dwell_secs: 30,
+            show_messages: false,
+            jsonl: None,
+            out_json,
+        };
+        let stopped = Reporter::new(|_| {}, Arc::new(AtomicBool::new(true)));
+        let report = run_with(&stopped, opts(Some(out.clone()))).unwrap();
+        assert!(report.channels.is_empty() && report.config.is_none());
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(written["mode"], report.mode);
+        assert!(written["channels"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn proposal_stays_inside_one_capture_window() {
+        // HFDL channels megahertz apart cannot share a 768 kS/s capture:
+        // the proposal takes the window that decoded the most.
+        let results = vec![
+            chan(5_502_000, 4, 3, -40.0),
+            chan(8_825_000, 30, 28, -38.0),
+            chan(8_834_000, 10, 9, -39.0),
+        ];
+        let cfg = proposed_config("driver=sdrplay", Mode::Hfdl, 768_000.0, None, &results).unwrap();
+        assert_eq!(cfg.channels_hz, vec![8_825_000, 8_834_000]);
+        let half = 768_000 / 2;
+        assert!(cfg.channels_hz.iter().all(|f| f.abs_diff(cfg.center_hz) < half));
+        assert!(!cfg.command.contains("5.502"), "{}", cfg.command);
     }
 }

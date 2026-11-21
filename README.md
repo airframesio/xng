@@ -167,6 +167,13 @@ sudo apt install ./xng-0.21.0-arm64.deb    # pulls runtime deps
 tar xzf xng-v0.21.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
 ```
 
+On Windows, unzip the `x86_64-pc-windows-msvc` release. To use a radio,
+install [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/), which
+provides SoapySDR and its RTL-SDR, Airspy, HackRF and SDRplay modules; xng
+finds it on `PATH`, in its default install folder, or under
+`SOAPY_SDR_ROOT`. An RTL-SDR also needs the WinUSB driver (Zadig). Without
+PothosSDR, `xng.exe` still runs and decodes IQ recordings.
+
 Multi-arch Docker images (amd64/arm64/armv7) are published per tag:
 
 ```bash
@@ -184,6 +191,9 @@ sudo apt install protobuf-compiler libsoapysdr-dev soapysdr-module-all
 
 # macOS
 brew install protobuf soapysdr
+
+# Windows: install PothosSDR and put its bin folder on PATH, then
+#   choco install protoc llvm
 
 # Build (binary at ./target/release/xng)
 cargo build --release
@@ -377,6 +387,19 @@ dumpvdl2 `decoded:json` to `:5552`, field-verified against dumpvdl2 2.6.0);
 other modes route to Airframes over asf-2.0. The multiplexed **asf-2.0**
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
+
+**Dashboard basemap.** The web dashboard (`http =`) draws
+[OpenFreeMap](https://openfreemap.org) vector tiles by default: OpenStreetMap
+data, no API key or account, and self-hostable. Pick a style under
+`[outputs.map]` (dark, positron, bright, liberty, fiord), point `style-url` at
+any MapLibre style (a self-hosted OpenFreeMap, say), or set
+`format = "raster"` for OpenStreetMap raster tiles, which are also the
+fallback on browsers without WebGL.
+
+```toml
+[outputs.map]
+style = "positron"
+```
 
 `xng status` prints a live per-session table for a running station
 (querying its dashboard endpoint, default `127.0.0.1:8080`, or

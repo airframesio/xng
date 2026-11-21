@@ -88,6 +88,67 @@ struct Dash {
     sessions: Vec<Value>,
 }
 
+impl Dash {
+    fn new(station: String, sessions: Vec<Value>) -> Self {
+        let mut dash = Dash { station, started: now_s(), sessions, ..Dash::default() };
+        // Resume the accumulated 48-beam pattern across restarts.
+        dash.beams =
+            crate::beam::BeamReconstructor::load(&crate::beam::BeamReconstructor::default_path());
+        dash
+    }
+}
+
+/// The dashboard's live picture of what's been heard — aircraft (merged
+/// across ADS-B, ACARS, VDL2, HFDL, UAT …), vessels, beacons, Iridium
+/// satellites/beams, pagers, trains and the cross-mode distress surface —
+/// built from the message stream. The web dashboard serves it over HTTP;
+/// other front ends (the desktop app) embed it directly so every UI shows
+/// the same merged entities.
+pub struct Dashboard(Dash);
+
+impl Dashboard {
+    /// An empty picture for `station` running `sessions` (descriptors as
+    /// [`crate::engine::SessionInfo::descriptor`]).
+    pub fn new(station: String, sessions: Vec<Value>) -> Self {
+        Self(Dash::new(station, sessions))
+    }
+
+    /// Fold one decoded message into the picture.
+    pub fn update(&mut self, msg: &Message) {
+        update(&mut self.0, msg)
+    }
+
+    /// The full `/api/state` JSON document (entities + recent messages).
+    pub fn state_json(&mut self) -> String {
+        snapshot(&mut self.0)
+    }
+
+    /// The `/api/state` document without the recent-message log.
+    pub fn entities(&mut self) -> Value {
+        snapshot_value(&mut self.0, false)
+    }
+
+    /// readsb/tar1090-compatible `aircraft.json`.
+    pub fn aircraft_json(&self) -> String {
+        aircraft_json(&self.0, None)
+    }
+
+    /// Every positioned entity as RFC 7946 GeoJSON.
+    pub fn export_geojson(&self) -> String {
+        export_geojson(&self.0)
+    }
+
+    /// Every positioned entity (with trails) as GPX.
+    pub fn export_gpx(&self) -> String {
+        export_gpx(&self.0)
+    }
+
+    /// Every positioned entity (with trails) as KML.
+    pub fn export_kml(&self) -> String {
+        export_kml(&self.0)
+    }
+}
+
 /// Append to the entity's position trail (decimated: only when moved
 /// meaningfully; capped length).
 fn push_trail(o: &mut serde_json::Map<String, Value>, lat: f64, lon: f64) {
@@ -476,6 +537,13 @@ fn update(d: &mut Dash, m: &Message) {
                 ("adsb_version", adsb_status.as_ref().and_then(|s| s.get("version").cloned())),
                 ("nacp", adsb_status.as_ref().and_then(|s| s.get("nac_p").cloned())),
                 ("sil", adsb_status.as_ref().and_then(|s| s.get("sil").cloned())),
+                // Remaining readsb accuracy/integrity fields (ADSB-9): velocity
+                // accuracy, baro-altitude integrity, geometric VA, system design
+                // assurance — all already on adsb_status from TC19/TC29/TC31.
+                ("nac_v", adsb_status.as_ref().and_then(|s| s.get("nac_v").cloned())),
+                ("nic_baro", adsb_status.as_ref().and_then(|s| s.get("nic_baro").cloned())),
+                ("gva", adsb_status.as_ref().and_then(|s| s.get("gva").cloned())),
+                ("sda", adsb_status.as_ref().and_then(|s| s.get("sda").cloned())),
                 // TC29 target-state selected altitude; BDS 4,4 wind/temp.
                 ("sel_alt", adsb_status.as_ref().and_then(|s| s.get("selected_altitude").cloned())),
                 ("wind_kt", comm_b.as_ref().and_then(|s| s.get("wind_speed").cloned())),
@@ -907,6 +975,13 @@ fn update(d: &mut Dash, m: &Message) {
 }
 
 fn snapshot(d: &mut Dash) -> String {
+    snapshot_value(d, true).to_string()
+}
+
+/// Expire stale entities and build the `/api/state` document. With
+/// `include_messages` false the (large) recent-message log is left out —
+/// embedders that stream messages separately poll only the entities.
+fn snapshot_value(d: &mut Dash, include_messages: bool) -> Value {
     let cutoff = now_s().saturating_sub(EXPIRE_S);
     d.aircraft.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     // Drop identifier-index entries whose master aircraft has expired.
@@ -946,12 +1021,15 @@ fn snapshot(d: &mut Dash) -> String {
         "iridium_devices": d.iridium_devices.values().collect::<Vec<_>>(),
         "iridium_terminals": d.iridium_terminals.values().collect::<Vec<_>>(),
         "iridium_beam_cells": d.beams.project(now_s() as f64, SAT_EXPIRE_S as f64),
-        "messages": d.recent.iter().rev().take(RECENT_SENT).collect::<Vec<_>>(),
+        "messages": if include_messages {
+            d.recent.iter().rev().take(RECENT_SENT).collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        },
         "totals": d.totals,
         "last_seen": d.last_seen,
         "now": now_s(),
     })
-    .to_string()
 }
 
 /// Parse a `since=<unix>` value from a request path's query string (ECO-4).
@@ -998,6 +1076,10 @@ fn aircraft_json(d: &Dash, since: Option<u64>) -> String {
             copy(&mut o, a, "squawk", "squawk");
             copy(&mut o, a, "nacp", "nac_p");
             copy(&mut o, a, "sil", "sil");
+            copy(&mut o, a, "nac_v", "nac_v");
+            copy(&mut o, a, "nic_baro", "nic_baro");
+            copy(&mut o, a, "gva", "gva");
+            copy(&mut o, a, "sda", "sda");
             copy(&mut o, a, "adsb_version", "version");
             copy(&mut o, a, "sel_alt", "nav_altitude_mcp");
             if a.get("lat").is_some() && a.get("lon").is_some() {
@@ -1204,25 +1286,28 @@ fn export_kml(d: &Dash) -> String {
     s
 }
 
+/// Serve the web dashboard on `addr`: the page, its JSON/GeoJSON/GPX/KML
+/// endpoints and `/map/config.json` (what basemap `map` says to draw), fed
+/// from the message bus until it closes.
 pub async fn run(
     mut rx: broadcast::Receiver<Arc<Message>>,
     addr: String,
     station: String,
     sessions: Vec<Value>,
+    map: crate::outputs::map::MapConfig,
 ) -> std::io::Result<()> {
-    let mut dash = Dash { station, started: now_s(), sessions, ..Dash::default() };
-    // Resume the accumulated 48-beam pattern across restarts.
-    dash.beams = crate::beam::BeamReconstructor::load(&crate::beam::BeamReconstructor::default_path());
-    let state = Arc::new(Mutex::new(dash));
+    let state = Arc::new(Mutex::new(Dash::new(station, sessions)));
 
     // HTTP listener.
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("dashboard on http://{addr}/");
     let http_state = state.clone();
+    let map_json = Arc::new(map.client_json());
     tokio::spawn(async move {
         loop {
             let Ok((mut sock, _)) = listener.accept().await else { break };
             let state = http_state.clone();
+            let map_json = map_json.clone();
             tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
@@ -1238,6 +1323,8 @@ pub async fn run(
                     ("application/geo+json", export_geojson(&state.lock().unwrap()))
                 } else if path.starts_with("/data/export.gpx") {
                     ("application/gpx+xml", export_gpx(&state.lock().unwrap()))
+                } else if path.starts_with("/map/config.json") {
+                    ("application/json", map_json.to_string())
                 } else if path.starts_with("/data/export.kml") {
                     ("application/vnd.google-earth.kml+xml", export_kml(&state.lock().unwrap()))
                 } else {

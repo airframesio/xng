@@ -1,0 +1,60 @@
+[package]
+name = "xng-desktop"
+description = "xng desktop app: the xng multi-mode SDR decoder with a live map, message browser and spectrum"
+version = "0.21.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/airframesio/xng"
+authors = ["Kevin Elliott", "xng contributors"]
+publish = false
+default-run = "xng-desktop"
+
+# Standalone workspace: the root workspace excludes desktop/ so the CLI's
+# build and lockfile never pull in the webview stack.
+[workspace]
+
+[lib]
+name = "xng_desktop_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xng-desktop"
+path = "src/main.rs"
+
+[features]
+default = ["soapy"]
+# Same SDR backends as the CLI.
+soapy = ["xng/soapy"]
+airspy = ["xng/airspy"]
+airspyhf = ["xng/airspyhf"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# The decode engine, outputs and dashboard aggregation — the exact code the
+# `xng` CLI runs.
+xng = { path = "../..", default-features = false }
+xng-types = { path = "../../crates/xng-types" }
+xng-sdr = { path = "../../crates/xng-sdr" }
+
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# Synthesizes an ACARS burst for the end-to-end session test.
+xng-mode-acars = { path = "../../crates/xng-mode-acars" }
+num-complex = "0.4"
+
+[profile.release]
+# Match the CLI's codegen for the decode path; trim the shipped binary.
+strip = true
+lto = "thin"

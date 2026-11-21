@@ -18,6 +18,7 @@ pub struct DeviceSummary {
 /// Enumerate available SoapySDR devices, optionally filtered by Soapy args
 /// (e.g. `driver=rtlsdr`).
 pub fn enumerate(filter: &str) -> Result<Vec<DeviceSummary>, SdrError> {
+    crate::soapy_runtime::ensure().map_err(SdrError::Device)?;
     let devices = soapysdr::enumerate(filter).map_err(|e| SdrError::Device(e.to_string()))?;
     Ok(devices
         .into_iter()
@@ -36,6 +37,9 @@ pub fn enumerate(filter: &str) -> Result<Vec<DeviceSummary>, SdrError> {
 /// back to the mode's plan rate. Opens the device briefly (no RX stream) and
 /// closes it on return.
 pub fn sample_rate_ranges(args: &str) -> Vec<(f64, f64, f64)> {
+    if crate::soapy_runtime::ensure().is_err() {
+        return Vec::new();
+    }
     let Ok(dev) = soapysdr::Device::new(args) else {
         return Vec::new();
     };
@@ -55,6 +59,7 @@ impl SoapyIqSource {
     /// Open a device by Soapy args (e.g. `driver=airspyhf`), tune it, and
     /// activate an RX stream on channel 0.
     pub fn open(args: &str, sample_rate: f64, center_freq_hz: u64, gain_db: Option<f64>) -> Result<Self, SdrError> {
+        crate::soapy_runtime::ensure().map_err(SdrError::Device)?;
         let dev = soapysdr::Device::new(args).map_err(|e| SdrError::Device(e.to_string()))?;
         let dir = soapysdr::Direction::Rx;
         dev.set_sample_rate(dir, 0, sample_rate)

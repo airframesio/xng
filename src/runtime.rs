@@ -29,6 +29,7 @@ use xng_mode_pocsag::PocsagChannelDecoder;
 use xng_mode_vdes::VdesChannelDecoder;
 use xng_mode_sarsat::SarsatChannelDecoder;
 use xng_mode_sonde::SondeChannelDecoder;
+use xng_mode_time::TimeChannelDecoder;
 use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
@@ -64,6 +65,8 @@ pub struct OutputConfig {
     pub iridium_satmap: Option<String>,
     /// Web dashboard listen address (live map + message stream).
     pub http: Option<String>,
+    /// Dashboard basemap (MapLibre style or raster).
+    pub map: crate::outputs::map::MapConfig,
     /// MQTT broker URL (mqtt://[user:pass@]host[:port]).
     pub mqtt: Option<String>,
     /// MQTT topic prefix (messages publish to `<prefix>/<mode>`).
@@ -282,7 +285,7 @@ pub struct LiveState {
     /// Cumulative FEC-corrected octets/bits per channel freq (ECO-7).
     pub fec: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
     pub spectrum: std::sync::Mutex<Option<SpectrumFrame>>,
-    /// Set by consumers that read `spectrum` — currently only the TUI;
+    /// Set by consumers that read `spectrum` — the TUI and the engine;
     /// `decode_loop` skips the spectrum FFT while false.
     pub spectrum_wanted: AtomicBool,
     pub samples: std::sync::atomic::AtomicU64,
@@ -386,6 +389,7 @@ pub(crate) enum ModeChannel {
     Sonde(SondeChannelDecoder),
     Adsl(AdslChannelDecoder),
     Atcs(AtcsChannelDecoder),
+    Time(TimeChannelDecoder),
 }
 
 impl ModeChannel {
@@ -455,6 +459,13 @@ impl ModeChannel {
             // (1600 2-FSK / 3200 / 6400 4-FSK) — real US paging is 4-level.
             Mode::Flex => Ok(Self::Flex(FlexChannelDecoder::new(sample_rate, offset, 0)?)),
             Mode::Vdes => Ok(Self::Vdes(VdesChannelDecoder::new(sample_rate, offset)?)),
+            // The tuned carrier (capture center + offset) selects CHU vs WWV.
+            Mode::Time => {
+                let carrier = (freq as i64 + offset.round() as i64).max(0) as u64;
+                Ok(Self::Time(
+                    TimeChannelDecoder::new(sample_rate, offset)?.with_carrier(carrier),
+                ))
+            }
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -479,6 +490,7 @@ impl ModeChannel {
             Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
             Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
             Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
+            Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -507,6 +519,7 @@ impl ModeChannel {
             Self::Eot(_) => xng_mode_eot::CHANNEL_RATE,
             Self::Flex(_) => xng_mode_flex::CHANNEL_RATE,
             Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
+            Self::Time(_) => xng_mode_time::CHANNEL_RATE,
         }
     }
 
@@ -543,6 +556,7 @@ impl ModeChannel {
             Self::Eot(d) => d.level_dbfs(),
             Self::Flex(d) => d.level_dbfs(),
             Self::Vdes(d) => d.level_dbfs(),
+            Self::Time(d) => d.level_dbfs(),
         }
     }
 
@@ -802,6 +816,19 @@ impl ModeChannel {
                     .collect();
                 (msgs, seen, seen)
             }
+            Self::Time(dec) => {
+                let frames = dec.process(iq);
+                let seen = frames.len() as u64;
+                // Only redundancy/sync-validated frames are emitted; count the
+                // valid ones as CRC-ok.
+                let ok = frames.iter().filter(|f| f.valid).count() as u64;
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_time::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, ok)
+            }
         }
     }
 
@@ -895,7 +922,7 @@ impl SharedProvenance {
 
 /// Spawn the configured output sinks on the current tokio runtime.
 /// JSON descriptor of one decode session for the dashboard / `xng status`.
-fn session_descriptor(
+pub(crate) fn session_descriptor(
     sdr: &Option<SdrInfo>,
     mode: Mode,
     center_hz: u64,
@@ -930,21 +957,25 @@ fn parse_serial(selector: &str) -> Option<String> {
     })
 }
 
-fn spawn_outputs(
+/// Spawn the configured output sinks (console, files, feeds, servers,
+/// dashboard) on the current tokio runtime, each subscribed to `bus`.
+pub(crate) fn spawn_outputs(
     bus: &MessageBus,
     outputs: &OutputConfig,
     station: &StationIdentity,
     sessions: &[serde_json::Value],
 ) -> Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>> {
     let mut output_tasks = Vec::new();
-    output_tasks.push(tokio::spawn({
-        let rx = bus.subscribe();
-        let fmt = outputs.console;
-        async move {
-            console::run(rx, fmt).await;
-            Ok::<(), std::io::Error>(())
-        }
-    }));
+    if outputs.console != ConsoleFormat::Off {
+        output_tasks.push(tokio::spawn({
+            let rx = bus.subscribe();
+            let fmt = outputs.console;
+            async move {
+                console::run(rx, fmt).await;
+                Ok::<(), std::io::Error>(())
+            }
+        }));
+    }
     if let Some(path) = outputs.jsonl.clone() {
         let rx = bus.subscribe();
         output_tasks.push(tokio::spawn(async move { jsonl::run(rx, &path).await }));
@@ -985,7 +1016,8 @@ fn spawn_outputs(
         let rx = bus.subscribe();
         let ident = station.ident.clone();
         let sessions = sessions.to_vec();
-        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr, ident, sessions)));
+        let map = outputs.map.clone();
+        output_tasks.push(tokio::spawn(crate::outputs::http::run(rx, addr, ident, sessions, map)));
     }
     if let Some(url) = outputs.mqtt.clone() {
         let rx = bus.subscribe();
@@ -1054,7 +1086,7 @@ async fn shutdown_signal() {
 /// signal forces an immediate exit. The escape hatch matters when the decode
 /// loop is blocked in a device read that never observes `stop` — without it a
 /// wedged SDR traps the process until SIGKILL/SIGQUIT.
-fn spawn_interrupt_handler(stop: Arc<AtomicBool>, what: &'static str) {
+pub(crate) fn spawn_interrupt_handler(stop: Arc<AtomicBool>, what: &'static str) {
     tokio::spawn(async move {
         shutdown_signal().await;
         tracing::info!("interrupt received, stopping {what} (signal again to force quit)");
@@ -1430,25 +1462,11 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         // and some session has a receiver-pos, inject a position report every
         // 30 s so it reaches the NMEA sinks / map like any AIS fix. Polls the
         // stop flag each second so it never keeps the bus open past shutdown.
-        if let (Some(mmsi), Some((lat, lon))) = (
+        if let (Some(mmsi), Some(pos)) = (
             prepared[0].cfg.outputs.own_ship_mmsi,
             prepared.iter().find_map(|p| p.cfg.receiver_pos),
         ) {
-            let (bus, stop, station) = (bus.clone(), stop.clone(), station.clone());
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                let mut n: u64 = 0;
-                loop {
-                    tick.tick().await;
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    if n % 30 == 0 {
-                        bus.publish(own_ship_message(mmsi, lat, lon, &station));
-                    }
-                    n += 1;
-                }
-            });
+            spawn_own_ship_beacon(&bus, &stop, &station, mmsi, pos);
         }
 
         spawn_interrupt_handler(stop.clone(), "station");
@@ -1510,6 +1528,50 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         Ok::<(), anyhow::Error>(())
     })?;
     Ok(())
+}
+
+/// Size the global decode worker pool (parallel channelization / burst
+/// demod) to `threads` (min 1). The pool can only be sized before its first
+/// use, so this returns false when it is already running.
+pub fn set_decode_threads(threads: usize) -> bool {
+    rayon::ThreadPoolBuilder::new().num_threads(threads.max(1)).build_global().is_ok()
+}
+
+/// Own-ship AIVDO beacon (AIS-5c): inject a position report for `mmsi` at
+/// `pos` every 30 s so it reaches the NMEA sinks / map like any AIS fix.
+/// Polls `stop` each second so it never keeps the bus open past shutdown.
+/// Must be called on a tokio runtime.
+pub(crate) fn spawn_own_ship_beacon(
+    bus: &MessageBus,
+    stop: &Arc<AtomicBool>,
+    station: &StationIdentity,
+    mmsi: u32,
+    (lat, lon): (f64, f64),
+) {
+    let (bus, stop, station) = (bus.clone(), stop.clone(), station.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        let mut n: u64 = 0;
+        loop {
+            tick.tick().await;
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if n % 30 == 0 {
+                bus.publish(own_ship_message(mmsi, lat, lon, &station));
+            }
+            n += 1;
+        }
+    });
+}
+
+/// ACARS reassembly timeout for a mode: satellite/HF ACARS blocks arrive
+/// minutes apart; VHF bearers are quick (libacars timeout profiles).
+pub(crate) fn reasm_timeout_s(mode: Mode) -> f64 {
+    match mode {
+        Mode::AcarsPoa | Mode::Vdl2 => 120.0,
+        _ => 660.0,
+    }
 }
 
 /// Suppresses cross-channel duplicates: the same transmission decoded

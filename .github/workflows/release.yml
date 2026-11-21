@@ -25,8 +25,13 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             deb: true
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
+          # SoapySDR on Windows is linked delay-loaded: radios need a
+          # PothosSDR install, everything else works without one.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            windows: true
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies (Linux)
@@ -37,9 +42,29 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install soapysdr airspy airspyhf protobuf
+      - name: Install dependencies (Windows)
+        if: matrix.windows
+        run: choco install protoc -y --no-progress
+      - name: Install PothosSDR (Windows)
+        if: matrix.windows
+        uses: ./.github/actions/pothossdr
       - name: Build
+        if: ${{ !matrix.windows }}
         run: cargo build --release --features airspy,airspyhf
+      - name: Build (Windows)
+        if: matrix.windows
+        run: cargo build --release
+      - name: Package zip (Windows)
+        if: matrix.windows
+        shell: bash
+        run: |
+          PKG=xng-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir -p dist/${PKG}
+          cp target/release/xng.exe README.md LICENSE-MIT LICENSE-APACHE dist/${PKG}/
+          (cd dist && 7z a ${PKG}.zip ${PKG})
+          rm -r dist/${PKG}
       - name: Package tarball
+        if: ${{ !matrix.windows }}
         run: |
           PKG=xng-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p dist/${PKG}
@@ -56,9 +81,14 @@ jobs:
           name: dist-${{ matrix.target }}
           path: dist/*
 
+  # Desktop app installers, built by the Desktop workflow.
+  desktop:
+    uses: ./.github/workflows/desktop.yml
+    secrets: inherit
+
   release:
     name: Publish release
-    needs: build
+    needs: [build, desktop]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,7 +123,16 @@ jobs:
           | `xng-*-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
           | `xng-*-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 (Pi 4/5 64-bit) |
           | `xng-*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+          | `xng-*-x86_64-pc-windows-msvc.zip` | Windows x86_64 (radios need [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/) installed) |
           | `xng_*.deb` | Debian/Ubuntu packages (x86_64 + arm64) |
+          | `xng-desktop-*.deb` | Desktop app, Debian/Ubuntu (x86_64 + arm64) |
+          | `xng-desktop-*-aarch64-apple-darwin.dmg` | Desktop app, macOS Apple Silicon |
+          | `xng-desktop-*-x86_64-pc-windows-msvc.exe` | Desktop app installer, Windows x86_64 (radios need [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/) installed) |
+
+          Windows: the desktop installer is not code-signed yet; choose
+          "More info" then "Run anyway" on the SmartScreen prompt. macOS: if
+          the app is blocked on first open, allow it under System Settings >
+          Privacy & Security > Open Anyway.
 
           Intel macOS: build from source (GitHub retired its free Intel
           macOS runners) — `brew install soapysdr airspy airspyhf protobuf

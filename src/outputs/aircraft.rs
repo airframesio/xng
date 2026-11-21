@@ -138,7 +138,17 @@ pub(crate) fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
                 speed_is_airspeed: false,
                 track_deg: None,
                 vertical_rate_fpm: None,
-                squawk: None,
+                // HFDL-7: dumphfdl's --freq-as-squawk convention — convey the
+                // HFDL channel frequency (kHz) in the Basestation/Beast squawk
+                // slot so SBS consumers see which channel carried the fix.
+                // Opt-in via env (matches the codebase's XNG_* flag pattern);
+                // off by default (a real squawk would be more useful if HFDL
+                // carried one, but it does not).
+                squawk: if std::env::var("XNG_HFDL_FREQ_AS_SQUAWK").is_ok() {
+                    Some((msg.frequency_hz / 1000).to_string())
+                } else {
+                    None
+                },
                 source: AircraftSource::Adsb,
             })
         }

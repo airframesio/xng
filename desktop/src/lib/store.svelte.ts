@@ -1,0 +1,499 @@
+// App state. Heavy, fast-changing data (messages, entities) is kept in
+// raw state and replaced wholesale per batch, so Svelte never deep-proxies
+// thousands of objects. Spectrum frames bypass reactivity entirely.
+
+import { backend } from "./backend";
+import { list, num, numList, text } from "./format";
+import type {
+  AppInfo,
+  BackendEvent,
+  ChannelStat,
+  DeviceEntry,
+  EntityState,
+  IngestReport,
+  MessageItem,
+  ProposedConfig,
+  ResolvedTune,
+  ScanReport,
+  SessionRequest,
+  SessionLive,
+  SessionSummary,
+  Source,
+  SurveyReport,
+  ToolEvent,
+  ToolRequest,
+} from "./types";
+
+const MAX_MESSAGES = 5000;
+const MAX_TOOL_LINES = 2000;
+const SETTINGS_KEY = "xng.settings.v1";
+
+export type SourceKind = "device" | "file" | "station" | "extern";
+
+/** Everything the setup form holds, as the strings the user typed. */
+export interface Settings {
+  sourceKind: SourceKind;
+  device: string;
+  gain: string;
+  filePath: string;
+  fileFormat: string;
+  stationPath: string;
+  externFormat: string;
+  externCommand: string;
+  mode: string;
+  sampleRate: string;
+  centerFreq: string;
+  channels: string;
+  receiverPos: string;
+  demodEffort: string;
+  maxPpm: string;
+  decodeThreads: string;
+  filterLabels: string;
+  excludeLabels: string;
+  aisIncludeTypes: string;
+  aisExcludeTypes: string;
+  aisIncludeMmsi: string;
+  aisExcludeMmsi: string;
+  aisMinInterval: string;
+  aisDedupWindow: string;
+  stationId: string;
+  feedAirframes: boolean;
+  jsonl: string;
+  udp: string;
+  asf2Grpc: string;
+  asf2Quic: string;
+  asf2QuicCa: string;
+  asf2QuicInsecure: boolean;
+  metrics: string;
+  http: string;
+  sbs: string;
+  beast: string;
+  nmeaTcp: string;
+  nmeaUdp: string;
+  nmeaTagBlocks: boolean;
+  gsmtap: string;
+  iridiumSatmap: string;
+  gsFile: string;
+  aircraftDb: string;
+  mqtt: string;
+  mqttTopic: string;
+  zmq: string;
+  ownShipMmsi: string;
+}
+
+const DEFAULTS: Settings = {
+  sourceKind: "device", device: "", gain: "", filePath: "", fileFormat: "",
+  stationPath: "", externFormat: "dumpvdl2", externCommand: "",
+  mode: "acars", sampleRate: "", centerFreq: "", channels: "", receiverPos: "",
+  demodEffort: "", maxPpm: "", decodeThreads: "", filterLabels: "", excludeLabels: "",
+  aisIncludeTypes: "", aisExcludeTypes: "", aisIncludeMmsi: "", aisExcludeMmsi: "",
+  aisMinInterval: "", aisDedupWindow: "", stationId: "", feedAirframes: false,
+  jsonl: "", udp: "", asf2Grpc: "", asf2Quic: "", asf2QuicCa: "", asf2QuicInsecure: false,
+  metrics: "", http: "", sbs: "", beast: "", nmeaTcp: "", nmeaUdp: "", nmeaTagBlocks: false,
+  gsmtap: "", iridiumSatmap: "", gsFile: "", aircraftDb: "", mqtt: "", mqttTopic: "",
+  zmq: "", ownShipMmsi: "",
+};
+
+function loadSettings(): Settings {
+  try {
+    const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) ?? "{}");
+    return { ...DEFAULTS, ...saved };
+  } catch {
+    return { ...DEFAULTS };
+  }
+}
+
+export const settings = $state<Settings>(loadSettings());
+
+export function saveSettings() {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify($state.snapshot(settings)));
+  } catch {
+    // Storage unavailable: settings just don't persist.
+  }
+}
+
+export function resetAdvanced() {
+  const keep: Partial<Settings> = {
+    sourceKind: settings.sourceKind, device: settings.device, filePath: settings.filePath, mode: settings.mode,
+    stationPath: settings.stationPath, externFormat: settings.externFormat, externCommand: settings.externCommand,
+  };
+  // For a recording these describe the capture and live on the Setup
+  // screen, not in the Advanced panel.
+  if (settings.sourceKind === "file") {
+    Object.assign(keep, {
+      sampleRate: settings.sampleRate, centerFreq: settings.centerFreq, fileFormat: settings.fileFormat,
+    });
+  }
+  Object.assign(settings, DEFAULTS, keep);
+  saveSettings();
+}
+
+/** How many advanced fields differ from their defaults. */
+export function advancedCount(): number {
+  const skip = new Set(["sourceKind", "device", "filePath", "mode", "stationPath", "externFormat", "externCommand"]);
+  if (settings.sourceKind === "file") ["sampleRate", "centerFreq", "fileFormat"].forEach((k) => skip.add(k));
+  return (Object.keys(DEFAULTS) as (keyof Settings)[]).filter((k) => !skip.has(k) && settings[k] !== DEFAULTS[k]).length;
+}
+
+function buildSource(): Source {
+  const s = settings;
+  switch (s.sourceKind) {
+    case "device":
+      return { kind: "device", selector: s.device, gain: num(s.gain) };
+    case "file":
+      return { kind: "file", path: s.filePath, format: text(s.fileFormat) };
+    case "station":
+      return { kind: "station", path: s.stationPath };
+    case "extern":
+      return { kind: "extern", format: s.externFormat, command: s.externCommand };
+  }
+}
+
+export function buildRequest(): SessionRequest {
+  const s = settings;
+  return {
+    source: buildSource(),
+    mode: s.mode,
+    sampleRate: num(s.sampleRate),
+    centerFreq: text(s.centerFreq),
+    channels: list(s.channels),
+    receiverPos: text(s.receiverPos),
+    filterLabels: list(s.filterLabels),
+    excludeLabels: list(s.excludeLabels),
+    demodEffort: text(s.demodEffort),
+    maxPpm: num(s.maxPpm),
+    ais: {
+      includeTypes: numList(s.aisIncludeTypes),
+      excludeTypes: numList(s.aisExcludeTypes),
+      includeMmsi: numList(s.aisIncludeMmsi),
+      excludeMmsi: numList(s.aisExcludeMmsi),
+      minIntervalS: num(s.aisMinInterval),
+      dedupWindowS: num(s.aisDedupWindow),
+    },
+    stationId: text(s.stationId),
+    outputs: {
+      jsonl: text(s.jsonl),
+      udp: list(s.udp),
+      feedAirframes: s.feedAirframes,
+      asf2Grpc: text(s.asf2Grpc),
+      asf2Quic: text(s.asf2Quic),
+      asf2QuicCa: text(s.asf2QuicCa),
+      asf2QuicInsecure: s.asf2QuicInsecure,
+      metrics: text(s.metrics),
+      sbs: text(s.sbs),
+      beast: text(s.beast),
+      nmeaTcp: text(s.nmeaTcp),
+      nmeaUdp: text(s.nmeaUdp),
+      nmeaTagBlocks: s.nmeaTagBlocks,
+      gsmtap: text(s.gsmtap),
+      iridiumSatmap: text(s.iridiumSatmap),
+      gsFile: text(s.gsFile),
+      aircraftDb: text(s.aircraftDb),
+      http: text(s.http),
+      mqtt: text(s.mqtt),
+      mqttTopic: text(s.mqttTopic),
+      zmq: list(s.zmq),
+      ownShipMmsi: num(s.ownShipMmsi),
+    },
+  };
+}
+
+export type Phase = "idle" | "starting" | "running" | "ended";
+export type ToolKind = "scan" | "survey" | "ingest";
+/** idle: choosing options. stopping: asked to finish, report on its way. */
+export type ToolPhase = "idle" | "running" | "stopping" | "done" | "failed";
+
+/** Take a tool's proposal as the setup for listening. */
+export function applyProposal(c: ProposedConfig) {
+  settings.sourceKind = "device";
+  settings.mode = c.mode;
+  settings.sampleRate = String(c.sample_rate);
+  settings.centerFreq = `${mhzExact(c.center_hz)}M`;
+  settings.channels = c.channels_hz.map(mhzExact).join(", ");
+  if (c.gain_db != null) settings.gain = String(c.gain_db);
+  saveSettings();
+}
+
+/** Hz as MHz without rounding away any digits (131550000 to "131.55"). */
+function mhzExact(hz: number): string {
+  return String(hz / 1e6);
+}
+export type View = "live" | "messages" | "signal";
+
+class AppState {
+  info = $state<AppInfo | null>(null);
+  native = $state(true);
+  devices = $state<DeviceEntry[]>([]);
+  devicesLoading = $state(false);
+  devicesError = $state<string | null>(null);
+
+  phase = $state<Phase>("idle");
+  view = $state<View>("live");
+  error = $state<string | null>(null);
+
+  station = $state("");
+  sessions = $state.raw<SessionSummary[]>([]);
+  messages = $state.raw<MessageItem[]>([]);
+  total = $state(0);
+  dropped = $state(0);
+  /** Of `dropped`, how many the map missed as well. */
+  lagged = $state(0);
+  /** Which of `sessions` the signal views show. */
+  activeSession = $state(0);
+  private lives = $state.raw<SessionLive[]>([]);
+  samples = $state(0);
+  elapsedMs = $state(0);
+  entities = $state.raw<EntityState | null>(null);
+  selectedId = $state<number | null>(null);
+  /** The selected message itself, kept so it outlives the rolling list. */
+  private selectedItem = $state.raw<MessageItem | null>(null);
+  /** Messages per second, smoothed. */
+  rate = $state(0);
+
+  /** The scan/survey screen, when open. */
+  tool = $state<ToolKind | null>(null);
+  toolPhase = $state<ToolPhase>("idle");
+  toolLines = $state.raw<string[]>([]);
+  toolReport = $state.raw<ScanReport | SurveyReport | IngestReport | null>(null);
+  /** Which tool produced `toolReport`. */
+  toolReportKind = $state<ToolKind | null>(null);
+  toolStopped = $state(false);
+  toolError = $state<string | null>(null);
+  /** Guards against events from a run that was superseded. */
+  private toolRun = 0;
+
+  private spectrumListeners = new Set<(bins: number[]) => void>();
+  private rateWindow: { t: number; n: number }[] = [];
+  /** The newest spectrum frame of each session. */
+  private lastSpectrum: (number[] | null)[] = [];
+
+  /** Subscribe to the shown session's spectrum frames; the latest one is
+   *  replayed at once. */
+  onSpectrum(fn: (bins: number[]) => void): () => void {
+    this.spectrumListeners.add(fn);
+    const last = this.lastSpectrum[this.activeSession];
+    if (last) fn(last);
+    return () => this.spectrumListeners.delete(fn);
+  }
+
+  /** Point the signal views at another session of a station. */
+  showSession(i: number) {
+    if (i < 0 || i >= this.sessions.length) return;
+    this.activeSession = i;
+    const last = this.lastSpectrum[i];
+    if (last) for (const fn of this.spectrumListeners) fn(last);
+  }
+
+  /** Per-channel stats of the shown session. */
+  get channels(): ChannelStat[] {
+    return this.lives[this.activeSession]?.channels ?? [];
+  }
+
+  select(m: MessageItem | null) {
+    this.selectedItem = m;
+    this.selectedId = m?.id ?? null;
+  }
+
+  /** Age out the rate window; called on every update so silence reads 0. */
+  private updateRate(added = 0) {
+    const now = performance.now();
+    if (added) this.rateWindow.push({ t: now, n: added });
+    while (this.rateWindow.length && now - this.rateWindow[0].t > 5000) this.rateWindow.shift();
+    this.rate = this.rateWindow.reduce((a, w) => a + w.n, 0) / 5;
+  }
+
+  get session(): SessionSummary | null {
+    return this.sessions[this.activeSession] ?? null;
+  }
+
+  get selected(): MessageItem | null {
+    return this.selectedId == null ? null : this.selectedItem;
+  }
+
+  async init() {
+    const b = await backend();
+    this.native = b.native;
+    this.info = await b.appInfo();
+    await this.refreshDevices();
+  }
+
+  async refreshDevices() {
+    this.devicesLoading = true;
+    this.devicesError = null;
+    try {
+      const b = await backend();
+      this.devices = await b.listDevices();
+      if (!this.devices.some((d) => d.selector === settings.device)) {
+        settings.device = this.devices[0]?.selector ?? "";
+      }
+    } catch (e) {
+      this.devicesError = String(e);
+      this.devices = [];
+    } finally {
+      this.devicesLoading = false;
+    }
+  }
+
+  async resolve(): Promise<ResolvedTune> {
+    return (await backend()).resolveTune(buildRequest());
+  }
+
+  async start() {
+    if (this.phase === "starting" || this.phase === "running") return;
+    saveSettings();
+    this.error = null;
+    this.tool = null;
+    this.phase = "starting";
+    this.messages = [];
+    this.total = 0;
+    this.dropped = 0;
+    this.lagged = 0;
+    this.lives = [];
+    this.activeSession = 0;
+    this.samples = 0;
+    this.elapsedMs = 0;
+    this.entities = null;
+    this.select(null);
+    this.lastSpectrum = [];
+    this.rate = 0;
+    this.rateWindow = [];
+    try {
+      const b = await backend();
+      const threads = num(settings.decodeThreads);
+      if (threads) await b.setDecodeThreads(threads);
+      await b.start(buildRequest(), (e) => this.handle(e));
+    } catch (e) {
+      this.error = String(e);
+      this.phase = "idle";
+    }
+  }
+
+  async stop() {
+    try {
+      await (await backend()).stop();
+    } finally {
+      if (this.phase === "running" || this.phase === "starting") this.phase = "ended";
+      this.rateWindow = [];
+      this.rate = 0;
+    }
+  }
+
+  openTool(kind: ToolKind) {
+    // A session that is still opening the radio can't be stopped yet.
+    if (this.phase === "starting") return;
+    this.tool = kind;
+    if (this.toolPhase !== "running" && this.toolPhase !== "stopping") this.toolPhase = "idle";
+  }
+
+  /** Leave the tool screen. A running tool is stopped first. */
+  async closeTool() {
+    if (this.toolPhase === "running" || this.toolPhase === "stopping") await this.stopTool();
+    this.tool = null;
+  }
+
+  async startTool(req: ToolRequest) {
+    if (this.toolPhase === "running" || this.toolPhase === "stopping") return;
+    const run = ++this.toolRun;
+    this.toolPhase = "running";
+    this.toolLines = [];
+    this.toolReport = null;
+    this.toolReportKind = null;
+    this.toolStopped = false;
+    this.toolError = null;
+    try {
+      await (await backend()).startTool(req, (e) => this.handleTool(run, req.kind, e));
+    } catch (e) {
+      if (run !== this.toolRun) return;
+      this.toolError = String(e);
+      this.toolPhase = "failed";
+    }
+  }
+
+  async stopTool() {
+    if (this.toolPhase !== "running") return;
+    this.toolPhase = "stopping";
+    try {
+      await (await backend()).stopTool();
+    } catch (e) {
+      this.toolError = String(e);
+      this.toolPhase = "failed";
+    }
+  }
+
+  private handleTool(run: number, kind: ToolKind, e: ToolEvent) {
+    if (run !== this.toolRun) return;
+    switch (e.type) {
+      case "line": {
+        // A line may hold several (the CLI prints blank separators).
+        const next = this.toolLines.concat(e.text.split("\n"));
+        this.toolLines = next.length > MAX_TOOL_LINES ? next.slice(next.length - MAX_TOOL_LINES) : next;
+        break;
+      }
+      case "done":
+        this.toolReport = e.report;
+        this.toolReportKind = kind;
+        this.toolStopped = e.stopped;
+        this.toolPhase = "done";
+        break;
+      case "failed":
+        this.toolError = e.message;
+        this.toolPhase = "failed";
+        break;
+    }
+  }
+
+  /** Back to the setup screen. */
+  reset() {
+    this.phase = "idle";
+    this.error = null;
+  }
+
+  private handle(e: BackendEvent) {
+    switch (e.type) {
+      case "started":
+        this.station = e.station;
+        this.sessions = e.sessions;
+        this.phase = "running";
+        this.view = "live";
+        break;
+      case "messages": {
+        const n = e.items.length + e.skipped;
+        this.total += n;
+        this.dropped += e.skipped;
+        this.lagged += e.lagged ?? 0;
+        this.updateRate(n);
+        if (e.items.length) {
+          const next = this.messages.concat(e.items);
+          this.messages = next.length > MAX_MESSAGES ? next.slice(next.length - MAX_MESSAGES) : next;
+        }
+        break;
+      }
+      case "live": {
+        this.elapsedMs = e.elapsedMs;
+        this.lives = e.sessions;
+        e.sessions.forEach((s, i) => {
+          if (s.spectrum) this.lastSpectrum[i] = s.spectrum;
+        });
+        const s = e.sessions[this.activeSession];
+        if (s) {
+          this.samples = s.samples;
+          if (s.spectrum) for (const fn of this.spectrumListeners) fn(s.spectrum);
+        }
+        this.updateRate();
+        break;
+      }
+      case "entities":
+        this.entities = e.state;
+        break;
+      case "ended":
+        if (e.error) this.error = e.error;
+        if (this.phase !== "idle") this.phase = "ended";
+        this.rateWindow = [];
+        this.rate = 0;
+        break;
+    }
+  }
+}
+
+export const app = new AppState();

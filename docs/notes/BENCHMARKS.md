@@ -13,6 +13,50 @@ floor in `bench/baselines.json`. Keys ending in `_max` are ceilings
 separately by exact-result `cargo test` fixtures (their captures are too
 large to vendor).
 
+## Methodology — three gate types (BENCH-4)
+
+xng verifies decode quality with three complementary mechanisms; a mode uses
+whichever its oracle/capture situation allows, and several use more than one:
+
+1. **Off-air count gate** (preferred) — decode a vendored real-RF fixture and
+   fail if the count drops below a committed floor (`bench/run.sh` +
+   `baselines.json`). Requires both a capture small enough to vendor and a way
+   to set an honest floor (an oracle head-to-head, or the decoder's own
+   stable count). This is the strongest gate: it catches real sensitivity loss.
+2. **Synthetic AWGN BER/recovery floor** — for modes with **no public peer
+   decoder** (STD-C, Aero, Iridium) or no vendorable capture, a
+   modulate → complex-AWGN → demod test asserts frame recovery at a target SNR
+   (an explicitly-allowed synthetic oracle, *not* a noiseless loopback). These
+   run as ordinary `#[test]`s, so CI already gates them; they catch demod
+   regressions without a capture but do not establish real-RF performance.
+3. **Field-exact oracle test** — a vendored frame is decoded and every field
+   compared bit/field-for-field against a reference (pyModeS, pyais, dumpvdl2
+   debug, rs41mod, fldigi, iridium-toolkit's parser…). Proves *correctness* of
+   the bit layout; orthogonal to sensitivity.
+
+Per-mode coverage matrix (✓ = present):
+
+| mode | off-air count | synthetic BER | field-exact | oracle |
+|---|---|---|---|---|
+| ADS-B / Mode S | ✓ | — | ✓ | readsb / dump1090-fa / pyModeS |
+| ACARS | ✓ (BENCH-1) | — | ✓ | acarsdec / libacars |
+| VDL2 | ✓ | — | ✓ | dumpvdl2 2.6.0 |
+| HFDL | ✓ | — | ✓ | dumphfdl |
+| AIS | ✓ | ✓ (MLSE) | ✓ | AIS-catcher / pyais |
+| UAT | ✓ (live) | — | ✓ | dump978 |
+| Radiosonde (RS41) | ✓ | — | ✓ | rs1729 rs41mod |
+| NAVTEX | ✓ | — | ✓ | fldigi / YaND |
+| SARSAT | — | ✓ | ✓ | amsa-code fgb-decoder |
+| STD-C | — | ✓ | ✓ | Scytale-C (facts) |
+| Aero | — | ✓ | ✓ | JAERO (facts) |
+| Iridium | — | (follow-up) | ✓ | iridium-toolkit parser |
+| POCSAG/FLEX/DSC/EOT/ADS-L/ATCS/VDES | — | ✓ | ✓ | spec / multimon-ng (facts) |
+
+Sensitivity targets, where measured: ADS-B ≥ 98% of readsb; AIS ~91% of
+AIS-catcher (deep-fade tail); HFDL ~97% of dumphfdl; VDL2 leads dumpvdl2 on both
+vendored captures; ACARS comparable to acarsdec (16 vs 17 clean); Iridium IDA
+exceeds gr-iridium (+32%).
+
 ## Results
 
 | mode | xng | oracle | capture | CI gate |
@@ -20,12 +64,14 @@ large to vendor).
 | ADS-B / Mode S | 164 | readsb 167 (98%) | modes1 @2.4 MS/s | floor (modes1 @2 MS/s) |
 | ADS-B / Mode S | 161 | dump1090-fa 162 (99%) | modes1 @2 MS/s | floor |
 | VDL2 | 44 | dumpvdl2 41 | sigidwiki | floor 42 |
+| VDL2 (2nd path) | 13 | dumpvdl2 2.6.0 12 | Opflasher 2.5 MS/s (105k slice) | floor 10 |
 | HFDL | 36 | dumphfdl 37 (97%) | 21931 kHz sigidwiki | floor 31 |
 | AIS | 48 | AIS-catcher 53 (91%) | 5 min, Sacramento | fixture floor |
 | Iridium IDA | 758 | gr-iridium 573 | 300 s Airspy R2 | oracle tests |
 | Radiosonde (RS41) | 119 | rs1729 `rs41mod` 119 (100%) | radiosonde_auto_rx 96 kS/s | floor 110 |
 | NAVTEX | 29 | fldigi/YaND (real USCG msg, char-identical) | SDRplay navtex.zip 62.5 kS/s | floor 25 |
 | UAT 978 | 879 CRC-OK | (live; no oracle on this capture) | live 50 s, KSMF (not vendored) | — |
+| ACARS (POA) | 16 CRC-OK | acarsdec 3.7 17 clean | Opflasher 3.0 MS/s (100k slice) | floor 13 |
 
 ## ADS-B / Mode S
 
@@ -93,6 +139,15 @@ docs/notes/VDL2.md.
 Residual gap: none on this capture (xng leads 44 vs 41). The remaining
 RS failures on accepted bursts are soft-decision territory (per-symbol
 confidence into RS erasure marking).
+
+Second real-RF path (BENCH-2): the Opflasher off-air capture
+(`discord-opflasher-vdl1.cf32`, complex float32, **2.5 MS/s**, 144 s,
+single VDL2 channel at the capture center) — real **Air New Zealand**
+traffic (reg ZK-NNB, flight NZ0142, **ADS-C over VDL2** + AVLC). Downconverted
+to 105 kS/s and vendored as `bench/data/vdl2_opflasher_105k.cs16` (release
+asset). Head-to-head on that fixture: **xng 13 vs dumpvdl2 2.6.0 12** (same
+ZK-NNB / C8274F→2138B7 traffic) — xng leads by one, confirming the parity
+generalizes across a second antenna/RF path. CI floor 10 (`vdl2_offair2`).
 
 ## HFDL
 
@@ -204,6 +259,38 @@ No public UAT IQ exists (the canonical dump978 dataset is bits, not IQ), so this
 is validated on a **live** capture: tuner on the 1090 antenna at 978 MHz for 50 s
 → **879 CRC-OK frames**, real GA aircraft (callsign/ICAO/position/track/altitude,
 e.g. N402AA, N316ME). Not CI-gated (live capture, not vendored).
+
+## ACARS (POA)
+
+Capture: a real off-air VHF ACARS capture contributed by **Opflasher**
+(Airframes Discord) — `discord-opflasher-acars1.cf32`, complex float32,
+**3.0 MS/s**, 120 s, quiet/sparse. A single active POA channel (≈ 50 kHz off
+the capture center) carries one aircraft's maintenance download — real **Korean
+Air** traffic, reg **HL8537**, flight **KE0402** (Sydney YSSY → Seoul RKSI,
+17 Jun 2026), H1 `#CFB`/`#DFB` ARINC-622/Boeing maintenance + `5V`.
+
+For CI the channel is downconverted to baseband and decimated 3.0 MS/s → 100 kS/s
+(polyphase, gentle anti-alias so xng's own DDC does the final channelization),
+vendored as `bench/data/acars_100k.cs16` (release asset). xng decodes **16
+CRC-OK** on the slice (≥ the 15 on the full-rate file). CI floor 13, gated on
+CRC-OK frames (ACARS also emits bad-CRC frames, which are noise-dependent).
+
+Fair head-to-head on the same capture, each decoder fed its native input —
+acarsdec gets a **channel-limited** 12.5 kHz AM WAV (the complex baseband
+resampled to 12.5 kHz *then* envelope-detected; detecting the wideband envelope
+first gives acarsdec garbage): **xng 16 CRC-OK vs acarsdec 3.7 17 clean** —
+comparable, acarsdec ahead by one weak frame, both decoding the same HL8537 H1
+maintenance blocks (sublabels C36I–M / D57A–C). This is xng's first real-RF
+ACARS gate (previously ACARS was loopback + field-exact only — the long-deferred
+ACARS-4.3). *(An earlier draft reported "xng 13 vs acarsdec 9"; that undercounted
+acarsdec because its WAV was the full-band envelope, not the channel — corrected.)*
+
+Reproduce:
+
+```
+xng decode bench/data/acars_100k.cs16 -f cs16 -m acars -r 100000 -c 131500000 --channels 131.500
+acarsdec -f acars_12k5.wav -o1     # channel-limited 12.5 kHz mono AM WAV (resample complex, then abs)
+```
 
 ## Synthetic demod validation (round 5/6)
 

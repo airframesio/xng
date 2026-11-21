@@ -1,0 +1,279 @@
+/* One system: one type pair, one radius scale, one button family, one
+   accent. Dark is the default (an instrument you leave running); light
+   follows the OS. */
+
+:root {
+  color-scheme: dark;
+  --bg: #0c0e0d;
+  --surface: #121514;
+  --surface-2: #191d1b;
+  --surface-3: #212624;
+  --line: #262b29;
+  --line-strong: #363d3a;
+  --ink: #eceee9;
+  --muted: #a2aba6;
+  --faint: #737c77;
+  --accent: #f5a524;
+  --accent-hover: #ffb84a;
+  --accent-ink: #1b1303;
+  --accent-soft: rgba(245, 165, 36, 0.13);
+  --ok: #4cc38a;
+  --bad: #f2676b;
+  --bad-soft: rgba(242, 103, 107, 0.13);
+  --air: #6cb6ff;
+  --sea: #3dd6c6;
+  --sat: #f5a524;
+  --ground: #c5ccc7;
+
+  --r-sm: 3px;
+  --r: 5px;
+  --r-lg: 8px;
+
+  --sans: "IBM Plex Sans Variable", "IBM Plex Sans", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --bg: #f5f4f0;
+    --surface: #ffffff;
+    --surface-2: #f0efea;
+    --surface-3: #e6e4dd;
+    --line: #dedcd4;
+    --line-strong: #c4c1b7;
+    --ink: #151816;
+    --muted: #555d58;
+    --faint: #7b837e;
+    --accent: #9a5a00;
+    --accent-hover: #7f4a00;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(154, 90, 0, 0.1);
+    --ok: #1d7a4f;
+    --bad: #c2333a;
+    --bad-soft: rgba(194, 51, 58, 0.09);
+    --air: #1f6fc4;
+    --sea: #0d8478;
+    --sat: #9a5a00;
+    --ground: #555d58;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 14px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.selectable {
+  user-select: text;
+  -webkit-user-select: text;
+  cursor: text;
+}
+
+/* Buttons: one family. Step up on hover, press on click. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 14px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  background: var(--surface-2);
+  color: var(--ink);
+  font: 500 13px/1 var(--sans);
+  cursor: pointer;
+  transition:
+    background 120ms var(--ease),
+    border-color 120ms var(--ease),
+    transform 120ms var(--ease);
+}
+.btn:hover:not(:disabled) {
+  background: var(--surface-3);
+  transform: translateY(-1px);
+}
+.btn:active:not(:disabled) {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+}
+.btn.primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.btn.danger {
+  border-color: var(--bad);
+  color: var(--bad);
+  background: var(--bad-soft);
+}
+.btn.quiet {
+  border-color: transparent;
+  background: transparent;
+  color: var(--muted);
+}
+.btn.quiet:hover:not(:disabled) {
+  background: var(--surface-2);
+  color: var(--ink);
+}
+.btn.lg {
+  height: 44px;
+  padding: 0 22px;
+  font-size: 15px;
+}
+.btn.sm {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 12px;
+}
+
+/* Fields */
+.field {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+.field > span {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+}
+.field > small {
+  font-size: 12px;
+  color: var(--faint);
+  line-height: 1.35;
+}
+.input,
+select.input {
+  width: 100%;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  background: var(--bg);
+  color: var(--ink);
+  font: 400 13px/1 var(--mono);
+  transition: border-color 120ms var(--ease);
+}
+.input::placeholder {
+  color: var(--faint);
+}
+.input:hover {
+  border-color: var(--faint);
+}
+.check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.check input {
+  margin: 2px 0 0;
+  width: 15px;
+  height: 15px;
+  accent-color: var(--accent);
+}
+.check small {
+  display: block;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Scrollbars that belong to the surface. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
+
+/* MapLibre chrome, in the app's own voice. */
+.maplibregl-map {
+  font: 400 12px/1.4 var(--sans);
+}
+.maplibregl-ctrl-group {
+  background: var(--surface) !important;
+  border: 1px solid var(--line-strong);
+  box-shadow: none !important;
+  border-radius: var(--r) !important;
+}
+.maplibregl-ctrl-group button + button {
+  border-top: 1px solid var(--line) !important;
+}
+@media (prefers-color-scheme: dark) {
+  .maplibregl-ctrl-group button .maplibregl-ctrl-icon {
+    filter: invert(1) brightness(0.9);
+  }
+}
+.maplibregl-ctrl-attrib {
+  background: color-mix(in srgb, var(--surface) 80%, transparent) !important;
+  color: var(--faint);
+  font-size: 10px;
+}
+.maplibregl-ctrl-attrib a {
+  color: var(--muted);
+}

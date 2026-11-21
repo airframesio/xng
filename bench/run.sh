@@ -120,8 +120,7 @@ fi
 # ACARS (POA): Opflasher off-air capture (release asset), the single active POA
 # channel downconverted 3.0 MS/s -> 100 kS/s cs16. CRC-OK gate. Fair head-to-head
 # on the same capture (acarsdec fed a channel-limited 12.5 kHz AM WAV): xng 15
-# CRC-OK (master as of this branch) vs acarsdec 3.7 17 clean — comparable (real
-# Korean Air HL8537 traffic).
+# CRC-OK vs acarsdec 3.7 17 clean — comparable (real Korean Air HL8537 traffic).
 if [ -f bench/data/acars_100k.cs16 ]; then
   acars=$(count_crc bench/data/acars_100k.cs16 cs16 acars 100000 131500000 131.500)
   check acars_offair "$acars"
