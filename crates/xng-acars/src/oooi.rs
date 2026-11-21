@@ -58,7 +58,9 @@ impl Oooi {
 /// or implausible — acarsdec copies the bytes unconditionally; we validate.
 fn airport(txt: &[u8], at: usize) -> Option<String> {
     let s = txt.get(at..at + 4)?;
-    if s.iter().all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+    if s.iter()
+        .all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
         Some(String::from_utf8_lossy(s).into_owned())
     } else {
         None
@@ -311,7 +313,11 @@ pub fn decode(label: &str, text: &str) -> Option<Oooi> {
         _ => return None,
     }
 
-    if o.is_empty() { None } else { Some(o) }
+    if o.is_empty() {
+        None
+    } else {
+        Some(o)
+    }
 }
 
 #[cfg(test)]

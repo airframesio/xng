@@ -61,8 +61,7 @@ pub fn classify(label: &str) -> Option<QSeries> {
         return None;
     }
     let c = b[1];
-    let in_family = c.is_ascii_digit() && (b'0'..=b'7').contains(&c)
-        || (b'A'..=b'X').contains(&c);
+    let in_family = c.is_ascii_digit() && (b'0'..=b'7').contains(&c) || (b'A'..=b'X').contains(&c);
     if !in_family {
         return None;
     }
@@ -95,7 +94,11 @@ pub fn classify(label: &str) -> Option<QSeries> {
         _ => (QKind::Other, "Link control / squitter"),
     };
 
-    Some(QSeries { label: label.to_owned(), kind, description })
+    Some(QSeries {
+        label: label.to_owned(),
+        kind,
+        description,
+    })
 }
 
 #[cfg(test)]
@@ -107,7 +110,10 @@ mod tests {
         // airframes acars-message-documentation
         assert_eq!(classify("Q0").unwrap().description, "ACARS Link Test");
         assert_eq!(classify("Q2").unwrap().description, "ETA Report");
-        assert_eq!(classify("QF").unwrap().description, "OFF Destination Report");
+        assert_eq!(
+            classify("QF").unwrap().description,
+            "OFF Destination Report"
+        );
         // airframes acars-decoder-typescript plugin descriptions
         assert_eq!(classify("QP").unwrap().description, "OUT Report");
         assert_eq!(classify("QQ").unwrap().description, "OFF Report");

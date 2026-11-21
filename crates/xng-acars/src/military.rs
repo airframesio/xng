@@ -82,7 +82,7 @@ pub struct WeatherReport {
     pub station: String,
     /// `HHMM` the report was issued.
     pub time: String,
-    /// `METAR` or `TAF`.
+    /// `METAR`, `TAF` or `UNKNOWN`.
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub report: String,
@@ -202,8 +202,39 @@ fn is_upper(s: &str) -> bool {
 }
 
 /// `DDHHMM` (6 digits) or `None`.
+/// `DDHHMM`, kept only when it is a real day of the month and time of day.
 fn ddhhmm(s: &str) -> Option<String> {
-    (s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.to_owned())
+    if s.len() != 6 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n = |i: usize| s[i..i + 2].parse::<u32>().unwrap_or(99);
+    ((1..=31).contains(&n(0)) && n(2) <= 23 && n(4) <= 59).then(|| s.to_owned())
+}
+
+/// `TAF`, `METAR` (station then a `DDHHMMZ` group, optionally after
+/// `METAR`/`SPECI`) or `UNKNOWN` for anything else, e.g. "no data" replies.
+fn weather_kind(report: &str) -> &'static str {
+    if report == "TAF" || report.starts_with("TAF ") {
+        return "TAF";
+    }
+    let mut words = report.split_whitespace();
+    let mut first = words.next().unwrap_or("");
+    if first == "METAR" || first == "SPECI" {
+        first = words.next().unwrap_or("");
+    }
+    let station = first.len() == 4
+        && first.as_bytes()[0].is_ascii_uppercase()
+        && first
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+    let time = words.next().is_some_and(|t| {
+        t.len() == 7 && t.ends_with('Z') && t[..6].bytes().all(|b| b.is_ascii_digit())
+    });
+    if station && time {
+        "METAR"
+    } else {
+        "UNKNOWN"
+    }
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -254,8 +285,8 @@ pub fn parse(text: &str) -> Option<MilitaryReport> {
     // Without a valid CRC, keep the last 4 characters as data.
     let data = if crc_ok { data } else { record };
 
-    let mut fields = data[kind_len + 1..].split('/');
-    let id = fields.next()?.strip_prefix("ID")?;
+    let fields: Vec<&str> = data[kind_len + 1..].split('/').collect();
+    let id = fields.first()?.strip_prefix("ID")?;
     let mut id_parts = id.split(',');
     let tail = id_parts.next()?;
     if tail.len() < 4 || tail.len() > 7 || !tail.bytes().all(|b| b.is_ascii_alphanumeric()) {
@@ -288,7 +319,7 @@ pub fn parse(text: &str) -> Option<MilitaryReport> {
         crc_ok,
     };
 
-    for f in fields {
+    for (i, &f) in fields.iter().enumerate().skip(1) {
         if f.len() < 2 || !f.is_char_boundary(2) {
             continue;
         }
@@ -332,22 +363,21 @@ pub fn parse(text: &str) -> Option<MilitaryReport> {
                 }
             }
             "MT" => {
-                // `<station>,<HHMM>,<report>`; the report itself has no
-                // commas in practice but keep everything after the 2nd.
-                let mut it = v.splitn(3, ',');
+                // `<station>,<HHMM>,<report>`. The report is free text that
+                // can contain '/' (1/2SM, 07/02, R09/...), so it runs to the
+                // end of the message.
+                let rest = fields[i..].join("/");
+                let mut it = rest[2..].splitn(3, ',');
                 if let (Some(st), Some(t), Some(rep)) = (it.next(), it.next(), it.next()) {
                     let rep = rep.trim();
                     r.weather = Some(WeatherReport {
                         station: st.to_owned(),
                         time: t.to_owned(),
-                        kind: if rep.starts_with("TAF ") {
-                            "TAF"
-                        } else {
-                            "METAR"
-                        },
+                        kind: weather_kind(rep),
                         report: rep.to_owned(),
                     });
                 }
+                break;
             }
             _ => {}
         }
@@ -464,6 +494,26 @@ mod tests {
         assert!(w.report.ends_with("MISSION PERMITS"));
         let t = parse("- #MDWXR/ID66162A,RCH3245,PAM7887W2324/MR1,48/MTPAED,0311,TAF PAED 210311Z 03009KT 9999 FEW030 BKN050 BKN100 QNH2979INS T0C-AUTO RESPONSE BASED ON AVAILABLE DATA-CONTACT C2 AGENCY FOR ADDITIONAL INFO2C6B").unwrap();
         assert_eq!(t.weather.unwrap().kind, "TAF");
+    }
+
+    #[test]
+    fn wxr_report_with_slashes_and_unknown_text() {
+        let r = parse("- #MDWXR/ID99207A,RCH3269,AAM7886W2324/MR4,120/MTKADW,1200,KADW 211200Z 1/2SM FG OVC002 07/02 A3027").unwrap();
+        let w = r.weather.unwrap();
+        assert_eq!(w.kind, "METAR");
+        assert_eq!(w.report, "KADW 211200Z 1/2SM FG OVC002 07/02 A3027");
+        let u =
+            parse("- #MDWXR/ID99207A,RCH3269,AAM7886W2324/MR4,120/MTKADW,1200,NO WX AVBL FOR KADW")
+                .unwrap();
+        assert_eq!(u.weather.unwrap().kind, "UNKNOWN");
+    }
+
+    #[test]
+    fn ddhhmm_range() {
+        assert_eq!(ddhhmm("210114").as_deref(), Some("210114"));
+        assert_eq!(ddhhmm("219914"), None);
+        assert_eq!(ddhhmm("001200"), None);
+        assert_eq!(ddhhmm("211260"), None);
     }
 
     #[test]
