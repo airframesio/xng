@@ -234,3 +234,22 @@ file id and size, segments numbered from 1 carry CORE-PDU text
 fragments, completion at the declared size parses the combined text as
 a CORE PDU (attached to the closing segment's message as
 miam_file_complete). Abort frames cancel; 10-minute timeout.
+
+## Military (AMC-style) ARINC 702 reports (2026-11)
+
+`military.rs`: clean-room reimplementation from airframes' own
+acars-decoder-typescript (`utils/arinc_702_helper.ts`,
+`utils/mission_number.ts` and their tests; facts only: the `/ID`
+tail/callsign/mission layout, the `/AF`, `/TD`, `/DC`, `/MT`, `/OF`, `/OT`,
+`/LL`, `/PS` field meanings, and the two ARINC 702 checksums,
+CRC-16/IBM-SDLC with reversed nibbles and CRC-16/GENIBUS). Tested against
+real messages received by Airframes between 2026-11-19 and 2026-11-21:
+all 139 distinct `/ID` reports in that sample decode, all 139 pass a
+checksum, 110 carry a parseable mission number. The mission number is
+split only into its fixed-width parts (prefix, basic number, suffix, day
+of year); the meaning of individual code letters is not public and is
+not decoded.
+
+The military ICAO address blocks in `src/outputs/dbinfo.rs` are public
+allocation facts, cross-checked against the list readsb uses for its
+military-flag fallback; no code was copied.

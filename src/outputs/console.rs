@@ -46,6 +46,22 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
             }
         }
         "media_advisory" => Some("MEDIA-ADV".to_owned()),
+        "military" => {
+            let mut s = format!("MIL {}", app.get("kind")?.as_str()?);
+            if let Some(c) = app.get("callsign").and_then(|v| v.as_str()) {
+                s.push_str(&format!(" {c}"));
+            }
+            if let Some(m) = app.get("mission").and_then(|v| v.get("value")).and_then(|v| v.as_str()) {
+                s.push_str(&format!(" msn {m}"));
+            }
+            if let (Some(d), Some(a)) = (
+                app.get("departure").and_then(|v| v.as_str()),
+                app.get("arrival").and_then(|v| v.as_str()),
+            ) {
+                s.push_str(&format!(" {d}->{a}"));
+            }
+            Some(s)
+        }
         _ => None,
     }
 }

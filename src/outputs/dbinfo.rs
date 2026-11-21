@@ -185,10 +185,61 @@ pub fn mid_country(mmsi: u32) -> Option<&'static str> {
     MIDS.iter().find(|(m, _)| *m == mid).map(|(_, c)| *c)
 }
 
+/// ICAO 24-bit address blocks allocated to military operators. Public
+/// allocation facts (ICAO Annex 10 Vol III national blocks as subdivided by
+/// each state), cross-checked against the range list readsb uses for its
+/// military flag fallback; no code is copied.
+const MILITARY_BLOCKS: &[(u32, u32)] = &[
+    (0xADF7C8, 0xAFFFFF), // United States
+    (0x010070, 0x01008F), // Egypt
+    (0x0A4000, 0x0A4FFF), // Algeria
+    (0x33FF00, 0x33FFFF), // Italy
+    (0x350000, 0x37FFFF), // Spain
+    (0x3AA000, 0x3AFFFF), // France
+    (0x3B7000, 0x3BFFFF), // France
+    (0x3EA000, 0x3EBFFF), // Germany
+    (0x3F4000, 0x3FBFFF), // Germany
+    (0x400000, 0x40003F), // United Kingdom
+    (0x43C000, 0x43CFFF), // United Kingdom
+    (0x444000, 0x446FFF), // Austria
+    (0x44F000, 0x44FFFF), // Belgium
+    (0x457000, 0x457FFF), // Bulgaria
+    (0x45F400, 0x45F4FF), // Denmark
+    (0x468000, 0x4683FF), // Greece
+    (0x473C00, 0x473C0F), // Hungary
+    (0x478100, 0x4781FF), // Norway
+    (0x480000, 0x480FFF), // Netherlands
+    (0x48D800, 0x48D87F), // Poland
+    (0x497C00, 0x497CFF), // Portugal
+    (0x498420, 0x49842F), // Czech Republic
+    (0x4B7000, 0x4B7FFF), // Switzerland
+    (0x4B8200, 0x4B82FF), // Turkey
+    (0x506F32, 0x506FFF), // Slovenia
+    (0x70C070, 0x70C07F), // Oman
+    (0x710258, 0x71028F), // Saudi Arabia
+    (0x710380, 0x71039F), // Saudi Arabia
+    (0x738A00, 0x738AFF), // Israel
+    (0x7CF800, 0x7CFAFF), // Australia
+    (0x800200, 0x8002FF), // India
+    (0xC20000, 0xC3FFFF), // Canada
+    (0xE40000, 0xE41FFF), // Brazil
+    (0xE80600, 0xE806FF), // Chile
+];
+
+/// True when the address is in a military allocation block, or the loaded
+/// aircraft database flags it military.
+pub fn is_military(icao: u32) -> bool {
+    MILITARY_BLOCKS.iter().any(|(lo, hi)| (*lo..=*hi).contains(&icao))
+        || AIRCRAFT_DB.get().is_some_and(|db| db.military.contains(&icao))
+}
+
 /// Optional aircraft database: tar1090 / Mictronics CSV
-/// (`icao;registration;type;...`, also accepts comma separators).
+/// (`icao;registration;type;flags;...`, also accepts comma separators).
+/// In the tar1090-db layout the 4th column is a bit string whose first
+/// character is `1` for military aircraft.
 pub struct AircraftDb {
     by_icao: HashMap<u32, (String, String)>,
+    military: std::collections::HashSet<u32>,
 }
 
 static AIRCRAFT_DB: OnceLock<AircraftDb> = OnceLock::new();
@@ -197,11 +248,16 @@ impl AircraftDb {
     pub fn load(path: &std::path::Path) -> anyhow::Result<usize> {
         let text = std::fs::read_to_string(path)?;
         let mut by_icao = HashMap::new();
+        let mut military = std::collections::HashSet::new();
         for line in text.lines() {
             let sep = if line.contains(';') { ';' } else { ',' };
             let mut f = line.split(sep);
             let (Some(hex), reg, typ) = (f.next(), f.next(), f.next()) else { continue };
             let Ok(icao) = u32::from_str_radix(hex.trim(), 16) else { continue };
+            let flags = f.next().unwrap_or("").trim();
+            if flags.len() <= 8 && flags.bytes().all(|b| b == b'0' || b == b'1') && flags.starts_with('1') {
+                military.insert(icao);
+            }
             by_icao.insert(
                 icao,
                 (
@@ -211,7 +267,7 @@ impl AircraftDb {
             );
         }
         let n = by_icao.len();
-        let _ = AIRCRAFT_DB.set(AircraftDb { by_icao });
+        let _ = AIRCRAFT_DB.set(AircraftDb { by_icao, military });
         Ok(n)
     }
 
@@ -231,6 +287,17 @@ mod tests {
         assert_eq!(icao_country(0x4D2023), Some("Malta"));
         assert_eq!(icao_country(0x3C5EF2), Some("Germany"));
         assert_eq!(icao_country(0x7C6B2D), Some("Australia"));
+    }
+
+    #[test]
+    fn military_blocks() {
+        assert!(is_military(0xAE144A)); // USAF C-17 (RCH4177)
+        assert!(is_military(0xADF7C8));
+        assert!(is_military(0x43C6F1)); // RAF
+        assert!(is_military(0x7CF800)); // RAAF
+        assert!(!is_military(0xA9B27C)); // US civil
+        assert!(!is_military(0x4D2023)); // Malta civil
+        assert!(!is_military(0xADF7C7));
     }
 
     #[test]

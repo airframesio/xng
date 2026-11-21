@@ -320,6 +320,38 @@ through the reassembler). That feed also now emits the per-burst `noise`
 floor field (dBFS, from `SignalQuality.noise_db`, omitted when unmeasured),
 matching acarsdec's `noise`.
 
+### Military (AMC-style) reports (`military.rs`)
+
+US Air Mobility Command aircraft (and RAAF, RCAF and others that use the
+same avionics) send ARINC 702 reports with a common header on H1 (`MD`
+sublabel) and bare on labels 1B/1J/1M/20/80/4J/2J/31:
+
+```text
+[preamble]<KIND>/ID<tail>,<callsign>,<mission>/<IEI><data>/...<csum>
+- #MDINI/ID88197A,RCH4913,AVYF913YT321/MR0,0/AFOTBH,ETAD/TD172129,0255E534
+```
+
+They decode to `app: "military"` with `kind` (`INI`, `POS`, `FTX`, `WXR`,
+`FPN`, `OOI`, `DIS`, `INR`, `REQPOS`, ...), `tail`, `callsign`,
+`mission_number` and `mission` (`prefix`, `basic`, `suffix`,
+`day_of_year`), `departure`/`arrival`, `planned_departure`/
+`estimated_departure`, `report_time`, `out_time`/`off_time`, `eta`,
+`position`/`altitude_ft`, `fuel_on_board`, `text`, `weather` (the
+METAR/TAF returned to a `WXR`), `flight_plan` (FPN route) and `crc_ok`.
+Multi-block uplinks repeat `- #MD` at each block join; those are removed
+before the checksum. Placeholder missions (`COLLINSAM123`,
+`ZZZ123456789`) are kept as `mission_number` but not parsed. The ACARS
+flight id on these messages is a 2-character carrier code (`MC`), so the
+dashboard uses the report's callsign for the aircraft instead.
+
+The header is not strictly military-only: a few civil operators with the
+same avionics send it too (for example N139RB as WDE01), so treat
+`app: "military"` as "AMC-format report". The dashboard's Military tab
+also includes Mode S aircraft whose address is in a military allocation
+block or that the aircraft DB (`--aircraft-db`, tar1090-db flags column)
+marks military. `xng_acars_military_messages_total{mode,kind}` counts
+CRC-valid reports, with a fixed kind set (`other` for the rest).
+
 ## Validation / oracles
 
 - **libacars** (MIT, attributed) is the structural oracle for ARINC 622,

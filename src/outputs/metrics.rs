@@ -36,6 +36,7 @@ fn render(live: &LiveState, mode: &str) -> String {
     out.push_str("# TYPE xng_samples_total counter\n");
     out.push_str("# TYPE xng_acars_messages_total counter\n");
     out.push_str("# TYPE xng_fec_corrected_total counter\n");
+    out.push_str("# TYPE xng_acars_military_messages_total counter\n");
     let stats = live.stats.lock().unwrap().clone();
     for (freq, frames, ok, level) in &stats {
         let labels = format!("{{mode=\"{mode}\",freq=\"{freq}\"}}");
@@ -52,6 +53,15 @@ fn render(live: &LiveState, mode: &str) -> String {
         let label = escape_label(label);
         out.push_str(&format!(
             "xng_acars_messages_total{{mode=\"{mode}\",freq=\"{freq}\",label=\"{label}\"}} {count}\n"
+        ));
+    }
+    // Military (AMC-style) reports by kind; the kind set is fixed upstream.
+    let mut mil: Vec<(&str, u64)> =
+        live.acars_military.lock().unwrap().iter().map(|(k, v)| (*k, *v)).collect();
+    mil.sort();
+    for (kind, count) in &mil {
+        out.push_str(&format!(
+            "xng_acars_military_messages_total{{mode=\"{mode}\",kind=\"{kind}\"}} {count}\n"
         ));
     }
     // Per-channel FEC-corrected units (ECO-7), sorted for stable output.
@@ -120,6 +130,18 @@ mod tests {
             ),
             "{body}"
         );
+    }
+
+    #[test]
+    fn renders_military_counters_with_bounded_kinds() {
+        let live = LiveState::new();
+        live.record_acars_military("INI");
+        live.record_acars_military("INI");
+        live.record_acars_military("ZZZ");
+        let body = render(&live, "aero");
+        assert!(body.contains("# TYPE xng_acars_military_messages_total counter\n"));
+        assert!(body.contains("xng_acars_military_messages_total{mode=\"aero\",kind=\"INI\"} 2\n"));
+        assert!(body.contains("xng_acars_military_messages_total{mode=\"aero\",kind=\"other\"} 1\n"));
     }
 
     #[test]

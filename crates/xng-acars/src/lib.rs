@@ -18,6 +18,7 @@ pub mod fpn;
 pub mod media_adv;
 pub mod met;
 pub mod miam;
+pub mod military;
 pub mod min;
 pub mod ohma;
 pub mod oooi;
@@ -68,6 +69,9 @@ pub enum AcarsApp {
     /// Label 5Z "Airline Designated Downlink" (United telex / structured
     /// free-text).
     Airline5z(airline5z::Airline5z),
+    /// Military (AMC-style) ARINC 702 report: `<KIND>/ID<tail>,<callsign>,
+    /// <mission>/…` on H1 (`MD` sublabel) and many other labels.
+    Military(military::MilitaryReport),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -115,13 +119,16 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
         // is recognized from the original text (the `#CFB` preamble is the
         // H1 `CF` sublabel, already stripped from `body`).
         "H1" => arinc622::parse(body, downlink)
+            .or_else(|| military::parse(body).map(AcarsApp::Military))
             .or_else(|| fpn::parse(body).map(AcarsApp::FlightPlan))
             .or_else(|| cfb::classify(text).map(AcarsApp::Cfb))
             .or_else(|| ohma::parse(body).map(|message| AcarsApp::Ohma { message })),
         "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
         "5Z" => airline5z::parse(body).map(AcarsApp::Airline5z),
-        _ => qseries::classify(label).map(AcarsApp::QSeries),
+        _ => qseries::classify(label)
+            .map(AcarsApp::QSeries)
+            .or_else(|| military::parse(text).map(AcarsApp::Military)),
     };
 
     // OOOI fields can be embedded in many labels' text (Q-series and several
@@ -166,6 +173,7 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
                 format!("5Z {message_type} ({description})")
             }
         }),
+        AcarsApp::Military(m) => Some(m.summary()),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(
                 "MIAM v{} {}{}{}",
