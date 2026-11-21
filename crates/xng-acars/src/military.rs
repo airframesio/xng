@@ -245,6 +245,10 @@ fn non_empty(s: &str) -> Option<String> {
 /// H1 sublabel already removed; returns `None` when it has no
 /// `<KIND>/ID<tail>,` header near the start.
 pub fn parse(text: &str) -> Option<MilitaryReport> {
+    // Byte offsets below assume ASCII; a military report is always ASCII.
+    if !text.is_ascii() {
+        return None;
+    }
     // Multi-block uplinks repeat the `- #MD` sublabel at every block join
     // (`…:V:OKA- #MDBU,240…`); the CRC covers the record without them.
     let cleaned: String = text
@@ -359,7 +363,7 @@ pub fn parse(text: &str) -> Option<MilitaryReport> {
             "PS" => {
                 r.position = decode_decimal_minutes(parts[0]);
                 if parts.len() > 2 {
-                    r.altitude_ft = parts[2].parse::<u32>().ok().map(|fl| fl * 100);
+                    r.altitude_ft = parts[2].parse::<u32>().ok().and_then(|fl| fl.checked_mul(100));
                 }
             }
             "MT" => {
@@ -506,6 +510,14 @@ mod tests {
             parse("- #MDWXR/ID99207A,RCH3269,AAM7886W2324/MR4,120/MTKADW,1200,NO WX AVBL FOR KADW")
                 .unwrap();
         assert_eq!(u.weather.unwrap().kind, "UNKNOWN");
+    }
+
+    #[test]
+    fn rejects_non_ascii_and_huge_altitude() {
+        assert!(parse("éABCDE/ID1234,,").is_none());
+        assert!(parse("FTX/ID1234,,/FX€ab").is_none());
+        let r = parse("POS/ID23571S,,/PSN31364E124002,120000,42949673/FXx0000").unwrap();
+        assert_eq!(r.altitude_ft, None);
     }
 
     #[test]
