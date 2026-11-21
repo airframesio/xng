@@ -70,34 +70,23 @@ impl Reassembler {
     /// `timeout_secs`: fragment lifetime — libacars uses ~120 s on VHF
     /// and several minutes on satcom/HF bearers.
     pub fn new(timeout_secs: f64) -> Self {
-        Self {
-            entries: HashMap::new(),
-            timeout_secs,
-        }
+        Self { entries: HashMap::new(), timeout_secs }
     }
 
     /// Offer a parsed block. `now_secs` is any monotonic seconds source.
     pub fn push(&mut self, core: &AcarsCore, now_secs: f64) -> Reasm {
         self.entries.retain(|_, e| e.deadline > now_secs);
 
-        let Some(block_id) = core.block_id else {
-            return Reasm::Skipped;
-        };
+        let Some(block_id) = core.block_id else { return Reasm::Skipped };
         let downlink = ('0'..='9').contains(&block_id);
         let (seq, msg_num, wrap) = if downlink {
             // Downlink message number "M01A": 3-char id + sequence char.
             // The split and the 4th-character sequence rule are the shared
             // libacars-faithful logic in `min` (handles the edge cases
             // where the 4th char is not a valid sequence letter).
-            let Some(num) = core.msg_num.as_deref() else {
-                return Reasm::Skipped;
-            };
-            let Some(m) = crate::min::split_downlink(num) else {
-                return Reasm::Skipped;
-            };
-            let Some(seq) = m.seq else {
-                return Reasm::Skipped;
-            };
+            let Some(num) = core.msg_num.as_deref() else { return Reasm::Skipped };
+            let Some(m) = crate::min::split_downlink(num) else { return Reasm::Skipped };
+            let Some(seq) = m.seq else { return Reasm::Skipped };
             (seq as i32, m.msg_num, i32::MAX)
         } else {
             // Empty-text uplink ACKs use out-of-sequence block ids (X,Y,Z).
@@ -143,18 +132,13 @@ impl Reassembler {
             seqs[0] == 0 && seqs.windows(2).all(|w| w[1] == w[0] + 1)
         } else {
             // Uplinks: contiguous modulo wrap.
-            seqs.windows(2)
-                .all(|w| w[1] == w[0] + 1 || (w[0] == wrap - 1 && w[1] == 0))
+            seqs.windows(2).all(|w| w[1] == w[0] + 1 || (w[0] == wrap - 1 && w[1] == 0))
         };
         if !contiguous {
             return Reasm::Incomplete;
         }
         Some(())
-            .map(|_| {
-                seqs.iter()
-                    .map(|s| entry.frags[s].as_str())
-                    .collect::<String>()
-            })
+            .map(|_| seqs.iter().map(|s| entry.frags[s].as_str()).collect::<String>())
             .map(Reasm::Complete)
             .unwrap()
     }
@@ -164,14 +148,7 @@ impl Reassembler {
 mod tests {
     use super::*;
 
-    fn core(
-        tail: &str,
-        label: &str,
-        block_id: char,
-        msg_num: Option<&str>,
-        text: &str,
-        more: bool,
-    ) -> AcarsCore {
+    fn core(tail: &str, label: &str, block_id: char, msg_num: Option<&str>, text: &str, more: bool) -> AcarsCore {
         AcarsCore {
             mode: '2',
             tail: Some(tail.into()),

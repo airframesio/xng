@@ -57,11 +57,7 @@ pub fn parse(text: &str) -> Option<MediaAdvisory> {
     }
     let free_text = if i < b.len() && b[i] == '/' {
         let t: String = b[i + 1..].iter().collect();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t)
-        }
+        if t.is_empty() { None } else { Some(t) }
     } else {
         None
     };
