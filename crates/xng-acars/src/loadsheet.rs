@@ -211,6 +211,9 @@ static NOT_HEADER: LazyLock<Regex> = LazyLock::new(|| {
 static LS_HEADER: LazyLock<Regex> = LazyLock::new(|| re(r"\bLS\s+(?:FINAL|PRELIM)"));
 static STATUS: LazyLock<Regex> = LazyLock::new(|| re(r"\b(FINAL|PRELIM)(?:INARY)?"));
 static EDITION: LazyLock<Regex> = LazyLock::new(|| re(r"\bED(?:NO?|N0)?\s*0*(\d{1,2})\b"));
+/// EDNO H040098-KO/02: a reference, then the edition after the slash.
+static EDITION_REF: LazyLock<Regex> =
+    LazyLock::new(|| re(r"\bEDNO\s+[A-Z0-9-]+/0*([0-9]{1,2})\b"));
 /// Flight number, optional `/day`, then the rest of the line, which must be
 /// empty or start with a space or `/`.
 static FLIGHT: LazyLock<Regex> =
@@ -249,9 +252,18 @@ static LAW: LazyLock<Regex> =
     LazyLock::new(|| re(r"^(?:LAW|LDW|LGW|LW)(?: ACTUAL)?:?\s+(\d+)(?:[^\d.]|$)"));
 /// A bare weight on the last line, possibly cut at a message split.
 static CUT_WEIGHT: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"^(ZFW|TOW|LAW|LDW|LGW|LW|TOF|TIF|TF|BO|DOW|UNDLD)(?: ACTUAL)?:?\s+([0-9]+)$")
+    re(r"^(ZFW|TOW|LAW|LDW|LGW|LW|TOF|TIF|TF|BO|DOW|UNDLD|ULOAD|UNDERLOAD)(?: ACTUAL)?:?\s+([0-9]+)$")
 });
-static MAX: LazyLock<Regex> = LazyLock::new(|| re(r"\bM(?:AX)?\s*(\d+)"));
+static MAX_BEFORE: LazyLock<Regex> = LazyLock::new(|| re(r"\bM(?:AX)?\s*(\d+)"));
+/// TOW 297997 36,27 312425 Op. Max: the maximum after the value, with its
+/// own number. Not the fraction of an index (17,42 Max closes the index,
+/// no maximum): the digits must not follow `.`, `,` or another digit.
+static MAX_AFTER: LazyLock<Regex> =
+    LazyLock::new(|| re(r"(?i)(?:^|[^.,0-9])([0-9]+)\s+(?:Op\.\s+)?Max\b"));
+/// Loadsheet keys that look like airport codes on an index or weight line.
+static FIELD_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"^(?:MAC|ZFW|TOW|LAW|LDW|LGW|DOW|DOI|DLI|TOF|TIF|PAX|TTL|TOB|CREW|ULOAD|UNDLD)$")
+});
 static LIMIT_MARK: LazyLock<Regex> = LazyLock::new(|| re(r"[\s\d]L$"));
 static WEIGHT_START: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:ZFW|TOW)(?: ACTUAL)?:?\s+\d"));
 static TOF: LazyLock<Regex> =
@@ -259,7 +271,7 @@ static TOF: LazyLock<Regex> =
 static TIF: LazyLock<Regex> =
     LazyLock::new(|| re(r"^(?:TIF|TF|BO|TRIP(?: FUEL)?):?\s+(\d+)(?:[^\d.]|$)"));
 static UNDLD: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^(?:UNDLD|ULOAD|UNDERLOAD):?\s+(\d+)(?:[^\d.]|$)"));
+    LazyLock::new(|| re(r"(?:^|\s)(?:UNDLD|ULOAD|UNDERLOAD):?\s+(\d+)(?:[^\d.]|$)"));
 static DOW: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|\s)DOW\s+(\d+)(?:[^\d.]|$)"));
 static BW: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|\s)BW\s*(\d+)(?:[^\d.]|$)"));
 static CREW: LazyLock<Regex> = LazyLock::new(|| re(r"^CREW\s+(\d{1,2}/\d{1,2}(?:/\d{1,2})?)\b"));
@@ -323,12 +335,40 @@ static INDEX_PATTERNS: LazyLock<Vec<(Regex, Index)>> = LazyLock::new(|| {
     .collect()
 });
 
+/// Weight and index in columns (freighter layout):
+///   DOW   184097   5,61
+///   ZFW   272172  17,42 286600 Max
+///   ZFW MAC 21,8
+/// Read after `INDEX_PATTERNS`, only for fields still unset.
+static COLUMN_INDEX: LazyLock<Vec<(Regex, Index)>> = LazyLock::new(|| {
+    [
+        (r"^DOW\s+[0-9]+\s+(-?[0-9]+[.,][0-9]+)(?:\s|$)", Index::Doi),
+        (r"^ZFW\s+[0-9]+\s+(-?[0-9]+[.,][0-9]+)(?:\s|$)", Index::LiZfw),
+        (r"^TOW\s+[0-9]+\s+(-?[0-9]+[.,][0-9]+)(?:\s|$)", Index::LiTow),
+        (r"^(?:LAW|LDW|LW)\s+[0-9]+\s+(-?[0-9]+[.,][0-9]+)(?:\s|$)", Index::LiLaw),
+        (r"^ZFW MAC:?\s+([0-9]+[.,][0-9]+)(?:\s|$)", Index::MacZfw),
+        (r"^TOW MAC:?\s+([0-9]+[.,][0-9]+)(?:\s|$)", Index::MacTow),
+        (r"^(?:LAW|LDW|LDG|LW) MAC:?\s+([0-9]+[.,][0-9]+)(?:\s|$)", Index::MacLaw),
+    ]
+    .into_iter()
+    .map(|(p, idx)| (re(p), idx))
+    .collect()
+});
+
 static ACCEPT_CSV_FLIGHT: LazyLock<Regex> =
     LazyLock::new(|| re(r"([A-Z]{2,3}\d{1,4}[A-Z]?),[A-Z]{3,4},"));
 static ACCEPT_WORDS: LazyLock<Regex> = LazyLock::new(|| {
     re(r"\b(?:LOADSHEET|LDSHT|LOAD SHEET)(?:\s+(?:FINAL|PRELIM))?(?:\s+\d{1,2})?\s+(?:ACCEPT|ACKNOW|RCVD)")
 });
 static ACK_LOADSHEET: LazyLock<Regex> = LazyLock::new(|| re(r"\bACK LOADSHEET"));
+/// LOADSHEET FINAL,EDNO 01,ACCEPT
+static ACCEPT_COMMAS: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"\b(?:LOADSHEET|LDSHT|LOAD SHEET)\s+(?:FINAL|PRELIM),\s*EDNO\s*\d+,\s*ACCEPT")
+});
+/// FOR QR274/21NOV26: the flight date, when the year is given.
+static ACCEPT_FOR_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"\bFOR\s+[A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?/([0-9]{2})([A-Z]{3})([0-9]{2})\b")
+});
 static ACCEPT_OF: LazyLock<Regex> = LazyLock::new(|| {
     re(r"(?:ACKNOWLEDGEMENT|ACCEPTANCE) OF (?:THE )?(?:FINAL|PRELIM) LOADSHEET")
 });
@@ -338,11 +378,12 @@ static ACCEPT_EDNO: LazyLock<Regex> = LazyLock::new(|| {
 static ACCEPT_FLIGHT: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?:FLIGHT NUMBER:\s*|FOR\s+)([A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?)\b"));
 /// SECTOR: YPPH-OMDB first, then the pair after the flight
-/// (FOR QR274/21NOV AMS-DOH), then a pair at the start of a line.
+/// (FOR QR274/21NOV AMS-DOH, or 21NOV26), then a pair at the start of a
+/// line.
 static ACCEPT_SECTORS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
     [
         re(r"SECTOR:\s*([A-Z]{3,4})[-/]([A-Z]{3,4})\b"),
-        re(r"\bFOR\s+[A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?(?:/\d{2}[A-Z]{3})?\s+([A-Z]{3,4})[-/]([A-Z]{3,4})\b"),
+        re(r"\bFOR\s+[A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?(?:/\d{2}[A-Z]{3}(?:\d{2})?)?\s+([A-Z]{3,4})[-/]([A-Z]{3,4})\b"),
         re(r"(?mR)^([A-Z]{3,4})[-/]([A-Z]{3,4})(?:\s|$)"),
     ]
 });
@@ -408,7 +449,8 @@ fn parse_header(ls: &mut Loadsheet, header: &str, next: &[&str]) {
     }
     let start = HEADER_WORD.find(header).map_or(0, |m| m.start());
     let rest = &header[start..];
-    if let Some(c) = EDITION.captures(rest) {
+    // EDNO 01, or a reference with the edition after the slash.
+    if let Some(c) = EDITION.captures(rest).or_else(|| EDITION_REF.captures(rest)) {
         ls.edition = int(&c[1]);
     }
     let stripped = EDITION.replace(rest, " ");
@@ -432,7 +474,7 @@ fn parse_header(ls: &mut Loadsheet, header: &str, next: &[&str]) {
     if ls.edition.is_none() {
         // EDNO on one of the next lines (EI132/21 21NOV26 EDNO 001).
         for line in next.iter().take(3) {
-            if let Some(c) = EDITION.captures(line) {
+            if let Some(c) = EDITION.captures(line).or_else(|| EDITION_REF.captures(line)) {
                 ls.edition = int(&c[1]);
                 break;
             }
@@ -492,6 +534,10 @@ fn parse_route_line(ls: &mut Loadsheet, line: &str) -> bool {
     let Some(m) = ROUTE.captures(line).or_else(|| ROUTE_JOINED.captures(line)) else {
         return false;
     };
+    // MAC ZFW 32.5 is an index line, not a route.
+    if FIELD_KEY.is_match(&m[1]) && FIELD_KEY.is_match(&m[2]) {
+        return false;
+    }
     ls.departure = Some(m[1].to_owned());
     ls.arrival = Some(m[2].to_owned());
     if let Some(r) = cap(&m, 3) {
@@ -514,7 +560,11 @@ fn parse_weight(ls: &mut Loadsheet, line: &str, which: Limiting) {
     }
     let Some(c) = re.captures(line) else { return };
     *value = int(&c[1]);
-    if let Some(mx) = MAX.captures(line) {
+    // MAX after the value only counts with its own number (TOW 105157 MAX
+    // sends no maximum). The weight regex reads one character past the
+    // digits, so the rest starts at the end of the digits.
+    let rest = &line[c.get(1).map_or(line.len(), |g| g.end())..];
+    if let Some(mx) = MAX_BEFORE.captures(line).or_else(|| MAX_AFTER.captures(rest)) {
         *max = int(&mx[1]);
     }
     // The first limiting weight wins when several are marked.
@@ -564,7 +614,7 @@ fn parse_body(ls: &mut Loadsheet, lines: &[String]) {
             continue;
         }
         // The line holds only the cut weight, so nothing else is skipped.
-        if Some(i) == last && i > 0 && is_cut_weight(ls, line) {
+        if Some(i) == last && is_cut_weight(ls, line) {
             continue;
         }
         if flight_seen {
@@ -631,6 +681,14 @@ fn parse_body(ls: &mut Loadsheet, lines: &[String]) {
                 }
             }
         }
+        for (re, idx) in COLUMN_INDEX.iter() {
+            let slot = idx.slot(ls);
+            if slot.is_none() {
+                if let Some(c) = re.captures(line) {
+                    *slot = c[1].replace(',', ".").parse().ok();
+                }
+            }
+        }
         if ls.notoc.is_none() {
             if let Some(c) = NOTOC.captures(line) {
                 ls.notoc = Some(&c[1] == "YES");
@@ -659,7 +717,10 @@ fn parse_acceptance(text: &str) -> Option<Loadsheet> {
         ls.date = Some(format!("20{}-{}-{}", &d[4..6], &d[2..4], &d[0..2]));
         return Some(ls);
     }
-    if ACCEPT_WORDS.is_match(text) || ACK_LOADSHEET.is_match(text) || ACCEPT_OF.is_match(text) {
+    if ACCEPT_WORDS.is_match(text) || ACK_LOADSHEET.is_match(text)
+        || ACCEPT_COMMAS.is_match(text)
+        || ACCEPT_OF.is_match(text)
+    {
         let mut ls = Loadsheet::new(LoadsheetKind::Acceptance);
         if let Some(c) = STATUS.captures(text) {
             ls.status = Some(status_of(&c[1]));
@@ -669,6 +730,11 @@ fn parse_acceptance(text: &str) -> Option<Loadsheet> {
         }
         if let Some(c) = ACCEPT_FLIGHT.captures(text) {
             ls.flight_number = Some(c[1].to_owned());
+        }
+        if let Some(c) = ACCEPT_FOR_DATE.captures(text) {
+            if let Some(date) = flight_date(&c[1], &c[2], &c[3]) {
+                ls.date = Some(date);
+            }
         }
         if let Some(c) = ACCEPT_SECTORS.iter().find_map(|r| r.captures(text)) {
             ls.departure = Some(c[1].to_owned());

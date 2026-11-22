@@ -117,6 +117,7 @@
       "kind": "loadsheet",
       "status": "final",
       "time": "2140",
+      "edition": 2,
       "flight_number": "TK0053",
       "flight_day": 21,
       "departure": "BKK",
@@ -284,6 +285,7 @@
       "arrival": "DZA",
       "registration": "F-OLRB",
       "crew": "3/9",
+      "underload": 107,
       "dow": 119930,
       "doi": 51.7,
       "zfw": 152493,
@@ -332,11 +334,21 @@
       "date": "2026-11-21",
       "weight_unit": "LB",
       "dow": 184097,
+      "doi": 5.61,
       "zfw": 272172,
+      "zfw_max": 286600,
+      "li_zfw": 17.42,
       "tof": 25825,
       "tow": 297997,
+      "tow_max": 312425,
+      "li_tow": 36.27,
       "tif": 8805,
       "law": 289192,
+      "law_max": 308650,
+      "li_law": 40.73,
+      "mac_zfw": 21.8,
+      "mac_tow": 24.5,
+      "mac_law": 25.1,
       "underload": 14428
     }
   },
@@ -559,6 +571,113 @@
       "crew": "2/4",
       "zfw": 100000,
       "tow": 120000
+    }
+  },
+  {
+    "id": 900000008,
+    "label": "RA",
+    "description": "synthetic: ULOAD cut to two digits on the last line",
+    "text": "LOADSHEET FINAL 1200 EDNO1\nBA123/01 01JAN26\nLHR JFK G-TEST 2/4\nZFW 100000\nULOAD 12",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "edition": 1,
+      "time": "1200",
+      "flight_number": "BA123",
+      "flight_day": 1,
+      "date": "2026-01-01",
+      "departure": "LHR",
+      "arrival": "JFK",
+      "registration": "G-TEST",
+      "crew": "2/4",
+      "zfw": 100000
+    }
+  },
+  {
+    "id": 900000009,
+    "label": "RA",
+    "description": "synthetic: acceptance with the year in the flight date",
+    "text": "LDSHT ACCEPT ACK FOR QR274/21NOV26 AMS-DOH",
+    "expected": {
+      "kind": "acceptance",
+      "flight_number": "QR274",
+      "date": "2026-11-21",
+      "departure": "AMS",
+      "arrival": "DOH"
+    }
+  },
+  {
+    "id": 900000010,
+    "label": "RA",
+    "description": "synthetic: cut weight as the only body line",
+    "text": "LOADSHEET FINAL\nTOW 2",
+    "expected": null
+  },
+  {
+    "id": 900000011,
+    "label": "RA",
+    "description": "synthetic: comma-separated acceptance",
+    "text": "LOADSHEET FINAL,EDNO 01,ACCEPT",
+    "expected": {
+      "kind": "acceptance",
+      "status": "final",
+      "edition": 1
+    }
+  },
+  {
+    "id": 900000012,
+    "label": "RA",
+    "description": "synthetic: MAC ZFW index line after the flight line",
+    "text": "LOADSHEET FINAL\nAI160/21 21NOV26\nMAC ZFW 32.5\nZFW 214843 MAX 237682",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "flight_number": "AI160",
+      "flight_day": 21,
+      "date": "2026-11-21",
+      "mac_zfw": 32.5,
+      "zfw": 214843,
+      "zfw_max": 237682
+    }
+  },
+  {
+    "id": 900000013,
+    "label": "RA",
+    "description": "synthetic: Max after an index closes the column, no maximum",
+    "text": "LOADSHEET FINAL 0900 EDNO 1\nD0123/21 21NOV26\nZFW   272172  17,42 Max\nTOW   297997  36,27 Op. Max",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "edition": 1,
+      "time": "0900",
+      "flight_number": "D0123",
+      "flight_day": 21,
+      "date": "2026-11-21",
+      "zfw": 272172,
+      "li_zfw": 17.42,
+      "tow": 297997,
+      "li_tow": 36.27
+    }
+  },
+  {
+    "id": 900000014,
+    "label": "RA",
+    "description": "synthetic: EDNO reference on the header line",
+    "text": "LOADSHEET FINAL 2140 EDNO H040098-KO/02\nTK0053/21 21NOV26\nBKK IST TC-JJA 3/12\nZFW 160708 MAX 175000",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "edition": 2,
+      "time": "2140",
+      "flight_number": "TK0053",
+      "flight_day": 21,
+      "date": "2026-11-21",
+      "departure": "BKK",
+      "arrival": "IST",
+      "registration": "TC-JJA",
+      "crew": "3/12",
+      "zfw": 160708,
+      "zfw_max": 175000
     }
   }
 ]
