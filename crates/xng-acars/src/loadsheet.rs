@@ -246,6 +246,8 @@ static ZFW: LazyLock<Regex> = LazyLock::new(|| re(r"^ZFW(?: ACTUAL)?:?\s+(\d+)(?
 static TOW: LazyLock<Regex> = LazyLock::new(|| re(r"^TOW(?: ACTUAL)?:?\s+(\d+)(?:[^\d.]|$)"));
 static LAW: LazyLock<Regex> =
     LazyLock::new(|| re(r"^(?:LAW|LDW|LGW|LW)(?: ACTUAL)?:?\s+(\d+)(?:[^\d.]|$)"));
+/// A bare `KEY number` line, checked on the last line for a cut-off value.
+static BARE_KEY_NUMBER: LazyLock<Regex> = LazyLock::new(|| re(r"^[A-Z]+:?\s+([0-9]+)$"));
 static MAX: LazyLock<Regex> = LazyLock::new(|| re(r"\bM(?:AX)?\s*(\d+)"));
 static LIMIT_MARK: LazyLock<Regex> = LazyLock::new(|| re(r"[\s\d]L$"));
 static WEIGHT_START: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:ZFW|TOW)(?: ACTUAL)?:?\s+\d"));
@@ -513,10 +515,23 @@ fn parse_body(ls: &mut Loadsheet, lines: &[String]) {
     let mut flight_seen = false;
     let mut route_seen = false;
     let mut since_flight = 0;
+    let last = lines.iter().rposition(|l| !l.trim().is_empty());
     for (i, line) in lines.iter().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        // Long loadsheets are split over several messages, and the split can
+        // fall inside a value ("TOW 2" for "TOW 288113"). A bare key and
+        // number on the last line is read only when it is about as long as
+        // the ZFW.
+        if Some(i) == last && i > 0 {
+            if let Some(c) = BARE_KEY_NUMBER.captures(line) {
+                let zfw_digits = ls.zfw.map(|z| z.to_string().len());
+                if zfw_digits.is_none_or(|d| c[1].len() + 1 < d) {
+                    continue;
+                }
+            }
         }
         if flight_seen {
             since_flight += 1;

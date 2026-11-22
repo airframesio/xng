@@ -236,8 +236,7 @@
    "tof": 41300,
    "tow": 192434,
    "tow_max": 233000,
-   "tif": 30754,
-   "law": 1616
+   "tif": 30754
   }
  },
  {
@@ -352,6 +351,29 @@
    "departure": "CDG",
    "arrival": "LOS",
    "registration": "FGSPO"
+  }
+ },
+ {
+  "id": 8188137282,
+  "label": "10",
+  "description": "loadsheet cut off inside a value at the end of the message",
+  "text": "QUDOHEOQR~1DIS01010101\r\n\r\nLOADSHEET FINAL 1508 EDNO1\r\nQR274/21      21NOV26\r\nAMS DOH A7-BEA   2/15\r\n************************\r\nZFW 232413 MAX 237682  L\r\n************************\r\nTOF 55700\r\n************************\r\nTOW 2",
+  "expected": {
+   "kind": "loadsheet",
+   "status": "final",
+   "edition": 1,
+   "time": "1508",
+   "flight_number": "QR274",
+   "flight_day": 21,
+   "date": "2026-11-21",
+   "departure": "AMS",
+   "arrival": "DOH",
+   "registration": "A7-BEA",
+   "crew": "2/15",
+   "zfw": 232413,
+   "zfw_max": 237682,
+   "limiting": "ZFW",
+   "tof": 55700
   }
  },
  {
