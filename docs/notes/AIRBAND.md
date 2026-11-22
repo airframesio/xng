@@ -142,11 +142,11 @@ than `max-s` (28 s) go in pieces. One worker runs the engine, oldest first;
 when it falls behind, the oldest waiting transmissions are dropped (queue of
 16), and the log says so with a hint to pick a smaller model.
 
-Engines (all opt-in; release binaries and Docker images include none of the
-local ones):
+Engines (release binaries and Docker images include sherpa-onnx, except the
+32-bit ARM Docker image; whisper.cpp is opt-in):
 
-- **sherpa-onnx** (`sherpa` build feature: `cargo build --release --features
-  sherpa`). Moonshine, NVIDIA Parakeet and SenseVoice on ONNX Runtime. These
+- **sherpa-onnx** (`sherpa` build feature, on in releases; from source:
+  `cargo build --release --features sherpa`). Moonshine, NVIDIA Parakeet and SenseVoice on ONNX Runtime. These
   models cost compute in proportion to the audio, where Whisper pads every
   transmission to a 30 s window, so a 4 s call is several times cheaper. The
   build links a prebuilt static sherpa-onnx library downloaded from its

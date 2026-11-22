@@ -50,10 +50,10 @@ jobs:
         uses: ./.github/actions/pothossdr
       - name: Build
         if: ${{ !matrix.windows }}
-        run: cargo build --release --features airspy,airspyhf
+        run: cargo build --release --features airspy,airspyhf,sherpa
       - name: Build (Windows)
         if: matrix.windows
-        run: cargo build --release
+        run: cargo build --release --features sherpa
       - name: Package zip (Windows)
         if: matrix.windows
         shell: bash
@@ -138,7 +138,10 @@ jobs:
           macOS runners) — `brew install soapysdr airspy airspyhf protobuf
           && cargo build --release --features airspy,airspyhf`.
 
-          Binaries are built with SoapySDR plus the native Airspy backends;
+          Binaries include airband transcription (sherpa-onnx): `--transcribe`
+          downloads the ATC-tuned `skycontrol-atc-110m` model (137 MB) once
+          on first use. Binaries are built with SoapySDR plus the native
+          Airspy backends;
           they need `libsoapysdr` (and `libairspy`/`libairspyhf` for native
           Airspy) at runtime — the .deb declares these. Multi-arch Docker
           images (amd64/arm64/armv7) are published to

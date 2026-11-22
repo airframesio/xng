@@ -7,7 +7,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /usr/src/app
 COPY . .
-RUN cargo build --release --bin xng
+# Airband transcription (sherpa-onnx) everywhere it has a prebuilt library;
+# it has none for 32-bit ARM.
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "arm" ]; then \
+        cargo build --release --bin xng; \
+    else \
+        cargo build --release --bin xng --features sherpa; \
+    fi
 
 FROM debian:bookworm-slim
 
