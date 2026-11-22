@@ -29,12 +29,19 @@ run adsb /tmp/bench_modes1_x20.cu8 cu8 adsb 2000000 1090000000 1090 3.57
 # acarsdec-replacement load that the per-channel front end has to keep up with.
 # Regenerate the fixture every run (cheap, ~0.5 s) so a change to gen_capture
 # can never leave a stale /tmp capture skewing the comparison.
-cargo run --release -q -p xng-mode-acars --example gen_capture -- /tmp/bench_acars_1x.cf32 >/dev/null 2>&1
+cargo run --release -q -p xng-mode-acars --example gen_capture -- /tmp/bench_acars_1x.cf32 >/dev/null || { echo "acars: capture generation failed" >&2; exit 1; }
 for _ in $(seq 5); do cat /tmp/bench_acars_1x.cf32; done > /tmp/bench_acars_8ch.cf32
 # gen_capture writes ~0.47 s at 2.4 MS/s; ×5 ≈ 2.36 s. 8 channels across the
 # US ACARS plan around the 131.500 capture center.
 run acars /tmp/bench_acars_8ch.cf32 cf32 acars 2400000 131500000 \
   131.425,131.450,131.475,131.525,131.550,131.575,131.725,131.825 2.36
+# VDL2 live workload: the real 7-channel plan inside one 2.4 MS/s capture
+# centered at 136.8125 MHz, each channel its own full-rate DDC. gen_vdl2_capture
+# writes exactly 4.0 s of RC-shaped bursts on every channel; regenerated
+# every run for the same reason as the acars row.
+cargo run --release -q -p xng-mode-vdl2 --example gen_vdl2_capture -- /tmp/bench_vdl2_7ch.cf32 4.0 >/dev/null || { echo "vdl2_7ch: capture generation failed" >&2; exit 1; }
+run vdl2_7ch /tmp/bench_vdl2_7ch.cf32 cf32 vdl2 2400000 136812500 \
+  136.650,136.725,136.775,136.825,136.875,136.925,136.975 4.0
 [ -f bench/data/ais_96k.cs16 ] && run ais bench/data/ais_96k.cs16 cs16 ais 96000 162000000 161.975,162.025 300
 [ -f bench/data/vdl2_105k_conj.s16 ] && run vdl2 bench/data/vdl2_105k_conj.s16 cs16 vdl2 105000 136975000 136.975 46.9
 [ -f bench/data/hfdl_48k.cs16 ] && run hfdl bench/data/hfdl_48k.cs16 cs16 hfdl 48000 21931000 21931k 127.3

@@ -20,31 +20,32 @@ pub struct Resampler {
     /// Input samples consumed per output sample (`in_rate / out_rate`).
     step: f64,
     /// Read position of the next output sample, in samples from the start of
-    /// `carry`. Kept in `[1, 2)` between calls so index `i-1` always exists.
+    /// `buf`. Kept in `[1, 2)` between calls so index `i-1` always exists.
     pos: f64,
-    /// Tail of the previous block needed for continuity (the 4-point kernel
-    /// reaches one sample back and two forward).
-    carry: Vec<IqSample>,
+    /// Persistent working buffer. Between calls it holds only the retained
+    /// tail of the previous block needed for continuity (the 4-point kernel
+    /// reaches one sample back and two forward); each call appends the new
+    /// block, so its capacity is reused and steady state never allocates.
+    buf: Vec<IqSample>,
 }
 
 impl Resampler {
     /// Resample from `in_rate` to `out_rate` (both Hz, `in_rate >= out_rate`
     /// in practice, though any positive ratio works).
     pub fn new(in_rate: f64, out_rate: f64) -> Self {
-        Self { step: in_rate / out_rate, pos: 1.0, carry: Vec::new() }
+        Self { step: in_rate / out_rate, pos: 1.0, buf: Vec::new() }
     }
 
     /// Resample `input`, appending output samples to `out`.
     pub fn process(&mut self, input: &[IqSample], out: &mut Vec<IqSample>) {
-        // Work on the carried tail followed by the new block.
-        let mut buf = std::mem::take(&mut self.carry);
-        buf.extend_from_slice(input);
-        let n = buf.len();
+        // Work on the retained tail followed by the new block.
+        self.buf.extend_from_slice(input);
+        let n = self.buf.len();
         // Need indices i-1 .. i+2, with i = floor(pos): require pos < n-2.
         if n < 4 {
-            self.carry = buf;
             return;
         }
+        let buf = &self.buf;
         let mut pos = self.pos;
         while pos < (n - 2) as f64 {
             let i = pos.floor() as usize;
@@ -53,9 +54,9 @@ impl Resampler {
             pos += self.step;
         }
         // Retain from one sample before the next read position so the kernel's
-        // `i-1` tap survives into the next call; rebase `pos` onto the carry.
+        // `i-1` tap survives into the next call; rebase `pos` onto the tail.
         let keep_from = (pos.floor() as usize).saturating_sub(1).min(n);
-        self.carry = buf.split_off(keep_from);
+        self.buf.drain(..keep_from);
         self.pos = pos - keep_from as f64;
     }
 }
@@ -135,5 +136,131 @@ mod tests {
         let mid = out.len() / 2;
         let dphi = (out[mid + 1] * out[mid].conj()).arg();
         assert!((dphi - expected_dphi).abs() < 1e-3, "freq drifted: {dphi} vs {expected_dphi}");
+    }
+
+    /// Frozen copy of the original allocating `process` algorithm, kept as the
+    /// bit-exact reference for any optimisation of [`Resampler::process`].
+    struct RefResampler {
+        step: f64,
+        pos: f64,
+        carry: Vec<IqSample>,
+    }
+
+    impl RefResampler {
+        fn new(step: f64) -> Self {
+            Self { step, pos: 1.0, carry: Vec::new() }
+        }
+    }
+
+    fn reference_process(st: &mut RefResampler, input: &[IqSample], out: &mut Vec<IqSample>) {
+        let mut buf = std::mem::take(&mut st.carry);
+        buf.extend_from_slice(input);
+        let n = buf.len();
+        if n < 4 {
+            st.carry = buf;
+            return;
+        }
+        let mut pos = st.pos;
+        while pos < (n - 2) as f64 {
+            let i = pos.floor() as usize;
+            let mu = (pos - i as f64) as f32;
+            out.push(cubic(buf[i - 1], buf[i], buf[i + 1], buf[i + 2], mu));
+            pos += st.step;
+        }
+        let keep_from = (pos.floor() as usize).saturating_sub(1).min(n);
+        st.carry = buf.split_off(keep_from);
+        st.pos = pos - keep_from as f64;
+    }
+
+    /// Deterministic xorshift64 stream in `[-1, 1)`.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next_f32(&mut self) -> f32 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+
+        fn next_usize(&mut self, below: usize) -> usize {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 33) as usize % below
+        }
+    }
+
+    /// Chirp plus noise, so every sample (and every `mu`) is distinct.
+    fn test_signal(n: usize) -> Vec<IqSample> {
+        let mut rng = Lcg(0x9e37_79b9_7f4a_7c15);
+        (0..n)
+            .map(|i| {
+                let t = i as f64;
+                let ph = TAU * (0.01 * t + 2.0e-6 * t * t);
+                IqSample::new(
+                    ph.cos() as f32 + 0.1 * rng.next_f32(),
+                    ph.sin() as f32 + 0.1 * rng.next_f32(),
+                )
+            })
+            .collect()
+    }
+
+    fn chunk_sizes(pattern: &str, total: usize) -> Vec<usize> {
+        let mut sizes = Vec::new();
+        let mut left = total;
+        let mut rng = Lcg(0x2545_f491_4f6c_dd1d);
+        let cycle = [1usize, 5, 3, 64, 2, 1000, 4, 17, 0, 333, 1, 4096];
+        let mut k = 0;
+        while left > 0 {
+            let want = match pattern {
+                "1" => 1,
+                "2" => 2,
+                "3" => 3,
+                "4" => 4,
+                "257" => 257,
+                "7919" => 7919,
+                "cyclic" => {
+                    k += 1;
+                    cycle[(k - 1) % cycle.len()]
+                }
+                "random" => rng.next_usize(3000),
+                _ => unreachable!("unknown chunk pattern {pattern}"),
+            };
+            let sz = want.min(left);
+            sizes.push(sz);
+            left -= sz;
+        }
+        sizes
+    }
+
+    #[test]
+    fn streaming_matches_reference_bit_exact() {
+        let input = test_signal(60_000);
+        let steps = [1.0001, 1.37, 2_500_000.0 / 1_200_000.0, 2.9, 4.7];
+        let patterns = ["1", "2", "3", "4", "257", "7919", "cyclic", "random"];
+        for &step in &steps {
+            for pattern in patterns {
+                let mut rs = Resampler::new(step, 1.0);
+                let mut reference = RefResampler::new(step);
+                let mut got = Vec::new();
+                let mut want = Vec::new();
+                let mut off = 0;
+                for sz in chunk_sizes(pattern, input.len()) {
+                    let chunk = &input[off..off + sz];
+                    off += sz;
+                    rs.process(chunk, &mut got);
+                    reference_process(&mut reference, chunk, &mut want);
+                }
+                assert_eq!(got.len(), want.len(), "length mismatch step={step} chunks={pattern}");
+                assert!(!want.is_empty());
+                for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        g.re.to_bits() == w.re.to_bits() && g.im.to_bits() == w.im.to_bits(),
+                        "sample {k} differs step={step} chunks={pattern}: {g} vs {w}"
+                    );
+                }
+            }
+        }
     }
 }

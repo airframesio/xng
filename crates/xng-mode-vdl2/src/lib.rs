@@ -4,6 +4,8 @@
 //! IQ → [`demod::Vdl2Demod`] (D8PSK burst acquisition, header,
 //! deinterleave + RS(255,249)) → [`avlc`] frame scan → ACARS-over-AVLC via
 //! [`xng_acars::block`] → [`xng_types::Message`].
+//! [`Vdl2MultiChannelDecoder`] replaces the per-channel DDCs with one shared
+//! front end feeding the same per-channel back end.
 //!
 //! See PROVENANCE.md for clean-room sourcing (no GPL decoder code used).
 
@@ -19,7 +21,7 @@ pub mod scramble;
 use chrono::Utc;
 use num_complex::Complex;
 use xng_dsp::rs::ReedSolomon;
-use xng_dsp::Ddc;
+use xng_dsp::{ChannelizedDdc, Ddc, Oversample, SharedDdc};
 use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQuality};
 
 /// Internal channel rate (≈4.76 samples/symbol).
@@ -44,95 +46,103 @@ pub struct Vdl2Frame {
     pub snr_db: f32,
 }
 
-pub struct Vdl2ChannelDecoder {
-    ddc: Option<Ddc>,
-    /// Channel-selectivity lowpass for the no-DDC path. The RC(α=0.6)
+/// Preferred channel rate (an exact 10 samples/symbol), used when the capture
+/// rate is an integer multiple of it.
+const CHANNEL_RATE_NATIVE: f64 = 105_000.0;
+
+/// Pick the internal channel rate for a capture rate.
+///
+/// Prefer 105 kS/s (an exact 10 samples/symbol) when the input divides into
+/// it: at 100 kS/s every symbol center falls at a fractional sample position
+/// and the linear interpolator's error acts as decision noise; integer sps
+/// removes it. Otherwise prefer the high channel rate when the capture divides
+/// into it; 50 kS/s remains the floor (and the vendored-fixture rate).
+fn channel_rate_for(input_rate: f64) -> f64 {
+    if input_rate >= CHANNEL_RATE_NATIVE
+        && (input_rate / CHANNEL_RATE_NATIVE).fract().abs() < 1e-9
+    {
+        CHANNEL_RATE_NATIVE
+    } else if input_rate >= CHANNEL_RATE_HI
+        && (input_rate / CHANNEL_RATE_HI).fract().abs() < 1e-9
+    {
+        CHANNEL_RATE_HI
+    } else {
+        CHANNEL_RATE
+    }
+}
+
+/// Where a channel's selectivity (its channel filter) comes from.
+#[derive(Clone, Copy)]
+enum Selectivity {
+    /// The front end only anti-aliases ([`Ddc`], [`SharedDdc`] at
+    /// [`shared_front_passband_hz`]), so the back end runs its own FIR.
+    BackEnd,
+    /// The front end already filters every channel to
+    /// ±[`CHANNELIZER_PASSBAND_HZ`] ([`ChannelizedDdc`]); a second filter
+    /// would only add cost.
+    FrontEnd,
+}
+
+/// Per-channel back end: everything downstream of the front-end
+/// downconverter (channel filter, demod, AVLC scan, ACARS/ATN decode). Shared
+/// verbatim by the single- and multi-channel decoders so the two paths cannot
+/// drift.
+struct ChannelBack {
+    /// Channel-selectivity lowpass at the channel rate, when the front end
+    /// does not provide one ([`Selectivity::BackEnd`]). The RC(α=0.6)
     /// TX pulse occupies ±(1+α)·Rs/2 = ±8.4 kHz; a flat lowpass there
     /// keeps the signal spectrum (and its Nyquist zero-ISI property)
-    /// untouched while removing all out-of-band noise. When a DDC runs
-    /// its decimation filter already provides this.
+    /// untouched while removing all out-of-band noise.
     selectivity: Option<xng_dsp::fir::Fir>,
     select_buf: Vec<Complex<f32>>,
     demod: demod::Vdl2Demod,
     rs: ReedSolomon,
-    channel_buf: Vec<Complex<f32>>,
     x25: atn::X25Reassembler,
     clnp: atn::ClnpReassembler,
     cotp: atn::CotpReassembler,
-    samples_seen: u64,
-    input_rate: f64,
 }
 
-impl Vdl2ChannelDecoder {
-    pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
-        // Prefer the high channel rate when the capture divides into it;
-        // 50 kS/s remains the floor (and the vendored-fixture rate).
-        // Prefer 105 kS/s (an exact 10 samples/symbol) when the input
-        // divides into it: at 100 kS/s every symbol center falls at a
-        // fractional sample position and the linear interpolator's
-        // error acts as decision noise; integer sps removes it.
-        const CHANNEL_RATE_NATIVE: f64 = 105_000.0;
-        let channel_rate = if input_rate >= CHANNEL_RATE_NATIVE
-            && (input_rate / CHANNEL_RATE_NATIVE).fract().abs() < 1e-9
-        {
-            CHANNEL_RATE_NATIVE
-        } else if input_rate >= CHANNEL_RATE_HI
-            && (input_rate / CHANNEL_RATE_HI).fract().abs() < 1e-9
-        {
-            CHANNEL_RATE_HI
-        } else {
-            CHANNEL_RATE
+impl ChannelBack {
+    fn new(channel_rate: f64, source: Selectivity) -> Self {
+        // -6 dB point at the symbol rate so the filter is flat through the
+        // RC band edge (8.4 kHz) and the windowed-sinc transition lives
+        // entirely in the noise-only region. This runs after the `Ddc` and
+        // `SharedDdc` front ends: their final stage is sized as an
+        // anti-alias filter, not a channel filter (≈−2 dB at 12 kHz for
+        // 2.4 MS/s → 100 kS/s), so this FIR is their channel filter. On the
+        // live path it moved the 50%-decode SNR from 20.8 to 18.6 dB.
+        let selectivity = match source {
+            Selectivity::BackEnd => Some(xng_dsp::fir::Fir::new(xng_dsp::fir::lowpass_taps(
+                demod::SYMBOL_RATE / channel_rate,
+                101,
+            ))),
+            Selectivity::FrontEnd => None,
         };
-        let ddc = if (input_rate - channel_rate).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
-            None
-        } else {
-            Some(Ddc::new(input_rate, channel_rate, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
-        };
-        let selectivity = if ddc.is_none() {
-            // -6 dB point at the symbol rate so the filter is flat
-            // through the RC band edge (8.4 kHz) and the windowed-sinc
-            // transition lives entirely in the noise-only region.
-            let taps = xng_dsp::fir::lowpass_taps(demod::SYMBOL_RATE / channel_rate, 101);
-            Some(xng_dsp::fir::Fir::new(taps))
-        } else {
-            None
-        };
-        Ok(Self {
-            ddc,
+        Self {
             selectivity,
             select_buf: Vec::new(),
             demod: demod::Vdl2Demod::new(channel_rate),
             rs: interleave::vdl2_rs(),
-            channel_buf: Vec::new(),
             x25: atn::X25Reassembler::new(),
             clnp: atn::ClnpReassembler::new(),
             cotp: atn::CotpReassembler::new(),
-            samples_seen: 0,
-            input_rate,
-        })
+        }
     }
 
-    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Vdl2Frame> {
-        self.samples_seen += input.len() as u64;
-        let now = self.samples_seen as f64 / self.input_rate;
-        let channel: &[Complex<f32>] = match &mut self.ddc {
-            Some(ddc) => {
-                self.channel_buf.clear();
-                ddc.process(input, &mut self.channel_buf);
-                &self.channel_buf
+    /// Feed channel-rate IQ; `now` is the wideband timebase (seconds of
+    /// capture consumed) used by the ATN reassemblers' timeouts.
+    fn process(&mut self, channel: &[Complex<f32>], now: f64) -> Vec<Vdl2Frame> {
+        let selected: &[Complex<f32>] = match &mut self.selectivity {
+            Some(fir) => {
+                self.select_buf.clear();
+                fir.process(channel, &mut self.select_buf);
+                &self.select_buf
             }
-            None => match &mut self.selectivity {
-                Some(fir) => {
-                    self.select_buf.clear();
-                    fir.process(input, &mut self.select_buf);
-                    &self.select_buf
-                }
-                None => input,
-            },
+            None => channel,
         };
         let mut out = Vec::new();
-        for burst in self.demod.process(channel, &self.rs) {
-            for frame in avlc::scan(&burst.bits) {
+        for burst in self.demod.process(selected, &self.rs) {
+            for frame in burst.frames {
                 let acars = match frame.payload {
                     avlc::Payload::Acars => {
                         let start = frame.info.iter().position(|&b| b != 0xFF).unwrap_or(0);
@@ -161,15 +171,269 @@ impl Vdl2ChannelDecoder {
         }
         out
     }
+}
+
+pub struct Vdl2ChannelDecoder {
+    ddc: Option<Ddc>,
+    channel_buf: Vec<Complex<f32>>,
+    back: ChannelBack,
+    samples_seen: u64,
+    input_rate: f64,
+    channel_rate: f64,
+}
+
+impl Vdl2ChannelDecoder {
+    pub fn new(input_rate: f64, freq_offset_hz: f64) -> Result<Self, String> {
+        let channel_rate = channel_rate_for(input_rate);
+        let ddc = if (input_rate - channel_rate).abs() < 1e-6 && freq_offset_hz.abs() < 1e-6 {
+            None
+        } else {
+            Some(Ddc::new(input_rate, channel_rate, freq_offset_hz, CHANNEL_PASSBAND_HZ)?)
+        };
+        Ok(Self {
+            ddc,
+            channel_buf: Vec::new(),
+            back: ChannelBack::new(channel_rate, Selectivity::BackEnd),
+            samples_seen: 0,
+            input_rate,
+            channel_rate,
+        })
+    }
+
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<Vdl2Frame> {
+        self.samples_seen += input.len() as u64;
+        let now = self.samples_seen as f64 / self.input_rate;
+        let channel: &[Complex<f32>] = match &mut self.ddc {
+            Some(ddc) => {
+                self.channel_buf.clear();
+                ddc.process(input, &mut self.channel_buf);
+                &self.channel_buf
+            }
+            None => input,
+        };
+        self.back.process(channel, now)
+    }
 
     pub fn level_dbfs(&self) -> f32 {
-        self.demod.level_dbfs()
+        self.back.demod.level_dbfs()
     }
 
     /// Reject bursts whose carrier offset exceeds `ppm` (VDL2-7); `None`
     /// (default) accepts every CFO-fit candidate.
     pub fn set_max_ppm(&mut self, ppm: Option<f64>) {
-        self.demod.set_max_ppm(ppm);
+        self.back.demod.set_max_ppm(ppm);
+    }
+
+    /// Internal channel rate the demod runs at (S/s).
+    pub fn channel_rate(&self) -> f64 {
+        self.channel_rate
+    }
+}
+
+/// One-sided passband of the channelizer front end, which filters every
+/// channel to it: this is VDL2's channel filter on the channelized path
+/// (the back end's own selectivity FIR is skipped there). 10.5 kHz is the
+/// symbol rate, the same cutoff as that FIR — flat through the RC band edge
+/// (±8.4 kHz), the transition in the noise-only region. The channelizer's
+/// residual-vs-bin-edge rule is sized from it too. Passing that rule does not make a critically sampled bin
+/// flat there: a channel 37.5 kHz off a 100 kHz bin center still sits in the
+/// prototype's roll-off; the 2× bank the default uses is flat there (see
+/// [`Vdl2MultiChannelDecoder::new`]).
+pub const CHANNELIZER_PASSBAND_HZ: f64 = 10_500.0;
+
+/// One-sided passband for the shared-decimation front end at `channel_rate`.
+///
+/// `SharedDdc` realizes its passband with a per-channel "sharp" FIR at the
+/// intermediate rate whose length scales with 1/passband; a narrow passband
+/// there would duplicate the back end's selectivity FIR at far higher cost. A
+/// wide 0.4·rate (40 kHz at 100 kS/s; `SharedDdc` needs rate ≥ 2·passband)
+/// keeps it a short anti-alias stage and leaves the channel filtering to the
+/// back end.
+pub fn shared_front_passband_hz(channel_rate: f64) -> f64 {
+    0.4 * channel_rate
+}
+
+/// Shared multi-channel downconverter front end (see
+/// [`Vdl2MultiChannelDecoder`]).
+enum Front {
+    Channelized(ChannelizedDdc),
+    Shared(SharedDdc),
+}
+
+impl Front {
+    fn process(&mut self, input: &[Complex<f32>], out: &mut [Vec<Complex<f32>>]) {
+        match self {
+            Self::Channelized(c) => c.process(input, out),
+            Self::Shared(s) => s.process(input, out),
+        }
+    }
+}
+
+/// Decodes SEVERAL VDL2 channels out of one wideband capture with a single
+/// shared downconverter front end: the wideband-rate work is done once for all
+/// channels, then each channel runs the same back end as
+/// [`Vdl2ChannelDecoder`] (demod, AVLC, ACARS/ATN; plus the selectivity FIR
+/// behind the shared decimation, whereas the channelizer is itself the
+/// channel filter).
+///
+/// Two front ends with the same contract:
+/// * a polyphase channelizer ([`xng_dsp::ChannelizedDdc`]): one FFT pass
+///   produces every channel; the default, 2× oversampled (see [`Self::new`]).
+/// * a shared decimation ([`xng_dsp::SharedDdc`]): one full-rate decimation
+///   feeds cheap per-channel finishes; the fallback.
+pub struct Vdl2MultiChannelDecoder {
+    front: Front,
+    backs: Vec<ChannelBack>,
+    channel_bufs: Vec<Vec<Complex<f32>>>,
+    samples_seen: u64,
+    input_rate: f64,
+    channel_rate: f64,
+}
+
+impl Vdl2MultiChannelDecoder {
+    /// `input_rate` is the wideband capture rate; `offsets` are each channel's
+    /// center relative to the capture center (Hz).
+    ///
+    /// Uses the 2× oversampled channelizer front end ([`Oversample::Twice`]),
+    /// falling back to the shared decimation if the channelizer cannot be
+    /// built for this rate/offset set.
+    ///
+    /// Not the critically sampled channelizer: its bins must be at least the
+    /// 100 kS/s channel rate, so on the 25 kHz VDL2 raster (e.g. the 7-channel
+    /// plan around 136.8125 MHz) four of seven channels sit 37.5 kHz off a
+    /// 100 kHz bin center, in the prototype's roll-off, and it decoded 35 of
+    /// the 44 off-air frames the shared decimation gets. The 2× bank is flat
+    /// wherever a channel falls in its bin: on that plan it matched the shared
+    /// decimation (44/44 off-air at every tuning offset, the same 50%-decode
+    /// SNR) at about half its CPU (PERF-20).
+    pub fn new(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
+        let channel_rate = channel_rate_for(input_rate);
+        let front = match ChannelizedDdc::with_oversample(
+            input_rate,
+            channel_rate,
+            offsets,
+            CHANNELIZER_PASSBAND_HZ,
+            Oversample::Twice,
+        ) {
+            Ok(c) => Front::Channelized(c),
+            // On double failure report BOTH errors so an unusual capture
+            // config shows why the default channelizer was rejected too.
+            Err(chan_err) => Front::Shared(
+                SharedDdc::new(
+                    input_rate,
+                    channel_rate,
+                    offsets,
+                    shared_front_passband_hz(channel_rate),
+                )
+                .map_err(|shared_err| {
+                    format!(
+                        "channelizer rejected ({chan_err}); shared-decim also failed ({shared_err})"
+                    )
+                })?,
+            ),
+        };
+        Ok(Self::with_front(front, input_rate, channel_rate, offsets.len()))
+    }
+
+    /// Build with the shared-decimation front end explicitly (no fallback).
+    pub fn new_shared(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
+        let channel_rate = channel_rate_for(input_rate);
+        let front = Front::Shared(SharedDdc::new(
+            input_rate,
+            channel_rate,
+            offsets,
+            shared_front_passband_hz(channel_rate),
+        )?);
+        Ok(Self::with_front(front, input_rate, channel_rate, offsets.len()))
+    }
+
+    /// Build with the critically sampled channelizer front end explicitly
+    /// (no fallback).
+    pub fn new_channelized(input_rate: f64, offsets: &[f64]) -> Result<Self, String> {
+        Self::new_channelized_with_oversample(input_rate, offsets, Oversample::Critical)
+    }
+
+    /// Build with the channelizer front end explicitly (no fallback), with
+    /// the bank's oversampling chosen: [`Oversample::Twice`] serves every
+    /// channel flat wherever it falls in its bin (no roll-off for channels
+    /// off a bin center) at about twice the shared bank cost.
+    pub fn new_channelized_with_oversample(
+        input_rate: f64,
+        offsets: &[f64],
+        oversample: Oversample,
+    ) -> Result<Self, String> {
+        let channel_rate = channel_rate_for(input_rate);
+        let front = Front::Channelized(ChannelizedDdc::with_oversample(
+            input_rate,
+            channel_rate,
+            offsets,
+            CHANNELIZER_PASSBAND_HZ,
+            oversample,
+        )?);
+        Ok(Self::with_front(front, input_rate, channel_rate, offsets.len()))
+    }
+
+    fn with_front(front: Front, input_rate: f64, channel_rate: f64, channels: usize) -> Self {
+        let source = match front {
+            Front::Channelized(_) => Selectivity::FrontEnd,
+            Front::Shared(_) => Selectivity::BackEnd,
+        };
+        Self {
+            front,
+            backs: (0..channels).map(|_| ChannelBack::new(channel_rate, source)).collect(),
+            channel_bufs: vec![Vec::new(); channels],
+            samples_seen: 0,
+            input_rate,
+            channel_rate,
+        }
+    }
+
+    /// Number of channels.
+    pub fn num_channels(&self) -> usize {
+        self.backs.len()
+    }
+
+    /// Which front end was built, for benches, logs and tests:
+    /// `"channelized <bank geometry>"` or `"shared"`.
+    pub fn describe_front(&self) -> String {
+        match &self.front {
+            Front::Channelized(c) => format!("channelized {}", c.describe()),
+            Front::Shared(_) => "shared".to_string(),
+        }
+    }
+
+    /// Internal channel rate the demods run at (S/s).
+    pub fn channel_rate(&self) -> f64 {
+        self.channel_rate
+    }
+
+    /// Feed wideband IQ; returns the decoded frames for channel `i` as
+    /// `(i, frames)` for every channel that produced any, in ascending `i`.
+    pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<(usize, Vec<Vdl2Frame>)> {
+        self.samples_seen += input.len() as u64;
+        let now = self.samples_seen as f64 / self.input_rate;
+        self.front.process(input, &mut self.channel_bufs);
+        let mut out = Vec::new();
+        for (i, (back, buf)) in self.backs.iter_mut().zip(&self.channel_bufs).enumerate() {
+            let frames = back.process(buf, now);
+            if !frames.is_empty() {
+                out.push((i, frames));
+            }
+        }
+        out
+    }
+
+    /// Demod level (dBFS) for channel `i`.
+    pub fn level_dbfs(&self, i: usize) -> f32 {
+        self.backs[i].demod.level_dbfs()
+    }
+
+    /// Reject bursts whose carrier offset exceeds `ppm` on every channel
+    /// (VDL2-7); `None` (default) accepts every CFO-fit candidate.
+    pub fn set_max_ppm(&mut self, ppm: Option<f64>) {
+        for b in &mut self.backs {
+            b.demod.set_max_ppm(ppm);
+        }
     }
 }
 

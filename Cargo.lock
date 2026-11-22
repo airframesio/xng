@@ -4288,6 +4288,7 @@ dependencies = [
  "serde_json",
  "xng-acars",
  "xng-dsp",
+ "xng-sdr",
  "xng-types",
 ]
 
@@ -4546,6 +4547,7 @@ dependencies = [
  "serde_json",
  "xng-acars",
  "xng-dsp",
+ "xng-sdr",
  "xng-types",
 ]
 
