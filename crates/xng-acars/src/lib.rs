@@ -15,6 +15,7 @@ pub mod cpdlc;
 pub mod block;
 pub mod cfb;
 pub mod fpn;
+pub mod gate;
 pub mod loadsheet;
 pub mod media_adv;
 pub mod met;
@@ -76,6 +77,12 @@ pub enum AcarsApp {
     /// Weight and balance loadsheet (IATA AHM 517 and airline layouts), its
     /// acceptance by the crew, or a request for one; on any label.
     Loadsheet(Box<loadsheet::Loadsheet>),
+    /// Gate assignment: arrival gate uplinks on label RA (United GATE ASSIGN
+    /// / GATE CHANGE, Republic, SkyWest, Air Wisconsin, Frontier, American
+    /// and its regionals), pre-departure clearance departure gates (B3), and
+    /// airline gate, stand and parking messages on 10, 11, 21, 25, 3M, 3T,
+    /// 40, 41, 42, 5Z and C1.
+    Gate(gate::GateInfo),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -130,6 +137,9 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
         "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
         "5Z" => airline5z::parse(body).map(AcarsApp::Airline5z),
+        "RA" => gate::parse(text)
+            .map(AcarsApp::Gate)
+            .or_else(|| military::parse(text).map(|m| AcarsApp::Military(Box::new(m)))),
         _ => qseries::classify(label)
             .map(AcarsApp::QSeries)
             .or_else(|| military::parse(text).map(|m| AcarsApp::Military(Box::new(m)))),
@@ -138,6 +148,12 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
     // them on any label whose text mentions one and nothing else decoded.
     if out.app.is_none() && loadsheet::may_be_loadsheet(text) {
         out.app = loadsheet::parse(text).map(|l| AcarsApp::Loadsheet(Box::new(l)));
+    }
+    // Gate reports (B3 clearances, airline gate/stand messages on 10/11/21/
+    // 25/3M/3T/40/41/42/5Z/C1, and the label RA families after the uplinks above) come last, so
+    // they never replace a richer decode of the same text.
+    if out.app.is_none() {
+        out.app = gate::parse_report(label, text).map(AcarsApp::Gate);
     }
 
     // OOOI fields can be embedded in many labels' text (Q-series and several
@@ -184,6 +200,7 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
         }),
         AcarsApp::Military(m) => Some(m.summary()),
         AcarsApp::Loadsheet(l) => Some(l.summary()),
+        AcarsApp::Gate(g) => Some(g.summary()),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(
                 "MIAM v{} {}{}{}",

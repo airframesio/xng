@@ -86,6 +86,28 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
             }
             Some(s)
         }
+        "gate" => {
+            let mut s = match app.get("kind")?.as_str()? {
+                "gate_change" => "GATE CHANGE".to_owned(),
+                "gate_assign" => "GATE ASSIGN".to_owned(),
+                "departure_gate" => "DEPARTURE GATE".to_owned(),
+                _ => "ARRIVAL GATE".to_owned(),
+            };
+            let field = |k: &str| app.get(k).and_then(|v| v.as_str());
+            if let Some(f) = field("flight_number") {
+                s.push_str(&format!(" {f}"));
+            }
+            match (field("departure"), field("arrival")) {
+                (Some(d), Some(a)) => s.push_str(&format!(" {d}->{a}")),
+                (Some(a), None) | (None, Some(a)) => s.push_str(&format!(" {a}")),
+                (None, None) => {}
+            }
+            if let Some(d) = field("departure_gate") {
+                s.push_str(&format!(" dep gate {d}"));
+            }
+            s.push_str(&format!(" gate {}", app.get("gate")?.as_str()?));
+            Some(s)
+        }
         _ => None,
     }
 }
@@ -856,5 +878,28 @@ mod tests {
         );
         assert!(s.contains("IRIDIUM voice VOC"), "{s}");
         assert!(!s.contains("lcw="), "silent lcw should be omitted: {s}");
+    }
+
+    #[test]
+    fn gate_summary_names_flight_route_and_gate() {
+        let s = app_summary(&json!({
+            "app": "gate", "kind": "gate_assign", "gate": "43", "gate_status": "OPEN",
+            "flight_number": "UA0942", "departure": "KIAD", "arrival": "LPPT",
+        }));
+        assert_eq!(s.as_deref(), Some("GATE ASSIGN UA0942 KIAD->LPPT gate 43"));
+        let s = app_summary(&json!({"app": "gate", "kind": "arrival_gate", "gate": "4", "arrival": "BFL"}));
+        assert_eq!(s.as_deref(), Some("ARRIVAL GATE BFL gate 4"));
+        let s = app_summary(&json!({
+            "app": "gate", "kind": "departure_gate", "format": "PDC", "gate": "12",
+            "flight_number": "JZA110", "departure": "CYWG", "arrival": "CYOW",
+        }));
+        assert_eq!(s.as_deref(), Some("DEPARTURE GATE JZA110 CYWG->CYOW gate 12"));
+        let s = app_summary(&json!({"app": "gate", "kind": "arrival_gate", "format": "JETBLUE_INR", "gate": "514"}));
+        assert_eq!(s.as_deref(), Some("ARRIVAL GATE gate 514"));
+        let s = app_summary(&json!({
+            "app": "gate", "kind": "arrival_gate", "format": "JAZZ_FLIGHT_DATA", "gate": "A17",
+            "departure": "YVR", "departure_gate": "C40", "arrival": "YYC",
+        }));
+        assert_eq!(s.as_deref(), Some("ARRIVAL GATE YVR->YYC dep gate C40 gate A17"));
     }
 }
