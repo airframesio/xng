@@ -232,7 +232,13 @@ pub struct Recorder {
     streams: Vec<StreamId>,
     split: HashMap<StreamId, Split>,
     hourly: HashMap<StreamId, Hourly>,
+    /// Sidecars of recent transmissions, so a transcript that arrives after
+    /// the file is finished can be added to them.
+    sidecars: std::collections::VecDeque<((StreamId, u64), Vec<PathBuf>)>,
 }
+
+/// Transmissions whose sidecars stay findable for late transcripts.
+const SIDECARS_KEPT: usize = 256;
 
 impl Recorder {
     pub fn new(o: &AirbandOutputs) -> anyhow::Result<Option<Self>> {
@@ -254,6 +260,7 @@ impl Recorder {
             streams: crate::airband::config::parse_streams(&o.record_streams)?,
             split: HashMap::new(),
             hourly: HashMap::new(),
+            sidecars: Default::default(),
         }))
     }
 
@@ -280,6 +287,10 @@ impl Recorder {
         if !selected(&self.streams, ev.stream()) {
             return Ok(());
         }
+        if let AudioEvent::Transcript(t) = ev {
+            self.add_transcript(t);
+            return Ok(());
+        }
         let r = if self.continuous { self.handle_continuous(ev) } else { self.handle_split(ev) };
         if r.is_err() {
             // A failed write leaves the file in an unknown state: stop using
@@ -289,6 +300,43 @@ impl Recorder {
             self.hourly.remove(&stream);
         }
         r
+    }
+
+    /// Split mode: add the text to the transmission's sidecar(s). Continuous
+    /// mode: append a line to the hour's `.transcripts.jsonl` next to it.
+    fn add_transcript(&mut self, t: &crate::airband::hub::Transcript) {
+        if self.continuous {
+            let path = self.hour_path(&t.chan, t.stream, top_of_hour(t.start)).with_extension("transcripts.jsonl");
+            let line = serde_json::json!({
+                "tx": t.tx, "start": t.start.to_rfc3339(), "end": t.end.to_rfc3339(),
+                "text": t.text, "engine": t.engine, "model": t.model, "confidence": t.confidence,
+            });
+            let r = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes()));
+            if let Err(e) = r {
+                tracing::warn!("airband transcript {}: {e}", path.display());
+            }
+            return;
+        }
+        let Some((_, paths)) = self.sidecars.iter().find(|(k, _)| *k == (t.stream, t.tx)) else { return };
+        for p in paths {
+            let Ok(text) = fs::read_to_string(p) else { continue };
+            let Ok(mut meta) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+            // A long transmission is transcribed in pieces; join them.
+            let joined = match meta["transcript"].as_str() {
+                Some(prev) if !prev.is_empty() => format!("{prev} {}", t.text),
+                _ => t.text.clone(),
+            };
+            meta["transcript"] = serde_json::json!(joined);
+            meta["transcript_engine"] = serde_json::json!(t.engine);
+            meta["transcript_model"] = serde_json::json!(t.model);
+            if let Err(e) = fs::write(p, format!("{meta:#}\n")) {
+                tracing::warn!("airband transcript {}: {e}", p.display());
+            }
+        }
     }
 
     fn handle_split(&mut self, ev: &AudioEvent) -> std::io::Result<()> {
@@ -348,6 +396,7 @@ impl Recorder {
                         return Ok(());
                     }
                     let n_parts = parts.len();
+                    let mut written = Vec::with_capacity(n_parts);
                     for (i, path) in parts.iter().enumerate() {
                         let meta = serde_json::json!({
                             "stream": stream.to_string(),
@@ -363,12 +412,18 @@ impl Recorder {
                             "part": i,
                             "parts": n_parts,
                         });
-                        let _ = fs::write(path.with_extension("json"), format!("{meta:#}\n"));
+                        let side = path.with_extension("json");
+                        let _ = fs::write(&side, format!("{meta:#}\n"));
+                        written.push(side);
                         tracing::debug!("airband recording {}", path.display());
+                    }
+                    self.sidecars.push_back(((*stream, *tx), written));
+                    while self.sidecars.len() > SIDECARS_KEPT {
+                        self.sidecars.pop_front();
                     }
                 }
             }
-            AudioEvent::Status(_) => {}
+            AudioEvent::Status(_) | AudioEvent::Transcript(_) => {}
         }
         Ok(())
     }
@@ -572,6 +627,29 @@ mod tests {
         let side: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(wav.with_extension("json")).unwrap()).unwrap();
         assert_eq!(side["label"], "KSFO Tower");
+        // A transcript that arrives later lands in the sidecar, pieces joined.
+        for text in ["United 12 cleared to land", "runway 28 right"] {
+            r.handle(&AudioEvent::Transcript(std::sync::Arc::new(crate::airband::hub::Transcript {
+                stream: s,
+                chan: meta(),
+                freq_hz: 118_300_000,
+                tx: 1,
+                start: t0,
+                end: t0,
+                text: text.into(),
+                engine: "whisper.cpp".into(),
+            engine_version: Some("1.8.2".into()),
+            model: "base.en".into(),
+                language: None,
+                confidence: None,
+            })))
+            .unwrap();
+        }
+        let side: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(wav.with_extension("json")).unwrap()).unwrap();
+        assert_eq!(side["transcript"], "United 12 cleared to land runway 28 right");
+        assert_eq!(side["transcript_model"], "base.en");
+        assert_eq!(side["transcript_engine"], "whisper.cpp");
         let _ = fs::remove_dir_all(&dir);
     }
 

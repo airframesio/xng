@@ -118,6 +118,33 @@ pub enum AudioEvent {
     },
     /// Periodic per-channel levels (about four a second).
     Status(Arc<ChannelStatus>),
+    /// Speech-to-text of a finished transmission (arrives after its Close).
+    Transcript(Arc<Transcript>),
+}
+
+/// What Whisper heard in one transmission (or one piece of a long one).
+#[derive(Clone, Debug, Serialize)]
+pub struct Transcript {
+    pub stream: StreamId,
+    #[serde(skip)]
+    pub chan: Arc<ChannelMeta>,
+    pub freq_hz: u64,
+    /// The transmission's number within `stream` (as in Open/Close).
+    pub tx: u64,
+    /// Capture time of the first and last transcribed sample.
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub text: String,
+    /// Implementation that made it (`whisper.cpp`, `sherpa-onnx`, ...).
+    pub engine: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Mean token probability (0..1), when the engine reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 impl AudioEvent {
@@ -126,6 +153,7 @@ impl AudioEvent {
             AudioEvent::Open { stream, .. } | AudioEvent::Close { stream, .. } => *stream,
             AudioEvent::Audio(f) => f.stream,
             AudioEvent::Status(s) => StreamId::Channel(s.freq_hz),
+            AudioEvent::Transcript(t) => t.stream,
         }
     }
 }
@@ -154,6 +182,8 @@ pub struct TxRecord {
     pub duration_s: f64,
     pub peak_dbfs: f32,
     pub noise_dbfs: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transcript: Option<String>,
 }
 
 pub struct AudioHub {
@@ -259,9 +289,23 @@ impl AudioHub {
                         duration_s: *duration_s,
                         peak_dbfs: *peak_dbfs,
                         noise_dbfs: *noise_dbfs,
+                        transcript: None,
                     });
                     while r.len() > RECENT {
                         r.pop_front();
+                    }
+                }
+            }
+            AudioEvent::Transcript(t) => {
+                let mut r = self.recent.lock().unwrap();
+                if let Some(rec) = r.iter_mut().rev().find(|x| x.stream == t.stream && x.tx == t.tx) {
+                    match &mut rec.transcript {
+                        // A long transmission arrives in pieces.
+                        Some(prev) => {
+                            prev.push(' ');
+                            prev.push_str(&t.text);
+                        }
+                        None => rec.transcript = Some(t.text.clone()),
                     }
                 }
             }

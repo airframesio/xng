@@ -16,7 +16,7 @@ use crate::airband::opus_enc::OpusEncoder;
 use crate::airband::{hub, AudioEvent, ChannelMeta, StreamId};
 use crate::outputs::asf2_quic::TrustMode;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -310,9 +310,62 @@ struct Feed {
     seq: u32,
     tx: Option<Tx>,
     listeners: u64,
+    /// Recent transmissions (tx, channel freq, start_us, end_us), so a
+    /// transcript that arrives after the transmission is matched to it.
+    recent: VecDeque<(u64, u64, u64, u64)>,
+    /// The `transcript` object this feed's OPEN declared (engine,
+    /// engine_version, model, lang); a TRANSCRIPT repeats only what differs.
+    declared: Value,
 }
 
+/// Transmissions remembered per feed for late transcripts.
+const RECENT_TX: usize = 64;
+
 impl Feed {
+    /// Send a transcript if it belongs to one of this feed's transmissions:
+    /// the same transmission on a channel feed, or on a scan feed the scan
+    /// transmission that carried that channel at the time.
+    fn transcript(&self, link: &Link, t: &crate::airband::hub::Transcript) -> anyhow::Result<()> {
+        let (start_us, end_us) = (t.start.timestamp_micros().max(0) as u64, t.end.timestamp_micros().max(0) as u64);
+        let tx = match self.stream {
+            StreamId::Channel(_) if self.stream == t.stream => t.tx,
+            StreamId::Scan => {
+                let Some(&(tx, ..)) = self
+                    .recent
+                    .iter()
+                    .rev()
+                    .find(|&&(_, f, s, e)| f == t.freq_hz && s < end_us && start_us < e)
+                else {
+                    return Ok(());
+                };
+                tx
+            }
+            _ => return Ok(()),
+        };
+        let mut v = json!({"ch": self.ch, "tx": tx, "final": true, "text": t.text,
+                           "start_us": start_us, "end_us": end_us, "model": t.model});
+        // The aggregator fills engine, engine_version and lang from OPEN;
+        // send them only when they changed since (or OPEN had none).
+        let d = &self.declared;
+        if d["engine"].as_str() != Some(t.engine.as_str()) {
+            v["engine"] = json!(t.engine);
+        }
+        if let Some(ver) = &t.engine_version {
+            if d["engine_version"].as_str() != Some(ver.as_str()) {
+                v["engine_version"] = json!(ver);
+            }
+        }
+        if let Some(l) = &t.language {
+            if d["lang"].as_str() != Some(l.as_str()) {
+                v["lang"] = json!(l);
+            }
+        }
+        if let Some(c) = t.confidence {
+            v["confidence"] = json!((c as f64 * 1000.0).round() / 1000.0);
+        }
+        link.send_json(p::TRANSCRIPT, &v)
+    }
+
     fn emit(&mut self, link: &Link, pkt: Vec<u8>, us: u64, flags: u8) -> anyhow::Result<()> {
         let t = self.tx.as_mut().expect("emit inside a transmission");
         if let Some((hp, hus, hflags)) = t.held.replace((pkt, us, flags)) {
@@ -346,6 +399,10 @@ impl Feed {
             sq["noise_dbfs"] = json!(v);
         }
         link.send_json(p::SQUELCH, &sq)?;
+        self.recent.push_back((tx, chan.freq_hz, at_us, u64::MAX));
+        while self.recent.len() > RECENT_TX {
+            self.recent.pop_front();
+        }
         self.tx = Some(Tx { tx, start_us: at_us, next_us: at_us, sent_any: false, disc: false, held: None });
         Ok(())
     }
@@ -393,6 +450,9 @@ impl Feed {
             link.send_audio(p::audio_payload(self.ch, self.seq, us, flags | p::FLAG_TX_END, &pkt))?;
             self.seq = self.seq.wrapping_add(1);
         }
+        if let Some(r) = self.recent.iter_mut().rev().find(|r| r.0 == t.tx) {
+            r.3 = at_us.max(r.2 + 1);
+        }
         let duration_ms =
             duration_s.map(|d| (d * 1000.0).round() as u64).unwrap_or_else(|| at_us.saturating_sub(t.start_us) / 1000);
         link.send_json(
@@ -434,6 +494,20 @@ fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> 
         }
         f
     };
+    let announce = crate::airband::transcribe::announced();
+    let transcript = |freqs: &[u64]| -> Option<Value> {
+        let a = announce.as_ref()?;
+        freqs.iter().any(|&f| a.covers(f)).then(|| {
+            let mut t = json!({"engine": a.engine.engine, "model": a.engine.model});
+            if let Some(v) = &a.engine.version {
+                t["engine_version"] = json!(v);
+            }
+            if let Some(l) = &a.language {
+                t["lang"] = json!(l);
+            }
+            t
+        })
+    };
     let mut out = Vec::new();
     for (i, st) in wanted.iter().enumerate() {
         let ch = (i + 1) as u16;
@@ -466,6 +540,14 @@ fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> 
                 continue;
             }
         };
+        let mut open = open;
+        let freqs: Vec<u64> = match st {
+            StreamId::Channel(f) => vec![*f],
+            _ => chans.iter().map(|c| c.freq_hz).collect(),
+        };
+        if let Some(t) = transcript(&freqs) {
+            open["transcript"] = t;
+        }
         out.push((*st, open));
     }
     out
@@ -642,9 +724,12 @@ async fn session(
         link.send_json(p::OPEN, open)?;
     }
     let mut feeds: HashMap<StreamId, Feed> = HashMap::new();
-    let mut waiting: HashMap<u16, (StreamId, String)> = plan
+    let mut waiting: HashMap<u16, (StreamId, String, Value)> = plan
         .iter()
-        .map(|(st, o)| (o["ch"].as_u64().unwrap_or(0) as u16, (*st, o["label"].as_str().unwrap_or("").to_string())))
+        .map(|(st, o)| {
+            let label = o["label"].as_str().unwrap_or("").to_string();
+            (o["ch"].as_u64().unwrap_or(0) as u16, (*st, label, o["transcript"].clone()))
+        })
         .collect();
     let deadline = Instant::now() + Duration::from_secs(15);
     while !waiting.is_empty() {
@@ -654,7 +739,7 @@ async fn session(
             p::OPENED => {
                 let v: Value = serde_json::from_slice(&payload)?;
                 let ch = v["ch"].as_u64().unwrap_or(0) as u16;
-                let Some((stream, label)) = waiting.remove(&ch) else { continue };
+                let Some((stream, label, declared)) = waiting.remove(&ch) else { continue };
                 if v["ok"].as_bool() == Some(true) {
                     let enc = OpusEncoder::new(bitrate)?;
                     tracing::info!(
@@ -665,7 +750,10 @@ async fn session(
                             .map(|a| a.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>().join(", "))
                             .unwrap_or_default()
                     );
-                    feeds.insert(stream, Feed { ch, stream, label, enc, seq: 0, tx: None, listeners: 0 });
+                    feeds.insert(
+                        stream,
+                        Feed { ch, stream, label, enc, seq: 0, tx: None, listeners: 0, recent: VecDeque::new(), declared },
+                    );
                 } else {
                     let cands = v["candidates"]
                         .as_array()
@@ -787,6 +875,12 @@ async fn session(
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(true),
                 };
+                if let AudioEvent::Transcript(t) = &ev {
+                    for f in feeds.values() {
+                        f.transcript(&link, t)?;
+                    }
+                    continue;
+                }
                 let Some(f) = feeds.get_mut(&ev.stream()) else { continue };
                 match &ev {
                     AudioEvent::Open { chan, tx, at, level_dbfs, noise_dbfs, .. } => {
@@ -803,7 +897,7 @@ async fn session(
                         let d = (*duration_s > 0.0).then_some(*duration_s);
                         f.close(&link, at.timestamp_micros().max(0) as u64, d)?;
                     }
-                    AudioEvent::Status(_) => {}
+                    AudioEvent::Status(_) | AudioEvent::Transcript(_) => {}
                 }
                 let _ = f.stream;
             }
@@ -857,5 +951,101 @@ mod tests {
         assert_eq!(clean_key("driver=rtlsdr,serial=00000001:118300000"), "driver-rtlsdr-serial-00000001:118300000");
         assert!(p::valid_key(&clean_key(&"x".repeat(100))));
         assert_eq!(clean_key(""), "0");
+    }
+
+    fn chan(f: u64) -> Arc<ChannelMeta> {
+        Arc::new(ChannelMeta {
+            freq_hz: f,
+            label: None,
+            key: format!("rtl:{f}"),
+            atc_frequency: None,
+            modulation: xng_mode_airband::Modulation::Am,
+            bandwidth_hz: 8_000.0,
+            squelch: xng_mode_airband::squelch::SquelchMode::Off,
+            sdr: None,
+        })
+    }
+
+    fn transcript(f: u64, tx: u64, start_us: i64, end_us: i64) -> crate::airband::hub::Transcript {
+        crate::airband::hub::Transcript {
+            stream: StreamId::Channel(f),
+            chan: chan(f),
+            freq_hz: f,
+            tx,
+            start: chrono::DateTime::from_timestamp_micros(start_us).unwrap(),
+            end: chrono::DateTime::from_timestamp_micros(end_us).unwrap(),
+            text: "Delta 22 roger".into(),
+            engine: "whisper.cpp".into(),
+            engine_version: Some("1.8.2".into()),
+            model: "base.en".into(),
+            language: Some("en".into()),
+            confidence: Some(0.8),
+        }
+    }
+
+    /// Transcripts follow the transmission they belong to: the channel's own
+    /// tx on a channel feed, the scan tx that carried it on a scan feed.
+    #[tokio::test]
+    async fn transcripts_match_their_transmission() {
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let (r, w) = tokio::io::split(ours);
+        let link = spawn_io(r, w, None, "tcp");
+        let (mut tr, _tw) = tokio::io::split(theirs);
+        let feed = |ch, stream| Feed {
+            ch,
+            stream,
+            label: String::new(),
+            enc: OpusEncoder::new(24_000).unwrap(),
+            seq: 0,
+            tx: None,
+            listeners: 0,
+            recent: VecDeque::new(),
+            declared: json!({"engine": "whisper.cpp", "engine_version": "1.8.2", "model": "base.en", "lang": "en"}),
+        };
+        let mut single = feed(1, StreamId::Channel(118_300_000));
+        let mut scan = feed(2, StreamId::Scan);
+        // Scan tx 9 carried 118.3 from t=1 s to 3 s, tx 10 carried 121.8.
+        scan.open(&link, &chan(118_300_000), 9, 1_000_000, -20.0, -40.0).unwrap();
+        scan.close(&link, 3_000_000, Some(2.0)).unwrap();
+        scan.open(&link, &chan(121_800_000), 10, 3_500_000, -20.0, -40.0).unwrap();
+        single.open(&link, &chan(118_300_000), 4, 1_000_000, -20.0, -40.0).unwrap();
+        single.close(&link, 3_000_000, Some(2.0)).unwrap();
+        let t = transcript(118_300_000, 4, 1_000_000, 2_900_000);
+        single.transcript(&link, &t).unwrap();
+        scan.transcript(&link, &t).unwrap();
+        // Another channel's transcript is not this channel feed's.
+        single.transcript(&link, &transcript(121_800_000, 1, 3_500_000, 4_000_000)).unwrap();
+        // Nothing on the scan feed matches this one.
+        scan.transcript(&link, &transcript(118_300_000, 5, 8_000_000, 9_000_000)).unwrap();
+        // A different engine than OPEN declared (a model change) is named.
+        let other = crate::airband::hub::Transcript {
+            engine: "sherpa-onnx".into(),
+            engine_version: Some("2.0.2".into()),
+            model: "moonshine-base".into(),
+            ..transcript(118_300_000, 4, 1_000_000, 2_900_000)
+        };
+        single.transcript(&link, &other).unwrap();
+        // The link's writer task sends in the background; read until quiet.
+        let mut got = Vec::new();
+        while let Ok(Ok(Some((kind, payload)))) =
+            tokio::time::timeout(Duration::from_millis(300), p::read_frame(&mut tr)).await
+        {
+            if kind == p::TRANSCRIPT {
+                got.push(serde_json::from_slice::<Value>(&payload).unwrap());
+            }
+        }
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!((got[0]["ch"].as_u64(), got[0]["tx"].as_u64()), (Some(1), Some(4)));
+        assert_eq!((got[1]["ch"].as_u64(), got[1]["tx"].as_u64()), (Some(2), Some(9)));
+        assert_eq!(got[1]["text"], "Delta 22 roger");
+        assert_eq!(got[1]["start_us"].as_u64(), Some(1_000_000));
+        assert_eq!(got[1]["model"], "base.en");
+        // Same engine, version and language as OPEN: not repeated.
+        assert!(got[1].get("engine").is_none() && got[1].get("engine_version").is_none(), "{got:?}");
+        assert!(got[1].get("lang").is_none());
+        assert_eq!((got[2]["engine"].as_str(), got[2]["engine_version"].as_str()), (Some("sherpa-onnx"), Some("2.0.2")));
+        assert_eq!(got[2]["model"], "moonshine-base");
+        assert_eq!(got[1]["final"], true);
+        drop(link);
     }
 }

@@ -85,6 +85,20 @@ default = ["soapy", "opus"]
 # Opus encoding (libopus, built from source when no system library is found)
 # for the Airframes ATC feeder, Icecast and Ogg/Opus airband recordings.
 opus = ["dep:opus"]
+# Local speech-to-text for airband transcripts (whisper.cpp, built from
+# source; needs cmake and libclang). Without it, transcripts can still come
+# from a Whisper HTTP server (--whisper-url).
+whisper = ["dep:whisper-rs", "whisper-rs/tracing_backend"]
+# GPU back ends for the local Whisper model.
+whisper-metal = ["whisper", "whisper-rs/metal"]
+whisper-cuda = ["whisper", "whisper-rs/cuda"]
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
+# Local speech-to-text with sherpa-onnx (Moonshine, NVIDIA Parakeet,
+# SenseVoice on ONNX Runtime): a fraction of Whisper's CPU per transmission.
+# Links a prebuilt static sherpa-onnx library that the build downloads from
+# GitHub (or set SHERPA_ONNX_ARCHIVE_DIR / SHERPA_ONNX_LIB_DIR to build
+# offline). Linux x86_64/aarch64, macOS and Windows.
+sherpa = ["dep:sherpa-onnx", "dep:tar", "dep:bzip2", "dep:sha2"]
 soapy = ["xng-sdr/soapy"]
 # Native Airspy R2/Mini support (libairspy) — no SoapyAirspy module needed.
 airspy = ["xng-sdr/airspy"]
@@ -146,6 +160,11 @@ tokio-stream.workspace = true
 webpki-roots.workspace = true
 zeromq.workspace = true
 opus = { version = "0.3", optional = true }
+whisper-rs = { version = "0.16", optional = true }
+sherpa-onnx = { version = "2.0.2", optional = true }
+tar = { version = "0.4", optional = true, default-features = false }
+bzip2 = { version = "0.6", optional = true }
+sha2 = { version = "0.10", optional = true }
 base64 = "0.22"
 bytes = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

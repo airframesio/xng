@@ -143,6 +143,8 @@ pub struct AirbandOutputs {
     pub scan: Option<ScanSettings>,
     /// Feed the Airframes ATC aggregator.
     pub atc: Option<AtcFeedSettings>,
+    /// Transcribe transmissions with Whisper.
+    pub transcribe: Option<TranscribeSettings>,
 }
 
 impl AirbandOutputs {
@@ -165,6 +167,9 @@ impl AirbandOutputs {
         }
         if let Some(s) = &self.scan {
             s.to_scan_config()?;
+        }
+        if let Some(t) = &self.transcribe {
+            t.validate()?;
         }
         if let Some(a) = &self.atc {
             anyhow::ensure!(a.server.contains(':'), "ATC ingest {:?} needs host:port", a.server);
@@ -284,6 +289,124 @@ impl Default for AtcFeedSettings {
             streams: Vec::new(),
             receiver: None,
         }
+    }
+}
+
+/// Speech-to-text for airband transmissions. Either a local whisper.cpp
+/// model (`model`, needs the `whisper` build feature) or a Whisper HTTP
+/// server (`url`: an OpenAI-compatible `/v1/audio/transcriptions`, or
+/// whisper.cpp's `server` with its `/inference` path).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TranscribeSettings {
+    /// Speech engine. Local: `whisper.cpp` or `sherpa-onnx` (default: picked
+    /// from `model`; with no model, sherpa-onnx in a build that has it, else
+    /// whisper.cpp). With `url`: what the
+    /// server runs, reported to Airframes ATC (`faster-whisper`, ...;
+    /// default `openai-api`).
+    pub engine: Option<String>,
+    /// Local: a model name fetched once into the cache, or a model file or
+    /// directory. whisper.cpp: `tiny.en`, `base.en`, `small.en`,
+    /// `large-v3-turbo`, ... or a ggml file. sherpa-onnx:
+    /// `skycontrol-atc-110m` (default), `moonshine-tiny`, `moonshine-base`,
+    /// `parakeet-110m`, `parakeet-tdt-0.6b-v2`, `sense-voice`, ... or an
+    /// exported model directory.
+    /// With `url`: the model name sent to the server (default `whisper-1`).
+    pub model: Option<String>,
+    /// Whisper HTTP server. A bare `http://host:port` gets
+    /// `/v1/audio/transcriptions` appended.
+    pub url: Option<String>,
+    /// Bearer token for `url` (or set XNG_WHISPER_API_KEY).
+    pub api_key: Option<String>,
+    /// Spoken language (ISO 639-1), or `auto` to let Whisper detect it.
+    pub language: String,
+    /// Context given to Whisper ahead of each transmission; the default
+    /// primes it for ATC phraseology. The channel label is added in front.
+    pub prompt: Option<String>,
+    /// Which channels to transcribe (frequencies). Empty = every channel.
+    pub streams: Vec<String>,
+    /// Skip transmissions shorter than this (ms).
+    pub min_ms: u32,
+    /// Cut longer transmissions into pieces of at most this many seconds
+    /// (Whisper works on 30 s windows).
+    pub max_s: u32,
+    /// CPU threads for the local model (0 = a sensible default).
+    pub threads: u32,
+    /// Transmissions waiting for Whisper; the oldest are dropped beyond this.
+    pub queue: usize,
+    /// Drop text Whisper itself rates as probably not speech (0..1).
+    pub no_speech_threshold: f32,
+}
+
+impl Default for TranscribeSettings {
+    fn default() -> Self {
+        Self {
+            engine: None,
+            model: None,
+            url: None,
+            api_key: None,
+            language: "en".into(),
+            prompt: None,
+            streams: Vec::new(),
+            min_ms: 600,
+            max_s: 28,
+            threads: 0,
+            queue: 16,
+            no_speech_threshold: 0.6,
+        }
+    }
+}
+
+impl TranscribeSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let streams = parse_streams(&self.streams)?;
+        anyhow::ensure!(
+            streams.iter().all(|s| matches!(s, super::StreamId::Channel(_))),
+            "transcription works on channels; list frequencies in its streams (not mix or scan)"
+        );
+        if let Some(u) = &self.url {
+            anyhow::ensure!(
+                u.starts_with("http://") || u.starts_with("https://"),
+                "Whisper URL must start with http:// or https://"
+            );
+        } else {
+            use super::transcribe::{kind, Kind};
+            anyhow::ensure!(
+                matches!(self.engine.as_deref(), None | Some("whisper.cpp" | "whisper" | "sherpa-onnx" | "sherpa")),
+                "local transcription engine must be whisper.cpp or sherpa-onnx (got {:?})",
+                self.engine.as_deref().unwrap_or_default()
+            );
+            match kind(self) {
+                Kind::Sherpa => anyhow::ensure!(
+                    cfg!(feature = "sherpa"),
+                    "sherpa-onnx models need xng built with the `sherpa` feature; or point --whisper-url at a Whisper server"
+                ),
+                _ => anyhow::ensure!(
+                    cfg!(feature = "whisper"),
+                    "local Whisper needs xng built with the `whisper` feature (or `sherpa` for Moonshine/Parakeet); \
+                     or point --whisper-url at a Whisper server"
+                ),
+            }
+        }
+        if let Some(e) = &self.engine {
+            anyhow::ensure!(
+                !e.is_empty()
+                    && e.len() <= 32
+                    && e.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)),
+                "transcription engine {e:?} must be a short lowercase id like faster-whisper"
+            );
+        }
+        anyhow::ensure!(
+            self.language == "auto" || (2..=3).contains(&self.language.len()),
+            "Whisper language must be a language code like en, or auto"
+        );
+        anyhow::ensure!((1..=30).contains(&self.max_s), "Whisper max-s must be 1 to 30");
+        anyhow::ensure!(self.queue >= 1, "Whisper queue must be at least 1");
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.no_speech_threshold),
+            "Whisper no-speech-threshold must be between 0 and 1"
+        );
+        Ok(())
     }
 }
 

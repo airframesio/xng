@@ -677,6 +677,10 @@ pub fn summary(msg: &Message) -> String {
             if let Some(l) = details.get("level_dbfs").and_then(|v| v.as_f64()) {
                 s.push_str(&format!(" {l:.1} dBFS"));
             }
+            // AIRBAND transcript #12 KSFO Tower: "United 12 cleared to land"
+            if let Some(t) = details.get("text").and_then(|v| v.as_str()) {
+                s.push_str(&format!(": \"{t}\""));
+            }
             s
         }
         MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
