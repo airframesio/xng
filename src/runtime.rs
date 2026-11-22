@@ -1138,6 +1138,11 @@ fn spawn_airband_outputs(
         #[cfg(not(feature = "opus"))]
         tracing::error!("icecast output {url}: xng was built without the `opus` feature");
     }
+    // Before the ATC feed, so its OPENs announce the transcripts.
+    if let Some(t) = &o.transcribe {
+        let (audio, rx, weak) = (crate::airband::hub::hub().subscribe(), bus.subscribe(), bus.downgrade());
+        tasks.push(tokio::spawn(crate::airband::transcribe::run(audio, rx, weak, t.clone())));
+    }
     if let Some(atc) = &o.atc {
         #[cfg(feature = "opus")]
         {

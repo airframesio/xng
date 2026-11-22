@@ -22,6 +22,7 @@ pub mod hub;
 pub mod opus_enc;
 pub mod scan_stream;
 pub mod set;
+pub mod transcribe;
 
 pub use config::{AirbandChannel, AirbandConfig, AirbandOutputs};
 pub use hub::{hub, AudioEvent, AudioFrame, ChannelMeta, StreamId};

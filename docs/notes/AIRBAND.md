@@ -87,6 +87,7 @@ drifts more than 1.5 s behind the wall clock).
 | Dashboard | `--http` | `/airband`: levels, squelch, scanner controls, history, listen in the browser |
 | Prometheus | `--metrics` | `xng_airband_{level,noise,squelch}_dbfs`, `xng_airband_open`, `xng_airband_afc_hz`, `xng_airband_transmissions_total`, `xng_airband_airtime_seconds_total` per channel |
 | Airframes ATC | `--atc-feed`, `[outputs.airband.atc]` | below |
+| Transcripts | `--transcribe`, `--whisper-model`, `--whisper-url`, `[outputs.airband.transcribe]` | Whisper speech-to-text; below |
 
 Opus needs the default `opus` feature (libopus, or the bundled build).
 
@@ -119,8 +120,61 @@ airframesio/aggregator-atc): ALPN `airframes-atc/1`, port 4433.
   status` checks the sign-in; `xng atc logout` forgets it and keeps the feeder
   id. `--atc-token dev:<user>` with `--atc-insecure` talks to a local
   `aggregator-atc --dev`.
+- **Transcripts**: with transcription on, each OPEN carries
+  `"transcript": {"model", "lang"}`, and each transcribed transmission is
+  followed by a TRANSCRIPT frame (`ch`, `tx`, `final`, `text`, `start_us`,
+  `end_us`, `model`, `confidence`). On a scan feed `tx` is the scan
+  transmission that carried the channel at the time.
 - The mix stream cannot be fed: listeners need to know which frequency is
   active.
+
+## Transcription (Whisper)
+
+`--transcribe` turns on speech-to-text for every channel (or the ones in
+`--whisper-streams`). Each transmission's audio is collected from squelch
+open to close and handed to Whisper once it ends; transmissions longer than
+`max-s` (28 s) go in pieces. One worker runs Whisper, oldest first; when it
+falls behind, the oldest waiting transmissions are dropped (queue of 16), and
+the log says so with a hint to pick a smaller model.
+
+Engines:
+
+- **Local whisper.cpp** (`--whisper-model`, needs the `whisper` build
+  feature: `cargo build --release --features whisper`, which compiles
+  whisper.cpp and needs cmake and libclang). The value is a ggml model file
+  or a name (`tiny.en`, `base.en` default, `small.en`, `medium.en`,
+  `large-v3-turbo`, with an optional `-q5_1`-style suffix), downloaded once
+  from the whisper.cpp model repository into `$XNG_WHISPER_MODELS`, else
+  `$XDG_CACHE_HOME/xng/whisper`, else `~/.cache/xng/whisper`.
+  `--whisper-threads` sets CPU threads (default: all cores but one, up to
+  8). Rough guide on one channel: `tiny.en` or `base.en` on a Raspberry Pi
+  4/5, `small.en` on a desktop CPU, `large-v3-turbo` with a GPU build.
+  GPU builds: `--features whisper-metal`, `whisper-cuda` or `whisper-vulkan`.
+- **Whisper HTTP server** (`--whisper-url`): a multipart WAV upload with
+  `response_format=verbose_json`. A bare `http://host:port` gets
+  `/v1/audio/transcriptions` appended (OpenAI, faster-whisper servers,
+  LocalAI, whisper.cpp `server --inference-path /v1/audio/transcriptions`);
+  a URL with a path is used as is (whisper.cpp's own `/inference`). The key,
+  if any, comes from `XNG_WHISPER_API_KEY` or `api-key` in TOML. `model` is
+  the name sent to the server (default `whisper-1`).
+
+Whisper gets a prompt ahead of each transmission: the channel label and ATC
+phraseology hints (`--whisper-prompt` replaces the hints). Output is cleaned
+before use: segments Whisper itself rates as probably not speech are
+dropped, bracketed noise marks (`[BLANK_AUDIO]`, `(static)`) go, phrases
+Whisper invents on static ("Thank you.", "Thanks for watching") are
+discarded, and looping repeats are cut to three.
+
+Where transcripts go:
+
+- the message bus as an airband message with `kind = "transcript"`
+  (`details`: `tx`, `label`, `start`, `end`, `text`, `model`, `language`,
+  `confidence`, `atc_frequency`), so console, JSONL, MQTT, ZMQ and asf-2.0
+  get them;
+- the dashboard's transmission history;
+- recordings: the transmission's JSON sidecar gains `transcript` (split
+  mode), or a line in `<hour file>.transcripts.jsonl` (continuous mode);
+- the Airframes ATC feed (TRANSCRIPT frames, above).
 
 ## Configuration
 
@@ -129,7 +183,7 @@ and `xng listen --help`. Station files: `[session.airband]` (`mix`,
 `[session.airband.defaults]`, `[[session.airband.channel]]` tables with
 `freq`, `label`, `atc-frequency`, `key` and any per-channel override) and
 `[outputs.airband]` (recordings, `udp`, `icecast`, `[outputs.airband.scan]`,
-`[outputs.airband.atc]`). An airband session may list its channels only as
+`[outputs.airband.atc]`, `[outputs.airband.transcribe]`). An airband session may list its channels only as
 tables. See `contrib/station.airband.example.toml`.
 
 ## Not done yet
@@ -138,6 +192,5 @@ tables. See `contrib/station.airband.example.toml`.
   frequencies spread wider than its bandwidth). xng covers a band by
   channelizing one wide capture instead; hopping needs retune support in
   the SDR sources.
-- An off-air airband capture in the test corpus.
-- Transcripts (the ATC protocol has a TRANSCRIPT frame; nothing in xng
-  produces one yet).
+- An off-air airband capture in the test corpus (transcription is tested
+  with a stand-in Whisper server, not real speech off air).

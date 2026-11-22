@@ -1,7 +1,9 @@
 //! `--mode airband` command-line flags (decode, listen). Station configs set
 //! the same things in TOML (`[sessions.airband]` and `[outputs.airband]`).
 
-use super::config::{AirbandChannel, AirbandConfig, AirbandOutputs, AtcFeedSettings, RecordFormat, ScanSettings};
+use super::config::{
+    AirbandChannel, AirbandConfig, AirbandOutputs, AtcFeedSettings, RecordFormat, ScanSettings, TranscribeSettings,
+};
 use std::path::PathBuf;
 use xng_mode_airband::squelch::SquelchMode;
 use xng_mode_airband::Modulation;
@@ -116,6 +118,33 @@ pub struct AirbandOpts {
     /// Opus bitrate for the ATC feed (bit/s)
     #[arg(long, default_value_t = 24_000)]
     pub atc_bitrate: u32,
+
+    /// Transcribe transmissions with Whisper (local model base.en unless
+    /// --whisper-model or --whisper-url says otherwise). Transcripts go to
+    /// the JSON outputs, the dashboard, recordings and the ATC feed
+    #[arg(long)]
+    pub transcribe: bool,
+    /// Local Whisper model: a ggml file or a name (tiny.en, base.en,
+    /// small.en, large-v3-turbo, ...) downloaded once. Implies --transcribe
+    #[arg(long)]
+    pub whisper_model: Option<String>,
+    /// Use a Whisper HTTP server instead of a local model (OpenAI-compatible
+    /// /v1/audio/transcriptions, or whisper.cpp server's /inference; key in
+    /// XNG_WHISPER_API_KEY). Implies --transcribe
+    #[arg(long)]
+    pub whisper_url: Option<String>,
+    /// Spoken language code, or auto
+    #[arg(long, default_value = "en")]
+    pub whisper_language: String,
+    /// Context for Whisper (default: ATC phraseology hints)
+    #[arg(long)]
+    pub whisper_prompt: Option<String>,
+    /// Channels to transcribe (default every channel)
+    #[arg(long, value_delimiter = ',')]
+    pub whisper_streams: Vec<String>,
+    /// CPU threads for the local model (0 = automatic)
+    #[arg(long, default_value_t = 0)]
+    pub whisper_threads: u32,
 }
 
 /// Parse `auto[:snr]`, `manual:dbfs`, `off`.
@@ -206,6 +235,17 @@ impl AirbandOpts {
             bitrate: self.atc_bitrate,
             ..Default::default()
         });
+        let transcribe = (self.transcribe || self.whisper_model.is_some() || self.whisper_url.is_some()).then(|| {
+            TranscribeSettings {
+                model: self.whisper_model.clone(),
+                url: self.whisper_url.clone(),
+                language: self.whisper_language.clone(),
+                prompt: self.whisper_prompt.clone(),
+                streams: self.whisper_streams.clone(),
+                threads: self.whisper_threads,
+                ..Default::default()
+            }
+        });
         let o = AirbandOutputs {
             record_dir: self.record_dir.clone(),
             record_format: self.record_format,
@@ -217,6 +257,7 @@ impl AirbandOpts {
             icecast: self.icecast.clone(),
             scan,
             atc,
+            transcribe,
         };
         o.validate()?;
         Ok(o)

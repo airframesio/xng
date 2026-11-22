@@ -143,6 +143,8 @@ pub struct AirbandOutputs {
     pub scan: Option<ScanSettings>,
     /// Feed the Airframes ATC aggregator.
     pub atc: Option<AtcFeedSettings>,
+    /// Transcribe transmissions with Whisper.
+    pub transcribe: Option<TranscribeSettings>,
 }
 
 impl AirbandOutputs {
@@ -165,6 +167,9 @@ impl AirbandOutputs {
         }
         if let Some(s) = &self.scan {
             s.to_scan_config()?;
+        }
+        if let Some(t) = &self.transcribe {
+            t.validate()?;
         }
         if let Some(a) = &self.atc {
             anyhow::ensure!(a.server.contains(':'), "ATC ingest {:?} needs host:port", a.server);
@@ -284,6 +289,92 @@ impl Default for AtcFeedSettings {
             streams: Vec::new(),
             receiver: None,
         }
+    }
+}
+
+/// Speech-to-text for airband transmissions. Either a local whisper.cpp
+/// model (`model`, needs the `whisper` build feature) or a Whisper HTTP
+/// server (`url`: an OpenAI-compatible `/v1/audio/transcriptions`, or
+/// whisper.cpp's `server` with its `/inference` path).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct TranscribeSettings {
+    /// Local: a ggml model file, or a model name (`tiny.en`, `base.en`,
+    /// `small.en`, `large-v3-turbo`, ...) fetched once into the cache.
+    /// With `url`: the model name sent to the server (default `whisper-1`).
+    pub model: Option<String>,
+    /// Whisper HTTP server. A bare `http://host:port` gets
+    /// `/v1/audio/transcriptions` appended.
+    pub url: Option<String>,
+    /// Bearer token for `url` (or set XNG_WHISPER_API_KEY).
+    pub api_key: Option<String>,
+    /// Spoken language (ISO 639-1), or `auto` to let Whisper detect it.
+    pub language: String,
+    /// Context given to Whisper ahead of each transmission; the default
+    /// primes it for ATC phraseology. The channel label is added in front.
+    pub prompt: Option<String>,
+    /// Which channels to transcribe (frequencies). Empty = every channel.
+    pub streams: Vec<String>,
+    /// Skip transmissions shorter than this (ms).
+    pub min_ms: u32,
+    /// Cut longer transmissions into pieces of at most this many seconds
+    /// (Whisper works on 30 s windows).
+    pub max_s: u32,
+    /// CPU threads for the local model (0 = a sensible default).
+    pub threads: u32,
+    /// Transmissions waiting for Whisper; the oldest are dropped beyond this.
+    pub queue: usize,
+    /// Drop text Whisper itself rates as probably not speech (0..1).
+    pub no_speech_threshold: f32,
+}
+
+impl Default for TranscribeSettings {
+    fn default() -> Self {
+        Self {
+            model: None,
+            url: None,
+            api_key: None,
+            language: "en".into(),
+            prompt: None,
+            streams: Vec::new(),
+            min_ms: 600,
+            max_s: 28,
+            threads: 0,
+            queue: 16,
+            no_speech_threshold: 0.6,
+        }
+    }
+}
+
+impl TranscribeSettings {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let streams = parse_streams(&self.streams)?;
+        anyhow::ensure!(
+            streams.iter().all(|s| matches!(s, super::StreamId::Channel(_))),
+            "transcription works on channels; list frequencies in its streams (not mix or scan)"
+        );
+        if let Some(u) = &self.url {
+            anyhow::ensure!(
+                u.starts_with("http://") || u.starts_with("https://"),
+                "Whisper URL must start with http:// or https://"
+            );
+        } else {
+            anyhow::ensure!(
+                cfg!(feature = "whisper"),
+                "local transcription needs xng built with the `whisper` feature; or point --whisper-url at a Whisper server"
+            );
+        }
+        anyhow::ensure!(
+            self.language == "auto" || (2..=3).contains(&self.language.len()),
+            "Whisper language must be a language code like en, or auto"
+        );
+        anyhow::ensure!((1..=30).contains(&self.max_s), "Whisper max-s must be 1 to 30");
+        anyhow::ensure!(self.queue >= 1, "Whisper queue must be at least 1");
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&self.no_speech_threshold),
+            "Whisper no-speech-threshold must be between 0 and 1"
+        );
+        Ok(())
     }
 }
 

@@ -85,6 +85,14 @@ default = ["soapy", "opus"]
 # Opus encoding (libopus, built from source when no system library is found)
 # for the Airframes ATC feeder, Icecast and Ogg/Opus airband recordings.
 opus = ["dep:opus"]
+# Local speech-to-text for airband transcripts (whisper.cpp, built from
+# source; needs cmake and libclang). Without it, transcripts can still come
+# from a Whisper HTTP server (--whisper-url).
+whisper = ["dep:whisper-rs", "whisper-rs/tracing_backend"]
+# GPU back ends for the local Whisper model.
+whisper-metal = ["whisper", "whisper-rs/metal"]
+whisper-cuda = ["whisper", "whisper-rs/cuda"]
+whisper-vulkan = ["whisper", "whisper-rs/vulkan"]
 soapy = ["xng-sdr/soapy"]
 # Native Airspy R2/Mini support (libairspy) — no SoapyAirspy module needed.
 airspy = ["xng-sdr/airspy"]
@@ -146,6 +154,7 @@ tokio-stream.workspace = true
 webpki-roots.workspace = true
 zeromq.workspace = true
 opus = { version = "0.3", optional = true }
+whisper-rs = { version = "0.16", optional = true }
 base64 = "0.22"
 bytes = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

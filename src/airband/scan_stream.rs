@@ -170,7 +170,7 @@ impl Follower {
             AudioEvent::Open { at, chan, .. } | AudioEvent::Close { at, chan, .. } => {
                 (hub().channel(src).unwrap_or_else(|| chan.clone()), *at, 0.0)
             }
-            AudioEvent::Status(_) => {
+            AudioEvent::Status(_) | AudioEvent::Transcript(_) => {
                 let chan = hub().channel(src).expect("scan source is a registered channel");
                 (chan, chrono::Utc::now(), 0.0)
             }
