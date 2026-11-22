@@ -282,6 +282,9 @@ pub struct LiveState {
     /// dimension the flat `stats` Vec can't carry. Feeds the per-label
     /// Prometheus counter (VERIFY-9 / ACARS-5.2).
     pub acars_labels: std::sync::Mutex<std::collections::HashMap<(u64, String), u64>>,
+    /// Military (AMC-style) ACARS reports keyed by report kind (`INI`,
+    /// `POS`, …; unlisted kinds fold into `other`).
+    pub acars_military: std::sync::Mutex<std::collections::HashMap<&'static str, u64>>,
     /// Cumulative FEC-corrected octets/bits per channel freq (ECO-7).
     pub fec: std::sync::Mutex<std::collections::HashMap<u64, u64>>,
     pub spectrum: std::sync::Mutex<Option<SpectrumFrame>>,
@@ -304,6 +307,7 @@ impl LiveState {
         Arc::new(Self {
             stats: std::sync::Mutex::new(Vec::new()),
             acars_labels: std::sync::Mutex::new(std::collections::HashMap::new()),
+            acars_military: std::sync::Mutex::new(std::collections::HashMap::new()),
             fec: std::sync::Mutex::new(std::collections::HashMap::new()),
             spectrum: std::sync::Mutex::new(None),
             spectrum_wanted: AtomicBool::new(false),
@@ -328,6 +332,17 @@ impl LiveState {
             Some(e) => *e = (freq, frames, crc_ok, level),
             None => s.push((freq, frames, crc_ok, level)),
         }
+    }
+
+    /// Tally one military ACARS report by kind. The kind set is fixed so a
+    /// stray decode can never mint new Prometheus series.
+    pub fn record_acars_military(&self, kind: &str) {
+        const KINDS: &[&str] = &[
+            "INI", "POS", "FTX", "WXR", "FPN", "OOI", "DIS", "INR", "SUM", "PER", "LDI", "PWI",
+            "REQPOS", "REQINI", "REQWXR",
+        ];
+        let k = KINDS.iter().find(|k| **k == kind).copied().unwrap_or("other");
+        *self.acars_military.lock().unwrap().entry(k).or_insert(0) += 1;
     }
 
     /// Tally one decoded ACARS message under `(freq, label)`.
@@ -1370,6 +1385,13 @@ fn publish_msg(
         // Prometheus cardinality.
         if msg.decode.crc_ok {
             state.record_acars_label(freq, &a.label);
+            if let Some(app) = a.app.as_ref() {
+                if app.get("app").and_then(|v| v.as_str()) == Some("military")
+                    && app.get("crc_ok").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    state.record_acars_military(app.get("kind").and_then(|v| v.as_str()).unwrap_or(""));
+                }
+            }
         }
     }
     bus.publish(msg);

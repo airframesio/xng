@@ -518,6 +518,9 @@ fn update(d: &mut Dash, m: &Message) {
                 if let Some(co) = crate::outputs::dbinfo::icao_country(hex) {
                     c.insert("country".into(), json!(co));
                 }
+                if crate::outputs::dbinfo::is_military(hex) {
+                    c.insert("military".into(), json!(true));
+                }
                 if let Some((r, t)) = crate::outputs::dbinfo::AircraftDb::lookup(hex) {
                     if !r.is_empty() {
                         reg = Some(r.to_string());
@@ -645,10 +648,41 @@ fn update(d: &mut Dash, m: &Message) {
         // if the application layer carries one (ADS-C report).
         MessageBody::Acars(a) => {
             let reg = a.tail.clone().filter(|s| !s.is_empty());
-            let flight = a.flight.as_ref().map(|f| f.trim().to_uppercase()).filter(|s| !s.is_empty());
+            let mut flight = a.flight.as_ref().map(|f| f.trim().to_uppercase()).filter(|s| !s.is_empty());
+            let mut c = serde_json::Map::new();
+            let mut pos = None;
+            // Military (AMC-style) report: the ICAO callsign (RCH4913) only
+            // appears in the text — the ACARS flight id is a 2-character
+            // carrier code (`MC`) — so prefer it, and surface the mission.
+            if let Some(app) = a.app.as_ref().filter(|v| v.get("app").and_then(Value::as_str) == Some("military")) {
+                c.insert("military".into(), json!(true));
+                if let Some(cs) = app.get("callsign").and_then(Value::as_str) {
+                    flight = Some(cs.to_uppercase());
+                }
+                if let Some(msn) = app.get("mission").and_then(|m| m.get("value")).and_then(Value::as_str) {
+                    c.insert("mission".into(), json!(msn));
+                }
+                for (k, src) in [("dep", "departure"), ("arr", "arrival")] {
+                    if let Some(v) = app.get(src).and_then(Value::as_str) {
+                        c.insert(k.into(), json!(v));
+                    }
+                }
+                if let Some(kind) = app.get("kind").and_then(Value::as_str) {
+                    c.insert("mil_kind".into(), json!(kind));
+                }
+                if let (Some(lat), Some(lon)) = (
+                    app.pointer("/position/latitude").and_then(Value::as_f64),
+                    app.pointer("/position/longitude").and_then(Value::as_f64),
+                ) {
+                    pos = Some((lat, lon));
+                    c.insert("lat".into(), json!(lat));
+                    c.insert("lon".into(), json!(lon));
+                    if let Some(alt) = app.get("altitude_ft").and_then(Value::as_i64) {
+                        c.insert("alt".into(), json!(alt));
+                    }
+                }
+            }
             if reg.is_some() || flight.is_some() {
-                let mut c = serde_json::Map::new();
-                let mut pos = None;
                 // ADS-C position report from the application layer, if present.
                 if let Some(app) = &a.app {
                     if app.get("app").and_then(|v| v.as_str()) == Some("adsc") {

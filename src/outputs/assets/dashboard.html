@@ -998,16 +998,21 @@ function render() {
 
   for (const a of s.aircraft) {
     // Callsigns arrive over RF: escape before any HTML context.
-    const label = escapeHtml(a.callsign || a.icao);
+    // ACARS-only aircraft (positions from ADS-C or military reports) have
+    // no ICAO address: key and label them by their entity id instead.
+    const label = escapeHtml(a.callsign || a.flight || a.icao || a.reg || a.id);
     const sil = silhouette(a.actype);
     const popup = entityPopup(
       sil ? silDiv(sil, altColor(a.alt), a.trk) : '',
       label,
       [
-        ['icao', escapeHtml(a.icao)],
+        ['icao', a.icao && escapeHtml(a.icao)],
         ['reg', a.reg && escapeHtml(a.reg)],
         ['type', a.actype && escapeHtml(a.actype)],
         ['country', a.country && escapeHtml(a.country)],
+        ['military', a.military ? (a.mil_kind ? `yes (${escapeHtml(a.mil_kind)})` : 'yes') : null],
+        ['mission', a.mission && escapeHtml(a.mission)],
+        ['route', (a.dep || a.arr) ? `${escapeHtml(a.dep || '?')} &rarr; ${escapeHtml(a.arr || '?')}` : null],
         ['altitude', a.alt != null ? `${a.alt} ft` : null],
         ['speed', a.spd != null ? `${a.spd} kt` : null],
         ['track', a.trk != null ? `${a.trk}&deg;` : null],
@@ -1022,7 +1027,7 @@ function render() {
         ['msgs', a.msgs],
         ['seen', `${fmtAge(s.now - a.seen)} ago`],
       ]);
-    const p = upsert('a' + a.icao, a.lat, a.lon, planeIcon(a.trk, a.alt, sil), label, popup, a.trail, altColor(a.alt), flightLayer);
+    const p = upsert('a' + (a.icao || a.id), a.lat, a.lon, planeIcon(a.trk, a.alt, sil), label, popup, a.trail, altColor(a.alt), flightLayer);
     if (p) pts.push(p);
   }
   for (const v of s.vessels) {
@@ -1095,11 +1100,12 @@ function render() {
     const id = a.id || a.icao || a.reg || a.flight || '';
     const srcs = a.sources ? Object.values(a.sources) : [];
     ents.push({
-      k: 'a' + id, id, type: 'aircraft', lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
-      color: altColor(a.alt), name: `${ic('✈️')}${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
+      k: 'a' + id, id, type: 'aircraft', mil: !!a.military, lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
+      color: altColor(a.alt), name: `${ic(a.military ? '🎖️' : '✈️')}${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
       sv: { id, flight: a.flight || '', icao: a.icao || '', reg: a.reg || '', type: a.actype || '', alt: a.alt, kt: a.spd, msgs: a.msgs || 0, seen: a.seen || 0 },
       cols: [escapeHtml(a.flight || ''), escapeHtml(a.icao || ''), escapeHtml(a.reg || ''), escapeHtml(a.actype || ''), a.alt ?? '', a.spd ?? '', a.msgs ?? ''],
-      f: { flight: escapeHtml(a.flight || ''), icao: escapeHtml(a.icao || ''), reg: escapeHtml(a.reg || ''), type: escapeHtml(a.actype || ''), alt: a.alt ?? '', kt: a.spd ?? '', msgs: a.msgs ?? '' },
+      f: { flight: escapeHtml(a.flight || ''), icao: escapeHtml(a.icao || ''), reg: escapeHtml(a.reg || ''), type: escapeHtml(a.actype || ''), alt: a.alt ?? '', kt: a.spd ?? '', msgs: a.msgs ?? '',
+        mission: escapeHtml(a.mission || ''), route: (a.dep || a.arr) ? `${escapeHtml(a.dep || '?')} &rarr; ${escapeHtml(a.arr || '?')}` : '', kind: escapeHtml(a.mil_kind || '') },
     });
   }
   for (const v of s.vessels) {
@@ -1166,6 +1172,10 @@ function render() {
       cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
     { key: 'aircraft', label: '✈️ Aircraft', types: ['aircraft'],
       cols: [['flight', 'flight'], ['icao', 'icao'], ['reg', 'reg'], ['type', 'type'], ['alt', 'alt', 1], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
+    // Military: aircraft in a military ICAO block / flagged by the aircraft
+    // DB, or that sent an AMC-style ACARS report (mission number etc.).
+    { key: 'military', label: '🎖️ Military', types: ['aircraft'], pred: e => e.mil,
+      cols: [['flight', 'callsign'], ['icao', 'icao'], ['reg', 'reg'], ['mission', 'mission'], ['route', 'route'], ['kind', 'last'], ['alt', 'alt', 1], ['msgs', 'msgs', 1]] },
     { key: 'ships', label: '🚢 Ships', types: ['vessel'],
       cols: [['mmsi', 'mmsi', 1], ['country', 'country'], ['type', 'type'], ['kt', 'kt', 1], ['msgs', 'msgs', 1]] },
     { key: 'beacons', label: '🎈 Beacons', types: ['beacon'],
@@ -1176,16 +1186,16 @@ function render() {
       cols: [['proto', 'proto'], ['capcode', 'capcode', 1], ['function', 'fn', 1], ['baud', 'baud', 1], ['text', 'text'], ['msgs', 'msgs', 1]] },
     { key: 'sats', label: '🛰 Sats', types: ['sat'], cols: [['type', 'type'], ['alt', 'alt']] },
   ];
-  const present = new Set(ents.map(e => e.type));
-  const shownTabs = TABS.filter(t => !t.types || t.types.some(ty => present.has(ty)));
+  const inTab = (t, e) => (!t.types || t.types.includes(e.type)) && (!t.pred || t.pred(e));
+  const shownTabs = TABS.filter(t => !t.types || ents.some(e => inTab(t, e)));
   if (!shownTabs.some(t => t.key === entTab)) entTab = 'all';
   const tab = shownTabs.find(t => t.key === entTab) || shownTabs[0];
   const isAll = tab.key === 'all';
   document.getElementById('enttabs').innerHTML = shownTabs.map(t => {
-    const n = t.types ? ents.filter(e => t.types.includes(e.type)).length : ents.length;
+    const n = ents.filter(e => inTab(t, e)).length;
     return `<span class="tab${t.key === entTab ? ' on' : ''}" data-tab="${t.key}">${t.label} ${n}</span>`;
   }).join('');
-  const view = tab.types ? ents.filter(e => tab.types.includes(e.type)) : ents;
+  const view = ents.filter(e => inTab(tab, e));
 
   // Sort. `name`/`seen` always valid; otherwise the active tab's column key.
   const colKeys = tab.cols.map(c => c[0]);
