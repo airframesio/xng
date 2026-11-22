@@ -162,9 +162,9 @@ The binaries need `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf`
 for native Airspy):
 
 ```bash
-sudo apt install ./xng-0.21.0-arm64.deb    # pulls runtime deps
+sudo apt install ./xng-0.22.0-arm64.deb    # pulls runtime deps
 # or
-tar xzf xng-v0.21.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
+tar xzf xng-v0.22.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
 ```
 
 On Windows, unzip the `x86_64-pc-windows-msvc` release. To use a radio,
