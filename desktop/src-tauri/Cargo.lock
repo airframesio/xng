@@ -7176,6 +7176,7 @@ dependencies = [
  "base64 0.22.1",
  "crc",
  "miniz_oxide 0.8.9",
+ "regex",
  "serde",
  "serde_json",
  "xng-types",
@@ -7263,7 +7264,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-airband"
-version = "0.21.0"
+version = "0.23.0"
 dependencies = [
  "chrono",
  "num-complex",
