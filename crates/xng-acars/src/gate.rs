@@ -176,6 +176,11 @@ fn parse_united(text: &str) -> Option<GateInfo> {
     let mut out = GateInfo::new(kind, "", "");
     let mut after_ground_time = false;
     for l in lines {
+        // The rest is about the aircraft's next flight, whose gate lines
+        // must not replace this flight's arrival gate.
+        if l.starts_with("NEXT FLT") {
+            break;
+        }
         if flight.is_none() {
             flight = UA_FLIGHT.captures(l);
             continue;
@@ -369,5 +374,11 @@ mod tests {
         assert_eq!(j["arrival"], "MSN");
         assert_eq!(j["gate"], "16");
         assert!(j.get("gate_status").is_none());
+    }
+
+    #[test]
+    fn united_next_flight_gate_is_not_read() {
+        let t = "QUNDCULUA~1GATE ASSIGN\r\nUA1720/09 KMSP KDEN\r\nSENT: 10:41:16Z\r\nGATE B47   OPEN\r\nNEXT FLT UA1127/09\r\nKDEN KSNA\r\nGATE B12   OPEN\r\n";
+        assert_eq!(parse(t).unwrap().gate, "B47");
     }
 }
