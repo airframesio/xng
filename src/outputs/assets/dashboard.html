@@ -163,6 +163,16 @@
     <div id="msgs"></div>
   </div>
 </div>
+<script>
+// Airband sessions get a link to the listening page.
+fetch('/api/airband', { cache: 'no-store' }).then(r => r.json()).then(a => {
+  if (!a.channels || !a.channels.length) return;
+  const l = document.createElement('a');
+  l.href = '/airband'; l.textContent = '🎧 airband';
+  l.style.cssText = 'color:#9ece6a;text-decoration:none;margin-left:10px;font-size:12px';
+  document.getElementById('head').firstElementChild.appendChild(l);
+}).catch(() => {});
+</script>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
 <script>
 const map = L.map('map', { zoomControl: true }).setView([40, -95], 4);
@@ -1332,6 +1342,7 @@ function escapeHtml(s) {
 }
 tick();
 setInterval(tick, 2000);
+
 </script>
 </body>
 </html>

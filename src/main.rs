@@ -238,6 +238,7 @@ impl OutputOpts {
                 // Set per-session by the caller once the mode is known.
                 airframes: None,
                 own_ship_mmsi: None,
+                airband: Default::default(),
             },
             ident,
         ))
@@ -264,6 +265,8 @@ enum Command {
         tune: TuneOpts,
         #[command(flatten)]
         output: OutputOpts,
+        #[command(flatten)]
+        airband: xng::airband::cli::AirbandOpts,
     },
     /// Decode live from an SDR (multi-channel, mode via --mode)
     Listen {
@@ -279,6 +282,8 @@ enum Command {
         tune: TuneOpts,
         #[command(flatten)]
         output: OutputOpts,
+        #[command(flatten)]
+        airband: xng::airband::cli::AirbandOpts,
     },
     /// Run a whole station from a config file: several decode
     /// sessions (modes + SDRs) in one process with shared outputs
@@ -425,6 +430,11 @@ enum Command {
         #[arg(long)]
         quic_cert_out: Option<PathBuf>,
     },
+    /// Airframes ATC network: sign this feeder in or out (`xng atc login`)
+    Atc {
+        #[command(subcommand)]
+        cmd: commands::atc::AtcCommand,
+    },
     /// Run the built-in pipeline self-test (bus + outputs + DSP sanity)
     Selftest {
         /// Also write messages to this JSONL file
@@ -469,7 +479,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Devices { filter } => commands::devices::run(&filter),
-        Command::Decode { file, format, tune, output } => {
+        Command::Decode { file, format, tune, output, airband } => {
             // "-" reads IQ from stdin (ECO-15): KiwiSDR/GNU Radio/rx_sdr pipes.
             let is_stdin = file.as_os_str() == "-";
             let fmt = match format.as_deref() {
@@ -485,6 +495,8 @@ fn main() -> anyhow::Result<()> {
             let (mut outputs, station_ident) = output.build()?;
             outputs.airframes =
                 Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
+            outputs.airband = airband.outputs()?;
+            let airband_session = airband.session()?;
             let source = if is_stdin {
                 FileIqSource::open_stdin(fmt, rate, center_hz)
             } else {
@@ -511,11 +523,12 @@ fn main() -> anyhow::Result<()> {
                     ais_filter: Default::default(),
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Max),
                     max_ppm: tune.max_ppm,
+                    airband: airband_session,
                 },
             )
         }
-        Command::Listen { sdr, gain, tune, output } => {
-            listen(&sdr, gain, &tune, &output)
+        Command::Listen { sdr, gain, tune, output, airband } => {
+            listen(&sdr, gain, &tune, &output, &airband)
         }
         Command::Station { config } => run_station_cmd(&config),
         Command::Status { http } => run_status_cmd(&http),
@@ -619,6 +632,7 @@ fn main() -> anyhow::Result<()> {
                     ais_filter: Default::default(),
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
                     max_ppm: tune.max_ppm,
+                    airband: Default::default(),
                     outputs: runtime::OutputConfig {
                         console: ConsoleFormat::Pretty,
                         jsonl: None,
@@ -641,6 +655,7 @@ fn main() -> anyhow::Result<()> {
                         zmq: Vec::new(),
                         airframes: None,
                         own_ship_mmsi: None,
+                        airband: Default::default(),
                     },
                 },
             )
@@ -648,6 +663,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ingest { grpc, quic, quic_cert_out } => {
             commands::ingest::run(grpc, quic, quic_cert_out.as_deref())
         }
+        Command::Atc { cmd } => commands::atc::run(cmd),
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
     }
 }
@@ -787,11 +803,19 @@ fn print_table(headers: &[&str], rows: &[[String; 5]]) {
     println!("  {}", line("└", "┴", "┘"));
 }
 
-fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) -> anyhow::Result<()> {
+fn listen(
+    sdr: &str,
+    gain: Option<f64>,
+    tune: &TuneOpts,
+    output: &OutputOpts,
+    airband: &xng::airband::cli::AirbandOpts,
+) -> anyhow::Result<()> {
     let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
     let (mut outputs, station_ident) = output.build()?;
     outputs.airframes =
         Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
+    outputs.airband = airband.outputs()?;
+    let airband_session = airband.session()?;
     let serial = sdr_args::SdrArgs::parse(sdr).serial;
     let (source, driver) = open_sdr(sdr, rate, center_hz, gain)?;
     runtime::run_session(
@@ -815,6 +839,7 @@ fn listen(sdr: &str, gain: Option<f64>, tune: &TuneOpts, output: &OutputOpts) ->
                     ais_filter: Default::default(),
                     demod_effort: tune.demod_effort.unwrap_or(runtime::DemodEffort::Live),
                     max_ppm: tune.max_ppm,
+                    airband: airband_session,
         },
     )
 }

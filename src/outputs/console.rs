@@ -702,6 +702,27 @@ pub fn summary(msg: &Message) -> String {
             }
             s
         }
+        MessageBody::Airband { kind, details } => {
+            // "AIRBAND tx_end #12 KSFO Tower 3.8s peak -18.2 dBFS"
+            let mut s = format!("AIRBAND {kind}");
+            if let Some(tx) = details.get("tx") {
+                s.push_str(&format!(" #{tx}"));
+            }
+            if let Some(l) = details.get("label").and_then(|v| v.as_str()) {
+                s.push_str(&format!(" {l}"));
+            }
+            if let Some(d) = details.get("duration_s").and_then(|v| v.as_f64()) {
+                s.push_str(&format!(" {d:.1}s"));
+            }
+            if let Some(l) = details.get("level_dbfs").and_then(|v| v.as_f64()) {
+                s.push_str(&format!(" {l:.1} dBFS"));
+            }
+            // AIRBAND transcript #12 KSFO Tower: "United 12 cleared to land"
+            if let Some(t) = details.get("text").and_then(|v| v.as_str()) {
+                s.push_str(&format!(": \"{t}\""));
+            }
+            s
+        }
         MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
     }
 }

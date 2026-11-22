@@ -133,6 +133,9 @@ pub fn mode_suffix(mode: Mode) -> Option<&'static str> {
         // No public per-port Airframes ingest — fed via asf-2.0, not the
         // per-mode router (so no station-id suffix).
         Mode::Aprs | Mode::Pocsag | Mode::Eot | Mode::Flex | Mode::Vdes | Mode::Time => None,
+        // Airband audio feeds the ATC aggregator (`--atc-feed`), not the
+        // per-port message ingests.
+        Mode::Airband => None,
         Mode::Extern => None,
     }
 }

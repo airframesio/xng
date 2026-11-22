@@ -256,6 +256,7 @@ fn start_single(req: &SessionRequest) -> anyhow::Result<Started> {
         ais_filter: req.ais_filter(),
         demod_effort: tune.demod_effort.unwrap_or(demod_default),
         max_ppm: tune.max_ppm,
+        airband: Default::default(),
     };
 
     let engine = Engine::start(vec![(source, cfg)], EngineOptions { handle_signals: false })?;

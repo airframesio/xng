@@ -148,7 +148,8 @@ impl From<&Message> for asf2::DecodedMessage {
             | MessageBody::Pocsag { kind, details }
             | MessageBody::Eot { kind, details }
             | MessageBody::Flex { kind, details }
-            | MessageBody::Vdes { kind, details } => {
+            | MessageBody::Vdes { kind, details }
+            | MessageBody::Airband { kind, details } => {
                 Some(asf2::decoded_message::Body::Generic(asf2::GenericBody {
                     kind: kind.clone(),
                     details_json: details.to_string(),

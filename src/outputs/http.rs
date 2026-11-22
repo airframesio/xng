@@ -1346,8 +1346,28 @@ pub async fn run(
                 let mut buf = [0u8; 2048];
                 let n = sock.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]);
-                let path = req.split_whitespace().nth(1).unwrap_or("/");
-                let (ctype, body) = if path.starts_with("/api/state") {
+                let method = req.split_whitespace().next().unwrap_or("GET").to_string();
+                let path = req.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let path = path.as_str();
+                if path.starts_with("/airband/stream") {
+                    crate::outputs::airband_web::stream(sock, path).await;
+                    return;
+                }
+                let mut status = 200u16;
+                let (ctype, body) = if path.starts_with("/api/airband/scan") {
+                    if method == "POST" {
+                        let (code, body) = crate::outputs::airband_web::scan_control(path);
+                        status = code;
+                        ("application/json", body)
+                    } else {
+                        status = 405;
+                        ("application/json", "{\"ok\":false,\"error\":\"use POST\"}".to_string())
+                    }
+                } else if path.starts_with("/api/airband") {
+                    ("application/json", crate::outputs::airband_web::state_json())
+                } else if path == "/airband" || path.starts_with("/airband?") || path.starts_with("/airband/") {
+                    ("text/html; charset=utf-8", crate::outputs::airband_web::PAGE.to_string())
+                } else if path.starts_with("/api/state") {
                     ("application/json", snapshot(&mut state.lock().unwrap()))
                 } else if path.starts_with("/data/aircraft.json") {
                     ("application/json", aircraft_json(&state.lock().unwrap(), query_since(path)))
@@ -1364,8 +1384,14 @@ pub async fn run(
                 } else {
                     ("text/html; charset=utf-8", PAGE.to_string())
                 };
+                let reason = match status {
+                    200 => "OK",
+                    400 => "Bad Request",
+                    405 => "Method Not Allowed",
+                    _ => "Conflict",
+                };
                 let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nCache-Control: no-cache, no-store, must-revalidate\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nCache-Control: no-cache, no-store, must-revalidate\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
                     body
                 );

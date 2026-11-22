@@ -101,6 +101,7 @@ impl Engine {
         }
 
         let multi = sessions.len() > 1;
+        crate::airband::hub::hub().reset();
         let mut prepared = Vec::with_capacity(sessions.len());
         let mut infos = Vec::with_capacity(sessions.len());
         for (source, cfg) in sessions {
@@ -347,6 +348,7 @@ mod tests {
             zmq: vec![],
             airframes: None,
             own_ship_mmsi: None,
+            airband: Default::default(),
         }
     }
 
@@ -369,6 +371,7 @@ mod tests {
             ais_filter: Default::default(),
             demod_effort: runtime::DemodEffort::Live,
             max_ppm: None,
+            airband: Default::default(),
         }
     }
 

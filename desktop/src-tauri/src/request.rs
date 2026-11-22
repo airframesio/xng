@@ -254,6 +254,7 @@ impl SessionRequest {
             zmq: nonempty_list(&o.zmq),
             airframes: Some(outputs::airframes::cli_router(o.feed_airframes, &ident, &[mode])),
             own_ship_mmsi: o.own_ship_mmsi,
+            airband: Default::default(),
         })
     }
 }

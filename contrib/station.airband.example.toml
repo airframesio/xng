@@ -1,0 +1,97 @@
+# xng airband station: voice channels from two SDRs, a scanner stream,
+# recordings, Icecast, and a feed to the Airframes ATC network.
+#   xng atc login                 # once, to feed the ATC network
+#   xng station station.airband.toml
+station-id = "XX-KSFO-ATC"
+
+[outputs]
+http = "0.0.0.0:8080"            # dashboard; airband page at /airband
+metrics = "0.0.0.0:9090"         # Prometheus, including xng_airband_* metrics
+
+[outputs.airband]
+record-dir = "/var/lib/xng/airband"
+record-format = "ogg"            # wav or ogg (Opus)
+record-min-ms = 400              # drop key-clicks shorter than this
+record-max-s = 300               # split very long transmissions
+# record-continuous = true       # one file per channel per hour instead
+# record-streams = ["120.5", "scan"]
+udp = ["127.0.0.1:7355"]         # 16 kHz s16le PCM with an XNGA header
+icecast = ["icecast://source:hackme@icecast.local:8000/ksfo?stream=scan&name=KSFO+Scanner"]
+
+# The "scan" stream follows the active channel like a scanner.
+[outputs.airband.scan]
+priority = ["120.5"]             # highest first
+hold-ms = 2000                   # stay on a channel this long after it ends
+preempt = true                   # priority channels interrupt others
+lockout = ["128.25"]
+
+# Feed the Airframes ATC network (after `xng atc login`).
+[outputs.airband.atc]
+station-name = "SFO west ridge"
+location-precision-m = 500       # published position is rounded to this
+# hide-username = true           # don't show your account name next to these feeds
+bitrate = 24000
+# streams = ["120.5", "121.8", "scan"]   # default: every channel
+# server = "atc-ingest.airframes.io:4433"
+# transport = "auto"             # auto (QUIC, then TCP), quic or tcp
+receiver = { type = "rtlsdr", model = "RTL-SDR Blog V4", antenna = "discone" }
+
+# Transcribe transmissions. Transcripts go to the JSON outputs,
+# the dashboard, the recordings' sidecars and the ATC feed.
+# [outputs.airband.transcribe]
+# model = "skycontrol-atc-110m"  # ATC-tuned sherpa-onnx model, the default (build with --features sherpa)
+# model = "base.en"              # or Whisper (build with --features whisper)
+# url = "http://gpu-box:8000"    # or a Whisper HTTP server instead
+# engine = "faster-whisper"      # with url: what the server runs, for Airframes ATC
+# language = "en"
+# streams = ["120.5"]            # default: every channel
+
+# Tower and ground on one RTL-SDR. Channels can be listed only as tables;
+# the center frequency is chosen to fit them.
+[[session]]
+sdr = "driver=rtlsdr,serial=00000001"
+mode = "airband"
+gain = 32.8
+sample-rate = 2400000
+receiver-pos = "37.62,-122.38"
+
+[session.airband]
+mix = true                       # also publish every channel summed
+
+[session.airband.defaults]
+squelch = "auto:9"               # auto[:SNR dB], manual:<dBFS>, or off
+hang-ms = 300
+afc-max-hz = 1500                # follow carriers up to 1.5 kHz off
+
+[[session.airband.channel]]
+freq = "120.500"
+label = "SFO Tower"
+atc-frequency = "airport:KSFO:TWR:120500"
+
+[[session.airband.channel]]
+freq = "121.800"
+label = "SFO Ground"
+atc-frequency = "airport:KSFO:GND:121800"
+
+[[session.airband.channel]]
+freq = "120.900"
+label = "SFO Ground (west)"
+squelch = "manual:-48"           # a fixed level for a noisy channel
+
+# NorCal approach on a second SDR, plus an NFM channel.
+[[session]]
+sdr = "driver=rtlsdr,serial=00000002"
+mode = "airband"
+sample-rate = 2400000
+channels = ["134.5", "135.65", "135.1"]   # all within ~2 MHz of one capture
+receiver-pos = "37.62,-122.38"
+
+[[session.airband.channel]]
+freq = "135.65"
+label = "NorCal Approach"
+
+[[session.airband.channel]]
+freq = "135.1"
+label = "Bay sailing club"
+modulation = "nfm"
+ctcss-hz = 100.0

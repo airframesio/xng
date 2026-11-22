@@ -4,10 +4,17 @@
 
 pub mod acarsdec_json;
 pub mod aircraft;
+#[cfg(feature = "opus")]
+pub mod airband_icecast;
+pub mod airband_record;
+pub mod airband_udp;
+pub mod airband_web;
 pub mod airframes;
 pub mod beast;
 pub mod asf2_grpc;
 pub mod asf2_quic;
+#[cfg(feature = "opus")]
+pub mod atc_feed;
 pub mod console;
 pub mod dbinfo;
 pub mod dumpvdl2_json;

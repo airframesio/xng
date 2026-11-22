@@ -66,7 +66,9 @@ impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
     }
 }
 
-fn client_endpoint(trust: &TrustMode) -> anyhow::Result<quinn::Endpoint> {
+/// rustls client config for `trust`, offering `alpn`. `what` names the
+/// output in log lines and errors.
+pub(crate) fn client_crypto(trust: &TrustMode, alpn: &[u8], what: &str) -> anyhow::Result<rustls::ClientConfig> {
     let provider = rustls::crypto::ring::default_provider();
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider.clone()))
         .with_safe_default_protocol_versions()?;
@@ -79,7 +81,7 @@ fn client_endpoint(trust: &TrustMode) -> anyhow::Result<quinn::Endpoint> {
         }
         TrustMode::CaFile(path) => {
             let pem = std::fs::read(path)
-                .map_err(|e| anyhow::anyhow!("cannot read --asf2-quic-ca {}: {e}", path.display()))?;
+                .map_err(|e| anyhow::anyhow!("{what}: cannot read CA file {}: {e}", path.display()))?;
             let mut roots = rustls::RootCertStore::empty();
             let mut added = 0;
             for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
@@ -91,9 +93,8 @@ fn client_endpoint(trust: &TrustMode) -> anyhow::Result<quinn::Endpoint> {
         }
         TrustMode::Insecure => {
             tracing::warn!(
-                "asf2 quic: TLS certificate verification is DISABLED \
-                 (--asf2-quic-insecure). Feeds can be intercepted or spoofed; \
-                 use --asf2-quic-ca with the ingest's certificate instead."
+                "{what}: TLS certificate verification is DISABLED. Feeds can be \
+                 intercepted or spoofed; pin the server certificate instead."
             );
             builder
                 .dangerous()
@@ -101,7 +102,12 @@ fn client_endpoint(trust: &TrustMode) -> anyhow::Result<quinn::Endpoint> {
                 .with_no_client_auth()
         }
     };
-    crypto.alpn_protocols = vec![xng_proto::ALPN.to_vec()];
+    crypto.alpn_protocols = vec![alpn.to_vec()];
+    Ok(crypto)
+}
+
+fn client_endpoint(trust: &TrustMode) -> anyhow::Result<quinn::Endpoint> {
+    let crypto = client_crypto(trust, xng_proto::ALPN, "asf2 quic (--asf2-quic-ca / --asf2-quic-insecure)")?;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,

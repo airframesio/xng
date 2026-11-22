@@ -48,6 +48,11 @@ impl WeakBus {
     pub fn subscribe(&self) -> Option<broadcast::Receiver<Arc<Message>>> {
         self.tx.upgrade().map(|tx| tx.subscribe())
     }
+
+    /// Publish if the bus is still open; returns the number of subscribers.
+    pub fn publish(&self, msg: Message) -> usize {
+        self.tx.upgrade().map(|tx| tx.send(Arc::new(msg)).unwrap_or(0)).unwrap_or(0)
+    }
 }
 
 impl Default for MessageBus {
