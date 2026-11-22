@@ -123,6 +123,15 @@ pub fn run(opts: SurveyOpts) -> anyhow::Result<()> {
     run_with(&rep, opts).map(|_| ())
 }
 
+/// Capture windows in visiting order: those holding more of the mode's core
+/// channels first (AIS: A/B before the long-range C/D pair), otherwise by
+/// frequency.
+fn survey_order(mode: xng_types::Mode, mut groups: Vec<(u64, Vec<u64>)>) -> Vec<(u64, Vec<u64>)> {
+    let core = scan::core_channels(mode);
+    groups.sort_by_key(|(_, g)| std::cmp::Reverse(g.iter().filter(|f| core.contains(f)).count()));
+    groups
+}
+
 /// The survey behind `xng survey`, reporting progress through `rep` and
 /// returning the report. Cancelling `rep` ends the survey early; the report
 /// then covers what was measured up to that point.
@@ -177,7 +186,7 @@ pub fn run_with(rep: &Reporter, opts: SurveyOpts) -> anyhow::Result<SurveyReport
         !channels.is_empty(),
         "no channels to survey: mode {mode} has no built-in plan; pass --channels"
     );
-    let groups = scan::group_channels(&channels, rate, passband);
+    let groups = survey_order(mode, scan::group_channels(&channels, rate, passband));
     say!(rep, 
         "surveying {} channel(s) in {} capture window(s), {}s total",
         channels.len(),
@@ -240,6 +249,11 @@ pub fn run_with(rep: &Reporter, opts: SurveyOpts) -> anyhow::Result<SurveyReport
         // to the next interim boundary instead of churning the device.
         let visit = if groups.len() == 1 {
             remaining.min(opts.interim_secs)
+        } else if gi <= groups.len() {
+            // First pass: share what is left with the windows not visited
+            // yet, so a run shorter than the dwell still measures each one.
+            let unvisited = (groups.len() - gi + 1) as u64;
+            remaining.min(opts.rotate_dwell_secs).min((remaining / unvisited).max(1))
         } else {
             remaining.min(opts.rotate_dwell_secs)
         };
@@ -735,6 +749,16 @@ fn proposed_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn survey_visits_the_ais_a_b_window_first() {
+        let (_, plan) = scan::plan(xng_types::Mode::Ais);
+        let groups = scan::group_channels(&plan, 2_400_000.0, scan::passband(xng_types::Mode::Ais));
+        let ordered = survey_order(xng_types::Mode::Ais, groups);
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].1, vec![161_975_000, 162_025_000]);
+        assert_eq!(ordered[1].1, vec![156_775_000, 156_825_000]);
+    }
 
     fn chan(freq: u64, frames: u64, ok: u64, level: f32) -> SurveyChannel {
         SurveyChannel {
