@@ -193,6 +193,8 @@ impl Loadsheet {
     }
 }
 
+// `\d` in the `regex` crate also matches non-ASCII digits, so fields that
+// are later byte-sliced (issue time, CSV date) use `[0-9]`.
 // The `regex` crate has no look-around; where the reference parser uses
 // `(?![\d.])` after a number, these patterns use `(?:[^\d.]|$)`, and a
 // trailing `(?=\s|$)` becomes `(?:\s|$)` (only captures are read).
@@ -222,10 +224,10 @@ static ROUTE_JOINED: LazyLock<Regex> = LazyLock::new(|| {
     re(r"^([A-Z]{3})([A-Z]{3})\s+([A-Z0-9]{1,2}-?[A-Z0-9]{2,6})(?:\s+(\d{1,2}/\d{1,2}(?:/\d{1,2})?))?(?:\s|$)")
 });
 static ACCEPT_CSV: LazyLock<Regex> = LazyLock::new(|| {
-    re(r",([A-Z]{3,4}),([A-Z]{3,4}),(\d{6}),(\d{4}),LOADSHEET (FINAL|PRELIM),EDNO\s*(\d+),ACCEPT")
+    re(r",([A-Z]{3,4}),([A-Z]{3,4}),([0-9]{6}),([0-9]{4}),LOADSHEET (FINAL|PRELIM),EDNO\s*(\d+),ACCEPT")
 });
 static LEADING_JUNK: LazyLock<Regex> = LazyLock::new(|| re(r"^[\s\-.*/]+"));
-static TIME_TOKEN: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}Z?$"));
+static TIME_TOKEN: LazyLock<Regex> = LazyLock::new(|| re(r"^[0-9]{4}Z?$"));
 static EDITION_TOKEN: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{3}$"));
 static NAMED_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     re(r"^(?:LOADSHEET|LOAD SHEET)\s+([A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?)\s+REF\b")
@@ -697,6 +699,14 @@ mod tests {
         assert_eq!(ls.limiting, Some(Limiting::Zfw));
         assert_eq!(ls.pax_total, Some(342));
         assert_eq!(ls.mac_zfw, Some(32.5));
+    }
+
+    #[test]
+    fn non_ascii_digits_do_not_panic() {
+        let ls = parse("LOADSHEET FINAL \u{0967}\u{0968}\u{0969}\u{096A}\nAI160/21 21NOV26\nZFW 123").unwrap();
+        assert_eq!(ls.time, None);
+        // Not a valid CSV acceptance date: must simply not panic.
+        let _ = parse("QTR1,HKJK,OTHH,\u{0967}\u{0968}\u{0969}\u{096A}\u{0967}\u{0968},1401,LOADSHEET FINAL,EDNO 01,ACCEPT");
     }
 
     #[test]
