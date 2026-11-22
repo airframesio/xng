@@ -220,7 +220,7 @@ fn numbered_report(text: &str) -> Option<Oooi> {
         ..Oooi::default()
     };
     o.depa.as_ref()?;
-    let tail = &text[slash + 17..];
+    let tail = text.get(slash + 17..)?;
     let time = if let Some(line) = tail.strip_prefix("\r\n").or_else(|| tail.strip_prefix('\n')) {
         let line = line.strip_prefix('\t').unwrap_or(line);
         line.get(..4).and_then(clock)
@@ -1073,6 +1073,11 @@ mod tests {
         assert!(decode("13", "INC,V02,CX 140 20261122 1,YPPH,VHHH,1556").is_none());
         assert!(decode("13", "ONA,V02,CX 105 20261122 1,VHHH,YMML,0124").is_none());
         assert!(decode("4T", "PSHBK AC0281/99/00 YVR 0000Z/    Z/    Z/0605Z").is_none());
+    }
+
+    #[test]
+    fn numbered_report_with_non_ascii_tail_does_not_panic() {
+        assert!(decode("11", "OUT01ETH309/22220151HKJKHAAé0151").is_none());
     }
 
     #[test]
