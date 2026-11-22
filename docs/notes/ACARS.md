@@ -309,6 +309,14 @@ JetBlue); Alaska ETA acks `FROM:LAX OPS` / `AS1831` / `ARRIVAL GATE:65B`
 GATE A52`, else `ARR POS D12` (32); Virgin Australia `ARR BAY:` (3M). Not
 read: Jazz `NEXT FLIGHT INFORMATION` gates, Air Canada 4C `-GTE C001  C47`,
 crew free text.
+Round 6 (event digger #29): KLM 32 connection info (`P64AMSKWKL...` / `KL
+1750` / `GATE  A04  POS  A62`, gate A04 at AMS; `NXM` is the next flight
+and stops reading); Korean Air 33 `SPOT NO : 606`; Aer Lingus 48 `STAND
+INFO = 400C`; Republic RA messages other than ARRIVAL GATE (`QUHDQDDRP` is
+no longer skipped, only what `parse` reads; the FLT route allows an airline
+prefix, `FLT YX4704 RDU-LGA` / `GATE 29`); Avianca dispatch (`QUATLASAV`)
+`GATE 13 EN SAL.`, `GATE E12`, `E7 PARK EN BOG`, read until `FROM:`; `ARR
+GATE B44 ASSIGNED`.
 `format` names the family (`PDC`, `FLT_ROUTE_GATE`, ...). A gate must
 contain a digit; reading stops at connections, `NEXT FLT`/`NEXT FLIGHT`/
 `NEXT LEG`/`NEXT SECTOR`/`- NEXT FLIGHT`,
