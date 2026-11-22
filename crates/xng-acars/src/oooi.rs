@@ -400,7 +400,7 @@ fn compact_report(text: &str) -> Option<Oooi> {
 }
 
 static DAY_CLOCK: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"^(OUT|OFF|ONN|INN)\d{2}A(\d{2})(\d{6})([A-Z]{4})(?:([A-Z]{4})\d{6}|\d{4}([A-Z]{4})?)")
+    re(r"^(OUT|OFF|ONN|INN)\d{2}A(0[1-9]|[12]\d|3[01])(\d{6})([A-Z]{4})(?:([A-Z]{4})\d{6}|\d{4}([A-Z]{4})?)")
 });
 
 /// JAL (label 10) and ANA (label 11): event, version, `A`, day, HHMMSS:
@@ -422,7 +422,7 @@ fn day_clock_report(text: &str) -> Option<Oooi> {
 }
 
 static DELTA_HEADER: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^(\d{2})\d{2}(1[0-5]) ([A-Z0-9]{4}) ([A-Z0-9]{4})\d\r?\n\t?"));
+    LazyLock::new(|| re(r"^(0[1-9]|[12]\d|3[01])(?:[01]\d|2[0-3])(1[0-5]) ([A-Z0-9]{4}) ([A-Z0-9]{4})\d\r?\n\t?"));
 static DELTA_OUT: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})\d{4}\d{8}"));
 static DELTA_OFF: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})\d{4}[\d ]{12}(\d{4})\d{4}"));
 static DELTA_ON: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})\d{4} *(?:\r?\n|$)"));
@@ -469,16 +469,15 @@ fn delta_report(label: &str, text: &str) -> Option<Oooi> {
 }
 
 static CSV_VERSION: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^(OUT|OFF|ON[A-Z]?|IN[A-Z]?),V\d{2},[^,]*,([A-Z0-9-]{4}),([A-Z0-9-]{4}),(\d{4})\b"));
+    LazyLock::new(|| re(r"^(OUT|ONE),V\d{2},[^,]*,([A-Z0-9-]{4}),([A-Z0-9-]{4}),(\d{4})\b"));
 
 /// Cathay Pacific `OUT,V02,CX 837 20261121 1,CYVR,VHHH,2044,2036,----, 1179`
 /// and `ONE,V02,CX 105 20261122 1,VHHH,YMML,0124,   96`.
 fn csv_version_report(text: &str) -> Option<Oooi> {
     let c = CSV_VERSION.captures(text)?;
     let event = match &c[1] {
-        e @ ("OUT" | "OFF") => e,
-        e if e.starts_with("ON") => "ON",
-        _ => "IN",
+        "OUT" => "OUT",
+        _ => "ON",
     };
     let mut o = Oooi { depa: icao(&c[2]), dsta: icao(&c[3]), ..Oooi::default() };
     set_event(&mut o, event, clock(&c[4]));
@@ -502,7 +501,7 @@ fn colon_times_report(text: &str) -> Option<Oooi> {
 }
 
 static PUSHBACK: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^PSHBK [A-Z0-9]{3,8}/\d{2}/\d{2} ([A-Z]{3}) (\d{4})Z"));
+    LazyLock::new(|| re(r"^PSHBK [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z"));
 
 /// Air Canada pushback `PSHBK AC0281/21/22 YVR 0603Z/    Z/    Z/0605Z`
 /// (label 4T) as the OUT time; the station is IATA, so it goes in `depa`
@@ -1064,6 +1063,16 @@ mod tests {
         assert_eq!(o.depa.as_deref(), Some("YVR"));
         assert_eq!(o.gtout.as_deref(), Some("0603"));
         assert!(decode("4T", "ETA AC0404/21/21 YUL 1510Z").is_none());
+    }
+
+    #[test]
+    fn impossible_days_and_unknown_codes_are_not_reports() {
+        assert!(decode("13", "992513 KLAX KATL6\r\n07830550038005490542").is_none());
+        assert!(decode("13", "219913 KLAX KATL6\r\n07830550038005490542").is_none());
+        assert!(decode("10", "OUT04A99204409KSFO2044RJTT").is_none());
+        assert!(decode("13", "INC,V02,CX 140 20261122 1,YPPH,VHHH,1556").is_none());
+        assert!(decode("13", "ONA,V02,CX 105 20261122 1,VHHH,YMML,0124").is_none());
+        assert!(decode("4T", "PSHBK AC0281/99/00 YVR 0000Z/    Z/    Z/0605Z").is_none());
     }
 
     #[test]
