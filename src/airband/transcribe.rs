@@ -384,8 +384,13 @@ fn collapse_repeats(mut words: Vec<String>) -> Vec<String> {
 // ---- running ----
 
 /// Start transcription: the engine loads on its worker thread (a model
-/// download can take a while), the collector follows the hub until the bus
-/// closes. Transcripts still queued at the end are finished, up to a minute.
+/// download can take a while), the collector follows the hub until input
+/// ends. Transcripts still queued at the end are finished, up to a minute.
+///
+/// While it runs it holds the bus open, so transcripts that finish after the
+/// session has let go of the bus (a recorded file decodes faster than the
+/// model loads) still reach the outputs. Input has ended once this is the
+/// bus's last holder; the bus closes when this returns.
 pub async fn run(
     mut rx: broadcast::Receiver<AudioEvent>,
     mut bus_rx: broadcast::Receiver<Arc<Message>>,
@@ -409,6 +414,8 @@ pub async fn run(
         language: (s.language != "auto").then(|| s.language.clone()),
         streams,
     }));
+    // Keeps the bus open until the transcripts are out (dropped on return).
+    let Some(hold) = bus.upgrade() else { return Ok(()) };
     let worker = {
         let (queue, prov, s) = (queue.clone(), prov.clone(), s.clone());
         std::thread::Builder::new()
@@ -417,8 +424,12 @@ pub async fn run(
             .map_err(std::io::Error::other)?
     };
     let mut warned_at = std::time::Instant::now() - Duration::from_secs(3600);
+    let mut tick = tokio::time::interval(Duration::from_millis(200));
     loop {
         tokio::select! {
+            _ = tick.tick() => if hold.is_last() {
+                break;
+            },
             ev = rx.recv() => match ev {
                 Ok(ev) => {
                     for clip in collector.step(&ev) {
@@ -449,6 +460,20 @@ pub async fn run(
             },
         }
     }
+    // Events already sent before input ended: provenance first (the worker
+    // needs it to publish), then the audio.
+    while let Ok(m) = bus_rx.try_recv() {
+        if let MessageBody::Airband { kind, .. } = &m.body {
+            if kind == "tx_end" || kind == "tx_start" {
+                prov.lock().unwrap().insert(m.frequency_hz, m.source.clone());
+            }
+        }
+    }
+    while let Ok(ev) = rx.try_recv() {
+        for clip in collector.step(&ev) {
+            queue.push(clip);
+        }
+    }
     // Transmissions still open at the end are transcribed as they are.
     for (_, c) in collector.open.drain() {
         if c.samples.len() >= collector.min_samples {
@@ -462,6 +487,7 @@ pub async fn run(
         tracing::warn!("airband transcription: gave up on {n} queued transmissions at shutdown");
     }
     set_announce(None);
+    drop(hold);
     Ok(())
 }
 

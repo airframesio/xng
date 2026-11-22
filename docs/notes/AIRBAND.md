@@ -142,8 +142,12 @@ than `max-s` (28 s) go in pieces. One worker runs the engine, oldest first;
 when it falls behind, the oldest waiting transmissions are dropped (queue of
 16), and the log says so with a hint to pick a smaller model.
 
-Engines (all opt-in; release binaries and Docker images include none of the
-local ones):
+Engines. Release binaries (Linux, macOS, Windows), the .deb and the
+amd64/arm64 Docker images include sherpa-onnx, so `--transcribe` works with
+no setup: it runs `skycontrol-atc-110m`, downloaded once on first use. The
+armv7 Docker image has no local engine (sherpa-onnx ships no 32-bit ARM
+library); whisper.cpp is never in release builds. Docker keeps models in the
+`/var/cache/xng` volume.
 
 - **sherpa-onnx** (`sherpa` build feature: `cargo build --release --features
   sherpa`). Moonshine, NVIDIA Parakeet and SenseVoice on ONNX Runtime. These
