@@ -88,9 +88,267 @@ fn starts(txt: &[u8], prefix: &[u8]) -> bool {
     txt.len() >= prefix.len() && &txt[..prefix.len()] == prefix
 }
 
+// --- OOOI report formats seen in Airframes production traffic ---
+//
+// Times in these reports are HHMM or HHMMSS; the fields stay HHMM like
+// acarsdec's, so seconds are dropped. Same formats as acars-decoder-typescript
+// (Label_80, Label_QE_Report, Label_QE_Station, Label_11Through14_OOOI,
+// Label_13Through18_Slash) and microservice-event-digger's oooi_reports.go.
+
+/// A 4- or 6-digit HHMM[SS] value, returned as HHMM.
+fn clock(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    if b.len() != 4 && b.len() != 6 {
+        return None;
+    }
+    if b.len() == 6 && (!b[4].is_ascii_digit() || !b[5].is_ascii_digit() || (b[4] - b'0') > 5) {
+        return None;
+    }
+    time4(b, 0)
+}
+
+/// A 4-character ICAO-style airport (`----` and other padding rejected).
+fn icao(s: &str) -> Option<String> {
+    if s.len() == 4 { airport(s.as_bytes(), 0) } else { None }
+}
+
+/// A 3-letter IATA station (`---` and `///` rejected).
+fn iata(t: &[u8], at: usize) -> Option<String> {
+    let s = t.get(at..at + 3)?;
+    if s.iter().all(u8::is_ascii_uppercase) {
+        Some(String::from_utf8_lossy(s).into_owned())
+    } else {
+        None
+    }
+}
+
+/// Puts `time` (HHMM) in the field for `event` (OUT/OFF/ON/IN).
+fn set_event(o: &mut Oooi, event: &str, time: Option<String>) {
+    let Some(time) = time else { return };
+    match event {
+        "OUT" => o.gtout = Some(time),
+        "OFF" => o.wloff = Some(time),
+        "ON" | "ONN" => o.wlin = Some(time),
+        "IN" | "INN" => o.gtin = Some(time),
+        _ => {}
+    }
+}
+
+fn has_time(o: &Oooi) -> bool {
+    o.gtout.is_some() || o.wloff.is_some() || o.wlin.is_some() || o.gtin.is_some()
+}
+
+fn decode_report(label: &str, text: &str) -> Option<Oooi> {
+    match label {
+        "80" | "30" | "31" | "32" | "33" | "82" | "8D" => airline_report(text),
+        "11" | "12" | "13" | "14" => numbered_report(text).or_else(|| united_report(text)),
+        "15" | "16" | "17" | "18" => united_report(text),
+        "22" => numbered_report(text).or_else(|| label22_csv(text)),
+        "44" => label44_report(text),
+        "QC" | "QD" | "QE" | "QF" => text_report(text).or_else(|| station_report(label, text)),
+        _ => None,
+    }
+}
+
+/// `1101 OFFRP  0001/21 KDCA/KSEA .N535AS\r\n/OUT 1258/OFF 1318/FOB 0391/ETA 1822`
+/// (also SUMMRY, OUTRP, ONRP, INRP; JetBlue prefixes `/FB 0242/AD TJSJ/<pos>,`).
+fn airline_report(text: &str) -> Option<Oooi> {
+    let first = text.split(['\r', '\n']).next().unwrap_or("");
+    let (kw_at, kw) = ["OUTRP", "OFFRP", "ONRP", "INRP", "SUMMRY"].iter().find_map(|kw| {
+        first.match_indices(kw).find_map(|(i, _)| {
+            let before_ok = i == 0 || first.as_bytes()[i - 1] == b' ';
+            let after_ok = first.as_bytes().get(i + kw.len()) == Some(&b' ');
+            (before_ok && after_ok).then_some((i, *kw))
+        })
+    })?;
+    let after = &text[kw_at + kw.len()..];
+    let mut words = after.split_whitespace();
+    let flight_day = words.next()?;
+    let route = words.next()?;
+    if !flight_day.contains('/') {
+        return None;
+    }
+    let (dep, arr) = route.split_once('/')?;
+    let mut o = Oooi {
+        depa: icao(dep),
+        dsta: icao(arr),
+        ..Oooi::default()
+    };
+    let rest = &after[after.find(route)? + route.len()..];
+    for tag in rest.split('/') {
+        let mut kv = tag.split_whitespace();
+        let (Some(key), Some(val)) = (kv.next(), kv.next()) else { continue };
+        match key {
+            "OUT" | "OFF" | "ON" | "IN" => set_event(&mut o, key, clock(val)),
+            "ETA" => o.eta = clock(val),
+            _ => {}
+        }
+    }
+    has_time(&o).then_some(o)
+}
+
+/// `OUT01    ETH309/22220151HKJKHAAB\r\n0151 ...` on labels 11-14, and
+/// `OFF01YX5763/21212240KDCAKLGA224047  77` (HHMMSS inline) on label 22.
+fn numbered_report(text: &str) -> Option<Oooi> {
+    let event = ["OUT", "OFF", "ONN", "INN"].into_iter().find(|e| text.starts_with(&format!("{e}01")))?;
+    let slash = text.find('/')?;
+    let flight = &text[5..slash];
+    let flight_ok = flight.bytes().all(|c| c == b' ' || c.is_ascii_alphanumeric());
+    if flight.is_empty() || flight.len() > 10 || !flight_ok {
+        return None;
+    }
+    let t = &text.as_bytes()[slash + 1..];
+    // flight day, report day, report time
+    if t.len() < 16 || !t[..8].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut o = Oooi {
+        depa: airport(t, 8),
+        dsta: airport(t, 12),
+        ..Oooi::default()
+    };
+    o.depa.as_ref()?;
+    let tail = &text[slash + 17..];
+    let time = if let Some(line) = tail.strip_prefix("\r\n").or_else(|| tail.strip_prefix('\n')) {
+        line.get(..4).and_then(clock)
+    } else {
+        tail.get(..6).and_then(clock)
+    };
+    set_event(&mut o, event, time);
+    has_time(&o).then_some(o)
+}
+
+/// Label 22 `OFF02\r\nKOAK,KLAS,1839,17.2`.
+fn label22_csv(text: &str) -> Option<Oooi> {
+    let body = text.strip_prefix("OFF02")?.trim_start_matches(['\r', '\n']);
+    let f: Vec<&str> = body.split(',').collect();
+    if f.len() < 3 {
+        return None;
+    }
+    let mut o = Oooi { depa: icao(f[0]), dsta: icao(f[1]), ..Oooi::default() };
+    set_event(&mut o, "OFF", clock(f[2]));
+    has_time(&o).then_some(o)
+}
+
+/// Label 44 `OFF02,N35575W115081,KHND,KPSP,1121,0458,0530,016.8`
+/// (position, departure, arrival, MMDD, event time; OFF also has an ETA).
+fn label44_report(text: &str) -> Option<Oooi> {
+    let body = text.strip_prefix("00").unwrap_or(text);
+    let f: Vec<&str> = body.split(',').collect();
+    if f.len() < 6 {
+        return None;
+    }
+    let event = ["OFF", "ON", "IN"].into_iter().find(|e| {
+        f[0].len() == e.len() + 2 && f[0].starts_with(e) && matches!(&f[0][e.len()..], "01" | "02" | "03")
+    })?;
+    let mut o = Oooi { depa: icao(f[2]), dsta: icao(f[3]), ..Oooi::default() };
+    set_event(&mut o, event, clock(f[5]));
+    if event == "OFF" {
+        o.eta = f.get(6).and_then(|v| clock(v));
+    }
+    has_time(&o).then_some(o)
+}
+
+/// `-------------------OUT REPORT\r\nDEP RCKU,OUT 1118,FOB 106` on QE/QF/QC/QD,
+/// also `M77ASC4873---OUT REPORT,DEP ZSQD,...` and `...INNRPT\n\tDES ZGSZ,...`.
+fn text_report(text: &str) -> Option<Oooi> {
+    let s = match text.find('-') {
+        Some(i) if i == 0 || i == 10 => text[i..].trim_start_matches('-'),
+        _ => text,
+    };
+    let event = ["OUT", "OFF", "ONN", "INN", "ON", "IN"].into_iter().find(|e| s.starts_with(e))?;
+    let s = s[event.len()..].trim_start_matches(' ');
+    let body = s.strip_prefix("REPORT").or_else(|| s.strip_prefix("RPT"))?;
+    let mut o = Oooi::default();
+    for field in body.split(',') {
+        let mut kv = field.split_whitespace();
+        let (Some(key), Some(val)) = (kv.next(), kv.next()) else { continue };
+        match key {
+            "DEP" => o.depa = icao(val),
+            "DES" => o.dsta = icao(val),
+            "ETA" => o.eta = clock(val),
+            "OUT" | "OFF" | "ON" | "IN" => set_event(&mut o, key, clock(val)),
+            _ => {}
+        }
+    }
+    has_time(&o).then_some(o)
+}
+
+/// Short layout with 3-letter IATA stations (`---`/`///` when unknown):
+/// QE `MEL2019       60WSI` (OUT, destination at 16), QF `PHL1412GSO...`
+/// (OFF, destination at 7), QC `IAD2128` (ON), QD `SFO164100792` (IN).
+/// The station goes in `depa` as in acarsdec's 4-character QC/QD layouts.
+fn station_report(label: &str, text: &str) -> Option<Oooi> {
+    let t = text.as_bytes();
+    let head = t.get(..3)?;
+    if !(head.iter().all(u8::is_ascii_uppercase) || head == b"---" || head == b"///") {
+        return None;
+    }
+    let time = time4(t, 3)?;
+    let mut o = Oooi { depa: iata(t, 0), ..Oooi::default() };
+    match label {
+        "QE" => {
+            o.gtout = Some(time);
+            o.dsta = iata(t, 16);
+        }
+        "QF" => {
+            o.wloff = Some(time);
+            o.dsta = iata(t, 7);
+        }
+        "QC" => o.wlin = Some(time),
+        _ => o.gtin = Some(time),
+    }
+    Some(o)
+}
+
+/// United slash reports: `/14 OFF EVENT      / KIAD KMCO 21 145718/TIME 1457`,
+/// `/17 POST RPT       / KORD KAUS 21 214146/TIME 2140` (IN),
+/// `/18 POST TIMES SECS/ KSFO KDFW 20 042934/IN TIME0428` (IN) and
+/// `/18 FLT TIMES SECS / DGAA KIAD 20 094735\r\n/M13 OUT TIME 221610...`.
+fn united_report(text: &str) -> Option<Oooi> {
+    let parts: Vec<&str> = text.splitn(4, '/').collect();
+    if parts.len() < 3 || !parts[0].is_empty() {
+        return None;
+    }
+    let kind: Vec<&str> = parts[1].split_whitespace().collect();
+    let route: Vec<&str> = parts[2].split_whitespace().collect();
+    if kind.len() < 2 || route.len() < 2 || !matches!(kind[0], "13" | "14" | "15" | "16" | "17" | "18") {
+        return None;
+    }
+    let mut o = Oooi { depa: icao(route[0]), dsta: icao(route[1]), ..Oooi::default() };
+    let reported = || {
+        let v = parts.get(3)?.trim_start();
+        let v = v.strip_prefix("IN ").unwrap_or(v).strip_prefix("TIME")?.trim_start();
+        v.get(..4).and_then(clock)
+    };
+    match kind[1..] {
+        [e @ ("OUT" | "OFF" | "ON" | "IN"), "EVENT"] => set_event(&mut o, e, reported()),
+        ["POST", "RPT"] if kind[0] == "17" => set_event(&mut o, "IN", reported()),
+        ["POST", "TIMES", "SECS"] if kind[0] == "18" => set_event(&mut o, "IN", reported()),
+        ["FLT", "TIMES", "SECS"] if kind[0] == "18" => {
+            for line in text.lines() {
+                let w: Vec<&str> = line.split_whitespace().collect();
+                if let [m, e, "TIME", v] = w[..] {
+                    if matches!(m, "/M13" | "/M14" | "/M15" | "/M16") {
+                        set_event(&mut o, e, clock(v));
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    has_time(&o).then_some(o)
+}
+
 /// Extract OOOI fields for `label` from message `text`. Returns `None` when
 /// the label is not OOOI-bearing or no plausible field is found.
 pub fn decode(label: &str, text: &str) -> Option<Oooi> {
+    // Report formats seen in production that acarsdec's fixed offsets do
+    // not cover; fall through to those offsets when none matches.
+    if let Some(o) = decode_report(label, text) {
+        return Some(o);
+    }
+
     let t = text.as_bytes();
     let mut o = Oooi::default();
 
@@ -336,16 +594,13 @@ mod tests {
     }
 
     #[test]
-    fn qf_three_char_faa_codes_rejected() {
-        // The 3-char-FAA-code QF form does not align to acarsdec's offsets;
-        // validation drops the misaligned fields rather than emitting junk.
-        let o = decode("QF", "EWR2210ATL");
-        // depa="EWR2" is alnum so survives, but the time/dest are garbage;
-        // assert we never emit an implausible time or 2-char airport.
-        if let Some(o) = o {
-            assert!(o.wloff.is_none(), "must not emit garbage OFF time");
-            assert!(o.dsta.is_none(), "must not emit truncated dest");
-        }
+    fn qf_three_char_iata_station_layout() {
+        // research/QF.md "EWR2210ATL": the 3-letter-station layout, which
+        // is also most of the production QF traffic ("PHL1412GSOOS GSO/...").
+        let o = decode("QF", "EWR2210ATL").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("EWR"));
+        assert_eq!(o.wloff.as_deref(), Some("2210"));
+        assert_eq!(o.dsta.as_deref(), Some("ATL"));
     }
 
     #[test]
@@ -414,5 +669,216 @@ mod tests {
     fn empty_link_test_yields_nothing() {
         // Q0 is not OOOI-bearing.
         assert!(decode("Q0", "").is_none());
+    }
+
+    // --- Report formats from Airframes production traffic (Nov 21-22 2026) ---
+
+    fn times(o: &Oooi) -> [Option<&str>; 4] {
+        [o.gtout.as_deref(), o.wloff.as_deref(), o.wlin.as_deref(), o.gtin.as_deref()]
+    }
+
+    #[test]
+    fn airline_offrp_label_80() {
+        let o = decode(
+            "80",
+            "1101 OFFRP  0001/21 KDCA/KSEA .N535AS\r\n/OUT 1258/OFF 1318/FOB 0391/ETA 1822/CAB 1254",
+        )
+        .unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KDCA"));
+        assert_eq!(o.dsta.as_deref(), Some("KSEA"));
+        assert_eq!(times(&o), [Some("1258"), Some("1318"), None, None]);
+        assert_eq!(o.eta.as_deref(), Some("1822"));
+    }
+
+    #[test]
+    fn airline_summary_label_80() {
+        let o = decode(
+            "80",
+            "3501 SUMMRY 3390/20 KPHX/KILN .N337AZ\r\n/OUT 1600/FOB 0541\r\n/OFF 1615/FOB ----\r\n/ON  1930/FOB ----\r\n/IN  1937/FOB 0224",
+        )
+        .unwrap();
+        assert_eq!(times(&o), [Some("1600"), Some("1615"), Some("1930"), Some("1937")]);
+    }
+
+    #[test]
+    fn airline_single_line_outrp() {
+        let o = decode("80", "1001 OUTRP 1925/21 KBOS/MMGL .XA-VSX/OUT 1245/FOB  171").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KBOS"));
+        assert_eq!(o.dsta.as_deref(), Some("MMGL"));
+        assert_eq!(o.gtout.as_deref(), Some("1245"));
+    }
+
+    #[test]
+    fn airline_reports_on_jetblue_labels() {
+        let out = decode(
+            "30",
+            " /FB 0069/AD ----/N 42.372,W 71.028,1001 OUTRP  0940/22 KBOS/---- .N2086J\r\n/OUT 0348/FOB 0069",
+        )
+        .unwrap();
+        assert_eq!(out.depa.as_deref(), Some("KBOS"));
+        assert_eq!(out.dsta, None);
+        assert_eq!(out.gtout.as_deref(), Some("0348"));
+
+        let off = decode(
+            "31",
+            " /FB 0242/AD TJSJ/N 28.420,W 81.307,1101 OFFRP  2133/22 KMCO/TJSJ .N506JB\r\n/OUT 0328/OFF 0349/FOB 0242/ETA 0618",
+        )
+        .unwrap();
+        assert_eq!(times(&off), [Some("0328"), Some("0349"), None, None]);
+        assert_eq!(off.eta.as_deref(), Some("0618"));
+
+        let on = decode(
+            "32",
+            "/FB 0131/AD KBOS/N4222.1,W07100.2,1201 ONRP   0150/22 KSAV/KBOS .N3189J\r\n/ON  0328/FOB 0131",
+        )
+        .unwrap();
+        assert_eq!(on.wlin.as_deref(), Some("0328"));
+
+        let inn = decode(
+            "33",
+            " /FB 0080/AD KBOS/N 42.371,W 71.006,1301 INRP   2166/21 KRSW/KBOS .N558JB\r\n/ON  1547/IN  1552/FOB 0080",
+        )
+        .unwrap();
+        assert_eq!(inn.depa.as_deref(), Some("KRSW"));
+        assert_eq!(times(&inn), [None, None, Some("1547"), Some("1552")]);
+    }
+
+    #[test]
+    fn airline_inrp_label_8d_and_outrp_label_82() {
+        let o = decode("8D", "13H3 INRP   2513/21 EKCH/EGPH .OY-KBR\r\n/ON 1825/IN 1828").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("EKCH"));
+        assert_eq!(times(&o), [None, None, Some("1825"), Some("1828")]);
+
+        let o = decode("82", "1001 OUTRP  0602/21 YSSY/RKSI .HL7626\r\n/OUT 2347/FOB 3084").unwrap();
+        assert_eq!(o.gtout.as_deref(), Some("2347"));
+    }
+
+    #[test]
+    fn label_80_position_report_is_not_oooi() {
+        assert!(decode("80", "3N01 POSRPT 0581/27 KIAD/MSLP .N962AV\r\n/POS N38541W077244").is_none());
+    }
+
+    #[test]
+    fn numbered_reports_labels_11_to_14() {
+        let o = decode("11", "OUT01    ETH309/22220151HKJKHAAB\r\n0151 16510600").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("HKJK"));
+        assert_eq!(o.dsta.as_deref(), Some("HAAB"));
+        assert_eq!(o.gtout.as_deref(), Some("0151"));
+
+        let o = decode("12", "OFF01    CSN654/21212021EGKKZHCC\r\n2021 5490936  98").unwrap();
+        assert_eq!(o.wloff.as_deref(), Some("2021"));
+
+        // the ON time is the first four digits, not 002101
+        let o = decode("13", "ONN01   WJA2251/21220021MMPRCYYC\r\n00210167").unwrap();
+        assert_eq!(o.wlin.as_deref(), Some("0021"));
+
+        let o = decode("14", "INN01UAE179    /21211019OMDBEPWA\r\n1017 1761011").unwrap();
+        assert_eq!(o.gtin.as_deref(), Some("1017"));
+
+        assert!(decode("13", "ONN011317EGJB").is_none());
+    }
+
+    #[test]
+    fn label_22_off_reports() {
+        let o = decode("22", "OFF01YX5763/21212240KDCAKLGA224047  77").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KDCA"));
+        assert_eq!(o.dsta.as_deref(), Some("KLGA"));
+        assert_eq!(o.wloff.as_deref(), Some("2240"));
+
+        let o = decode("22", "OFF02\r\nKOAK,KLAS,1839,17.2").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KOAK"));
+        assert_eq!(o.wloff.as_deref(), Some("1839"));
+    }
+
+    #[test]
+    fn label_44_off_report() {
+        let o = decode("44", "OFF02,N35575W115081,KHND,KPSP,1121,0458,0530,016.8").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KHND"));
+        assert_eq!(o.dsta.as_deref(), Some("KPSP"));
+        assert_eq!(o.wloff.as_deref(), Some("0458"));
+        assert_eq!(o.eta.as_deref(), Some("0530"));
+        assert!(decode("44", "/FB 0083/AD KRDU/N3823.5,W07507.3,INA03,KRDU,2337").is_none());
+    }
+
+    #[test]
+    fn q_series_text_reports() {
+        let o = decode("QE", "-------------------OUT REPORT\r\nDEP RCKU,OUT 1118,FOB 106").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("RCKU"));
+        assert_eq!(o.gtout.as_deref(), Some("1118"));
+
+        let o = decode("QE", "M77ASC4873-------------------OUT REPORT,DEP ZSQD,OUT 2350,FOB 110").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("ZSQD"));
+        assert_eq!(o.gtout.as_deref(), Some("2350"));
+
+        let o = decode("QF", "----------OFF REPORT\r\nDEP RCKU,OFF 1124,DES RCSS,FOB 106").unwrap();
+        assert_eq!(o.dsta.as_deref(), Some("RCSS"));
+        assert_eq!(o.wloff.as_deref(), Some("1124"));
+
+        let o = decode("QC", "-------ON REPORT\r\nDES RCKU,ON 0843,FOB 111").unwrap();
+        assert_eq!(o.dsta.as_deref(), Some("RCKU"));
+        assert_eq!(o.wlin.as_deref(), Some("0843"));
+
+        let o = decode("QD", "M55AZH9110------------INNRPT\n\tDES ZGSZ,N 22380E113495,IN 165807,FOB ,DEP ZBAA")
+            .unwrap();
+        assert_eq!(o.depa.as_deref(), Some("ZBAA"));
+        assert_eq!(o.dsta.as_deref(), Some("ZGSZ"));
+        assert_eq!(o.gtin.as_deref(), Some("1658"));
+    }
+
+    #[test]
+    fn q_series_iata_station_reports() {
+        let o = decode("QE", "MEL2019       60WSI").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("MEL"));
+        assert_eq!(o.dsta.as_deref(), Some("WSI"));
+        assert_eq!(o.gtout.as_deref(), Some("2019"));
+
+        let o = decode("QE", "---1116       29---").unwrap();
+        assert_eq!(o.depa, None);
+        assert_eq!(o.dsta, None);
+        assert_eq!(o.gtout.as_deref(), Some("1116"));
+
+        let o = decode("QF", "PHL1412GSOOS GSO/FUL0628").unwrap();
+        assert_eq!(o.dsta.as_deref(), Some("GSO"));
+
+        let o = decode("QC", "IAD2128").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("IAD"));
+        assert_eq!(o.wlin.as_deref(), Some("2128"));
+
+        let o = decode("QD", "SFO164100792").unwrap();
+        assert_eq!(o.gtin.as_deref(), Some("1641"));
+
+        // the 4-character ICAO layout still decodes as before
+        let o = decode("QC", "KIAD2128").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KIAD"));
+        assert_eq!(o.wlin.as_deref(), Some("2128"));
+    }
+
+    #[test]
+    fn q_series_blank_time_gives_no_time() {
+        assert!(decode("QP", "KSEAKORD    0276     ").is_none_or(|o| o.gtout.is_none()));
+    }
+
+    #[test]
+    fn united_slash_reports() {
+        let o = decode("14", "/14 OFF EVENT      / KIAD KMCO 21 145718/TIME 1457\r\n/AU 17542332").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KIAD"));
+        assert_eq!(o.dsta.as_deref(), Some("KMCO"));
+        assert_eq!(o.wloff.as_deref(), Some("1457"));
+
+        let o = decode("17", "/17 POST RPT       / KORD KAUS 21 214146/TIME 2140\r\n/FOB 0068").unwrap();
+        assert_eq!(o.gtin.as_deref(), Some("2140"));
+
+        let o = decode("18", "/18 POST TIMES SECS/ KSFO KDFW 20 042934/IN TIME0428/PDOOR 042934").unwrap();
+        assert_eq!(o.gtin.as_deref(), Some("0428"));
+
+        let o = decode(
+            "18",
+            "/18 FLT TIMES SECS / DGAA KIAD 20 094735\r\n/M11 PDOOR TIME 220923\r\n/M13 OUT TIME 221610\r\n/M14 OFF TIME 223552\r\n/M15 ON TIME 093824\r\n/M16 IN TIME 094635\r\n/M17 POS",
+        )
+        .unwrap();
+        assert_eq!(o.depa.as_deref(), Some("DGAA"));
+        assert_eq!(times(&o), [Some("2216"), Some("2235"), Some("0938"), Some("0946")]);
+
+        assert!(decode("12", "/12 CREW EVENT     / KMSP KORD 21 222646/TIME 2226").is_none());
     }
 }
