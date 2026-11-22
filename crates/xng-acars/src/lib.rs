@@ -71,7 +71,7 @@ pub enum AcarsApp {
     Airline5z(airline5z::Airline5z),
     /// Military (AMC-style) ARINC 702 report: `<KIND>/ID<tail>,<callsign>,
     /// <mission>/…` on H1 (`MD` sublabel) and many other labels.
-    Military(military::MilitaryReport),
+    Military(Box<military::MilitaryReport>),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -119,7 +119,7 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
         // is recognized from the original text (the `#CFB` preamble is the
         // H1 `CF` sublabel, already stripped from `body`).
         "H1" => arinc622::parse(body, downlink)
-            .or_else(|| military::parse(body).map(AcarsApp::Military))
+            .or_else(|| military::parse(body).map(|m| AcarsApp::Military(Box::new(m))))
             .or_else(|| fpn::parse(body).map(AcarsApp::FlightPlan))
             .or_else(|| cfb::classify(text).map(AcarsApp::Cfb))
             .or_else(|| ohma::parse(body).map(|message| AcarsApp::Ohma { message })),
@@ -128,7 +128,7 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
         "5Z" => airline5z::parse(body).map(AcarsApp::Airline5z),
         _ => qseries::classify(label)
             .map(AcarsApp::QSeries)
-            .or_else(|| military::parse(text).map(AcarsApp::Military)),
+            .or_else(|| military::parse(text).map(|m| AcarsApp::Military(Box::new(m)))),
     };
 
     // OOOI fields can be embedded in many labels' text (Q-series and several

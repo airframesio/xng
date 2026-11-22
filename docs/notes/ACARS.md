@@ -335,9 +335,15 @@ They decode to `app: "military"` with `kind` (`INI`, `POS`, `FTX`, `WXR`,
 `FPN`, `OOI`, `DIS`, `INR`, `REQPOS`, ...), `tail`, `callsign`,
 `mission_number` and `mission` (`prefix`, `basic`, `suffix`,
 `day_of_year`), `departure`/`arrival`, `planned_departure`/
-`estimated_departure`, `report_time`, `out_time`/`off_time`, `eta`,
+`estimated_departure`, `report_time`, `out_time`/`off_time`/`on_time`/
+`in_time` (from `/OT`, `/OF`, `/ON`, `/IN` or a `/SM` summary), `eta`,
 `position`/`altitude_ft`, `fuel_on_board`, `text`, `weather` (the
-METAR/TAF returned to a `WXR`), `flight_plan` (FPN route) and `crc_ok`.
+METAR/TAF returned to a `WXR`), `weather_request_station` (the station
+asked for in a `REQWXR`), `flight_plan` (FPN route) and `crc_ok`.
+AMC free text (`/FX`, `/MT`) never contains `/` or `,`: senders leave
+commas out and usually replace `/` with `(` (`15(06`, `(((((KT` in a
+relayed METAR), though a writer may use another workaround. `(` can stand
+for either character, so the text is kept exactly as sent.
 Multi-block uplinks repeat `- #MD` at each block join; those are removed
 before the checksum. Placeholder missions (`COLLINSAM123`,
 `ZZZ123456789`) are kept as `mission_number` but not parsed. The ACARS

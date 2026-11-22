@@ -241,7 +241,7 @@ miam_file_complete). Abort frames cancel; 10-minute timeout.
 acars-decoder-typescript (`utils/arinc_702_helper.ts`,
 `utils/mission_number.ts` and their tests; facts only: the `/ID`
 tail/callsign/mission layout, the `/AF`, `/TD`, `/DC`, `/MT`, `/OF`, `/OT`,
-`/LL`, `/PS` field meanings, and the two ARINC 702 checksums,
+`/ON`, `/IN`, `/SM`, `/WX`, `/LL`, `/PS` field meanings, and the two ARINC 702 checksums,
 CRC-16/IBM-SDLC with reversed nibbles and CRC-16/GENIBUS). Tested against
 real messages received by Airframes between 2026-11-19 and 2026-11-21:
 all 139 distinct `/ID` reports in that sample decode, all 139 pass a

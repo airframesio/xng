@@ -120,6 +120,12 @@ pub struct MilitaryReport {
     /// `/OF` takeoff time, `DDHHMM`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub off_time: Option<String>,
+    /// `/ON` landing time, `DDHHMM`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_time: Option<String>,
+    /// `/IN` in-gate time, `DDHHMM`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_time: Option<String>,
     /// `/ET` estimated arrival, `DDHHMM`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eta: Option<String>,
@@ -135,6 +141,9 @@ pub struct MilitaryReport {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub weather: Option<WeatherReport>,
+    /// Station asked for in a `REQWXR` (`/WX<DDHHMM>,<code>,<station>,…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weather_request_station: Option<String>,
     /// Route of an `FPN` report.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight_plan: Option<FlightPlan>,
@@ -144,7 +153,9 @@ pub struct MilitaryReport {
 
 fn description(kind: &str) -> String {
     let one = |k: &str| match k {
+        "CRG" => "Cargo Report",
         "DIS" => "Position Report (DIS)",
+        "ENG" => "Engine Report",
         "FPN" => "Flight Plan",
         "FTX" => "Free Text",
         "INI" => "Initial Report",
@@ -313,17 +324,20 @@ pub fn parse(text: &str) -> Option<MilitaryReport> {
         report_time: None,
         out_time: None,
         off_time: None,
+        on_time: None,
+        in_time: None,
         eta: None,
         position: None,
         altitude_ft: None,
         fuel_on_board: None,
         text: None,
         weather: None,
+        weather_request_station: None,
         flight_plan: None,
         crc_ok,
     };
 
-    for (i, &f) in fields.iter().enumerate().skip(1) {
+    for &f in fields.iter().skip(1) {
         if f.len() < 2 || !f.is_char_boundary(2) {
             continue;
         }
@@ -357,31 +371,55 @@ pub fn parse(text: &str) -> Option<MilitaryReport> {
             "ET" => r.eta = ddhhmm(v),
             "OF" => r.off_time = ddhhmm(v),
             "OT" => r.out_time = ddhhmm(parts[0]),
+            "ON" => r.on_time = ddhhmm(v),
+            "IN" => r.in_time = ddhhmm(parts[0]),
+            // engine start, fuel, engine stop, then out, off, on and in times,
+            // each followed by the fuel on board at that moment
+            "SM" if parts.len() == 11 => {
+                r.out_time = ddhhmm(parts[3]);
+                r.off_time = ddhhmm(parts[5]);
+                r.on_time = ddhhmm(parts[7]);
+                r.in_time = ddhhmm(parts[9]);
+            }
+            "WX" if parts.len() >= 3
+                && parts[2].len() == 4
+                && parts[2].bytes().all(|b| b.is_ascii_alphanumeric())
+                && parts[2].as_bytes()[0].is_ascii_uppercase() =>
+            {
+                r.weather_request_station = Some(parts[2].to_owned());
+            }
             "FB" => r.fuel_on_board = v.parse().ok(),
             "FX" => r.text = non_empty(v),
             "LL" => r.position = decode_decimal_minutes(v),
             "PS" => {
                 r.position = decode_decimal_minutes(parts[0]);
                 if parts.len() > 2 {
-                    r.altitude_ft = parts[2].parse::<u32>().ok().and_then(|fl| fl.checked_mul(100));
+                    r.altitude_ft = parts[2]
+                        .parse::<u32>()
+                        .ok()
+                        .and_then(|fl| fl.checked_mul(100));
                 }
             }
             "MT" => {
-                // `<station>,<HHMM>,<report>`. The report is free text that
-                // can contain '/' (1/2SM, 07/02, R09/...), so it runs to the
-                // end of the message.
-                let rest = fields[i..].join("/");
-                let mut it = rest[2..].splitn(3, ',');
+                // `<station>,<HHMM>,<report>`. AMC free text never contains
+                // '/' (slashes and commas are sent as '('), so the report ends
+                // at the next field like any other.
+                let mut it = v.splitn(3, ',');
                 if let (Some(st), Some(t), Some(rep)) = (it.next(), it.next(), it.next()) {
-                    let rep = rep.trim();
-                    r.weather = Some(WeatherReport {
-                        station: st.to_owned(),
-                        time: t.to_owned(),
-                        kind: weather_kind(rep),
-                        report: rep.to_owned(),
-                    });
+                    let hhmm_ok = t.len() == 4
+                        && t.bytes().all(|b| b.is_ascii_digit())
+                        && t[..2].parse::<u32>().is_ok_and(|h| h <= 23)
+                        && t[2..].parse::<u32>().is_ok_and(|m| m <= 59);
+                    if hhmm_ok {
+                        let rep = rep.trim();
+                        r.weather = Some(WeatherReport {
+                            station: st.to_owned(),
+                            time: t.to_owned(),
+                            kind: weather_kind(rep),
+                            report: rep.to_owned(),
+                        });
+                    }
                 }
-                break;
             }
             _ => {}
         }
@@ -415,6 +453,9 @@ impl MilitaryReport {
         }
         if let Some(w) = &self.weather {
             s.push_str(&format!(" {} {}", w.kind, w.station));
+        }
+        if let Some(st) = &self.weather_request_station {
+            s.push_str(&format!(" wx? {st}"));
         }
         s
     }
@@ -501,15 +542,19 @@ mod tests {
     }
 
     #[test]
-    fn wxr_report_with_slashes_and_unknown_text() {
-        let r = parse("- #MDWXR/ID99207A,RCH3269,AAM7886W2324/MR4,120/MTKADW,1200,KADW 211200Z 1/2SM FG OVC002 07/02 A3027").unwrap();
+    fn wxr_paren_substitution_and_unknown_text() {
+        // AMC free text cannot contain '/' or ','; both are sent as '('.
+        let r = parse("- #MDWXR/ID99207A,RCH3269,AAM7886W2324/MR4,120/MTKADW,1200,KADW 211200Z 1(2SM FG OVC002 07(02 A3027/FB123").unwrap();
         let w = r.weather.unwrap();
         assert_eq!(w.kind, "METAR");
-        assert_eq!(w.report, "KADW 211200Z 1/2SM FG OVC002 07/02 A3027");
+        assert_eq!(w.report, "KADW 211200Z 1(2SM FG OVC002 07(02 A3027");
+        assert_eq!(r.fuel_on_board, Some(123));
         let u =
             parse("- #MDWXR/ID99207A,RCH3269,AAM7886W2324/MR4,120/MTKADW,1200,NO WX AVBL FOR KADW")
                 .unwrap();
         assert_eq!(u.weather.unwrap().kind, "UNKNOWN");
+        let bad = parse("- #MDWXR/ID99207A,RCH3269,AAM7886W2324/MR4,120/MTKADW,2460,TEST").unwrap();
+        assert!(bad.weather.is_none());
     }
 
     #[test]
@@ -559,6 +604,68 @@ mod tests {
         let r = parse("- #MDFTX/ID55139A,RCH117,XMZM120GF318/MR1,/FXAH - YOU ALREADY HAVE A QT YOU JUST WANT A QUICKER TURN. WILL BRING IT UP TO DO. WILL MOST LIKELY BE TABLED UNTIL YOU LAND AND IT WILL BE CONSIDERED AN EGO VS FUEL ONLY QT. FM- #MD B2 SENDS.600C").unwrap();
         assert!(r.crc_ok);
         assert!(r.text.unwrap().ends_with("FM B2 SENDS."));
+    }
+
+    #[test]
+    fn ftx_paren_substitutions_are_kept() {
+        // https://app.airframes.io/messages/7755431084 and 7931914752: AMC free
+        // text never contains '/' or ','; both are sent as '('.
+        let r = parse("FTX/ID543615,CANNY52,202609300515/MR7,/FXTO ESP AND GIBAJF502 FLT FOR TOMORROW WILL BE ACTIVATED.ETD WILL BE 0100Z SO FAR.SO ASC HQ IS NOW REQUESTING TO CANX 4TH PERIOD TODAY.BTW CONFIRM T(O FUEL OF JF502 FROM RJOH IS 115K.0D88").unwrap();
+        assert!(r.crc_ok);
+        assert!(r
+            .text
+            .unwrap()
+            .ends_with("CONFIRM T(O FUEL OF JF502 FROM RJOH IS 115K."));
+        assert!(r.mission.is_none());
+        let r = parse("- #MDFTX/ID80002A,BRK71,COLLINSAM123/MR2,/FXMETAR LIPA 260855Z 07009KT 9999 FEW080 15(06 Q1021 RMK FEW VIS MIN 9999 WIND THR05 (((((KT WIND THR23 (((((KT A3015 BLU15ED").unwrap();
+        assert!(r.crc_ok);
+        assert_eq!(
+            r.text.as_deref(),
+            Some("METAR LIPA 260855Z 07009KT 9999 FEW080 15(06 Q1021 RMK FEW VIS MIN 9999 WIND THR05 (((((KT WIND THR23 (((((KT A3015 BLU")
+        );
+    }
+
+    #[test]
+    fn ftx_sigmet_relay() {
+        // https://app.airframes.io/messages/7655317188: body verbatim, header
+        // and checksum rebuilt around it (only the text was copied).
+        let body = "CZQX SIGMET F2 VALID 231520(231920 CWUL-CZQX GANDER OCEANIC FIR(CTA SEV TURB OBS AT 1509Z WI 180NM WID LINEBTN (N5630W03900( - (N6130 W03200( FL310(360 MOV WNW 10KT WKN";
+        let r = parse(&format!(
+            "FTX/ID80002A,BRK71,COLLINSAM123/MR2,/FX{body}2B23"
+        ))
+        .unwrap();
+        assert!(r.crc_ok);
+        assert_eq!(r.text.as_deref(), Some(body));
+    }
+
+    #[test]
+    fn on_in_and_summary_times() {
+        let r = parse("OOI/ID66015S,RAMEN95,CPZ595L5P323/DC19112026,192310/MR8,/ON191923/CG254,112,360/FB990/VR32F49A").unwrap();
+        assert_eq!(r.on_time.as_deref(), Some("191923"));
+        let r = parse("OOI/ID50005B,RCH2151,PBC03810C314/DC16112026,121054/MR152,/IN161210,16/CG,,/FB/VR032AE97").unwrap();
+        assert!(r.crc_ok);
+        assert_eq!(r.in_time.as_deref(), Some("161210"));
+        assert_eq!(r.fuel_on_board, None);
+        let r = parse("F25ACR1225#M2BSUM/ID00403A,GOLD38,ZZZ123456789/DC17112026,181139/MR120,/SM170742,2204,171811,170755,2203,170805,2200,171751,325,171811,310/VR32A36A").unwrap();
+        assert_eq!(r.description, "Summary Report");
+        assert_eq!(r.out_time.as_deref(), Some("170755"));
+        assert_eq!(r.off_time.as_deref(), Some("170805"));
+        assert_eq!(r.on_time.as_deref(), Some("171751"));
+        assert_eq!(r.in_time.as_deref(), Some("171811"));
+    }
+
+    #[test]
+    fn weather_and_cargo_requests() {
+        let r = parse("REQWXR/ID16093S,RCH5070,DS8903461322/DC21112026,102803/MR18,/WX211915,2,KWRI,,,,,,,,,,,/FB1162/VR32B6AD").unwrap();
+        assert!(r.crc_ok);
+        assert_eq!(r.description, "Request for Weather Report");
+        assert_eq!(r.weather_request_station.as_deref(), Some("KWRI"));
+        assert_eq!(r.fuel_on_board, Some(1162));
+        let r = parse("REQWXR/ID16093S,RCH5070,DS8903461322/DC21112026,102803/MR18,/WX211915,2,,,,/FB1162/VR326817").unwrap();
+        assert_eq!(r.weather_request_station, None);
+        let r = parse("- #MDREQCRG/ID77174A,RCH341,AMZM2016C322/MR2,230F").unwrap();
+        assert!(r.crc_ok);
+        assert_eq!(r.description, "Request for Cargo Report");
     }
 
     #[test]
