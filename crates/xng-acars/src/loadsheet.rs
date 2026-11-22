@@ -208,6 +208,7 @@ static HEADER_WORD: LazyLock<Regex> =
 static NOT_HEADER: LazyLock<Regex> = LazyLock::new(|| {
     re(r"END (?:OF )?(?:ACARS )?LOADSHEET|LOADSHEET END|AMENDMENTS|WILL FOLLOW|NO FINAL LOADSHEET|AWAITING|CANCELLED|CHECKS PERFORMED|ACCEPT|\bACK|RCVD|\bREQ\b|REQUEST")
 });
+static LS_HEADER: LazyLock<Regex> = LazyLock::new(|| re(r"\bLS\s+(?:FINAL|PRELIM)"));
 static STATUS: LazyLock<Regex> = LazyLock::new(|| re(r"\b(FINAL|PRELIM)(?:INARY)?"));
 static EDITION: LazyLock<Regex> = LazyLock::new(|| re(r"\bED(?:NO?|N0)?\s*0*(\d{1,2})\b"));
 /// Flight number, optional `/day`, then the rest of the line, which must be
@@ -353,15 +354,15 @@ static REQUEST: LazyLock<Regex> = LazyLock::new(|| {
 const MONTHS: [&str; 12] =
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 
-/// Cheap check: could this text hold a loadsheet? Plain substring scans
-/// that cover every `HEADER_WORD` alternative, plus LDSHT, which only
-/// acceptances use.
+/// Cheap check: could this text hold a loadsheet? Substring scans (plus the
+/// LS header regex, run only when "LS" occurs, so "LS  PRELIM" with any
+/// spacing passes) that cover every `HEADER_WORD` alternative, plus LDSHT,
+/// which only acceptances use.
 pub fn may_be_loadsheet(text: &str) -> bool {
     text.contains("LOADSHEET")
         || text.contains("LOAD SHEET")
         || text.contains("L O A D S H E E T")
-        || text.contains("LS FINAL")
-        || text.contains("LS PRELIM")
+        || (text.contains("LS") && LS_HEADER.is_match(text))
         || text.contains("LDSHT")
 }
 
