@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xng airband</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0e14; --panel: #11151f; --line: #1c2230; --line2: #2a2f41; --text: #c8ccd4;
+          --muted: #565f89; --dim: #8a91b4; --accent: #7aa2f7; --live: #9ece6a; --warn: #e0af68; --bad: #f7768e; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; gap: 14px; padding: 10px 16px; border-bottom: 1px solid var(--line); flex-wrap: wrap; position: sticky; top: 0; background: var(--bg); z-index: 2; }
+  header b { color: var(--accent); font-size: 15px; }
+  header a { color: var(--dim); text-decoration: none; }
+  header a:hover { color: var(--accent); }
+  .grow { flex: 1; }
+  .sub { color: var(--muted); }
+  button { font: inherit; color: var(--text); background: #161b29; border: 1px solid var(--line2); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.on { background: var(--accent); border-color: var(--accent); color: #0b0e14; }
+  button.warn.on { background: var(--warn); border-color: var(--warn); }
+  #playing { display: none; align-items: center; gap: 8px; padding: 3px 10px; border: 1px solid var(--live); border-radius: 12px; color: var(--live); }
+  #playing.show { display: flex; }
+  #playing .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--live); animation: pulse 1.2s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  input[type=range] { accent-color: var(--accent); width: 110px; vertical-align: middle; }
+  main { padding: 14px 16px 30px; max-width: 1400px; margin: 0 auto; }
+  h2 { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; font-weight: 600; }
+  .streams { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; position: relative; }
+  .card.open { border-color: var(--live); box-shadow: 0 0 0 1px var(--live) inset, 0 0 18px -6px var(--live); }
+  .card.locked { opacity: .45; }
+  .card .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .card .name { font-size: 14px; font-weight: 600; color: #e1e4ef; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .freq { color: var(--accent); font-size: 13px; white-space: nowrap; }
+  .card .meta { color: var(--muted); font-size: 11.5px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .badge { font-size: 10.5px; border-radius: 4px; padding: 0 6px; border: 1px solid; }
+  .badge.air { color: var(--live); border-color: var(--live); }
+  .badge.pin { color: var(--warn); border-color: var(--warn); }
+  .badge.out { color: var(--bad); border-color: var(--bad); }
+  .meter { position: relative; height: 12px; margin: 10px 0 6px; background: #0d1018; border: 1px solid var(--line); border-radius: 3px; overflow: hidden; }
+  .meter .fill { position: absolute; left: 0; top: 0; bottom: 0; background: #3d59a1; transition: width .2s linear; }
+  .card.open .meter .fill { background: var(--live); }
+  .meter .noise { position: absolute; top: 0; bottom: 0; left: 0; background: rgba(86,95,137,.35); }
+  .meter .sq { position: absolute; top: -1px; bottom: -1px; width: 2px; background: var(--warn); }
+  .row { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 11.5px; color: var(--dim); }
+  .btns { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+  .scanbig { font-size: 22px; color: #e1e4ef; margin: 6px 0 2px; min-height: 30px; }
+  .scanbig .f { color: var(--accent); font-size: 15px; margin-left: 8px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 4px 10px; white-space: nowrap; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 500; font-size: 11.5px; }
+  td.num, th.num { text-align: right; }
+  .empty { color: var(--muted); padding: 30px; text-align: center; border: 1px dashed var(--line2); border-radius: 10px; }
+  @media (max-width: 600px) { header { gap: 8px; } .grid, .streams { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <b>xng airband</b>
+  <span class="sub" id="summary"></span>
+  <span class="grow"></span>
+  <span id="playing"><span class="dot"></span><span id="playname"></span><button id="stopbtn" title="Stop listening">stop</button></span>
+  <label class="sub" title="Volume">vol <input id="vol" type="range" min="0" max="150" value="80"></label>
+  <a href="/">map dashboard &rarr;</a>
+</header>
+<main>
+  <div id="streamsec" hidden>
+    <h2>Streams</h2>
+    <div class="streams" id="streams"></div>
+  </div>
+  <h2>Channels</h2>
+  <div class="grid" id="channels"><div class="empty">Waiting for airband channels&hellip;</div></div>
+  <h2>Recent transmissions</h2>
+  <div style="overflow-x:auto"><table>
+    <thead><tr><th>time</th><th>channel</th><th class="num">duration</th><th class="num">peak</th><th class="num">SNR</th><th></th></tr></thead>
+    <tbody id="recent"><tr><td colspan="6" class="sub">none yet</td></tr></tbody>
+  </table></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const mhz = hz => (hz / 1e6).toFixed(3);
+const name = c => c.label || mhz(c.freq_hz) + ' MHz';
+const db = v => (v === null || v === undefined || !isFinite(v)) ? '–' : v.toFixed(1);
+const pct = v => Math.max(0, Math.min(100, (v + 90) / 90 * 100));  // -90..0 dBFS
+const dur = s => s >= 60 ? `${Math.floor(s / 60)}m${String(Math.round(s % 60)).padStart(2, '0')}s` : `${s.toFixed(1)}s`;
+
+let state = { channels: [], recent: [] };
+let playing = null;  // stream id string: "<hz>", "mix", "scan"
+
+// ---- listening: fetch-streamed s16le at 16 kHz, scheduled with Web Audio ----
+let ctx = null, gainNode = null, abort = null, nextT = 0;
+function setVol() { if (gainNode) gainNode.gain.value = $('vol').value / 100; }
+$('vol').addEventListener('input', setVol);
+async function listen(s, label) {
+  if (playing === s) { stop(); return; }
+  stop();
+  playing = s;
+  $('playname').textContent = label;
+  $('playing').classList.add('show');
+  render();
+  if (!ctx) {
+    ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+    gainNode = ctx.createGain(); gainNode.connect(ctx.destination); setVol();
+  }
+  await ctx.resume();
+  const ac = new AbortController(); abort = ac;
+  try {
+    const r = await fetch('/airband/stream?s=' + encodeURIComponent(s), { signal: ac.signal, cache: 'no-store' });
+    const rd = r.body.getReader();
+    let carry = null;
+    for (;;) {
+      const { value, done } = await rd.read();
+      if (done) break;
+      let bytes = value;
+      if (carry) { const b = new Uint8Array(carry.length + bytes.length); b.set(carry); b.set(bytes, carry.length); bytes = b; carry = null; }
+      if (bytes.length & 1) { carry = bytes.slice(bytes.length - 1); bytes = bytes.slice(0, bytes.length - 1); }
+      const n = bytes.length / 2;
+      if (!n) continue;
+      const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.length);
+      const buf = ctx.createBuffer(1, n, 16000);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < n; i++) ch[i] = dv.getInt16(i * 2, true) / 32768;
+      const src = ctx.createBufferSource(); src.buffer = buf; src.connect(gainNode);
+      // Small jitter buffer: restart 150 ms ahead after a gap.
+      if (nextT < ctx.currentTime + 0.02) nextT = ctx.currentTime + 0.15;
+      src.start(nextT); nextT += buf.duration;
+    }
+  } catch (e) { if (e.name !== 'AbortError') console.warn('airband stream', e); }
+}
+function stop() {
+  if (abort) abort.abort();
+  abort = null; playing = null; nextT = 0;
+  $('playing').classList.remove('show');
+  render();
+}
+$('stopbtn').onclick = stop;
+
+async function scanCtl(q) {
+  await fetch('/api/airband/scan?' + q, { method: 'POST' });
+  poll();
+}
+
+// ---- drawing ----
+function channelCard(c) {
+  const s = c.status || {};
+  const scan = state.scan;
+  const pinned = scan && scan.pinned === c.freq_hz;
+  const id = String(c.freq_hz);
+  const lvl = s.level_dbfs, nf = s.noise_dbfs, sq = s.squelch_dbfs;
+  const meta = [c.modulation.toUpperCase(), `${(c.bandwidth_hz / 1000).toFixed(1)} kHz`, c.atc_frequency || c.sdr || ''].filter(Boolean).join(' · ');
+  return `<div class="card${s.open ? ' open' : ''}${c.locked_out ? ' locked' : ''}">
+    <div class="top"><span class="name" title="${esc(c.key)}">${esc(name(c))}</span><span class="freq">${mhz(c.freq_hz)}</span></div>
+    <div class="meta">${esc(meta)}</div>
+    <div class="meter" title="level ${db(lvl)} dBFS · noise ${db(nf)} · squelch ${db(sq)}">
+      <div class="noise" style="width:${isFinite(nf) ? pct(nf) : 0}%"></div>
+      <div class="fill" style="width:${isFinite(lvl) ? pct(lvl) : 0}%"></div>
+      ${isFinite(sq) ? `<div class="sq" style="left:${pct(sq)}%"></div>` : ''}
+    </div>
+    <div class="row"><span>${db(lvl)} dBFS <span class="sub">/ sq ${db(sq)}</span></span>
+      <span>${s.open ? '<span class="badge air">ON AIR</span> ' : ''}${pinned ? '<span class="badge pin">PINNED</span> ' : ''}${c.locked_out ? '<span class="badge out">LOCKED OUT</span>' : ''}</span></div>
+    <div class="row" style="margin-top:4px"><span>${s.transmissions ?? 0} tx · ${dur(s.airtime_s || 0)} on air</span>
+      <span>${s.afc_hz ? `AFC ${s.afc_hz > 0 ? '+' : ''}${Math.round(s.afc_hz)} Hz` : ''}</span></div>
+    <div class="btns">
+      <button class="${playing === id ? 'on' : ''}" onclick="listen('${id}', '${esc(name(c)).replace(/'/g, '')}')">${playing === id ? '■ stop' : '▶ listen'}</button>
+      ${scan ? `<button class="warn${pinned ? ' on' : ''}" onclick="scanCtl('pin=${pinned ? 'off' : id}')">${pinned ? 'unpin' : 'pin scan'}</button>
+      <button onclick="scanCtl('lockout=${id}&on=${c.locked_out ? 0 : 1}')">${c.locked_out ? 'unlock' : 'lock out'}</button>` : ''}
+    </div>
+  </div>`;
+}
+
+function render() {
+  const chans = state.channels || [];
+  const open = chans.filter(c => c.status && c.status.open).length;
+  $('summary').textContent = chans.length ? `${chans.length} channel${chans.length > 1 ? 's' : ''} · ${open} on air` : '';
+  $('channels').innerHTML = chans.length ? chans.map(channelCard).join('') : '<div class="empty">Waiting for airband channels&hellip; (start xng with --mode airband)</div>';
+
+  const streams = [];
+  if (state.scan) {
+    const sel = chans.find(c => c.freq_hz === state.scan.selected);
+    const pinned = chans.find(c => c.freq_hz === state.scan.pinned);
+    streams.push(`<div class="card${sel && sel.status && sel.status.open ? ' open' : ''}">
+      <div class="top"><span class="name">Scanner</span><span class="sub">${pinned ? '<span class="badge pin">PINNED</span>' : 'scanning'}</span></div>
+      <div class="scanbig">${sel ? esc(name(sel)) + `<span class="f">${mhz(sel.freq_hz)}</span>` : '<span class="sub">quiet</span>'}</div>
+      <div class="meta">${state.scan.locked_out.length} locked out · ${pinned ? 'held on one channel' : 'follows the active channel'}</div>
+      <div class="btns"><button class="${playing === 'scan' ? 'on' : ''}" onclick="listen('scan', 'Scanner')">${playing === 'scan' ? '■ stop' : '▶ listen'}</button>
+      ${pinned ? `<button onclick="scanCtl('pin=off')">resume scanning</button>` : ''}</div></div>`);
+  }
+  if (state.mix) {
+    streams.push(`<div class="card${open ? ' open' : ''}"><div class="top"><span class="name">Mix</span><span class="sub">${open} on air</span></div>
+      <div class="meta" style="margin-top:8px">every channel summed into one stream</div>
+      <div class="btns"><button class="${playing === 'mix' ? 'on' : ''}" onclick="listen('mix', 'Mix')">${playing === 'mix' ? '■ stop' : '▶ listen'}</button></div></div>`);
+  }
+  $('streamsec').hidden = !streams.length;
+  $('streams').innerHTML = streams.join('');
+
+  const rec = (state.recent || []).slice().sort((a, b) => b.start.localeCompare(a.start));
+  $('recent').innerHTML = rec.length ? rec.slice(0, 50).map(t => `<tr>
+    <td>${new Date(t.start).toLocaleTimeString()}</td>
+    <td>${esc(t.label || '')} <span class="sub">${mhz(t.freq_hz)}</span></td>
+    <td class="num">${dur(t.duration_s)}</td>
+    <td class="num">${db(t.peak_dbfs)} dBFS</td>
+    <td class="num">${isFinite(t.peak_dbfs) && isFinite(t.noise_dbfs) ? (t.peak_dbfs - t.noise_dbfs).toFixed(1) + ' dB' : '–'}</td>
+    <td><button title="listen to this channel live" onclick="listen('${t.freq_hz}', '${esc(t.label || mhz(t.freq_hz)).replace(/'/g, '')}')">▶</button></td></tr>`).join('') : '<tr><td colspan="6" class="sub">none yet</td></tr>';
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/airband', { cache: 'no-store' });
+    state = await r.json();
+    render();
+  } catch (e) { $('summary').textContent = 'disconnected'; }
+}
+poll();
+setInterval(poll, 400);
+</script>
+</body>
+</html>

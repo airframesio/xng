@@ -163,6 +163,7 @@ pub struct AudioHub {
     recent: Mutex<VecDeque<TxRecord>>,
     /// The scanner behind the `scan` stream, when enabled (for pin/lockout).
     pub(crate) scan: Mutex<Option<ScanState>>,
+    mix: std::sync::atomic::AtomicBool,
 }
 
 /// Scanner state shared with the dashboard controls.
@@ -182,6 +183,7 @@ pub fn hub() -> &'static AudioHub {
         status: Mutex::new(BTreeMap::new()),
         recent: Mutex::new(VecDeque::new()),
         scan: Mutex::new(None),
+        mix: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -193,6 +195,15 @@ impl AudioHub {
     /// Register a channel (done when a session builds its decoders).
     pub fn register(&self, meta: Arc<ChannelMeta>) {
         self.channels.lock().unwrap().insert(meta.freq_hz, meta);
+    }
+
+    /// Note that some session publishes the `mix` stream.
+    pub fn enable_mix(&self) {
+        self.mix.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn has_mix(&self) -> bool {
+        self.mix.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn channels(&self) -> Vec<Arc<ChannelMeta>> {

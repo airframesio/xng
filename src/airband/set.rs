@@ -112,7 +112,10 @@ impl AirbandSet {
             freqs: freqs.to_vec(),
             clock: Clock { anchor: None, slipped: false },
             last_status: 0,
-            mix: cfg.mix.then(|| Arc::new(ChannelMeta::mix())),
+            mix: cfg.mix.then(|| {
+                hub().enable_mix();
+                Arc::new(ChannelMeta::mix())
+            }),
             mix_tx: 0,
             mix_open: false,
             mix_open_at: None,
