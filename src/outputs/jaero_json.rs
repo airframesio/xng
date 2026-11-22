@@ -1,17 +1,22 @@
-//! JAERO JSON output: Inmarsat Aero ACARS in the flat upper-case JSON JAERO
-//! sends to feeders, which the Airframes JAERO ingests take over UDP
+//! JAERO JDUMP output: Inmarsat Aero ACARS in the nested JSON JAERO's
+//! JDUMP feeder format, which the Airframes JAERO ingests take over UDP
 //! (`feed.airframes.io:5571` for L-band, `:5561` for C-band).
 //!
-//! The AES/GES ids come from the transient `core.link` field stashed by
-//! `xng_mode_aero::to_message`. `STATION_ID` is extra to JAERO's own output:
-//! the ingest credits JAERO feeds by source address today, and the field lets
-//! it use the feeder's ident once it reads it.
+//! The AES/GES ids and the channel come from the transient `core.link` field
+//! stashed by `xng_mode_aero::to_message`. P-channel bursts are sent by the
+//! ground station (uplink); R- and T-channel bursts by the aircraft
+//! (downlink). The ingest credits the feed by `station`, reads the receiver
+//! time from `t` (Unix seconds plus microseconds) and the direction from
+//! `isu.src.type`.
 
 use serde_json::{json, Value};
 use xng_types::{Message, MessageBody, Mode};
 
-/// Render an Aero ACARS message as one JAERO JSON object. `None` for other
-/// bodies, other modes, failed CRCs and messages without the AES ids.
+const AES: &str = "Aircraft Earth Station";
+const GES: &str = "Ground Earth Station";
+
+/// Render an Aero ACARS message as one JDUMP JSON object. `None` for other
+/// bodies, other modes, failed CRCs and messages without the AES id.
 pub fn format_jaero(msg: &Message, station: Option<&str>) -> Option<Value> {
     if !matches!(msg.mode, Mode::AeroL | Mode::AeroC) || !msg.decode.crc_ok {
         return None;
@@ -25,39 +30,43 @@ pub fn format_jaero(msg: &Message, station: Option<&str>) -> Option<Value> {
             .and_then(Value::as_u64)
             .map(|v| format!("{v:02X}"))
     };
-    let time = msg
-        .timestamp
-        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let mut v = json!({
-        "NAME": "xng",
-        "VERSION": env!("CARGO_PKG_VERSION"),
-        "TIME": time,
-        "TIME_UTC": msg.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-        "NONACARS": false,
-        "AESID": link.get("aes_id")?.as_str()?,
-        "MODE": core.mode.to_string(),
-        "LABEL": core.label,
+    let aes = json!({ "type": AES, "addr": link.get("aes_id")?.as_str()?.to_uppercase() });
+    let ges = json!({ "type": GES, "addr": hex2("ges_id").unwrap_or_else(|| "00".into()) });
+    let uplink = link.get("channel").and_then(Value::as_str) == Some("p-channel");
+    let (src, dst) = if uplink { (ges, aes) } else { (aes, ges) };
+
+    let mut acars = json!({
+        "mode": core.mode.to_string(),
+        "label": core.label,
         // JAERO prints the technical ack, or "!" for a NAK.
-        "TAK": core.ack.map(|c| c.to_string()).unwrap_or_else(|| "!".into()),
-        "MESSAGE": core.text,
+        "ack": core.ack.map(|c| c.to_string()).unwrap_or_else(|| "!".into()),
+        "msg_text": core.text,
     });
-    let o = v.as_object_mut().unwrap();
-    for (key, field) in [("GESID", "ges_id"), ("QNO", "qno"), ("REFNO", "refno")] {
-        if let Some(h) = hex2(field) {
-            o.insert(key.into(), json!(h));
-        }
-    }
+    let a = acars.as_object_mut().unwrap();
     if let Some(t) = &core.tail {
-        o.insert("REG".into(), json!(t));
+        a.insert("reg".into(), json!(t));
     }
     if let Some(b) = core.block_id {
-        o.insert("BI".into(), json!(b.to_string()));
+        a.insert("blk_id".into(), json!(b.to_string()));
     }
     if let Some(f) = &core.flight {
-        o.insert("FLIGHT".into(), json!(f));
+        a.insert("flight".into(), json!(f));
     }
+
+    let mut isu = json!({ "src": src, "dst": dst, "acars": acars });
+    for key in ["qno", "refno"] {
+        if let Some(h) = hex2(key) {
+            isu[key] = json!(h);
+        }
+    }
+    let micros = msg.timestamp.timestamp_micros();
+    let mut v = json!({
+        "app": { "name": "xng", "ver": env!("CARGO_PKG_VERSION") },
+        "t": { "sec": micros.div_euclid(1_000_000), "usec": micros.rem_euclid(1_000_000) },
+        "isu": isu,
+    });
     if let Some(st) = station {
-        o.insert("STATION_ID".into(), json!(st));
+        v["station"] = json!(st);
     }
     Some(v)
 }
@@ -100,23 +109,37 @@ mod tests {
     }
 
     #[test]
-    fn renders_jaero_fields() {
-        let link =
-            json!({ "aes_id": "76CCA9", "ges_id": 144, "qno": 3, "refno": 10, "bit_rate": 1200 });
+    fn renders_jdump_fields() {
+        let link = json!({ "aes_id": "76cca9", "ges_id": 144, "qno": 3, "refno": 10,
+                           "bit_rate": 1200, "channel": "r-channel" });
         let v = format_jaero(&msg(Mode::AeroL, Some(link)), Some("XX-TEST-IMSL")).unwrap();
-        assert_eq!(v["TIME"], "2026-11-22T12:00:00.000Z");
-        assert_eq!(v["AESID"], "76CCA9");
-        assert_eq!(v["GESID"], "90");
-        assert_eq!(v["QNO"], "03");
-        assert_eq!(v["REFNO"], "0A");
-        assert_eq!(v["REG"], "9V-SMF");
-        assert_eq!(v["LABEL"], "H1");
-        assert_eq!(v["BI"], "3");
-        assert_eq!(v["TAK"], "A");
-        assert_eq!(v["FLIGHT"], "SQ0321");
-        assert_eq!(v["MESSAGE"], "/AKLCDYA.ADS");
-        assert_eq!(v["NONACARS"], false);
-        assert_eq!(v["STATION_ID"], "XX-TEST-IMSL");
+        assert_eq!(v["station"], "XX-TEST-IMSL");
+        assert_eq!(v["app"]["name"], "xng");
+        assert_eq!(v["t"]["sec"], 1_795_348_800i64);
+        assert_eq!(v["t"]["usec"], 0);
+        let isu = &v["isu"];
+        assert_eq!(isu["src"]["type"], "Aircraft Earth Station");
+        assert_eq!(isu["src"]["addr"], "76CCA9");
+        assert_eq!(isu["dst"]["type"], "Ground Earth Station");
+        assert_eq!(isu["dst"]["addr"], "90");
+        assert_eq!(isu["qno"], "03");
+        assert_eq!(isu["refno"], "0A");
+        let a = &isu["acars"];
+        assert_eq!(a["reg"], "9V-SMF");
+        assert_eq!(a["label"], "H1");
+        assert_eq!(a["blk_id"], "3");
+        assert_eq!(a["ack"], "A");
+        assert_eq!(a["flight"], "SQ0321");
+        assert_eq!(a["msg_text"], "/AKLCDYA.ADS");
+    }
+
+    #[test]
+    fn p_channel_is_uplink() {
+        let link = json!({ "aes_id": "76CCA9", "ges_id": 144, "channel": "p-channel" });
+        let v = format_jaero(&msg(Mode::AeroL, Some(link)), None).unwrap();
+        assert_eq!(v["isu"]["src"]["type"], "Ground Earth Station");
+        assert_eq!(v["isu"]["dst"]["addr"], "76CCA9");
+        assert!(v.get("station").is_none());
     }
 
     #[test]

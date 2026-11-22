@@ -581,6 +581,7 @@ pub fn to_message(e: &AeroEvent, frequency_hz: u64, level_dbfs: f32, source: Pro
                 "qno": e.user.qno,
                 "refno": e.user.refno,
                 "bit_rate": e.bit_rate,
+                "channel": e.channel.tag(),
             }));
             (MessageBody::Acars(core), b.crc_ok, Some(b.parity_errors))
         }

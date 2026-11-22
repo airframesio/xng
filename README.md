@@ -420,7 +420,7 @@ Each mode goes to its own Airframes ingest in the format that ingest reads:
 | VDL2 | UDP `:5552` | dumpvdl2 `decoded:json` (`vdl2.station` set) |
 | HFDL | TCP `:5556` | dumphfdl `decoded:json` (ACARS and performance data) |
 | AIS | HTTP `:5599` | AIS-catcher JSON batches (every 5 s, gzip) |
-| Aero L-band / C-band | UDP `:5571` / `:5561` | JAERO JSON |
+| Aero L-band / C-band | UDP `:5571` / `:5561` | JAERO JDUMP JSON |
 | Iridium | TCP `:5590` | iridium-toolkit ACARS JSON |
 
 Each block (`[outputs.airframes.acars]`, `.vdl2`, `.hfdl`, `.ais`, `.aero`,

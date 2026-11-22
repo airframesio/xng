@@ -11,8 +11,8 @@
 //! - VDL2    UDP  `:5552`  dumpvdl2 `decoded:json` (also TCP `:5553`)
 //! - HFDL    TCP  `:5556`  dumphfdl `decoded:json`, one object per line
 //! - AIS     HTTP `:5599`  AIS-catcher `jsonaiscatcher` batches
-//! - Aero-L  UDP  `:5571`  JAERO JSON
-//! - Aero-C  UDP  `:5561`  JAERO JSON
+//! - Aero-L  UDP  `:5571`  JAERO JDUMP JSON
+//! - Aero-C  UDP  `:5561`  JAERO JDUMP JSON
 //! - Iridium TCP  `:5590`  iridium-toolkit ACARS JSON, one object per line
 //!
 //! STD-C / ADS-B / UAT / … have no per-port ingest — those modes reach
@@ -658,8 +658,12 @@ mod tests {
                     assert_eq!(v["hfdl"]["lpdu"]["ac_info"]["icao"], "A1B2C3", "{v}");
                 }
                 "jaero" => {
-                    assert_eq!(v["AESID"].as_str().map(str::len), Some(6), "{v}");
-                    assert!(v["REG"].is_string(), "{v}");
+                    assert_eq!(v["station"], "XX-TEST-IMSL");
+                    let isu = &v["isu"];
+                    let aes = if isu["src"]["type"] == "Aircraft Earth Station" { &isu["src"] } else { &isu["dst"] };
+                    assert_eq!(aes["addr"].as_str().map(str::len), Some(6), "{v}");
+                    assert!(v["isu"]["acars"]["reg"].is_string(), "{v}");
+                    assert!(v["t"]["sec"].is_i64(), "{v}");
                 }
                 "iridium-toolkit" => assert_eq!(v["source"]["station_id"], "XX-TEST-IRDM"),
                 "aiscatcher" => assert_eq!(v["msgs"].as_array().unwrap().len(), 2),

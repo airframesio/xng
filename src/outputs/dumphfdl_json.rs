@@ -10,7 +10,7 @@
 //! - performance data (HFNPDU 0xD1, 209), which carries the flight id and the
 //!   aircraft position.
 //!
-//! Field names follow dumphfdl 1.x. `sig_level`, `noise_level`, `freq_skew`
+//! Field names follow dumphfdl 1.x. `sig_level`, `noise_level`, `freq_skew`, `slot`
 //! and `bit_rate` are always present because the ingest's model requires
 //! them. Other kinds (squitters, logons, frequency data, system tables) need
 //! the system table to name their frequencies and are not sent yet.
@@ -71,6 +71,9 @@ pub fn format_dumphfdl(msg: &Message, station: Option<&str>) -> Option<Value> {
         "sig_level": sig_level,
         "noise_level": noise_level,
         "freq_skew": freq_skew,
+        // dumphfdl's "S"/"D" (single/double slot). The ingest requires the
+        // field; xng does not carry the slot setting yet, so "-" = unknown.
+        "slot": "-",
         "lpdu": lpdu,
     });
     if let Some(st) = station {
@@ -207,6 +210,7 @@ mod tests {
         assert_eq!(h["station"], "XX-TEST-HFDL");
         assert_eq!(h["freq"], 8_927_000);
         assert_eq!(h["bit_rate"], 1800);
+        assert_eq!(h["slot"], "-");
         assert_eq!(h["sig_level"], -23.1);
         assert_eq!(h["noise_level"], -35.1, "rssi - snr");
         assert_eq!(h["freq_skew"], 0.0);

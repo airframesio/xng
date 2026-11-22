@@ -84,7 +84,7 @@ pub struct AcarsCore {
     /// needs but the public model doesn't carry: the VDL2 AVLC addresses and
     /// control field (`{src,dst,control}`, for dumpvdl2 `decoded:json`), the
     /// HFDL MPDU/LPDU addressing (`{who,bps}`, for dumphfdl `decoded:json`),
-    /// the Aero AES/GES ids (`{aes_id,ges_id,qno,refno}`, for JAERO JSON) and
+    /// the Aero AES/GES ids and channel (`{aes_id,ges_id,qno,refno,bit_rate,channel}`, for JAERO JDUMP) and
     /// the Iridium SBD header (for iridium-toolkit JSON). `#[serde(skip)]`
     /// keeps it out of every serialized output (JSONL, MQTT, asf-2.0); it
     /// rides in-memory only, from each mode's `to_message` to the
