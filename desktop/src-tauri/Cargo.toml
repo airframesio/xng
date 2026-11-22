@@ -1,7 +1,7 @@
 [package]
 name = "xng-desktop"
 description = "xng desktop app: the xng multi-mode SDR decoder with a live map, message browser and spectrum"
-version = "0.23.0"
+version = "0.23.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/airframesio/xng"
