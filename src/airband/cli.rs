@@ -119,15 +119,17 @@ pub struct AirbandOpts {
     #[arg(long, default_value_t = 24_000)]
     pub atc_bitrate: u32,
 
-    /// Transcribe transmissions (local Whisper base.en unless
-    /// --transcribe-model or --whisper-url says otherwise). Transcripts go
+    /// Transcribe transmissions (locally with skycontrol-atc-110m in a
+    /// sherpa build, else Whisper base.en, unless --transcribe-model or
+    /// --whisper-url says otherwise). Transcripts go
     /// to the JSON outputs, the dashboard, recordings and the ATC feed
     #[arg(long)]
     pub transcribe: bool,
     /// Speech model, downloaded once: Whisper (tiny.en, base.en, small.en,
-    /// large-v3-turbo, ... or a ggml file) or sherpa-onnx (moonshine-tiny,
-    /// moonshine-base, parakeet-110m, parakeet-tdt-0.6b-v2, sense-voice, or
-    /// a model directory). Implies --transcribe
+    /// large-v3-turbo, ... or a ggml file) or sherpa-onnx
+    /// (skycontrol-atc-110m, moonshine-tiny, moonshine-base, parakeet-110m,
+    /// parakeet-tdt-0.6b-v2, sense-voice, or a model directory). Implies
+    /// --transcribe
     #[arg(long, alias = "whisper-model")]
     pub transcribe_model: Option<String>,
     /// Speech engine: whisper.cpp or sherpa-onnx (default: from the model).

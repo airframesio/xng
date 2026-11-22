@@ -36,10 +36,10 @@ bitrate = 24000
 # transport = "auto"             # auto (QUIC, then TCP), quic or tcp
 receiver = { type = "rtlsdr", model = "RTL-SDR Blog V4", antenna = "discone" }
 
-# Transcribe transmissions with Whisper. Transcripts go to the JSON outputs,
+# Transcribe transmissions. Transcripts go to the JSON outputs,
 # the dashboard, the recordings' sidecars and the ATC feed.
 # [outputs.airband.transcribe]
-# model = "parakeet-110m"        # sherpa-onnx model (build with --features sherpa)
+# model = "skycontrol-atc-110m"  # ATC-tuned sherpa-onnx model, the default (build with --features sherpa)
 # model = "base.en"              # or Whisper (build with --features whisper)
 # url = "http://gpu-box:8000"    # or a Whisper HTTP server instead
 # engine = "faster-whisper"      # with url: what the server runs, for Airframes ATC

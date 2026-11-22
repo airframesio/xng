@@ -304,12 +304,12 @@ xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
     --scan --scan-priority 120.5 --record-dir ~/airband --http 0.0.0.0:8080 \
     --receiver-pos 37.62,-122.38 --atc-feed
 
-# ...and transcribe them (Parakeet needs a build with `--features sherpa`,
-# Whisper models `--features whisper`; or use --whisper-url http://host:port
-# for a Whisper server)
+# ...and transcribe them with the ATC-tuned Parakeet model (a build with
+# `--features sherpa`; or `--transcribe-model base.en` with `--features whisper`,
+# or --whisper-url http://host:port for a Whisper server)
 xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
     --channels 120.5,121.8 --labels "120.5=SFO Tower,121.8=SFO Ground" \
-    --transcribe-model parakeet-110m --receiver-pos 37.62,-122.38 --atc-feed
+    --transcribe-model skycontrol-atc-110m --receiver-pos 37.62,-122.38 --atc-feed
 ```
 
 ![Airband dashboard page](docs/screenshots/airband-dashboard.png?raw=true)

@@ -300,15 +300,17 @@ impl Default for AtcFeedSettings {
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct TranscribeSettings {
     /// Speech engine. Local: `whisper.cpp` or `sherpa-onnx` (default: picked
-    /// from `model`, whisper.cpp when it does not say). With `url`: what the
+    /// from `model`; with no model, sherpa-onnx in a build that has it, else
+    /// whisper.cpp). With `url`: what the
     /// server runs, reported to Airframes ATC (`faster-whisper`, ...;
     /// default `openai-api`).
     pub engine: Option<String>,
     /// Local: a model name fetched once into the cache, or a model file or
     /// directory. whisper.cpp: `tiny.en`, `base.en`, `small.en`,
-    /// `large-v3-turbo`, ... or a ggml file. sherpa-onnx: `moonshine-tiny`,
-    /// `moonshine-base`, `parakeet-110m`, `parakeet-tdt-0.6b-v2`,
-    /// `sense-voice`, ... or an exported model directory.
+    /// `large-v3-turbo`, ... or a ggml file. sherpa-onnx:
+    /// `skycontrol-atc-110m` (default), `moonshine-tiny`, `moonshine-base`,
+    /// `parakeet-110m`, `parakeet-tdt-0.6b-v2`, `sense-voice`, ... or an
+    /// exported model directory.
     /// With `url`: the model name sent to the server (default `whisper-1`).
     pub model: Option<String>,
     /// Whisper HTTP server. A bare `http://host:port` gets

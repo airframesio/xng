@@ -528,8 +528,9 @@ pub enum Kind {
 }
 
 /// Which engine runs: a server when `url` is set; else `engine` if given;
-/// else a sherpa-onnx model name or directory picks sherpa-onnx, anything
-/// else is whisper.cpp.
+/// else a sherpa-onnx model name or directory picks sherpa-onnx, another
+/// name whisper.cpp. With no model named, a build with sherpa-onnx runs its
+/// default ATC model, otherwise whisper.cpp base.en.
 pub fn kind(s: &TranscribeSettings) -> Kind {
     if s.url.is_some() {
         return Kind::Http;
@@ -539,6 +540,7 @@ pub fn kind(s: &TranscribeSettings) -> Kind {
         Some(SHERPA_ENGINE | "sherpa") => Kind::Sherpa,
         _ => match s.model.as_deref() {
             Some(m) if sherpa_models::find(m).is_some() || std::path::Path::new(m).is_dir() => Kind::Sherpa,
+            None if cfg!(feature = "sherpa") => Kind::Sherpa,
             _ => Kind::Whisper,
         },
     }
@@ -1169,6 +1171,12 @@ mod tests {
         assert!(model_path("../../etc/passwd").is_err());
         assert!(model_path("huge.en").is_err());
         let p = planned(&TranscribeSettings::default());
+        if cfg!(feature = "sherpa") {
+            assert_eq!((p.engine.as_str(), p.model.as_str()), ("sherpa-onnx", "skycontrol-atc-110m"));
+        } else {
+            assert_eq!((p.engine.as_str(), p.model.as_str()), ("whisper.cpp", "base.en"));
+        }
+        let p = planned(&TranscribeSettings { engine: Some("whisper.cpp".into()), ..Default::default() });
         assert_eq!((p.engine.as_str(), p.model.as_str()), ("whisper.cpp", "base.en"));
         let p = planned(&TranscribeSettings { model: Some("/m/ggml-small.en-q5_1.bin".into()), ..Default::default() });
         assert_eq!(p.model, "small.en-q5_1");

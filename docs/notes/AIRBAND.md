@@ -154,21 +154,27 @@ local ones):
   build offline, put the archive in a folder and set
   `SHERPA_ONNX_ARCHIVE_DIR`, or point `SHERPA_ONNX_LIB_DIR` at an unpacked
   library. Models (`--transcribe-model`, downloaded once into
-  `<model cache>/sherpa`; `XNG_SHERPA_MODELS_URL` points at a mirror), or a
-  directory holding an exported sherpa-onnx model:
+  `<model cache>/sherpa`; `XNG_SHERPA_MODELS_URL` and `XNG_HF_URL` point at
+  mirrors of the GitHub release and Hugging Face), or a directory holding an
+  exported sherpa-onnx model:
 
   | Model | Download | Languages | Notes |
   |---|---|---|---|
+  | `skycontrol-atc-110m` (default) | 137 MB | English ATC | Parakeet-110m fine-tuned on ATC speech; far the best on real ATC audio, same CPU as parakeet-110m |
   | `moonshine-tiny` | 108 MB | English | lowest CPU, Raspberry Pi 3/4 |
   | `moonshine-base` | 250 MB | English | |
   | `moonshine-tiny-v2`, `moonshine-base-v2` | 40, 125 MB | English | Moonshine v2, smaller downloads |
-  | `parakeet-110m` (default) | 108 MB | English | best accuracy per CPU second |
+  | `parakeet-110m` | 108 MB | English | general-purpose English |
   | `parakeet-tdt-0.6b-v2` | 600 MB | English | most accurate, 4x the CPU of parakeet-110m |
   | `parakeet-tdt-0.6b-v3` | 640 MB | 25 European languages | |
   | `sense-voice` | 160 MB | zh, en, ja, ko, yue | |
 
   `--whisper-threads` sets CPU threads (default half the cores, 1 to 4).
-  These models take no text prompt.
+  These models take no text prompt. `skycontrol-atc-110m` is
+  [srinath-exe/skycontrol-atc-asr-110m](https://huggingface.co/srinath-exe/skycontrol-atc-asr-110m)
+  (CC-BY-4.0, based on NVIDIA's `parakeet-tdt_ctc-110m`), fetched from a
+  pinned commit and checked by sha256. With `--transcribe` and no model, a
+  build with the `sherpa` feature uses it; otherwise whisper.cpp `base.en`.
 - **Local whisper.cpp** (`whisper` build feature: `cargo build --release
   --features whisper`, which compiles whisper.cpp and needs cmake and
   libclang). `--transcribe-model` (alias `--whisper-model`) is a ggml model
@@ -190,12 +196,44 @@ local ones):
   default `openai-api`).
 
 The engine is picked from the model name (a sherpa-onnx name or a directory
-means sherpa-onnx, anything else whisper.cpp); `--transcribe-engine
+means sherpa-onnx, another name whisper.cpp; no name means sherpa-onnx when
+it is built in); `--transcribe-engine
 whisper.cpp|sherpa-onnx` forces it.
 
 ### Choosing a model
 
-Measured in the cloud sandbox (x86_64, one thread) on 120 clips of ATC
+**Real ATC audio.** Measured on an Apple M2 Max, one thread, on 871
+transmissions from the ATCO2 1-hour test set, 400 from the UWB-ATCC test
+set, and 75 unlabeled LiveATC transmissions (LAX tower, JFK departure). The
+audio, manifests, scripts and full side-by-side transcripts are in the
+private `airframesio/xng-corpus` repository under `atc-asr/` (the licences
+do not allow publishing it). CPU is CPU seconds per second of audio.
+
+| Model | WER ATCO2 | WER UWB | CPU s/s | RSS |
+|---|---|---|---|---|
+| **skycontrol-atc-110m** | 25.4% | **19.9%** | 0.045 | 793 MB |
+| Whisper base.en ATC (TU Delft, CTranslate2 int8) | 19.3%\* | 51.2% | 0.61 | 728 MB |
+| wav2vec2 XLS-R 300M ATC (Idiap, no LM) | 45.6% | 24.4%\* | 0.18 | 3.6 GB |
+| Whisper tiny.en ATC (TU Delft) | 63.0%\* | 80.6% | 0.66 | 456 MB |
+| parakeet-tdt-0.6b-v2 | 55.0% | 71.3% | 0.12 | 1.6 GB |
+| parakeet-110m | 62.3% | 81.9% | 0.044 | 794 MB |
+| sense-voice | 62.6% | 69.8% | 0.082 | 677 MB |
+| whisper.cpp base.en with xng's ATC prompt | 66.3% | 79.0% | 0.46 | 496 MB |
+| Whisper base.en | 73.8% | 84.4% | 0.21 | 700 MB |
+| moonshine-base | 77.3% | 88.9% | 0.067 | 762 MB |
+| moonshine-tiny | 88.3% | 98.9% | 0.037 | 594 MB |
+
+\* trained on that corpus, so optimistic. SkyControl's training data is not
+published; its spellings suggest some ATCO2 overlap, so UWB and the US
+LiveATC audio are the fairer tests for it. On JFK departure it gave "delta
+one fifteen heavy turn left heading one three zero" where whisper.cpp
+base.en gave "Delta 115 heavy turn left to re-zero." It was trained on
+European audio and sometimes reaches for European words on US callsigns
+("praha" for a JFK callsign). The Whisper ATC fine-tunes cost 10 to 15
+times its CPU; small.en and medium.en ATC fine-tunes run slower than real
+time on one core.
+
+**Synthetic speech.** Earlier, in the cloud sandbox (x86_64, one thread) on 120 clips of ATC
 phrases (20 phrases, 2 synthetic voices, read at controller pace) in three
 conditions: clean; "radio" (300 to 2700 Hz, AGC clipping, 12 dB SNR); and
 "weak" (4 dB SNR). Word error rate after normalising numbers; CPU is CPU
@@ -223,8 +261,8 @@ roughly four to six times slower than the sandbox's.
 
 ### ATC-tuned Whisper models
 
-No ATC-tuned model ships in a format xng loads directly yet. The useful
-ones are Whisper fine-tunes on public ATC corpora (ATCO2, UWB-ATCC), all MIT
+`skycontrol-atc-110m` (above) is the ATC model xng loads directly. The
+Whisper alternatives are fine-tunes on public ATC corpora (ATCO2, UWB-ATCC), all MIT
 licensed:
 
 - `jacktol/whisper-medium.en-fine-tuned-for-ATC` (WER 15% on its ATC test
@@ -276,8 +314,10 @@ tables. See `contrib/station.airband.example.toml`.
   frequencies spread wider than its bandwidth). xng covers a band by
   channelizing one wide capture instead; hopping needs retune support in
   the SDR sources.
-- An off-air airband capture in the test corpus (transcription is tested
-  with a stand-in Whisper server and synthetic speech, not real speech off
-  air).
+- An ARTCC (en-route centre) recording in the ATC speech corpus; the
+  corpus has tower and departure audio only.
+- US-trained ATC model: SkyControl was trained on European audio; a
+  Parakeet-110m fine-tune on US audio (or Parakeet hotwords, below) should
+  fix its European guesses on US callsigns.
 - Hotwords for Parakeet (sherpa-onnx can bias a transducer towards a word
   list, e.g. the local airport's callsigns and fixes).
