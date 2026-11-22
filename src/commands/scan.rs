@@ -26,7 +26,10 @@ pub fn plan(mode: Mode) -> (f64, Vec<u64>) {
             2_400_000.0,
             k(&[136_650, 136_725, 136_775, 136_825, 136_875, 136_925, 136_975]),
         ),
-        Mode::Ais => (2_400_000.0, k(&[161_975, 162_025])),
+        // A/B plus the long-range (message 27) channels C/D. The two pairs
+        // are 5.2 MHz apart: a 2.4 MS/s capture holds one pair (auto-tune
+        // picks A/B, the core pair); 8 MS/s and up holds all four.
+        Mode::Ais => (2_400_000.0, k(&[156_775, 156_825, 161_975, 162_025])),
         Mode::Adsb => (2_000_000.0, k(&[1_090_000])),
         Mode::StdC => (2_400_000.0, k(&[1_537_100, 1_537_700, 1_541_450])),
         // Simplex ring-alert + primary messaging channels.
@@ -365,9 +368,13 @@ pub fn auto_window(mode: Mode, rate: f64, max_channels: usize) -> Option<(u64, V
         return None;
     }
     let groups = group_channels(&plan_channels, rate, passband(mode));
-    let (center, mut chans) = groups.into_iter().max_by_key(|(_, g)| g.len())?;
+    let core = core_channels(mode);
+    // Densest window; on a tie, the one holding more core channels (AIS:
+    // A/B over the long-range C/D pair).
+    let (center, mut chans) = groups
+        .into_iter()
+        .max_by_key(|(_, g)| (g.len(), g.iter().filter(|f| core.contains(f)).count()))?;
     if chans.len() > max_channels {
-        let core = core_channels(mode);
         chans.sort_by_key(|f| {
             (!core.contains(f), (*f as i64 - center as i64).unsigned_abs())
         });
@@ -868,6 +875,25 @@ mod tests {
         assert_eq!(capped.len(), 3);
         assert!(capped.contains(&131_550_000), "core channel evicted: {capped:?}");
         assert!(capped.contains(&131_725_000), "core channel evicted: {capped:?}");
+    }
+
+    #[test]
+    fn ais_plan_has_channels_a_to_d_and_auto_tune_prefers_a_b() {
+        let (_, plan_chans) = plan(Mode::Ais);
+        for f in [161_975_000, 162_025_000, 156_775_000, 156_825_000] {
+            assert!(plan_chans.contains(&f), "{f} missing from the AIS plan");
+        }
+        // 2.4 MS/s holds one pair: A/B wins the tie over C/D.
+        let (center, chans) = auto_window(Mode::Ais, 2_400_000.0, 64).unwrap();
+        assert_eq!(chans, vec![161_975_000, 162_025_000]);
+        assert_eq!(center, 162_000_000);
+        // A 10 MS/s Airspy capture holds all four.
+        let (center, chans) = auto_window(Mode::Ais, 10_000_000.0, 64).unwrap();
+        assert_eq!(chans, vec![156_775_000, 156_825_000, 161_975_000, 162_025_000]);
+        assert_eq!(center, 159_400_000);
+        // Scanning at 2.4 MS/s visits both pairs.
+        let groups = group_channels(&plan_chans, 2_400_000.0, passband(Mode::Ais));
+        assert_eq!(groups.len(), 2, "{groups:?}");
     }
 
     #[test]

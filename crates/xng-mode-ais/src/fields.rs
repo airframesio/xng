@@ -1171,8 +1171,14 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
             put("interval", json!(u(bits, 146, 4)));
             put("quiet_min", json!(u(bits, 150, 4)));
         }
-        // Long-range position report.
+        // Long-range position report (sent on AIS channels C/D for
+        // satellite AIS, and on A/B by some base stations). Positions are
+        // 1/10 minute; speed whole knots (63 = n/a); course whole degrees
+        // (511 = n/a).
         27 => {
+            put("position_accuracy", json!(u(bits, 38, 1)? == 1));
+            put("raim", json!(u(bits, 39, 1)? == 1));
+            put("nav_status", json!(NAV_STATUS[u(bits, 40, 4)? as usize]));
             let lon = i(bits, 44, 18)? as f64 / 600.0;
             let lat = i(bits, 62, 17)? as f64 / 600.0;
             if lon.abs() <= 180.0 && lat.abs() <= 90.0 {
@@ -1183,6 +1189,12 @@ pub fn decode(msg_type: u8, bits: &[u8]) -> Option<Value> {
                 63 => {}
                 v => put("sog_kt", json!(v)),
             }
+            match u(bits, 85, 9)? {
+                v if v >= 360 => {}
+                v => put("cog_deg", json!(v)),
+            }
+            // GNSS position status: 0 = current, 1 = not current.
+            put("gnss_current", json!(u(bits, 94, 1)? == 0));
         }
         _ => return None,
     }

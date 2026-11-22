@@ -1,7 +1,11 @@
 # AIS (ITU-R M.1371-5) — implementation notes
 
 Native AIS demod/decode for `xng-mode-ais`. GMSK 9600 bd, h=0.5, BT=0.4 in
-the 25 kHz channels at 161.975 (A) / 162.025 (B) MHz. Clean-room — see
+the 25 kHz channels at 161.975 (A) / 162.025 (B) MHz, and the long-range
+channels 156.775 (C, marine ch 75) / 156.825 (D, ch 76) that class A ships
+use for message 27 to satellites. The two pairs are 5.2 MHz apart: a
+2.4 MS/s capture holds one pair (auto-tune picks A/B), 8 MS/s and up all
+four; `xng scan` and `xng survey` visit both pairs. Clean-room — see
 PROVENANCE.md; AIS-catcher is an off-air oracle only, pyais is the
 field-decode oracle (except the ASMs pyais does not decode — all of DAC=1,
 DAC=200 FIDs 21/22/55, and the regional DACs — where the layouts are
@@ -102,7 +106,8 @@ fill bits, XOR checksum, multi-sentence fragmentation at 60 armored chars
 (82-char sentence limit) with a rotating 0–9 message sequence ID for
 multi-fragment messages. Channel A/B designator from the frequency
 (`lib.rs::channel_letter`): ±12.5 kHz of 161.975 → `'A'`, of 162.025 →
-`'B'`, anything else → `'?'` (never a silently wrong `'A'`; the field stays
+`'B'`, of 156.775 → `'C'`, of 156.825 → `'D'` (as AIS-catcher labels the
+long-range channels), anything else → `'?'` (never a silently wrong `'A'`; the field stays
 one valid ASCII char so `(channel,total,seq)` fragment keying is
 unaffected). The e2e test reproduces a published gpsd example sentence
 (`!AIVDM,1,1,,B,177KQJ5000G?tO`K>RA1wUbN0TKH,0*5C`) byte-for-byte from a
