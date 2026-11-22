@@ -82,6 +82,9 @@ pub struct OutputConfig {
     /// position report is emitted periodically so chart plotters show the
     /// station (AIS-5c).
     pub own_ship_mmsi: Option<u32>,
+    /// Airband audio outputs (recordings, UDP PCM, Icecast, scan stream, ATC
+    /// feeder).
+    pub airband: crate::airband::AirbandOutputs,
 }
 
 pub struct SessionConfig {
@@ -93,6 +96,9 @@ pub struct SessionConfig {
     pub outputs: OutputConfig,
     /// Receiver location (lat, lon) — enables ADS-B surface decode.
     pub receiver_pos: Option<(f64, f64)>,
+    /// Airband channel settings (labels, squelch, modulation, ...). Ignored
+    /// by every other mode.
+    pub airband: crate::airband::AirbandConfig,
     /// ACARS label filter applied before messages reach the bus.
     pub label_filter: LabelFilter,
     /// AIS type/MMSI filter + rate downsample + content dedup (AIS-5h).
@@ -371,6 +377,12 @@ pub(crate) enum ModeChannel {
     Adsl(AdslChannelDecoder),
     Atcs(AtcsChannelDecoder),
     Time(TimeChannelDecoder),
+    /// Placeholder for one airband channel; `collapse_airband` folds every
+    /// placeholder of a session into one [`ModeChannel::AirbandSet`].
+    AirbandPending,
+    /// Every airband channel of a session behind one shared front end (a
+    /// multi-channel decoder like `AcarsShared`, driven by `process_shared`).
+    AirbandSet(Box<crate::airband::set::AirbandSet>),
 }
 
 impl ModeChannel {
@@ -447,6 +459,9 @@ impl ModeChannel {
                     TimeChannelDecoder::new(sample_rate, offset)?.with_carrier(carrier),
                 ))
             }
+            // Airband channels are built together (shared front end and the
+            // session's per-channel settings) by `collapse_airband`.
+            Mode::Airband => Ok(Self::AirbandPending),
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -472,6 +487,7 @@ impl ModeChannel {
             Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
             Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
             Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
+            Mode::Airband => xng_mode_airband::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -500,6 +516,7 @@ impl ModeChannel {
             Self::Flex(_) => xng_mode_flex::CHANNEL_RATE,
             Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
             Self::Time(_) => xng_mode_time::CHANNEL_RATE,
+            Self::AirbandPending | Self::AirbandSet(_) => xng_mode_airband::CHANNEL_RATE,
         }
     }
 
@@ -534,6 +551,19 @@ impl ModeChannel {
             Self::Flex(d) => d.level_dbfs(),
             Self::Vdes(d) => d.level_dbfs(),
             Self::Time(d) => d.level_dbfs(),
+            Self::AirbandPending => f32::NEG_INFINITY,
+            Self::AirbandSet(s) => s.level_dbfs(0),
+        }
+    }
+
+    /// The channel frequencies of a multi-channel decoder (`None` for the
+    /// single-channel variants). The decode loop drives these through
+    /// `process_shared`.
+    fn shared_freqs(&self) -> Option<&[u64]> {
+        match self {
+            Self::AcarsShared { freqs, .. } => Some(freqs),
+            Self::AirbandSet(s) => Some(s.freqs()),
+            _ => None,
         }
     }
 
@@ -543,7 +573,7 @@ impl ModeChannel {
         match self {
             // Shared ACARS spans many channels and cannot be tagged with one
             // freq/provenance; the decode loop drives it via `process_shared`.
-            Self::AcarsShared { .. } => (Vec::new(), 0, 0),
+            Self::AcarsShared { .. } | Self::AirbandSet(_) | Self::AirbandPending => (Vec::new(), 0, 0),
             Self::Acars(dec) => {
                 let frames = dec.process(iq);
                 let seen = frames.len() as u64;
@@ -817,12 +847,16 @@ impl ModeChannel {
     /// metrics for all of them, matching the single-channel path.
     ///
     /// Returns `(channel_index, freq, level, msgs, seen, ok)` per channel.
-    /// Only `Self::AcarsShared` produces output; other variants return empty.
+    /// Only `Self::AcarsShared` and `Self::AirbandSet` produce output; other
+    /// variants return empty.
     fn process_shared(
         &mut self,
         iq: &[Complex<f32>],
         base_prov: &SharedProvenance,
     ) -> Vec<(usize, u64, f32, Vec<Message>, u64, u64)> {
+        if let Self::AirbandSet(set) = self {
+            return set.process(iq, |i, freq| base_prov.for_channel(i, freq, xng_mode_airband::CHANNEL_RATE));
+        }
         let Self::AcarsShared { dec, freqs } = self else {
             return Vec::new();
         };
@@ -856,7 +890,7 @@ pub(crate) struct SharedProvenance {
 }
 
 impl SharedProvenance {
-    fn for_channel(&self, index: usize, freq: u64, channel_rate: f64) -> Provenance {
+    pub(crate) fn for_channel(&self, index: usize, freq: u64, channel_rate: f64) -> Provenance {
         Provenance {
             station: self.station.clone(),
             app: self.app.clone(),
@@ -1001,7 +1035,64 @@ pub(crate) fn spawn_outputs(
         let (id, ident) = (station.id.to_string(), station.ident.clone());
         output_tasks.push(tokio::spawn(crate::outputs::asf2_quic::run(rx, target, trust, id, ident)));
     }
+    spawn_airband_outputs(bus, &outputs.airband, station, sessions, &mut output_tasks);
     output_tasks
+}
+
+/// Airband audio outputs. They read the audio hub and end when the bus
+/// closes. Configuration errors were reported when the config was built, so
+/// here they only log.
+fn spawn_airband_outputs(
+    bus: &MessageBus,
+    o: &crate::airband::AirbandOutputs,
+    station: &StationIdentity,
+    sessions: &[serde_json::Value],
+    tasks: &mut Vec<tokio::task::JoinHandle<Result<(), std::io::Error>>>,
+) {
+    if let Some(scan) = &o.scan {
+        match scan.to_scan_config() {
+            Ok(cfg) => {
+                crate::airband::scan_stream::install(cfg);
+                let rx = bus.subscribe();
+                tasks.push(tokio::spawn(async move {
+                    tokio::select! {
+                        _ = crate::airband::scan_stream::run() => {}
+                        _ = crate::airband::bus_closed(rx) => {}
+                    }
+                    Ok(())
+                }));
+            }
+            Err(e) => tracing::error!("airband scan: {e}"),
+        }
+    }
+    match crate::outputs::airband_record::Recorder::new(o) {
+        Ok(Some(rec)) => tasks.push(tokio::spawn(crate::outputs::airband_record::run(bus.subscribe(), rec))),
+        Ok(None) => {}
+        Err(e) => tracing::error!("airband recordings: {e}"),
+    }
+    for t in &o.udp {
+        match crate::outputs::airband_udp::parse_target(t) {
+            Ok(target) => tasks.push(tokio::spawn(crate::outputs::airband_udp::run(bus.subscribe(), target))),
+            Err(e) => tracing::error!("{e}"),
+        }
+    }
+    for url in &o.icecast {
+        #[cfg(feature = "opus")]
+        match crate::outputs::airband_icecast::parse_url(url) {
+            Ok(mut t) => {
+                t.stream.get_or_insert(if o.scan.is_some() {
+                    crate::airband::StreamId::Scan
+                } else {
+                    crate::airband::StreamId::Mix
+                });
+                tasks.push(tokio::spawn(crate::outputs::airband_icecast::run(bus.subscribe(), t)))
+            }
+            Err(e) => tracing::error!("{e}"),
+        }
+        #[cfg(not(feature = "opus"))]
+        tracing::error!("icecast output {url}: xng was built without the `opus` feature");
+    }
+    let _ = (station, sessions);
 }
 
 /// Resolve when the process is asked to stop — Ctrl-C (SIGINT) or SIGTERM.
@@ -1073,6 +1164,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
     }
     let n_channels = decoders.len();
     decoders = collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode);
+    decoders = collapse_airband(decoders, sample_rate, capture_center, &cfg)?;
     tracing::info!(
         "{} session: {} channel(s) from a {:.0} S/s capture centered at {:.3} MHz",
         cfg.mode,
@@ -1151,14 +1243,23 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
             }
         }
 
+        let voice = cfg.mode == Mode::Airband;
         for (freq, count, crc_ok) in &stats {
-            tracing::info!(
-                "channel {:.3} MHz: {count} frame(s), {crc_ok} with valid CRC",
-                *freq as f64 / 1e6
-            );
+            if voice {
+                tracing::info!("channel {:.3} MHz: {count} transmission(s)", *freq as f64 / 1e6);
+            } else {
+                tracing::info!(
+                    "channel {:.3} MHz: {count} frame(s), {crc_ok} with valid CRC",
+                    *freq as f64 / 1e6
+                );
+            }
         }
         let total: u64 = stats.iter().map(|s| s.1).sum();
-        tracing::info!("session complete: {total} frame(s) decoded");
+        if voice {
+            tracing::info!("session complete: {total} transmission(s)");
+        } else {
+            tracing::info!("session complete: {total} frame(s) decoded");
+        }
         Ok(())
     })
 }
@@ -1189,7 +1290,7 @@ pub(crate) fn decode_loop(
     let shared_indices: Vec<usize> = decoders
         .iter()
         .enumerate()
-        .filter(|(_, (_, d))| matches!(d, ModeChannel::AcarsShared { .. }))
+        .filter(|(_, (_, d))| d.shared_freqs().is_some())
         .map(|(i, _)| i)
         .collect();
     // Per-frequency stats for shared multi-channel decoders, seeded with every
@@ -1197,7 +1298,7 @@ pub(crate) fn decode_loop(
     let mut shared_stats: std::collections::BTreeMap<u64, (u64, u64)> =
         std::collections::BTreeMap::new();
     for (_, d) in &decoders {
-        if let ModeChannel::AcarsShared { freqs, .. } = d {
+        if let Some(freqs) = d.shared_freqs() {
             for &f in freqs {
                 shared_stats.insert(f, (0, 0));
             }
@@ -1270,7 +1371,7 @@ pub(crate) fn decode_loop(
             // vdl2/ais/aero/stdc, fold this into the main path (a decoder
             // yielding per-channel (freq, msgs, …) results) rather than
             // branching on the ACARS variant here.
-            if let ModeChannel::AcarsShared { .. } = dec {
+            if dec.shared_freqs().is_some() {
                 let base = SharedProvenance {
                     station: station.clone(),
                     app: AppInfo::xng(),
@@ -1432,6 +1533,8 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         }
         let n_channels = decoders.len();
         decoders = collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode);
+        decoders = collapse_airband(decoders, sample_rate, capture_center, &cfg)
+            .map_err(|e| anyhow::anyhow!("[{}] {e}", cfg.mode))?;
         tracing::info!(
             "station session: {} with {} channel(s) at {:.0} S/s centered {:.3} MHz",
             cfg.mode,
@@ -1489,7 +1592,9 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         spawn_interrupt_handler(stop.clone(), "station");
 
         let mut decode_tasks = Vec::new();
+        let mut task_modes = Vec::new();
         for mut prep in prepared {
+            task_modes.push(prep.cfg.mode);
             let bus = bus.clone();
             let stop = stop.clone();
             let station = station.clone();
@@ -1520,16 +1625,20 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
                 )
             }));
         }
-        for t in decode_tasks {
+        for (t, mode) in decode_tasks.into_iter().zip(task_modes) {
             match t.await? {
                 Ok(stats) => {
                     for (freq, seen, ok) in stats {
-                        tracing::info!(
-                            "channel {:.3} MHz: {} frame(s), {} with valid CRC",
-                            freq as f64 / 1e6,
-                            seen,
-                            ok
-                        );
+                        if mode == Mode::Airband {
+                            tracing::info!("channel {:.3} MHz: {seen} transmission(s)", freq as f64 / 1e6);
+                        } else {
+                            tracing::info!(
+                                "channel {:.3} MHz: {} frame(s), {} with valid CRC",
+                                freq as f64 / 1e6,
+                                seen,
+                                ok
+                            );
+                        }
                     }
                 }
                 Err(e) => tracing::warn!("session ended with error: {e}"),
@@ -1726,7 +1835,30 @@ pub(crate) fn build_decoders(
         }
         decoders.push((freq, dec));
     }
-    Ok(collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode))
+    let decoders = collapse_shared_acars(decoders, sample_rate, capture_center, cfg.mode);
+    collapse_airband(decoders, sample_rate, capture_center, cfg)
+}
+
+/// Fold an airband session's per-channel placeholders into one
+/// [`ModeChannel::AirbandSet`]: every channel behind one shared front end,
+/// with the session's per-channel settings. Other modes pass through.
+fn collapse_airband(
+    decoders: Vec<(u64, ModeChannel)>,
+    sample_rate: f64,
+    capture_center: u64,
+    cfg: &SessionConfig,
+) -> anyhow::Result<Vec<(u64, ModeChannel)>> {
+    if cfg.mode != Mode::Airband || decoders.is_empty() {
+        return Ok(decoders);
+    }
+    let freqs: Vec<u64> = decoders.iter().map(|(f, _)| *f).collect();
+    let sdr = cfg.sdr.as_ref().map(|s| s.serial.clone().unwrap_or_else(|| s.id.clone()));
+    let set = crate::airband::set::AirbandSet::new(sample_rate, capture_center, &freqs, &cfg.airband, sdr)
+        .map_err(|e| anyhow::anyhow!("airband: {e}"))?;
+    if freqs.len() > 1 {
+        tracing::info!("airband: {} channels share one downconverter front end", freqs.len());
+    }
+    Ok(vec![(freqs[0], ModeChannel::AirbandSet(Box::new(set)))])
 }
 
 /// When an ACARS session has more than one channel, replace the N independent

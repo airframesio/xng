@@ -344,6 +344,7 @@ mod tests {
             zmq: vec![],
             airframes: None,
             own_ship_mmsi: None,
+            airband: Default::default(),
         }
     }
 
@@ -366,6 +367,7 @@ mod tests {
             ais_filter: Default::default(),
             demod_effort: runtime::DemodEffort::Live,
             max_ppm: None,
+            airband: Default::default(),
         }
     }
 

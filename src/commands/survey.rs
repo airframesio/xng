@@ -501,6 +501,7 @@ fn dwell(
         ais_filter: Default::default(),
         demod_effort: runtime::DemodEffort::Live,
         max_ppm: None,
+        airband: Default::default(),
         outputs: runtime::OutputConfig {
             console: ConsoleFormat::Pretty,
             jsonl: None,
@@ -523,6 +524,7 @@ fn dwell(
             zmq: Vec::new(),
             airframes: None,
             own_ship_mmsi: None,
+            airband: Default::default(),
         },
     };
     let decoders = runtime::build_decoders(rate, center, &cfg)?;

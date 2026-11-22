@@ -4,6 +4,7 @@
 //! desktop app) embed the same decode runtime through [`engine`], so every
 //! front end shares one decode path and one set of outputs.
 
+pub mod airband;
 pub mod beam;
 pub mod bus;
 pub mod commands;

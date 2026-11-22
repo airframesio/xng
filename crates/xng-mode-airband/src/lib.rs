@@ -225,6 +225,10 @@ pub struct AirbandChannelDecoder {
     prev: Complex<f32>,
     carrier: f32,
     carrier_alpha: f32,
+    /// Short-term envelope (5 ms) used to snap the carrier estimate up at
+    /// the start of a transmission.
+    env_fast: f32,
+    env_fast_alpha: f32,
     deemph: Option<Deemphasis>,
     hp: Option<[Biquad; 2]>,
     lp: Option<[Biquad; 2]>,
@@ -296,6 +300,8 @@ impl AirbandChannelDecoder {
             carrier: 0.0,
             // 50 ms carrier tracker: well below the lowest voice frequency.
             carrier_alpha: (1.0 / (0.05 * rate)) as f32,
+            env_fast: 0.0,
+            env_fast_alpha: (1.0 / (0.005 * rate)) as f32,
             deemph,
             hp,
             lp,
@@ -381,6 +387,7 @@ impl AirbandChannelDecoder {
         self.block_audio.clear();
         self.block_power = 0.0;
         self.carrier = 0.0;
+        self.env_fast = 0.0;
         self.afc_acc = Complex::new(0.0, 0.0);
         if let Some(c) = &mut self.ctcss {
             c.reset();
@@ -451,7 +458,13 @@ impl AirbandChannelDecoder {
         let raw = match self.cfg.modulation {
             Modulation::Am => {
                 let env = p.sqrt();
+                self.env_fast += self.env_fast_alpha * (env - self.env_fast);
                 self.carrier += self.carrier_alpha * (env - self.carrier);
+                // Fast attack, slow release: a carrier that just keyed up is
+                // followed within a few ms instead of a 50 ms climb.
+                if self.env_fast > self.carrier {
+                    self.carrier += 0.2 * (self.env_fast - self.carrier);
+                }
                 let ac = env - self.carrier;
                 if self.cfg.agc {
                     // Never divide by less than twice the noise amplitude, so
@@ -551,10 +564,12 @@ impl AirbandChannelDecoder {
                     level_dbfs: power_db,
                     noise_dbfs: self.squelch.noise_db(),
                 });
+                let first = events.len();
                 for b in pre {
                     push_audio(events, start, b);
                 }
                 push_audio(events, block_start, block);
+                fade_in(&mut events[first..]);
             }
             Transition::Closed => {
                 let e = self.end_event();
@@ -692,6 +707,27 @@ fn db_to_amp(db: f32) -> f32 {
     }
 }
 
+/// Key-up fade (samples): the carrier step at the start of a transmission
+/// is an audible thump however fast the demodulator settles, so the first
+/// 20 ms of each transmission are faded in.
+const FADE_IN: usize = (CHANNEL_RATE * 0.020) as usize;
+
+fn fade_in(events: &mut [AirbandEvent]) {
+    let mut k = 0usize;
+    for e in events {
+        if let AirbandEvent::Audio { samples, .. } = e {
+            for v in samples.iter_mut() {
+                if k >= FADE_IN {
+                    return;
+                }
+                let g = 0.5 - 0.5 * (std::f32::consts::PI * k as f32 / FADE_IN as f32).cos();
+                *v *= g;
+                k += 1;
+            }
+        }
+    }
+}
+
 /// Append audio, merging with the previous Audio event when contiguous.
 fn push_audio(events: &mut Vec<AirbandEvent>, sample: u64, block: Vec<f32>) {
     if let Some(AirbandEvent::Audio { sample: s, samples }) = events.last_mut() {
@@ -719,9 +755,6 @@ pub struct TransmissionInfo {
     pub duration_s: Option<f64>,
     pub level_dbfs: f32,
     pub noise_dbfs: f32,
-    /// Recording written for this transmission, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recording: Option<String>,
     /// ATC frequency key this channel is mapped to, if configured.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub atc_frequency: Option<String>,
@@ -837,6 +870,18 @@ mod tests {
         }
         let ratio_db = 20.0 * (levels[0] / levels[1]).log10();
         assert!(ratio_db.abs() < 1.5, "levels {levels:?}");
+    }
+
+    #[test]
+    fn no_thump_at_key_up() {
+        // The first 20 ms of a transmission must not be louder than its body.
+        let iq = am_capture(RATE, 2.0, 0.0, &[burst(0.5, 1.0, 0.05)], 1e-6, 13);
+        let mut dec = AirbandChannelDecoder::new(RATE, 0.0, ChannelConfig::default()).unwrap();
+        let (_, audio) = collect(&run(&mut dec, &iq));
+        let peak = |x: &[f32]| x.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let head = peak(&audio[..320]);
+        let body = peak(&audio[3_200..8_000]);
+        assert!(head < 1.3 * body, "head {head} body {body}");
     }
 
     #[test]

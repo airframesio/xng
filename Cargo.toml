@@ -81,7 +81,10 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
-default = ["soapy"]
+default = ["soapy", "opus"]
+# Opus encoding (libopus, built from source when no system library is found)
+# for the Airframes ATC feeder, Icecast and Ogg/Opus airband recordings.
+opus = ["dep:opus"]
 soapy = ["xng-sdr/soapy"]
 # Native Airspy R2/Mini support (libairspy) — no SoapyAirspy module needed.
 airspy = ["xng-sdr/airspy"]
@@ -142,3 +145,6 @@ rustls-pemfile.workspace = true
 tokio-stream.workspace = true
 webpki-roots.workspace = true
 zeromq.workspace = true
+opus = { version = "0.3", optional = true }
+base64 = "0.22"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

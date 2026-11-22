@@ -4,6 +4,10 @@
 
 pub mod acarsdec_json;
 pub mod aircraft;
+#[cfg(feature = "opus")]
+pub mod airband_icecast;
+pub mod airband_record;
+pub mod airband_udp;
 pub mod airframes;
 pub mod beast;
 pub mod asf2_grpc;

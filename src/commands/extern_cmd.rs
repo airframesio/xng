@@ -545,6 +545,7 @@ mod tests {
             zmq: vec![],
             airframes: None,
             own_ship_mmsi: None,
+            airband: Default::default(),
         }
     }
 

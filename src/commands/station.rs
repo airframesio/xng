@@ -272,6 +272,7 @@ pub fn build(
         zmq: st.outputs.zmq.clone(),
         airframes: Some(airframes_router(&st)),
         own_ship_mmsi: st.outputs.own_ship_mmsi,
+        airband: Default::default(),
     };
 
     if let Some(p) = &st.outputs.aircraft_db {
@@ -384,6 +385,7 @@ pub fn build(
                 },
                 demod_effort: tune.demod_effort.unwrap_or(crate::runtime::DemodEffort::Live),
                 max_ppm: tune.max_ppm,
+                airband: Default::default(),
             },
         ));
     }
