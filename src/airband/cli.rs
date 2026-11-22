@@ -3,7 +3,7 @@
 
 use super::config::{AirbandChannel, AirbandConfig, AirbandOutputs, AtcFeedSettings, RecordFormat, ScanSettings};
 use std::path::PathBuf;
-use xng_mode_airband::squelch::{SquelchMode, DEFAULT_SNR_DB};
+use xng_mode_airband::squelch::SquelchMode;
 use xng_mode_airband::Modulation;
 
 #[derive(clap::Args, Clone, Debug, Default)]
@@ -117,22 +117,7 @@ pub struct AirbandOpts {
 
 /// Parse `auto[:snr]`, `manual:dbfs`, `off`.
 pub fn parse_squelch(s: &str) -> anyhow::Result<SquelchMode> {
-    let s = s.trim().to_ascii_lowercase();
-    let (kind, arg) = match s.split_once(':') {
-        Some((k, a)) => (k, Some(a)),
-        None => (s.as_str(), None),
-    };
-    let num = |a: Option<&str>| -> anyhow::Result<Option<f32>> {
-        a.map(|v| v.parse::<f32>().map_err(|_| anyhow::anyhow!("bad squelch value {v:?}"))).transpose()
-    };
-    Ok(match kind {
-        "auto" => SquelchMode::Auto { snr_db: num(arg)?.unwrap_or(DEFAULT_SNR_DB) },
-        "manual" => SquelchMode::Manual {
-            dbfs: num(arg)?.ok_or_else(|| anyhow::anyhow!("manual squelch needs a level, e.g. manual:-40"))?,
-        },
-        "off" => SquelchMode::Off,
-        other => anyhow::bail!("unknown squelch {other:?} (auto[:snr], manual:dbfs, off)"),
-    })
+    s.parse::<SquelchMode>().map_err(|e| anyhow::anyhow!(e))
 }
 
 fn freq_map(v: &[String], what: &str) -> anyhow::Result<Vec<(u64, String)>> {
@@ -237,6 +222,7 @@ impl AirbandOpts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use xng_mode_airband::squelch::DEFAULT_SNR_DB;
 
     #[test]
     fn squelch_spellings() {

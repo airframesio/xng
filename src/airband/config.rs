@@ -8,7 +8,7 @@ use xng_mode_airband::{ChannelConfig, Modulation};
 /// Per-session airband settings: defaults for every channel plus per-channel
 /// overrides and metadata.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AirbandConfig {
     /// Settings every channel starts from.
     pub defaults: ChannelConfig,
@@ -22,7 +22,7 @@ pub struct AirbandConfig {
 /// One channel's metadata and overrides. `freq` accepts the same spellings
 /// as `--channels` (MHz like `118.300`, or Hz).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AirbandChannel {
     pub freq: String,
     /// Display name ("KSFO Tower").
@@ -119,7 +119,7 @@ impl AirbandConfig {
 /// Where airband audio goes. Shared by every session (like the other
 /// outputs, station mode takes it from the station-level config).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AirbandOutputs {
     /// Record transmissions under this folder.
     pub record_dir: Option<PathBuf>,
@@ -204,7 +204,7 @@ impl std::str::FromStr for RecordFormat {
 
 /// Scanner settings for the `scan` stream.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ScanSettings {
     /// Priority channels, highest first (MHz or Hz).
     pub priority: Vec<String>,
@@ -238,7 +238,7 @@ impl ScanSettings {
 
 /// Airframes ATC feeder settings.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct AtcFeedSettings {
     /// Ingest `host:port`.
     pub server: String,
@@ -318,16 +318,16 @@ mod tests {
         let t = r#"
             mix = true
             [defaults]
-            squelch = { type = "auto", snr_db = 10.0 }
-            hang_ms = 400
+            squelch = "auto:10"
+            hang-ms = 400
             [[channel]]
             freq = "118.300"
             label = "Tower"
-            atc_frequency = "airport:KSFO:TWR:118300"
+            atc-frequency = "airport:KSFO:TWR:118300"
             [[channel]]
             freq = "462.5625"
             modulation = "nfm"
-            ctcss_hz = 100.0
+            ctcss-hz = 100.0
         "#;
         let c: AirbandConfig = toml::from_str(t).unwrap();
         c.validate().unwrap();

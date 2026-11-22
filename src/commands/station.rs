@@ -53,6 +53,9 @@ pub struct StationFile {
 pub struct OutputsToml {
     #[serde(default)]
     pub feed_airframes: bool,
+    /// Airband audio outputs: recordings, UDP, Icecast, scanner, ATC feed.
+    #[serde(default)]
+    pub airband: crate::airband::AirbandOutputs,
     pub jsonl: Option<PathBuf>,
     pub metrics: Option<String>,
     #[serde(default)]
@@ -191,6 +194,9 @@ pub struct SessionToml {
     pub feed: Option<bool>,
     /// Override the Airframes station id used for this decoder's messages.
     pub airframes_station_id: Option<String>,
+    /// Airband channel defaults, per-channel overrides and the mix stream.
+    #[serde(default)]
+    pub airband: crate::airband::AirbandConfig,
 }
 
 pub fn load(path: &Path) -> anyhow::Result<StationFile> {
@@ -224,6 +230,11 @@ impl StationFile {
         };
         fix(&mut self.outputs.jsonl);
         fix(&mut self.outputs.aircraft_db);
+        fix(&mut self.outputs.airband.record_dir);
+        if let Some(a) = &mut self.outputs.airband.atc {
+            fix(&mut a.credentials);
+            fix(&mut a.ca);
+        }
         for s in &mut self.sessions {
             fix(&mut s.file);
         }
@@ -272,7 +283,10 @@ pub fn build(
         zmq: st.outputs.zmq.clone(),
         airframes: Some(airframes_router(&st)),
         own_ship_mmsi: st.outputs.own_ship_mmsi,
-        airband: Default::default(),
+        airband: {
+            st.outputs.airband.validate().map_err(|e| anyhow::anyhow!("[outputs.airband]: {e}"))?;
+            st.outputs.airband.clone()
+        },
     };
 
     if let Some(p) = &st.outputs.aircraft_db {
@@ -303,13 +317,20 @@ pub fn build(
     let mut sessions = Vec::new();
     for (i, sess) in st.sessions.iter().enumerate() {
         let label = format!("session {} ({})", i + 1, sess.mode);
+        sess.airband.validate().map_err(|e| anyhow::anyhow!("{label} [session.airband]: {e}"))?;
+        // Airband sessions may list their channels only as
+        // [[session.airband.channel]] tables.
+        let mut chan_list = sess.channels.clone();
+        if chan_list.is_empty() {
+            chan_list = sess.airband.channels.iter().map(|c| c.freq.clone()).collect();
+        }
         // Tuning: explicit values, or the mode plan via the same
         // derivation the TUI uses.
         let tune = crate::tuning::Tune {
             mode: sess.mode.clone(),
             sample_rate: sess.sample_rate,
             center_freq: sess.center.clone(),
-            channels: sess.channels.clone(),
+            channels: chan_list,
             receiver_pos: sess.receiver_pos.clone(),
             filter_labels: Vec::new(),
             exclude_labels: Vec::new(),
@@ -385,7 +406,7 @@ pub fn build(
                 },
                 demod_effort: tune.demod_effort.unwrap_or(crate::runtime::DemodEffort::Live),
                 max_ppm: tune.max_ppm,
-                airband: Default::default(),
+                airband: sess.airband.clone(),
             },
         ));
     }
@@ -494,6 +515,31 @@ mod tests {
         assert!(f.outputs.feed_airframes);
         assert_eq!(f.sessions[1].mode, "vdl2");
         assert!(f.sessions[1].channels.is_empty()); // plan-derived
+    }
+
+    #[test]
+    fn parses_airband_example() {
+        let mut f: StationFile =
+            toml::from_str(include_str!("../../contrib/station.airband.example.toml")).unwrap();
+        assert_eq!(f.sessions.len(), 2);
+        let a = &f.sessions[0].airband;
+        a.validate().unwrap();
+        assert!(a.mix);
+        assert_eq!(a.channels.len(), 3);
+        assert_eq!(a.channel(120_500_000).1.unwrap().atc_frequency.as_deref(), Some("airport:KSFO:TWR:120500"));
+        assert_eq!(
+            a.channel(120_900_000).0.squelch,
+            xng_mode_airband::squelch::SquelchMode::Manual { dbfs: -48.0 }
+        );
+        assert_eq!(f.sessions[1].airband.channel(135_100_000).0.modulation, xng_mode_airband::Modulation::Nfm);
+        let o = &f.outputs.airband;
+        o.validate().unwrap();
+        assert_eq!(o.scan.as_ref().unwrap().priority, vec!["120.5".to_string()]);
+        let atc = o.atc.as_ref().unwrap();
+        assert_eq!(atc.location_precision_m, 500);
+        assert_eq!(atc.server, "atc-ingest.airframes.io:4433");
+        f.resolve_paths(Path::new("/srv"));
+        assert_eq!(f.outputs.airband.record_dir.as_deref(), Some(Path::new("/var/lib/xng/airband")));
     }
 
     #[test]

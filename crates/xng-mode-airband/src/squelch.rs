@@ -13,9 +13,10 @@
 
 use serde::{Deserialize, Serialize};
 
-/// How the open threshold is chosen.
+/// How the open threshold is chosen. Written as text in configs:
+/// `auto`, `auto:12` (margin in dB), `manual:-40` (dBFS) or `off`.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(try_from = "String", into = "String")]
 pub enum SquelchMode {
     /// Open when the channel is `snr_db` above the tracked noise floor.
     Auto { snr_db: f32 },
@@ -28,6 +29,52 @@ pub enum SquelchMode {
 impl Default for SquelchMode {
     fn default() -> Self {
         SquelchMode::Auto { snr_db: DEFAULT_SNR_DB }
+    }
+}
+
+impl std::str::FromStr for SquelchMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let s = s.trim().to_ascii_lowercase();
+        let (kind, arg) = match s.split_once(':') {
+            Some((k, a)) => (k, Some(a)),
+            None => (s.as_str(), None),
+        };
+        let num = |a: Option<&str>| -> Result<Option<f32>, String> {
+            a.map(|v| v.trim().parse::<f32>().map_err(|_| format!("bad squelch value {v:?}"))).transpose()
+        };
+        Ok(match kind {
+            "auto" => SquelchMode::Auto { snr_db: num(arg)?.unwrap_or(DEFAULT_SNR_DB) },
+            "manual" => SquelchMode::Manual {
+                dbfs: num(arg)?.ok_or("manual squelch needs a level, e.g. manual:-40")?,
+            },
+            "off" => SquelchMode::Off,
+            other => return Err(format!("unknown squelch {other:?} (auto[:snr_db], manual:dbfs, off)")),
+        })
+    }
+}
+
+impl std::fmt::Display for SquelchMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SquelchMode::Auto { snr_db } => write!(f, "auto:{snr_db}"),
+            SquelchMode::Manual { dbfs } => write!(f, "manual:{dbfs}"),
+            SquelchMode::Off => f.write_str("off"),
+        }
+    }
+}
+
+impl TryFrom<String> for SquelchMode {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        s.parse()
+    }
+}
+
+impl From<SquelchMode> for String {
+    fn from(m: SquelchMode) -> String {
+        m.to_string()
     }
 }
 

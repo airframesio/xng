@@ -91,7 +91,7 @@ impl std::fmt::Display for Modulation {
 
 /// Per-channel settings. Every field has a sensible airband default.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct ChannelConfig {
     pub modulation: Modulation,
     /// Two-sided RF filter width (Hz). Default 8 kHz for AM (fits 8.33 kHz
@@ -1012,11 +1012,15 @@ mod tests {
     fn config_toml_shape() {
         let c: ChannelConfig = serde_json::from_value(serde_json::json!({
             "modulation": "nfm",
-            "squelch": {"type": "manual", "dbfs": -40.0},
-            "ctcss_hz": 100.0
+            "squelch": "manual:-40",
+            "ctcss-hz": 100.0
         }))
         .unwrap();
         assert_eq!(c.modulation, Modulation::Nfm);
         assert_eq!(c.squelch, SquelchMode::Manual { dbfs: -40.0 });
+        assert_eq!(c.ctcss_hz, Some(100.0));
+        let back = serde_json::to_value(&c).unwrap();
+        assert_eq!(back["squelch"], "manual:-40");
+        assert!(serde_json::from_value::<ChannelConfig>(serde_json::json!({"squelch": "loud"})).is_err());
     }
 }

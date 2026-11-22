@@ -65,7 +65,34 @@ fn render(live: &LiveState, mode: &str) -> String {
         "xng_samples_total{{mode=\"{mode}\"}} {}\n",
         live.samples.load(Ordering::Relaxed)
     ));
+    render_airband(&mut out);
     out
+}
+
+/// Per-channel airband gauges and counters from the audio hub.
+fn render_airband(out: &mut String) {
+    let h = crate::airband::hub();
+    if !h.active() {
+        return;
+    }
+    let status = h.status();
+    out.push_str("# HELP xng_airband_level_dbfs Channel power.\n# TYPE xng_airband_level_dbfs gauge\n");
+    out.push_str("# TYPE xng_airband_noise_dbfs gauge\n# TYPE xng_airband_squelch_dbfs gauge\n");
+    out.push_str("# TYPE xng_airband_open gauge\n# TYPE xng_airband_afc_hz gauge\n");
+    out.push_str("# TYPE xng_airband_transmissions_total counter\n# TYPE xng_airband_airtime_seconds_total counter\n");
+    for c in h.channels() {
+        let Some(st) = status.iter().find(|s| s.freq_hz == c.freq_hz) else { continue };
+        let label = escape_label(c.label.as_deref().unwrap_or(""));
+        let l = format!("{{freq=\"{}\",label=\"{label}\"}}", c.freq_hz);
+        let g = |v: f32| if v.is_finite() { format!("{v:.1}") } else { "NaN".to_string() };
+        out.push_str(&format!("xng_airband_level_dbfs{l} {}\n", g(st.level_dbfs)));
+        out.push_str(&format!("xng_airband_noise_dbfs{l} {}\n", g(st.noise_dbfs)));
+        out.push_str(&format!("xng_airband_squelch_dbfs{l} {}\n", g(st.squelch_dbfs)));
+        out.push_str(&format!("xng_airband_open{l} {}\n", st.open as u8));
+        out.push_str(&format!("xng_airband_afc_hz{l} {}\n", g(st.afc_hz)));
+        out.push_str(&format!("xng_airband_transmissions_total{l} {}\n", st.transmissions));
+        out.push_str(&format!("xng_airband_airtime_seconds_total{l} {:.2}\n", st.airtime_s));
+    }
 }
 
 /// Escape a label value for the Prometheus text exposition format. The format
