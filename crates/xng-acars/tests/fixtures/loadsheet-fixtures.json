@@ -658,5 +658,26 @@
       "tow": 297997,
       "li_tow": 36.27
     }
+  },
+  {
+    "id": 900000014,
+    "label": "RA",
+    "description": "synthetic: EDNO reference on the header line",
+    "text": "LOADSHEET FINAL 2140 EDNO H040098-KO/02\nTK0053/21 21NOV26\nBKK IST TC-JJA 3/12\nZFW 160708 MAX 175000",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "edition": 2,
+      "time": "2140",
+      "flight_number": "TK0053",
+      "flight_day": 21,
+      "date": "2026-11-21",
+      "departure": "BKK",
+      "arrival": "IST",
+      "registration": "TC-JJA",
+      "crew": "3/12",
+      "zfw": 160708,
+      "zfw_max": 175000
+    }
   }
 ]

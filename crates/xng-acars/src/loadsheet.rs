@@ -449,7 +449,8 @@ fn parse_header(ls: &mut Loadsheet, header: &str, next: &[&str]) {
     }
     let start = HEADER_WORD.find(header).map_or(0, |m| m.start());
     let rest = &header[start..];
-    if let Some(c) = EDITION.captures(rest) {
+    // EDNO 01, or a reference with the edition after the slash.
+    if let Some(c) = EDITION.captures(rest).or_else(|| EDITION_REF.captures(rest)) {
         ls.edition = int(&c[1]);
     }
     let stripped = EDITION.replace(rest, " ");
