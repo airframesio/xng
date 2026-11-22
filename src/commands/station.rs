@@ -123,6 +123,9 @@ pub struct AirframesToml {
     pub vdl2: Option<AirframesModeToml>,
     pub hfdl: Option<AirframesModeToml>,
     pub ais: Option<AirframesModeToml>,
+    /// Inmarsat Aero (both `aero-l` and `aero-c` sessions).
+    pub aero: Option<AirframesModeToml>,
+    pub iridium: Option<AirframesModeToml>,
 }
 
 /// Per-mode override block under `[outputs.airframes.<mode>]`.
@@ -150,6 +153,8 @@ impl AirframesToml {
             Mode::Vdl2 => self.vdl2.as_ref(),
             Mode::Hfdl => self.hfdl.as_ref(),
             Mode::Ais => self.ais.as_ref(),
+            Mode::AeroL | Mode::AeroC => self.aero.as_ref(),
+            Mode::Iridium => self.iridium.as_ref(),
             _ => None,
         }
     }
@@ -436,9 +441,8 @@ pub fn build(
 /// (`[outputs.airframes].station-id` or the top-level `station-id`).
 ///
 /// asf-2.0 carries every mode separately under the canonical ident and is not
-/// represented here. Modes without a public per-port ingest (IMSL/IRDM/STD-C/
-/// Aero-C/ADS-B) and modes whose native serializer isn't implemented yet are
-/// skipped (fed via asf-2.0 only).
+/// represented here. Modes without a per-port ingest (STD-C, ADS-B, UAT, ...)
+/// are skipped (fed via asf-2.0 only).
 pub fn airframes_router(f: &StationFile) -> AirframesRouter {
     // Resolve the effective config, honoring the legacy `feed-airframes` bool
     // (ACARS-only, verbatim id) when no `[outputs.airframes]` block is given.
@@ -468,7 +472,7 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
             continue;
         }
         let Some((dhost, dport, proto)) = default_endpoint(mode) else {
-            // IMSL/IRDM/STD-C/Aero-C/ADS-B: no public per-port ingest.
+            // STD-C/ADS-B/UAT/...: no per-port ingest.
             if mode_cfg.is_some() {
                 tracing::info!(
                     "airframes: {} has no public per-port ingest — fed via asf-2.0 only",

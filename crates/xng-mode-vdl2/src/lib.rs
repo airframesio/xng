@@ -547,13 +547,13 @@ pub fn to_message(f: &Vdl2Frame, frequency_hz: u64, level_dbfs: f32, source: Pro
             // ACARS-over-AVLC: the body is the shared ACARS core, but the AVLC
             // link wrapper (src/dst/control) would otherwise be lost — the
             // dumpvdl2-JSON feed (FEED-2.1) needs it. Carry it on the
-            // `#[serde(skip)]` transient `vdl2_link` field, NOT inside `app`:
+            // `#[serde(skip)]` transient `link` field, NOT inside `app`:
             // `app` is serialized into every public output (JSONL/MQTT/asf-2.0)
             // and is overwritten wholesale by the reassembler on completion, so
             // stashing link data there both leaked internal plumbing and got
             // destroyed on multi-block reassembly.
             let mut core = b.core.clone();
-            core.vdl2_link = Some(serde_json::json!({
+            core.link = Some(serde_json::json!({
                 "src": f.avlc.src, "dst": f.avlc.dst, "control": f.avlc.control,
             }));
             (MessageBody::Acars(core), b.crc_ok, Some(b.parity_errors))

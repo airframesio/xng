@@ -4,13 +4,13 @@
 //!
 //! Field names + shapes are pinned to dumpvdl2 2.6.0 / libacars 2.2.1 output
 //! captured on the vendored off-air fixture (see the golden in tests). The
-//! AVLC link wrapper rides on the `#[serde(skip)]` transient `core.vdl2_link`
+//! AVLC link wrapper rides on the `#[serde(skip)]` transient `core.link`
 //! field (stashed by `xng_mode_vdl2::to_message`), so it never leaks into the
 //! public outputs and survives multi-block reassembly. Non-ACARS AVLC/XID
 //! frames are not yet emitted.
 
 use serde_json::{json, Value};
-use xng_types::{Message, MessageBody};
+use xng_types::{AcarsCore, Message, MessageBody};
 
 /// dumpvdl2 address-type label for an xng `AddressType` (serde snake_case).
 fn addr_type(kind: &str) -> &'static str {
@@ -22,16 +22,18 @@ fn addr_type(kind: &str) -> &'static str {
     }
 }
 
-/// Render a VDL2 message as dumpvdl2 `decoded:json`. Only ACARS-over-AVLC
-/// frames (the Airframes-valuable content) are emitted today; `None` otherwise.
-pub fn format_dumpvdl2(msg: &Message) -> Option<Value> {
+/// Render a VDL2 message as dumpvdl2 `decoded:json`, stamping `station` as
+/// `vdl2.station` (the field the Airframes ingest reads as the station ident;
+/// dumpvdl2 `--station-id`). Only ACARS-over-AVLC frames (the
+/// Airframes-valuable content) are emitted today; `None` otherwise.
+pub fn format_dumpvdl2(msg: &Message, station: Option<&str>) -> Option<Value> {
     let MessageBody::Acars(core) = &msg.body else {
         return None;
     };
     if msg.mode != xng_types::Mode::Vdl2 {
         return None;
     }
-    let link = core.vdl2_link.as_ref()?;
+    let link = core.link.as_ref()?;
     let (src, dst, control) = (link.get("src")?, link.get("dst")?, link.get("control")?);
 
     // AVLC addresses. dumpvdl2 puts the A/G status (from the dst octet-1 bit)
@@ -74,7 +76,52 @@ pub fn format_dumpvdl2(msg: &Message) -> Option<Value> {
         }
     }
 
-    // ACARS inner object — dumpvdl2/libacars field names + conventions.
+    let acars = libacars_object(msg, core);
+    avlc.as_object_mut().unwrap().insert("acars".into(), Value::Object(acars));
+
+    // Envelope. app name/ver are hardcoded to the dumpvdl2 wire identity (not
+    // xng's) so the ingest recognizes the producer. Gap fields dumpvdl2 emits
+    // but xng doesn't track (burst_len_octets / hdr_bits_fixed / idx) are
+    // omitted rather than faked. `sig_level`, `noise_level` and `freq_skew`
+    // are always present: the Airframes ingest's model requires all three and
+    // rejects the whole message when one is missing.
+    let ts = msg.timestamp;
+    let (sig_level, noise_level, freq_skew) = signal_levels(msg);
+    let mut vdl2 = json!({
+        "app": { "name": "dumpvdl2", "ver": "2.6.0" },
+        "t": { "sec": ts.timestamp(), "usec": ts.timestamp_subsec_micros() },
+        "freq": msg.frequency_hz,
+        "octets_corrected_by_fec": msg.decode.fec_corrected.unwrap_or(0),
+        "sig_level": sig_level,
+        "noise_level": noise_level,
+        "freq_skew": freq_skew,
+        "avlc": avlc,
+    });
+    if let Some(st) = station {
+        vdl2["station"] = json!(st);
+    }
+    Some(json!({ "vdl2": vdl2 }))
+}
+
+/// `(sig_level, noise_level, freq_skew)` for the dumpvdl2/dumphfdl
+/// envelopes, rounded to 0.1. The noise floor falls back to signal minus SNR
+/// when only those were measured; a value that was never measured is 0.
+pub(crate) fn signal_levels(msg: &Message) -> (f64, f64, f64) {
+    let r = |v: f32| (v as f64 * 10.0).round() / 10.0;
+    let s = &msg.signal;
+    let sig = s.rssi_db.map(r).unwrap_or(0.0);
+    let noise = s
+        .noise_db
+        .or_else(|| Some(s.rssi_db? - s.snr_db?))
+        .map(r)
+        .unwrap_or(0.0);
+    (sig, noise, s.freq_skew_hz.map(r).unwrap_or(0.0))
+}
+
+/// The libacars `acars` object both dumpvdl2 and dumphfdl `decoded:json`
+/// nest under their link layer: `{err, crc_ok, more, reg, mode, label,
+/// blk_id, ack, flight, msg_num, msg_num_seq, msg_text}`.
+pub(crate) fn libacars_object(msg: &Message, core: &AcarsCore) -> serde_json::Map<String, Value> {
     let reg = core.tail.as_deref().map(|t| {
         // ACARS registration is a 7-char dot-left-padded field; xng strips the
         // leading fill, so reconstruct it (".HB-IJW").
@@ -123,27 +170,7 @@ pub fn format_dumpvdl2(msg: &Message) -> Option<Value> {
     if !core.text.is_empty() {
         acars.insert("msg_text".into(), json!(core.text));
     }
-    avlc.as_object_mut().unwrap().insert("acars".into(), Value::Object(acars));
-
-    // Envelope. app name/ver are hardcoded to the dumpvdl2 wire identity (not
-    // xng's) so the ingest recognizes the producer. Gap fields dumpvdl2 emits
-    // but xng doesn't track (burst_len_octets / hdr_bits_fixed / idx /
-    // noise_level) are omitted rather than faked.
-    let ts = msg.timestamp;
-    let mut vdl2 = json!({
-        "app": { "name": "dumpvdl2", "ver": "2.6.0" },
-        "t": { "sec": ts.timestamp(), "usec": ts.timestamp_subsec_micros() },
-        "freq": msg.frequency_hz,
-        "octets_corrected_by_fec": msg.decode.fec_corrected.unwrap_or(0),
-        "avlc": avlc,
-    });
-    if let Some(l) = msg.signal.rssi_db {
-        vdl2["sig_level"] = json!(l);
-    }
-    if let Some(s) = msg.signal.freq_skew_hz {
-        vdl2["freq_skew"] = json!(s);
-    }
-    Some(json!({ "vdl2": vdl2 }))
+    acars
 }
 
 #[cfg(test)]
@@ -185,7 +212,7 @@ mod tests {
                     f.acars.as_ref().and_then(|b| b.core.tail.as_deref()) == Some("HB-IJW");
                 if is_hbijw && out.is_none() {
                     let msg = xng_mode_vdl2::to_message(&f, 136_975_000, -10.77, prov.clone());
-                    out = format_dumpvdl2(&msg);
+                    out = format_dumpvdl2(&msg, Some("XX-TEST-VDL2"));
                 }
             }
         }
@@ -194,6 +221,12 @@ mod tests {
         assert_eq!(vdl2["app"]["name"], "dumpvdl2");
         assert_eq!(vdl2["app"]["ver"], "2.6.0");
         assert_eq!(vdl2["freq"], 136_975_000);
+        // The Airframes ingest reads `station` as the station ident and
+        // requires the three level fields.
+        assert_eq!(vdl2["station"], "XX-TEST-VDL2");
+        assert!(vdl2["sig_level"].is_number(), "{vdl2}");
+        assert!(vdl2["noise_level"].is_number(), "{vdl2}");
+        assert!(vdl2["freq_skew"].is_number(), "{vdl2}");
         let avlc = &vdl2["avlc"];
         assert_eq!(avlc["src"]["addr"], "0468D2", "{avlc}");
         assert_eq!(avlc["src"]["type"], "Aircraft");

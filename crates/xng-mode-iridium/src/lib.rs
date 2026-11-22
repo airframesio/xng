@@ -560,11 +560,14 @@ pub fn to_message(
     // the HFDL/Aero carriers), so downstream consumers treat it as
     // ACARS traffic.
     let (body, crc_ok, errors) = match &f.acars {
-        Some(b) => (
-            MessageBody::Acars(b.core.clone()),
-            b.crc_ok,
-            Some(b.parity_errors),
-        ),
+        Some(b) => {
+            // Keep the SBD header (MOMSN = mobile originated / MTMSN = mobile
+            // terminated, IMEI, ...) on the transient link field for the
+            // iridium-toolkit JSON feed (outputs::iridium_toolkit_json).
+            let mut core = b.core.clone();
+            core.link = Some(f.details.clone());
+            (MessageBody::Acars(core), b.crc_ok, Some(b.parity_errors))
+        }
         None => (
             MessageBody::Iridium { kind: f.kind.to_string(), details: f.details.clone() },
             true,

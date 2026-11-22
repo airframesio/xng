@@ -531,6 +531,7 @@ impl PduParser {
                         "freq_change_code": freq_change_code,
                         "freq_change_cause": freq_change_cause(freq_change_code),
                         "who": who,
+                        "bps": bps,
                 });
                 // HFDL-4: normalized aircraft-position object for the map/
                 // serial layer (only when a real fix is present).
