@@ -119,15 +119,22 @@ pub struct AirbandOpts {
     #[arg(long, default_value_t = 24_000)]
     pub atc_bitrate: u32,
 
-    /// Transcribe transmissions with Whisper (local model base.en unless
-    /// --whisper-model or --whisper-url says otherwise). Transcripts go to
-    /// the JSON outputs, the dashboard, recordings and the ATC feed
+    /// Transcribe transmissions (local Whisper base.en unless
+    /// --transcribe-model or --whisper-url says otherwise). Transcripts go
+    /// to the JSON outputs, the dashboard, recordings and the ATC feed
     #[arg(long)]
     pub transcribe: bool,
-    /// Local Whisper model: a ggml file or a name (tiny.en, base.en,
-    /// small.en, large-v3-turbo, ...) downloaded once. Implies --transcribe
+    /// Speech model, downloaded once: Whisper (tiny.en, base.en, small.en,
+    /// large-v3-turbo, ... or a ggml file) or sherpa-onnx (moonshine-tiny,
+    /// moonshine-base, parakeet-110m, parakeet-tdt-0.6b-v2, sense-voice, or
+    /// a model directory). Implies --transcribe
+    #[arg(long, alias = "whisper-model")]
+    pub transcribe_model: Option<String>,
+    /// Speech engine: whisper.cpp or sherpa-onnx (default: from the model).
+    /// With --whisper-url, the server's engine as reported to Airframes ATC
+    /// (e.g. faster-whisper)
     #[arg(long)]
-    pub whisper_model: Option<String>,
+    pub transcribe_engine: Option<String>,
     /// Use a Whisper HTTP server instead of a local model (OpenAI-compatible
     /// /v1/audio/transcriptions, or whisper.cpp server's /inference; key in
     /// XNG_WHISPER_API_KEY). Implies --transcribe
@@ -235,9 +242,10 @@ impl AirbandOpts {
             bitrate: self.atc_bitrate,
             ..Default::default()
         });
-        let transcribe = (self.transcribe || self.whisper_model.is_some() || self.whisper_url.is_some()).then(|| {
+        let transcribe = (self.transcribe || self.transcribe_model.is_some() || self.whisper_url.is_some()).then(|| {
             TranscribeSettings {
-                model: self.whisper_model.clone(),
+                engine: self.transcribe_engine.clone(),
+                model: self.transcribe_model.clone(),
                 url: self.whisper_url.clone(),
                 language: self.whisper_language.clone(),
                 prompt: self.whisper_prompt.clone(),

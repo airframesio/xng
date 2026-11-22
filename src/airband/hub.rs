@@ -135,6 +135,10 @@ pub struct Transcript {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,
     pub text: String,
+    /// Implementation that made it (`whisper.cpp`, `sherpa-onnx`, ...).
+    pub engine: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
     pub model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,

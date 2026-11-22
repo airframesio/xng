@@ -9,12 +9,15 @@
 //! the message bus as an airband `transcript` message (console, JSONL, MQTT,
 //! ...).
 //!
-//! Engines: a local whisper.cpp model (`whisper` build feature), or any
+//! Engines: a local whisper.cpp model (`whisper` build feature), a
+//! sherpa-onnx model such as Moonshine or Parakeet (`sherpa` build feature,
+//! much less CPU than Whisper; see [`super::sherpa`]), or any
 //! Whisper HTTP server that takes a WAV upload: the OpenAI-compatible
 //! `/v1/audio/transcriptions` (OpenAI, faster-whisper servers, LocalAI,
 //! whisper.cpp `server --inference-path`), or whisper.cpp's own `/inference`.
 
 use super::config::{parse_streams, selected, TranscribeSettings};
+use super::sherpa as sherpa_models;
 use super::hub::{hub, AudioEvent, ChannelMeta, StreamId, Transcript, AUDIO_RATE};
 use crate::bus::WeakBus;
 use chrono::{DateTime, Utc};
@@ -34,13 +37,13 @@ wind 290 at 12. Climb and maintain flight level 350. Contact NorCal Approach 135
 /// Longest text kept from one transmission (the ATC protocol's limit).
 const MAX_TEXT: usize = 2_000;
 
-/// What this run's transcription announces (model, language), for the ATC
-/// feed's OPEN. Set when transcription starts.
+/// What this run's transcription announces (engine, model, language), for
+/// the ATC feed's OPEN. Set when transcription starts.
 static ANNOUNCE: OnceLock<Mutex<Option<Announce>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct Announce {
-    pub model: String,
+    pub engine: EngineInfo,
     pub language: Option<String>,
     streams: Vec<StreamId>,
 }
@@ -87,10 +90,24 @@ pub struct Segment {
     pub prob: Option<f32>,
 }
 
+/// Which implementation and model make the transcripts. Sent to Airframes
+/// ATC with each feed (OPEN) and kept on every transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EngineInfo {
+    /// Short lowercase id of the implementation: `whisper.cpp`,
+    /// `sherpa-onnx`, or for a server whatever it runs (`openai-api` unless
+    /// configured, e.g. `faster-whisper`).
+    pub engine: String,
+    pub version: Option<String>,
+    /// The model as the engine knows it: `base.en`, `moonshine-base`,
+    /// `parakeet-tdt-0.6b-v2`, a file name, or the server's model name.
+    pub model: String,
+}
+
 /// A speech-to-text engine. Runs on the worker thread, one clip at a time.
 pub trait Engine: Send {
-    /// Model name reported with each transcript.
-    fn model(&self) -> String;
+    /// Engine and model reported with each transcript.
+    fn info(&self) -> EngineInfo;
     fn transcribe(&mut self, samples: &[f32], prompt: &str) -> anyhow::Result<Vec<Segment>>;
 }
 
@@ -387,9 +404,8 @@ pub async fn run(
     // Provenance of each channel's latest transmission message, for the
     // transcript messages (same station/SDR/channel).
     let prov: Arc<Mutex<HashMap<u64, Provenance>>> = Default::default();
-    let label = engine_label(&s);
     set_announce(Some(Announce {
-        model: label.clone(),
+        engine: planned(&s),
         language: (s.language != "auto").then(|| s.language.clone()),
         streams,
     }));
@@ -449,19 +465,82 @@ pub async fn run(
     Ok(())
 }
 
-/// Model name before the engine loads (for the ATC OPEN).
-fn engine_label(s: &TranscribeSettings) -> String {
-    match (&s.url, &s.model) {
-        (Some(_), Some(m)) => m.clone(),
-        (Some(_), None) => "whisper".into(),
-        (None, m) => {
-            let m = m.clone().unwrap_or_else(|| DEFAULT_LOCAL_MODEL.into());
-            // "base.en", or a file such as /models/ggml-small.en-q5_1.bin.
-            let file = m.rsplit(['/', '\\']).next().unwrap_or(&m);
-            let file = file.strip_suffix(".bin").unwrap_or(file);
-            let name = file.strip_prefix("ggml-").unwrap_or(file);
-            format!("whisper-{name}")
-        }
+/// Which engine and model a configuration will use, before it loads (for
+/// the ATC OPEN, which goes out before a model download finishes).
+pub fn planned(s: &TranscribeSettings) -> EngineInfo {
+    match kind(s) {
+        Kind::Http => EngineInfo {
+            engine: s.engine.clone().unwrap_or_else(|| HTTP_ENGINE.into()),
+            version: None,
+            model: s.model.clone().unwrap_or_else(|| HTTP_MODEL.into()),
+        },
+        Kind::Whisper => EngineInfo {
+            engine: WHISPER_ENGINE.into(),
+            version: whisper_version(),
+            model: model_label(s.model.as_deref().unwrap_or(DEFAULT_LOCAL_MODEL), "ggml-"),
+        },
+        Kind::Sherpa => EngineInfo {
+            engine: SHERPA_ENGINE.into(),
+            version: sherpa_version(),
+            model: model_label(s.model.as_deref().unwrap_or(sherpa_models::DEFAULT), "sherpa-onnx-"),
+        },
+    }
+}
+
+/// A model's name for reports: `base.en` as given, or a file or directory
+/// such as `/models/ggml-small.en-q5_1.bin` as `small.en-q5_1`.
+fn model_label(m: &str, prefix: &str) -> String {
+    let file = m.trim_end_matches(['/', '\\']);
+    let file = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let file = file.strip_suffix(".bin").unwrap_or(file);
+    file.strip_prefix(prefix).unwrap_or(file).to_string()
+}
+
+pub const WHISPER_ENGINE: &str = "whisper.cpp";
+pub const SHERPA_ENGINE: &str = "sherpa-onnx";
+/// What a Whisper server reports as unless `engine` names it.
+pub const HTTP_ENGINE: &str = "openai-api";
+const HTTP_MODEL: &str = "whisper-1";
+
+fn whisper_version() -> Option<String> {
+    #[cfg(feature = "whisper")]
+    {
+        Some(whisper_rs::get_whisper_version().to_string())
+    }
+    #[cfg(not(feature = "whisper"))]
+    None
+}
+
+fn sherpa_version() -> Option<String> {
+    #[cfg(feature = "sherpa")]
+    {
+        Some(sherpa_onnx::version().to_string())
+    }
+    #[cfg(not(feature = "sherpa"))]
+    None
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Http,
+    Whisper,
+    Sherpa,
+}
+
+/// Which engine runs: a server when `url` is set; else `engine` if given;
+/// else a sherpa-onnx model name or directory picks sherpa-onnx, anything
+/// else is whisper.cpp.
+pub fn kind(s: &TranscribeSettings) -> Kind {
+    if s.url.is_some() {
+        return Kind::Http;
+    }
+    match s.engine.as_deref() {
+        Some(WHISPER_ENGINE | "whisper") => Kind::Whisper,
+        Some(SHERPA_ENGINE | "sherpa") => Kind::Sherpa,
+        _ => match s.model.as_deref() {
+            Some(m) if sherpa_models::find(m).is_some() || std::path::Path::new(m).is_dir() => Kind::Sherpa,
+            _ => Kind::Whisper,
+        },
     }
 }
 
@@ -479,8 +558,18 @@ fn worker(queue: Arc<Queue>, prov: Arc<Mutex<HashMap<u64, Provenance>>>, bus: We
             return;
         }
     };
-    let model = engine.model();
-    tracing::info!("airband transcription with {model}");
+    let info = engine.info();
+    tracing::info!(
+        "airband transcription with {} {}{}",
+        info.engine,
+        info.model,
+        info.version.as_deref().map(|v| format!(" ({v})")).unwrap_or_default()
+    );
+    // The engine's own report wins over the guess made before it loaded.
+    if let Some(mut a) = announced() {
+        a.engine = info.clone();
+        set_announce(Some(a));
+    }
     let base_prompt = s.prompt.clone().unwrap_or_else(|| DEFAULT_PROMPT.to_string());
     let mut failures = 0u32;
     while let Some(clip) = queue.pop() {
@@ -522,7 +611,9 @@ fn worker(queue: Arc<Queue>, prov: Arc<Mutex<HashMap<u64, Provenance>>>, bus: We
             start: clip.start,
             end: clip.end(),
             text,
-            model: model.clone(),
+            engine: info.engine.clone(),
+            engine_version: info.version.clone(),
+            model: info.model.clone(),
             language: (s.language != "auto").then(|| s.language.clone()),
             confidence,
         });
@@ -541,8 +632,12 @@ pub fn to_message(t: &Transcript, source: Provenance) -> Message {
         "start": t.start.to_rfc3339(),
         "end": t.end.to_rfc3339(),
         "text": t.text,
+        "engine": t.engine,
         "model": t.model,
     });
+    if let Some(v) = &t.engine_version {
+        details["engine_version"] = serde_json::json!(v);
+    }
     if let Some(l) = &t.language {
         details["language"] = serde_json::json!(l);
     }
@@ -565,15 +660,19 @@ pub fn to_message(t: &Transcript, source: Provenance) -> Message {
 }
 
 fn make_engine(s: &TranscribeSettings) -> anyhow::Result<Box<dyn Engine>> {
-    if let Some(url) = &s.url {
-        return Ok(Box::new(HttpEngine::new(url, s)?));
+    match kind(s) {
+        Kind::Http => Ok(Box::new(HttpEngine::new(s.url.as_deref().unwrap_or_default(), s)?)),
+        #[cfg(feature = "whisper")]
+        Kind::Whisper => Ok(Box::new(local::LocalEngine::new(s)?)),
+        #[cfg(not(feature = "whisper"))]
+        Kind::Whisper => {
+            anyhow::bail!("xng was built without the `whisper` feature; use --whisper-url with a Whisper server")
+        }
+        #[cfg(feature = "sherpa")]
+        Kind::Sherpa => Ok(Box::new(sherpa_models::SherpaEngine::new(s)?)),
+        #[cfg(not(feature = "sherpa"))]
+        Kind::Sherpa => anyhow::bail!("xng was built without the `sherpa` feature (sherpa-onnx models)"),
     }
-    #[cfg(feature = "whisper")]
-    {
-        Ok(Box::new(local::LocalEngine::new(s)?))
-    }
-    #[cfg(not(feature = "whisper"))]
-    anyhow::bail!("xng was built without the `whisper` feature; use --whisper-url with a Whisper server")
 }
 
 // ---- HTTP engine ----
@@ -581,6 +680,7 @@ fn make_engine(s: &TranscribeSettings) -> anyhow::Result<Box<dyn Engine>> {
 /// Whisper over HTTP: a multipart WAV upload.
 pub struct HttpEngine {
     url: String,
+    info: EngineInfo,
     model: String,
     language: Option<String>,
     key: Option<String>,
@@ -591,7 +691,8 @@ impl HttpEngine {
     pub fn new(url: &str, s: &TranscribeSettings) -> anyhow::Result<Self> {
         Ok(Self {
             url: endpoint(url),
-            model: s.model.clone().unwrap_or_else(|| "whisper-1".into()),
+            info: planned(s),
+            model: s.model.clone().unwrap_or_else(|| HTTP_MODEL.into()),
             language: (s.language != "auto").then(|| s.language.clone()),
             key: s.api_key.clone().or_else(|| std::env::var("XNG_WHISPER_API_KEY").ok()).filter(|k| !k.is_empty()),
             agent: ureq::AgentBuilder::new()
@@ -613,8 +714,8 @@ pub fn endpoint(url: &str) -> String {
 }
 
 impl Engine for HttpEngine {
-    fn model(&self) -> String {
-        self.model.clone()
+    fn info(&self) -> EngineInfo {
+        self.info.clone()
     }
 
     fn transcribe(&mut self, samples: &[f32], prompt: &str) -> anyhow::Result<Vec<Segment>> {
@@ -728,7 +829,7 @@ mod local {
         // it; keep both.
         _ctx: WhisperContext,
         state: WhisperState,
-        name: String,
+        info: super::EngineInfo,
         language: Option<String>,
         threads: i32,
     }
@@ -754,7 +855,7 @@ mod local {
             Ok(Self {
                 _ctx: ctx,
                 state,
-                name: super::engine_label(s),
+                info: super::planned(s),
                 language: (s.language != "auto").then(|| s.language.clone()),
                 threads,
             })
@@ -762,8 +863,8 @@ mod local {
     }
 
     impl Engine for LocalEngine {
-        fn model(&self) -> String {
-            self.name.clone()
+        fn info(&self) -> super::EngineInfo {
+            self.info.clone()
         }
 
         fn transcribe(&mut self, samples: &[f32], prompt: &str) -> anyhow::Result<Vec<Segment>> {
@@ -1067,11 +1168,17 @@ mod tests {
     fn model_names() {
         assert!(model_path("../../etc/passwd").is_err());
         assert!(model_path("huge.en").is_err());
-        assert_eq!(engine_label(&TranscribeSettings::default()), "whisper-base.en");
-        assert_eq!(
-            engine_label(&TranscribeSettings { model: Some("/m/ggml-small.en-q5_1.bin".into()), ..Default::default() }),
-            "whisper-small.en-q5_1"
-        );
+        let p = planned(&TranscribeSettings::default());
+        assert_eq!((p.engine.as_str(), p.model.as_str()), ("whisper.cpp", "base.en"));
+        let p = planned(&TranscribeSettings { model: Some("/m/ggml-small.en-q5_1.bin".into()), ..Default::default() });
+        assert_eq!(p.model, "small.en-q5_1");
+        let p = planned(&TranscribeSettings { model: Some("moonshine-base".into()), ..Default::default() });
+        assert_eq!((p.engine.as_str(), p.model.as_str()), ("sherpa-onnx", "moonshine-base"));
+        let http = TranscribeSettings { url: Some("http://h:8000".into()), ..Default::default() };
+        let p = planned(&http);
+        assert_eq!((p.engine.as_str(), p.model.as_str(), p.version), ("openai-api", "whisper-1", None));
+        let p = planned(&TranscribeSettings { engine: Some("faster-whisper".into()), model: Some("jacktol/atc".into()), ..http });
+        assert_eq!((p.engine.as_str(), p.model.as_str()), ("faster-whisper", "jacktol/atc"));
     }
 
     /// The HTTP engine against a stand-in server.

@@ -309,7 +309,7 @@ impl Recorder {
             let path = self.hour_path(&t.chan, t.stream, top_of_hour(t.start)).with_extension("transcripts.jsonl");
             let line = serde_json::json!({
                 "tx": t.tx, "start": t.start.to_rfc3339(), "end": t.end.to_rfc3339(),
-                "text": t.text, "model": t.model, "confidence": t.confidence,
+                "text": t.text, "engine": t.engine, "model": t.model, "confidence": t.confidence,
             });
             let r = fs::OpenOptions::new()
                 .create(true)
@@ -331,6 +331,7 @@ impl Recorder {
                 _ => t.text.clone(),
             };
             meta["transcript"] = serde_json::json!(joined);
+            meta["transcript_engine"] = serde_json::json!(t.engine);
             meta["transcript_model"] = serde_json::json!(t.model);
             if let Err(e) = fs::write(p, format!("{meta:#}\n")) {
                 tracing::warn!("airband transcript {}: {e}", p.display());
@@ -636,7 +637,9 @@ mod tests {
                 start: t0,
                 end: t0,
                 text: text.into(),
-                model: "whisper-base.en".into(),
+                engine: "whisper.cpp".into(),
+            engine_version: Some("1.8.2".into()),
+            model: "base.en".into(),
                 language: None,
                 confidence: None,
             })))
@@ -645,7 +648,8 @@ mod tests {
         let side: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(wav.with_extension("json")).unwrap()).unwrap();
         assert_eq!(side["transcript"], "United 12 cleared to land runway 28 right");
-        assert_eq!(side["transcript_model"], "whisper-base.en");
+        assert_eq!(side["transcript_model"], "base.en");
+        assert_eq!(side["transcript_engine"], "whisper.cpp");
         let _ = fs::remove_dir_all(&dir);
     }
 

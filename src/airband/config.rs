@@ -299,8 +299,16 @@ impl Default for AtcFeedSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
 pub struct TranscribeSettings {
-    /// Local: a ggml model file, or a model name (`tiny.en`, `base.en`,
-    /// `small.en`, `large-v3-turbo`, ...) fetched once into the cache.
+    /// Speech engine. Local: `whisper.cpp` or `sherpa-onnx` (default: picked
+    /// from `model`, whisper.cpp when it does not say). With `url`: what the
+    /// server runs, reported to Airframes ATC (`faster-whisper`, ...;
+    /// default `openai-api`).
+    pub engine: Option<String>,
+    /// Local: a model name fetched once into the cache, or a model file or
+    /// directory. whisper.cpp: `tiny.en`, `base.en`, `small.en`,
+    /// `large-v3-turbo`, ... or a ggml file. sherpa-onnx: `moonshine-tiny`,
+    /// `moonshine-base`, `parakeet-110m`, `parakeet-tdt-0.6b-v2`,
+    /// `sense-voice`, ... or an exported model directory.
     /// With `url`: the model name sent to the server (default `whisper-1`).
     pub model: Option<String>,
     /// Whisper HTTP server. A bare `http://host:port` gets
@@ -331,6 +339,7 @@ pub struct TranscribeSettings {
 impl Default for TranscribeSettings {
     fn default() -> Self {
         Self {
+            engine: None,
             model: None,
             url: None,
             api_key: None,
@@ -359,9 +368,30 @@ impl TranscribeSettings {
                 "Whisper URL must start with http:// or https://"
             );
         } else {
+            use super::transcribe::{kind, Kind};
             anyhow::ensure!(
-                cfg!(feature = "whisper"),
-                "local transcription needs xng built with the `whisper` feature; or point --whisper-url at a Whisper server"
+                matches!(self.engine.as_deref(), None | Some("whisper.cpp" | "whisper" | "sherpa-onnx" | "sherpa")),
+                "local transcription engine must be whisper.cpp or sherpa-onnx (got {:?})",
+                self.engine.as_deref().unwrap_or_default()
+            );
+            match kind(self) {
+                Kind::Sherpa => anyhow::ensure!(
+                    cfg!(feature = "sherpa"),
+                    "sherpa-onnx models need xng built with the `sherpa` feature; or point --whisper-url at a Whisper server"
+                ),
+                _ => anyhow::ensure!(
+                    cfg!(feature = "whisper"),
+                    "local Whisper needs xng built with the `whisper` feature (or `sherpa` for Moonshine/Parakeet); \
+                     or point --whisper-url at a Whisper server"
+                ),
+            }
+        }
+        if let Some(e) = &self.engine {
+            anyhow::ensure!(
+                !e.is_empty()
+                    && e.len() <= 32
+                    && e.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)),
+                "transcription engine {e:?} must be a short lowercase id like faster-whisper"
             );
         }
         anyhow::ensure!(
