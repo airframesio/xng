@@ -23,7 +23,7 @@ AIS-catcher) while finding Mode S frames they miss — see the
 [benchmarks](#benchmarks) below; every count-gated number is enforced
 by a [CI regression gate](bench/) on each pull request.
 
-Releases ship binaries for Linux (x86_64/arm64, tarball + .deb), macOS
+Releases ship binaries for Linux (x86_64/arm64/armhf, tarball + .deb), macOS
 Apple Silicon, and multi-arch Docker images.
 
 ```bash
@@ -157,13 +157,15 @@ runs real-time on Pi-class hardware via `--demod-effort`.
 ## Installing
 
 Grab a [release](https://github.com/airframesio/xng/releases/latest) —
-tarballs for Linux x86_64/arm64 and macOS Apple Silicon, `.deb` packages
-for Debian/Ubuntu (which declare the runtime libraries), and `SHA256SUMS`.
-The binaries need `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf`
-for native Airspy):
+tarballs for Linux x86_64/arm64/armhf and macOS Apple Silicon, `.deb`
+packages for Debian/Ubuntu/Raspberry Pi OS (which declare the runtime
+libraries), and `SHA256SUMS`. The Linux builds run on Ubuntu 22.04+, Debian
+12+ and Pi OS Bookworm; armhf is for 32-bit Pi OS on a Pi 2 or newer (no
+local speech-to-text there: use `--whisper-url`). The binaries need
+`libsoapysdr` at runtime (plus `libairspy`/`libairspyhf` for native Airspy):
 
 ```bash
-sudo apt install ./xng-0.23.1-arm64.deb    # pulls runtime deps
+sudo apt install ./xng-0.23.1-arm64.deb    # pulls runtime deps (armhf: -armhf.deb)
 # or
 tar xzf xng-v0.23.1-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng /usr/local/bin/
 ```
