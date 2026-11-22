@@ -15,6 +15,7 @@ pub mod cpdlc;
 pub mod block;
 pub mod cfb;
 pub mod fpn;
+pub mod loadsheet;
 pub mod media_adv;
 pub mod met;
 pub mod miam;
@@ -72,6 +73,9 @@ pub enum AcarsApp {
     /// Military (AMC-style) ARINC 702 report: `<KIND>/ID<tail>,<callsign>,
     /// <mission>/…` on H1 (`MD` sublabel) and many other labels.
     Military(Box<military::MilitaryReport>),
+    /// Weight and balance loadsheet (IATA AHM 517 and airline layouts), its
+    /// acceptance by the crew, or a request for one; on any label.
+    Loadsheet(Box<loadsheet::Loadsheet>),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -130,6 +134,11 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
             .map(AcarsApp::QSeries)
             .or_else(|| military::parse(text).map(|m| AcarsApp::Military(Box::new(m)))),
     };
+    // Loadsheets travel on many labels (RA, C1, 2A, 10, 3L, 22, ...); try
+    // them on any label whose text mentions one and nothing else decoded.
+    if out.app.is_none() && loadsheet::may_be_loadsheet(text) {
+        out.app = loadsheet::parse(text).map(|l| AcarsApp::Loadsheet(Box::new(l)));
+    }
 
     // OOOI fields can be embedded in many labels' text (Q-series and several
     // airline-application labels); run the extractor on the original text.
@@ -174,6 +183,7 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
             }
         }),
         AcarsApp::Military(m) => Some(m.summary()),
+        AcarsApp::Loadsheet(l) => Some(l.summary()),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(
                 "MIAM v{} {}{}{}",
