@@ -17,9 +17,32 @@ fixtures and fails if any count drops below its baseline
 
 ```bash
 cargo build --release
-gh release download bench-fixtures-v1 -p ais_96k.cs16 -p vdl2_105k_conj.s16 -p hfdl_48k.cs16 -p adsb_quiet_24m.cu8 -p acars_100k.cs16 -p vdl2_opflasher_105k.cs16 -p sonde_96k.cf32 -p navtex_62500.cs16 -D bench/data/
+bench/fetch-fixtures.sh      # release assets, checked against bench/fixtures.sha256
 bench/run.sh
 ```
+
+### The saved corpus (airframesio/xng-corpus)
+
+Every capture above, plus the vendored `tests/data` fixtures, is kept in
+the private Git LFS repo **airframesio/xng-corpus** under `iq/<mode>/`,
+each folder with a `manifest.jsonl` (format, rate, center, channels,
+checksum, gate) and a `SOURCES.md` (origin, license, attribution). That
+repo is the durable copy and the place to add new captures, including
+modes that have none yet (UAT, APRS, DSC, POCSAG, FLEX, EOT, ATCS, ADS-L,
+VDES, time, airband).
+
+To run the bench from a local clone of it instead of the release assets:
+
+```bash
+git clone https://github.com/airframesio/xng-corpus ../xng-corpus   # needs git-lfs and access
+XNG_CORPUS=../xng-corpus bench/fetch-fixtures.sh
+bench/run.sh
+```
+
+CI keeps fetching the public release assets so it spends none of the
+corpus repo's LFS bandwidth. When a fixture changes, update the release
+asset, the corpus file and its manifest, and `bench/fixtures.sha256`
+together.
 
 `cpu.sh` measures decode speed (×-realtime) per mode on the same
 fixtures. Aero, STD-C, and Iridium are fenced separately: their
