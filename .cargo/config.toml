@@ -4,3 +4,6 @@
 # no system package is needed.
 OPUS_STATIC = "1"
 OPUS_NO_PKG = "1"
+# The bundled Opus source declares cmake_minimum_required < 3.5, which
+# CMake 4 refuses without this (harmless on CMake 3).
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
