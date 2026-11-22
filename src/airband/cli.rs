@@ -123,9 +123,8 @@ pub fn parse_squelch(s: &str) -> anyhow::Result<SquelchMode> {
 fn freq_map(v: &[String], what: &str) -> anyhow::Result<Vec<(u64, String)>> {
     v.iter()
         .map(|kv| {
-            let (f, val) = kv
-                .split_once('=')
-                .ok_or_else(|| anyhow::anyhow!("{what} entry {kv:?} must be FREQ=VALUE"))?;
+            let (f, val) =
+                kv.split_once('=').ok_or_else(|| anyhow::anyhow!("{what} entry {kv:?} must be FREQ=VALUE"))?;
             Ok((crate::freq::parse_hz(f)?, val.trim().to_string()))
         })
         .collect()
@@ -181,12 +180,13 @@ impl AirbandOpts {
 
     /// Output settings these flags describe.
     pub fn outputs(&self) -> anyhow::Result<AirbandOutputs> {
-        let scan = (self.scan || !self.scan_priority.is_empty() || !self.scan_lockout.is_empty()).then(|| ScanSettings {
-            priority: self.scan_priority.clone(),
-            hold_ms: self.scan_hold_ms,
-            preempt: true,
-            lockout: self.scan_lockout.clone(),
-        });
+        let scan =
+            (self.scan || !self.scan_priority.is_empty() || !self.scan_lockout.is_empty()).then(|| ScanSettings {
+                priority: self.scan_priority.clone(),
+                hold_ms: self.scan_hold_ms,
+                preempt: true,
+                lockout: self.scan_lockout.clone(),
+            });
         if let Some(s) = &scan {
             s.to_scan_config()?;
         }

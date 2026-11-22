@@ -9,10 +9,7 @@ use tokio::sync::broadcast::error::RecvError;
 use xng_mode_airband::scan::{ScanConfig, ScanController};
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// Install the scanner (before outputs that pick the scan stream start).

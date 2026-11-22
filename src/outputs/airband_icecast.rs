@@ -36,9 +36,8 @@ pub struct IcecastTarget {
 }
 
 pub fn parse_url(s: &str) -> anyhow::Result<IcecastTarget> {
-    let rest = s
-        .strip_prefix("icecast://")
-        .ok_or_else(|| anyhow::anyhow!("icecast URL must start with icecast:// ({s})"))?;
+    let rest =
+        s.strip_prefix("icecast://").ok_or_else(|| anyhow::anyhow!("icecast URL must start with icecast:// ({s})"))?;
     let (auth, rest) = match rest.rsplit_once('@') {
         Some((a, r)) => (Some(a), r),
         None => (None, rest),
@@ -99,7 +98,11 @@ async fn connect(t: &IcecastTarget, title: &str) -> anyhow::Result<TcpStream> {
     let n = tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await??;
     let resp = String::from_utf8_lossy(&buf[..n]);
     let status = resp.split_whitespace().nth(1).unwrap_or("");
-    anyhow::ensure!(status == "100" || status == "200", "icecast refused the source: {}", resp.lines().next().unwrap_or(""));
+    anyhow::ensure!(
+        status == "100" || status == "200",
+        "icecast refused the source: {}",
+        resp.lines().next().unwrap_or("")
+    );
     Ok(sock)
 }
 
@@ -186,7 +189,8 @@ mod tests {
 
     #[test]
     fn parses_urls() {
-        let t = parse_url("icecast://source:hackme@radio.local:8000/airband?stream=scan&bitrate=24000&name=KSFO+Scan").unwrap();
+        let t = parse_url("icecast://source:hackme@radio.local:8000/airband?stream=scan&bitrate=24000&name=KSFO+Scan")
+            .unwrap();
         assert_eq!(t.host, "radio.local");
         assert_eq!(t.port, 8000);
         assert_eq!(t.mount, "/airband");

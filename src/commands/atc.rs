@@ -54,11 +54,7 @@ pub fn run(cmd: AtcCommand) -> anyhow::Result<()> {
                     atc_auth::device_wait(&path, &api, &dc)?
                 }
             };
-            println!(
-                "Signed in as {}. Saved to {}.",
-                c.username.as_deref().unwrap_or("your account"),
-                path.display()
-            );
+            println!("Signed in as {}. Saved to {}.", c.username.as_deref().unwrap_or("your account"), path.display());
             println!("Start feeding with --atc-feed (CLI) or [outputs.airband.atc] (station file).");
             Ok(())
         }

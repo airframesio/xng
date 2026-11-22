@@ -120,9 +120,8 @@ mod tests {
     #[test]
     fn encodes_and_decodes_a_tone() {
         let mut enc = OpusEncoder::new(24_000).unwrap();
-        let tone: Vec<f32> = (0..16_000)
-            .map(|i| 0.5 * (std::f32::consts::TAU * 1_000.0 * i as f32 / 16_000.0).sin())
-            .collect();
+        let tone: Vec<f32> =
+            (0..16_000).map(|i| 0.5 * (std::f32::consts::TAU * 1_000.0 * i as f32 / 16_000.0).sin()).collect();
         let packets = enc.push(&tone);
         assert_eq!(packets.len(), 50);
         let mut dec = opus::Decoder::new(16_000, opus::Channels::Mono).unwrap();

@@ -47,18 +47,26 @@ fn channel_dir(chan: &ChannelMeta, stream: StreamId) -> String {
 }
 
 fn sanitize(s: &str) -> String {
-    let t: String = s
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
-        .collect();
+    let t: String =
+        s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect();
     t.trim_matches('_').chars().take(48).collect()
 }
 
 /// One file being written.
 enum Writer {
-    Wav { file: File, path: PathBuf, samples: u64, since_header: u64 },
+    Wav {
+        file: File,
+        path: PathBuf,
+        samples: u64,
+        since_header: u64,
+    },
     #[cfg(feature = "opus")]
-    Ogg { file: File, path: PathBuf, samples: u64, stream: crate::airband::opus_enc::OggOpus },
+    Ogg {
+        file: File,
+        path: PathBuf,
+        samples: u64,
+        stream: crate::airband::opus_enc::OggOpus,
+    },
 }
 
 impl Writer {
@@ -75,8 +83,8 @@ impl Writer {
             #[cfg(feature = "opus")]
             RecordFormat::Ogg => {
                 let serial = rand_serial(&path);
-                let (stream, head) = crate::airband::opus_enc::OggOpus::new(24_000, serial, title)
-                    .map_err(std::io::Error::other)?;
+                let (stream, head) =
+                    crate::airband::opus_enc::OggOpus::new(24_000, serial, title).map_err(std::io::Error::other)?;
                 file.write_all(&head)?;
                 Ok(Writer::Ogg { file, path, samples: 0, stream })
             }
@@ -121,6 +129,7 @@ impl Writer {
     }
 
     /// Rewrite the WAV sizes so the file is valid as written so far.
+    #[allow(irrefutable_let_patterns)] // only WAV exists without `opus`
     fn refresh_header(&mut self) -> std::io::Result<()> {
         if let Writer::Wav { file, samples, since_header, .. } = self {
             let pos = file.stream_position()?;
@@ -203,18 +212,20 @@ impl Recorder {
     fn split_path(&self, chan: &ChannelMeta, stream: StreamId, start: DateTime<Utc>, part: u32) -> PathBuf {
         let mhz = if chan.freq_hz > 0 { format!("{:.3}", chan.freq_hz as f64 / 1e6) } else { stream.to_string() };
         let suffix = if part > 0 { format!("_part{part}") } else { String::new() };
-        self.dir
-            .join(channel_dir(chan, stream))
-            .join(start.format("%Y-%m-%d").to_string())
-            .join(format!("{}_{mhz}{suffix}.{}", start.format("%H%M%S"), ext(self.format)))
+        self.dir.join(channel_dir(chan, stream)).join(start.format("%Y-%m-%d").to_string()).join(format!(
+            "{}_{mhz}{suffix}.{}",
+            start.format("%H%M%S"),
+            ext(self.format)
+        ))
     }
 
     fn hour_path(&self, chan: &ChannelMeta, stream: StreamId, hour: DateTime<Utc>) -> PathBuf {
         let mhz = if chan.freq_hz > 0 { format!("{:.3}", chan.freq_hz as f64 / 1e6) } else { stream.to_string() };
-        self.dir
-            .join(channel_dir(chan, stream))
-            .join(hour.format("%Y-%m-%d").to_string())
-            .join(format!("{}0000_{mhz}.{}", hour.format("%H"), ext(self.format)))
+        self.dir.join(channel_dir(chan, stream)).join(hour.format("%Y-%m-%d").to_string()).join(format!(
+            "{}0000_{mhz}.{}",
+            hour.format("%H"),
+            ext(self.format)
+        ))
     }
 
     pub fn handle(&mut self, ev: &AudioEvent) -> std::io::Result<()> {
@@ -289,12 +300,8 @@ impl Recorder {
 
     fn handle_continuous(&mut self, ev: &AudioEvent) -> std::io::Result<()> {
         let AudioEvent::Audio(f) = ev else { return Ok(()) };
-        let hour = f
-            .at
-            .with_minute(0)
-            .and_then(|t| t.with_second(0))
-            .and_then(|t| t.with_nanosecond(0))
-            .unwrap_or(f.at);
+        let hour =
+            f.at.with_minute(0).and_then(|t| t.with_second(0)).and_then(|t| t.with_nanosecond(0)).unwrap_or(f.at);
         let rotate = self.hourly.get(&f.stream).is_none_or(|h| h.hour != hour);
         if rotate {
             if let Some(old) = self.hourly.remove(&f.stream) {
@@ -321,6 +328,7 @@ impl Recorder {
         }
         h.writer.write(&f.samples)?;
         h.cursor = f.at + chrono::Duration::microseconds((f.samples.len() as i64) * 1_000_000 / RATE as i64);
+        #[allow(irrefutable_let_patterns)]
         if let Writer::Wav { since_header, .. } = &h.writer {
             if *since_header >= HEADER_REFRESH {
                 h.writer.refresh_header()?;
@@ -432,7 +440,8 @@ mod tests {
         let bytes = fs::read(&wav).unwrap();
         assert_eq!(bytes.len(), 44 + 32_000);
         assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 32_000);
-        let side: serde_json::Value = serde_json::from_str(&fs::read_to_string(wav.with_extension("json")).unwrap()).unwrap();
+        let side: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(wav.with_extension("json")).unwrap()).unwrap();
         assert_eq!(side["label"], "KSFO Tower");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -444,10 +453,19 @@ mod tests {
         let mut r = Recorder::new(&o).unwrap().unwrap();
         let t0 = Utc::now();
         let s = StreamId::Channel(118_300_000);
-        r.handle(&AudioEvent::Open { stream: s, chan: meta(), tx: 1, at: t0, level_dbfs: 0.0, noise_dbfs: 0.0 }).unwrap();
-        r.handle(&frame(t0, 1_600)).unwrap();
-        r.handle(&AudioEvent::Close { stream: s, chan: meta(), tx: 1, at: t0, duration_s: 0.1, peak_dbfs: 0.0, noise_dbfs: 0.0 })
+        r.handle(&AudioEvent::Open { stream: s, chan: meta(), tx: 1, at: t0, level_dbfs: 0.0, noise_dbfs: 0.0 })
             .unwrap();
+        r.handle(&frame(t0, 1_600)).unwrap();
+        r.handle(&AudioEvent::Close {
+            stream: s,
+            chan: meta(),
+            tx: 1,
+            at: t0,
+            duration_s: 0.1,
+            peak_dbfs: 0.0,
+            noise_dbfs: 0.0,
+        })
+        .unwrap();
         let n = walk(&dir).iter().filter(|p| p.extension().is_some_and(|e| e == "wav")).count();
         assert_eq!(n, 0);
         let _ = fs::remove_dir_all(&dir);

@@ -121,8 +121,7 @@ pub fn round_coord(v: f64, precision_m: u32) -> f64 {
 
 /// Frequency keys the server accepts: 1-64 of `[A-Za-z0-9._:/@+-]`.
 pub fn valid_key(k: &str) -> bool {
-    (1..=64).contains(&k.len())
-        && k.chars().all(|c| c.is_ascii_alphanumeric() || "._:/@+-".contains(c))
+    (1..=64).contains(&k.len()) && k.chars().all(|c| c.is_ascii_alphanumeric() || "._:/@+-".contains(c))
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 FROM rust:bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev libclang-dev protobuf-compiler \
+    pkg-config libssl-dev libclang-dev protobuf-compiler cmake \
     libsoapysdr-dev \
     && rm -rf /var/lib/apt/lists/*
 

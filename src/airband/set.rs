@@ -88,9 +88,8 @@ impl AirbandSet {
         let mut chans = Vec::with_capacity(freqs.len());
         for &f in freqs {
             let (c, ch) = cfg.channel(f);
-            let key = ch
-                .and_then(|c| c.key.clone())
-                .unwrap_or_else(|| format!("{}:{}", sdr.as_deref().unwrap_or("sdr"), f));
+            let key =
+                ch.and_then(|c| c.key.clone()).unwrap_or_else(|| format!("{}:{}", sdr.as_deref().unwrap_or("sdr"), f));
             let meta = Arc::new(ChannelMeta {
                 freq_hz: f,
                 label: ch.and_then(|c| c.label.clone()),
@@ -244,7 +243,14 @@ impl AirbandSet {
         out
     }
 
-    fn info(&self, i: usize, start: DateTime<Utc>, end: Option<DateTime<Utc>>, level: f32, noise: f32) -> TransmissionInfo {
+    fn info(
+        &self,
+        i: usize,
+        start: DateTime<Utc>,
+        end: Option<DateTime<Utc>>,
+        level: f32,
+        noise: f32,
+    ) -> TransmissionInfo {
         let c = &self.chans[i];
         TransmissionInfo {
             tx: c.tx,

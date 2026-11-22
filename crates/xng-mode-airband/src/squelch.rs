@@ -46,9 +46,7 @@ impl std::str::FromStr for SquelchMode {
         };
         Ok(match kind {
             "auto" => SquelchMode::Auto { snr_db: num(arg)?.unwrap_or(DEFAULT_SNR_DB) },
-            "manual" => SquelchMode::Manual {
-                dbfs: num(arg)?.ok_or("manual squelch needs a level, e.g. manual:-40")?,
-            },
+            "manual" => SquelchMode::Manual { dbfs: num(arg)?.ok_or("manual squelch needs a level, e.g. manual:-40")? },
             "off" => SquelchMode::Off,
             other => return Err(format!("unknown squelch {other:?} (auto[:snr_db], manual:dbfs, off)")),
         })

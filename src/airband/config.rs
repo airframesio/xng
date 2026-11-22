@@ -224,9 +224,7 @@ impl Default for ScanSettings {
 
 impl ScanSettings {
     pub fn to_scan_config(&self) -> anyhow::Result<xng_mode_airband::scan::ScanConfig> {
-        let parse = |v: &[String]| -> anyhow::Result<Vec<u64>> {
-            v.iter().map(|s| crate::freq::parse_hz(s)).collect()
-        };
+        let parse = |v: &[String]| -> anyhow::Result<Vec<u64>> { v.iter().map(|s| crate::freq::parse_hz(s)).collect() };
         Ok(xng_mode_airband::scan::ScanConfig {
             priority: parse(&self.priority)?,
             hold_ms: self.hold_ms,

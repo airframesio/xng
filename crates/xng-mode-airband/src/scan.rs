@@ -195,12 +195,7 @@ mod tests {
 
     #[test]
     fn no_preempt_when_disabled() {
-        let mut s = ScanController::new(ScanConfig {
-            priority: vec![C],
-            hold_ms: 0,
-            preempt: false,
-            lockout: vec![],
-        });
+        let mut s = ScanController::new(ScanConfig { priority: vec![C], hold_ms: 0, preempt: false, lockout: vec![] });
         s.on_open(B, 0);
         assert_eq!(s.select(0), Some(B));
         s.on_open(C, 10);

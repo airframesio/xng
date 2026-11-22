@@ -36,7 +36,7 @@ pub fn ulaw_encode(sample: i16) -> u8 {
         mask >>= 1;
     }
     let mantissa = (s >> (exponent + 3)) & 0x0F;
-    !(sign | (exponent << 4) as i32 | mantissa) as u8
+    !(sign | (exponent << 4) | mantissa) as u8
 }
 
 /// G.711 µ-law decode one byte.

@@ -1,0 +1,6 @@
+[env]
+# Build libopus from the bundled source (needs cmake) and link it
+# statically, so xng binaries never depend on a libopus shared library and
+# no system package is needed.
+OPUS_STATIC = "1"
+OPUS_NO_PKG = "1"

@@ -160,10 +160,7 @@ impl ChannelConfig {
     pub fn validate(&self) -> Result<(), String> {
         let bw = self.bandwidth();
         if !(1_000.0..=2.0 * CHANNEL_PASSBAND_HZ).contains(&bw) {
-            return Err(format!(
-                "bandwidth {bw} Hz out of range (1000..={} Hz)",
-                2.0 * CHANNEL_PASSBAND_HZ
-            ));
+            return Err(format!("bandwidth {bw} Hz out of range (1000..={} Hz)", 2.0 * CHANNEL_PASSBAND_HZ));
         }
         if let Some(t) = self.ctcss_hz {
             if !(60.0..=260.0).contains(&t) {
@@ -279,12 +276,8 @@ impl AirbandChannelDecoder {
         let notch = cfg.notch_hz.map(|f| Biquad::notch(f as f64, cfg.notch_q.max(0.5) as f64, rate));
         let deemph = (cfg.modulation == Modulation::Nfm && cfg.tau_us > 0.0)
             .then(|| Deemphasis::new(cfg.tau_us as f64 * 1e-6, rate));
-        let squelch = Squelch::new(
-            cfg.squelch,
-            BLOCK_S as f32,
-            cfg.open_ms as f32 / 1_000.0,
-            cfg.hang_ms as f32 / 1_000.0,
-        );
+        let squelch =
+            Squelch::new(cfg.squelch, BLOCK_S as f32, cfg.open_ms as f32 / 1_000.0, cfg.hang_ms as f32 / 1_000.0);
         let ctcss = cfg.ctcss_hz.map(|t| CtcssGate::new(t, rate));
         Ok(Self {
             gain: 10f32.powf(cfg.gain_db / 20.0),
@@ -510,11 +503,8 @@ impl AirbandChannelDecoder {
         let n = self.block_audio.len();
         let power_db = 10.0 * ((self.block_power / n as f64).max(1e-20)).log10() as f32;
         self.block_power = 0.0;
-        self.level_db = if self.level_db.is_finite() {
-            self.level_db + 0.3 * (power_db - self.level_db)
-        } else {
-            power_db
-        };
+        self.level_db =
+            if self.level_db.is_finite() { self.level_db + 0.3 * (power_db - self.level_db) } else { power_db };
         let tone_ok = match &mut self.ctcss {
             Some(g) => g.push(&self.block_raw),
             None => true,
@@ -657,12 +647,13 @@ impl AirbandMultiChannelDecoder {
         // alias in; each channel's own low-pass then sets the selectivity.
         // A narrower front lets a strong neighbour 8.33 kHz away fold back.
         let passband = FRONT_PASSBAND_HZ;
-        let front = match ChannelizedDdc::new(input_rate, CHANNEL_RATE, offsets, passband) {
-            Ok(c) => Front::Channelized(c),
-            Err(chan_err) => Front::Shared(SharedDdc::new(input_rate, CHANNEL_RATE, offsets, passband).map_err(
-                |shared_err| format!("channelizer rejected ({chan_err}); shared-decim also failed ({shared_err})"),
-            )?),
-        };
+        let front =
+            match ChannelizedDdc::new(input_rate, CHANNEL_RATE, offsets, passband) {
+                Ok(c) => Front::Channelized(c),
+                Err(chan_err) => Front::Shared(SharedDdc::new(input_rate, CHANNEL_RATE, offsets, passband).map_err(
+                    |shared_err| format!("channelizer rejected ({chan_err}); shared-decim also failed ({shared_err})"),
+                )?),
+            };
         let chans = cfgs
             .into_iter()
             .map(|c| AirbandChannelDecoder::at_channel_rate(c, passband))
@@ -779,10 +770,7 @@ pub fn to_message(kind: &str, info: &TransmissionInfo, freq_hz: u64, source: Pro
             ..Default::default()
         },
         decode: DecodeQuality { crc_ok: true, ..Default::default() },
-        body: MessageBody::Airband {
-            kind: kind.to_string(),
-            details: serde_json::to_value(info).unwrap_or_default(),
-        },
+        body: MessageBody::Airband { kind: kind.to_string(), details: serde_json::to_value(info).unwrap_or_default() },
         raw: None,
         source,
     }
@@ -962,10 +950,8 @@ mod tests {
         let cfg = ChannelConfig { squelch: SquelchMode::Off, ..Default::default() };
         let mut dec = AirbandChannelDecoder::new(RATE, 0.0, cfg).unwrap();
         let ev = run(&mut dec, &iq);
-        let n: usize = ev
-            .iter()
-            .map(|e| if let AirbandEvent::Audio { samples, .. } = e { samples.len() } else { 0 })
-            .sum();
+        let n: usize =
+            ev.iter().map(|e| if let AirbandEvent::Audio { samples, .. } = e { samples.len() } else { 0 }).sum();
         assert_eq!(n as u64, dec.position() / BLOCK_LEN as u64 * BLOCK_LEN as u64);
     }
 

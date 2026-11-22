@@ -51,7 +51,14 @@ pub struct Burst {
 }
 
 /// AM bursts at `offset_hz` from the capture center, in AWGN of `noise_power`.
-pub fn am_capture(rate: f64, secs: f64, offset_hz: f64, bursts: &[Burst], noise_power: f64, seed: u64) -> Vec<Complex<f32>> {
+pub fn am_capture(
+    rate: f64,
+    secs: f64,
+    offset_hz: f64,
+    bursts: &[Burst],
+    noise_power: f64,
+    seed: u64,
+) -> Vec<Complex<f32>> {
     let n = (rate * secs) as usize;
     let mut noise = Noise::new(seed);
     (0..n)
@@ -71,7 +78,14 @@ pub fn am_capture(rate: f64, secs: f64, offset_hz: f64, bursts: &[Burst], noise_
 }
 
 /// NFM bursts (deviation `depth` Hz) at `offset_hz`, in AWGN.
-pub fn nfm_capture(rate: f64, secs: f64, offset_hz: f64, bursts: &[Burst], noise_power: f64, seed: u64) -> Vec<Complex<f32>> {
+pub fn nfm_capture(
+    rate: f64,
+    secs: f64,
+    offset_hz: f64,
+    bursts: &[Burst],
+    noise_power: f64,
+    seed: u64,
+) -> Vec<Complex<f32>> {
     let n = (rate * secs) as usize;
     let mut noise = Noise::new(seed);
     let mut phase = vec![0.0f64; bursts.len()];
@@ -86,10 +100,7 @@ pub fn nfm_capture(rate: f64, secs: f64, offset_hz: f64, bursts: &[Burst], noise
                         inst += dev * (TAU * f * t).sin();
                     }
                     phase[k] += TAU * inst / rate;
-                    x += Complex::new(
-                        (b.amplitude * phase[k].cos()) as f32,
-                        (b.amplitude * phase[k].sin()) as f32,
-                    );
+                    x += Complex::new((b.amplitude * phase[k].cos()) as f32, (b.amplitude * phase[k].sin()) as f32);
                 }
             }
             x

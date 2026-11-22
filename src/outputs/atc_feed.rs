@@ -34,10 +34,7 @@ pub struct StationInfo {
 }
 
 fn now_us() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as u64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
 }
 
 fn finite(v: f32) -> Option<f64> {
@@ -46,11 +43,8 @@ fn finite(v: f32) -> Option<f64> {
 
 /// Make a channel key acceptable to the server (`[A-Za-z0-9._:/@+-]{1,64}`).
 fn clean_key(k: &str) -> String {
-    let mut s: String = k
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "._:/@+-".contains(c) { c } else { '-' })
-        .take(64)
-        .collect();
+    let mut s: String =
+        k.chars().map(|c| if c.is_ascii_alphanumeric() || "._:/@+-".contains(c) { c } else { '-' }).take(64).collect();
     if s.is_empty() {
         s.push('0');
     }
@@ -239,9 +233,8 @@ impl Dialer {
         let quic = if s.transport == "tcp" {
             None
         } else {
-            let mut qc = quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(
-                crypto.clone(),
-            )?));
+            let mut qc =
+                quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(crypto.clone())?));
             let mut tc = quinn::TransportConfig::default();
             tc.keep_alive_interval(Some(Duration::from_secs(10)));
             tc.max_idle_timeout(Some(Duration::from_secs(60).try_into()?));
@@ -310,7 +303,15 @@ impl Feed {
         Ok(())
     }
 
-    fn open(&mut self, link: &Link, chan: &ChannelMeta, tx: u64, at_us: u64, level: f32, noise: f32) -> anyhow::Result<()> {
+    fn open(
+        &mut self,
+        link: &Link,
+        chan: &ChannelMeta,
+        tx: u64,
+        at_us: u64,
+        level: f32,
+        noise: f32,
+    ) -> anyhow::Result<()> {
         if self.tx.is_some() {
             self.close(link, at_us, None)?;
         }
@@ -370,9 +371,8 @@ impl Feed {
             link.send_audio(p::audio_payload(self.ch, self.seq, us, flags | p::FLAG_TX_END, &pkt))?;
             self.seq = self.seq.wrapping_add(1);
         }
-        let duration_ms = duration_s
-            .map(|d| (d * 1000.0).round() as u64)
-            .unwrap_or_else(|| at_us.saturating_sub(t.start_us) / 1000);
+        let duration_ms =
+            duration_s.map(|d| (d * 1000.0).round() as u64).unwrap_or_else(|| at_us.saturating_sub(t.start_us) / 1000);
         link.send_json(
             p::SQUELCH,
             &json!({"ch": self.ch, "tx": t.tx, "open": false, "capture_us": at_us, "duration_ms": duration_ms}),
@@ -384,11 +384,8 @@ impl Feed {
 /// OPEN payloads for the streams to feed, with their channel numbers.
 fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> Vec<(StreamId, Value)> {
     let streams = parse_streams(&s.streams).unwrap_or_default();
-    let wanted: Vec<StreamId> = if streams.is_empty() {
-        chans.iter().map(|c| StreamId::Channel(c.freq_hz)).collect()
-    } else {
-        streams
-    };
+    let wanted: Vec<StreamId> =
+        if streams.is_empty() { chans.iter().map(|c| StreamId::Channel(c.freq_hz)).collect() } else { streams };
     let receiver = |c: Option<&ChannelMeta>| {
         let mut r = s.receiver.clone().filter(|v| v.is_object()).unwrap_or_else(|| json!({}));
         if let Some(c) = c {
@@ -441,7 +438,9 @@ fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> 
                        "codec": codec, "receiver": receiver(chans.first().map(|c| c.as_ref()))})
             }
             StreamId::Mix => {
-                tracing::warn!("atc feed: the mix stream cannot be fed (listeners need the active frequency); use scan");
+                tracing::warn!(
+                    "atc feed: the mix stream cannot be fed (listeners need the active frequency); use scan"
+                );
                 continue;
             }
         };
@@ -450,7 +449,11 @@ fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> 
     out
 }
 
-pub async fn run(bus_rx: broadcast::Receiver<Arc<Message>>, s: AtcFeedSettings, station: StationInfo) -> std::io::Result<()> {
+pub async fn run(
+    bus_rx: broadcast::Receiver<Arc<Message>>,
+    s: AtcFeedSettings,
+    station: StationInfo,
+) -> std::io::Result<()> {
     let closed = crate::airband::bus_closed(bus_rx);
     tokio::pin!(closed);
     let creds = s.credentials.clone().unwrap_or_else(atc_auth::default_path);
@@ -587,7 +590,8 @@ async fn session(
         p::ERROR => return Err(server_error(&payload)),
         k => anyhow::bail!("expected WELCOME, got {}", p::type_name(k)),
     };
-    let heartbeat = Duration::from_secs(welcome.get("heartbeat_s").and_then(|v| v.as_u64()).unwrap_or(15).clamp(5, 120));
+    let heartbeat =
+        Duration::from_secs(welcome.get("heartbeat_s").and_then(|v| v.as_u64()).unwrap_or(15).clamp(5, 120));
     let max_bitrate = welcome.pointer("/limits/max_bitrate").and_then(|v| v.as_u64()).unwrap_or(64_000) as u32;
     let max_channels = welcome.pointer("/limits/max_channels").and_then(|v| v.as_u64()).unwrap_or(32) as usize;
     let bitrate = s.bitrate.min(max_bitrate).max(6_000);
@@ -621,24 +625,28 @@ async fn session(
                     tracing::info!(
                         "atc feed: {label} accepted as {} ({})",
                         v["feed_id"].as_str().unwrap_or("?"),
-                        v["frequencies"].as_array().map(|a| a.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default()
+                        v["frequencies"]
+                            .as_array()
+                            .map(|a| a.iter().filter_map(|f| f.as_str()).collect::<Vec<_>>().join(", "))
+                            .unwrap_or_default()
                     );
                     feeds.insert(stream, Feed { ch, stream, label, enc, seq: 0, tx: None, listeners: 0 });
                 } else {
                     let cands = v["candidates"]
                         .as_array()
                         .map(|a| {
-                            a.iter()
-                                .filter_map(|c| c["id"].as_str().map(str::to_string))
-                                .collect::<Vec<_>>()
-                                .join(", ")
+                            a.iter().filter_map(|c| c["id"].as_str().map(str::to_string)).collect::<Vec<_>>().join(", ")
                         })
                         .unwrap_or_default();
                     tracing::warn!(
                         "atc feed: {label} rejected: {} {}{}",
                         v["code"].as_str().unwrap_or("?"),
                         v["message"].as_str().unwrap_or(""),
-                        if cands.is_empty() { String::new() } else { format!(" (candidates: {cands}; set --atc-frequency)") }
+                        if cands.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (candidates: {cands}; set --atc-frequency)")
+                        }
                     );
                 }
             }

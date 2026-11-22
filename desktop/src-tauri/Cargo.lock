@@ -5829,6 +5829,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-rustls"
+version = "0.26.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9cc2678c2cdd569ef8215e2afd7954ada2ae20b4fdd2c5fe6139a3b02d105db"
+dependencies = [
+ "rustls",
+ "tokio",
+]
+
+[[package]]
 name = "tokio-stream"
 version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7102,6 +7112,8 @@ name = "xng"
 version = "0.21.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "bytes",
  "chrono",
  "clap",
  "num-complex",
@@ -7118,6 +7130,7 @@ dependencies = [
  "serde_json",
  "sgp4",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "toml 0.8.2",
  "tonic",
@@ -7132,6 +7145,7 @@ dependencies = [
  "xng-mode-adsb",
  "xng-mode-adsl",
  "xng-mode-aero",
+ "xng-mode-airband",
  "xng-mode-ais",
  "xng-mode-aprs",
  "xng-mode-atcs",
@@ -7243,6 +7257,18 @@ dependencies = [
  "serde",
  "serde_json",
  "xng-acars",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-airband"
+version = "0.21.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
  "xng-dsp",
  "xng-types",
 ]

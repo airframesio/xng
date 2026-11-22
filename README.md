@@ -184,17 +184,19 @@ docker run --rm ghcr.io/airframesio/xng:latest --version
 ## Building
 
 Requirements: a stable [Rust](https://rustup.rs) toolchain, a **protobuf
-compiler**, and (for live SDR use) **SoapySDR** with your vendor module.
+compiler**, **cmake** (builds the bundled Opus codec used by airband
+recordings, Icecast and the ATC feed; `--no-default-features --features soapy`
+skips it), and (for live SDR use) **SoapySDR** with your vendor module.
 
 ```bash
 # Debian / Ubuntu
-sudo apt install protobuf-compiler libsoapysdr-dev soapysdr-module-all
+sudo apt install protobuf-compiler cmake libsoapysdr-dev soapysdr-module-all
 
 # macOS
-brew install protobuf soapysdr
+brew install protobuf cmake soapysdr
 
 # Windows: install PothosSDR and put its bin folder on PATH, then
-#   choco install protoc llvm
+#   choco install protoc llvm cmake
 
 # Build (binary at ./target/release/xng)
 cargo build --release
