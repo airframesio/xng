@@ -265,6 +265,36 @@ and SkyWest `BFL ARRIVAL GATE 4` (also on the header line) give the gate at
 an IATA airport; SkyWest's next-flight block is not read. Finnair
 connection lists name other flights' departure gates and are not decoded.
 
+**Other gate reports** (`gate.rs` `parse_report`) — port of the event
+digger's `gate_reports.go` (keep in step). They run after every other
+decoder on the label, so they never replace a richer decode, and each
+family is tied to the labels it was seen on: B3 pre-departure clearances
+(`JZA110-CYWG-GATE 12-CYOW`, `kind: departure_gate`, gate at `departure`);
+`FLT 1658/22 AUS-DFW` with a `GATE D21 ...` or `NEW ARRIVAL GATE NBR IS
+C33` line (American, Envoy, PSA, GoJet, Piedmont on 40/41/C1/RA, also
+after an RA header or `- `; text is read with CRs dropped, so Piedmont's
+CR-only lines run the gate into the route line); Envoy `FLT 4258 ARRIVING
+DCA` / `ARRIVAL GATE D43A` (40); Air Wisconsin `FLT 4940 IAD GATE A4C` and
+Frontier `FROM PHL OPS` ... `GATE  E8` with `GATE AVAIL AT ARRIVAL` (RA);
+Hawaiian `804 ARR GATE 69A` (3T) and `HA0805 AT GATE A6` (40); JetBlue
+`INR,221156,  GATE:514` (41/42); Jetstar `ARRIVAL GATE THIS FLT:43` (C1);
+Alaska `GATE CHANGE IN LAX` / `NEW GATE: 210A` (21, `kind: gate_change`);
+PSA crew acknowledgements `/ACKFLT GATE F1` (5Z, first line, when no 5Z
+type decodes); Jazz `JZA GATE DATA UPLINK` with `FLIGHT:
+8063/22Nov26/YYC/YVR` and `PLANNED ARRIVAL GATE IS C42` (C1); Jetstar
+`GATE CHANGE MESSAGE - ARRIVAL` with `JQ782/22 Nov MEL-ADL` and `NEW GATE:
+23` (C1, `gate_change`); WestJet `WS 345 YXE-YYC` then `YYC GATE D80/OPS`
+(airport from the gate line) or `ARR GATE IS NOW C26/OPS` (route
+destination) (RA); `SC8402 ARR:ZSJN` / `GATE:10` (RA); LATAM `GATE
+ASSIGNMENT` / `PPOS:602L` parking position, `PPOS:N/A` ignored (RA).
+`format` names the family (`PDC`, `FLT_ROUTE_GATE`, ...). A gate must
+contain a digit; reading stops at connections, `NEXT FLT`/`NEXT FLIGHT`/
+`NEXT LEG`/`NEXT SECTOR`,
+`TURN FLT`, `AC TURN` and `END`. RA uplinks read by `parse` (United,
+Republic, SkyWest, Finnair headers) are skipped. Hawaiian, JetBlue and
+Jetstar do not name the airport, so `arrival` is absent. 5Z `/C3 GATE REQ`
+carries no gate and is not read.
+
 **Media advisory** (`media_adv.rs`) — label **SA** datalink-availability
 report (`0EV121314VS/text`): version, established/lost, changed link,
 HH:MM:SS, available links (V/S/H/G/C/2/X/I), free text.

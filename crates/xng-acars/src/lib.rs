@@ -77,8 +77,10 @@ pub enum AcarsApp {
     /// Weight and balance loadsheet (IATA AHM 517 and airline layouts), its
     /// acceptance by the crew, or a request for one; on any label.
     Loadsheet(Box<loadsheet::Loadsheet>),
-    /// Arrival gate uplink on label RA (United GATE ASSIGN / GATE CHANGE,
-    /// Republic ARRIVAL GATE, SkyWest ARR GATE INFO).
+    /// Gate assignment: arrival gate uplinks on label RA (United GATE ASSIGN
+    /// / GATE CHANGE, Republic, SkyWest, Air Wisconsin, Frontier, American
+    /// and its regionals), pre-departure clearance departure gates (B3), and
+    /// airline gate messages on 40, 41, 42, C1, 21, 3T and 5Z.
     Gate(gate::GateInfo),
 }
 
@@ -145,6 +147,12 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
     // them on any label whose text mentions one and nothing else decoded.
     if out.app.is_none() && loadsheet::may_be_loadsheet(text) {
         out.app = loadsheet::parse(text).map(|l| AcarsApp::Loadsheet(Box::new(l)));
+    }
+    // Gate reports (B3 clearances, airline gate messages on 40/41/42/C1/21/
+    // 3T/5Z, and the label RA families after the uplinks above) come last, so
+    // they never replace a richer decode of the same text.
+    if out.app.is_none() {
+        out.app = gate::parse_report(label, text).map(AcarsApp::Gate);
     }
 
     // OOOI fields can be embedded in many labels' text (Q-series and several

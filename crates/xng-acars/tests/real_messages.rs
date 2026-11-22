@@ -405,7 +405,7 @@ fn label_ra_united_gate_assign_tab_indented() {
         false,
     );
     let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
-    assert_eq!((g.departure.as_deref(), g.arrival.as_str(), g.gate.as_str()), (Some("KIAD"), "LPPT", "43"));
+    assert_eq!((g.departure.as_deref(), g.arrival.as_deref(), g.gate.as_str()), (Some("KIAD"), Some("LPPT"), "43"));
     let j = serde_json::to_value(decode("RA", "QUHDQITOO.1ARR GATE INFO   \r\nBFL ARRIVAL GATE 4\r\nNEXT FLIGHT INFORMATION-\r\n", false)).unwrap();
     assert_eq!(j["app"]["app"], "gate");
     assert_eq!(j["app"]["kind"], "arrival_gate");
@@ -421,4 +421,42 @@ fn label_ra_finnair_connections_are_not_gates() {
         false,
     );
     assert!(d.app.is_none(), "{:?}", d.app);
+}
+
+// --- Gate reports on other labels (production texts, names removed) ---
+#[test]
+fn label_b3_pdc_departure_gate() {
+    let j = serde_json::to_value(decode("B3", "/CYWG.DC1/RCD 024\r\nJZA110-CYWG-GATE 12-CYOW\r\nATIS O\r\n-TYP/CRJ9912E", false)).unwrap();
+    assert_eq!(j["app"]["app"], "gate");
+    assert_eq!(j["app"]["kind"], "departure_gate");
+    assert_eq!(j["app"]["departure"], "CYWG");
+    assert_eq!(j["app"]["arrival"], "CYOW");
+    assert_eq!(j["app"]["gate"], "12");
+}
+
+#[test]
+fn label_40_and_ra_route_gates() {
+    let d = decode("40", "FLT 1658/22 AUS-DFW\r\nGATE D21 AVAILABILITY PLN ETA 0721\r\nNEXT FLT 0602 ACFT 3JF SKD 0900 GRR\r\n", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some("DFW"), "D21"));
+    // Label RA: new families still run after the United/Republic/SkyWest uplinks.
+    let d = decode("RA", "FLT 4940 IAD GATE A4C\r\n", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some("IAD"), "A4C"));
+    let d = decode("RA", "QUNDCULUA~1GATE ASSIGN\r\nUA1720/09 KMSP KDEN\r\nSENT: 10:41:16Z\r\nGATE B47   OPEN\r\n", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!((g.kind, g.format), (xng_acars::gate::GateKind::GateAssign, None));
+}
+
+#[test]
+fn label_5z_psa_gate_acknowledgement() {
+    let d = decode("5Z", "/ACKFLT GATE F1", true);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!((g.gate.as_str(), g.arrival), ("F1", None));
+}
+
+#[test]
+fn label_5z_gate_request_is_not_a_gate() {
+    let d = decode("5Z", "/C3 GATE REQ       / KAUS KIAH\r\n", true);
+    assert!(!matches!(d.app, Some(AcarsApp::Gate(_))), "{:?}", d.app);
 }

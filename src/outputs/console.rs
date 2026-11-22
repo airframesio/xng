@@ -90,15 +90,17 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
             let mut s = match app.get("kind")?.as_str()? {
                 "gate_change" => "GATE CHANGE".to_owned(),
                 "gate_assign" => "GATE ASSIGN".to_owned(),
+                "departure_gate" => "DEPARTURE GATE".to_owned(),
                 _ => "ARRIVAL GATE".to_owned(),
             };
-            if let Some(f) = app.get("flight_number").and_then(|v| v.as_str()) {
+            let field = |k: &str| app.get(k).and_then(|v| v.as_str());
+            if let Some(f) = field("flight_number") {
                 s.push_str(&format!(" {f}"));
             }
-            let arrival = app.get("arrival")?.as_str()?;
-            match app.get("departure").and_then(|v| v.as_str()) {
-                Some(d) => s.push_str(&format!(" {d}->{arrival}")),
-                None => s.push_str(&format!(" {arrival}")),
+            match (field("departure"), field("arrival")) {
+                (Some(d), Some(a)) => s.push_str(&format!(" {d}->{a}")),
+                (Some(a), None) | (None, Some(a)) => s.push_str(&format!(" {a}")),
+                (None, None) => {}
             }
             s.push_str(&format!(" gate {}", app.get("gate")?.as_str()?));
             Some(s)
@@ -884,5 +886,12 @@ mod tests {
         assert_eq!(s.as_deref(), Some("GATE ASSIGN UA0942 KIAD->LPPT gate 43"));
         let s = app_summary(&json!({"app": "gate", "kind": "arrival_gate", "gate": "4", "arrival": "BFL"}));
         assert_eq!(s.as_deref(), Some("ARRIVAL GATE BFL gate 4"));
+        let s = app_summary(&json!({
+            "app": "gate", "kind": "departure_gate", "format": "PDC", "gate": "12",
+            "flight_number": "JZA110", "departure": "CYWG", "arrival": "CYOW",
+        }));
+        assert_eq!(s.as_deref(), Some("DEPARTURE GATE JZA110 CYWG->CYOW gate 12"));
+        let s = app_summary(&json!({"app": "gate", "kind": "arrival_gate", "format": "JETBLUE_INR", "gate": "514"}));
+        assert_eq!(s.as_deref(), Some("ARRIVAL GATE gate 514"));
     }
 }
