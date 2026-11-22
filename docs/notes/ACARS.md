@@ -272,8 +272,8 @@ family is tied to the labels it was seen on: B3 pre-departure clearances
 (`JZA110-CYWG-GATE 12-CYOW`, `kind: departure_gate`, gate at `departure`);
 `FLT 1658/22 AUS-DFW` with a `GATE D21 ...` or `NEW ARRIVAL GATE NBR IS
 C33` line (American, Envoy, PSA, GoJet, Piedmont on 40/41/C1/RA, also
-after an RA header or `- `; text is read with CRs dropped, so Piedmont's
-CR-only lines run the gate into the route line); Envoy `FLT 4258 ARRIVING
+after an RA header or `- `; a bare CR ends a line like a CRLF, so
+Piedmont's CR-only lines give the route and then its `GATE` line); Envoy `FLT 4258 ARRIVING
 DCA` / `ARRIVAL GATE D43A` (40); Air Wisconsin `FLT 4940 IAD GATE A4C` and
 Frontier `FROM PHL OPS` ... `GATE  E8` with `GATE AVAIL AT ARRIVAL` (RA);
 Hawaiian `804 ARR GATE 69A` (3T) and `HA0805 AT GATE A6` (40); JetBlue
@@ -297,6 +297,18 @@ stays with the OOOI extractor, in the same decode); Virgin Australia
 (RA; Finnair's connection lists are still not read); Jazz flight data `DEP
 YVR/06:20Z/GTE C40` / `ARR YYC/07:48Z/GTE A17` (C1) gives the arrival gate
 with `departure_gate`.
+Round 5 (event digger #28): Finnair W&B `AY230 19NOV TKU STD0600 BOARD 0540
+GATE 2` (RA, `departure_gate` at TKU) and `ARRIVING STAND` on 3E; Delta
+crew P/F on HX; Qatar `QR899 BNE - DOH ARR STAND - C6`, loose arrival lines
+`-PKG T21`, `ESTIMATED PARK IS G09`, `PARK BAY: 21`, `ARR GATE IS 17R`,
+`YOUR GATE IS 9`, `PLANNING GATE B37`, Qantas `GDAY QF0011 BAY 221`,
+Avianca `GATE J-12 MIA` (J12 at MIA) and `EAU ARRIVAL GATE 1` (RA);
+WestJet Encore `FTX01,WS 3564 YVR-YLW` (WestJet also on 41/42 when not
+JetBlue); Alaska ETA acks `FROM:LAX OPS` / `AS1831` / `ARRIVAL GATE:65B`
+(21); SAS `ATT SK0932  ETA: 1414  GATE: C33` (C1); Swiss/Edelweiss `ARR
+GATE A52`, else `ARR POS D12` (32); Virgin Australia `ARR BAY:` (3M). Not
+read: Jazz `NEXT FLIGHT INFORMATION` gates, Air Canada 4C `-GTE C001  C47`,
+crew free text.
 `format` names the family (`PDC`, `FLT_ROUTE_GATE`, ...). A gate must
 contain a digit; reading stops at connections, `NEXT FLT`/`NEXT FLIGHT`/
 `NEXT LEG`/`NEXT SECTOR`/`- NEXT FLIGHT`,
