@@ -69,6 +69,7 @@ conventions — invisible to loopback testing — were caught only this way).
 | AIS (ITU-R M.1371) | `ais` | 161.975/162.025 MHz | NMEA AIVDM (TCP server + UDP push, optional tag-blocks) plus **field decode for types 1–27**: positions/kinematics (class A/B, SAR, long-range), static & voyage data, binary/safety messages, aids to navigation, DGNSS, link/channel management, group assignment, **Inland-AIS ASM (DAC=200: ship static, EMMA, water level, signal strength, ETA/RTA, persons-on-board)**, **regional AtoN-monitoring (DAC 235/250)**, and **IMO DAC=1 ASM (Circ.289: met/hydro, area-notice, route, tidal, …)**, and **SART/MOB/EPIRB-AIS distress tagging**; **own-ship AIVDO Type-1 emit** (periodic from the station receiver-pos) and an **output filter** (type/MMSI keep-drop + per-MMSI rate downsample + content dedup); **weak-signal coherent demod (16-state GMSK MLSE + SIC, +11–12 dB)** | pyais-exact field vectors; off-air benchmark **91 % of AIS-catcher with zero false decodes**, CI-fenced |
 | Mode S / ADS-B | `adsb` | 1090 MHz | **CPR positions** (airborne + surface via `--receiver-pos`, speed-gated, **graduated position trust** — global / NIC-contained / receiver-referenced), velocity, squawk, altitude replies, **Comm-B/BDS registers** (callsign, capability 1,0/1,7, **ACAS RA 3,0**, selected-altitude 4,0, track/turn 5,0, heading/speed 6,0, **MRAR/hazard met 4,4/4,5** — pyModeS field-exact), **target state 6,2 + operational status 6,5** (ADS-B version, NACp/SIL/NIC-supp/GVA), emergency/priority status, **DF18 TIS-B/ADS-R source tagging**, single-bit CRC repair, two-sighting phantom rejection, per-aircraft tracking, Mode A/C decode kernel, **SBS + Beast outputs** (Beast carries a monotonic sample-clock 12 MHz MLAT counter, not the wall clock); any rate ≥ 2 MS/s incl. **native 2.4 MS/s** | **98–99 % of readsb/dump1090-fa** with frames each of them misses (see [Benchmarks](#benchmarks)); field-exact vs pyModeS |
 
+| Airband voice (AM / NFM) | `airband` | 118–137 MHz (any VHF/UHF AM or NFM voice) | **Many voice channels from one capture** (8.33 and 25 kHz spacing), auto (noise-floor tracking) / manual / off squelch with hang time, AGC, AFC, CTCSS, notch; **mix and scan streams** (priority, hold, lockout, pin); **recordings** (WAV or Opus, per transmission or continuous), UDP PCM, **Icecast**, a **listen-in-the-browser dashboard page**, Prometheus metrics, and **feeding the Airframes ATC network** (`xng atc login`) — see [AIRBAND.md](docs/notes/AIRBAND.md) | Synthetic AM/NFM IQ end to end; ATC feed verified against aggregator-atc |
 
 ### Newer modes (wired to `--mode`; demod maturity varies)
 
@@ -289,7 +290,18 @@ xng listen --sdr driver=rtlsdr --mode ais -r 2400000 -c 162.000M \
 # Mode S / ADS-B (consumes the whole capture; 2.4 MS/s — the
 # RTL-SDR's best rate — decodes natively via the fractional path)
 xng listen --sdr driver=rtlsdr --mode adsb -r 2400000 -c 1090.000M --channels 1090
+
+# Airband voice: three tower/ground/approach channels from one RTL-SDR,
+# a scanner stream, recordings, the browser listening page on :8080/airband,
+# and a feed to the Airframes ATC network (run `xng atc login` once first)
+xng listen --sdr driver=rtlsdr --mode airband -r 2400000 \
+    --channels 120.5,121.8,135.65 \
+    --labels "120.5=SFO Tower,121.8=SFO Ground,135.65=NorCal Approach" \
+    --scan --scan-priority 120.5 --record-dir ~/airband --http 0.0.0.0:8080 \
+    --receiver-pos 37.62,-122.38 --atc-feed
 ```
+
+![Airband dashboard page](docs/screenshots/airband-dashboard.png?raw=true)
 
 ### Site survey / soak test
 

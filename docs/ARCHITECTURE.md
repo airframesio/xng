@@ -97,7 +97,10 @@ xng/
 │   ├── runtime.rs, bus.rs # session supervisor + message bus
 │   ├── outputs/           # console, JSON/JSONL, acarsdec UDP, dumpvdl2 UDP/TCP,
 │   │                      #   Airframes, Prometheus, SBS/Beast, NMEA, MQTT, ZMQ, asf-2.0,
-│   │                      #   and the web dashboard (map + geo export)
+│   │                      #   and the web dashboard (map + geo export); airband audio
+│   │                      #   outputs (recordings, UDP PCM, Icecast, ATC feeder)
+│   ├── airband/           # airband runtime: channel sets, audio hub (channel/mix/scan
+│   │                      #   streams), scanner, Opus, ATC protocol + sign-in
 │   ├── tui.rs             # ratatui TUI
 │   ├── beam.rs, satmap.rs # Iridium beam-pattern reconstruction + satellite naming
 │   └── freq.rs, sdr_args.rs
@@ -143,6 +146,13 @@ are `[lon, lat]`, GPX uses `lat`/`lon` attributes) — and surfaces a
 cross-mode distress array on `/api/state` aggregating ADS-B
 emergency/7500-7600-7700, AIS SART/MOB/EPIRB, STD-C distress, DSC
 distress, and every COSPAS-SARSAT 406 beacon, keyed `mode:entity`.
+
+Airband voice is the one mode whose product is audio. Its transmissions
+still reach the bus as `tx_start`/`tx_end` messages, but the audio travels
+on a separate process-wide hub (`src/airband/hub.rs`) that the audio
+outputs subscribe to: recordings, UDP PCM, Icecast, the dashboard's
+`/airband` listening page, and the Airframes ATC feeder (aggregator-atc
+protocol over QUIC or TLS/TCP). Details in [notes/AIRBAND.md](notes/AIRBAND.md).
 
 ## Statistics and control
 
