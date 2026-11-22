@@ -256,9 +256,14 @@ static CUT_WEIGHT: LazyLock<Regex> = LazyLock::new(|| {
 });
 static MAX_BEFORE: LazyLock<Regex> = LazyLock::new(|| re(r"\bM(?:AX)?\s*(\d+)"));
 /// TOW 297997 36,27 312425 Op. Max: the maximum after the value, with its
-/// own number.
+/// own number. Not the fraction of an index (17,42 Max closes the index,
+/// no maximum): the digits must not follow `.`, `,` or another digit.
 static MAX_AFTER: LazyLock<Regex> =
-    LazyLock::new(|| re(r"(?i)\b([0-9]+)\s+(?:Op\.\s+)?Max\b"));
+    LazyLock::new(|| re(r"(?i)(?:^|[^.,0-9])([0-9]+)\s+(?:Op\.\s+)?Max\b"));
+/// Loadsheet keys that look like airport codes on an index or weight line.
+static FIELD_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"^(?:MAC|ZFW|TOW|LAW|LDW|LGW|DOW|DOI|DLI|TOF|TIF|PAX|TTL|TOB|CREW|ULOAD|UNDLD)$")
+});
 static LIMIT_MARK: LazyLock<Regex> = LazyLock::new(|| re(r"[\s\d]L$"));
 static WEIGHT_START: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:ZFW|TOW)(?: ACTUAL)?:?\s+\d"));
 static TOF: LazyLock<Regex> =
@@ -266,7 +271,7 @@ static TOF: LazyLock<Regex> =
 static TIF: LazyLock<Regex> =
     LazyLock::new(|| re(r"^(?:TIF|TF|BO|TRIP(?: FUEL)?):?\s+(\d+)(?:[^\d.]|$)"));
 static UNDLD: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^(?:UNDLD|ULOAD|UNDERLOAD):?\s+(\d+)(?:[^\d.]|$)"));
+    LazyLock::new(|| re(r"(?:^|\s)(?:UNDLD|ULOAD|UNDERLOAD):?\s+(\d+)(?:[^\d.]|$)"));
 static DOW: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|\s)DOW\s+(\d+)(?:[^\d.]|$)"));
 static BW: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|\s)BW\s*(\d+)(?:[^\d.]|$)"));
 static CREW: LazyLock<Regex> = LazyLock::new(|| re(r"^CREW\s+(\d{1,2}/\d{1,2}(?:/\d{1,2})?)\b"));
@@ -356,6 +361,14 @@ static ACCEPT_WORDS: LazyLock<Regex> = LazyLock::new(|| {
     re(r"\b(?:LOADSHEET|LDSHT|LOAD SHEET)(?:\s+(?:FINAL|PRELIM))?(?:\s+\d{1,2})?\s+(?:ACCEPT|ACKNOW|RCVD)")
 });
 static ACK_LOADSHEET: LazyLock<Regex> = LazyLock::new(|| re(r"\bACK LOADSHEET"));
+/// LOADSHEET FINAL,EDNO 01,ACCEPT
+static ACCEPT_COMMAS: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"\b(?:LOADSHEET|LDSHT|LOAD SHEET)\s+(?:FINAL|PRELIM),\s*EDNO\s*\d+,\s*ACCEPT")
+});
+/// FOR QR274/21NOV26: the flight date, when the year is given.
+static ACCEPT_FOR_DATE: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"\bFOR\s+[A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?/([0-9]{2})([A-Z]{3})([0-9]{2})\b")
+});
 static ACCEPT_OF: LazyLock<Regex> = LazyLock::new(|| {
     re(r"(?:ACKNOWLEDGEMENT|ACCEPTANCE) OF (?:THE )?(?:FINAL|PRELIM) LOADSHEET")
 });
@@ -520,6 +533,10 @@ fn parse_route_line(ls: &mut Loadsheet, line: &str) -> bool {
     let Some(m) = ROUTE.captures(line).or_else(|| ROUTE_JOINED.captures(line)) else {
         return false;
     };
+    // MAC ZFW 32.5 is an index line, not a route.
+    if FIELD_KEY.is_match(&m[1]) && FIELD_KEY.is_match(&m[2]) {
+        return false;
+    }
     ls.departure = Some(m[1].to_owned());
     ls.arrival = Some(m[2].to_owned());
     if let Some(r) = cap(&m, 3) {
@@ -596,7 +613,7 @@ fn parse_body(ls: &mut Loadsheet, lines: &[String]) {
             continue;
         }
         // The line holds only the cut weight, so nothing else is skipped.
-        if Some(i) == last && i > 0 && is_cut_weight(ls, line) {
+        if Some(i) == last && is_cut_weight(ls, line) {
             continue;
         }
         if flight_seen {
@@ -699,7 +716,10 @@ fn parse_acceptance(text: &str) -> Option<Loadsheet> {
         ls.date = Some(format!("20{}-{}-{}", &d[4..6], &d[2..4], &d[0..2]));
         return Some(ls);
     }
-    if ACCEPT_WORDS.is_match(text) || ACK_LOADSHEET.is_match(text) || ACCEPT_OF.is_match(text) {
+    if ACCEPT_WORDS.is_match(text) || ACK_LOADSHEET.is_match(text)
+        || ACCEPT_COMMAS.is_match(text)
+        || ACCEPT_OF.is_match(text)
+    {
         let mut ls = Loadsheet::new(LoadsheetKind::Acceptance);
         if let Some(c) = STATUS.captures(text) {
             ls.status = Some(status_of(&c[1]));
@@ -709,6 +729,11 @@ fn parse_acceptance(text: &str) -> Option<Loadsheet> {
         }
         if let Some(c) = ACCEPT_FLIGHT.captures(text) {
             ls.flight_number = Some(c[1].to_owned());
+        }
+        if let Some(c) = ACCEPT_FOR_DATE.captures(text) {
+            if let Some(date) = flight_date(&c[1], &c[2], &c[3]) {
+                ls.date = Some(date);
+            }
         }
         if let Some(c) = ACCEPT_SECTORS.iter().find_map(|r| r.captures(text)) {
             ls.departure = Some(c[1].to_owned());

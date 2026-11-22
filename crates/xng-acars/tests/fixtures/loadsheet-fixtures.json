@@ -285,6 +285,7 @@
       "arrival": "DZA",
       "registration": "F-OLRB",
       "crew": "3/9",
+      "underload": 107,
       "dow": 119930,
       "doi": 51.7,
       "zfw": 152493,
@@ -600,8 +601,62 @@
     "expected": {
       "kind": "acceptance",
       "flight_number": "QR274",
+      "date": "2026-11-21",
       "departure": "AMS",
       "arrival": "DOH"
+    }
+  },
+  {
+    "id": 900000010,
+    "label": "RA",
+    "description": "synthetic: cut weight as the only body line",
+    "text": "LOADSHEET FINAL\nTOW 2",
+    "expected": null
+  },
+  {
+    "id": 900000011,
+    "label": "RA",
+    "description": "synthetic: comma-separated acceptance",
+    "text": "LOADSHEET FINAL,EDNO 01,ACCEPT",
+    "expected": {
+      "kind": "acceptance",
+      "status": "final",
+      "edition": 1
+    }
+  },
+  {
+    "id": 900000012,
+    "label": "RA",
+    "description": "synthetic: MAC ZFW index line after the flight line",
+    "text": "LOADSHEET FINAL\nAI160/21 21NOV26\nMAC ZFW 32.5\nZFW 214843 MAX 237682",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "flight_number": "AI160",
+      "flight_day": 21,
+      "date": "2026-11-21",
+      "mac_zfw": 32.5,
+      "zfw": 214843,
+      "zfw_max": 237682
+    }
+  },
+  {
+    "id": 900000013,
+    "label": "RA",
+    "description": "synthetic: Max after an index closes the column, no maximum",
+    "text": "LOADSHEET FINAL 0900 EDNO 1\nD0123/21 21NOV26\nZFW   272172  17,42 Max\nTOW   297997  36,27 Op. Max",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "edition": 1,
+      "time": "0900",
+      "flight_number": "D0123",
+      "flight_day": 21,
+      "date": "2026-11-21",
+      "zfw": 272172,
+      "li_zfw": 17.42,
+      "tow": 297997,
+      "li_tow": 36.27
     }
   }
 ]
