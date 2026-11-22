@@ -53,6 +53,9 @@ pub enum Mode {
     /// Multi-band radio time signals (WWV/WWVH/CHU on HF; WWVB/DCF77/MSF/JJY
     /// on LF). The decodable HF stations carry CHU AFSK or WWV 100 Hz BCD.
     Time,
+    /// Airband voice (AM/NFM) channels: squelch-gated audio plus
+    /// transmission start/end events.
+    Airband,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -82,6 +85,7 @@ impl Mode {
             Mode::Flex => "flex",
             Mode::Vdes => "vdes",
             Mode::Time => "time",
+            Mode::Airband => "airband",
             Mode::Extern => "extern",
         }
     }
@@ -111,6 +115,7 @@ impl Mode {
             Mode::Flex,
             Mode::Vdes,
             Mode::Time,
+            Mode::Airband,
         ]
     }
 }
@@ -148,6 +153,7 @@ impl std::str::FromStr for Mode {
             "flex" | "flex-next" | "flexnext" => Ok(Mode::Flex),
             "vdes" | "vdes-asm" | "asm" => Ok(Mode::Vdes),
             "time" | "timesignal" | "time-signal" | "wwv" | "chu" => Ok(Mode::Time),
+            "airband" | "voice" | "atc" => Ok(Mode::Airband),
             other => Err(format!("unknown mode: {other}")),
         }
     }

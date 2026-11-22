@@ -249,6 +249,13 @@ pub enum MessageBody {
         station: String,
         details: serde_json::Value,
     },
+    /// Airband voice transmission event. `kind` = `tx_start` / `tx_end`;
+    /// `details` = label, modulation, start/end, duration, levels, recording
+    /// path and the mapped ATC frequency key (see `xng_mode_airband`).
+    Airband {
+        kind: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 
