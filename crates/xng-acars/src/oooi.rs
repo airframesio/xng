@@ -479,7 +479,7 @@ fn delta_report(label: &str, text: &str) -> Option<Oooi> {
 }
 
 static CSV_VERSION: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"^(OUT|OFF|ONE),V\d{2},[^,]*,([A-Z0-9-]{4}),([A-Z0-9-]{4}),(\d{4})\b(?:,([\d-]{4})\b)?")
+    re(r"^(OUT|OFF|ONE),V\d{2},[^,]*,([A-Z0-9-]{4}),([A-Z0-9-]{4}),(\d{4})(?:,|\s|$)(?:([\d-]{4})(?:,|\s|$))?")
 });
 
 /// Cathay Pacific `OUT,V02,CX 837 20261121 1,CYVR,VHHH,2044,2036,----, 1179`,
@@ -491,7 +491,9 @@ fn csv_version_report(text: &str) -> Option<Oooi> {
     match &c[1] {
         "OUT" => set_event(&mut o, "OUT", clock(&c[4])),
         "OFF" => {
-            set_event(&mut o, "OFF", clock(c.get(5)?.as_str()));
+            if let Some(off) = c.get(5) {
+                set_event(&mut o, "OFF", clock(off.as_str()));
+            }
             set_event(&mut o, "OUT", clock(&c[4]));
         }
         _ => set_event(&mut o, "ON", clock(&c[4])),
@@ -1193,6 +1195,9 @@ mod tests {
         assert_eq!(times(&o), [Some("0437"), Some("0500"), None, None]);
         let o = decode("12", "OFF,V01,CX 314220261121 1,VIDP,VHHH,1008,1029,,  473").unwrap();
         assert_eq!((o.depa.as_deref(), o.wloff.as_deref()), (Some("VIDP"), Some("1029")));
+        // An OFF field still dashed keeps the OUT time.
+        let o = decode("12", "OFF,V02,CX 837 20261121 1,CYVR,VHHH,2044,----,----, 1175").unwrap();
+        assert_eq!(times(&o), [Some("2044"), None, None, None]);
 
         let o = decode("16", "CAR,V03,CX 181 20261122 1,CX0181,22NOV26,VHHH,YSSY,01,Y\r\n1655,1721,0151,0157,1655,0829,---,--------,--------, ").unwrap();
         assert_eq!(times(&o), [Some("1655"), Some("1721"), Some("0151"), Some("0157")]);
