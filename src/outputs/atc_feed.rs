@@ -79,8 +79,15 @@ enum Out {
 
 /// The open connection: frames go through a writer task; frames the server
 /// sends (except PING, answered by the reader) arrive on `incoming`.
+/// Frames waiting for the writer. A server that stops reading fills this
+/// (several seconds of audio) and the session reconnects instead of queueing
+/// without limit; nothing is dropped silently.
+const OUT_QUEUE: usize = 1_024;
+/// One socket write; longer means the peer is not reading.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 struct Link {
-    out: mpsc::UnboundedSender<Out>,
+    out: mpsc::Sender<Out>,
     incoming: mpsc::UnboundedReceiver<(u8, Vec<u8>)>,
     quic: Option<quinn::Connection>,
     transport: &'static str,
@@ -102,7 +109,14 @@ impl Drop for Link {
 impl Link {
     fn send(&self, kind: u8, payload: &[u8]) -> anyhow::Result<()> {
         let f = p::frame(kind, payload)?;
-        self.out.send(Out::Stream(f)).map_err(|_| anyhow::anyhow!("connection closed"))
+        self.push(Out::Stream(f))
+    }
+
+    fn push(&self, o: Out) -> anyhow::Result<()> {
+        self.out.try_send(o).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => anyhow::anyhow!("the server is not reading (send queue full)"),
+            mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("connection closed"),
+        })
     }
 
     fn send_json(&self, kind: u8, v: &Value) -> anyhow::Result<()> {
@@ -118,7 +132,7 @@ impl Link {
                 d.extend_from_slice(&payload);
                 // Through the writer, so a datagram never overtakes the
                 // SQUELCH frame queued before it.
-                return self.out.send(Out::Datagram(d)).map_err(|_| anyhow::anyhow!("connection closed"));
+                return self.push(Out::Datagram(d));
             }
         }
         self.send(p::AUDIO, &payload)
@@ -138,7 +152,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Out>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Out>(OUT_QUEUE);
     let dgram_conn = quic.clone();
     let (in_tx, in_rx) = mpsc::unbounded_channel();
     let last_rx = Arc::new(std::sync::Mutex::new(Instant::now()));
@@ -149,13 +163,13 @@ where
             while let Some(o) = next.take().or_else(|| out_rx.try_recv().ok()) {
                 match o {
                     Out::Stream(f) => {
-                        if w.write_all(&f).await.is_err() {
+                        if !matches!(tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&f)).await, Ok(Ok(()))) {
                             return;
                         }
                     }
                     Out::Datagram(d) => {
                         // Stream bytes written so far must leave first.
-                        if w.flush().await.is_err() {
+                        if !matches!(tokio::time::timeout(WRITE_TIMEOUT, w.flush()).await, Ok(Ok(()))) {
                             return;
                         }
                         let Some(c) = &dgram_conn else { continue };
@@ -165,7 +179,7 @@ where
                             }
                             // Too big or unsupported after all: use the stream.
                             if let Ok(f) = p::frame(p::AUDIO, &d[1..]) {
-                                if w.write_all(&f).await.is_err() {
+                                if !matches!(tokio::time::timeout(WRITE_TIMEOUT, w.write_all(&f)).await, Ok(Ok(()))) {
                                     return;
                                 }
                             }
@@ -173,11 +187,11 @@ where
                     }
                 }
             }
-            if w.flush().await.is_err() {
+            if !matches!(tokio::time::timeout(WRITE_TIMEOUT, w.flush()).await, Ok(Ok(()))) {
                 break;
             }
         }
-        let _ = w.shutdown().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), w.shutdown()).await;
     });
     let pong = out_tx.clone();
     let lr = last_rx.clone();
@@ -189,7 +203,7 @@ where
                     match kind {
                         p::PING => {
                             if let Ok(f) = p::frame(p::PONG, &p::pong_payload(&payload, now_us())) {
-                                let _ = pong.send(Out::Stream(f));
+                                let _ = pong.try_send(Out::Stream(f));
                             }
                         }
                         k if k >= 0x80 => {} // extensions: ignore
@@ -257,7 +271,9 @@ impl Dialer {
             let conn = tokio::time::timeout(Duration::from_secs(8), ep.connect(addr, &self.host)?)
                 .await
                 .map_err(|_| anyhow::anyhow!("QUIC handshake timed out (UDP blocked?)"))??;
-            let (send, recv) = conn.open_bi().await?;
+            let (send, recv) = tokio::time::timeout(Duration::from_secs(8), conn.open_bi())
+                .await
+                .map_err(|_| anyhow::anyhow!("QUIC stream open timed out"))??;
             Ok(spawn_io(recv, send, Some(conn), "quic"))
         } else {
             let tcp = tokio::time::timeout(Duration::from_secs(10), tokio::net::TcpStream::connect(addr))
@@ -265,7 +281,10 @@ impl Dialer {
                 .map_err(|_| anyhow::anyhow!("TCP connect timed out"))??;
             tcp.set_nodelay(true)?;
             let name = rustls::pki_types::ServerName::try_from(self.host.clone())?;
-            let tls = tokio_rustls::TlsConnector::from(self.tls.clone()).connect(name, tcp).await?;
+            let tls =
+                tokio::time::timeout(Duration::from_secs(10), tokio_rustls::TlsConnector::from(self.tls.clone()).connect(name, tcp))
+                    .await
+                    .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
             let (r, w) = tokio::io::split(tls);
             Ok(spawn_io(r, w, None, "tcp"))
         }
@@ -362,7 +381,10 @@ impl Feed {
         let next_us = t.next_us;
         if let Some(pkt) = self.enc.flush() {
             let t = self.tx.as_mut().unwrap();
-            let flags = if t.sent_any { 0 } else { p::FLAG_TX_START };
+            let mut flags = if t.sent_any { 0 } else { p::FLAG_TX_START };
+            if std::mem::take(&mut t.disc) {
+                flags |= p::FLAG_DISCONTINUITY;
+            }
             t.sent_any = true;
             self.emit(link, pkt, next_us, flags)?;
         }
@@ -495,12 +517,15 @@ pub async fn run(
             _ => quic_failures < 2,
         };
         let started = Instant::now();
-        let r = session(&s, &dialer, use_quic, &tokens, &feeder_id, &station, &chans, &mut closed).await;
+        let mut opened = false;
+        let r = session(&s, &dialer, use_quic, &tokens, &feeder_id, &station, &chans, &mut closed, &mut opened).await;
         match r {
             Ok(true) => break, // bus closed
             Ok(false) => {}
             Err(e) => {
-                if use_quic && started.elapsed() < Duration::from_secs(15) {
+                // A QUIC attempt that never got its feeds opened counts
+                // toward falling back to TCP, however long it took to fail.
+                if use_quic && !opened {
                     quic_failures += 1;
                 }
                 let fatal = e.downcast_ref::<Fatal>().is_some();
@@ -560,20 +585,29 @@ async fn session(
     station: &StationInfo,
     chans: &[Arc<ChannelMeta>],
     closed: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+    opened: &mut bool,
 ) -> anyhow::Result<bool> {
-    let mut token = tokens.get().await.map_err(|e| {
+    let token = tokio::select! {
+        _ = closed.as_mut() => return Ok(true),
+        t = tokens.get() => t,
+    };
+    let mut token = token.map_err(|e| {
         if matches!(tokens, TokenSource::Saved(_)) && e.to_string().contains("xng atc login") {
             anyhow::Error::from(Fatal(e.to_string()))
         } else {
             e
         }
     })?;
-    let mut link = dialer.dial(quic).await.map_err(|e| e.context(if quic { "QUIC" } else { "TLS/TCP" }))?;
+    let link = tokio::select! {
+        _ = closed.as_mut() => return Ok(true),
+        l = dialer.dial(quic) => l,
+    };
+    let mut link = link.map_err(|e| e.context(if quic { "QUIC" } else { "TLS/TCP" }))?;
 
     let mut st = json!({"name": station.name, "location_precision_m": s.location_precision_m});
     if let (Some(lat), Some(lon)) = (station.lat, station.lon) {
-        st["lat"] = json!(p::round_coord(lat, s.location_precision_m));
-        st["lon"] = json!(p::round_coord(lon, s.location_precision_m));
+        st["lat"] = json!(p::round_coord(lat, s.location_precision_m).clamp(-90.0, 90.0));
+        st["lon"] = json!(p::round_coord(lon, s.location_precision_m).clamp(-180.0, 180.0));
     }
     if let Some(a) = station.alt_m {
         st["alt_m"] = json!(a.round());
@@ -656,6 +690,7 @@ async fn session(
         }
     }
     anyhow::ensure!(!feeds.is_empty(), "the server accepted none of the declared feeds");
+    *opened = true;
     tracing::info!(
         "atc feed: connected to {} over {} as {user}, feeding {} stream(s) at {} kbit/s",
         s.server,
@@ -670,6 +705,8 @@ async fn session(
     let mut ping_tick = tokio::time::interval(heartbeat);
     ping_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut reauth_pending = false;
+    // A token refresh in flight; audio keeps flowing while it runs.
+    let mut refresh: Option<tokio::task::JoinHandle<anyhow::Result<AccessToken>>> = None;
 
     loop {
         tokio::select! {
@@ -708,8 +745,11 @@ async fn session(
                             "maintenance" => {
                                 let after = v["reconnect_after_s"].as_u64().unwrap_or(30);
                                 tracing::info!("atc feed: server maintenance, reconnecting in {after}s");
-                                tokio::time::sleep(Duration::from_secs(after.min(600))).await;
-                                return Ok(false);
+                                drop(link);
+                                tokio::select! {
+                                    _ = closed.as_mut() => return Ok(true),
+                                    _ = tokio::time::sleep(Duration::from_secs(after.min(600))) => return Ok(false),
+                                }
                             }
                             other => tracing::info!("atc feed: notice {other}: {}", v["message"].as_str().unwrap_or("")),
                         }
@@ -780,16 +820,23 @@ async fn session(
                 if token.remaining_s().is_some_and(|r| r < 600) {
                     reauth_pending = true;
                 }
-                if reauth_pending && matches!(tokens, TokenSource::Saved(_)) {
-                    match tokens.get().await {
-                        Ok(t) => {
-                            token = t;
-                            link.send_json(p::REAUTH, &json!({"token": token.token}))?;
-                            reauth_pending = false;
-                            tracing::debug!("atc feed: access token refreshed");
-                        }
-                        Err(e) => tracing::warn!("atc feed: token refresh failed: {e:#}"),
+                if reauth_pending && refresh.is_none() {
+                    if let TokenSource::Saved(path) = tokens {
+                        let path = path.clone();
+                        refresh = Some(tokio::task::spawn_blocking(move || atc_auth::refresh(&path)));
                     }
+                }
+            }
+            r = async { refresh.as_mut().expect("guarded").await }, if refresh.is_some() => {
+                refresh = None;
+                match r.map_err(anyhow::Error::from).and_then(|r| r) {
+                    Ok(t) => {
+                        token = t;
+                        link.send_json(p::REAUTH, &json!({"token": token.token}))?;
+                        reauth_pending = false;
+                        tracing::debug!("atc feed: access token refreshed");
+                    }
+                    Err(e) => tracing::warn!("atc feed: token refresh failed: {e:#}"),
                 }
             }
             _ = ping_tick.tick() => {

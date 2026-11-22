@@ -506,7 +506,7 @@ impl ModeChannel {
             Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
             Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
             Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
-            Mode::Airband => xng_mode_airband::CHANNEL_PASSBAND_HZ,
+            Mode::Airband => xng_mode_airband::FRONT_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -1099,9 +1099,10 @@ fn spawn_airband_outputs(
             Ok(cfg) => {
                 crate::airband::scan_stream::install(cfg);
                 let rx = bus.subscribe();
+                let audio = crate::airband::hub::hub().subscribe();
                 tasks.push(tokio::spawn(async move {
                     tokio::select! {
-                        _ = crate::airband::scan_stream::run() => {}
+                        _ = crate::airband::scan_stream::run(audio) => {}
                         _ = crate::airband::bus_closed(rx) => {}
                     }
                     Ok(())
@@ -1111,13 +1112,13 @@ fn spawn_airband_outputs(
         }
     }
     match crate::outputs::airband_record::Recorder::new(o) {
-        Ok(Some(rec)) => tasks.push(tokio::spawn(crate::outputs::airband_record::run(bus.subscribe(), rec))),
+        Ok(Some(rec)) => tasks.push(tokio::spawn(crate::outputs::airband_record::run(crate::airband::hub::hub().subscribe(), bus.subscribe(), rec))),
         Ok(None) => {}
         Err(e) => tracing::error!("airband recordings: {e}"),
     }
     for t in &o.udp {
         match crate::outputs::airband_udp::parse_target(t) {
-            Ok(target) => tasks.push(tokio::spawn(crate::outputs::airband_udp::run(bus.subscribe(), target))),
+            Ok(target) => tasks.push(tokio::spawn(crate::outputs::airband_udp::run(crate::airband::hub::hub().subscribe(), bus.subscribe(), target))),
             Err(e) => tracing::error!("{e}"),
         }
     }
@@ -1130,7 +1131,7 @@ fn spawn_airband_outputs(
                 } else {
                     crate::airband::StreamId::Mix
                 });
-                tasks.push(tokio::spawn(crate::outputs::airband_icecast::run(bus.subscribe(), t)))
+                tasks.push(tokio::spawn(crate::outputs::airband_icecast::run(crate::airband::hub::hub().subscribe(), bus.subscribe(), t)))
             }
             Err(e) => tracing::error!("{e}"),
         }
@@ -1212,6 +1213,7 @@ pub(crate) fn spawn_interrupt_handler(stop: Arc<AtomicBool>, what: &'static str)
 
 /// Run a decode session until the source ends or `stop` is set.
 pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow::Result<()> {
+    crate::airband::hub::hub().reset();
     let sample_rate = source.sample_rate();
     let capture_center = if cfg.center_hz > 0 { cfg.center_hz } else { source.center_freq_hz() };
 
@@ -1503,6 +1505,7 @@ fn publish_msg(
 /// as a single unit.
 pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow::Result<()> {
     anyhow::ensure!(!sessions.is_empty(), "station config has no sessions");
+    crate::airband::hub::hub().reset();
 
     struct Prepared {
         source: Box<dyn IqSource>,
@@ -1853,6 +1856,10 @@ fn collapse_airband(
         return Ok(decoders);
     }
     let freqs: Vec<u64> = decoders.iter().flat_map(|g| g.freqs.iter().copied()).collect();
+    let mut seen = std::collections::HashSet::new();
+    if let Some(f) = freqs.iter().find(|&&f| !seen.insert(f)) {
+        anyhow::bail!("airband channel {:.3} MHz is listed twice", *f as f64 / 1e6);
+    }
     let sdr = cfg.sdr.as_ref().map(|s| s.serial.clone().unwrap_or_else(|| s.id.clone()));
     let set = crate::airband::set::AirbandSet::new(sample_rate, capture_center, &freqs, &cfg.airband, sdr)
         .map_err(|e| anyhow::anyhow!("airband: {e}"))?;

@@ -77,24 +77,32 @@ pub fn save(path: &Path, c: &Credentials) -> anyhow::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    // A staging file of our own (exclusive, private from the start), so
+    // concurrent saves never share one; then an atomic rename.
+    let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4().simple()));
     {
         let mut o = std::fs::OpenOptions::new();
-        o.write(true).create(true).truncate(true);
+        o.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             o.mode(0o600);
         }
         let mut f = o.open(&tmp)?;
-        std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(c)?)?;
+        if let Err(e) = std::io::Write::write_all(&mut f, &serde_json::to_vec_pretty(c)?) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(())
 }
 
@@ -200,7 +208,15 @@ pub fn refresh(path: &Path) -> anyhow::Result<AccessToken> {
     }
     let t: TokenResponse = serde_json::from_value(v)?;
     let at = absorb(&mut c, t)?;
-    save(path, &c)?;
+    // The request took a while: only save if the sign-in on disk is still
+    // the one we refreshed, so a logout (or a newer sign-in) meanwhile is
+    // not undone.
+    let now = load(path)?;
+    match now.refresh_token.as_deref() {
+        Some(cur) if cur == rt => save(path, &c)?,
+        None => anyhow::bail!("signed out of the Airframes ATC network meanwhile"),
+        Some(_) => tracing::debug!("atc sign-in changed while refreshing; keeping the saved one"),
+    }
     Ok(at)
 }
 
@@ -251,7 +267,8 @@ pub fn device_wait(path: &Path, api: &str, dc: &DeviceCode) -> anyhow::Result<Cr
     let mut interval = dc.interval.max(1);
     let deadline = now_s() + dc.expires_in.unwrap_or(900);
     loop {
-        std::thread::sleep(Duration::from_secs(interval));
+        // Never sleep past the code's expiry.
+        std::thread::sleep(Duration::from_secs(interval.min(deadline.saturating_sub(now_s()))));
         anyhow::ensure!(now_s() < deadline, "the sign-in code expired; run `xng atc login` again");
         let (status, v) = post(
             &format!("{}/auth/token", api.trim_end_matches('/')),

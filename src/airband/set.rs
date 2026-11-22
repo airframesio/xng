@@ -203,6 +203,10 @@ impl AirbandSet {
                         ended += 1;
                         self.open_count = self.open_count.saturating_sub(1);
                         if self.open_count == 0 {
+                            // Mixed audio of this transmission goes out before its Close.
+                            if let Some((start, samples)) = mix_buf.take() {
+                                self.publish_mix(start, &samples, discontinuity);
+                            }
                             self.mix_end(at);
                         }
                     }
@@ -211,17 +215,8 @@ impl AirbandSet {
             out.push((i, freq, self.dec.channel(i).level_dbfs(), msgs, ended, ended));
         }
 
-        if let (Some(meta), Some((start, samples))) = (&self.mix, mix_buf) {
-            if !samples.is_empty() {
-                h.publish(AudioEvent::Audio(Arc::new(AudioFrame {
-                    stream: StreamId::Mix,
-                    chan: meta.clone(),
-                    tx: self.mix_tx,
-                    at: self.clock.at(start),
-                    samples: samples.iter().map(|v| v.clamp(-1.0, 1.0)).collect::<Vec<_>>().into(),
-                    discontinuity,
-                })));
-            }
+        if let Some((start, samples)) = mix_buf {
+            self.publish_mix(start, &samples, discontinuity);
         }
 
         if end_pos >= self.last_status + STATUS_EVERY {
@@ -281,6 +276,21 @@ impl AirbandSet {
             level_dbfs: f32::NEG_INFINITY,
             noise_dbfs: f32::NEG_INFINITY,
         });
+    }
+
+    fn publish_mix(&self, start: u64, samples: &[f32], discontinuity: bool) {
+        let Some(meta) = &self.mix else { return };
+        if samples.is_empty() {
+            return;
+        }
+        hub().publish(AudioEvent::Audio(Arc::new(AudioFrame {
+            stream: StreamId::Mix,
+            chan: meta.clone(),
+            tx: self.mix_tx,
+            at: self.clock.at(start),
+            samples: samples.iter().map(|v| v.clamp(-1.0, 1.0)).collect::<Vec<_>>().into(),
+            discontinuity,
+        })));
     }
 
     fn mix_end(&mut self, at: DateTime<Utc>) {

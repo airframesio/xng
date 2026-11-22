@@ -410,6 +410,20 @@ pub fn build(
             },
         ));
     }
+    // Airband streams are named by frequency, so a frequency may be heard by
+    // one session only.
+    let mut seen = std::collections::HashSet::new();
+    for (_, cfg) in &sessions {
+        if cfg.mode == xng_types::Mode::Airband {
+            for &f in &cfg.channels_hz {
+                anyhow::ensure!(
+                    seen.insert(f),
+                    "airband channel {:.3} MHz is listed more than once (each frequency can be heard by one session)",
+                    f as f64 / 1e6
+                );
+            }
+        }
+    }
     Ok(sessions)
 }
 
@@ -533,7 +547,12 @@ mod tests {
         );
         assert_eq!(f.sessions[1].airband.channel(135_100_000).0.modulation, xng_mode_airband::Modulation::Nfm);
         let o = &f.outputs.airband;
+        // The example uses Ogg recordings, Icecast and the ATC feed, which
+        // all need Opus.
+        #[cfg(feature = "opus")]
         o.validate().unwrap();
+        #[cfg(not(feature = "opus"))]
+        assert!(o.validate().is_err());
         assert_eq!(o.scan.as_ref().unwrap().priority, vec!["120.5".to_string()]);
         let atc = o.atc.as_ref().unwrap();
         assert_eq!(atc.location_precision_m, 500);

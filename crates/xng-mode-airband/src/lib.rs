@@ -47,14 +47,16 @@ use xng_types::{DecodeQuality, Message, MessageBody, Mode, Provenance, SignalQua
 /// ~3.5 kHz; 16 kHz is also what speech recognisers (Whisper) take and the
 /// native wideband rate of Opus.
 pub const CHANNEL_RATE: f64 = 16_000.0;
-/// Widest one-sided channel passband the core will configure; the runtime
-/// uses it to check that a channel fits inside the capture.
+/// Widest one-sided channel passband the core will configure (half the
+/// widest allowed channel bandwidth).
 pub const CHANNEL_PASSBAND_HZ: f64 = 6_250.0;
 /// Squelch block length (seconds).
 pub const BLOCK_S: f64 = 0.010;
 const BLOCK_LEN: usize = (CHANNEL_RATE * BLOCK_S) as usize;
-/// One-sided passband of the shared multichannel front end (Hz).
-const FRONT_PASSBAND_HZ: f64 = 7_000.0;
+/// One-sided passband of the shared multichannel front end (Hz). The
+/// runtime uses it to check that a channel fits inside the capture, so every
+/// layout it accepts can be built.
+pub const FRONT_PASSBAND_HZ: f64 = 7_000.0;
 /// AFC correction limit per 10 ms block (Hz): pulls in 2.5 kHz in 1 s.
 const AFC_MAX_STEP_HZ: f64 = 25.0;
 
@@ -172,6 +174,20 @@ impl ChannelConfig {
                 return Err(format!("notch {n} Hz out of range"));
             }
         }
+        if self.modulation == Modulation::Nfm && !(self.nfm_deviation_hz.is_finite() && self.nfm_deviation_hz > 0.0) {
+            return Err(format!("nfm deviation {} Hz must be a positive number", self.nfm_deviation_hz));
+        }
+        for (name, v) in [
+            ("gain", self.gain_db),
+            ("highpass", self.highpass_hz),
+            ("lowpass", self.lowpass_hz),
+            ("afc", self.afc_max_hz),
+            ("tau", self.tau_us),
+        ] {
+            if !v.is_finite() {
+                return Err(format!("{name} must be a finite number"));
+            }
+        }
         if self.lowpass_hz > 0.0 && self.lowpass_hz >= CHANNEL_RATE as f32 / 2.0 {
             return Err(format!("lowpass {} Hz must be below {} Hz", self.lowpass_hz, CHANNEL_RATE / 2.0));
         }
@@ -254,6 +270,8 @@ pub struct AirbandChannelDecoder {
     airtime_s: f64,
     /// Squelch `Off`: the one continuous "transmission" has been announced.
     continuous_started: bool,
+    /// Key-up fade progress in samples (`FADE_IN` = done).
+    fade_pos: usize,
 }
 
 impl AirbandChannelDecoder {
@@ -267,6 +285,9 @@ impl AirbandChannelDecoder {
         } else {
             Some(Ddc::new(input_rate, CHANNEL_RATE, offset_hz, half_bw)?)
         };
+        // Without a DDC nothing has limited the RF bandwidth yet: filter at
+        // the channel rate so the squelch only measures this channel.
+        let chan_fir = ddc.is_none().then(|| Fir::new(lowpass_taps(half_bw / CHANNEL_RATE, 95)));
         let rate = CHANNEL_RATE;
         let pair = |mk: &dyn Fn() -> Biquad| [mk(), mk()];
         let hp = (cfg.highpass_hz > 0.0)
@@ -283,7 +304,7 @@ impl AirbandChannelDecoder {
             gain: 10f32.powf(cfg.gain_db / 20.0),
             cfg,
             ddc,
-            chan_fir: None,
+            chan_fir,
             chan: Vec::new(),
             filtered: Vec::new(),
             afc_hz: 0.0,
@@ -315,6 +336,7 @@ impl AirbandChannelDecoder {
             transmissions: 0,
             airtime_s: 0.0,
             continuous_started: false,
+            fade_pos: FADE_IN,
         })
     }
 
@@ -324,9 +346,7 @@ impl AirbandChannelDecoder {
     pub fn at_channel_rate(cfg: ChannelConfig, front_passband_hz: f64) -> Result<Self, String> {
         let mut d = Self::new(CHANNEL_RATE, 0.0, cfg)?;
         let half = d.cfg.bandwidth() / 2.0;
-        if half + 250.0 < front_passband_hz {
-            d.chan_fir = Some(Fir::new(lowpass_taps(half / CHANNEL_RATE, 95)));
-        }
+        d.chan_fir = (half + 250.0 < front_passband_hz).then(|| Fir::new(lowpass_taps(half / CHANNEL_RATE, 95)));
         Ok(d)
     }
 
@@ -554,17 +574,26 @@ impl AirbandChannelDecoder {
                     level_dbfs: power_db,
                     noise_dbfs: self.squelch.noise_db(),
                 });
-                let first = events.len();
-                for b in pre {
-                    push_audio(events, start, b);
+                self.fade_pos = 0;
+                let mut at = start;
+                for mut b in pre {
+                    apply_fade(&mut self.fade_pos, &mut b);
+                    let n = b.len() as u64;
+                    push_audio(events, at, b);
+                    at += n;
                 }
+                let mut block = block;
+                apply_fade(&mut self.fade_pos, &mut block);
                 push_audio(events, block_start, block);
-                fade_in(&mut events[first..]);
             }
             Transition::Closed => {
                 let e = self.end_event();
                 events.push(e);
-                self.remember_preroll(block);
+                // The next carrier must show its own tone.
+                if let Some(g) = &mut self.ctcss {
+                    g.reset();
+                }
+                self.remember_preroll(block, power_db);
             }
             Transition::None => {
                 if self.squelch.is_open() {
@@ -574,18 +603,28 @@ impl AirbandChannelDecoder {
                         self.tx_sum_db += power_db as f64;
                         self.tx_blocks += 1;
                     }
+                    let mut block = block;
+                    apply_fade(&mut self.fade_pos, &mut block);
                     push_audio(events, block_start, block);
                 } else {
-                    self.remember_preroll(block);
+                    self.remember_preroll(block, power_db);
                 }
             }
         }
     }
 
-    fn remember_preroll(&mut self, block: Vec<f32>) {
+    fn remember_preroll(&mut self, block: Vec<f32>, power_db: f32) {
         // Keep as many blocks as it takes the squelch to open, minus the one
-        // that will be passed directly.
-        let keep = self.squelch.open_blocks().saturating_sub(1) as usize;
+        // that will be passed directly. With CTCSS, a carrier waits for its
+        // tone to be confirmed (up to two gate windows, since the carrier can
+        // start mid-window), so keep that carrier's audio too; a block with
+        // no carrier drops back to the short pre-roll.
+        let mut keep = self.squelch.open_blocks().saturating_sub(1) as usize;
+        if let Some(g) = &self.ctcss {
+            if power_db >= self.squelch.threshold_db() {
+                keep += 2 * g.window_len().div_ceil(BLOCK_LEN) + 1;
+            }
+        }
         if keep == 0 {
             self.preroll.clear();
             return;
@@ -703,19 +742,16 @@ fn db_to_amp(db: f32) -> f32 {
 /// 20 ms of each transmission are faded in.
 const FADE_IN: usize = (CHANNEL_RATE * 0.020) as usize;
 
-fn fade_in(events: &mut [AirbandEvent]) {
-    let mut k = 0usize;
-    for e in events {
-        if let AirbandEvent::Audio { samples, .. } = e {
-            for v in samples.iter_mut() {
-                if k >= FADE_IN {
-                    return;
-                }
-                let g = 0.5 - 0.5 * (std::f32::consts::PI * k as f32 / FADE_IN as f32).cos();
-                *v *= g;
-                k += 1;
-            }
+/// Apply the key-up fade to the next samples of a transmission; `pos`
+/// carries the progress across blocks and `process` calls.
+fn apply_fade(pos: &mut usize, samples: &mut [f32]) {
+    for v in samples.iter_mut() {
+        if *pos >= FADE_IN {
+            return;
         }
+        let g = 0.5 - 0.5 * (std::f32::consts::PI * *pos as f32 / FADE_IN as f32).cos();
+        *v *= g;
+        *pos += 1;
     }
 }
 
@@ -929,8 +965,30 @@ mod tests {
         let mut dec = AirbandChannelDecoder::new(RATE, 0.0, cfg).unwrap();
         let (txs, _) = collect(&run(&mut dec, &iq));
         assert_eq!(txs.len(), 1, "{txs:?}");
+        // The carrier's audio is kept while its tone is confirmed, so the
+        // transmission starts with the carrier, not after the tone check.
         let start = txs[0].0 as f64 / CHANNEL_RATE;
-        assert!(start > 2.5 && start < 3.5, "{start}");
+        assert!(start > 2.45 && start < 2.55, "{start}");
+    }
+
+    #[test]
+    fn preroll_audio_is_contiguous() {
+        // A longer open delay means several pre-roll blocks.
+        let iq = am_capture(RATE, 2.0, 0.0, &[burst(0.5, 1.0, 0.05)], 1e-5, 7);
+        let cfg = ChannelConfig { open_ms: 60, ..Default::default() };
+        let mut dec = AirbandChannelDecoder::new(RATE, 0.0, cfg).unwrap();
+        let mut next: Option<u64> = None;
+        for e in run(&mut dec, &iq) {
+            match e {
+                AirbandEvent::Start { sample, .. } => next = Some(sample),
+                AirbandEvent::Audio { sample, samples } => {
+                    assert_eq!(Some(sample), next, "audio must continue where the last block ended");
+                    next = Some(sample + samples.len() as u64);
+                }
+                _ => {}
+            }
+        }
+        assert!(next.is_some());
     }
 
     #[test]

@@ -188,6 +188,17 @@ pub fn hub() -> &'static AudioHub {
 }
 
 impl AudioHub {
+    /// Forget every channel, status, history row, mix flag and scanner left
+    /// by an earlier run, so a new run in the same process (the desktop
+    /// engine) starts clean. Called before any session registers channels.
+    pub fn reset(&self) {
+        self.channels.lock().unwrap().clear();
+        self.status.lock().unwrap().clear();
+        self.recent.lock().unwrap().clear();
+        *self.scan.lock().unwrap() = None;
+        self.mix.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<AudioEvent> {
         self.tx.subscribe()
     }

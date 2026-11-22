@@ -85,7 +85,8 @@ attribution. GPL projects are listed as fact references only.
 | airframesio/airframes-client — https://github.com/airframesio/airframes-client | Prior protobuf art for asf-2.0 design |
 | airframesio/stack (53labs) — https://github.com/airframesio/stack | Current Go/NATS ingest architecture asf-2.0 must integrate with |
 | airframesio/aggregator-atc — https://github.com/airframesio/aggregator-atc | ATC feeder protocol v0.2 (docs/PROTOCOL.md section 4) implemented by the airband ATC feeder; `--dev` server and the pkg/feeder Go client used as the executable spec |
-| RFC 7845 (Ogg Opus), RFC 6716 (Opus), RFC 3533 (Ogg) | Airband recordings, Icecast stream and ATC feed audio framing (OpusHead/OpusTags, granule positions, page CRC) |
+| RFC 6716 (Opus) | Opus packets: airband recordings, the Icecast stream, and the ATC feed's AUDIO frames (bare Opus packets, not Ogg) |
+| RFC 7845 (Ogg Opus), RFC 3533 (Ogg) | Ogg framing for airband recordings and the Icecast stream only (OpusHead/OpusTags, granule positions, page CRC) |
 | RFC 8628 (OAuth 2.0 Device Authorization Grant) | `xng atc login` device flow |
 | sdr-enthusiasts/acars_router — https://github.com/sdr-enthusiasts/acars_router | JSON normalization/dedup conventions, port-per-class scheme |
 | sdr-enthusiasts/docker-acarshub — https://github.com/sdr-enthusiasts/docker-acarshub | Prometheus metric family conventions |

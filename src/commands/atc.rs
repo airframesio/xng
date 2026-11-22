@@ -88,7 +88,10 @@ fn status(path: &Path) -> anyhow::Result<()> {
                 println!("token:       valid for {} min", s / 60);
             }
         }
-        Err(e) => println!("signed in:   saved, but refreshing failed: {e:#}"),
+        Err(e) => {
+            println!("signed in:   saved, but refreshing failed");
+            return Err(e.context("the saved sign-in does not work"));
+        }
     }
     Ok(())
 }
@@ -99,22 +102,31 @@ fn read_line_stdin() -> anyhow::Result<String> {
     Ok(s.trim_end_matches(['\r', '\n']).to_string())
 }
 
-/// Prompt without echo where the terminal allows it.
+/// Prompt for a password with terminal echo off. Refuses to read it when
+/// echo cannot be turned off (use --password-stdin there).
 fn prompt_password(prompt: &str) -> anyhow::Result<String> {
-    print!("{prompt}");
-    std::io::stdout().flush()?;
     #[cfg(unix)]
-    let echo_off = std::process::Command::new("stty")
-        .arg("-echo")
-        .stdin(std::process::Stdio::inherit())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let r = read_line_stdin();
-    #[cfg(unix)]
-    if echo_off {
+    {
+        print!("{prompt}");
+        std::io::stdout().flush()?;
+        let echo_off = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !echo_off {
+            println!();
+            anyhow::bail!("cannot turn off terminal echo; pipe the password with --password-stdin");
+        }
+        let r = read_line_stdin();
         let _ = std::process::Command::new("stty").arg("echo").stdin(std::process::Stdio::inherit()).status();
         println!();
+        r
     }
-    r
+    #[cfg(not(unix))]
+    {
+        let _ = prompt;
+        anyhow::bail!("reading a password from this terminal is not supported; pipe it with --password-stdin or sign in without --email")
+    }
 }

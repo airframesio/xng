@@ -19,7 +19,7 @@
 //! e.g. `nc -lu 7355 | aplay -r 16000 -f S16_LE -c 1` (pick one stream).
 
 use crate::airband::config::{parse_stream, selected};
-use crate::airband::{hub, AudioEvent, StreamId};
+use crate::airband::{AudioEvent, StreamId};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::broadcast;
@@ -40,7 +40,13 @@ pub struct UdpTarget {
 pub fn parse_target(s: &str) -> anyhow::Result<UdpTarget> {
     let mut parts = s.split(',');
     let addr = parts.next().unwrap_or_default().trim().to_string();
-    anyhow::ensure!(addr.contains(':'), "airband UDP target {s:?} needs host:port");
+    let (host, port) = addr.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("airband UDP target {s:?} needs host:port"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    anyhow::ensure!(!host.is_empty(), "airband UDP target {s:?} needs a host");
+    anyhow::ensure!(
+        port.parse::<u16>().is_ok_and(|p| p > 0),
+        "airband UDP target {s:?}: bad port {port:?}"
+    );
     let mut t = UdpTarget { addr, streams: Vec::new(), raw: false };
     for p in parts {
         match p.trim().split_once('=') {
@@ -67,14 +73,18 @@ pub fn header(flags: u8, freq_hz: u64, at_us: u64) -> [u8; HEADER_LEN] {
     h
 }
 
-pub async fn run(bus_rx: broadcast::Receiver<Arc<Message>>, target: UdpTarget) -> std::io::Result<()> {
+pub async fn run(
+    mut rx: tokio::sync::broadcast::Receiver<crate::airband::hub::AudioEvent>,
+    bus_rx: broadcast::Receiver<Arc<Message>>,
+    target: UdpTarget,
+) -> std::io::Result<()> {
     let sock = UdpSocket::bind("0.0.0.0:0").await?;
     sock.connect(&target.addr).await?;
     tracing::info!("airband UDP audio to {}", target.addr);
-    let mut rx = hub().subscribe();
     let closed = crate::airband::bus_closed(bus_rx);
     tokio::pin!(closed);
-    let mut starting: std::collections::HashSet<StreamId> = Default::default();
+    // Streams whose next audio starts a transmission, and which one.
+    let mut starting: std::collections::HashMap<StreamId, u64> = Default::default();
     loop {
         let ev = tokio::select! {
             _ = &mut closed => break,
@@ -82,6 +92,7 @@ pub async fn run(bus_rx: broadcast::Receiver<Arc<Message>>, target: UdpTarget) -
                 Ok(ev) => ev,
                 Err(RecvError::Lagged(n)) => {
                     tracing::warn!("airband UDP lagged, dropped {n} events");
+                    starting.clear();
                     continue;
                 }
                 Err(RecvError::Closed) => break,
@@ -91,8 +102,8 @@ pub async fn run(bus_rx: broadcast::Receiver<Arc<Message>>, target: UdpTarget) -
             continue;
         }
         match ev {
-            AudioEvent::Open { stream, .. } => {
-                starting.insert(stream);
+            AudioEvent::Open { stream, tx, .. } => {
+                starting.insert(stream, tx);
             }
             AudioEvent::Audio(f) => {
                 let pcm = to_i16(&f.samples);
@@ -102,7 +113,8 @@ pub async fn run(bus_rx: broadcast::Receiver<Arc<Message>>, target: UdpTarget) -
                     let mut pkt = Vec::with_capacity(HEADER_LEN + chunk.len() * 2);
                     if !target.raw {
                         let mut flags = 0u8;
-                        if first && starting.remove(&f.stream) {
+                        if first && starting.get(&f.stream) == Some(&f.tx) {
+                            starting.remove(&f.stream);
                             flags |= 1;
                         }
                         if first && f.discontinuity {
@@ -141,6 +153,9 @@ mod tests {
         assert!(t.raw);
         assert!(parse_target("127.0.0.1:7355,raw").is_err());
         assert!(parse_target("localhost").is_err());
+        assert!(parse_target(":7355").is_err());
+        assert!(parse_target("host:99999").is_err());
+        assert!(parse_target("host:x").is_err());
         assert!(parse_target("h:1,bogus=1").is_err());
     }
 

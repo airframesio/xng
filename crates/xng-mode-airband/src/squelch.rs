@@ -42,7 +42,14 @@ impl std::str::FromStr for SquelchMode {
             None => (s.as_str(), None),
         };
         let num = |a: Option<&str>| -> Result<Option<f32>, String> {
-            a.map(|v| v.trim().parse::<f32>().map_err(|_| format!("bad squelch value {v:?}"))).transpose()
+            a.map(|v| {
+                v.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|x| x.is_finite())
+                    .ok_or_else(|| format!("bad squelch value {v:?}"))
+            })
+            .transpose()
         };
         Ok(match kind {
             "auto" => SquelchMode::Auto { snr_db: num(arg)?.unwrap_or(DEFAULT_SNR_DB) },
@@ -258,6 +265,15 @@ mod tests {
             assert!(s.in_hang());
         }
         assert_eq!(s.update(-50.0, true), Transition::Closed);
+    }
+
+    #[test]
+    fn parses_and_rejects_nonfinite() {
+        assert_eq!("manual:-40".parse::<SquelchMode>().unwrap(), SquelchMode::Manual { dbfs: -40.0 });
+        assert_eq!("auto:12".parse::<SquelchMode>().unwrap(), SquelchMode::Auto { snr_db: 12.0 });
+        for bad in ["manual:nan", "auto:inf", "manual:-inf", "manual:x"] {
+            assert!(bad.parse::<SquelchMode>().is_err(), "{bad}");
+        }
     }
 
     #[test]

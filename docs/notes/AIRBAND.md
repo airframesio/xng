@@ -111,8 +111,10 @@ airframesio/aggregator-atc): ALPN `airframes-atc/1`, port 4433.
   quiet channel sends nothing. STATS every 10 s, PING every heartbeat.
 - **Sign-in**: `xng atc login` runs the device flow (`/auth/device/code`,
   then polling `/auth/token`) or `--email` with a password (`/auth/login`),
-  client id `airframes-feeder`. Only the rotating refresh token and the feeder
-  id are kept, in `~/.config/xng/atc.json` (mode 0600). Access tokens (1 h) are
+  client id `airframes-feeder`. `~/.config/xng/atc.json` keeps the API URL,
+  username, user id, feeder id and the rotating refresh token; the refresh
+  token is the only credential stored (the file is mode 0600 on Unix; on other
+  systems it relies on the user profile's permissions). Access tokens (1 h) are
   minted before each connect and replaced in-session with REAUTH. `xng atc
   status` checks the sign-in; `xng atc logout` forgets it and keeps the feeder
   id. `--atc-token dev:<user>` with `--atc-insecure` talks to a local

@@ -101,6 +101,7 @@ impl Engine {
         }
 
         let multi = sessions.len() > 1;
+        crate::airband::hub::hub().reset();
         let mut prepared = Vec::with_capacity(sessions.len());
         let mut infos = Vec::with_capacity(sessions.len());
         for (source, cfg) in sessions {

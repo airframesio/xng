@@ -92,6 +92,7 @@ let playing = null;  // stream id string: "<hz>", "mix", "scan"
 
 // ---- listening: fetch-streamed s16le at 16 kHz, scheduled with Web Audio ----
 let ctx = null, gainNode = null, abort = null, nextT = 0;
+const sources = new Set();  // scheduled buffer sources, stopped on stop()
 function setVol() { if (gainNode) gainNode.gain.value = $('vol').value / 100; }
 $('vol').addEventListener('input', setVol);
 async function listen(s, label) {
@@ -101,19 +102,23 @@ async function listen(s, label) {
   $('playname').textContent = label;
   $('playing').classList.add('show');
   render();
+  // Cancellation is installed before any await, so a stop (or another
+  // listen) while the audio context resumes wins.
+  const ac = new AbortController(); abort = ac;
   if (!ctx) {
     ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     gainNode = ctx.createGain(); gainNode.connect(ctx.destination); setVol();
   }
   await ctx.resume();
-  const ac = new AbortController(); abort = ac;
+  if (abort !== ac) return;
   try {
     const r = await fetch('/airband/stream?s=' + encodeURIComponent(s), { signal: ac.signal, cache: 'no-store' });
+    if (!r.ok || !r.body) throw new Error('HTTP ' + r.status);
     const rd = r.body.getReader();
     let carry = null;
     for (;;) {
       const { value, done } = await rd.read();
-      if (done) break;
+      if (done || abort !== ac) break;
       let bytes = value;
       if (carry) { const b = new Uint8Array(carry.length + bytes.length); b.set(carry); b.set(bytes, carry.length); bytes = b; carry = null; }
       if (bytes.length & 1) { carry = bytes.slice(bytes.length - 1); bytes = bytes.slice(0, bytes.length - 1); }
@@ -127,11 +132,16 @@ async function listen(s, label) {
       // Small jitter buffer: restart 150 ms ahead after a gap.
       if (nextT < ctx.currentTime + 0.02) nextT = ctx.currentTime + 0.15;
       src.start(nextT); nextT += buf.duration;
+      sources.add(src); src.onended = () => sources.delete(src);
     }
   } catch (e) { if (e.name !== 'AbortError') console.warn('airband stream', e); }
+  // The stream ended on its own (server gone, error): leave the playing state.
+  if (abort === ac) stop();
 }
 function stop() {
   if (abort) abort.abort();
+  for (const src of sources) { try { src.stop(); } catch (e) {} }
+  sources.clear();
   abort = null; playing = null; nextT = 0;
   $('playing').classList.remove('show');
   render();
@@ -171,7 +181,19 @@ function channelCard(c) {
   </div>`;
 }
 
+// Re-rendering replaces the buttons; put keyboard focus back on the
+// equivalent one (same action) so tabbing through the page survives polls.
 function render() {
+  const f = document.activeElement;
+  const key = f && f.tagName === 'BUTTON' && f.closest('main') ? f.getAttribute('onclick') : null;
+  draw();
+  if (key) {
+    const again = [...document.querySelectorAll('main button')].find(b => b.getAttribute('onclick') === key);
+    if (again) again.focus();
+  }
+}
+
+function draw() {
   const chans = state.channels || [];
   const open = chans.filter(c => c.status && c.status.open).length;
   $('summary').textContent = chans.length ? `${chans.length} channel${chans.length > 1 ? 's' : ''} · ${open} on air` : '';

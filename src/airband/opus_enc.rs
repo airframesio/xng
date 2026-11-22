@@ -77,6 +77,8 @@ pub struct OggOpus {
     enc: OpusEncoder,
     ogg: OggWriter,
     granule: u64,
+    /// Real (unpadded) input so far, at the hub rate.
+    input: u64,
 }
 
 impl OggOpus {
@@ -87,12 +89,13 @@ impl OggOpus {
         let mut head = ogg.page(&opus_head(super::hub::AUDIO_RATE, enc.pre_skip()), 0, true, false);
         let vendor = concat!("xng ", env!("CARGO_PKG_VERSION"));
         head.extend(ogg.page(&opus_tags(vendor, &[("TITLE", title)]), 0, false, false));
-        Ok((Self { enc, ogg, granule: 0 }, head))
+        Ok((Self { enc, ogg, granule: 0, input: 0 }, head))
     }
 
     /// Encode samples; returns the Ogg pages produced.
     pub fn push(&mut self, samples: &[f32]) -> Vec<u8> {
         let mut out = Vec::new();
+        self.input += samples.len() as u64;
         for p in self.enc.push(samples) {
             self.granule += GRANULE_PER_FRAME;
             out.extend(self.ogg.page(&p, self.granule, false, false));
@@ -100,16 +103,28 @@ impl OggOpus {
         out
     }
 
-    /// Flush the last partial frame and end the stream.
+    /// Flush the last partial frame, encode enough silence to push the
+    /// encoder's delay out, and end the stream. The last page's granule is
+    /// the real input length plus `pre_skip` (RFC 7845 §4), so players trim
+    /// the padding and the decoded length matches what went in.
     pub fn finish(&mut self) -> Vec<u8> {
-        let p = self.enc.flush().or_else(|| self.enc.encode(&[0.0; FRAME]));
-        match p {
-            Some(p) => {
-                self.granule += GRANULE_PER_FRAME;
-                self.ogg.page(&p, self.granule, false, true)
+        let end = self.input * 3 + self.enc.pre_skip() as u64;
+        let mut packets: Vec<Vec<u8>> = self.enc.flush().into_iter().collect();
+        while self.granule + packets.len() as u64 * GRANULE_PER_FRAME < end || packets.is_empty() {
+            match self.enc.encode(&[0.0; FRAME]) {
+                Some(p) => packets.push(p),
+                None => break,
             }
-            None => Vec::new(),
         }
+        let mut out = Vec::new();
+        let n = packets.len();
+        for (i, p) in packets.into_iter().enumerate() {
+            self.granule += GRANULE_PER_FRAME;
+            let last = i + 1 == n;
+            let granule = if last { end.min(self.granule) } else { self.granule };
+            out.extend(self.ogg.page(&p, granule, false, last));
+        }
+        out
     }
 }
 
@@ -143,7 +158,13 @@ mod tests {
         assert_eq!(&head[28..36], b"OpusHead");
         let body = s.push(&vec![0.1; FRAME * 3]);
         assert_eq!(body.windows(4).filter(|w| w == b"OggS").count(), 3);
+        let skip = s.enc.pre_skip() as u64;
         let end = s.finish();
-        assert_eq!(end[5] & 0x04, 0x04);
+        // The last page ends the stream, and its granule is the real input
+        // (3 frames of 320 samples, x3 to 48 kHz) plus pre_skip.
+        let last = end.windows(4).rposition(|w| w == b"OggS").unwrap();
+        assert_eq!(end[last + 5] & 0x04, 0x04);
+        let granule = u64::from_le_bytes(end[last + 6..last + 14].try_into().unwrap());
+        assert_eq!(granule, (FRAME as u64 * 3) * 3 + skip);
     }
 }

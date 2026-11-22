@@ -81,6 +81,11 @@ impl ScanController {
     pub fn on_open(&mut self, freq: u64, now_ms: u64) {
         self.open.entry(freq).or_insert(now_ms);
         if self.current == Some(freq) {
+            // Back within the hold: keep it. After the hold the channel has
+            // no claim, so let `select` weigh it against the others.
+            if self.closed_at.is_some_and(|t| now_ms.saturating_sub(t) >= self.cfg.hold_ms) {
+                self.current = None;
+            }
             self.closed_at = None;
         }
     }
@@ -180,6 +185,22 @@ mod tests {
         s.on_close(A, 700);
         // Hold expires; B is still open and takes over.
         assert_eq!(s.select(1_800), Some(B));
+    }
+
+    #[test]
+    fn reopen_after_hold_yields_to_earlier_channel() {
+        let hold = ctl(vec![]).cfg.hold_ms;
+        for (reopen, want) in [(hold - 1, A), (hold + 1, B)] {
+            let mut s = ctl(vec![]);
+            s.on_open(A, 0);
+            assert_eq!(s.select(0), Some(A));
+            s.on_open(B, 50);
+            s.on_close(A, 100);
+            // A keys up again just before / just after its hold ran out,
+            // with no select in between.
+            s.on_open(A, 100 + reopen);
+            assert_eq!(s.select(100 + reopen), Some(want), "reopen at +{reopen} ms");
+        }
     }
 
     #[test]

@@ -6,7 +6,7 @@
 use crate::airband::config::parse_stream;
 use crate::airband::{hub, AudioEvent};
 use serde_json::{json, Value};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::broadcast::error::RecvError;
 
 pub const PAGE: &str = include_str!("assets/airband.html");
@@ -108,17 +108,25 @@ pub async fn stream(mut sock: tokio::net::TcpStream, path: &str) {
     }
     let _ = sock.set_nodelay(true);
     tracing::debug!("dashboard listener on airband stream {stream}");
+    let (mut rd, mut wr) = sock.into_split();
+    let mut scratch = [0u8; 256];
     loop {
-        match rx.recv().await {
-            Ok(AudioEvent::Audio(f)) if f.stream == stream => {
-                let pcm = xng_mode_airband::codec::i16_le_bytes(&xng_mode_airband::codec::to_i16(&f.samples));
-                if sock.write_all(&pcm).await.is_err() {
-                    break;
+        tokio::select! {
+            ev = rx.recv() => match ev {
+                Ok(AudioEvent::Audio(f)) if f.stream == stream => {
+                    let pcm = xng_mode_airband::codec::i16_le_bytes(&xng_mode_airband::codec::to_i16(&f.samples));
+                    if wr.write_all(&pcm).await.is_err() {
+                        break;
+                    }
                 }
-            }
-            Ok(_) => {}
-            Err(RecvError::Lagged(_)) => {}
-            Err(RecvError::Closed) => break,
+                Ok(_) => {}
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+            // The listener sends nothing after its request, so a read
+            // returning means it hung up; this frees the slot even while the
+            // channel is quiet and nothing is being written.
+            r = rd.read(&mut scratch) => if matches!(r, Ok(0) | Err(_)) { break },
         }
     }
 }

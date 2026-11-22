@@ -296,7 +296,7 @@ xng listen --sdr driver=rtlsdr --mode adsb -r 2400000 -c 1090.000M --channels 10
 # Airband voice: three tower/ground/approach channels from one RTL-SDR,
 # a scanner stream, recordings, the browser listening page on :8080/airband,
 # and a feed to the Airframes ATC network (run `xng atc login` once first)
-xng listen --sdr driver=rtlsdr --mode airband -r 2400000 \
+xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
     --channels 120.5,120.9,121.8 \
     --labels "120.5=SFO Tower,120.9=SFO Ground West,121.8=SFO Ground" \
     --scan --scan-priority 120.5 --record-dir ~/airband --http 0.0.0.0:8080 \

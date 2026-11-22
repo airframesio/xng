@@ -75,12 +75,15 @@ pub fn pong_payload(ping: &[u8], now_us: u64) -> Vec<u8> {
 
 /// Read one frame. `Ok(None)` at a clean end of stream.
 pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> anyhow::Result<Option<(u8, Vec<u8>)>> {
+    // A clean end of stream is only possible before a frame starts; once its
+    // first byte is in, a short read is a truncated frame.
     let mut head = [0u8; 4];
-    match r.read_exact(&mut head).await {
+    match r.read_exact(&mut head[..1]).await {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(e) => return Err(e.into()),
     }
+    r.read_exact(&mut head[1..]).await.map_err(|e| anyhow::anyhow!("truncated ATC frame header: {e}"))?;
     let len = u32::from_be_bytes([0, head[1], head[2], head[3]]) as usize;
     let mut payload = vec![0u8; len];
     r.read_exact(&mut payload).await?;
@@ -161,6 +164,8 @@ mod tests {
         let (t, p) = read_frame(&mut r).await.unwrap().unwrap();
         assert_eq!((t, p.as_slice()), (NOTICE, b"{\"code\":\"x\"}".as_slice()));
         assert!(read_frame(&mut r).await.unwrap().is_none());
+        let partial = [PING, 0u8];
+        assert!(read_frame(&mut partial.as_slice()).await.is_err(), "a partial header is an error");
     }
 
     #[test]

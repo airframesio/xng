@@ -21,8 +21,7 @@ pub fn install(cfg: ScanConfig) {
 
 /// Run the scan stream. The hub never closes, so the caller ends this task
 /// together with the session.
-pub async fn run() {
-    let mut rx = hub().subscribe();
+pub async fn run(mut rx: tokio::sync::broadcast::Receiver<crate::airband::hub::AudioEvent>) {
     let mut follower = Follower::default();
     loop {
         match rx.recv().await {
@@ -31,7 +30,12 @@ pub async fn run() {
                     hub().publish(out);
                 }
             }
-            Err(RecvError::Lagged(n)) => tracing::warn!("airband scan stream lagged, dropped {n} events"),
+            Err(RecvError::Lagged(n)) => {
+                tracing::warn!("airband scan stream lagged, dropped {n} events; resyncing");
+                for out in follower.resync(now_ms()) {
+                    hub().publish(out);
+                }
+            }
             Err(RecvError::Closed) => break,
         }
     }
@@ -121,6 +125,41 @@ impl Follower {
             _ => {}
         }
         out
+    }
+
+    /// After dropped events: take which channels are open from the hub's
+    /// latest status instead of the lost Open/Close events, reselect, and
+    /// close the scan transmission if its channel is no longer selected.
+    fn resync(&mut self, now: u64) -> Vec<AudioEvent> {
+        let status = hub().status();
+        let mut guard = hub().scan.lock().unwrap();
+        let Some(state) = guard.as_mut() else { return Vec::new() };
+        for st in &status {
+            match (st.open, state.ctl.is_open(st.freq_hz)) {
+                (true, false) => state.ctl.on_open(st.freq_hz, now),
+                (false, true) => state.ctl.on_close(st.freq_hz, now),
+                _ => {}
+            }
+        }
+        let sel = state.ctl.select(now);
+        state.selected = sel;
+        drop(guard);
+        match self.source {
+            Some(src) if sel != Some(src) || !status.iter().any(|st| st.freq_hz == src && st.open) => {
+                self.source = None;
+                let Some(chan) = hub().channel(src) else { return Vec::new() };
+                vec![AudioEvent::Close {
+                    stream: StreamId::Scan,
+                    chan,
+                    tx: self.tx,
+                    at: chrono::Utc::now(),
+                    duration_s: 0.0,
+                    peak_dbfs: f32::NEG_INFINITY,
+                    noise_dbfs: f32::NEG_INFINITY,
+                }]
+            }
+            _ => Vec::new(),
+        }
     }
 
     fn close(&mut self, ev: &AudioEvent, src: u64) -> AudioEvent {
