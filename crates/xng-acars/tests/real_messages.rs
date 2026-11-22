@@ -395,3 +395,48 @@ fn label_5z_b3_departure_clearance() {
     assert_eq!(arrival_runway.as_deref(), Some("27C"));
     assert_eq!(day, Some(14));
 }
+
+// --- Label RA arrival gate uplinks ---
+// Production texts (shortened), shared with event-digger
+// `pkg/handlers/labelra_gate_test.go`. Goes through `decode("RA", ...)` so
+// the RA routing and the JSON shape are covered.
+#[test]
+fn ra_united_gate_assign_tab_indented() {
+    let d = decode(
+        "RA",
+        "QUNDCULUA~1GATE ASSIGN\r\n\tUA0942/21 KIAD LPPT\r\n\tSENT: 09:14:42Z\r\n\tGATE 43    OPEN\r\n\tRAMP FREQ  \r\n\tOPS FREQ   131.575\r\n\tEON        1003Z\r\n",
+        false,
+    );
+    let Some(app @ AcarsApp::Gate(_)) = &d.app else {
+        panic!("expected Gate: {:?}", d.app);
+    };
+    let j = serde_json::to_value(app).unwrap();
+    assert_eq!(j["app"], "gate");
+    assert_eq!(j["format"], "united_gate_assign");
+    assert_eq!(j["gate"], "43");
+    assert_eq!(j["airport"], "LPPT");
+    assert_eq!(j["departure"], "KIAD");
+    assert_eq!(j["eta"], "1003");
+    assert!(j.get("ramp_frequency").is_none());
+}
+
+#[test]
+fn ra_republic_and_skywest_arrival_gates() {
+    let d = decode("RA", "QUHDQDDRP~1ARRIVAL GATE\r\nINFORMATION\r\nRPA N401YX YX4450 ORD MSN ETA = 0542 GATE = 16\r\n", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected Gate: {:?}", d.app) };
+    assert_eq!((g.gate.as_str(), g.airport.as_str()), ("16", "MSN"));
+
+    let d = decode("RA", "QUHDQITOO.1ARR GATE INFO   \r\nBFL ARRIVAL GATE 4\r\nNEXT FLIGHT INFORMATION-\r\n N-A 4634 BFL-SFO 220700\r\n", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected Gate: {:?}", d.app) };
+    assert_eq!((g.gate.as_str(), g.airport.as_str()), ("4", "BFL"));
+}
+
+#[test]
+fn ra_finnair_connection_gates_are_not_decoded() {
+    let d = decode(
+        "RA",
+        "QUHELASAY~1\r\nCURRENT FLIGHT\r\nFLIGHT  ESTIMATED ARRIVAL TIME\r\nAY1014   EIBT  UTC  \r\n\r\nCONNECTION INFO\r\nFLIGHT DATE     TIME  TO  GATE \r\nAY0957 20261122 09:35 CPH 31\r\n",
+        false,
+    );
+    assert!(!matches!(d.app, Some(AcarsApp::Gate(_))), "{:?}", d.app);
+}

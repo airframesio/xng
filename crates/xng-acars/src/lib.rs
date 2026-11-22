@@ -15,6 +15,7 @@ pub mod cpdlc;
 pub mod block;
 pub mod cfb;
 pub mod fpn;
+pub mod gate;
 pub mod loadsheet;
 pub mod media_adv;
 pub mod met;
@@ -76,6 +77,9 @@ pub enum AcarsApp {
     /// Weight and balance loadsheet (IATA AHM 517 and airline layouts), its
     /// acceptance by the crew, or a request for one; on any label.
     Loadsheet(Box<loadsheet::Loadsheet>),
+    /// Arrival gate assignment uplink (label `RA`: United GATE ASSIGN /
+    /// GATE CHANGE, Republic ARRIVAL GATE, SkyWest ARR GATE INFO).
+    Gate(gate::GateAssignment),
 }
 
 /// Result of running the application layer over one ACARS message.
@@ -130,6 +134,7 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
         "MA" => miam::parse(body).map(|frame| AcarsApp::Miam { frame }),
         "SA" => media_adv::parse(body).map(AcarsApp::MediaAdvisory),
         "5Z" => airline5z::parse(body).map(AcarsApp::Airline5z),
+        "RA" => gate::parse(text).map(AcarsApp::Gate),
         _ => qseries::classify(label)
             .map(AcarsApp::QSeries)
             .or_else(|| military::parse(text).map(|m| AcarsApp::Military(Box::new(m)))),
@@ -184,6 +189,7 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
         }),
         AcarsApp::Military(m) => Some(m.summary()),
         AcarsApp::Loadsheet(l) => Some(l.summary()),
+        AcarsApp::Gate(g) => Some(g.summary()),
         AcarsApp::Miam { frame } => Some(match frame {
             miam::MiamFrame::SingleTransfer(p) => format!(
                 "MIAM v{} {}{}{}",

@@ -86,6 +86,16 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
             }
             Some(s)
         }
+        "gate" => {
+            let mut s = format!("GATE {} {}", app.get("gate")?.as_str()?, app.get("airport")?.as_str()?);
+            if let Some(f) = app.get("flight").and_then(|v| v.as_str()) {
+                s.push_str(&format!(" {f}"));
+            }
+            if let Some(e) = app.get("eta").and_then(|v| v.as_str()) {
+                s.push_str(&format!(" ETA {e}"));
+            }
+            Some(s)
+        }
         _ => None,
     }
 }
@@ -856,5 +866,13 @@ mod tests {
         );
         assert!(s.contains("IRIDIUM voice VOC"), "{s}");
         assert!(!s.contains("lcw="), "silent lcw should be omitted: {s}");
+    }
+
+    #[test]
+    fn gate_app_summary() {
+        let app = json!({"app": "gate", "format": "united_gate_assign", "gate": "43", "airport": "LPPT", "flight": "UA0942", "eta": "1003"});
+        assert_eq!(app_summary(&app).as_deref(), Some("GATE 43 LPPT UA0942 ETA 1003"));
+        let app = json!({"app": "gate", "format": "skywest_arr_gate_info", "gate": "4", "airport": "BFL"});
+        assert_eq!(app_summary(&app).as_deref(), Some("GATE 4 BFL"));
     }
 }
