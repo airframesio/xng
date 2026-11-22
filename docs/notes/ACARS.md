@@ -287,9 +287,19 @@ type decodes); Jazz `JZA GATE DATA UPLINK` with `FLIGHT:
 (airport from the gate line) or `ARR GATE IS NOW C26/OPS` (route
 destination) (RA); `SC8402 ARR:ZSJN` / `GATE:10` (RA); LATAM `GATE
 ASSIGNMENT` / `PPOS:602L` parking position, `PPOS:N/A` ignored (RA).
+Stands, bays and parking positions are reported as gates: Delta crew P/F
+(RA, 25; a `CREW P/F` or `PART  1 OF` line) `ARR ATL GTE E15`; BA PAD11
+(10, 11, first line `:PAD11`) the first `STAND 503  ETA 1357` after
+`ARRIVAL- GTNED BA1447`, stopping at `ON STAND-` and `CREW DEPT` (the ETA
+stays with the OOOI extractor, in the same decode); Virgin Australia
+`VA1007, BAY: 45A` (3M); Turkish `- EXPECTED PARKING POSITION: F8R`,
+`PARKING (PRE)ASSIGNED:138` (`NA` ignored) and Finnair `ARRIVING STAND 131`
+(RA; Finnair's connection lists are still not read); Jazz flight data `DEP
+YVR/06:20Z/GTE C40` / `ARR YYC/07:48Z/GTE A17` (C1) gives the arrival gate
+with `departure_gate`.
 `format` names the family (`PDC`, `FLT_ROUTE_GATE`, ...). A gate must
 contain a digit; reading stops at connections, `NEXT FLT`/`NEXT FLIGHT`/
-`NEXT LEG`/`NEXT SECTOR`,
+`NEXT LEG`/`NEXT SECTOR`/`- NEXT FLIGHT`,
 `TURN FLT`, `AC TURN` and `END`. RA uplinks read by `parse` (United,
 Republic, SkyWest, Finnair headers) are skipped. Hawaiian, JetBlue and
 Jetstar do not name the airport, so `arrival` is absent. 5Z `/C3 GATE REQ`

@@ -80,7 +80,8 @@ pub enum AcarsApp {
     /// Gate assignment: arrival gate uplinks on label RA (United GATE ASSIGN
     /// / GATE CHANGE, Republic, SkyWest, Air Wisconsin, Frontier, American
     /// and its regionals), pre-departure clearance departure gates (B3), and
-    /// airline gate messages on 40, 41, 42, C1, 21, 3T and 5Z.
+    /// airline gate, stand and parking messages on 10, 11, 21, 25, 3M, 3T,
+    /// 40, 41, 42, 5Z and C1.
     Gate(gate::GateInfo),
 }
 
@@ -148,8 +149,8 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
     if out.app.is_none() && loadsheet::may_be_loadsheet(text) {
         out.app = loadsheet::parse(text).map(|l| AcarsApp::Loadsheet(Box::new(l)));
     }
-    // Gate reports (B3 clearances, airline gate messages on 40/41/42/C1/21/
-    // 3T/5Z, and the label RA families after the uplinks above) come last, so
+    // Gate reports (B3 clearances, airline gate/stand messages on 10/11/21/
+    // 25/3M/3T/40/41/42/5Z/C1, and the label RA families after the uplinks above) come last, so
     // they never replace a richer decode of the same text.
     if out.app.is_none() {
         out.app = gate::parse_report(label, text).map(AcarsApp::Gate);

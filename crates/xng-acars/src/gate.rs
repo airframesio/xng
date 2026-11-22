@@ -55,13 +55,22 @@
 //! | WestJet | RA | `WS 345 YXE-YYC` / `YYC GATE D80/OPS`, `ARR GATE IS NOW C26/OPS` |
 //! | Shandong and others | RA | `SC8402 ARR:ZSJN` / `GATE:10` |
 //! | LATAM | RA | `GATE ASSIGNMENT` / `PPOS:602L` |
+//! | Delta crew P/F | RA, 25 | `CREW P/F` ... `ARR ATL GTE E15` |
+//! | BA PAD11 arrival stand | 10, 11 | `:PAD11` / `ARRIVAL- GTNED BA1447` / `STAND 503  ETA 1357` |
+//! | Virgin Australia bay | 3M | `VA1007, BAY: 45A` |
+//! | Turkish parking position | RA | `- EXPECTED PARKING POSITION: F8R` |
+//! | Finnair arriving stand | RA | `AY1074 22NOV26` / `ARRIVING STAND 131 ELDT 12:53` |
+//! | Parking assigned | RA | `PARKING PREASSIGNED:138`, `PARKING ASSIGNED:138` |
+//! | Jazz flight data (both gates) | C1 | `DEP YVR/06:20Z/GTE C40` / `ARR YYC/07:48Z/GTE A17` |
 //!
 //! A gate must contain a digit, so `GATE OPEN` or `GATE STATUS NOT AVAIL`
 //! never match. Reading stops where a message moves on to other flights
 //! (crew/pax connections, `NEXT FLT`, `NEXT LEG`, `NEXT SECTOR`,
-//! `TURN FLT`, `AC TURN`, `END`). The
-//! label RA uplinks read by [`parse`] and Finnair connection lists are left
-//! to it; gate requests (5Z `/C3 GATE REQ`) carry no gate and are not read.
+//! `- NEXT FLIGHT`, `TURN FLT`, `AC TURN`, `END`, and for BA PAD11
+//! `ON STAND-` and `CREW DEPT`). Stands, bays and parking positions are
+//! reported as gates. The
+//! label RA uplinks read by [`parse`] are left to it, Finnair connection
+//! lists are never read (only Finnair's arriving stand); gate requests (5Z `/C3 GATE REQ`) carry no gate and are not read.
 
 use regex::Regex;
 use serde::Serialize;
@@ -108,6 +117,10 @@ pub struct GateInfo {
     /// Departure airport; for a departure gate, the airport the gate is at.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub departure: Option<String>,
+    /// Gate the flight left from, when an arrival gate report also names it
+    /// (Jazz flight data `DEP YVR/06:20Z/GTE C40`); it is at `departure`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub departure_gate: Option<String>,
     /// Arrival airport, as written (ICAO for United and clearances, IATA
     /// otherwise); for an arrival gate, the airport the gate is at. Some
     /// airlines (Hawaiian, JetBlue, Jetstar) do not name it.
@@ -144,6 +157,7 @@ impl GateInfo {
             flight_number: None,
             day: None,
             departure: None,
+            departure_gate: None,
             arrival: (!arrival.is_empty()).then(|| arrival.to_owned()),
             sent_time: None,
             eon_time: None,
@@ -169,6 +183,9 @@ impl GateInfo {
             (Some(d), Some(a)) => s.push_str(&format!(" {d}->{a}")),
             (Some(a), None) | (None, Some(a)) => s.push_str(&format!(" {a}")),
             (None, None) => {}
+        }
+        if let Some(d) = &self.departure_gate {
+            s.push_str(&format!(" dep gate {d}"));
         }
         s.push_str(&format!(" gate {}", self.gate));
         if let Some(st) = &self.gate_status {
@@ -353,19 +370,36 @@ re!(ARR_ICAO_LINE, r"^([A-Z0-9]{2}\d{1,4}) ARR:([A-Z]{4})$");
 gate_re!(COLON_GATE, r"^GATE:\s*", r"\s*$");
 // LATAM (RA): GATE ASSIGNMENT / PPOS:602L (parking position) / NEXT LEG: ...
 gate_re!(LATAM_PPOS, r"^PPOS:\s*", r"\s*$");
+// Delta crew P/F (RA, 25): ARR ATL GTE E15
+gate_re!(DELTA_ARR, r"^ARR ([A-Z]{3}) GTE\s+", r"\s*$");
+// Virgin Australia (3M): VA1007, BAY: 45A
+gate_re!(VIRGIN_BAY, r"^(VA\d{1,4}), BAY:\s*", r"\s*$");
+// Turkish (RA): - EXPECTED PARKING POSITION: F8R
+gate_re!(TURKISH_PARK, r"^- EXPECTED PARKING POSITION:\s*", r"\s*$");
+// Finnair (RA): AY1074 22NOV26 / ARRIVING STAND 131 ELDT 12:53
+gate_re!(FINNAIR_STAND, r"^ARRIVING STAND\s+", r"(?:\s|$)");
+re!(FINNAIR_FLIGHT, r"^(AY\d{1,4})\s+\d{2}[A-Z]{3}\d{2}$");
+// China Southern and others (RA): PARKING PREASSIGNED:138 (NA when none)
+gate_re!(PARKING_ASSIGNED, r"^PARKING (?:PRE)?ASSIGNED:\s*", r"\s*$");
+// BA PAD11 arrival uplink (10, 11): ARRIVAL- GMEDK BA2661 / STAND 36M  ETA 1341
+re!(BA_ARRIVAL, r"^ARRIVAL-\s+[A-Z0-9]{5}\s+(BA\d{1,4})[A-Z]?\b");
+gate_re!(BA_STAND, r"^STAND\s+", r"(?:\s|$)");
+// Jazz flight data (C1): DEP YVR/06:20Z/GTE C40 / ARR YYC/07:48Z/GTE A17
+gate_re!(JAZZ_DEP, r"^DEP ([A-Z]{3})/[0-9:]+Z/GTE\s+", r"\s*$");
+gate_re!(JAZZ_ARR, r"^ARR ([A-Z]{3})/[0-9:]+Z/GTE\s+", r"\s*$");
 // Where a message moves on to other flights (connections, the aircraft's
 // next flight); gate lines after it are not this flight's.
 re!(
     STOP_LINE,
-    r"^(?:CREW CONNECTING|CONNECTING GATE|NEXT FLT|NEXT FLIGHT|NEXT LEG|NEXT SECTOR|TURN FLT|CREW CONNECTIONS|PAX CONNECTIONS|AC TURN|END$)"
+    r"^(?:CREW CONNECTING|CONNECTING GATE|NEXT FLT|NEXT FLIGHT|NEXT LEG|NEXT SECTOR|- NEXT FLIGHT|ON STAND-|CREW DEPT|TURN FLT|CREW CONNECTIONS|PAX CONNECTIONS|AC TURN|END$)"
 );
 // Label RA uplinks read by [`parse`], and Finnair connection lists (other
 // flights' departure gates).
 re!(RA_HANDLED_HEADER, r"^(?:QUNDCULUA|QUHDQDDRP|QUHDQITOO|QUSILITOO|QUHELASAY)");
 
 /// Read a gate assignment from the families in the module docs (label B3
-/// clearances and airline gate messages on 40, 41, 42, C1, 21, 3T, 5Z and
-/// RA);
+/// clearances and airline gate, stand and parking messages on 10, 11, 21,
+/// 25, 3M, 3T, 40, 41, 42, 5Z, C1 and RA);
 /// `None` when the text is not one. On label RA the uplinks [`parse`] reads
 /// are skipped, so call it first.
 pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
@@ -381,6 +415,12 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             g.flight_number = Some(c[1].to_owned());
             g.departure = Some(c[2].to_owned());
             Some(g)
+        }),
+        "10" | "11" if first == ":PAD11" => ba_pad11_stand(&lines),
+        "25" => delta_arr_gate(&lines),
+        "3M" => lines.iter().find_map(|l| {
+            let c = VIRGIN_BAY.captures(l)?;
+            Some(with_flight(report(GateKind::ArrivalGate, "VIRGIN_AUSTRALIA_BAY", &c[2], ""), &c[1]))
         }),
         "3T" => {
             if !lines.iter().any(|l| l.starts_with("ARR GATE MSG")) {
@@ -403,6 +443,7 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
                 Some(report(GateKind::ArrivalGate, "JETSTAR_ARRIVAL_GATE", &c[1], ""))
             })
             .or_else(|| jazz_gate(&lines))
+            .or_else(|| jazz_flight_data(&lines))
             .or_else(|| jetstar_gate_change(&lines))
             .or_else(|| route_gate(&lines)),
         "41" | "42" => {
@@ -423,15 +464,27 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             .or_else(|| envoy_arriving(&lines))
             .or_else(|| route_gate(&lines)),
         "RA" => {
+            if first.starts_with("QUHELASAY") {
+                // Finnair: the arriving stand, not the connection lists.
+                return finnair_stand(&lines);
+            }
             if RA_HANDLED_HEADER.is_match(first) {
                 return None;
             }
-            lines
-                .iter()
-                .find_map(|l| {
+            delta_arr_gate(&lines)
+                .or_else(|| {
+                    lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
+                        if let Some(c) = TURKISH_PARK.captures(l) {
+                            return Some(report(GateKind::ArrivalGate, "TURKISH_PARKING_POSITION", &c[1], ""));
+                        }
+                        let c = PARKING_ASSIGNED.captures(l)?;
+                        Some(report(GateKind::ArrivalGate, "PARKING_ASSIGNED", &c[1], ""))
+                    })
+                })
+                .or_else(|| lines.iter().find_map(|l| {
                     let c = FLIGHT_AIRPORT_GATE.captures(l)?;
                     Some(with_flight(report(GateKind::ArrivalGate, "FLT_AIRPORT_GATE", &c[3], &c[2]), &c[1]))
-                })
+                }))
                 .or_else(|| frontier_gate(&lines))
                 .or_else(|| westjet_gate(&lines))
                 .or_else(|| arr_icao_gate(&lines))
@@ -496,6 +549,73 @@ fn alaska_gate_change(lines: &[&str]) -> Option<GateInfo> {
         }
     }
     None
+}
+
+/// Delta crew P/F (`CREW P/F` or `PART  1 OF` line): `ARR ATL GTE E15`.
+fn delta_arr_gate(lines: &[&str]) -> Option<GateInfo> {
+    if !lines.iter().any(|l| l.starts_with("CREW P/F") || l.starts_with("PART  1 OF")) {
+        return None;
+    }
+    lines.iter().find_map(|l| {
+        let c = DELTA_ARR.captures(l)?;
+        Some(report(GateKind::ArrivalGate, "DELTA_CREW_PF", &c[2], &c[1]))
+    })
+}
+
+/// Finnair `AY1074 22NOV26` / `ARRIVING STAND 131 ELDT 12:53`; connection
+/// lists name other flights' gates, so reading stops at `CONNECTION INFO`.
+fn finnair_stand(lines: &[&str]) -> Option<GateInfo> {
+    let mut flight = None;
+    for l in lines {
+        if let Some(c) = FINNAIR_FLIGHT.captures(l) {
+            flight = Some(c[1].to_owned());
+        }
+        if let Some(c) = FINNAIR_STAND.captures(l) {
+            let mut g = report(GateKind::ArrivalGate, "FINNAIR_ARRIVING_STAND", &c[1], "");
+            g.flight_number = flight;
+            return Some(g);
+        }
+        if l.starts_with("CONNECTION INFO") {
+            return None;
+        }
+    }
+    None
+}
+
+/// BA PAD11 arrival uplink: after `ARRIVAL- GTNED BA1447`, the first
+/// `STAND 503  ETA 1357` line, before `ON STAND-` (the aircraft on the
+/// stand) or `CREW DEPT` (the crew's next flight). The ETA itself is left
+/// to the OOOI extractor.
+fn ba_pad11_stand(lines: &[&str]) -> Option<GateInfo> {
+    let (i, c) = lines.iter().enumerate().find_map(|(i, l)| Some((i, BA_ARRIVAL.captures(l)?)))?;
+    lines[i + 1..].iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
+        let g = BA_STAND.captures(l)?;
+        Some(with_flight(report(GateKind::ArrivalGate, "BA_PAD11_STAND", &g[1], ""), &c[1]))
+    })
+}
+
+/// Jazz flight data: `DEP YVR/06:20Z/GTE C40` and `ARR YYC/07:48Z/GTE A17`
+/// give both gates (an arrival gate with `departure_gate`), or only the
+/// departure gate when there is no arrival line.
+fn jazz_flight_data(lines: &[&str]) -> Option<GateInfo> {
+    let mut dep = None;
+    for l in lines.iter().take_while(|l| !STOP_LINE.is_match(l)) {
+        if let Some(c) = JAZZ_DEP.captures(l) {
+            dep = Some(c);
+        }
+        if let Some(c) = JAZZ_ARR.captures(l) {
+            let mut g = report(GateKind::ArrivalGate, "JAZZ_FLIGHT_DATA", &c[2], &c[1]);
+            if let Some(d) = dep {
+                g.departure = Some(d[1].to_owned());
+                g.departure_gate = Some(d[2].to_owned());
+            }
+            return Some(g);
+        }
+    }
+    let d = dep?;
+    let mut g = report(GateKind::DepartureGate, "JAZZ_FLIGHT_DATA", &d[2], "");
+    g.departure = Some(d[1].to_owned());
+    Some(g)
 }
 
 /// Jazz `JZA GATE DATA UPLINK`: the `FLIGHT:` line and `PLANNED ARRIVAL
@@ -774,6 +894,15 @@ mod tests {
             ("WestJet gate change", "RA", "///GATECHANGE///\r\n\r\nWS 736 YVR-YYZ\r\n\r\nARR GATE IS NOW C26/OPS", ArrivalGate, "WESTJET_OPS_GATE", Some("YVR"), Some("YYZ"), "C26", Some("736")),
             ("Shandong current flight", "RA", "QUTAOUOSC~10000\r\n\tCURRENT FLIGHT:\r\n\tSC8402 ARR:ZSJN\r\n\tGATE:10\r\n\tWEATHER:\r\n", ArrivalGate, "ARR_ICAO_GATE", None, Some("ZSJN"), "10", Some("SC8402")),
             ("LATAM parking position", "RA", "QUSCLASLA~1\r\n\r\nGATE ASSIGNMENT\r\n\r\n\r\n\r\nPPOS:602L\r\n\r\nBAG BELT:\r\n\r\nNEXT LEG: LA8142 GRU-AEP 22NOV 14:05Z", ArrivalGate, "LATAM_GATE_ASSIGNMENT", None, None, "602L", None),
+            ("Delta crew P/F", "RA", "48   ATLE15\r\nCREW P/F        \r\nPART  1 OF  1 \r\nFLT 1160 - 22NOV1213 CREW P/F        \r\nARR ATL GTE E15\r\nFLT 1941 PVR 1025L\r\n                     NXT  DEPT  DEPT    \r\n NAME                FLT  TIME  FROM GTE\r\n", ArrivalGate, "DELTA_CREW_PF", None, Some("ATL"), "E15", None),
+            ("Delta crew P/F on 25", "25", "48   JFKB22\r\nCREW P/F        \r\nPART  1 OF  1 \r\nFLT 0028 - 22NOV1236 CREW P/F        \r\nARR JFK GTE B22\r\n", ArrivalGate, "DELTA_CREW_PF", None, Some("JFK"), "B22", None),
+            ("Virgin Australia bay", "3M", "VA1007, BAY: 45A\r\nGPU: NO\r\nPCA: \r\n", ArrivalGate, "VIRGIN_AUSTRALIA_BAY", None, None, "45A", Some("VA1007")),
+            ("Turkish parking position", "RA", "QUISTBITK~1\r\n- EXPECTED PARKING POSITION: F8R\r\n- NEXT FLIGHT INFO:IST/PRG TK1769 14:45Z\r\n", ArrivalGate, "TURKISH_PARKING_POSITION", None, None, "F8R", None),
+            ("Finnair arriving stand", "RA", "QUHELASAY~1\r\nAY1074 22NOV26\r\nARRIVING STAND 131 ELDT 12:53\r\nOHATR->AY1101 23NOV26 ETD - (STD 05:45)\r\n", ArrivalGate, "FINNAIR_ARRIVING_STAND", None, None, "131", Some("AY1074")),
+            ("parking preassigned", "RA", "QUCANXMCZ~1RA221348\r\n\tB-309Y\r\n\tPARKING PREASSIGNED:138\r\n\tMETAR ZYTX 221330Z 19007MPS 9999 OVC040 04/M03 Q1020 NOSIG=\r\n", ArrivalGate, "PARKING_ASSIGNED", None, None, "138", None),
+            ("BA PAD11 stand", "10", ":PAD11\r\nUTC\r\nARRIVAL- GTNED BA1447  \r\nSTAND 503  ETA 1357\r\nON STAND- BA424   \r\nETD 1350\r\n\r\nCREW DEPT- FOR INFO ONLY\r\nGTNED BA1372  TO X\r\nSTAND 503\r\n", ArrivalGate, "BA_PAD11_STAND", None, None, "503", Some("BA1447")),
+            ("BA PAD11 stand with suffix", "11", ":PAD11\r\nUTC\r\nARRIVAL- GMEDK BA2661  \r\nSTAND 36M  ETA 1341 //\r\nON STAND- UNKNOWN //", ArrivalGate, "BA_PAD11_STAND", None, None, "36M", Some("BA2661")),
+            ("Jazz flight data", "C1", JAZZ_FLIGHT_DATA, ArrivalGate, "JAZZ_FLIGHT_DATA", Some("YVR"), Some("YYC"), "A17", None),
             ("Alaska gate change", "21", ",,1\r\nGATE UPDATE\r\nGATE CHANGE IN LAX\r\nAS1636\r\nNEW GATE: 210A\r\n\r\n", GateChange, "ALASKA_GATE_CHANGE", None, Some("LAX"), "210A", Some("AS1636")),
         ];
         for &(name, label, text, kind, format, departure, arrival, gate, flight) in cases {
@@ -784,6 +913,27 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    const JAZZ_FLIGHT_DATA: &str = ".YHZITQK 220419\r\nAGM\r\nAN CGJUZ/MA 395I\r\n-  DFR FLT 8074\r\n----\r\nFIN 726/CGJUZ/CRA\r\nDEP YVR/06:20Z/GTE C40\r\nARR YYC/07:48Z/GTE A17\r\nPAX 46/PAD 8/FUEL \r\n";
+
+    #[test]
+    fn jazz_flight_data_gives_both_gates() {
+        let g = parse_report("C1", JAZZ_FLIGHT_DATA).unwrap();
+        assert_eq!((g.departure_gate.as_deref(), g.gate.as_str()), (Some("C40"), "A17"));
+        assert_eq!(g.summary(), "ARRIVAL GATE YVR->YYC dep gate C40 gate A17");
+        let dep_only = parse_report("C1", "-  DFR FLT 8074\r\nDEP YVR/06:20Z/GTE C40\r\nPAX 46\r\n").unwrap();
+        assert_eq!(dep_only.kind, GateKind::DepartureGate);
+        assert_eq!((dep_only.departure.as_deref(), dep_only.gate.as_str()), (Some("YVR"), "C40"));
+        assert_eq!(dep_only.departure_gate, None);
+    }
+
+    #[test]
+    fn finnair_stand_but_not_connections() {
+        // `parse` still reads neither; `parse_report` reads only the stand.
+        assert!(parse_report("RA", FINNAIR_CONNECT).is_none());
+        assert!(parse_report("RA", FINNAIR_PAX).is_none());
+        assert!(parse_report("RA", "QUHELASAY~1\r\nCONNECTION INFO\r\nARRIVING STAND 131\r\n").is_none());
     }
 
     #[test]
@@ -810,6 +960,11 @@ mod tests {
             ("route family on another label", "H1", "FLT 1658/22 AUS-DFW\r\nGATE D21\r\n"),
             ("PSA acknowledgement without a gate", "5Z", "/ACKFLT GATE E"),
             ("LATAM without a position", "RA", "QUSCLASLA~1\r\n\tGATE ASSIGNMENT\r\n\t\r\n\tPPOS:N/A\r\n\tBAG BELT:\r\n\tNEXT LEG: LA3091 FLN-CGH 22NOV 11:35Z"),
+            ("Finnair delay summary", "RA", "QUHELASAY~1\r\nDELAY SUMMARY\r\nAY818/21NOV2026 ARN-HEL\r\nSTD 20:05\r\nATD 21:19\r\n"),
+            ("parking not assigned", "RA", "QUCANXMCZ~1RA221348\r\n\tPARKING ASSIGNED:NA\r\n"),
+            ("BA PAD11 release without a stand", "10", ":PAD11\r\n22NOV26 BA356    GEUUZ LHR-LYS\r\nETD 0700Z FLIGHT RELEASE OFP  5"),
+            ("BA PAD11 next flight stand only", "10", ":PAD11\r\nUTC\r\nARRIVAL- GTNEF BA1421  \r\nETA 1343\r\nCREW DEPT- FOR INFO ONLY\r\nSTAND 506\r\n"),
+            ("stand on another label", "H1", ":PAD11\r\nUTC\r\nARRIVAL- GTNED BA1447  \r\nSTAND 503  ETA 1357\r\n"),
             ("empty", "40", ""),
         ];
         for (name, label, text) in cases {

@@ -102,6 +102,9 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
                 (Some(a), None) | (None, Some(a)) => s.push_str(&format!(" {a}")),
                 (None, None) => {}
             }
+            if let Some(d) = field("departure_gate") {
+                s.push_str(&format!(" dep gate {d}"));
+            }
             s.push_str(&format!(" gate {}", app.get("gate")?.as_str()?));
             Some(s)
         }
@@ -893,5 +896,10 @@ mod tests {
         assert_eq!(s.as_deref(), Some("DEPARTURE GATE JZA110 CYWG->CYOW gate 12"));
         let s = app_summary(&json!({"app": "gate", "kind": "arrival_gate", "format": "JETBLUE_INR", "gate": "514"}));
         assert_eq!(s.as_deref(), Some("ARRIVAL GATE gate 514"));
+        let s = app_summary(&json!({
+            "app": "gate", "kind": "arrival_gate", "format": "JAZZ_FLIGHT_DATA", "gate": "A17",
+            "departure": "YVR", "departure_gate": "C40", "arrival": "YYC",
+        }));
+        assert_eq!(s.as_deref(), Some("ARRIVAL GATE YVR->YYC dep gate C40 gate A17"));
     }
 }

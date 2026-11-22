@@ -456,6 +456,21 @@ fn label_5z_psa_gate_acknowledgement() {
 }
 
 #[test]
+fn stands_and_parking_positions() {
+    // BA PAD11: the stand becomes the gate app; the OOOI extractor keeps
+    // the arrival ETA in the same decode.
+    let d = decode("10", ":PAD11\r\nUTC\r\nARRIVAL- GMEDK BA2661  \r\nSTAND 36M  ETA 1341 //\r\nON STAND- UNKNOWN //", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!((g.flight_number.as_deref(), g.gate.as_str()), (Some("BA2661"), "36M"));
+    let d = decode("25", "48   JFKB22\r\nCREW P/F        \r\nPART  1 OF  1 \r\nARR JFK GTE B22\r\n", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some("JFK"), "B22"));
+    let d = decode("RA", "QUHELASAY~1\r\nAY1074 22NOV26\r\nARRIVING STAND 131 ELDT 12:53\r\n", false);
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!(g.gate, "131");
+}
+
+#[test]
 fn label_5z_gate_request_is_not_a_gate() {
     let d = decode("5Z", "/C3 GATE REQ       / KAUS KIAH\r\n", true);
     assert!(!matches!(d.app, Some(AcarsApp::Gate(_))), "{:?}", d.app);
