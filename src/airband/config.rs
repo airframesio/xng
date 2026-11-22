@@ -250,6 +250,9 @@ pub struct AtcFeedSettings {
     pub token: Option<String>,
     /// Station name shown to listeners.
     pub station_name: Option<String>,
+    /// Ask the network not to show the account's username next to this
+    /// feeder's feeds.
+    pub hide_username: bool,
     /// Round the published station position to this many metres.
     pub location_precision_m: u32,
     /// Opus bitrate (bit/s).
@@ -273,6 +276,7 @@ impl Default for AtcFeedSettings {
             credentials: None,
             token: None,
             station_name: None,
+            hide_username: false,
             location_precision_m: 100,
             bitrate: 24_000,
             ca: None,

@@ -110,6 +110,9 @@ pub struct AirbandOpts {
     /// Station name shown to ATC listeners
     #[arg(long)]
     pub atc_station_name: Option<String>,
+    /// Don't show your account's username next to this feeder's feeds
+    #[arg(long)]
+    pub atc_hide_username: bool,
     /// Opus bitrate for the ATC feed (bit/s)
     #[arg(long, default_value_t = 24_000)]
     pub atc_bitrate: u32,
@@ -199,6 +202,7 @@ impl AirbandOpts {
             ca: self.atc_ca.clone(),
             insecure: self.atc_insecure,
             station_name: self.atc_station_name.clone(),
+            hide_username: self.atc_hide_username,
             bitrate: self.atc_bitrate,
             ..Default::default()
         });

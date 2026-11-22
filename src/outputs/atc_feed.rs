@@ -579,11 +579,12 @@ async fn session(
         st["alt_m"] = json!(a.round());
     }
     let platform = format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH);
-    link.send_json(
-        p::HELLO,
-        &json!({"v": p::VERSION, "token": token.token, "feeder_id": feeder_id, "station": st,
-                "client": {"name": "xng", "version": env!("CARGO_PKG_VERSION"), "platform": platform}}),
-    )?;
+    let mut hello = json!({"v": p::VERSION, "token": token.token, "feeder_id": feeder_id, "station": st,
+                "client": {"name": "xng", "version": env!("CARGO_PKG_VERSION"), "platform": platform}});
+    if s.hide_username {
+        hello["hide_username"] = json!(true);
+    }
+    link.send_json(p::HELLO, &hello)?;
     let (kind, payload) = link.recv(Duration::from_secs(10)).await?;
     let welcome: Value = match kind {
         p::WELCOME => serde_json::from_slice(&payload)?,

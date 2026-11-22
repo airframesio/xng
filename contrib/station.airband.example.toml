@@ -29,6 +29,7 @@ lockout = ["128.25"]
 [outputs.airband.atc]
 station-name = "SFO west ridge"
 location-precision-m = 500       # published position is rounded to this
+# hide-username = true           # don't show your account name next to these feeds
 bitrate = 24000
 # streams = ["120.5", "121.8", "scan"]   # default: every channel
 # server = "atc-ingest.airframes.io:4433"

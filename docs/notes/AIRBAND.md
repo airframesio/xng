@@ -99,7 +99,8 @@ airframesio/aggregator-atc): ALPN `airframes-atc/1`, port 4433.
   failed QUIC attempts in `auto` it falls back to TLS 1.3 over TCP. Reconnects
   with backoff from 1 s to 60 s plus jitter.
 - **Session**: HELLO (token, feeder id, station name and position rounded to
-  `location-precision-m`) → WELCOME → one OPEN per fed stream → OPENED. A
+  `location-precision-m`, and `hide_username` when `--atc-hide-username` /
+  `hide-username` is set) → WELCOME → one OPEN per fed stream → OPENED. A
   channel stream is `mode: single`; the scan stream is `mode: scan` with up to
   16 frequencies. A channel with `atc-frequency` sends that key; otherwise the
   server resolves `freq_hz` from the station position, and a rejection lists
