@@ -117,6 +117,7 @@
       "kind": "loadsheet",
       "status": "final",
       "time": "2140",
+      "edition": 2,
       "flight_number": "TK0053",
       "flight_day": 21,
       "departure": "BKK",
@@ -332,11 +333,21 @@
       "date": "2026-11-21",
       "weight_unit": "LB",
       "dow": 184097,
+      "doi": 5.61,
       "zfw": 272172,
+      "zfw_max": 286600,
+      "li_zfw": 17.42,
       "tof": 25825,
       "tow": 297997,
+      "tow_max": 312425,
+      "li_tow": 36.27,
       "tif": 8805,
       "law": 289192,
+      "law_max": 308650,
+      "li_law": 40.73,
+      "mac_zfw": 21.8,
+      "mac_tow": 24.5,
+      "mac_law": 25.1,
       "underload": 14428
     }
   },
@@ -559,6 +570,38 @@
       "crew": "2/4",
       "zfw": 100000,
       "tow": 120000
+    }
+  },
+  {
+    "id": 900000008,
+    "label": "RA",
+    "description": "synthetic: ULOAD cut to two digits on the last line",
+    "text": "LOADSHEET FINAL 1200 EDNO1\nBA123/01 01JAN26\nLHR JFK G-TEST 2/4\nZFW 100000\nULOAD 12",
+    "expected": {
+      "kind": "loadsheet",
+      "status": "final",
+      "edition": 1,
+      "time": "1200",
+      "flight_number": "BA123",
+      "flight_day": 1,
+      "date": "2026-01-01",
+      "departure": "LHR",
+      "arrival": "JFK",
+      "registration": "G-TEST",
+      "crew": "2/4",
+      "zfw": 100000
+    }
+  },
+  {
+    "id": 900000009,
+    "label": "RA",
+    "description": "synthetic: acceptance with the year in the flight date",
+    "text": "LDSHT ACCEPT ACK FOR QR274/21NOV26 AMS-DOH",
+    "expected": {
+      "kind": "acceptance",
+      "flight_number": "QR274",
+      "departure": "AMS",
+      "arrival": "DOH"
     }
   }
 ]
