@@ -14,3 +14,6 @@ xng-acars.workspace = true
 num-complex.workspace = true
 xng-dsp.workspace = true
 xng-types.workspace = true
+
+[dev-dependencies]
+xng-sdr.workspace = true

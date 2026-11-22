@@ -94,7 +94,7 @@ impl Engine {
 
         struct Prepared {
             source: Box<dyn IqSource>,
-            decoders: Vec<(u64, runtime::ModeChannel)>,
+            decoders: Vec<runtime::ChannelGroup>,
             cfg: SessionConfig,
             capture_center: u64,
             live: Arc<LiveState>,
@@ -126,6 +126,9 @@ impl Engine {
                 cfg.receiver_pos,
             );
             let live = LiveState::new();
+            // Embedders watch the spectrum (the module contract); one that
+            // does not can clear the flag and skip the FFT.
+            live.spectrum_wanted.store(true, Ordering::Relaxed);
             infos.push(SessionInfo {
                 mode: cfg.mode,
                 center_hz: capture_center,

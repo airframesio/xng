@@ -78,32 +78,44 @@ pub fn rrc_taps(beta: f64, sps: f64, num_taps: usize) -> Vec<f32> {
 
 /// Streaming FIR filter over complex samples with optional decimation.
 ///
-/// The delay line is stored **doubled and time-reversed-friendly**: the most
-/// recent `n` samples always occupy one contiguous run, so the convolution
-/// inner loop is a straight `zip` of two slices. A circular buffer with a
-/// wrapping index (the obvious implementation) defeats vectorisation — the
-/// compiler cannot prove the access pattern is affine, so it emits a
-/// bounds-checked load and a branch per tap. Convolution is the single
-/// largest cost in the decode pipeline, so this layout is deliberate.
+/// The delay line is stored **linearly, newest-first**: the most recent `n`
+/// samples always occupy one contiguous run, so the convolution inner loop is
+/// a straight `zip` of two slices. A circular buffer with a wrapping index
+/// (the obvious implementation) defeats this — the compiler cannot prove the
+/// access pattern is affine, so it emits a bounds-checked load and a branch
+/// per tap. Convolution is the single largest cost in the decode pipeline, so
+/// this layout is deliberate.
 ///
-/// The doubling costs one extra store per **input** sample while the saving is
-/// on **output** samples, so the win narrows as decimation rises: measured
-/// ~2.2× at 121 taps / decim 1, ~2.1× at 121/10, ~1.65× at 101/25, ~1.45× at
-/// 31/8, ~1.3× at 9/1. Still a win everywhere, but "~2×" describes the
-/// undecimated case that dominates this pipeline, not every configuration.
+/// Because the windows of several consecutive outputs coexist in the buffer,
+/// [`Fir::process`] computes four outputs per pass with four independent
+/// accumulation chains, which hides floating-point add latency: ~2.4–3.4× over
+/// one output at a time for the decoders' undecimated selectivity filters and
+/// long decimating stages (`examples/fir_bench.rs`).
 pub struct Fir {
     taps: Vec<f32>,
-    /// `2 * n` slots holding the live window contiguously. Samples are stored
-    /// **newest-first** so the convolution walks the window and the taps in
-    /// the same direction the circular-buffer formulation did — the summation
-    /// order is preserved, so the result is bit-identical (asserted in tests).
+    /// Linear history buffer of `span + n` slots, written **downwards** so the
+    /// samples read **newest-first** from `head`: the live window is always
+    /// the contiguous run `hist[head .. head + n]`. Walking it alongside the
+    /// taps in natural order pairs tap `k` with the sample `k` steps back —
+    /// the same pairing and summation order as the circular-buffer
+    /// formulation, so the result is bit-identical (asserted in tests).
+    ///
+    /// When `head` reaches 0 the newest `n - 1` samples are copied back to
+    /// the top and writing resumes below them. That is one `n - 1` sample
+    /// copy per `span` inputs instead of a mirror store on every input, and —
+    /// the real reason — every window written since the last copy stays
+    /// intact, so [`Self::process`] can compute several outputs at once.
     hist: Vec<IqSample>,
-    /// Index of the newest sample within `hist` (always `< n`); the live
-    /// window is `hist[head .. head + n]`, newest first.
+    /// Index of the newest sample within `hist`.
     head: usize,
     decim: usize,
     phase: usize,
 }
+
+/// Outputs computed per pass in [`Fir::process`]. A single output is one
+/// serial floating-point accumulation chain per component, so throughput is
+/// bound by add latency; `GROUP` independent chains let the CPU overlap them.
+const GROUP: usize = 4;
 
 impl Fir {
     pub fn new(taps: Vec<f32>) -> Self {
@@ -113,47 +125,98 @@ impl Fir {
     pub fn with_decimation(taps: Vec<f32>, decim: usize) -> Self {
         assert!(!taps.is_empty() && decim >= 1);
         let n = taps.len();
+        // Room below the top window: large enough that the wrap copy is rare
+        // relative to the input rate and that a full group of outputs
+        // (`GROUP * decim` inputs) usually fits between copies.
+        let span = (4 * n).max(2 * GROUP * decim).max(1024);
         Self {
             taps,
-            hist: vec![IqSample::new(0.0, 0.0); 2 * n],
-            head: 0,
+            hist: vec![IqSample::new(0.0, 0.0); span + n],
+            head: span,
             decim,
             phase: 0,
         }
     }
 
+    /// Prepend one sample to the window, copying the newest `n - 1` samples
+    /// back to the top of `hist` first if the bottom has been reached.
+    #[inline]
+    fn push(&mut self, x: IqSample) {
+        if self.head == 0 {
+            let keep = self.taps.len() - 1;
+            let top = self.hist.len() - keep;
+            self.hist.copy_within(0..keep, top);
+            self.head = top;
+        }
+        self.head -= 1;
+        self.hist[self.head] = x;
+    }
+
+    /// One output from the window starting at `head`, taps in natural order.
+    #[inline]
+    fn dot(&self, head: usize) -> IqSample {
+        let win = &self.hist[head..head + self.taps.len()];
+        let mut acc = IqSample::new(0.0, 0.0);
+        for (w, &tap) in win.iter().zip(self.taps.iter()) {
+            acc += *w * tap;
+        }
+        acc
+    }
+
     /// Push input samples; append filtered (and decimated) output to `out`.
     pub fn process(&mut self, input: &[IqSample], out: &mut Vec<IqSample>) {
         let n = self.taps.len();
-        for &x in input {
-            // Prepend to the sliding window: `head` walks backwards so the
-            // newest sample is at the LOW end and `hist[head..head + n]` reads
-            // newest-first. Storing each sample at both `head` and `head + n`
-            // keeps that window contiguous across the wrap.
-            //
-            // The mirror write at `head == n - 1` (i.e. `hist[2n - 1]`) is
-            // never read back: the widest window starting there ends at
-            // `2n - 2`, and no later `head` reaches `n`. It is left in place
-            // deliberately — skipping it would need a branch on every input
-            // sample to save one store, which is the wrong trade in this loop.
-            self.head = if self.head == 0 { n - 1 } else { self.head - 1 };
-            self.hist[self.head] = x;
-            self.hist[self.head + n] = x;
-
-            self.phase += 1;
-            if self.phase == self.decim {
-                self.phase = 0;
-                // Newest-first window against taps in natural order — the same
-                // pairing and the same summation order as the circular-buffer
-                // version, so the result is bit-identical. Both slices are
-                // contiguous with statically-equal length, so this vectorises
-                // (no wrapping index, no per-tap bounds check or branch).
-                let win = &self.hist[self.head..self.head + n];
-                let mut acc = IqSample::new(0.0, 0.0);
-                for (w, &tap) in win.iter().zip(self.taps.iter()) {
-                    acc += *w * tap;
+        let d = self.decim;
+        let mut rest = input;
+        while !rest.is_empty() {
+            // Inputs needed to reach the next output, then the full group.
+            let to_next = d - self.phase;
+            let need = to_next + (GROUP - 1) * d;
+            if rest.len() >= need && self.head >= need {
+                let (chunk, tail) = rest.split_at(need);
+                rest = tail;
+                // Write the whole chunk below `head` (no wrap: `head >= need`),
+                // newest at the lowest index.
+                let base = self.head - need;
+                for (slot, &x) in self.hist[base..self.head].iter_mut().rev().zip(chunk) {
+                    *slot = x;
                 }
-                out.push(acc);
+                self.head = base;
+                self.phase = 0;
+                // Output `j` fires after `to_next + j * d` inputs, so its
+                // newest sample sits `(GROUP - 1 - j) * d` above `base`.
+                let h = |j: usize| base + (GROUP - 1 - j) * d;
+                let taps = &self.taps[..];
+                let w0 = &self.hist[h(0)..h(0) + n];
+                let w1 = &self.hist[h(1)..h(1) + n];
+                let w2 = &self.hist[h(2)..h(2) + n];
+                let w3 = &self.hist[h(3)..h(3) + n];
+                // Bit-identical to `dot`: each accumulator sees exactly the
+                // terms `w[k] * tap[k]` (same multiply), added one at a time
+                // in increasing `k` (same order and association). Only the
+                // interleaving of the four independent chains differs, which
+                // floating point cannot observe. No FMA, no reassociation.
+                let zero = IqSample::new(0.0, 0.0);
+                let (mut a0, mut a1, mut a2, mut a3) = (zero, zero, zero, zero);
+                for ((((&tap, x0), x1), x2), x3) in taps.iter().zip(w0).zip(w1).zip(w2).zip(w3) {
+                    a0 += *x0 * tap;
+                    a1 += *x1 * tap;
+                    a2 += *x2 * tap;
+                    a3 += *x3 * tap;
+                }
+                out.extend_from_slice(&[a0, a1, a2, a3]);
+                continue;
+            }
+            // Tail of the block or a wrap copy pending: one sample at a time.
+            let Some((&x, tail)) = rest.split_first() else {
+                break;
+            };
+            rest = tail;
+            self.push(x);
+            self.phase += 1;
+            if self.phase == d {
+                self.phase = 0;
+                out.push(self.dot(self.head));
             }
         }
     }
@@ -302,23 +365,81 @@ mod tests {
                 fast.process(blk, &mut a);
                 refr.process(blk, &mut b);
             }
-            assert_eq!(a.len(), b.len(), "ntaps={ntaps} decim={decim}: length differs");
-            for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
-                assert_eq!(
-                    x.re.to_bits(),
-                    y.re.to_bits(),
-                    "ntaps={ntaps} decim={decim} sample {i}: re {} vs {}",
-                    x.re,
-                    y.re
-                );
-                assert_eq!(
-                    x.im.to_bits(),
-                    y.im.to_bits(),
-                    "ntaps={ntaps} decim={decim} sample {i}: im {} vs {}",
-                    x.im,
-                    y.im
-                );
+            assert_bits_eq(&a, &b, &format!("ntaps={ntaps} decim={decim}"));
+        }
+    }
+
+    fn assert_bits_eq(a: &[IqSample], b: &[IqSample], ctx: &str) {
+        assert_eq!(a.len(), b.len(), "{ctx}: length differs");
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(x.re.to_bits(), y.re.to_bits(), "{ctx} sample {i}: re {} vs {}", x.re, y.re);
+            assert_eq!(x.im.to_bits(), y.im.to_bits(), "{ctx} sample {i}: im {} vs {}", x.im, y.im);
+        }
+    }
+
+    #[test]
+    fn grouped_outputs_bit_exact_across_block_sizes() {
+        // The grouped (four-outputs-per-pass) path, the one-at-a-time tail and
+        // the wrap copy must all agree bit-for-bit with the circular reference,
+        // whatever the block boundaries do to group alignment and phase.
+        let mut s = 0x0bad_c0de_dead_beefu64;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        };
+        let input: Vec<IqSample> = (0..65_536).map(|_| IqSample::new(next(), next())).collect();
+        // Long enough to wrap the history buffer several times.
+        let short = &input[..6_000];
+        let irregular = [1usize, 2, 3, 4, 5, 7, 11, 64, 127, 1_000, 4_093, 9, 6, 8_191];
+
+        for &ntaps in &[1usize, 2, 3, 4, 5, 13, 21, 101, 121] {
+            // Arbitrary (not lowpass) taps so tiny lengths are allowed and every
+            // tap position carries a distinct value.
+            let taps: Vec<f32> = (0..ntaps).map(|_| next()).collect();
+            for &decim in &[1usize, 2, 3, 10, 12] {
+                let mut want = Vec::new();
+                RefFir::new(taps.clone(), decim).process(&input, &mut want);
+
+                for &blk in &[1usize, 3, 4, 5, 7, 64] {
+                    let mut fir = Fir::with_decimation(taps.clone(), decim);
+                    let mut got = Vec::new();
+                    for chunk in short.chunks(blk) {
+                        fir.process(chunk, &mut got);
+                    }
+                    let n_out = short.len() / decim;
+                    assert_bits_eq(
+                        &got,
+                        &want[..n_out],
+                        &format!("ntaps={ntaps} decim={decim} block={blk}"),
+                    );
+                }
+
+                let mut fir = Fir::with_decimation(taps.clone(), decim);
+                let mut got = Vec::new();
+                let mut rest = &input[..];
+                for &len in irregular.iter().cycle() {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    let (chunk, tail) = rest.split_at(len.min(rest.len()));
+                    fir.process(chunk, &mut got);
+                    rest = tail;
+                }
+                assert_bits_eq(&got, &want, &format!("ntaps={ntaps} decim={decim} irregular"));
             }
         }
+    }
+
+    #[test]
+    fn decimation_phase_carries_across_calls() {
+        let taps = lowpass_taps(0.05, 21);
+        let mut fir = Fir::with_decimation(taps, 3);
+        let mut out = Vec::new();
+        for _ in 0..10 {
+            fir.process(&[IqSample::new(1.0, 0.0); 2], &mut out);
+        }
+        assert_eq!(out.len(), 20 / 3);
     }
 }

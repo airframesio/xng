@@ -4,21 +4,32 @@
 
 pub const LFSR15_INIT: [u8; 15] = [1, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 0, 1];
 
+/// [`LFSR15_INIT`] bit-packed: stage `i` in bit `i`.
+const LFSR15_INIT_PACKED: u16 = {
+    let mut v = 0u16;
+    let mut i = 0;
+    while i < 15 {
+        v |= (LFSR15_INIT[i] as u16) << i;
+        i += 1;
+    }
+    v
+};
+
 pub struct Lfsr15 {
-    state: [u8; 15],
+    /// Stage `i` in bit `i` (bit 15 always clear).
+    state: u16,
 }
 
 impl Lfsr15 {
     pub fn new() -> Self {
-        Self { state: LFSR15_INIT }
+        Self { state: LFSR15_INIT_PACKED }
     }
 
     #[inline]
     pub fn next_bit(&mut self) -> u8 {
-        let out = self.state[0] ^ self.state[14];
-        self.state.rotate_right(1);
-        self.state[0] = out;
-        out
+        let out = (self.state ^ (self.state >> 14)) & 1;
+        self.state = ((self.state << 1) & 0x7FFF) | out;
+        out as u8
     }
 
     /// XOR the keystream over `bits` in place.
@@ -47,5 +58,19 @@ mod tests {
         let mut s = Lfsr15::new();
         let got: String = (0..48).map(|_| char::from(b'0' + s.next_bit())).collect();
         assert_eq!(got, expected);
+    }
+
+    /// The packed register reproduces the stage-array formulation (out =
+    /// s0 ⊕ s14, shift up, feed back into s0) over two full periods.
+    #[test]
+    fn packed_matches_array_reference() {
+        let mut reference = LFSR15_INIT;
+        let mut s = Lfsr15::new();
+        for i in 0..2 * 32_767 {
+            let want = reference[0] ^ reference[14];
+            reference.rotate_right(1);
+            reference[0] = want;
+            assert_eq!(s.next_bit(), want, "bit {i}");
+        }
     }
 }
