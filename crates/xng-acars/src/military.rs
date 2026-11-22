@@ -426,7 +426,17 @@ pub fn parse(text: &str) -> Option<MilitaryReport> {
     }
 
     if kind == "FPN" {
-        r.flight_plan = crate::fpn::parse(&format!("FPN/{}", &record[kind_len + 1..]));
+        // fpn::parse always treats the last 4 characters as the checksum. A
+        // record without a valid one keeps them as route data, so hand it a
+        // placeholder and drop the checksum it reports.
+        let trailer = if crc_ok { csum } else { "0000" };
+        r.flight_plan =
+            crate::fpn::parse(&format!("FPN/{}{trailer}", &data[kind_len + 1..])).map(|mut fp| {
+                if !crc_ok {
+                    fp.checksum.clear();
+                }
+                fp
+            });
     }
     Some(r)
 }
@@ -597,6 +607,18 @@ mod tests {
         assert_eq!(fp.origin.as_deref(), Some("KCHS"));
         assert_eq!(fp.destination.as_deref(), Some("KNYG"));
         assert_eq!(r.mission.unwrap().day_of_year, 325);
+    }
+
+    #[test]
+    fn fpn_without_valid_crc_keeps_route_end() {
+        let r = parse(
+            "FPN/ID00534A,RCH3216,AJM7031H1325/MR3,/RP:DA:KCHS:AA:KNYG:F:FILLI..SARKY..DAG..HEC",
+        )
+        .unwrap();
+        assert!(!r.crc_ok);
+        let fp = r.flight_plan.unwrap();
+        assert_eq!(fp.checksum, "");
+        assert_eq!(fp.waypoints.last().map(|w| w.name.as_str()), Some("HEC"));
     }
 
     #[test]
