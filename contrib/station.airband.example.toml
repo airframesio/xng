@@ -68,12 +68,12 @@ freq = "120.900"
 label = "SFO Ground (west)"
 squelch = "manual:-48"           # a fixed level for a noisy channel
 
-# NorCal approach on a second SDR, plus a marine NFM channel.
+# NorCal approach on a second SDR, plus an NFM channel.
 [[session]]
 sdr = "driver=rtlsdr,serial=00000002"
 mode = "airband"
 sample-rate = 2400000
-channels = ["128.25", "135.65", "135.1"]
+channels = ["134.5", "135.65", "135.1"]   # all within ~2 MHz of one capture
 receiver-pos = "37.62,-122.38"
 
 [[session.airband.channel]]
