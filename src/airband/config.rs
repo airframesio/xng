@@ -170,9 +170,14 @@ impl AirbandOutputs {
             anyhow::ensure!(a.server.contains(':'), "ATC ingest {:?} needs host:port", a.server);
             anyhow::ensure!(
                 matches!(a.transport.as_str(), "auto" | "quic" | "tcp"),
-                "ATC transport must be auto, quic or tcp"
+                "ATC transport must be auto, quic or tcp (got {:?})",
+                a.transport
             );
-            parse_streams(&a.streams)?;
+            anyhow::ensure!((6_000..=64_000).contains(&a.bitrate), "ATC bitrate must be 6000 to 64000 bit/s");
+            anyhow::ensure!(
+                !parse_streams(&a.streams)?.contains(&super::StreamId::Mix),
+                "the ATC feed cannot carry the mix stream (listeners need the active frequency); feed channels or scan"
+            );
         }
         Ok(())
     }

@@ -1092,6 +1092,33 @@ fn spawn_airband_outputs(
         #[cfg(not(feature = "opus"))]
         tracing::error!("icecast output {url}: xng was built without the `opus` feature");
     }
+    if let Some(atc) = &o.atc {
+        #[cfg(feature = "opus")]
+        {
+            // Station position: the first session that has one.
+            let pos = sessions.iter().find_map(|d| {
+                let a = d.get("receiver_pos")?.as_array()?;
+                Some((a.first()?.as_f64()?, a.get(1)?.as_f64()?))
+            });
+            let info = crate::outputs::atc_feed::StationInfo {
+                name: atc.station_name.clone().unwrap_or_else(|| station.ident.clone()),
+                lat: pos.map(|p| p.0),
+                lon: pos.map(|p| p.1),
+                alt_m: None,
+            };
+            if pos.is_none() {
+                tracing::info!(
+                    "atc feed: no receiver position set (--receiver-pos); channels need --atc-frequency keys"
+                );
+            }
+            tasks.push(tokio::spawn(crate::outputs::atc_feed::run(bus.subscribe(), atc.clone(), info)));
+        }
+        #[cfg(not(feature = "opus"))]
+        {
+            let _ = (atc, station, sessions);
+            tracing::error!("atc feed: xng was built without the `opus` feature");
+        }
+    }
     let _ = (station, sessions);
 }
 

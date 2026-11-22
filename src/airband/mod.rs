@@ -13,6 +13,8 @@
 //! - `scan`: follows one channel at a time, scanner style
 //!   ([`scan_stream`], driven by `xng_mode_airband::scan::ScanController`).
 
+pub mod atc_auth;
+pub mod atc_proto;
 pub mod cli;
 pub mod config;
 pub mod hub;

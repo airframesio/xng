@@ -95,6 +95,12 @@ pub struct AirbandOpts {
     /// Use this access token instead of the saved login (dev: dev:<user>)
     #[arg(long)]
     pub atc_token: Option<String>,
+    /// Credentials file from `xng atc login` (default ~/.config/xng/atc.json)
+    #[arg(long)]
+    pub atc_credentials: Option<PathBuf>,
+    /// Streams to feed: channel frequencies or scan (default every channel)
+    #[arg(long, value_delimiter = ',')]
+    pub atc_streams: Vec<String>,
     /// PEM certificate/CA to trust for the ATC ingest (self-hosted, dev)
     #[arg(long)]
     pub atc_ca: Option<PathBuf>,
@@ -203,6 +209,8 @@ impl AirbandOpts {
             server: server.clone(),
             transport: self.atc_transport.clone(),
             token: self.atc_token.clone(),
+            credentials: self.atc_credentials.clone(),
+            streams: self.atc_streams.clone(),
             ca: self.atc_ca.clone(),
             insecure: self.atc_insecure,
             station_name: self.atc_station_name.clone(),

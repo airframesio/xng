@@ -430,6 +430,11 @@ enum Command {
         #[arg(long)]
         quic_cert_out: Option<PathBuf>,
     },
+    /// Airframes ATC network: sign this feeder in or out (`xng atc login`)
+    Atc {
+        #[command(subcommand)]
+        cmd: commands::atc::AtcCommand,
+    },
     /// Run the built-in pipeline self-test (bus + outputs + DSP sanity)
     Selftest {
         /// Also write messages to this JSONL file
@@ -658,6 +663,7 @@ fn main() -> anyhow::Result<()> {
         Command::Ingest { grpc, quic, quic_cert_out } => {
             commands::ingest::run(grpc, quic, quic_cert_out.as_deref())
         }
+        Command::Atc { cmd } => commands::atc::run(cmd),
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
     }
 }

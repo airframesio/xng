@@ -147,4 +147,5 @@ webpki-roots.workspace = true
 zeromq.workspace = true
 opus = { version = "0.3", optional = true }
 base64 = "0.22"
+bytes = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
