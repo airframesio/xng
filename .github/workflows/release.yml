@@ -24,6 +24,8 @@ jobs:
   # (32-bit Pi OS, Pi 2 and newer) is cross-compiled on amd64.
   build-linux:
     name: Build Linux ${{ matrix.arch }}
+    permissions:
+      contents: read
     runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
     container: ubuntu:22.04
     strategy:
@@ -34,6 +36,8 @@ jobs:
       - name: Install git
         run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Build binary, tarball and .deb
         env:
           XNG_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'pr' }}
@@ -72,7 +76,7 @@ jobs:
             apt-get update
             DEBIAN_FRONTEND=noninteractive apt-get install -y /dist/*.deb
             xng --version
-            xng devices || true
+            xng devices
             mkdir /t && tar -C /t -xzf /dist/*.tar.gz && /t/*/xng --version
           '
 
