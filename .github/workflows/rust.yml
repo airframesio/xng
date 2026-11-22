@@ -16,8 +16,9 @@ jobs:
     - uses: actions/checkout@v4
     - name: Install dependencies
       run: sudo apt install -y libsoapysdr-dev libairspy-dev libairspyhf-dev protobuf-compiler
+    # Same features as the release build (sherpa: local transcription).
     - name: Build
-      run: cargo build --verbose --release --features airspy,airspyhf
+      run: cargo build --verbose --release --features airspy,airspyhf,sherpa
     - name: Run tests
       run: cargo test --workspace --verbose
     - name: Run tests (native Airspy backends)
@@ -44,7 +45,7 @@ jobs:
       run: choco install protoc -y --no-progress
     - uses: ./.github/actions/pothossdr
     - name: Build
-      run: cargo build --verbose --release
+      run: cargo build --verbose --release --features sherpa
     - name: Run tests
       run: cargo test --workspace --verbose
     - name: Self-test

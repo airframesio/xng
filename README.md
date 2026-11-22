@@ -181,6 +181,11 @@ Multi-arch Docker images (amd64/arm64/armv7) are published per tag:
 docker run --rm ghcr.io/airframesio/xng:latest --version
 ```
 
+The amd64 and arm64 images include local airband transcription; downloaded
+models are kept in the `/var/cache/xng` volume (`-v xng-models:/var/cache/xng`
+keeps them across containers). The armv7 image has no local speech-to-text
+engine; use `--whisper-url` there.
+
 ## Building
 
 Requirements: a stable [Rust](https://rustup.rs) toolchain, a **protobuf
@@ -304,12 +309,14 @@ xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
     --scan --scan-priority 120.5 --record-dir ~/airband --http 0.0.0.0:8080 \
     --receiver-pos 37.62,-122.38 --atc-feed
 
-# ...and transcribe them with the ATC-tuned Parakeet model (a build with
-# `--features sherpa`; or `--transcribe-model base.en` with `--features whisper`,
-# or --whisper-url http://host:port for a Whisper server)
+# ...and transcribe them. Release binaries, the .deb and the amd64/arm64
+# Docker images include sherpa-onnx: --transcribe runs the ATC-tuned
+# skycontrol-atc-110m model, downloaded once (137 MB) on first use.
+# (Source builds: add `--features sherpa`; or --whisper-url http://host:port
+# for a Whisper server.)
 xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
     --channels 120.5,121.8 --labels "120.5=SFO Tower,121.8=SFO Ground" \
-    --transcribe-model skycontrol-atc-110m --receiver-pos 37.62,-122.38 --atc-feed
+    --transcribe --receiver-pos 37.62,-122.38 --atc-feed
 ```
 
 ![Airband dashboard page](docs/screenshots/airband-dashboard.png?raw=true)

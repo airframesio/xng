@@ -48,12 +48,15 @@ jobs:
       - name: Install PothosSDR (Windows)
         if: matrix.windows
         uses: ./.github/actions/pothossdr
+      # `sherpa` builds in local speech-to-text (sherpa-onnx), so
+      # `--transcribe` works with no extra setup: the default ATC model is
+      # downloaded on first use.
       - name: Build
         if: ${{ !matrix.windows }}
-        run: cargo build --release --features airspy,airspyhf
+        run: cargo build --release --features airspy,airspyhf,sherpa
       - name: Build (Windows)
         if: matrix.windows
-        run: cargo build --release
+        run: cargo build --release --features sherpa
       - name: Package zip (Windows)
         if: matrix.windows
         shell: bash
@@ -136,13 +139,20 @@ jobs:
 
           Intel macOS: build from source (GitHub retired its free Intel
           macOS runners) — `brew install soapysdr airspy airspyhf protobuf
-          && cargo build --release --features airspy,airspyhf`.
+          && cargo build --release --features airspy,airspyhf,sherpa`.
 
           Binaries are built with SoapySDR plus the native Airspy backends;
           they need `libsoapysdr` (and `libairspy`/`libairspyhf` for native
           Airspy) at runtime — the .deb declares these. Multi-arch Docker
           images (amd64/arm64/armv7) are published to
           `ghcr.io/airframesio/xng` for the same tag.
+
+          Airband transcription works out of the box in the binaries, the
+          .deb and the amd64/arm64 Docker images: `--transcribe` runs
+          sherpa-onnx with the ATC-tuned `skycontrol-atc-110m` model,
+          downloaded once (137 MB) on first use. The armv7 image has no local
+          engine (sherpa-onnx has no 32-bit ARM build); use `--whisper-url`
+          there.
 
           Quick start:
 
