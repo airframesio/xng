@@ -4221,6 +4221,7 @@ dependencies = [
  "base64",
  "crc",
  "miniz_oxide",
+ "regex",
  "serde",
  "serde_json",
  "xng-types",

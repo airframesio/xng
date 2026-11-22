@@ -11,6 +11,7 @@ authors.workspace = true
 base64 = "0.22"
 crc.workspace = true
 miniz_oxide = "0.8"
+regex = "1"
 serde.workspace = true
 serde_json.workspace = true
 xng-types.workspace = true

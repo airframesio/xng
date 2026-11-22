@@ -62,6 +62,30 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
             }
             Some(s)
         }
+        "loadsheet" => {
+            let mut s = match app.get("kind")?.as_str()? {
+                "acceptance" => "LOADSHEET ACCEPT".to_owned(),
+                "request" => "LOADSHEET REQ".to_owned(),
+                _ => "LOADSHEET".to_owned(),
+            };
+            for key in ["status", "flight_number"] {
+                if let Some(v) = app.get(key).and_then(|v| v.as_str()) {
+                    s.push_str(&format!(" {v}"));
+                }
+            }
+            if let (Some(d), Some(a)) = (
+                app.get("departure").and_then(|v| v.as_str()),
+                app.get("arrival").and_then(|v| v.as_str()),
+            ) {
+                s.push_str(&format!(" {d}->{a}"));
+            }
+            for (key, name) in [("zfw", "ZFW"), ("tow", "TOW"), ("pax_total", "PAX")] {
+                if let Some(v) = app.get(key).and_then(|v| v.as_i64()) {
+                    s.push_str(&format!(" {name} {v}"));
+                }
+            }
+            Some(s)
+        }
         _ => None,
     }
 }
