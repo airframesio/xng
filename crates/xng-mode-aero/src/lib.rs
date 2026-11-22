@@ -570,7 +570,21 @@ fn enrich_details(details: &mut serde_json::Value, e: &AeroEvent) {
 /// Convert a decoded event into the normalized message model.
 pub fn to_message(e: &AeroEvent, frequency_hz: u64, level_dbfs: f32, source: Provenance) -> Message {
     let (body, crc_ok, errors) = match (&e.acars, &e.su_event) {
-        (Some(b), _) => (MessageBody::Acars(b.core.clone()), b.crc_ok, Some(b.parity_errors)),
+        (Some(b), _) => {
+            // The AES/GES ids live on the signal unit, not the ACARS core;
+            // keep them on the transient link field for the JAERO-JSON feed
+            // (outputs::jaero_json).
+            let mut core = b.core.clone();
+            core.link = Some(serde_json::json!({
+                "aes_id": e.user.aes_id,
+                "ges_id": e.user.ges_id,
+                "qno": e.user.qno,
+                "refno": e.user.refno,
+                "bit_rate": e.bit_rate,
+                "channel": e.channel.tag(),
+            }));
+            (MessageBody::Acars(core), b.crc_ok, Some(b.parity_errors))
+        }
         (None, Some(a)) => {
             // Enrich the structured-SU details with the channel tag and the
             // physical line/burst bit rate so consumers can distinguish

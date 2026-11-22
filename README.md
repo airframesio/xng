@@ -412,9 +412,20 @@ classic behavior (ACARS to `feed.airframes.io:5550`); an optional
 from a base id, each routed to that mode's own Airframes ingest in its
 native format), disable feeding for one decoder with `feed = false` on its
 `[[session]]`, or override a decoder's id with `airframes-station-id`.
-Native per-mode serialization now covers **ACARS and VDL2** (VDL2 emits
-dumpvdl2 `decoded:json` to `:5552`, field-verified against dumpvdl2 2.6.0);
-other modes route to Airframes over asf-2.0. The multiplexed **asf-2.0**
+Each mode goes to its own Airframes ingest in the format that ingest reads:
+
+| Mode | Ingest | Format |
+|---|---|---|
+| ACARS | UDP `:5550` | acarsdec JSON |
+| VDL2 | UDP `:5552` | dumpvdl2 `decoded:json` (`vdl2.station` set) |
+| HFDL | TCP `:5556` | dumphfdl `decoded:json` (ACARS and performance data) |
+| AIS | HTTP `:5599` | AIS-catcher JSON batches (every 5 s, gzip) |
+| Aero L-band / C-band | UDP `:5571` / `:5561` | JAERO JDUMP JSON |
+| Iridium | TCP `:5590` | iridium-toolkit ACARS JSON |
+
+Each block (`[outputs.airframes.acars]`, `.vdl2`, `.hfdl`, `.ais`, `.aero`,
+`.iridium`) takes `enabled`, `station-id`, `host` and `port`. Other modes
+(STD-C, ADS-B, UAT, ...) reach Airframes over asf-2.0. The multiplexed **asf-2.0**
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
 

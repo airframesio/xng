@@ -112,6 +112,7 @@ rumqttc.workspace = true
 toml = "0.8"
 sgp4 = "2"
 ureq = "2"
+flate2 = "1"
 chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
 num-complex.workspace = true

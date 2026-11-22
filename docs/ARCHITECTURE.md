@@ -132,10 +132,13 @@ protobuf schema multiplexing every channel/SDR/mode over a single gRPC
 (tonic/HTTP/2) or QUIC (quinn) connection, with the raw payload always
 preserved for server-side re-decode. `xng ingest` is the reference
 server. Legacy decoder-native JSON is retained so existing Airframes
-ingests work unchanged: ACARS feeds acarsdec flat JSON, and VDL2 feeds
-dumpvdl2 `decoded:json` (nested vdl2/avlc/acars; UDP `:5552` / TCP `:5553`,
-verified field-for-field against dumpvdl2 2.6.0). Modes without a
-per-port serializer reach Airframes via asf-2.0 only. Full protocol in
+ingests work unchanged: ACARS feeds acarsdec flat JSON (UDP `:5550`),
+VDL2 dumpvdl2 `decoded:json` (UDP `:5552`, verified field-for-field
+against dumpvdl2 2.6.0), HFDL dumphfdl `decoded:json` (TCP `:5556`), AIS
+AIS-catcher JSON batches (HTTP `:5599`), Aero JAERO JDUMP JSON (UDP `:5571` /
+`:5561`) and Iridium iridium-toolkit JSON (TCP `:5590`)
+(`src/outputs/airframes.rs`). Modes without a per-port ingest reach
+Airframes via asf-2.0 only. Full protocol in
 [ASF2.md](ASF2.md).
 
 The web dashboard (`--http`) also exports positioned entities over

@@ -412,7 +412,7 @@ pub fn to_message(
                 reassembled: false,
                 assstat: None,
                 app,
-                vdl2_link: None,
+                link: None,
             })
         },
         raw: Some(f.raw.clone()),

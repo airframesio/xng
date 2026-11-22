@@ -102,11 +102,15 @@ impl HfdlChannelDecoder {
 /// Convert a decoded event into the normalized message model.
 pub fn to_message(e: &pdu::HfdlEvent, frequency_hz: u64, level_dbfs: f32, source: Provenance) -> Message {
     let (body, crc_ok, errors) = match &e.acars {
-        Some(b) => (
-            MessageBody::Acars(b.core.clone()),
-            b.crc_ok,
-            Some(b.parity_errors),
-        ),
+        Some(b) => {
+            // Keep the MPDU/LPDU addressing (`who`: direction, ground station,
+            // aircraft id, cached ICAO) and the burst bit rate on the
+            // transient link field: the ACARS core doesn't carry them, and the
+            // dumphfdl `decoded:json` feed (outputs::dumphfdl_json) needs them.
+            let mut core = b.core.clone();
+            core.link = Some(e.details.clone());
+            (MessageBody::Acars(core), b.crc_ok, Some(b.parity_errors))
+        }
         None => (
             MessageBody::Hfdl { kind: e.kind.clone(), details: e.details.clone() },
             true,

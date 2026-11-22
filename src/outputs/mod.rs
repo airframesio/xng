@@ -3,6 +3,7 @@
 //! land in M3).
 
 pub mod acarsdec_json;
+pub mod aiscatcher_json;
 pub mod aircraft;
 #[cfg(feature = "opus")]
 pub mod airband_icecast;
@@ -17,9 +18,12 @@ pub mod asf2_quic;
 pub mod atc_feed;
 pub mod console;
 pub mod dbinfo;
+pub mod dumphfdl_json;
 pub mod dumpvdl2_json;
 pub mod gsmtap;
 pub mod http;
+pub mod iridium_toolkit_json;
+pub mod jaero_json;
 pub mod jsonl;
 pub mod map;
 pub mod metrics;
