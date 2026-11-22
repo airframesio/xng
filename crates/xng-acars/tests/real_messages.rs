@@ -395,3 +395,30 @@ fn label_5z_b3_departure_clearance() {
     assert_eq!(arrival_runway.as_deref(), Some("27C"));
     assert_eq!(day, Some(14));
 }
+
+// --- Label RA arrival gate uplinks (production texts, names removed) ---
+#[test]
+fn label_ra_united_gate_assign_tab_indented() {
+    let d = decode(
+        "RA",
+        "QUNDCULUA~1GATE ASSIGN\r\n\tUA0942/21 KIAD LPPT\r\n\tSENT: 09:14:42Z\r\n\tGATE 43    OPEN\r\n\tRAMP FREQ  \r\n\tOPS FREQ   131.575\r\n\tEON        1003Z\r\n",
+        false,
+    );
+    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    assert_eq!((g.departure.as_deref(), g.arrival.as_str(), g.gate.as_str()), (Some("KIAD"), "LPPT", "43"));
+    let j = serde_json::to_value(decode("RA", "QUHDQITOO.1ARR GATE INFO   \r\nBFL ARRIVAL GATE 4\r\nNEXT FLIGHT INFORMATION-\r\n", false)).unwrap();
+    assert_eq!(j["app"]["app"], "gate");
+    assert_eq!(j["app"]["kind"], "arrival_gate");
+    assert_eq!(j["app"]["arrival"], "BFL");
+    assert_eq!(j["app"]["gate"], "4");
+}
+
+#[test]
+fn label_ra_finnair_connections_are_not_gates() {
+    let d = decode(
+        "RA",
+        "QUHELASAY~1\r\nCURRENT FLIGHT\r\nFLIGHT  ESTIMATED ARRIVAL TIME\r\nAY1014   EIBT  UTC  \r\n\r\nCONNECTION INFO\r\nFLIGHT DATE     TIME  TO  GATE \r\nAY0957 20261122 09:35 CPH 31\r\n",
+        false,
+    );
+    assert!(d.app.is_none(), "{:?}", d.app);
+}

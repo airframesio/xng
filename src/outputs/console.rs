@@ -86,6 +86,23 @@ fn app_summary(app: &serde_json::Value) -> Option<String> {
             }
             Some(s)
         }
+        "gate" => {
+            let mut s = match app.get("kind")?.as_str()? {
+                "gate_change" => "GATE CHANGE".to_owned(),
+                "gate_assign" => "GATE ASSIGN".to_owned(),
+                _ => "ARRIVAL GATE".to_owned(),
+            };
+            if let Some(f) = app.get("flight_number").and_then(|v| v.as_str()) {
+                s.push_str(&format!(" {f}"));
+            }
+            let arrival = app.get("arrival")?.as_str()?;
+            match app.get("departure").and_then(|v| v.as_str()) {
+                Some(d) => s.push_str(&format!(" {d}->{arrival}")),
+                None => s.push_str(&format!(" {arrival}")),
+            }
+            s.push_str(&format!(" gate {}", app.get("gate")?.as_str()?));
+            Some(s)
+        }
         _ => None,
     }
 }
@@ -856,5 +873,16 @@ mod tests {
         );
         assert!(s.contains("IRIDIUM voice VOC"), "{s}");
         assert!(!s.contains("lcw="), "silent lcw should be omitted: {s}");
+    }
+
+    #[test]
+    fn gate_summary_names_flight_route_and_gate() {
+        let s = app_summary(&json!({
+            "app": "gate", "kind": "gate_assign", "gate": "43", "gate_status": "OPEN",
+            "flight_number": "UA0942", "departure": "KIAD", "arrival": "LPPT",
+        }));
+        assert_eq!(s.as_deref(), Some("GATE ASSIGN UA0942 KIAD->LPPT gate 43"));
+        let s = app_summary(&json!({"app": "gate", "kind": "arrival_gate", "gate": "4", "arrival": "BFL"}));
+        assert_eq!(s.as_deref(), Some("ARRIVAL GATE BFL gate 4"));
     }
 }

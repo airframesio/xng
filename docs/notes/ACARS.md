@@ -254,6 +254,17 @@ broken out; `B3` additionally yields `day` and `arrival_runway`. Unknown
 types are not decoded (matching the TS plugin's `decoded=false`). Verified
 against the documented `Label_5Z_Slash.test.ts` examples.
 
+**Label RA arrival gates** (`gate.rs`) — port of the event digger's RA
+gate parsing (keep in step). United `GATE ASSIGN` / `GATE CHANGE` are read
+line by line (field lines are often tab indented): the flight/route line
+gives `flight_number`, `day` and ICAO `departure`/`arrival`; the gate must
+contain a digit (the crew alert's "GATE ASSIGN" line is skipped) and the
+last gate wins; `gate_status` is `OPEN` or `AVAIL` with
+`gate_available_time`. Republic `... YX4450 ORD MSN ETA = 0542 GATE = 16`
+and SkyWest `BFL ARRIVAL GATE 4` (also on the header line) give the gate at
+an IATA airport; SkyWest's next-flight block is not read. Finnair
+connection lists name other flights' departure gates and are not decoded.
+
 **Media advisory** (`media_adv.rs`) — label **SA** datalink-availability
 report (`0EV121314VS/text`): version, established/lost, changed link,
 HH:MM:SS, available links (V/S/H/G/C/2/X/I), free text.
