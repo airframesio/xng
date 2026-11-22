@@ -12,7 +12,9 @@
 //! `gtout` (gate-out, `gout`), `gtin` (gate-in, `gin`), `wloff`
 //! (wheels-off, `woff`), `wlin` (wheels-on, `won`).
 
+use regex::Regex;
 use serde::Serialize;
+use std::sync::LazyLock;
 
 /// Decoded OOOI fields. Empty fields are omitted from serialization; an
 /// all-empty result is reported as `None` by [`decode`].
@@ -141,8 +143,17 @@ fn has_time(o: &Oooi) -> bool {
 fn decode_report(label: &str, text: &str) -> Option<Oooi> {
     match label {
         "80" | "30" | "31" | "32" | "33" | "82" | "8D" => airline_report(text),
-        "11" | "12" | "13" | "14" => numbered_report(text).or_else(|| united_report(text)),
-        "15" | "16" | "17" | "18" => united_report(text),
+        "10" => delta_report(label, text).or_else(|| day_clock_report(text)),
+        "11" | "12" | "13" | "14" => delta_report(label, text)
+            .or_else(|| numbered_report(text))
+            .or_else(|| united_report(text))
+            .or_else(|| compact_report(text))
+            .or_else(|| day_clock_report(text))
+            .or_else(|| csv_version_report(text)),
+        "15" => delta_report(label, text).or_else(|| united_report(text)),
+        "16" | "17" | "18" => united_report(text),
+        "C1" | "RA" => colon_times_report(text),
+        "4T" => pushback_report(text),
         "22" => numbered_report(text).or_else(|| label22_csv(text)),
         "44" => label44_report(text),
         "QC" | "QD" | "QE" | "QF" => text_report(text).or_else(|| station_report(label, text)),
@@ -190,6 +201,7 @@ fn airline_report(text: &str) -> Option<Oooi> {
 /// `OUT01    ETH309/22220151HKJKHAAB\r\n0151 ...` on labels 11-14, and
 /// `OFF01YX5763/21212240KDCAKLGA224047  77` (HHMMSS inline) on label 22.
 fn numbered_report(text: &str) -> Option<Oooi> {
+    let text = strip_block_header(text);
     let event = ["OUT", "OFF", "ONN", "INN"].into_iter().find(|e| text.starts_with(&format!("{e}01")))?;
     let slash = text.find('/')?;
     let flight = &text[5..slash];
@@ -208,8 +220,9 @@ fn numbered_report(text: &str) -> Option<Oooi> {
         ..Oooi::default()
     };
     o.depa.as_ref()?;
-    let tail = &text[slash + 17..];
+    let tail = text.get(slash + 17..)?;
     let time = if let Some(line) = tail.strip_prefix("\r\n").or_else(|| tail.strip_prefix('\n')) {
+        let line = line.strip_prefix('\t').unwrap_or(line);
         line.get(..4).and_then(clock)
     } else {
         tail.get(..6).and_then(clock)
@@ -337,6 +350,166 @@ fn united_report(text: &str) -> Option<Oooi> {
         }
         _ => return None,
     }
+    has_time(&o).then_some(o)
+}
+
+// --- More airline layouts (production samples 2026-11-21/22) ---
+
+fn re(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("valid OOOI regex")
+}
+
+/// Drops a C-Band `M<nn>A<airline><flight>` block header
+/// (`M99ANH0218INN01...`, `M70ADL0065201915 ...`).
+fn strip_block_header(text: &str) -> &str {
+    let t = text.as_bytes();
+    let is_header = t.len() > 10
+        && t[0].is_ascii_uppercase()
+        && t[1].is_ascii_digit()
+        && t[2].is_ascii_digit()
+        && t[3].is_ascii_uppercase()
+        && t[4..6].iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && t[6..10].iter().all(u8::is_ascii_digit);
+    if is_header { &text[10..] } else { text }
+}
+
+static COMPACT_OUT: LazyLock<Regex> = LazyLock::new(|| re(r"^OUT01(\d{4})\d{4}([A-Z]{4})([A-Z]{4})"));
+static COMPACT_OFF: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^OFF01(\d{4})DIA\d{2}([A-Z]{4})([A-Z]{4})(\d{4})?"));
+static COMPACT_ON_IN: LazyLock<Regex> = LazyLock::new(|| re(r"^(ONN|INN)01(\d{4})([A-Z]{4}|-{4})"));
+
+/// British Airways, the numbered form without the flight and `/`:
+/// 11 `OUT0105400525LSZHEGLL`, 12 `OFF010247DIA02KEWREGLL0859BAB708...` (ETA),
+/// 13 `ONN010223CYVR`, 14 `INN010611EGLL 484 480  56  54` / `INN011053----`.
+fn compact_report(text: &str) -> Option<Oooi> {
+    let mut o = Oooi::default();
+    if let Some(c) = COMPACT_OUT.captures(text) {
+        o.depa = icao(&c[2]);
+        o.dsta = icao(&c[3]);
+        set_event(&mut o, "OUT", clock(&c[1]));
+    } else if let Some(c) = COMPACT_OFF.captures(text) {
+        o.depa = icao(&c[2]);
+        o.dsta = icao(&c[3]);
+        o.eta = c.get(4).and_then(|m| clock(m.as_str()));
+        set_event(&mut o, "OFF", clock(&c[1]));
+    } else if let Some(c) = COMPACT_ON_IN.captures(text) {
+        o.dsta = icao(&c[3]);
+        set_event(&mut o, &c[1], clock(&c[2]));
+    }
+    has_time(&o).then_some(o)
+}
+
+static DAY_CLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"^(OUT|OFF|ONN|INN)\d{2}A(0[1-9]|[12]\d|3[01])(\d{6})([A-Z]{4})(?:([A-Z]{4})\d{6}|\d{4}([A-Z]{4})?)")
+});
+
+/// JAL (label 10) and ANA (label 11): event, version, `A`, day, HHMMSS:
+/// `OUT04A21204409KSFO2044RJTT`, `ONN04A21200226YSSY2002`,
+/// `OFF01A21070436RJSSRJCC070421`. OUT/OFF name the departure then the
+/// arrival, ON/IN the arrival.
+fn day_clock_report(text: &str) -> Option<Oooi> {
+    let c = DAY_CLOCK.captures(strip_block_header(text))?;
+    let mut o = Oooi::default();
+    let second = c.get(5).or(c.get(6)).and_then(|m| icao(m.as_str()));
+    if matches!(&c[1], "OUT" | "OFF") {
+        o.depa = icao(&c[4]);
+        o.dsta = second;
+    } else {
+        o.dsta = icao(&c[4]);
+    }
+    set_event(&mut o, &c[1], clock(&c[3]));
+    has_time(&o).then_some(o)
+}
+
+static DELTA_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(0[1-9]|[12]\d|3[01])(?:[01]\d|2[0-3])(1[0-5]) ([A-Z0-9]{4}) ([A-Z0-9]{4})\d\r?\n\t?"));
+static DELTA_OUT: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})\d{4}\d{8}"));
+static DELTA_OFF: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})\d{4}[\d ]{12}(\d{4})\d{4}"));
+static DELTA_ON: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})\d{4} *(?:\r?\n|$)"));
+static DELTA_IN: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})[\d ]{4}[\d ]{4} *$"));
+static DELTA_SUMMARY: LazyLock<Regex> = LazyLock::new(|| re(r"^\d{4}(\d{4})[\d ]{4}\S"));
+
+/// Delta: `<DD><HH><label> <dep> <arr><n>` then four-digit fields:
+/// 13 OUT `210513 KLAX KATL6\r\n07830550038005490542` (flight, OUT, fuel, ...),
+/// 10 OFF `...\r\n07830603037905520549054205500550` (flight, OFF, fuel, three
+/// times, OUT, OUT), 15 ON `...\r\n081805460086` (flight, ON, fuel),
+/// 14 IN `...\r\n0694062900810084`, 11 IN with the ON time last on the line.
+/// Checked on flights that sent several: DL816 L15 0045, L14 0056, L11
+/// `0056 ... 0045`; NW783 L13 0550 repeated as the OUT of its L10 at 0603.
+fn delta_report(label: &str, text: &str) -> Option<Oooi> {
+    let text = strip_block_header(text);
+    let h = DELTA_HEADER.captures(text)?;
+    if &h[2] != label {
+        return None;
+    }
+    let body = &text[h.get(0)?.end()..];
+    let mut o = Oooi { depa: icao(&h[3]), dsta: icao(&h[4]), ..Oooi::default() };
+    match label {
+        "13" => set_event(&mut o, "OUT", clock(&DELTA_OUT.captures(body)?[1])),
+        "10" => {
+            let c = DELTA_OFF.captures(body)?;
+            set_event(&mut o, "OFF", clock(&c[1]));
+            set_event(&mut o, "OUT", clock(&c[2]));
+        }
+        "15" => set_event(&mut o, "ON", clock(&DELTA_ON.captures(body)?[1])),
+        "14" => {
+            let line = body.split(['\r', '\n']).next().unwrap_or("");
+            set_event(&mut o, "IN", clock(&DELTA_IN.captures(line)?[1]));
+        }
+        "11" => {
+            let line = body.split(['\r', '\n']).next().unwrap_or("").trim_end_matches(' ');
+            set_event(&mut o, "IN", clock(&DELTA_SUMMARY.captures(line)?[1]));
+            if line.len() >= 16 {
+                set_event(&mut o, "ON", line.get(line.len() - 4..).and_then(clock));
+            }
+        }
+        _ => return None,
+    }
+    has_time(&o).then_some(o)
+}
+
+static CSV_VERSION: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(OUT|ONE),V\d{2},[^,]*,([A-Z0-9-]{4}),([A-Z0-9-]{4}),(\d{4})\b"));
+
+/// Cathay Pacific `OUT,V02,CX 837 20261121 1,CYVR,VHHH,2044,2036,----, 1179`
+/// and `ONE,V02,CX 105 20261122 1,VHHH,YMML,0124,   96`.
+fn csv_version_report(text: &str) -> Option<Oooi> {
+    let c = CSV_VERSION.captures(text)?;
+    let event = match &c[1] {
+        "OUT" => "OUT",
+        _ => "ON",
+    };
+    let mut o = Oooi { depa: icao(&c[2]), dsta: icao(&c[3]), ..Oooi::default() };
+    set_event(&mut o, event, clock(&c[4]));
+    has_time(&o).then_some(o)
+}
+
+static COLON_TIMES: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"\bOUT:\s*([\d-]{4})\s+OFF:\s*([\d-]{4})\s*\r?\n\s*IN:\s*([\d-]{4})\s+ON:\s*([\d-]{4})")
+});
+
+/// SkyWest end of flight report (uplink, C1 or RA):
+/// `OUT: 0538    OFF: 0551\r\n  IN: 0712     ON: 0649\r\nDOOR: 0713`.
+fn colon_times_report(text: &str) -> Option<Oooi> {
+    let c = COLON_TIMES.captures(text)?;
+    let mut o = Oooi::default();
+    set_event(&mut o, "OUT", clock(&c[1]));
+    set_event(&mut o, "OFF", clock(&c[2]));
+    set_event(&mut o, "IN", clock(&c[3]));
+    set_event(&mut o, "ON", clock(&c[4]));
+    has_time(&o).then_some(o)
+}
+
+static PUSHBACK: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^PSHBK [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z"));
+
+/// Air Canada pushback `PSHBK AC0281/21/22 YVR 0603Z/    Z/    Z/0605Z`
+/// (label 4T) as the OUT time; the station is IATA, so it goes in `depa`
+/// like the QE/QF short layouts.
+fn pushback_report(text: &str) -> Option<Oooi> {
+    let c = PUSHBACK.captures(text)?;
+    let mut o = Oooi { depa: Some(c[1].to_string()), ..Oooi::default() };
+    set_event(&mut o, "OUT", clock(&c[2]));
     has_time(&o).then_some(o)
 }
 
@@ -775,7 +948,136 @@ mod tests {
         let o = decode("14", "INN01UAE179    /21211019OMDBEPWA\r\n1017 1761011").unwrap();
         assert_eq!(o.gtin.as_deref(), Some("1017"));
 
-        assert!(decode("13", "ONN011317EGJB").is_none());
+        // British Airways sends it without the flight and slash
+        let o = decode("13", "ONN011317EGJB").unwrap();
+        assert_eq!(o.dsta.as_deref(), Some("EGJB"));
+        assert_eq!(o.wlin.as_deref(), Some("1317"));
+    }
+
+    #[test]
+    fn british_airways_compact_reports() {
+        let o = decode("11", "OUT0105400525LSZHEGLL").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("LSZH"), Some("EGLL")));
+        assert_eq!(o.gtout.as_deref(), Some("0540"));
+
+        let o = decode("12", "OFF010247DIA02KEWREGLL0859BAB7080926130450READY ").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("KEWR"), Some("EGLL")));
+        assert_eq!(o.wloff.as_deref(), Some("0247"));
+        assert_eq!(o.eta.as_deref(), Some("0859"));
+
+        let o = decode("14", "INN010611EGLL 484 480  56  54").unwrap();
+        assert_eq!(o.dsta.as_deref(), Some("EGLL"));
+        assert_eq!(o.gtin.as_deref(), Some("0611"));
+
+        let o = decode("14", "INN011053----").unwrap();
+        assert_eq!(o.dsta, None);
+        assert_eq!(o.gtin.as_deref(), Some("1053"));
+
+        assert!(decode("16", "MVT01063100EGLLELLX000048000048021").is_none());
+    }
+
+    #[test]
+    fn jal_and_ana_day_clock_reports() {
+        let o = decode("10", "OUT04A21204409KSFO2044RJTT").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("KSFO"), Some("RJTT")));
+        assert_eq!(o.gtout.as_deref(), Some("2044"));
+
+        let o = decode("10", "ONN04A21200226YSSY2002").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (None, Some("YSSY")));
+        assert_eq!(o.wlin.as_deref(), Some("2002"));
+
+        let o = decode("10", "M34AJL0111OUT04A22003718RJTT0037RJOO").unwrap();
+        assert_eq!(o.gtout.as_deref(), Some("0037"));
+
+        let o = decode("11", "OFF01A21070436RJSSRJCC070421").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("RJSS"), Some("RJCC")));
+        assert_eq!(o.wloff.as_deref(), Some("0704"));
+
+        let o = decode("14", "M99ANH0218INN01ANA218    /21212126EDDMRJTT\n\t2124192 ").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("EDDM"), Some("RJTT")));
+        assert_eq!(o.gtin.as_deref(), Some("2124"));
+
+        assert!(decode("10", "ETA04M22062329   VTBS090161  340Y").is_none());
+    }
+
+    #[test]
+    fn delta_reports() {
+        let o = decode("13", "210513 KLAX KATL6\r\n07830550038005490542            ").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("KLAX"), Some("KATL")));
+        assert_eq!(o.gtout.as_deref(), Some("0550"));
+        assert_eq!(o.wloff, None);
+
+        let o = decode("10", "210610 KLAX KATL6\r\n07830603037905520549054205500550            ").unwrap();
+        assert_eq!(o.wloff.as_deref(), Some("0603"));
+        assert_eq!(o.gtout.as_deref(), Some("0550"));
+
+        let o = decode("10", "212010 KORD KATL6\r\n2894200502051942        19411941000000000000").unwrap();
+        assert_eq!(o.wloff.as_deref(), Some("2005"));
+        assert_eq!(o.gtout.as_deref(), Some("1941"));
+
+        let o = decode("15", "210015 KSAT KBOS6\r\n081600450059\r\n000000903094901036000000000000001160000148").unwrap();
+        assert_eq!(o.wlin.as_deref(), Some("0045"));
+
+        let o = decode("15", "M70ADL0065201915 KLAX NZAA6\n\t006519470293\n\t      391944456540488833007827   ").unwrap();
+        assert_eq!(o.dsta.as_deref(), Some("NZAA"));
+        assert_eq!(o.wlin.as_deref(), Some("1947"));
+
+        let o = decode("14", "210014 KSAT KBOS6\r\n0816005600560059").unwrap();
+        assert_eq!(o.gtin.as_deref(), Some("0056"));
+
+        let o = decode("14", "212214 KJFK KSFO6\r\n03632222        ").unwrap();
+        assert_eq!(o.gtin.as_deref(), Some("2222"));
+
+        let o = decode("11", "210111 KSAT KBOS6\r\n081600560056111390  0       0011600001490045\r\n\r\n").unwrap();
+        assert_eq!((o.gtin.as_deref(), o.wlin.as_deref()), (Some("0056"), Some("0045")));
+
+        let o = decode("11", "210511 KSLC KBOS8\r\n07020454    111200  0                   0449\r\n").unwrap();
+        assert_eq!((o.gtin.as_deref(), o.wlin.as_deref()), (Some("0454"), Some("0449")));
+
+        // a header for another label, a delay remark, a position report
+        assert!(decode("13", "210514 KDTW KLAX6\r\n0694062900810084").is_none());
+        assert!(decode("12", "212212 KSFO KATL6\r\n2253\r\nLONG LINE OF DEPARTURES\r\n").is_none());
+        assert!(decode("17", "210617 KDTW EDDF7\r\n/FN 0086\r\nAGPED   06103900727-602750290039682").is_none());
+    }
+
+    #[test]
+    fn cathay_skywest_and_air_canada_reports() {
+        let o = decode("11", "OUT,V02,CX 837 20261121 1,CYVR,VHHH,2044,2036,----, 1179").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("CYVR"), Some("VHHH")));
+        assert_eq!(o.gtout.as_deref(), Some("2044"));
+
+        let o = decode("13", "ONE,V02,CX 105 20261122 1,VHHH,YMML,0124,   96").unwrap();
+        assert_eq!(o.wlin.as_deref(), Some("0124"));
+
+        let o = decode(
+            "RA",
+            "SOULS: 69\r\nCARGO:  1280 ZFW: 64946\r\n\r\n OUT: 0353    OFF: 0409\r\n  IN: 0601     ON: 0551\r\nDOOR: 0603\r\n",
+        )
+        .unwrap();
+        assert_eq!(o.gtout.as_deref(), Some("0353"));
+        assert_eq!(o.wloff.as_deref(), Some("0409"));
+        assert_eq!(o.wlin.as_deref(), Some("0551"));
+        assert_eq!(o.gtin.as_deref(), Some("0601"));
+
+        let o = decode("4T", "PSHBK AC0281/21/22 YVR 0603Z/    Z/    Z/0605Z").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("YVR"));
+        assert_eq!(o.gtout.as_deref(), Some("0603"));
+        assert!(decode("4T", "ETA AC0404/21/21 YUL 1510Z").is_none());
+    }
+
+    #[test]
+    fn impossible_days_and_unknown_codes_are_not_reports() {
+        assert!(decode("13", "992513 KLAX KATL6\r\n07830550038005490542").is_none());
+        assert!(decode("13", "219913 KLAX KATL6\r\n07830550038005490542").is_none());
+        assert!(decode("10", "OUT04A99204409KSFO2044RJTT").is_none());
+        assert!(decode("13", "INC,V02,CX 140 20261122 1,YPPH,VHHH,1556").is_none());
+        assert!(decode("13", "ONA,V02,CX 105 20261122 1,VHHH,YMML,0124").is_none());
+        assert!(decode("4T", "PSHBK AC0281/99/00 YVR 0000Z/    Z/    Z/0605Z").is_none());
+    }
+
+    #[test]
+    fn numbered_report_with_non_ascii_tail_does_not_panic() {
+        assert!(decode("11", "OUT01ETH309/22220151HKJKHAAé0151").is_none());
     }
 
     #[test]
