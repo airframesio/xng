@@ -141,7 +141,7 @@ pub struct Loadsheet {
     pub pax_breakdown: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pax_total: Option<i64>,
-    /// Infants (PAX 339 PLUS 3).
+    /// Infants (PAX 339 PLUS 3), already counted in `pax_total`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub infants: Option<i64>,
     /// Total on board, crew included.
@@ -206,7 +206,7 @@ static HEADER_WORD: LazyLock<Regex> =
     LazyLock::new(|| re(r"LOADSHEET|LOAD SHEET|L O A D S H E E T|\bLS\s+(?:FINAL|PRELIM)"));
 /// Lines that mention a loadsheet without starting one.
 static NOT_HEADER: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"END (?:OF )?(?:ACARS )?LOADSHEET|LOADSHEET END|AMENDMENTS|WILL FOLLOW|NO FINAL LOADSHEET|AWAITING|CANCELLED|CHECKS PERFORMED|ACCEPT|\bACK|RCVD|\bREQ\b|REQUEST|,")
+    re(r"END (?:OF )?(?:ACARS )?LOADSHEET|LOADSHEET END|AMENDMENTS|WILL FOLLOW|NO FINAL LOADSHEET|AWAITING|CANCELLED|CHECKS PERFORMED|ACCEPT|\bACK|RCVD|\bREQ\b|REQUEST")
 });
 static STATUS: LazyLock<Regex> = LazyLock::new(|| re(r"\b(FINAL|PRELIM)(?:INARY)?"));
 static EDITION: LazyLock<Regex> = LazyLock::new(|| re(r"\bED(?:NO?|N0)?\s*0*(\d{1,2})\b"));
@@ -246,14 +246,19 @@ static ZFW: LazyLock<Regex> = LazyLock::new(|| re(r"^ZFW(?: ACTUAL)?:?\s+(\d+)(?
 static TOW: LazyLock<Regex> = LazyLock::new(|| re(r"^TOW(?: ACTUAL)?:?\s+(\d+)(?:[^\d.]|$)"));
 static LAW: LazyLock<Regex> =
     LazyLock::new(|| re(r"^(?:LAW|LDW|LGW|LW)(?: ACTUAL)?:?\s+(\d+)(?:[^\d.]|$)"));
-/// A bare `KEY number` line, checked on the last line for a cut-off value.
-static BARE_KEY_NUMBER: LazyLock<Regex> = LazyLock::new(|| re(r"^[A-Z]+:?\s+([0-9]+)$"));
+/// A bare weight on the last line, possibly cut at a message split.
+static CUT_WEIGHT: LazyLock<Regex> = LazyLock::new(|| {
+    re(r"^(ZFW|TOW|LAW|LDW|LGW|LW|TOF|TIF|TF|BO|DOW|UNDLD)(?: ACTUAL)?:?\s+([0-9]+)$")
+});
 static MAX: LazyLock<Regex> = LazyLock::new(|| re(r"\bM(?:AX)?\s*(\d+)"));
 static LIMIT_MARK: LazyLock<Regex> = LazyLock::new(|| re(r"[\s\d]L$"));
 static WEIGHT_START: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:ZFW|TOW)(?: ACTUAL)?:?\s+\d"));
-static TOF: LazyLock<Regex> = LazyLock::new(|| re(r"^TOF\s+(\d+)(?:[^\d.]|$)"));
-static TIF: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:TIF|TF|BO)\s+(\d+)(?:[^\d.]|$)"));
-static UNDLD: LazyLock<Regex> = LazyLock::new(|| re(r"^UNDLD\s+(\d+)(?:[^\d.]|$)"));
+static TOF: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(?:TOF|TAKE ?OFF FUEL):?\s+(\d+)(?:[^\d.]|$)"));
+static TIF: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(?:TIF|TF|BO|TRIP(?: FUEL)?):?\s+(\d+)(?:[^\d.]|$)"));
+static UNDLD: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(?:UNDLD|ULOAD|UNDERLOAD):?\s+(\d+)(?:[^\d.]|$)"));
 static DOW: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|\s)DOW\s+(\d+)(?:[^\d.]|$)"));
 static BW: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|\s)BW\s*(\d+)(?:[^\d.]|$)"));
 static CREW: LazyLock<Regex> = LazyLock::new(|| re(r"^CREW\s+(\d{1,2}/\d{1,2}(?:/\d{1,2})?)\b"));
@@ -261,6 +266,8 @@ static TOB: LazyLock<Regex> = LazyLock::new(|| re(r"^TOB\s+(\d+)(?:[^\d.]|$)"));
 static TYPE: LazyLock<Regex> = LazyLock::new(|| re(r"^TYPE\s+([A-Z0-9-]{3,10})$"));
 static PAX_TTL: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?:^|\s)PAX[\s/]+(\d+(?:/\s*\d+)*)\s+TTL\s+(\d+)"));
+/// PAX 255 145/96/9/5: total first, then the breakdown.
+static PAX_TOTAL_FIRST: LazyLock<Regex> = LazyLock::new(|| re(r"^PAX\s+(\d+)\s+(\d+(?:/\d+)+)$"));
 static INFANTS: LazyLock<Regex> = LazyLock::new(|| re(r"^PAX\s+\d+\s+PLUS\s+(\d+)"));
 static NOTOC: LazyLock<Regex> = LazyLock::new(|| re(r"NOTOC:?\s*(YES|NO)\b"));
 static UNIT: LazyLock<Regex> = LazyLock::new(|| {
@@ -296,7 +303,8 @@ impl Index {
     }
 }
 
-/// MACZFW 32.5, MAC ZFW: 30.58, LIZFW 33.0, DOI -28.7.
+/// MACZFW 32.5, MAC ZFW: 30.58, LIZFW 33.0, DOI -28.7, DOI 5,61 (decimal
+/// comma).
 static INDEX_PATTERNS: LazyLock<Vec<(Regex, Index)>> = LazyLock::new(|| {
     [
         ("DOI", Index::Doi),
@@ -310,7 +318,7 @@ static INDEX_PATTERNS: LazyLock<Vec<(Regex, Index)>> = LazyLock::new(|| {
         ("MAC ?LAW", Index::MacLaw),
     ]
     .into_iter()
-    .map(|(key, idx)| (re(&format!(r"(?:^|\s){key}:?\s+(-?\d+(?:\.\d+)?)")), idx))
+    .map(|(key, idx)| (re(&format!(r"(?:^|\s){key}:?\s+(-?\d+(?:[.,]\d+)?)(?:[^\d,]|$)")), idx))
     .collect()
 });
 
@@ -328,22 +336,33 @@ static ACCEPT_EDNO: LazyLock<Regex> = LazyLock::new(|| {
 });
 static ACCEPT_FLIGHT: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?:FLIGHT NUMBER:\s*|FOR\s+)([A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?)\b"));
-static ACCEPT_SECTOR: LazyLock<Regex> =
-    LazyLock::new(|| re(r"(?:SECTOR:\s*|\s)([A-Z]{3,4})[-/]([A-Z]{3,4})\b"));
-static ACCEPT_SECTOR_START: LazyLock<Regex> = LazyLock::new(|| re(r"^([A-Z]{4})/([A-Z]{4})\s"));
+/// SECTOR: YPPH-OMDB first, then the pair after the flight
+/// (FOR QR274/21NOV AMS-DOH), then a pair at the start of a line.
+static ACCEPT_SECTORS: LazyLock<[Regex; 3]> = LazyLock::new(|| {
+    [
+        re(r"SECTOR:\s*([A-Z]{3,4})[-/]([A-Z]{3,4})\b"),
+        re(r"\bFOR\s+[A-Z0-9]{2}[A-Z]?\d{1,4}[A-Z]?(?:/\d{2}[A-Z]{3})?\s+([A-Z]{3,4})[-/]([A-Z]{3,4})\b"),
+        re(r"(?mR)^([A-Z]{3,4})[-/]([A-Z]{3,4})(?:\s|$)"),
+    ]
+});
 static REQUEST: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"\b(?:LOADSHEET|LDSHT|LOAD SHEET)\s+(?:REQ|REQUEST)\b(?:.*?/ORIG\s+([A-Z]{3,4}))?")
+    // /ORIG on the same line or one of the next two (uplinks wrap).
+    re(r"\b(?:LOADSHEET|LDSHT|LOAD SHEET)\s+(?:REQ|REQUEST)\b(?:[^\n]*(?:\r?\n[^\n]*){0,2}?/ORIG\s+([A-Z]{3,4}))?")
 });
 
 const MONTHS: [&str; 12] =
     ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
 
-/// Cheap check: could this text hold a loadsheet?
+/// Cheap check: could this text hold a loadsheet? Plain substring scans
+/// that cover every `HEADER_WORD` alternative, plus LDSHT, which only
+/// acceptances use.
 pub fn may_be_loadsheet(text: &str) -> bool {
     text.contains("LOADSHEET")
         || text.contains("LOAD SHEET")
-        || text.contains("LDSHT")
+        || text.contains("L O A D S H E E T")
         || text.contains("LS FINAL")
+        || text.contains("LS PRELIM")
+        || text.contains("LDSHT")
 }
 
 fn clean_lines(text: &str) -> Vec<String> {
@@ -503,6 +522,28 @@ fn parse_weight(ls: &mut Loadsheet, line: &str, which: Limiting) {
     }
 }
 
+/// Long loadsheets are split over several messages, and the split can fall
+/// inside a value ("TOW 2" for "TOW 288113"). A bare weight on the last line
+/// is taken as cut when it is two or more digits shorter than a ZFW, TOW or
+/// LAW already read (for those three keys), or when it has at most two
+/// digits.
+fn is_cut_weight(ls: &Loadsheet, line: &str) -> bool {
+    let Some(c) = CUT_WEIGHT.captures(line) else { return false };
+    let digits = c[2].len();
+    if digits <= 2 {
+        return true;
+    }
+    if !matches!(&c[1], "ZFW" | "TOW" | "LAW" | "LDW" | "LGW" | "LW") {
+        return false;
+    }
+    [ls.zfw, ls.tow, ls.law]
+        .into_iter()
+        .flatten()
+        .map(|v| v.to_string().len())
+        .max()
+        .is_some_and(|width| digits + 1 < width)
+}
+
 fn set_int(slot: &mut Option<i64>, re: &Regex, line: &str) {
     if slot.is_none() {
         if let Some(c) = re.captures(line) {
@@ -521,17 +562,9 @@ fn parse_body(ls: &mut Loadsheet, lines: &[String]) {
         if line.is_empty() {
             continue;
         }
-        // Long loadsheets are split over several messages, and the split can
-        // fall inside a value ("TOW 2" for "TOW 288113"). A bare key and
-        // number on the last line is read only when it is about as long as
-        // the ZFW.
-        if Some(i) == last && i > 0 {
-            if let Some(c) = BARE_KEY_NUMBER.captures(line) {
-                let zfw_digits = ls.zfw.map(|z| z.to_string().len());
-                if zfw_digits.is_none_or(|d| c[1].len() + 1 < d) {
-                    continue;
-                }
-            }
+        // The line holds only the cut weight, so nothing else is skipped.
+        if Some(i) == last && i > 0 && is_cut_weight(ls, line) {
+            continue;
         }
         if flight_seen {
             since_flight += 1;
@@ -582,12 +615,18 @@ fn parse_body(ls: &mut Loadsheet, lines: &[String]) {
                 ls.pax_total = int(&c[2]);
             }
         }
+        if ls.pax_total.is_none() {
+            if let Some(c) = PAX_TOTAL_FIRST.captures(line) {
+                ls.pax_total = int(&c[1]);
+                ls.pax_breakdown = Some(c[2].to_owned());
+            }
+        }
         set_int(&mut ls.infants, &INFANTS, line);
         for (re, idx) in INDEX_PATTERNS.iter() {
             let slot = idx.slot(ls);
             if slot.is_none() {
                 if let Some(c) = re.captures(line) {
-                    *slot = c[1].parse().ok();
+                    *slot = c[1].replace(',', ".").parse().ok();
                 }
             }
         }
@@ -630,7 +669,7 @@ fn parse_acceptance(text: &str) -> Option<Loadsheet> {
         if let Some(c) = ACCEPT_FLIGHT.captures(text) {
             ls.flight_number = Some(c[1].to_owned());
         }
-        if let Some(c) = ACCEPT_SECTOR.captures(text).or_else(|| ACCEPT_SECTOR_START.captures(text)) {
+        if let Some(c) = ACCEPT_SECTORS.iter().find_map(|r| r.captures(text)) {
             ls.departure = Some(c[1].to_owned());
             ls.arrival = Some(c[2].to_owned());
         }

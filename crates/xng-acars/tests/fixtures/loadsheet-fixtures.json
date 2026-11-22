@@ -295,6 +295,8 @@
    "tif": 48000,
    "law": 167493,
    "law_max": 167600,
+   "pax_total": 255,
+   "pax_breakdown": "145/96/9/5",
    "mac_zfw": 18.8,
    "mac_tow": 18.4
   }
@@ -313,7 +315,8 @@
    "mac_zfw": 30.58,
    "zfw": 140709,
    "tow": 207177,
-   "mac_tow": 28.69
+   "mac_tow": 28.69,
+   "tof": 66468
   }
  },
  {
@@ -332,7 +335,9 @@
    "zfw": 272172,
    "tof": 25825,
    "tow": 297997,
-   "law": 289192
+   "tif": 8805,
+   "law": 289192,
+   "underload": 14428
   }
  },
  {
@@ -429,5 +434,111 @@
   "description": "ZFW message announcing a later loadsheet (not decoded)",
   "text": ":PAD12.LHRLDBA.ZFW\n\tAZF/GYMMJ/BA0248\n\t- PAX/234 INCLUDING 002 INF\n\t- CGO/008239\n\t- ZFW/176042\n\t- CRW/02/10\n\t- FWT/027981\n\t- OWT/173945\n\t- TTL/029553\n\t- TOW/203498\n\t- DEP/1635\n\t- SEC/EZE-GIG\n\tFLT STATUS:CLOSED\n\tSI ISSUED ON: 21NOV2026 15:36 UTC\n\tFOR INFO ONLY - USE TOW FOR PRELIM TOPL CALC. SEND MESSAGE TO .CLC IF\n\t ANY CHANGES TO CRW OR \n\tPOTABLE WATER. PRELIM LOADSHEET WILL FOLLOW AT ETD -25.\n\tSERVICE WEIGHT ADJUSTMENT WEIGHT/INDEX\n\tADD\n\tGIG POTABLE WATER 3/4           75 PCT       928    7.7\n\tGIG LINEN                                    105    0.7",
   "expected": null
+ },
+ {
+  "id": 900000001,
+  "label": "RA",
+  "description": "synthetic: header line with a comma",
+  "text": "LOADSHEET FINAL, 1359 EDNO1\nBA123/01 01JAN26\nLHR JFK G-TEST 2/4\nZFW 100000\nTOW 120000",
+  "expected": {
+   "kind": "loadsheet",
+   "status": "final",
+   "edition": 1,
+   "time": "1359",
+   "flight_number": "BA123",
+   "flight_day": 1,
+   "date": "2026-01-01",
+   "departure": "LHR",
+   "arrival": "JFK",
+   "registration": "G-TEST",
+   "crew": "2/4",
+   "zfw": 100000,
+   "tow": 120000
+  }
+ },
+ {
+  "id": 900000002,
+  "label": "RA",
+  "description": "synthetic: LS PRELIM header",
+  "text": "LS PRELIM 1200\nBA123/01 01JAN26\nLHR JFK G-TEST 2/4\nZFW 100000\nTOW 120000",
+  "expected": {
+   "kind": "loadsheet",
+   "status": "prelim",
+   "time": "1200",
+   "flight_number": "BA123",
+   "flight_day": 1,
+   "date": "2026-01-01",
+   "departure": "LHR",
+   "arrival": "JFK",
+   "registration": "G-TEST",
+   "crew": "2/4",
+   "zfw": 100000,
+   "tow": 120000
+  }
+ },
+ {
+  "id": 900000003,
+  "label": "RA",
+  "description": "synthetic: complete ZFW on the last line",
+  "text": "LOADSHEET FINAL 1200 EDNO1\nBA123/01 01JAN26\nLHR JFK N12345 2/4\nZFW 214843",
+  "expected": {
+   "kind": "loadsheet",
+   "status": "final",
+   "edition": 1,
+   "time": "1200",
+   "flight_number": "BA123",
+   "flight_day": 1,
+   "date": "2026-01-01",
+   "departure": "LHR",
+   "arrival": "JFK",
+   "registration": "N12345",
+   "crew": "2/4",
+   "zfw": 214843
+  }
+ },
+ {
+  "id": 900000004,
+  "label": "RA",
+  "description": "synthetic: complete UNDLD on the last line",
+  "text": "LOADSHEET FINAL 1200 EDNO1\nTK53/21 21NOV26\nBKK IST TC-JJA 3/12\nZFW 160708 MAX 175000\nTOW 210000\nUNDLD 492",
+  "expected": {
+   "kind": "loadsheet",
+   "status": "final",
+   "edition": 1,
+   "time": "1200",
+   "flight_number": "TK53",
+   "flight_day": 21,
+   "date": "2026-11-21",
+   "departure": "BKK",
+   "arrival": "IST",
+   "registration": "TC-JJA",
+   "crew": "3/12",
+   "zfw": 160708,
+   "zfw_max": 175000,
+   "tow": 210000,
+   "underload": 492
+  }
+ },
+ {
+  "id": 900000005,
+  "label": "RA",
+  "description": "synthetic: acceptance with a route-like remark before SECTOR",
+  "text": "LDSHT ACCEPT ACK\nNOTE SEE ABC-DEF BEFORE\nSECTOR: YPPH-OMDB\nFLIGHT NUMBER: EK0421",
+  "expected": {
+   "kind": "acceptance",
+   "flight_number": "EK0421",
+   "departure": "YPPH",
+   "arrival": "OMDB"
+  }
+ },
+ {
+  "id": 900000006,
+  "label": "RA",
+  "description": "synthetic: request with /ORIG on the next line",
+  "text": "LOADSHEET REQ\n/ORIG HKJK",
+  "expected": {
+   "kind": "request",
+   "departure": "HKJK"
+  }
  }
 ]
