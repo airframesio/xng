@@ -92,9 +92,11 @@ pub struct DeviceToml {
     pub format: Option<String>,
     /// Tuner gain in dB; hardware AGC when omitted.
     pub gain: Option<f64>,
-    /// Capture rate; planned from the sessions' channels when omitted.
+    /// Capture rate. A radio may leave it out to have it planned from the
+    /// sessions' channels; a recording must give it.
     pub sample_rate: Option<f64>,
-    /// Capture center; planned from the sessions' channels when omitted.
+    /// Capture center. A radio may leave it out to have it planned from the
+    /// sessions' channels; a recording must give it.
     pub center: Option<String>,
 }
 
@@ -279,7 +281,8 @@ enum Opener<'a> {
 /// with a bare `driver=rtlsdr` each open the next free dongle, as before.
 fn check_sources(f: &StationFile) -> anyhow::Result<()> {
     let mut ids = HashSet::new();
-    let mut openers: HashMap<&str, Opener> = HashMap::new();
+    let mut openers: HashMap<String, Opener> = HashMap::new();
+    let used = |id: &str| f.sessions.iter().any(|s| s.device.as_deref() == Some(id));
     for d in &f.devices {
         anyhow::ensure!(!d.id.trim().is_empty(), "[[device]]: `id` is required");
         anyhow::ensure!(
@@ -297,8 +300,10 @@ fn check_sources(f: &StationFile) -> anyhow::Result<()> {
             "[[device]] {}: a recording needs `sample-rate` and `center`",
             d.id
         );
-        if let Some(sdr) = d.sdr.as_deref().filter(|s| names_one_radio(s)) {
-            if let Some(Opener::Device(other)) = openers.insert(sdr.trim(), Opener::Device(&d.id)) {
+        // A [[device]] no session reads is never opened, so it holds no radio.
+        let sdr = d.sdr.as_deref().filter(|_| used(&d.id));
+        if let Some((sdr, key)) = sdr.and_then(|s| Some((s, radio_key(s)?))) {
+            if let Some(Opener::Device(other)) = openers.insert(key, Opener::Device(&d.id)) {
                 anyhow::bail!(
                     "[[device]] {other} and {} both open `{sdr}`; keep one of them",
                     d.id
@@ -334,27 +339,50 @@ fn check_sources(f: &StationFile) -> anyhow::Result<()> {
                 !session_channels(s).is_empty(),
                 "{label}: a session on a shared device needs `channels`"
             );
+            // Their messages would carry the same radio and mode, so the
+            // outputs couldn't route them apart.
+            if let Some(j) = f.sessions[..i]
+                .iter()
+                .position(|o| o.device == s.device && o.mode == s.mode)
+            {
+                anyhow::bail!(
+                    "{label}: session {} already decodes {} from [[device]] {id}; \
+                     list all of its channels in one session",
+                    j + 1,
+                    s.mode
+                );
+            }
         }
-        let Some(sdr) = s.sdr.as_deref().filter(|s| names_one_radio(s)) else {
-            continue;
-        };
-        match openers.get(sdr.trim()) {
+        let Some(sdr) = s.sdr.as_deref() else { continue };
+        let Some(key) = radio_key(sdr) else { continue };
+        match openers.get(&key) {
             Some(Opener::Device(id)) => anyhow::bail!(
                 "{label}: `{sdr}` is already opened by [[device]] {id}; use `device = \"{id}\"` instead of `sdr`"
             ),
             Some(Opener::Session(first)) => anyhow::bail!(share_hint(*first, n, sdr)),
             None => {
-                openers.insert(sdr.trim(), Opener::Session(n));
+                openers.insert(key, Opener::Session(n));
             }
         }
     }
     Ok(())
 }
 
-/// Whether an SDR selector picks out one particular radio (it names a
-/// serial), so that a second open of it is certain to fail.
-fn names_one_radio(sdr: &str) -> bool {
-    crate::sdr_args::SdrArgs::parse(sdr).serial.is_some()
+/// Which radio a selector names, for comparing two of them: its driver and
+/// serial, or `None` when it names no serial. Airspy serials are numbers, so
+/// `0x1234` and `0000000000001234` are the same radio.
+fn radio_key(sdr: &str) -> Option<String> {
+    let a = crate::sdr_args::SdrArgs::parse(sdr);
+    let driver = a.driver.unwrap_or_default().to_ascii_lowercase();
+    let serial = a.serial?.trim().to_ascii_lowercase();
+    let serial = match driver.as_str() {
+        "airspy" | "airspyhf" => {
+            let hex = serial.strip_prefix("0x").unwrap_or(&serial);
+            u64::from_str_radix(hex, 16).map_or(serial.clone(), |v| format!("{v:x}"))
+        }
+        _ => serial,
+    };
+    Some(format!("{driver}:{serial}"))
 }
 
 /// The error for two sessions that open the same radio, with the
@@ -453,7 +481,8 @@ struct Tap {
 /// every session see every sample.
 fn open_devices(st: &StationFile) -> anyhow::Result<HashMap<String, Tap>> {
     use crate::commands::capture::plan_capture;
-    use crate::commands::scan::{passband, plan, RateCaps};
+    use crate::commands::scan::{channel_rate, plan, RateCaps};
+    use crate::runtime::passband_hz as passband;
     use xng_sdr::tee::{tee, Overflow};
 
     let mut taps = HashMap::new();
@@ -476,10 +505,13 @@ fn open_devices(st: &StationFile) -> anyhow::Result<HashMap<String, Tap>> {
         for s in &users {
             let mode: Mode = s.mode.parse().map_err(ctx)?;
             let pb = passband(mode);
-            if pb == 0.0 {
+            min_rate = min_rate.max(match mode {
                 // Whole-capture modes demodulate the capture itself.
-                min_rate = min_rate.max(plan(mode).0);
-            }
+                Mode::Uat => xng_mode_uat::CHANNEL_RATE,
+                _ if pb == 0.0 => plan(mode).0,
+                // Every channel is brought down to the decoder's own rate.
+                _ => channel_rate(mode),
+            });
             for c in session_channels(s) {
                 needs.push((crate::freq::parse_hz(&c)?, pb));
             }
@@ -826,9 +858,13 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
             );
         }
 
-        // A station session is one SDR (or a file); messages carry this id in
-        // their provenance, letting the router target it precisely.
-        let sdr_id = sess.sdr.clone().unwrap_or_else(|| "file".to_string());
+        // Messages carry the id of the radio they came from (a session's own
+        // `sdr`, or its `[[device]]`'s) or "file", letting the router target
+        // the session precisely.
+        let sdr_id = match f.source_of(sess) {
+            Some(SessionSource::Sdr(sdr)) => sdr.to_string(),
+            _ => "file".to_string(),
+        };
         routes.push(Route {
             sdr_id: Some(sdr_id),
             mode,
@@ -1062,6 +1098,17 @@ mode = "adsb"
         );
     }
 
+    /// A session reading a `[[device]]` is fed to Airframes: its route is
+    /// keyed by the radio its messages come from, not by "file".
+    #[test]
+    fn shared_device_sessions_route_to_airframes() {
+        let f = parse(include_str!("../../contrib/station.shared.example.toml")).unwrap();
+        let r = airframes_router(&f);
+        let airspy = "driver=airspy,serial=0123456789ABCDEF";
+        assert!(r.resolve(Mode::AcarsPoa, Some(airspy)).is_some());
+        assert!(r.resolve(Mode::AcarsPoa, Some("file")).is_none());
+    }
+
     /// Two sessions on one serial-numbered radio are refused, and the error
     /// shows the [[device]] block that shares it.
     #[test]
@@ -1124,7 +1171,8 @@ mode = "adsb"
                 "exactly one of `sdr`, `device` or `file`",
             ),
             (
-                "[[session]]\nsdr = \"driver=airspy,serial=0x1234\"\nmode = \"acars\"",
+                "[[session]]\ndevice = \"a\"\nmode = \"vdl2\"\nchannels = [\"136.975\"]\n\
+                 [[session]]\nsdr = \"driver=airspy,serial=0x1234\"\nmode = \"acars\"",
                 "already opened by [[device]] a",
             ),
             ("[[device]]\nid = \"a\"\nsdr = \"driver=rtlsdr\"\n[[session]]\ndevice = \"a\"\nmode = \"acars\"\nchannels = [\"131.550\"]", "defined twice"),
@@ -1156,7 +1204,7 @@ mode = "adsb"
             station-id = "T"
             [[device]]
             id = "rec"
-            file = "{}"
+            file = {}
             sample-rate = 10000000
             center = "132.9875M"
             [[session]]
@@ -1168,7 +1216,7 @@ mode = "adsb"
             mode = "vdl2"
             channels = ["136.975"]
             "#,
-            path.display()
+            toml::Value::String(path.display().to_string())
         ))
         .unwrap();
         let built = build(&st, crate::outputs::console::ConsoleFormat::Off);
@@ -1190,5 +1238,91 @@ mode = "adsb"
         let (a, b) = (read(0), read(1));
         assert!(!a.is_empty());
         assert_eq!(a, b);
+    }
+
+    /// A [[device]] that no session reads holds no radio, so a session may
+    /// still open that radio itself.
+    #[test]
+    fn an_unused_device_reserves_nothing() {
+        parse(
+            r#"
+            station-id = "T"
+            [[device]]
+            id = "spare"
+            sdr = "driver=airspy,serial=0x1234"
+            [[session]]
+            sdr = "driver=airspy,serial=0x1234"
+            mode = "vdl2"
+            "#,
+        )
+        .unwrap();
+    }
+
+    /// Two spellings of one Airspy serial are the same radio.
+    #[test]
+    fn airspy_serials_are_compared_as_numbers() {
+        let e = load_error(
+            r#"
+            station-id = "T"
+            [[device]]
+            id = "airspy"
+            sdr = "driver=airspy,serial=0x1234"
+            [[session]]
+            device = "airspy"
+            mode = "acars"
+            channels = ["131.550"]
+            [[session]]
+            sdr = "serial=0000000000001234,driver=airspy"
+            mode = "vdl2"
+            "#,
+        );
+        assert!(e.contains("already opened by [[device]] airspy"), "{e}");
+    }
+
+    /// Two sessions of one mode on one device are refused: their messages
+    /// couldn't be routed apart.
+    #[test]
+    fn one_mode_twice_on_a_device_is_refused() {
+        let e = load_error(
+            r#"
+            station-id = "T"
+            [[device]]
+            id = "airspy"
+            sdr = "driver=airspy,serial=0x1234"
+            [[session]]
+            device = "airspy"
+            mode = "acars"
+            channels = ["131.550"]
+            [[session]]
+            device = "airspy"
+            mode = "acars"
+            channels = ["131.725"]
+            feed = false
+            "#,
+        );
+        assert!(e.contains("session 1 already decodes acars"), "{e}");
+    }
+
+    /// A shared recording slower than a decoder's own input rate is refused
+    /// before anything is opened.
+    #[test]
+    fn a_shared_capture_below_the_decoder_rate_is_refused() {
+        let st = parse(
+            r#"
+            station-id = "T"
+            [[device]]
+            id = "rec"
+            file = "/nonexistent.cf32"
+            sample-rate = 20000
+            center = "131.550M"
+            [[session]]
+            device = "rec"
+            mode = "acars"
+            channels = ["131.550"]
+            "#,
+        )
+        .unwrap();
+        let e = format!("{:#}", build(&st, crate::outputs::console::ConsoleFormat::Off).err().unwrap());
+        assert!(e.contains("below"), "{e}");
     }
 }

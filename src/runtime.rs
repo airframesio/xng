@@ -419,6 +419,34 @@ pub(crate) enum ModeChannel {
     AirbandSet(Box<crate::airband::set::AirbandSet>),
 }
 
+/// Each mode's one-sided channel passband (Hz): how far a channel reaches
+/// from its center frequency. 0 for whole-capture modes.
+pub fn passband_hz(mode: Mode) -> f64 {
+    match mode {
+        Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
+        Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
+        Mode::AeroL | Mode::AeroC => xng_mode_aero::CHANNEL_PASSBAND_HZ,
+        Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
+        Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
+        Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
+        Mode::Adsb | Mode::Uat => 0.0, // wideband: offset must be 0, no DDC
+        Mode::Sarsat => xng_mode_sarsat::CHANNEL_PASSBAND_HZ,
+        Mode::Dsc => xng_mode_dsc::CHANNEL_PASSBAND_HZ,
+        Mode::Navtex => xng_mode_navtex::CHANNEL_PASSBAND_HZ,
+        Mode::Sonde => xng_mode_sonde::CHANNEL_PASSBAND_HZ,
+        Mode::AdsL => xng_mode_adsl::CHANNEL_PASSBAND_HZ,
+        Mode::Atcs => xng_mode_atcs::CHANNEL_PASSBAND_HZ,
+        Mode::Aprs => xng_mode_aprs::CHANNEL_PASSBAND_HZ,
+        Mode::Pocsag => xng_mode_pocsag::CHANNEL_PASSBAND_HZ,
+        Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
+        Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
+        Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
+        Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
+        Mode::Airband => xng_mode_airband::FRONT_PASSBAND_HZ,
+        _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
+    }
+}
+
 impl ModeChannel {
     fn new(
         mode: Mode,
@@ -497,32 +525,6 @@ impl ModeChannel {
             // session's per-channel settings) by `collapse_airband`.
             Mode::Airband => Ok(Self::AirbandPending),
             other => Err(format!("mode {other} has no native core yet")),
-        }
-    }
-
-    fn passband_hz(mode: Mode) -> f64 {
-        match mode {
-            Mode::Ais => xng_mode_ais::CHANNEL_PASSBAND_HZ,
-            Mode::Vdl2 => xng_mode_vdl2::CHANNEL_PASSBAND_HZ,
-            Mode::AeroL | Mode::AeroC => xng_mode_aero::CHANNEL_PASSBAND_HZ,
-            Mode::StdC => xng_mode_stdc::CHANNEL_PASSBAND_HZ,
-            Mode::Hfdl => xng_mode_hfdl::CHANNEL_PASSBAND_HZ,
-            Mode::Iridium => xng_mode_iridium::CHANNEL_PASSBAND_HZ,
-            Mode::Adsb | Mode::Uat => 0.0, // wideband: offset must be 0, no DDC
-            Mode::Sarsat => xng_mode_sarsat::CHANNEL_PASSBAND_HZ,
-            Mode::Dsc => xng_mode_dsc::CHANNEL_PASSBAND_HZ,
-            Mode::Navtex => xng_mode_navtex::CHANNEL_PASSBAND_HZ,
-            Mode::Sonde => xng_mode_sonde::CHANNEL_PASSBAND_HZ,
-            Mode::AdsL => xng_mode_adsl::CHANNEL_PASSBAND_HZ,
-            Mode::Atcs => xng_mode_atcs::CHANNEL_PASSBAND_HZ,
-            Mode::Aprs => xng_mode_aprs::CHANNEL_PASSBAND_HZ,
-            Mode::Pocsag => xng_mode_pocsag::CHANNEL_PASSBAND_HZ,
-            Mode::Eot => xng_mode_eot::CHANNEL_PASSBAND_HZ,
-            Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
-            Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
-            Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
-            Mode::Airband => xng_mode_airband::FRONT_PASSBAND_HZ,
-            _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
 
@@ -1241,7 +1243,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
     let mut decoders = Vec::new();
     for &freq in &cfg.channels_hz {
         let offset = freq as f64 - capture_center as f64;
-        if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+        if 2.0 * (offset.abs() + passband_hz(cfg.mode)) > sample_rate {
             anyhow::bail!(
                 "channel {:.3} MHz is outside the capture (center {:.3} MHz, rate {} S/s)",
                 freq as f64 / 1e6,
@@ -1549,7 +1551,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         let mut decoders = Vec::new();
         for &freq in &cfg.channels_hz {
             let offset = freq as f64 - capture_center as f64;
-            if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+            if 2.0 * (offset.abs() + passband_hz(cfg.mode)) > sample_rate {
                 anyhow::bail!(
                     "[{}] channel {:.3} MHz is outside the capture (center {:.3} MHz, rate {} S/s)",
                     cfg.mode,
@@ -1853,7 +1855,7 @@ pub(crate) fn build_decoders(
     let mut decoders = Vec::new();
     for &freq in &cfg.channels_hz {
         let offset = freq as f64 - capture_center as f64;
-        if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+        if 2.0 * (offset.abs() + passband_hz(cfg.mode)) > sample_rate {
             anyhow::bail!(
                 "channel {:.3} MHz is outside the capture",
                 freq as f64 / 1e6
