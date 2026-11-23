@@ -67,6 +67,7 @@ pub fn tee(mut source: Box<dyn IqSource>, n: usize, overflow: Overflow) -> Vec<T
             center_freq_hz,
             dropped,
             reported: 0,
+            wait: overflow == Overflow::Block,
         });
     }
 
@@ -75,7 +76,18 @@ pub fn tee(mut source: Box<dyn IqSource>, n: usize, overflow: Overflow) -> Vec<T
         .spawn(move || {
             let mut buf = vec![Complex::new(0.0f32, 0.0f32); BLOCK];
             let mut consecutive_errors = 0u32;
-            while txs.iter().any(Option::is_some) {
+            loop {
+                // A consumer that was dropped leaves this thread the only
+                // holder of its loss counter. Checked every pass, so the
+                // source is released even while reads come back empty.
+                for slot in txs.iter_mut() {
+                    if slot.as_ref().is_some_and(|(_, d)| Arc::strong_count(d) == 1) {
+                        *slot = None;
+                    }
+                }
+                if txs.iter().all(Option::is_none) {
+                    break;
+                }
                 let msg = match source.read(&mut buf) {
                     Ok(0) => continue,
                     Ok(n) => {
@@ -132,6 +144,9 @@ pub struct TeeSource {
     center_freq_hz: u64,
     dropped: Arc<AtomicU64>,
     reported: u64,
+    /// `Overflow::Block`: the reader may be waiting on a slower sibling, so
+    /// a quiet spell is not a stalled source.
+    wait: bool,
 }
 
 impl TeeSource {
@@ -155,6 +170,7 @@ impl IqSource for TeeSource {
             let block = match self.rx.recv_timeout(Duration::from_secs(2)) {
                 Ok(Ok(b)) => b,
                 Ok(Err(e)) => return Err(SdrError::Device(e)),
+                Err(RecvTimeoutError::Timeout) if self.wait => return Ok(0),
                 Err(RecvTimeoutError::Timeout) => {
                     return Err(SdrError::Device(
                         "no samples from shared source for 2 s".into(),
@@ -261,5 +277,58 @@ mod tests {
         let got = drain(reader);
         assert!(got.len() <= len);
         assert!(stalled.dropped_blocks() > 0);
+    }
+
+    /// A source that never has samples, and says when it is released.
+    struct Empty(Arc<std::sync::atomic::AtomicBool>);
+
+    impl IqSource for Empty {
+        fn sample_rate(&self) -> f64 {
+            1_000_000.0
+        }
+        fn center_freq_hz(&self) -> u64 {
+            100_000_000
+        }
+        fn read(&mut self, _: &mut [Complex<f32>]) -> Result<usize, SdrError> {
+            std::thread::sleep(Duration::from_millis(1));
+            Ok(0)
+        }
+    }
+
+    impl Drop for Empty {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Once every consumer is gone the source is released, even when its
+    /// reads only ever come back empty.
+    #[test]
+    fn source_is_released_when_every_consumer_is_gone() {
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        drop(tee(Box::new(Empty(released.clone())), 2, Overflow::Drop));
+        let start = std::time::Instant::now();
+        while !released.load(Ordering::Relaxed) {
+            assert!(start.elapsed() < Duration::from_secs(5), "source never released");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// With `Block`, a consumer waiting on a slower sibling keeps waiting
+    /// instead of reporting a stalled source, and still gets every sample.
+    #[test]
+    fn block_mode_waits_out_a_slow_sibling() {
+        let len = (DEPTH + 8) * BLOCK;
+        let mut outs = tee(Box::new(Ramp { next: 0, len }), 2, Overflow::Block);
+        let slow = outs.pop().unwrap();
+        let fast = std::thread::spawn({
+            let s = outs.pop().unwrap();
+            move || drain(s)
+        });
+        std::thread::sleep(Duration::from_secs(3));
+        let slow = std::thread::spawn(move || drain(slow));
+        let want: Vec<f32> = (0..len).map(|k| k as f32).collect();
+        assert_eq!(fast.join().unwrap(), want);
+        assert_eq!(slow.join().unwrap(), want);
     }
 }
