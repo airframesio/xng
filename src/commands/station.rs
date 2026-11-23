@@ -30,11 +30,35 @@
 //! mode = "vdl2"          # rate/center/channels from the mode's plan
 //! feed = false           # decode locally but don't feed this decoder
 //! ```
+//!
+//! A radio can be opened only once, so sessions that decode from the same
+//! one describe it in a `[[device]]` block and name it with `device`. The
+//! device is opened once and every session reads the same samples. Its rate
+//! and center are planned from all of their channels unless the block sets
+//! them:
+//!
+//! ```toml
+//! [[device]]
+//! id = "airspy"
+//! sdr = "driver=airspy,serial=0123456789ABCDEF"
+//! gain = 20
+//!
+//! [[session]]
+//! device = "airspy"
+//! mode = "acars"
+//! channels = ["131.125", "131.550", "131.725"]
+//!
+//! [[session]]
+//! device = "airspy"
+//! mode = "vdl2"
+//! channels = ["136.650", "136.800", "136.975"]
+//! ```
 
 use crate::outputs::airframes::{
     auto_suffix, default_endpoint, has_serializer, AirframesRouter, AirframesTarget, Route,
 };
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use xng_types::Mode;
 
@@ -46,6 +70,32 @@ pub struct StationFile {
     pub outputs: OutputsToml,
     #[serde(rename = "session")]
     pub sessions: Vec<SessionToml>,
+    /// Radios (or recordings) that several sessions read at once.
+    #[serde(default, rename = "device")]
+    pub devices: Vec<DeviceToml>,
+}
+
+/// A radio or recording opened once and read by every session that names its
+/// `id` with `device`.
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct DeviceToml {
+    /// The name sessions use to read it.
+    pub id: String,
+    /// SDR selector (`driver=airspy,serial=…`); mutually exclusive with
+    /// `file`.
+    pub sdr: Option<String>,
+    /// IQ file replay instead of live hardware.
+    pub file: Option<PathBuf>,
+    /// Sample format for `file` (cf32/cs16/cs8/cu8); guessed from the
+    /// extension when omitted.
+    pub format: Option<String>,
+    /// Tuner gain in dB; hardware AGC when omitted.
+    pub gain: Option<f64>,
+    /// Capture rate; planned from the sessions' channels when omitted.
+    pub sample_rate: Option<f64>,
+    /// Capture center; planned from the sessions' channels when omitted.
+    pub center: Option<String>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -163,9 +213,11 @@ impl AirframesToml {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct SessionToml {
-    /// SDR selector (`driver=rtlsdr,serial=…`); mutually exclusive
-    /// with `file`.
+    /// SDR selector (`driver=rtlsdr,serial=…`). A session reads exactly one
+    /// of `sdr`, `device` or `file`.
     pub sdr: Option<String>,
+    /// `id` of a `[[device]]` this session shares with others.
+    pub device: Option<String>,
     /// IQ file replay instead of live hardware.
     pub file: Option<PathBuf>,
     /// Sample format for `file` (cf32/cs16/cs8/cu8); guessed from the
@@ -210,14 +262,135 @@ pub fn load(path: &Path) -> anyhow::Result<StationFile> {
     let f: StationFile = toml::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     anyhow::ensure!(!f.sessions.is_empty(), "{}: no [[session]] entries", path.display());
-    for (i, sess) in f.sessions.iter().enumerate() {
-        anyhow::ensure!(
-            sess.sdr.is_some() ^ sess.file.is_some(),
-            "session {}: exactly one of `sdr` or `file` is required",
-            i + 1
-        );
-    }
+    check_sources(&f)?;
     Ok(f)
+}
+
+/// Who opens an SDR selector, for the "opened twice" check.
+enum Opener<'a> {
+    Device(&'a str),
+    Session(usize),
+}
+
+/// Check that every session reads exactly one source, that `device` names a
+/// `[[device]]`, and that no radio is opened twice.
+///
+/// Only a selector that names a serial is one particular radio. Two sessions
+/// with a bare `driver=rtlsdr` each open the next free dongle, as before.
+fn check_sources(f: &StationFile) -> anyhow::Result<()> {
+    let mut ids = HashSet::new();
+    let mut openers: HashMap<&str, Opener> = HashMap::new();
+    for d in &f.devices {
+        anyhow::ensure!(!d.id.trim().is_empty(), "[[device]]: `id` is required");
+        anyhow::ensure!(
+            ids.insert(d.id.as_str()),
+            "[[device]] `{}` is defined twice",
+            d.id
+        );
+        anyhow::ensure!(
+            d.sdr.is_some() ^ d.file.is_some(),
+            "[[device]] {}: exactly one of `sdr` or `file` is required",
+            d.id
+        );
+        anyhow::ensure!(
+            d.file.is_none() || (d.sample_rate.is_some() && d.center.is_some()),
+            "[[device]] {}: a recording needs `sample-rate` and `center`",
+            d.id
+        );
+        if let Some(sdr) = d.sdr.as_deref().filter(|s| names_one_radio(s)) {
+            if let Some(Opener::Device(other)) = openers.insert(sdr.trim(), Opener::Device(&d.id)) {
+                anyhow::bail!(
+                    "[[device]] {other} and {} both open `{sdr}`; keep one of them",
+                    d.id
+                );
+            }
+        }
+    }
+    for (i, s) in f.sessions.iter().enumerate() {
+        let n = i + 1;
+        let label = format!("session {n} ({})", s.mode);
+        let sources = [s.sdr.is_some(), s.device.is_some(), s.file.is_some()];
+        anyhow::ensure!(
+            sources.iter().filter(|&&b| b).count() == 1,
+            "{label}: exactly one of `sdr`, `device` or `file` is required"
+        );
+        if let Some(id) = &s.device {
+            anyhow::ensure!(
+                ids.contains(id.as_str()),
+                "{label}: no [[device]] has id `{id}`"
+            );
+            for (key, set) in [
+                ("gain", s.gain.is_some()),
+                ("sample-rate", s.sample_rate.is_some()),
+                ("center", s.center.is_some()),
+                ("format", s.format.is_some()),
+            ] {
+                anyhow::ensure!(
+                    !set,
+                    "{label}: `{key}` belongs on [[device]] {id}, which this session shares"
+                );
+            }
+            anyhow::ensure!(
+                !session_channels(s).is_empty(),
+                "{label}: a session on a shared device needs `channels`"
+            );
+        }
+        let Some(sdr) = s.sdr.as_deref().filter(|s| names_one_radio(s)) else {
+            continue;
+        };
+        match openers.get(sdr.trim()) {
+            Some(Opener::Device(id)) => anyhow::bail!(
+                "{label}: `{sdr}` is already opened by [[device]] {id}; use `device = \"{id}\"` instead of `sdr`"
+            ),
+            Some(Opener::Session(first)) => anyhow::bail!(share_hint(*first, n, sdr)),
+            None => {
+                openers.insert(sdr.trim(), Opener::Session(n));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an SDR selector picks out one particular radio (it names a
+/// serial), so that a second open of it is certain to fail.
+fn names_one_radio(sdr: &str) -> bool {
+    crate::sdr_args::SdrArgs::parse(sdr).serial.is_some()
+}
+
+/// The error for two sessions that open the same radio, with the
+/// `[[device]]` block that shares it.
+fn share_hint(first: usize, second: usize, sdr: &str) -> String {
+    let id = crate::sdr_args::SdrArgs::parse(sdr)
+        .driver
+        .unwrap_or_else(|| "radio".into());
+    format!(
+        "sessions {first} and {second} both open `{sdr}`, and a radio can be opened only once. \
+         To share it, describe it once:\n\n    [[device]]\n    id = \"{id}\"\n    sdr = \"{sdr}\"\n\n\
+         then write `device = \"{id}\"` instead of `sdr` in both sessions, and move their \
+         `gain`, `sample-rate` and `center` to the [[device]]."
+    )
+}
+
+/// The channels a session lists: `channels`, or for airband the frequencies
+/// of its `[[session.airband.channel]]` tables.
+fn session_channels(sess: &SessionToml) -> Vec<String> {
+    if sess.channels.is_empty() {
+        sess.airband
+            .channels
+            .iter()
+            .map(|c| c.freq.clone())
+            .collect()
+    } else {
+        sess.channels.clone()
+    }
+}
+
+/// Where a session's samples come from, after following its `device`.
+pub enum SessionSource<'a> {
+    /// A live radio, by its SDR selector.
+    Sdr(&'a str),
+    /// A recording, by its path.
+    File(&'a Path),
 }
 
 impl StationFile {
@@ -243,6 +416,156 @@ impl StationFile {
         for s in &mut self.sessions {
             fix(&mut s.file);
         }
+        for d in &mut self.devices {
+            fix(&mut d.file);
+        }
+    }
+
+    /// The SDR or recording a session reads, following its `device`.
+    pub fn source_of<'a>(&'a self, s: &'a SessionToml) -> Option<SessionSource<'a>> {
+        let (sdr, file) = match &s.device {
+            Some(id) => {
+                let d = self.devices.iter().find(|d| &d.id == id)?;
+                (&d.sdr, &d.file)
+            }
+            None => (&s.sdr, &s.file),
+        };
+        match (sdr, file) {
+            (Some(sdr), _) => Some(SessionSource::Sdr(sdr)),
+            (_, Some(path)) => Some(SessionSource::File(path)),
+            _ => None,
+        }
+    }
+}
+
+/// A `[[device]]` opened once, split among the sessions that read it.
+struct Tap {
+    /// One stream per session still to be built.
+    consumers: Vec<xng_sdr::tee::TeeSource>,
+    rate: f64,
+    center_hz: u64,
+    info: xng_types::SdrInfo,
+}
+
+/// Plan and open every `[[device]]` that a session reads, splitting each
+/// one's samples into a stream per session. Live radios drop samples for a
+/// session that falls behind rather than stall the others; recordings make
+/// every session see every sample.
+fn open_devices(st: &StationFile) -> anyhow::Result<HashMap<String, Tap>> {
+    use crate::commands::capture::plan_capture;
+    use crate::commands::scan::{passband, plan, RateCaps};
+    use xng_sdr::tee::{tee, Overflow};
+
+    let mut taps = HashMap::new();
+    for dev in &st.devices {
+        let users: Vec<&SessionToml> = st
+            .sessions
+            .iter()
+            .filter(|s| s.device.as_deref() == Some(dev.id.as_str()))
+            .collect();
+        if users.is_empty() {
+            tracing::warn!(
+                "[[device]] {}: no session reads it, so it isn't opened",
+                dev.id
+            );
+            continue;
+        }
+        let ctx = |e: String| anyhow::anyhow!("[[device]] {}: {e}", dev.id);
+        let mut needs = Vec::new();
+        let mut min_rate = 0.0f64;
+        for s in &users {
+            let mode: Mode = s.mode.parse().map_err(ctx)?;
+            let pb = passband(mode);
+            if pb == 0.0 {
+                // Whole-capture modes demodulate the capture itself.
+                min_rate = min_rate.max(plan(mode).0);
+            }
+            for c in session_channels(s) {
+                needs.push((crate::freq::parse_hz(&c)?, pb));
+            }
+        }
+        let center = dev
+            .center
+            .as_deref()
+            .map(crate::freq::parse_hz)
+            .transpose()?;
+        let caps = match (&dev.sdr, dev.sample_rate) {
+            (Some(sdr), None) => {
+                let caps = crate::sdr_open::probe_rate_caps(sdr);
+                if matches!(caps, RateCaps::Unknown) {
+                    return Err(ctx(format!(
+                        "couldn't ask `{sdr}` which sample rates it supports (not connected, in use \
+                         by another program, or no driver for it in this build); set `sample-rate`"
+                    )));
+                }
+                caps
+            }
+            _ => RateCaps::Unknown,
+        };
+        let (rate, center_hz) =
+            plan_capture(&needs, dev.sample_rate, center, min_rate, &caps).map_err(ctx)?;
+        tracing::info!(
+            "[[device]] {}: {} session(s), {} channel(s) at {} S/s centered {:.4} MHz",
+            dev.id,
+            users.len(),
+            needs.len(),
+            rate as u64,
+            center_hz as f64 / 1e6
+        );
+        let label = format!("[[device]] {}", dev.id);
+        let (source, info, overflow) = match (&dev.sdr, &dev.file) {
+            (Some(sdr), None) => {
+                let (src, backend) = crate::sdr_open::open_sdr(sdr, rate, center_hz, dev.gain)?;
+                let info = xng_types::SdrInfo {
+                    id: sdr.clone(),
+                    driver: backend.to_string(),
+                    serial: None,
+                };
+                (src, info, Overflow::Drop)
+            }
+            (None, Some(path)) => {
+                let fmt = file_format(&label, dev.format.as_deref(), path)?;
+                let src: Box<dyn xng_sdr::IqSource> =
+                    Box::new(xng_sdr::FileIqSource::open(path, fmt, rate, center_hz)?);
+                (src, file_info(), Overflow::Block)
+            }
+            _ => unreachable!("validated in station::load"),
+        };
+        let consumers = tee(source, users.len(), overflow);
+        taps.insert(
+            dev.id.clone(),
+            Tap {
+                consumers,
+                rate,
+                center_hz,
+                info,
+            },
+        );
+    }
+    Ok(taps)
+}
+
+/// The sample format of a recording: `format`, or its file extension.
+fn file_format(
+    label: &str,
+    format: Option<&str>,
+    path: &Path,
+) -> anyhow::Result<xng_sdr::IqFormat> {
+    match format {
+        Some(f) => f
+            .parse::<xng_sdr::IqFormat>()
+            .map_err(|e| anyhow::anyhow!("{label}: {e}")),
+        None => xng_sdr::IqFormat::from_extension(path)
+            .ok_or_else(|| anyhow::anyhow!("{label}: pass `format`")),
+    }
+}
+
+/// The `SdrInfo` messages from a recording carry.
+fn file_info() -> xng_types::SdrInfo {
+    xng_types::SdrInfo {
+        id: "file".into(),
+        driver: "file".into(),
+        serial: None,
     }
 }
 
@@ -257,7 +580,7 @@ pub fn build(
 ) -> anyhow::Result<Vec<(Box<dyn xng_sdr::IqSource>, crate::runtime::SessionConfig)>> {
     use crate::sdr_open::open_sdr;
     use crate::tuning::{parse_receiver_pos, parse_tune, resolve_tune_auto};
-    use xng_sdr::{FileIqSource, IqFormat};
+    use xng_sdr::FileIqSource;
 
     // Shared outputs (the first session's SessionConfig carries them).
     // Airframes feeding is routed per-mode/per-session by the router below,
@@ -319,23 +642,27 @@ pub fn build(
             Err(e) => tracing::warn!("APRS satellite correlation disabled: {e}"),
         }
     }
+    let mut taps = open_devices(st)?;
     let mut sessions = Vec::new();
     for (i, sess) in st.sessions.iter().enumerate() {
         let label = format!("session {} ({})", i + 1, sess.mode);
         sess.airband.validate().map_err(|e| anyhow::anyhow!("{label} [session.airband]: {e}"))?;
-        // Airband sessions may list their channels only as
-        // [[session.airband.channel]] tables.
-        let mut chan_list = sess.channels.clone();
-        if chan_list.is_empty() {
-            chan_list = sess.airband.channels.iter().map(|c| c.freq.clone()).collect();
-        }
+        // A session on a shared device takes the device's capture.
+        let shared = sess
+            .device
+            .as_ref()
+            .map(|id| (taps[id].rate, taps[id].center_hz));
         // Tuning: explicit values, or the mode plan via the same
         // derivation the TUI uses.
         let tune = crate::tuning::Tune {
             mode: sess.mode.clone(),
-            sample_rate: sess.sample_rate,
-            center_freq: sess.center.clone(),
-            channels: chan_list,
+            sample_rate: shared.map(|(rate, _)| rate).or(sess.sample_rate),
+            center_freq: shared
+                .map(|(_, center)| format!("{center}Hz"))
+                .or_else(|| sess.center.clone()),
+            // Airband sessions may list their channels only as
+            // [[session.airband.channel]] tables.
+            channels: session_channels(sess),
             receiver_pos: sess.receiver_pos.clone(),
             filter_labels: Vec::new(),
             exclude_labels: Vec::new(),
@@ -359,8 +686,13 @@ pub fn build(
         };
 
         let (source, sdr_info): (Box<dyn xng_sdr::IqSource>, Option<xng_types::SdrInfo>) =
-            match (&sess.sdr, &sess.file) {
-                (Some(sdr), None) => {
+            match (&sess.sdr, &sess.file, &sess.device) {
+                (None, None, Some(id)) => {
+                    let tap = taps.get_mut(id).expect("opened above");
+                    let src = tap.consumers.pop().expect("one stream per session");
+                    (Box::new(src), Some(tap.info.clone()))
+                }
+                (Some(sdr), None, None) => {
                     let (src, backend) = open_sdr(sdr, rate, center_hz, sess.gain)?;
                     let info = xng_types::SdrInfo {
                         id: sdr.clone(),
@@ -369,23 +701,10 @@ pub fn build(
                     };
                     (src, Some(info))
                 }
-                (None, Some(path)) => {
-                    let fmt = match &sess.format {
-                        Some(f) => f
-                            .parse::<IqFormat>()
-                            .map_err(|e| anyhow::anyhow!("{label}: {e}"))?,
-                        None => IqFormat::from_extension(path)
-                            .ok_or_else(|| anyhow::anyhow!("{label}: pass `format`"))?,
-                    };
+                (None, Some(path), None) => {
+                    let fmt = file_format(&label, sess.format.as_deref(), path)?;
                     let src = FileIqSource::open(path, fmt, rate, center_hz)?;
-                    (
-                        Box::new(src),
-                        Some(xng_types::SdrInfo {
-                            id: "file".into(),
-                            driver: "file".into(),
-                            serial: None,
-                        }),
-                    )
+                    (Box::new(src), Some(file_info()))
                 }
                 _ => unreachable!("validated in station::load"),
             };
@@ -713,5 +1032,163 @@ sdr = "rtl"
 mode = "adsb"
 "#;
         assert!(toml::from_str::<StationFile>(toml).is_err());
+    }
+
+    /// Parse a station file from TOML and run the `load` checks on it.
+    fn parse(text: &str) -> anyhow::Result<StationFile> {
+        let f: StationFile = toml::from_str(text)?;
+        check_sources(&f)?;
+        Ok(f)
+    }
+
+    /// The load error for `text`, which must fail.
+    fn load_error(text: &str) -> String {
+        format!("{:#}", parse(text).expect_err("should be refused"))
+    }
+
+    /// The shared-device example parses, and its sessions read the device.
+    #[test]
+    fn parses_shared_example() {
+        let f = parse(include_str!("../../contrib/station.shared.example.toml")).unwrap();
+        assert_eq!(f.devices.len(), 1);
+        assert_eq!(f.sessions.len(), 3);
+        assert_eq!(f.sessions[0].device.as_deref(), Some("airspy"));
+        match f.source_of(&f.sessions[1]) {
+            Some(SessionSource::Sdr(sdr)) => assert!(sdr.starts_with("driver=airspy")),
+            _ => panic!("session 2 should read the airspy"),
+        }
+        assert!(
+            matches!(f.source_of(&f.sessions[2]), Some(SessionSource::Sdr(s)) if s.contains("rtlsdr"))
+        );
+    }
+
+    /// Two sessions on one serial-numbered radio are refused, and the error
+    /// shows the [[device]] block that shares it.
+    #[test]
+    fn one_radio_in_two_sessions_suggests_a_device() {
+        let e = load_error(
+            r#"
+            station-id = "T"
+            [[session]]
+            sdr = "driver=airspy,serial=0x1234"
+            mode = "acars"
+            [[session]]
+            sdr = "driver=airspy,serial=0x1234"
+            mode = "vdl2"
+            "#,
+        );
+        assert!(e.contains("sessions 1 and 2 both open"), "{e}");
+        assert!(e.contains("[[device]]\n    id = \"airspy\""), "{e}");
+    }
+
+    /// A selector without a serial opens the next free radio, so two of
+    /// them are still two radios.
+    #[test]
+    fn bare_driver_twice_is_still_allowed() {
+        parse(
+            r#"
+            station-id = "T"
+            [[session]]
+            sdr = "driver=rtlsdr"
+            mode = "acars"
+            [[session]]
+            sdr = "driver=rtlsdr"
+            mode = "ais"
+            "#,
+        )
+        .unwrap();
+    }
+
+    /// The mistakes a shared-device config can make, each with its own error.
+    #[test]
+    fn shared_device_mistakes_are_refused() {
+        let device = r#"
+            station-id = "T"
+            [[device]]
+            id = "a"
+            sdr = "driver=airspy,serial=0x1234"
+        "#;
+        let cases = [
+            ("[[session]]\ndevice = \"b\"\nmode = \"acars\"\nchannels = [\"131.550\"]", "no [[device]] has id `b`"),
+            (
+                "[[session]]\ndevice = \"a\"\ngain = 10\nmode = \"acars\"\nchannels = [\"131.550\"]",
+                "`gain` belongs on [[device]] a",
+            ),
+            (
+                "[[session]]\ndevice = \"a\"\nsample-rate = 2500000\nmode = \"acars\"\nchannels = [\"131.550\"]",
+                "`sample-rate` belongs on [[device]] a",
+            ),
+            ("[[session]]\ndevice = \"a\"\nmode = \"acars\"", "needs `channels`"),
+            (
+                "[[session]]\ndevice = \"a\"\nsdr = \"driver=rtlsdr\"\nmode = \"acars\"\nchannels = [\"131.550\"]",
+                "exactly one of `sdr`, `device` or `file`",
+            ),
+            (
+                "[[session]]\nsdr = \"driver=airspy,serial=0x1234\"\nmode = \"acars\"",
+                "already opened by [[device]] a",
+            ),
+            ("[[device]]\nid = \"a\"\nsdr = \"driver=rtlsdr\"\n[[session]]\ndevice = \"a\"\nmode = \"acars\"\nchannels = [\"131.550\"]", "defined twice"),
+            (
+                "[[device]]\nid = \"f\"\nfile = \"x.cf32\"\n[[session]]\ndevice = \"f\"\nmode = \"acars\"\nchannels = [\"131.550\"]",
+                "a recording needs `sample-rate` and `center`",
+            ),
+        ];
+        for (extra, want) in cases {
+            let e = load_error(&format!("{device}\n{extra}"));
+            assert!(e.contains(want), "want {want:?}, got: {e}");
+        }
+    }
+
+    /// A recording shared by an ACARS and a VDL2 session is opened once, and
+    /// both sessions get its capture and the same samples.
+    #[test]
+    fn sessions_on_a_shared_recording_read_the_same_samples() {
+        let path = std::env::temp_dir().join(format!("xng-shared-{}.cf32", std::process::id()));
+        let samples: Vec<u8> = (0..200_000u32)
+            .flat_map(|k| {
+                let (re, im) = ((k % 97) as f32 / 97.0, (k % 89) as f32 / -89.0);
+                re.to_le_bytes().into_iter().chain(im.to_le_bytes())
+            })
+            .collect();
+        std::fs::write(&path, samples).unwrap();
+        let st = parse(&format!(
+            r#"
+            station-id = "T"
+            [[device]]
+            id = "rec"
+            file = "{}"
+            sample-rate = 10000000
+            center = "132.9875M"
+            [[session]]
+            device = "rec"
+            mode = "acars"
+            channels = ["131.550", "131.725"]
+            [[session]]
+            device = "rec"
+            mode = "vdl2"
+            channels = ["136.975"]
+            "#,
+            path.display()
+        ))
+        .unwrap();
+        let built = build(&st, crate::outputs::console::ConsoleFormat::Off);
+        std::fs::remove_file(&path).ok();
+        let mut sessions = built.unwrap();
+        assert_eq!(sessions.len(), 2);
+        for (src, cfg) in &sessions {
+            assert_eq!(src.sample_rate(), 10e6);
+            assert_eq!(cfg.center_hz, 132_987_500);
+            assert_eq!(cfg.sdr.as_ref().unwrap().driver, "file");
+        }
+        assert_eq!(sessions[1].1.channels_hz, vec![136_975_000]);
+        let mut read = |i: usize| {
+            let mut buf = vec![num_complex::Complex::new(0.0f32, 0.0); 4096];
+            let n = sessions[i].0.read(&mut buf).unwrap();
+            buf.truncate(n);
+            buf
+        };
+        let (a, b) = (read(0), read(1));
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
     }
 }

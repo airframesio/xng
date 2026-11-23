@@ -1,4 +1,5 @@
 pub mod atc;
+pub mod capture;
 pub mod devices;
 pub mod extern_cmd;
 pub mod ingest;

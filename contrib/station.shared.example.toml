@@ -1,0 +1,41 @@
+# xng station sharing one radio: ACARS and VDL2 from one Airspy R2.
+#   xng station station.shared.toml
+#
+# A radio can be opened only once, so it's described once in a [[device]]
+# block and each session names it with `device`. The radio's settings (gain,
+# and optionally sample-rate and center) live on the [[device]]. Leave the
+# rate and center out and they're planned from all the sessions' channels:
+# here 129.000–136.975 MHz, which an R2 covers at 10 MS/s around
+# 132.9875 MHz.
+station-id = "XX-KSEA-1"
+
+[outputs]
+feed-airframes = true
+jsonl = "/var/log/xng/messages.jsonl"
+
+[[device]]
+id = "airspy"
+sdr = "driver=airspy,serial=0123456789ABCDEF"
+gain = 20
+# sample-rate = 10000000
+# center = "132.9875M"
+
+[[session]]
+device = "airspy"
+mode = "acars"
+channels = ["129.000", "129.350", "130.025", "130.425", "130.450", "130.850",
+            "131.125", "131.425", "131.475", "131.525", "131.550", "131.670",
+            "131.725", "131.825"]
+
+[[session]]
+device = "airspy"
+mode = "vdl2"
+channels = ["136.100", "136.650", "136.700", "136.800", "136.975"]
+
+# Sessions can mix: one radio of their own (`sdr`) beside a shared one.
+[[session]]
+sdr = "driver=rtlsdr,serial=00000002"
+mode = "adsb"
+sample-rate = 2000000
+center = "1090M"
+channels = ["1090"]

@@ -17,6 +17,7 @@ mod pump;
 #[cfg(feature = "soapy")]
 pub mod soapy;
 pub mod soapy_runtime;
+pub mod tee;
 
 pub use file::{FileIqSource, IqFormat};
 

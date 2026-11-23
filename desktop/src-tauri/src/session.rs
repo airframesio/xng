@@ -264,12 +264,15 @@ fn start_single(req: &SessionRequest) -> anyhow::Result<Started> {
     Ok((Core::Engine(engine), station_ident, summaries, descriptors))
 }
 
-/// What a station session reads from, for display.
-fn station_source(s: &station::SessionToml) -> String {
-    match (&s.sdr, &s.file) {
-        (Some(sdr), _) => sdr.clone(),
-        (_, Some(file)) => file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
-        _ => String::new(),
+/// What a station session reads from, for display: its SDR or recording, or
+/// the shared `[[device]]`'s.
+fn station_source(st: &station::StationFile, s: &station::SessionToml) -> String {
+    match st.source_of(s) {
+        Some(station::SessionSource::Sdr(sdr)) => sdr.to_owned(),
+        Some(station::SessionSource::File(file)) => {
+            file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        }
+        None => String::new(),
     }
 }
 
@@ -283,7 +286,7 @@ fn start_station(path: &std::path::Path) -> anyhow::Result<Started> {
     }
     let sessions = station::build(&st, console::ConsoleFormat::Off)?;
     let engine = Engine::start(sessions, EngineOptions { handle_signals: false })?;
-    let sources: Vec<String> = st.sessions.iter().map(station_source).collect();
+    let sources: Vec<String> = st.sessions.iter().map(|s| station_source(&st, s)).collect();
     let (summaries, descriptors) = summaries(&engine, &sources);
     Ok((Core::Engine(engine), st.station_id, summaries, descriptors))
 }
@@ -375,8 +378,8 @@ pub fn station_preview(path: &std::path::Path) -> anyhow::Result<StationPreview>
             .iter()
             .map(|s| StationPreviewSession {
                 mode: s.mode.clone(),
-                source: station_source(s),
-                live: s.sdr.is_some(),
+                source: station_source(&st, s),
+                live: matches!(st.source_of(s), Some(station::SessionSource::Sdr(_))),
                 channels: s.channels.clone(),
             })
             .collect(),
