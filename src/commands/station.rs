@@ -341,10 +341,10 @@ fn check_sources(f: &StationFile) -> anyhow::Result<()> {
             );
             // Their messages would carry the same radio and mode, so the
             // outputs couldn't route them apart.
-            if let Some(j) = f.sessions[..i]
-                .iter()
-                .position(|o| o.device == s.device && o.mode == s.mode)
-            {
+            let mode = s.mode.parse::<Mode>().ok();
+            if let Some(j) = f.sessions[..i].iter().position(|o| {
+                o.device == s.device && mode.is_some() && o.mode.parse::<Mode>().ok() == mode
+            }) {
                 anyhow::bail!(
                     "{label}: session {} already decodes {} from [[device]] {id}; \
                      list all of its channels in one session",
@@ -1301,6 +1301,24 @@ mode = "adsb"
             "#,
         );
         assert!(e.contains("session 1 already decodes acars"), "{e}");
+        // Spellings of one mode are the same mode.
+        let e = load_error(
+            r#"
+            station-id = "T"
+            [[device]]
+            id = "airspy"
+            sdr = "driver=airspy,serial=0x1234"
+            [[session]]
+            device = "airspy"
+            mode = "acars"
+            channels = ["131.550"]
+            [[session]]
+            device = "airspy"
+            mode = "ACARS"
+            channels = ["131.725"]
+            "#,
+        );
+        assert!(e.contains("session 1 already decodes"), "{e}");
     }
 
     /// A shared recording slower than a decoder's own input rate is refused
