@@ -150,8 +150,7 @@ unsafe extern "C" fn rx_callback(transfer: *mut ffi::Transfer) -> c_int {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .process(raw, &mut samples);
-        let head_pwr: f32 = samples.iter().take(64).map(|s| s.norm_sqr()).sum();
-        if head_pwr < 1e-9 {
+        if stalled(raw) {
             ctx.stats.near_zero.fetch_add(1, Ordering::Relaxed);
         }
         // Drop the transfer if the consumer is behind; stalling the USB
@@ -161,6 +160,19 @@ unsafe extern "C" fn rx_callback(transfer: *mut ffi::Transfer) -> c_int {
         }
     }
     0
+}
+
+/// Whether a transfer looks like a device stall: its first 128 raw samples
+/// are flat to within one ADC count. Judged before conversion, because the
+/// converter's slow DC tracker keeps its output nonzero for many transfers
+/// after the input goes flat. A live R2 never holds that still: across 762
+/// recorded transfers at gain 20, the flattest head still spanned 12 counts.
+fn stalled(raw: &[u16]) -> bool {
+    let head = &raw[..raw.len().min(128)];
+    match (head.iter().min(), head.iter().max()) {
+        (Some(&lo), Some(&hi)) => hi - lo < 2,
+        _ => false,
+    }
 }
 
 /// A single-channel RX capture from an Airspy R2/Mini.
@@ -334,6 +346,19 @@ mod tests {
         assert!(major >= 1);
         // No device attached in CI: must still return cleanly.
         enumerate().expect("enumerate");
+    }
+
+    /// Flat transfers (all zeros, or stuck mid-scale) read as stalls; one
+    /// count of jitter still does; ADC noise and an empty slice don't.
+    #[test]
+    fn stall_is_judged_on_raw_samples() {
+        assert!(stalled(&[0; 4096]));
+        assert!(stalled(&[2048; 4096]));
+        let jitter: Vec<u16> = (0..4096).map(|k| 2048 + (k % 2) as u16).collect();
+        assert!(stalled(&jitter));
+        let noise: Vec<u16> = (0..4096).map(|k| 2048 + ((k * 7919) % 25) as u16).collect();
+        assert!(!stalled(&noise));
+        assert!(!stalled(&[]));
     }
 
     #[test]
