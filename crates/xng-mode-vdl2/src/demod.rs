@@ -334,6 +334,12 @@ pub struct Burst {
     pub freq_skew_hz: f32,
     /// EVM-derived per-burst SNR (dB) from the symbol decision residuals (VDL2-8).
     pub snr_db: f32,
+    /// Transmission length from the burst header, bits.
+    pub tl_bits: usize,
+    /// Header bits corrected by the header FEC (0 or 1).
+    pub hdr_bits_fixed: u8,
+    /// Channel noise-floor estimate at the burst (dBFS).
+    pub noise_dbfs: f32,
 }
 
 impl Vdl2Demod {
@@ -705,7 +711,8 @@ impl Vdl2Demod {
                     Some(Ok(())) => {
                         let n = c.needed.unwrap();
                         let hdr: [u8; HEADER_BITS] = c.bits[..HEADER_BITS].try_into().unwrap();
-                        let tl_bits = header::decode(&hdr).unwrap() as usize;
+                        let (tl, hdr_bits_fixed) = header::decode_with_fixed(&hdr).unwrap();
+                        let tl_bits = tl as usize;
                         match interleave::deinterleave_soft(
                             &c.bits[HEADER_BITS..n],
                             &c.conf,
@@ -733,6 +740,9 @@ impl Vdl2Demod {
                                     rs_corrected: fixed,
                                     freq_skew_hz,
                                     snr_db: evm_snr_db(&c.conf),
+                                    tl_bits,
+                                    hdr_bits_fixed,
+                                    noise_dbfs: 10.0 * self.noise.max(1e-12).log10(),
                                 });
                                 // A burst got through: nothing at the start
                                 // to re-hunt, and re-hunting would repeat it.
