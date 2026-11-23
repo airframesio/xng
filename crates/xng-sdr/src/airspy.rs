@@ -44,6 +44,7 @@ mod ffi {
         pub revision: u32,
     }
 
+    pub const AIRSPY_SAMPLE_FLOAT32_IQ: c_int = 0;
     pub const AIRSPY_SAMPLE_UINT16_REAL: c_int = 4;
     pub const AIRSPY_SUCCESS: c_int = 0;
 
@@ -224,11 +225,13 @@ impl AirspyIqSource {
         }
         let guard = scopeguard(dev);
 
-        // The raw samples at twice the IQ rate, unpacked by libairspy when
-        // packing is on. Before set_samplerate, as airspy_rx does: the sample
-        // type selects the path the rate is applied to.
+        // Configure in IQ mode, so libairspy reads the requested rate and
+        // reports the advertised ones as IQ rates: with a real sample type it
+        // passes an off-list rate to the device undoubled and doubles the
+        // list it returns. The switch to raw samples comes just before
+        // start_rx (set_sample_type only changes the delivered format).
         check("set_sample_type", unsafe {
-            ffi::airspy_set_sample_type(dev, ffi::AIRSPY_SAMPLE_UINT16_REAL)
+            ffi::airspy_set_sample_type(dev, ffi::AIRSPY_SAMPLE_FLOAT32_IQ)
         })?;
 
         let rate = sample_rate.round() as u32;
@@ -257,6 +260,12 @@ impl AirspyIqSource {
             check("set_rf_bias", unsafe { ffi::airspy_set_rf_bias(dev, 1) })?;
         }
         check("set_freq", unsafe { ffi::airspy_set_freq(dev, center_freq_hz as u32) })?;
+
+        // The raw samples at twice the IQ rate, unpacked by libairspy when
+        // packing is on; `conv` turns them into IQ at the rate set above.
+        check("set_sample_type", unsafe {
+            ffi::airspy_set_sample_type(dev, ffi::AIRSPY_SAMPLE_UINT16_REAL)
+        })?;
 
         let (tx, pump) = sample_channel();
         let stats = Arc::new(StreamStats::default());
