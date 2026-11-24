@@ -230,10 +230,11 @@ fn xid_avlc(d: &Value) -> Option<Value> {
     let mut avlc = avlc_header(d.get("src")?, d.get("dst")?, d.get("control")?);
     let response = avlc["cr"] == "Response";
     let pf = avlc["pf"].as_bool().unwrap_or(false);
-    let info = d
-        .get("info_hex")
-        .and_then(Value::as_str)
-        .and_then(hex_bytes)?;
+    // The whole information field; an empty one carries no `info_hex`.
+    let info = match d.get("info_hex") {
+        Some(h) => hex_bytes(h.as_str()?)?,
+        None => Vec::new(),
+    };
     let params = d.get("params").and_then(Value::as_array);
     avlc.as_object_mut()
         .unwrap()
@@ -252,17 +253,21 @@ fn hex_bytes(s: &str) -> Option<Vec<u8>> {
 const XID_FMT_ID: u8 = 0x82;
 
 /// The `xid` object. An information field that is not a well-formed
-/// ISO 8885 XID (wrong format identifier, a length that overruns its group,
+/// ISO 8885 XID (see [`xid_leftover`], a parameter that overruns its group,
 /// or a zero-length parameter) is reported the way dumpvdl2 does: `err` with
-/// the raw octets under `unknown_proto`.
+/// the raw octets under `unknown_proto`, or an empty `unknown_proto` when
+/// the field is empty.
 fn xid_object(response: bool, pf: bool, info: &[u8], params: Option<&Vec<Value>>) -> Value {
+    if info.is_empty() {
+        return json!({ "err": true, "unknown_proto": {} });
+    }
     let malformed = || json!({ "err": true, "unknown_proto": { "data": info } });
+    let Some(leftover) = xid_leftover(info) else {
+        return malformed();
+    };
     let Some(params) = params else {
         return malformed();
     };
-    if info.first() != Some(&XID_FMT_ID) {
-        return malformed();
-    }
     let mut pub_params = Vec::new();
     let mut vdl_params = Vec::new();
     let mut conn_mgmt = None;
@@ -301,7 +306,31 @@ fn xid_object(response: bool, pf: bool, info: &[u8], params: Option<&Vec<Value>>
         x["pub_params"] = json!(pub_params);
     }
     x["vdl_params"] = json!(vdl_params);
+    if !leftover.is_empty() {
+        x["unknown_proto"] = json!({ "data": leftover });
+    }
     x
+}
+
+/// Check the information field's group layout as dumpvdl2 does. After the
+/// format identifier there must be at least one group, and every group must
+/// fit inside the field; otherwise `None` (malformed). Returns the one or two
+/// octets left after the last group, too few for another group header,
+/// which dumpvdl2 reports as `unknown_proto` beside the parameters.
+fn xid_leftover(info: &[u8]) -> Option<&[u8]> {
+    if info.first() != Some(&XID_FMT_ID) {
+        return None;
+    }
+    let (mut pos, mut groups) = (1, 0);
+    while info.len() - pos >= 3 {
+        let len = u16::from_be_bytes([info[pos + 1], info[pos + 2]]) as usize;
+        pos += 3 + len;
+        if pos > info.len() {
+            return None;
+        }
+        groups += 1;
+    }
+    (groups > 0).then(|| &info[pos..])
 }
 
 /// XID group identifiers (ISO 8885): public (HDLC) and VDL-private.
@@ -590,7 +619,7 @@ mod tests {
         assert_eq!(acars["msg_text"], "/EHAM.TI2/040EHAMACFFA");
     }
 
-    // XID: every golden frame (61 synthetic covering each parameter type,
+    // XID: every golden frame (69 synthetic covering each parameter type,
     // wrong-length and malformed cases and every C/R x P/F x conn-mgmt
     // combination, plus 10 off-air) goes through the real AVLC bit-level
     // parse and message build; the U-frame header and `xid` object must equal
@@ -630,6 +659,6 @@ mod tests {
             assert_eq!(avlc["xid"], g["xid"], "{} {}", g["src"], g["frame"]);
             n += 1;
         }
-        assert_eq!(n, 71);
+        assert_eq!(n, 79);
     }
 }

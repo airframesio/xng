@@ -638,7 +638,10 @@ fn avlc_body(frame: &avlc::AvlcFrame, atn: Option<&serde_json::Value>) -> Messag
         }
     }
     if !frame.info.is_empty() {
-        let shown = &frame.info[..frame.info.len().min(64)];
+        // XID fields are short, and the dumpvdl2 feed re-checks their whole
+        // layout, so they're kept in full; other payloads show 64 octets.
+        let cap = if kind == "xid" { frame.info.len() } else { 64 };
+        let shown = &frame.info[..frame.info.len().min(cap)];
         details["info_hex"] =
             serde_json::json!(shown.iter().map(|b| format!("{b:02x}")).collect::<String>());
         details["info_len"] = serde_json::json!(frame.info.len());
