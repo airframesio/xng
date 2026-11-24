@@ -257,47 +257,67 @@ const UDP_QUEUE: usize = 4096;
 /// How long a UDP target's looked-up address is reused before it's looked
 /// up again. A failed send looks it up again at once.
 const UDP_RESOLVE_EVERY: Duration = Duration::from_secs(300);
+/// After a failed lookup, how long until the next try. Until then the last
+/// good address (if any) is used, so a DNS outage doesn't stall each datagram.
+const UDP_RETRY: Duration = Duration::from_secs(30);
+/// At shutdown, how long the UDP targets get to send what they have queued.
+const UDP_DRAIN: Duration = Duration::from_secs(2);
 
 /// One UDP target. Its own task looks up the address and sends, so a slow or
 /// failing DNS lookup for one target never holds up the others or the bus.
 /// The socket matches the address family, so IPv6 targets work too.
 struct UdpFeed {
     tx: mpsc::Sender<Vec<u8>>,
+    task: tokio::task::JoinHandle<()>,
     dropped: u64,
 }
 
 impl UdpFeed {
     fn spawn(endpoint: String) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(UDP_QUEUE);
-        tokio::spawn(async move {
-            let mut dest: Option<(std::net::SocketAddr, UdpSocket, tokio::time::Instant)> = None;
-            let mut failures: u64 = 0;
+        let task = tokio::spawn(async move {
+            use tokio::time::Instant;
+            let mut dest: Option<(std::net::SocketAddr, UdpSocket)> = None;
+            // When to look the address up next: UDP_RESOLVE_EVERY after a
+            // good lookup, UDP_RETRY after a failed one, at once after a
+            // failed send.
+            let mut next_lookup = Instant::now();
+            let mut unsent: u64 = 0;
             while let Some(datagram) = rx.recv().await {
-                if dest.as_ref().is_none_or(|(_, _, at)| at.elapsed() >= UDP_RESOLVE_EVERY) {
+                if Instant::now() >= next_lookup {
                     match udp_dest(&endpoint).await {
-                        Ok(d) => dest = Some(d),
-                        // Keep a stale address rather than stop sending.
-                        Err(e) if dest.is_none() => {
-                            failures += 1;
-                            if failures.is_power_of_two() {
-                                tracing::warn!("airframes udp: {endpoint}: {e} ({failures} message(s) not sent)");
-                            }
-                            continue;
+                        Ok(d) => {
+                            dest = Some(d);
+                            next_lookup = Instant::now() + UDP_RESOLVE_EVERY;
                         }
-                        Err(_) => {}
+                        // Keep the last good address, if any, until the retry.
+                        Err(e) => {
+                            tracing::warn!("airframes udp: looking up {endpoint} failed: {e}; trying again in {UDP_RETRY:?}");
+                            next_lookup = Instant::now() + UDP_RETRY;
+                        }
                     }
                 }
-                let Some((addr, socket, _)) = &dest else { continue };
-                if let Err(e) = socket.send_to(&datagram, addr).await {
-                    failures += 1;
-                    if failures.is_power_of_two() {
-                        tracing::warn!("airframes udp send to {endpoint} failed: {e} ({failures} message(s) not sent)");
+                let sent = match &dest {
+                    Some((addr, socket)) => match socket.send_to(&datagram, addr).await {
+                        Ok(_) => true,
+                        Err(e) => {
+                            tracing::debug!("airframes udp send to {endpoint} failed: {e}");
+                            dest = None;
+                            next_lookup = Instant::now();
+                            false
+                        }
+                    },
+                    None => false,
+                };
+                if !sent {
+                    unsent += 1;
+                    if unsent.is_power_of_two() {
+                        tracing::warn!("airframes udp: {endpoint}: {unsent} message(s) not sent");
                     }
-                    dest = None;
                 }
             }
         });
-        Self { tx, dropped: 0 }
+        Self { tx, task, dropped: 0 }
     }
 
     fn send(&mut self, datagram: Vec<u8>, endpoint: &str) -> bool {
@@ -315,15 +335,13 @@ impl UdpFeed {
 }
 
 /// Look up a UDP target and bind a socket of the same address family.
-async fn udp_dest(
-    endpoint: &str,
-) -> std::io::Result<(std::net::SocketAddr, UdpSocket, tokio::time::Instant)> {
+async fn udp_dest(endpoint: &str) -> std::io::Result<(std::net::SocketAddr, UdpSocket)> {
     let addr = tokio::net::lookup_host(endpoint)
         .await?
         .next()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address found"))?;
     let any = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
-    Ok((addr, UdpSocket::bind(any).await?, tokio::time::Instant::now()))
+    Ok((addr, UdpSocket::bind(any).await?))
 }
 
 /// One long-lived TCP connection to a line-JSON ingest (HFDL, Iridium):
@@ -527,6 +545,13 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+    // Let each UDP target send what it still has queued, as the direct sends
+    // did before; bounded so a stuck lookup can't hold up shutdown.
+    let deadline = tokio::time::Instant::now() + UDP_DRAIN;
+    for UdpFeed { tx, task, .. } in udp.into_values() {
+        drop(tx);
+        let _ = tokio::time::timeout_at(deadline, task).await;
+    }
     // Counts are messages handed to each target's sender (UDP and TCP send
     // from their own tasks).
     tracing::info!("airframes output: {sent} message(s) sent");
@@ -610,9 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_target_gets_a_copy() {
-        use chrono::TimeZone;
         use tokio::io::AsyncBufReadExt;
-        use xng_types::*;
 
         let udp1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let udp2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -646,22 +669,7 @@ mod tests {
         let router = AirframesRouter { routes };
         let (tx, rx) = broadcast::channel(4);
         let task = tokio::spawn(run(rx, router));
-        let msg = Message {
-            mode: Mode::AcarsPoa,
-            timestamp: chrono::Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
-            frequency_hz: 131_550_000,
-            signal: SignalQuality::default(),
-            decode: DecodeQuality { crc_ok: true, ..Default::default() },
-            body: MessageBody::Acars(AcarsCore { mode: '2', label: "H1".into(), text: "HELLO".into(), ..Default::default() }),
-            raw: None,
-            source: Provenance {
-                station: StationIdentity::new("XX-TEST"),
-                app: AppInfo::xng(),
-                sdr: Some(SdrInfo { id: "rtl0".into(), driver: "rtlsdr".into(), serial: None }),
-                channel: None,
-            },
-        };
-        tx.send(Arc::new(msg)).unwrap();
+        tx.send(Arc::new(acars_hello())).unwrap();
 
         let mut buf = [0u8; 2048];
         for sock in [Some(&udp1), Some(&udp2), udp6.as_ref()].into_iter().flatten() {
@@ -679,6 +687,54 @@ mod tests {
         // The output stops when the bus closes.
         drop(tx);
         within(task).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn queued_udp_is_sent_before_the_output_returns() {
+        // Run the output on a runtime that's dropped as soon as `run`
+        // returns, as the station's is at shutdown. Anything still queued in
+        // a target's task at that point would be lost.
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let router = AirframesRouter {
+            routes: vec![Route {
+                sdr_id: Some("rtl0".into()),
+                mode: Mode::AcarsPoa,
+                target: target("127.0.0.1", sock.local_addr().unwrap().port(), Proto::Udp, "XX-TEST-ACARS"),
+            }],
+        };
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = broadcast::channel(4);
+            tx.send(Arc::new(acars_hello())).unwrap();
+            drop(tx);
+            run(rx, router).await.unwrap();
+        });
+        drop(rt);
+        let mut buf = [0u8; 2048];
+        let n = sock.recv(&mut buf).expect("the queued datagram was sent before run returned");
+        let v: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+        assert_eq!(v["text"], "HELLO");
+    }
+
+    fn acars_hello() -> Message {
+        use chrono::TimeZone;
+        use xng_types::*;
+        Message {
+            mode: Mode::AcarsPoa,
+            timestamp: chrono::Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
+            frequency_hz: 131_550_000,
+            signal: SignalQuality::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
+            body: MessageBody::Acars(AcarsCore { mode: '2', label: "H1".into(), text: "HELLO".into(), ..Default::default() }),
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("XX-TEST"),
+                app: AppInfo::xng(),
+                sdr: Some(SdrInfo { id: "rtl0".into(), driver: "rtlsdr".into(), serial: None }),
+                channel: None,
+            },
+        }
     }
 
     async fn within<F: std::future::Future>(f: F) -> F::Output {
