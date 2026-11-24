@@ -251,6 +251,81 @@ fn serialize(msg: &Message, mode: Mode, station_id: &str) -> Option<Vec<u8>> {
 /// in flight and new ones dropped once full (counted in the log).
 const TCP_QUEUE: usize = 4096;
 
+/// Datagrams queued per UDP target while its address is being looked up;
+/// new ones are dropped once full (counted in the log).
+const UDP_QUEUE: usize = 4096;
+/// How long a UDP target's looked-up address is reused before it's looked
+/// up again. A failed send looks it up again at once.
+const UDP_RESOLVE_EVERY: Duration = Duration::from_secs(300);
+
+/// One UDP target. Its own task looks up the address and sends, so a slow or
+/// failing DNS lookup for one target never holds up the others or the bus.
+/// The socket matches the address family, so IPv6 targets work too.
+struct UdpFeed {
+    tx: mpsc::Sender<Vec<u8>>,
+    dropped: u64,
+}
+
+impl UdpFeed {
+    fn spawn(endpoint: String) -> Self {
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(UDP_QUEUE);
+        tokio::spawn(async move {
+            let mut dest: Option<(std::net::SocketAddr, UdpSocket, tokio::time::Instant)> = None;
+            let mut failures: u64 = 0;
+            while let Some(datagram) = rx.recv().await {
+                if dest.as_ref().is_none_or(|(_, _, at)| at.elapsed() >= UDP_RESOLVE_EVERY) {
+                    match udp_dest(&endpoint).await {
+                        Ok(d) => dest = Some(d),
+                        // Keep a stale address rather than stop sending.
+                        Err(e) if dest.is_none() => {
+                            failures += 1;
+                            if failures.is_power_of_two() {
+                                tracing::warn!("airframes udp: {endpoint}: {e} ({failures} message(s) not sent)");
+                            }
+                            continue;
+                        }
+                        Err(_) => {}
+                    }
+                }
+                let Some((addr, socket, _)) = &dest else { continue };
+                if let Err(e) = socket.send_to(&datagram, addr).await {
+                    failures += 1;
+                    if failures.is_power_of_two() {
+                        tracing::warn!("airframes udp send to {endpoint} failed: {e} ({failures} message(s) not sent)");
+                    }
+                    dest = None;
+                }
+            }
+        });
+        Self { tx, dropped: 0 }
+    }
+
+    fn send(&mut self, datagram: Vec<u8>, endpoint: &str) -> bool {
+        match self.tx.try_send(datagram) {
+            Ok(()) => true,
+            Err(_) => {
+                self.dropped += 1;
+                if self.dropped.is_power_of_two() {
+                    tracing::warn!("airframes udp: {endpoint} queue full, {} message(s) dropped", self.dropped);
+                }
+                false
+            }
+        }
+    }
+}
+
+/// Look up a UDP target and bind a socket of the same address family.
+async fn udp_dest(
+    endpoint: &str,
+) -> std::io::Result<(std::net::SocketAddr, UdpSocket, tokio::time::Instant)> {
+    let addr = tokio::net::lookup_host(endpoint)
+        .await?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no address found"))?;
+    let any = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    Ok((addr, UdpSocket::bind(any).await?, tokio::time::Instant::now()))
+}
+
 /// One long-lived TCP connection to a line-JSON ingest (HFDL, Iridium):
 /// connects lazily, reconnects with backoff, and never blocks the bus.
 struct TcpFeed {
@@ -396,10 +471,10 @@ fn post_gzip_json(agent: &ureq::Agent, url: &str, body: &serde_json::Value) -> R
 
 /// Consume the bus and feed each message to every target for its mode.
 pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRouter) -> std::io::Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut sent: u64 = 0;
     // Deliveries per target, for the shutdown log when there's more than one.
     let mut per_target: std::collections::BTreeMap<String, u64> = Default::default();
+    let mut udp: HashMap<String, UdpFeed> = HashMap::new();
     let mut tcp: HashMap<String, TcpFeed> = HashMap::new();
     let mut ais: HashMap<(String, String), AisBatcher> = HashMap::new();
     loop {
@@ -420,13 +495,9 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                                 continue;
                             };
                             if target.proto == Proto::Udp {
-                                match socket.send_to(&bytes, &endpoint).await {
-                                    Ok(_) => true,
-                                    Err(e) => {
-                                        tracing::warn!("airframes udp send to {endpoint} failed: {e}");
-                                        false
-                                    }
-                                }
+                                let feed =
+                                    udp.entry(endpoint.clone()).or_insert_with(|| UdpFeed::spawn(endpoint.clone()));
+                                feed.send(bytes, &endpoint)
                             } else {
                                 let feed =
                                     tcp.entry(endpoint.clone()).or_insert_with(|| TcpFeed::spawn(endpoint.clone()));
@@ -456,6 +527,8 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+    // Counts are messages handed to each target's sender (UDP and TCP send
+    // from their own tasks).
     tracing::info!("airframes output: {sent} message(s) sent");
     if per_target.len() > 1 {
         for (target, n) in &per_target {
@@ -550,13 +623,27 @@ mod tests {
             mode: Mode::AcarsPoa,
             target: target("127.0.0.1", port, proto, "XX-TEST-ACARS"),
         };
-        let router = AirframesRouter {
-            routes: vec![
-                route(port(udp1.local_addr().unwrap()), Proto::Udp),
-                route(port(udp2.local_addr().unwrap()), Proto::Udp),
-                route(port(tcp.local_addr().unwrap()), Proto::Tcp),
-            ],
-        };
+        // IPv6 loopback, when the host has it.
+        let udp6 = UdpSocket::bind("[::1]:0").await.ok();
+        let mut routes = vec![
+            // A target whose lookup fails comes first; it mustn't hold up the rest.
+            Route {
+                sdr_id: Some("rtl0".into()),
+                mode: Mode::AcarsPoa,
+                target: target("no-such-host.invalid", 5550, Proto::Udp, "XX-TEST-ACARS"),
+            },
+            route(port(udp1.local_addr().unwrap()), Proto::Udp),
+            route(port(udp2.local_addr().unwrap()), Proto::Udp),
+            route(port(tcp.local_addr().unwrap()), Proto::Tcp),
+        ];
+        if let Some(s) = &udp6 {
+            routes.push(Route {
+                sdr_id: Some("rtl0".into()),
+                mode: Mode::AcarsPoa,
+                target: target("[::1]", port(s.local_addr().unwrap()), Proto::Udp, "XX-TEST-ACARS"),
+            });
+        }
+        let router = AirframesRouter { routes };
         let (tx, rx) = broadcast::channel(4);
         let task = tokio::spawn(run(rx, router));
         let msg = Message {
@@ -577,7 +664,7 @@ mod tests {
         tx.send(Arc::new(msg)).unwrap();
 
         let mut buf = [0u8; 2048];
-        for sock in [&udp1, &udp2] {
+        for sock in [Some(&udp1), Some(&udp2), udp6.as_ref()].into_iter().flatten() {
             let n = within(sock.recv(&mut buf)).await.unwrap();
             let v: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
             assert_eq!(v["text"], "HELLO");
