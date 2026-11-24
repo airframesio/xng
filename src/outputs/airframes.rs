@@ -39,6 +39,28 @@ pub enum Proto {
     Http,
 }
 
+impl std::str::FromStr for Proto {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "udp" => Ok(Proto::Udp),
+            "tcp" => Ok(Proto::Tcp),
+            "http" => Ok(Proto::Http),
+            other => Err(format!("unknown transport `{other}` (use udp, tcp or http)")),
+        }
+    }
+}
+
+impl Proto {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Proto::Udp => "udp",
+            Proto::Tcp => "tcp",
+            Proto::Http => "http",
+        }
+    }
+}
+
 /// A resolved Airframes ingest endpoint plus the station id to stamp.
 #[derive(Clone, Debug)]
 pub struct AirframesTarget {
@@ -74,23 +96,31 @@ impl AirframesRouter {
         self.routes.is_empty()
     }
 
-    /// Resolve the feed target for a message: prefer an exact `(sdr_id, mode)`
-    /// match (per-session routes from a station config), then a wildcard
-    /// (`sdr_id = None`) match on mode (single-session CLI routes).
-    pub fn resolve(&self, mode: Mode, sdr_id: Option<&str>) -> Option<&AirframesTarget> {
-        if let Some(id) = sdr_id {
-            if let Some(r) = self
-                .routes
+    /// Resolve the feed targets for a message: every exact `(sdr_id, mode)`
+    /// route (per-session routes from a station config) when there are any,
+    /// otherwise every wildcard (`sdr_id = None`) route for the mode
+    /// (single-session CLI routes). A mode with several `targets` has one
+    /// route per target, and each target gets its own copy of the message.
+    pub fn resolve_all(&self, mode: Mode, sdr_id: Option<&str>) -> Vec<&AirframesTarget> {
+        let matching = |want: Option<&str>| -> Vec<&AirframesTarget> {
+            self.routes
                 .iter()
-                .find(|r| r.mode == mode && r.sdr_id.as_deref() == Some(id))
-            {
-                return Some(&r.target);
+                .filter(|r| r.mode == mode && r.sdr_id.as_deref() == want)
+                .map(|r| &r.target)
+                .collect()
+        };
+        if let Some(id) = sdr_id {
+            let exact = matching(Some(id));
+            if !exact.is_empty() {
+                return exact;
             }
         }
-        self.routes
-            .iter()
-            .find(|r| r.mode == mode && r.sdr_id.is_none())
-            .map(|r| &r.target)
+        matching(None)
+    }
+
+    /// The first feed target for a message (see [`Self::resolve_all`]).
+    pub fn resolve(&self, mode: Mode, sdr_id: Option<&str>) -> Option<&AirframesTarget> {
+        self.resolve_all(mode, sdr_id).into_iter().next()
     }
 }
 
@@ -364,47 +394,59 @@ fn post_gzip_json(agent: &ureq::Agent, url: &str, body: &serde_json::Value) -> R
         .map_err(|e| e.to_string())
 }
 
-/// Consume the bus and feed each message to its mode's Airframes ingest.
+/// Consume the bus and feed each message to every target for its mode.
 pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRouter) -> std::io::Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut sent: u64 = 0;
+    // Deliveries per target, for the shutdown log when there's more than one.
+    let mut per_target: std::collections::BTreeMap<String, u64> = Default::default();
     let mut tcp: HashMap<String, TcpFeed> = HashMap::new();
     let mut ais: HashMap<(String, String), AisBatcher> = HashMap::new();
     loop {
         match rx.recv().await {
             Ok(msg) => {
                 let sdr_id = msg.source.sdr.as_ref().map(|s| s.id.as_str());
-                let Some(target) = router.resolve(msg.mode, sdr_id) else {
-                    continue;
-                };
-                let endpoint = target.endpoint();
-                match target.proto {
-                    Proto::Udp => {
-                        if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id) {
-                            match socket.send_to(&bytes, &endpoint).await {
-                                Ok(_) => sent += 1,
-                                Err(e) => tracing::warn!("airframes udp send to {endpoint} failed: {e}"),
+                // Targets under one station id share one serialization.
+                let mut line: Option<(&str, Option<Vec<u8>>)> = None;
+                for target in router.resolve_all(msg.mode, sdr_id) {
+                    let endpoint = target.endpoint();
+                    let delivered = match target.proto {
+                        Proto::Udp | Proto::Tcp => {
+                            if line.as_ref().map(|(id, _)| *id) != Some(target.station_id.as_str()) {
+                                let bytes = serialize(&msg, msg.mode, &target.station_id);
+                                line = Some((target.station_id.as_str(), bytes));
+                            }
+                            let Some(bytes) = line.as_ref().and_then(|(_, b)| b.clone()) else {
+                                continue;
+                            };
+                            if target.proto == Proto::Udp {
+                                match socket.send_to(&bytes, &endpoint).await {
+                                    Ok(_) => true,
+                                    Err(e) => {
+                                        tracing::warn!("airframes udp send to {endpoint} failed: {e}");
+                                        false
+                                    }
+                                }
+                            } else {
+                                let feed =
+                                    tcp.entry(endpoint.clone()).or_insert_with(|| TcpFeed::spawn(endpoint.clone()));
+                                feed.send(bytes, &endpoint)
                             }
                         }
-                    }
-                    Proto::Tcp => {
-                        if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id) {
-                            let feed = tcp.entry(endpoint.clone()).or_insert_with(|| TcpFeed::spawn(endpoint.clone()));
-                            if feed.send(bytes, &endpoint) {
-                                sent += 1;
+                        Proto::Http => match crate::outputs::aiscatcher_json::format_aiscatcher(&msg) {
+                            Some(v) => {
+                                let key = (endpoint.clone(), target.station_id.clone());
+                                let batcher = ais.entry(key).or_insert_with(|| {
+                                    AisBatcher::spawn(format!("http://{endpoint}/"), target.station_id.clone())
+                                });
+                                batcher.tx.try_send(v).is_ok()
                             }
-                        }
-                    }
-                    Proto::Http => {
-                        if let Some(v) = crate::outputs::aiscatcher_json::format_aiscatcher(&msg) {
-                            let key = (endpoint.clone(), target.station_id.clone());
-                            let batcher = ais.entry(key).or_insert_with(|| {
-                                AisBatcher::spawn(format!("http://{endpoint}/"), target.station_id.clone())
-                            });
-                            if batcher.tx.try_send(v).is_ok() {
-                                sent += 1;
-                            }
-                        }
+                            None => continue,
+                        },
+                    };
+                    if delivered {
+                        sent += 1;
+                        *per_target.entry(format!("{}://{endpoint}", target.proto.as_str())).or_insert(0) += 1;
                     }
                 }
             }
@@ -415,6 +457,11 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
         }
     }
     tracing::info!("airframes output: {sent} message(s) sent");
+    if per_target.len() > 1 {
+        for (target, n) in &per_target {
+            tracing::info!("airframes output: {n} to {target}");
+        }
+    }
     Ok(())
 }
 
@@ -461,6 +508,94 @@ mod tests {
         assert_eq!(r.resolve(Mode::AcarsPoa, Some("other")).unwrap().station_id, "WILD");
         assert_eq!(r.resolve(Mode::AcarsPoa, None).unwrap().station_id, "WILD");
         assert!(r.resolve(Mode::Vdl2, Some("rtl0")).is_none());
+    }
+
+    fn target(host: &str, port: u16, proto: Proto, id: &str) -> AirframesTarget {
+        AirframesTarget { host: host.into(), port, proto, station_id: id.into() }
+    }
+
+    #[test]
+    fn resolve_all_returns_every_target_for_the_session() {
+        let route = |sdr: Option<&str>, port, id: &str| Route {
+            sdr_id: sdr.map(Into::into),
+            mode: Mode::Vdl2,
+            target: target("h", port, Proto::Udp, id),
+        };
+        let r = AirframesRouter {
+            routes: vec![
+                route(Some("rtl0"), 5552, "A"),
+                route(Some("rtl0"), 15555, "A"),
+                route(None, 5552, "WILD"),
+            ],
+        };
+        let ports = |v: Vec<&AirframesTarget>| v.iter().map(|t| t.port).collect::<Vec<_>>();
+        assert_eq!(ports(r.resolve_all(Mode::Vdl2, Some("rtl0"))), [5552, 15555]);
+        // No exact route: every wildcard route.
+        assert_eq!(ports(r.resolve_all(Mode::Vdl2, Some("other"))), [5552]);
+        assert!(r.resolve_all(Mode::AcarsPoa, Some("rtl0")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn every_target_gets_a_copy() {
+        use chrono::TimeZone;
+        use tokio::io::AsyncBufReadExt;
+        use xng_types::*;
+
+        let udp1 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = |a: std::net::SocketAddr| a.port();
+        let route = |port, proto| Route {
+            sdr_id: Some("rtl0".into()),
+            mode: Mode::AcarsPoa,
+            target: target("127.0.0.1", port, proto, "XX-TEST-ACARS"),
+        };
+        let router = AirframesRouter {
+            routes: vec![
+                route(port(udp1.local_addr().unwrap()), Proto::Udp),
+                route(port(udp2.local_addr().unwrap()), Proto::Udp),
+                route(port(tcp.local_addr().unwrap()), Proto::Tcp),
+            ],
+        };
+        let (tx, rx) = broadcast::channel(4);
+        let task = tokio::spawn(run(rx, router));
+        let msg = Message {
+            mode: Mode::AcarsPoa,
+            timestamp: chrono::Utc.with_ymd_and_hms(2026, 6, 9, 12, 0, 0).unwrap(),
+            frequency_hz: 131_550_000,
+            signal: SignalQuality::default(),
+            decode: DecodeQuality { crc_ok: true, ..Default::default() },
+            body: MessageBody::Acars(AcarsCore { mode: '2', label: "H1".into(), text: "HELLO".into(), ..Default::default() }),
+            raw: None,
+            source: Provenance {
+                station: StationIdentity::new("XX-TEST"),
+                app: AppInfo::xng(),
+                sdr: Some(SdrInfo { id: "rtl0".into(), driver: "rtlsdr".into(), serial: None }),
+                channel: None,
+            },
+        };
+        tx.send(Arc::new(msg)).unwrap();
+
+        let mut buf = [0u8; 2048];
+        for sock in [&udp1, &udp2] {
+            let n = within(sock.recv(&mut buf)).await.unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+            assert_eq!(v["text"], "HELLO");
+            assert_eq!(v["station_id"], "XX-TEST-ACARS");
+        }
+        let (conn, _) = within(tcp.accept()).await.unwrap();
+        let mut lines = tokio::io::BufReader::new(conn).lines();
+        let line = within(lines.next_line()).await.unwrap().expect("a line over tcp");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["text"], "HELLO");
+
+        // The output stops when the bus closes.
+        drop(tx);
+        within(task).await.unwrap().unwrap();
+    }
+
+    async fn within<F: std::future::Future>(f: F) -> F::Output {
+        tokio::time::timeout(Duration::from_secs(5), f).await.expect("timed out")
     }
 
     #[test]
