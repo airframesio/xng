@@ -300,7 +300,11 @@ pub fn build(
     }
     if let Some(src) = &st.outputs.iridium_satmap {
         match crate::satmap::init(src) {
-            Ok(n) => tracing::info!("iridium satmap: {n} satellites ({src})"),
+            Ok(n) => {
+                tracing::info!("iridium satmap: {n} satellites ({src})");
+                // Receiver location from ring-alert Doppler needs the TLEs.
+                crate::doppler_locate::enable(0.0);
+            }
             Err(e) => tracing::warn!("iridium satmap disabled: {e}"),
         }
     }

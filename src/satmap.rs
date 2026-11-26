@@ -25,6 +25,11 @@ pub fn init(source: &str) -> anyhow::Result<usize> {
 
 /// Enrich a ring-alert message with its matched satellite, if a satellite
 /// map has been loaded (no-op otherwise).
+/// The loaded satellite map, if any.
+pub fn get() -> Option<&'static SatMap> {
+    SATMAP.get()
+}
+
 pub fn enrich(msg: &mut Message) {
     if let Some(map) = SATMAP.get() {
         map.enrich(msg);
@@ -43,6 +48,14 @@ struct Sat {
     name: String,
     constants: sgp4::Constants,
     epoch_unix: f64,
+}
+
+/// A satellite's Earth-fixed (ECEF) state: km, km/s, km/s².
+#[derive(Debug, Clone, Copy)]
+pub struct SatState {
+    pub pos: [f64; 3],
+    pub vel: [f64; 3],
+    pub acc: [f64; 3],
 }
 
 pub struct SatMap {
@@ -96,6 +109,24 @@ impl SatMap {
         let [tx, ty, tz] = pred.position; // TEME, km
         let (sin_g, cos_g) = gmst_rad(unix).sin_cos();
         Some([tx * cos_g + ty * sin_g, -tx * sin_g + ty * cos_g, tz])
+    }
+
+    /// Earth-fixed state of the named satellite at `unix`: position (km),
+    /// velocity (km/s) and acceleration (km/s²), the latter two by central
+    /// differences of the ECEF position so they include Earth rotation.
+    pub fn state_ecef(&self, name: &str, unix: f64) -> Option<SatState> {
+        let s = self.sats.iter().find(|s| s.name == name)?;
+        const H: f64 = 1.0;
+        let p0 = Self::propagate_ecef(s, unix - H)?;
+        let p1 = Self::propagate_ecef(s, unix)?;
+        let p2 = Self::propagate_ecef(s, unix + H)?;
+        let mut v = [0.0; 3];
+        let mut a = [0.0; 3];
+        for i in 0..3 {
+            v[i] = (p2[i] - p0[i]) / (2.0 * H);
+            a[i] = (p2[i] - 2.0 * p1[i] + p0[i]) / (H * H);
+        }
+        Some(SatState { pos: p1, vel: v, acc: a })
     }
 
     /// Nearest satellite (name, distance km) to a geocentric ECEF position

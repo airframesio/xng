@@ -678,12 +678,17 @@ impl ModeChannel {
                 (msgs, seen, ok)
             }
             Self::Iridium(dec) => {
-                let frames = dec.process(iq);
+                let frames = dec.process_with_offsets(iq);
                 let seen = frames.len() as u64;
                 let level = dec.level_dbfs();
+                // Frequency = channel + the burst's measured carrier offset
+                // (Doppler + receiver error), as the wideband path reports.
                 let msgs = frames
                     .iter()
-                    .map(|f| xng_mode_iridium::to_message(f, freq, level, prov.clone()))
+                    .map(|(off, f)| {
+                        let f_hz = (freq as i64 + off.round() as i64).max(0) as u64;
+                        xng_mode_iridium::to_message(f, f_hz, level, prov.clone())
+                    })
                     .collect();
                 (msgs, seen, seen)
             }
@@ -1498,6 +1503,8 @@ fn publish_msg(
     // Attribute space-based APRS (145.825 / ISS digipeat) to the
     // satellite(s) overhead (no-op unless init_aprs ran).
     crate::satmap::enrich_aprs(&mut msg);
+    // Ring-alert Doppler → receiver location estimate (no-op unless enabled).
+    let located = crate::doppler_locate::observe(&msg);
     if !label_filter.allows(&msg) {
         return;
     }
@@ -1525,6 +1532,9 @@ fn publish_msg(
         }
     }
     bus.publish(msg);
+    if let Some(fix) = located {
+        bus.publish(fix);
+    }
 }
 
 /// Run several decode sessions (different modes/SDRs) in one process,

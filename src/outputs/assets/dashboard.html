@@ -319,6 +319,33 @@ function renderReceiver(s) {
     .bindTooltip(`Receiver ${lat.toFixed(4)}, ${lon.toFixed(4)}`, { direction: 'top', className: 'lbl' });
 }
 
+// Receiver location estimated from Iridium ring-alert Doppler (no GPS): a
+// marker plus a circle, wide while provisional. Shown beside a configured
+// receiver position too, as a cross-check.
+let rxEstMarker = null, rxEstCircle = null;
+function renderReceiverEstimate(s) {
+  const e = s.receiver_estimate;
+  if (!e || e.lat == null) {
+    if (rxEstMarker) { map.removeLayer(rxEstMarker); map.removeLayer(rxEstCircle); rxEstMarker = rxEstCircle = null; }
+    return;
+  }
+  const ll = [e.lat, e.lon];
+  const color = e.settled ? '#9ece6a' : '#e0af68';
+  const radius = e.settled ? 5000 : Math.max(20000, (e.moved_km || 50) * 1000);
+  const tip = `Receiver estimate from Iridium Doppler<br>${e.lat.toFixed(4)}, ${e.lon.toFixed(4)}` +
+    `<br>${e.settled ? 'Settled' : 'Provisional'}: ${e.measurements} ring alerts of ${e.satellites} satellites, ${e.rms_hz} Hz rms` +
+    (e.moved_km != null ? `<br>${e.moved_km} km from the previous fit` : '') +
+    `<br>Receiver offset ${e.offset_hz} Hz`;
+  if (!rxEstMarker) {
+    const icon = L.divIcon({ className: 'rx-ic', html: '🛰️', iconSize: [22, 22], iconAnchor: [11, 11] });
+    rxEstCircle = L.circle(ll, { radius, color, weight: 1, dashArray: '4,4', fillOpacity: 0.06 }).addTo(map);
+    rxEstMarker = L.marker(ll, { icon, zIndexOffset: 900 }).addTo(map)
+      .bindTooltip('', { direction: 'top', className: 'lbl' });
+  }
+  rxEstMarker.setLatLng(ll).setTooltipContent(tip);
+  rxEstCircle.setLatLng(ll).setRadius(radius).setStyle({ color });
+}
+
 map.on('overlayadd overlayremove', e => {
   if (e.layer === trailLayer) {
     showAllTrails = map.hasLayer(trailLayer);
@@ -1078,6 +1105,7 @@ function render() {
     }
   });
   syncIridium(s);
+  renderReceiverEstimate(s);
   if (!fitted && pts.length) { map.fitBounds(pts, { maxZoom: 9, padding: [40, 40] }); fitted = true; }
 
   if (s.station) document.getElementById('station').textContent = s.station;
@@ -1085,7 +1113,9 @@ function render() {
   const nsat = (s.iridium_sats || []).length;
   document.getElementById('status').textContent =
     `up ${fmtUptime(s.now - s.started)} · ${s.aircraft.length} aircraft · ${s.vessels.length} vessels` +
-    (nsat ? ` · ${nsat} sats` : '');
+    (nsat ? ` · ${nsat} sats` : '') +
+    (s.receiver_estimate ? ` · rx ${s.receiver_estimate.lat.toFixed(3)}, ${s.receiver_estimate.lon.toFixed(3)}` +
+      (s.receiver_estimate.settled ? '' : ' (provisional)') : '');
   renderSdr(s);
 
   const rate = rates();

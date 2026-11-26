@@ -344,3 +344,26 @@ fn soft_decode_recovers_corrupted_access_code() {
     assert_eq!(soft.details["sat"], 55);
     assert_eq!(soft.details["beam"], 9);
 }
+
+/// The single-channel decoder reports each burst's carrier offset (Doppler +
+/// receiver error), which the ring-alert Doppler receiver locator fits.
+#[test]
+fn ring_alert_carrier_offset_is_measured() {
+    let payload = ira_payload(99, 7, 500, -900, 1300, &[0x12345678]);
+    let bits = ira_bits(&payload);
+    for cfo in [-9_870.0f64, -2_345.0, 0.0, 1_500.0, 7_321.0] {
+        let mut iq = modulate::modulate(&bits, 64, CHANNEL_RATE, cfo, 0.5);
+        let mut sig = vec![Complex::new(0.0f32, 0.0); 4000];
+        sig.extend(iq.drain(..));
+        sig.extend(std::iter::repeat(Complex::new(0.0f32, 0.0)).take((CHANNEL_RATE * 0.12) as usize));
+        let mut dec = IridiumChannelDecoder::new(CHANNEL_RATE, 0.0).unwrap();
+        let mut frames = Vec::new();
+        for chunk in sig.chunks(65_536) {
+            frames.extend(dec.process_with_offsets(chunk));
+        }
+        let (off, f) = frames.first().expect("burst decodes");
+        assert_eq!(f.kind, "ring-alert");
+        eprintln!("cfo {cfo} measured {off:.1} err {:.1}", off - cfo);
+        assert!((off - cfo).abs() < 20.0, "cfo {cfo} measured {off}");
+    }
+}

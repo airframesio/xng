@@ -8,6 +8,7 @@ pub mod airband;
 pub mod beam;
 pub mod bus;
 pub mod commands;
+pub mod doppler_locate;
 pub mod engine;
 pub mod freq;
 pub mod outputs;

@@ -64,6 +64,9 @@ struct Dash {
     beacons: HashMap<String, Value>,
     /// Rail EOT/HOT telemetry units, keyed by unit address (no position).
     trains: HashMap<String, Value>,
+    /// The receiver location fitted from Iridium ring-alert Doppler
+    /// (`doppler_locate`), when one has been made.
+    receiver_estimate: Option<Value>,
     /// Pager capcodes (FLEX/POCSAG), keyed by "proto:capcode" (no position).
     pagers: HashMap<String, Value>,
     /// Cross-mode distress/emergency alerting surface (XM-6): ADS-B emergency
@@ -763,6 +766,9 @@ fn update(d: &mut Dash, m: &Message) {
         // Mobile-terminal self-reported positions: the actual Iridium
         // customer terminals (vessels/aircraft/handhelds), distinct from the
         // ring-alert beam footprints above.
+        MessageBody::Iridium { kind, details } if kind == "receiver-position" => {
+            d.receiver_estimate = Some(details.clone());
+        }
         MessageBody::Iridium { kind, details } if kind == "mt-position" => {
             if let (Some(lat), Some(lon)) = (
                 details.get("lat").and_then(Value::as_f64),
@@ -1044,6 +1050,7 @@ fn snapshot_value(d: &mut Dash, include_messages: bool) -> Value {
         "version": env!("CARGO_PKG_VERSION"),
         "started": d.started,
         "sessions": d.sessions,
+        "receiver_estimate": d.receiver_estimate,
         "aircraft": d.aircraft.values().collect::<Vec<_>>(),
         "vessels": d.vessels.values().collect::<Vec<_>>(),
         "beacons": d.beacons.values().collect::<Vec<_>>(),
@@ -1148,6 +1155,13 @@ fn receiver_json(d: &Dash) -> String {
                 o.insert("lon".into(), rp[1].clone());
                 break;
             }
+        }
+    }
+    // No configured position: a settled Iridium Doppler estimate.
+    if !o.contains_key("lat") {
+        if let Some(e) = d.receiver_estimate.as_ref().filter(|e| e["settled"] == true) {
+            o.insert("lat".into(), e["lat"].clone());
+            o.insert("lon".into(), e["lon"].clone());
         }
     }
     Value::Object(o).to_string()
@@ -1455,6 +1469,28 @@ mod tests {
         assert_eq!(snap["iridium_sats"][0]["name"], "IRIDIUM 106");
         assert_eq!(snap["iridium_rings"][0]["sat"], 77);
         assert_eq!(snap["iridium_rings"][0]["beam"], 5);
+    }
+
+    #[test]
+    fn doppler_receiver_estimate_reaches_snapshot_and_receiver_json() {
+        let mut d = Dash::default();
+        let est = |settled: bool| {
+            iridium(
+                "receiver-position",
+                json!({"lat": 38.5121, "lon": -121.4931, "settled": settled, "satellites": 3,
+                       "measurements": 412, "rms_hz": 21.5, "offset_hz": 1830.0}),
+            )
+        };
+        update(&mut d, &est(false));
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        assert_eq!(snap["receiver_estimate"]["lat"], 38.5121);
+        // A provisional fit is not offered as the receiver location.
+        let rx: Value = serde_json::from_str(&receiver_json(&d)).unwrap();
+        assert!(rx.get("lat").is_none(), "{rx}");
+        update(&mut d, &est(true));
+        let rx: Value = serde_json::from_str(&receiver_json(&d)).unwrap();
+        assert_eq!(rx["lat"], 38.5121);
+        assert_eq!(rx["lon"], -121.4931);
     }
 
     fn mt_position(lat: f64, lon: f64) -> Message {

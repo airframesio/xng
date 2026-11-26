@@ -56,6 +56,12 @@ impl IridiumChannelDecoder {
     }
 
     pub fn process(&mut self, input: &[Complex<f32>]) -> Vec<ira::IridiumFrame> {
+        self.process_with_offsets(input).into_iter().map(|(_, f)| f).collect()
+    }
+
+    /// Like [`process`](Self::process), with each frame's measured carrier
+    /// offset from the channel center (Hz): Doppler plus receiver error.
+    pub fn process_with_offsets(&mut self, input: &[Complex<f32>]) -> Vec<(f64, ira::IridiumFrame)> {
         let channel: &[Complex<f32>] = match &mut self.ddc {
             Some(ddc) => {
                 self.channel_buf.clear();
@@ -68,6 +74,7 @@ impl IridiumChannelDecoder {
         let time = self.samples_seen as f64 / CHANNEL_RATE;
         let mut out = Vec::new();
         for burst in self.demod.process(channel) {
+            let mut frames = Vec::new();
             handle_bits(
                 &burst.bits,
                 burst.soft.as_deref(),
@@ -75,8 +82,9 @@ impl IridiumChannelDecoder {
                 0.0,
                 &mut self.sbd,
                 &mut self.pager,
-                &mut out,
+                &mut frames,
             );
+            out.extend(frames.into_iter().map(|f| (burst.cfo_hz, f)));
         }
         out
     }

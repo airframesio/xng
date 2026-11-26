@@ -434,6 +434,36 @@ of the satellite's sub-point so Leaflet draws across the seam instead of the
 long way round. The dashboard shows one satellite's pattern at a time (click to
 pin); satellites expire 2 min after last contact.
 
+## Receiver location from ring-alert Doppler (`src/doppler_locate.rs`)
+
+With `--iridium-satmap` loaded, xng fits the receiver's own location from the
+satellite-matched ring alerts, with no GPS. Ring alerts are sent on one fixed
+frequency (1626.270833 MHz), so each one's measured carrier (channel or burst
+offset + the demod's fine carrier estimate, reported in `frequency_hz` by both
+the single-channel and wideband paths) is that frequency shifted by Doppler and
+the receiver's own error: `f = F0·(1 − ṙ/c) + b`, with the satellite's ECEF
+position/velocity/acceleration from SGP4. The fit solves latitude, longitude,
+`b` and a constant stamp lag (decode latency), altitude held at 0 m: a coarse
+global grid (`b` in closed form), Levenberg-Marquardt on the six best minima
+≥500 km apart, then a refit without residuals beyond max(3σ, 90 Hz). It uses
+the last 30 min of ring alerts, refits every 60 s once 30 are held, and calls
+the fit *settled* when it uses ≥2 satellites and two consecutive fits agree
+within 20 km (one pass alone leaves a mirror solution across the ground
+track). Each fit is published as an Iridium `receiver-position` message (log
+line, JSONL, dashboard marker and circle); a settled fit fills
+`/data/receiver.json` when no `receiver-pos` is configured.
+`XNG_IRIDIUM_LOCATE=off` disables it.
+
+Validation: a synthetic 66-satellite Iridium-like constellation, 30 min of ring
+alerts with 25 Hz noise, 1.8 kHz receiver error and 0.8 s lag, locates four
+receivers worldwide within 5 km (`doppler_locate::tests`); bursts 4 kHz off on
+every 15th measurement are rejected. The single-channel and wideband carrier
+estimates are within 0.1 Hz / 20 Hz on generated bursts (`e2e.rs`
+`ring_alert_carrier_offset_is_measured`, `wideband.rs`). Not yet run on live
+off-air ring alerts. Method: standard Iridium Doppler positioning (Tan et al.,
+IEEE Access 7, 2019); feature idea from iridium-sniffer / iridium-observatory
+(GPL-3, no code used).
+
 ## Validation / oracles
 
 Layer 2 is **oracle-validated against iridium-toolkit** (`bitsparser.py`,
