@@ -100,7 +100,10 @@ pub fn parse(text: &str, downlink: bool) -> Option<AcarsApp> {
         return None;
     }
     let gs_addr = &txt[..pos];
-    if !gs_addr.bytes().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
+    if !gs_addr
+        .bytes()
+        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    {
         return None;
     }
 
@@ -195,7 +198,10 @@ mod tests {
             .map(|b| format!("{b:02X}"))
             .collect();
         let app = parse(&format!("/MSTEC7X.AT1.N123AB{hex}"), true).expect("parses");
-        let AcarsApp::Cpdlc { envelope, message, .. } = &app else {
+        let AcarsApp::Cpdlc {
+            envelope, message, ..
+        } = &app
+        else {
             panic!("expected CPDLC");
         };
         assert!(envelope.crc_ok);

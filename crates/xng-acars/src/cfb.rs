@@ -71,9 +71,17 @@ pub fn classify(text: &str) -> Option<Cfb> {
             let tok = if rest.starts_with(".01") { ".01" } else { ".1" };
             (tok, CfbKind::FailureRecord, "Failure/fault/warning record")
         } else if rest.starts_with("APM_REPORT") {
-            ("APM_REPORT", CfbKind::ApmReport, "Aircraft Performance Monitoring / ACMF snapshot report")
+            (
+                "APM_REPORT",
+                CfbKind::ApmReport,
+                "Aircraft Performance Monitoring / ACMF snapshot report",
+            )
         } else if rest.starts_with("APM") {
-            ("APM", CfbKind::ApmReport, "Aircraft Performance Monitoring report")
+            (
+                "APM",
+                CfbKind::ApmReport,
+                "Aircraft Performance Monitoring report",
+            )
         } else if rest.starts_with("ATA") {
             ("ATA", CfbKind::AtaFault, "ATA-chapter fault report")
         } else if rest.starts_with("FDE") {
@@ -85,15 +93,27 @@ pub fn classify(text: &str) -> Option<Cfb> {
         } else if rest.starts_with("LIGHTS") {
             ("LIGHTS", CfbKind::Lights, "Lighting status / fault report")
         } else if rest.starts_with("MIL") {
-            ("MIL", CfbKind::VibrationReport, "Engine spool vibration units report")
+            (
+                "MIL",
+                CfbKind::VibrationReport,
+                "Engine spool vibration units report",
+            )
         } else if rest.starts_with("MPF") {
-            ("MPF", CfbKind::MaintenancePlanning, "Maintenance Planning Function")
+            (
+                "MPF",
+                CfbKind::MaintenancePlanning,
+                "Maintenance Planning Function",
+            )
         } else if rest.starts_with("PAGE") {
             ("PAGE", CfbKind::McduPage, "MDC report page")
         } else if rest.starts_with("WRN") {
             ("WRN", CfbKind::Warning, "Warning")
         } else if rest.starts_with("AL") {
-            ("AL", CfbKind::EngineStatus, "Air temperature / FADEC bleed status report")
+            (
+                "AL",
+                CfbKind::EngineStatus,
+                "Air temperature / FADEC bleed status report",
+            )
         } else {
             ("", CfbKind::Generic, "Crew Flight Bag message")
         };

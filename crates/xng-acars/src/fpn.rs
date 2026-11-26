@@ -211,7 +211,11 @@ mod tests {
         // The approach value carries waypoints; it is surfaced verbatim
         // (the AP field) — coordinate decoding is exercised via the F field
         // in the in-flight test below.
-        assert!(fp.approach_procedure.as_deref().unwrap().contains("AIR,N40010W080490"));
+        assert!(fp
+            .approach_procedure
+            .as_deref()
+            .unwrap()
+            .contains("AIR,N40010W080490"));
     }
 
     #[test]

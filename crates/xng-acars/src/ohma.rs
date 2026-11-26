@@ -30,8 +30,10 @@ pub fn parse(text: &str) -> Option<serde_json::Value> {
             ptr = &payload[pos..];
             continue;
         }
-        let cleaned: String =
-            payload.chars().filter(|c| !matches!(c, '\r' | '\n')).collect();
+        let cleaned: String = payload
+            .chars()
+            .filter(|c| !matches!(c, '\r' | '\n'))
+            .collect();
         let bin = base64::engine::general_purpose::STANDARD
             .decode(cleaned.as_bytes())
             .ok()?;

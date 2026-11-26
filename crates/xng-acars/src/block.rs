@@ -55,8 +55,10 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
     }
 
     let crc_ok = ACARS_CRC.checksum(&body[..suffix_idx + 3]) == 0;
-    let parity_errors =
-        body[..=suffix_idx].iter().filter(|&&c| c.count_ones() % 2 == 0).count() as u32;
+    let parity_errors = body[..=suffix_idx]
+        .iter()
+        .filter(|&&c| c.count_ones() % 2 == 0)
+        .count() as u32;
 
     let ch: Vec<u8> = body[..=suffix_idx].iter().map(|c| c & 0x7F).collect();
     let mode = ch[0] as char;
@@ -64,14 +66,21 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
     let tail = if addr.iter().all(|&c| c == 0) {
         None
     } else {
-        Some(addr.iter().map(|&c| c as char).skip_while(|&c| c == '.').collect::<String>())
+        Some(
+            addr.iter()
+                .map(|&c| c as char)
+                .skip_while(|&c| c == '.')
+                .collect::<String>(),
+        )
     };
     let ack = match ch[8] {
         NAK => None,
         c => Some(c as char),
     };
-    let label: String =
-        ch[9..11].iter().map(|&c| if c == DEL { 'd' } else { c as char }).collect();
+    let label: String = ch[9..11]
+        .iter()
+        .map(|&c| if c == DEL { 'd' } else { c as char })
+        .collect();
     let block_id = match ch[11] {
         0 => None,
         c => Some(c as char),

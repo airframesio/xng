@@ -232,11 +232,17 @@ macro_rules! re {
 }
 
 re!(UA_HEADER, r"^[A-Z0-9~.]+?\s*GATE (ASSIGN|CHANGE)\b");
-re!(UA_FLIGHT, r"^([A-Z]{2}\d{1,4})/(\d{2})\s+([A-Z0-9]{4})\s+([A-Z0-9]{4})\b");
+re!(
+    UA_FLIGHT,
+    r"^([A-Z]{2}\d{1,4})/(\d{2})\s+([A-Z0-9]{4})\s+([A-Z0-9]{4})\b"
+);
 re!(UA_SENT, r"^SENT:\s*(\d{2}:\d{2}:\d{2})Z");
 // The gate always has a digit, which tells it apart from the "GATE ASSIGN"
 // and "GATE CHANGE" lines. `AVAIL` gates carry the time they free up.
-re!(UA_GATE, r"^GATE\s+([A-Z]{0,3}\d+[A-Z]?)(?:\s+([A-Z]+)(?:\s+(\d{2}:\d{2}))?)?$");
+re!(
+    UA_GATE,
+    r"^GATE\s+([A-Z]{0,3}\d+[A-Z]?)(?:\s+([A-Z]+)(?:\s+(\d{2}:\d{2}))?)?$"
+);
 re!(UA_EON, r"^EON\s+(\d{4})Z");
 re!(UA_RAMP, r"^RAMP FREQ\s+(\d{3}\.\d{1,3})");
 re!(UA_OPS, r"^OPS FREQ\s+(\d{3}\.\d{1,3})");
@@ -261,7 +267,10 @@ pub fn parse(text: &str) -> Option<GateInfo> {
 /// Lines as the digger's `raLines` splits them: CRLF and bare CR (Piedmont,
 /// Air Europa) both end a line, then each line is trimmed.
 fn split_lines(text: &str) -> Vec<&str> {
-    text.split("\r\n").flat_map(|l| l.split(['\r', '\n'])).map(str::trim).collect()
+    text.split("\r\n")
+        .flat_map(|l| l.split(['\r', '\n']))
+        .map(str::trim)
+        .collect()
 }
 
 fn parse_united(text: &str) -> Option<GateInfo> {
@@ -358,7 +367,10 @@ macro_rules! gate_re {
 // `- FLT 0174 RDU-LHR`), and Piedmont runs the gate into the route:
 // `FLT 5966 SYR-PHLGATE F37 ETA 707L`.
 // The flight can carry an airline prefix (Republic `FLT YX4704 RDU-LGA`).
-re!(ROUTE_LINE, r"^(?:-\s*|[A-Z0-9]{9}[~.]\d)?FLT\s+(?:[A-Z]{2}|[A-Z]\d|\d[A-Z])?(\d{1,4})(?:/(\d{2}))?\s+([A-Z]{3})-([A-Z]{3})");
+re!(
+    ROUTE_LINE,
+    r"^(?:-\s*|[A-Z0-9]{9}[~.]\d)?FLT\s+(?:[A-Z]{2}|[A-Z]\d|\d[A-Z])?(\d{1,4})(?:/(\d{2}))?\s+([A-Z]{3})-([A-Z]{3})"
+);
 gate_re!(INLINE_GATE, r"GATE\s+", r"(?:\s|$)");
 // GATE D21 AVAILABILITY PLN ETA 0721, GATE D43APCA Y ELEC Y, GATE 9
 gate_re!(LEADING_GATE, r"^GATE\s+", r"(?:\s|PCA|$)");
@@ -368,7 +380,11 @@ gate_re!(NEW_ARRIVAL, r"^NEW ARRIVAL GATE NBR IS\s+", r"\s*$");
 re!(ENVOY_ARRIVING, r"^FLT\s+\d{1,4}\s+ARRIVING\s+([A-Z]{3})\b");
 gate_re!(ENVOY_GATE, r"^ARRIVAL GATE\s+", r"(?:\s|$)");
 // United Express (Air Wisconsin): FLT 4940 IAD GATE A4C
-gate_re!(FLIGHT_AIRPORT_GATE, r"^FLT\s+(\d{1,4})\s+([A-Z]{3})\s+GATE\s+", r"\s*$");
+gate_re!(
+    FLIGHT_AIRPORT_GATE,
+    r"^FLT\s+(\d{1,4})\s+([A-Z]{3})\s+GATE\s+",
+    r"\s*$"
+);
 // Hawaiian: ARR GATE MSG / 899 ARR GATE C5, and HA1195 AT GATE A19
 gate_re!(HAWAIIAN_ARR, r"^(\d{1,4})\s+ARR GATE\s+", r"\s*$");
 gate_re!(HAWAIIAN_AT_GATE, r"^(HA\d{1,4})\s+AT GATE\s+", r"\s*$");
@@ -386,19 +402,32 @@ re!(FRONTIER_FROM, r"^FROM ([A-Z]{3}) OPS$");
 gate_re!(FRONTIER_GATE, r"^GATE\s+", r"$");
 // Pre-departure clearance (label B3): JZA110-CYWG-GATE 12-CYOW,
 // BAW22G -EGKK-GATE 27-MDPC. The gate is at the departure airport.
-gate_re!(PDC, r"^([A-Z0-9]{2,8})\s*-([A-Z]{4})-GATE\s+", r"-([A-Z]{4})\b");
+gate_re!(
+    PDC,
+    r"^([A-Z0-9]{2,8})\s*-([A-Z]{4})-GATE\s+",
+    r"-([A-Z]{4})\b"
+);
 // PSA crew acknowledgement of the arrival gate (label 5Z): /ACKFLT GATE F1
 gate_re!(PSA_ACK, r"^/ACKFLT GATE\s+", r"\s*$");
 // Jazz (C1): JZA GATE DATA UPLINK / FLIGHT: 8063/22Nov26/YYC/YVR /
 // PLANNED ARRIVAL GATE IS C42
-re!(JAZZ_FLIGHT, r"^FLIGHT:\s*(\d{1,4})/\d{2}[A-Za-z]{3}\d{2}/([A-Z]{3})/([A-Z]{3})");
+re!(
+    JAZZ_FLIGHT,
+    r"^FLIGHT:\s*(\d{1,4})/\d{2}[A-Za-z]{3}\d{2}/([A-Z]{3})/([A-Z]{3})"
+);
 gate_re!(JAZZ_PLANNED, r"^PLANNED ARRIVAL GATE IS\s+", r"\s*$");
 // Jetstar gate change (C1): JQ782/22 Nov MEL-ADL / GATE CHANGE MESSAGE -
 // ARRIVAL / PREVIOUS GATE: 25 / NEW GATE: 23
-re!(JETSTAR_ROUTE, r"^([A-Z0-9]{2}\d{1,4})/(\d{2}) [A-Za-z]{3} ([A-Z]{3})-([A-Z]{3})\b");
+re!(
+    JETSTAR_ROUTE,
+    r"^([A-Z0-9]{2}\d{1,4})/(\d{2}) [A-Za-z]{3} ([A-Z]{3})-([A-Z]{3})\b"
+);
 // WestJet (RA): WS 345 YXE-YYC / YYC GATE D80/OPS, or ARR GATE IS NOW C26/OPS
 // WestJet Encore (41) starts the route with `FTX01,`: FTX01,WS 3564 YVR-YLW
-re!(WESTJET_ROUTE, r"^(?:FTX\d{2},)?WS\s+(\d{1,4})\s+([A-Z]{3})-([A-Z]{3})\b");
+re!(
+    WESTJET_ROUTE,
+    r"^(?:FTX\d{2},)?WS\s+(\d{1,4})\s+([A-Z]{3})-([A-Z]{3})\b"
+);
 gate_re!(WESTJET_GATE, r"^([A-Z]{3}) GATE\s+", r"/OPS");
 gate_re!(WESTJET_ARR_GATE, r"^ARR GATE IS NOW\s+", r"/OPS");
 // Shandong and others (RA): CURRENT FLIGHT: / SC8402 ARR:ZSJN / GATE:10
@@ -433,12 +462,20 @@ gate_re!(
 re!(ALASKA_FROM, r"^FROM:\s*([A-Z]{3}) OPS$");
 gate_re!(ALASKA_ARR_GATE, r"^ARRIVAL GATE:\s*", r"\s*$");
 // SAS passenger info (C1): ATT SK0932  ETA: 1414  GATE: C33   TERM: 3
-gate_re!(SAS, r"^ATT (SK\d{1,4})\s+ETA:\s*\d{4}\s+GATE:\s*", r"(?:\s|$)");
+gate_re!(
+    SAS,
+    r"^ATT (SK\d{1,4})\s+ETA:\s*\d{4}\s+GATE:\s*",
+    r"(?:\s|$)"
+);
 // Swiss/Edelweiss (32): ARR GATE A12, or ARR POS D12 when the gate is a bus
 gate_re!(ARR_GATE_LINE, r"^ARR GATE\s+", r"\s*$");
 gate_re!(ARR_POS_LINE, r"^ARR POS\s+", r"\s*$");
 // Qatar (RA): QR899 BNE - DOH ARR STAND - C6
-gate_re!(QATAR_STAND, r"^([A-Z0-9]{2}\d{1,4}) ([A-Z]{3}) - ([A-Z]{3}) ARR STAND - ", r"\s*$");
+gate_re!(
+    QATAR_STAND,
+    r"^([A-Z0-9]{2}\d{1,4}) ([A-Z]{3}) - ([A-Z]{3}) ARR STAND - ",
+    r"\s*$"
+);
 // Free-standing arrival lines (RA): -PKG 35 (Air Europa handling), ESTIMATED
 // PARK IS G09 (EVA), PARK BAY: 21 and ARR GATE IS 17R (Qantas), YOUR GATE IS
 // 9, PLANNING GATE B37 and ARR GATE B44 ASSIGNED (Ethiopian dispatch).
@@ -450,19 +487,28 @@ gate_re!(
 // KLM connection info (32): P64AMSKWKL170542 / KL 1750 / GATE  A04  POS  A62
 re!(KLM_HEADER, r"^P\d{2}AMSKWKL\d{6}");
 re!(KLM_FLIGHT, r"^KL\s+(\d{1,4})$");
-static KLM_GATE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(&format!(r"^GATE\s+{GATE_TOKEN}\s+POS\s+{GATE_TOKEN}\s*$")).unwrap());
+static KLM_GATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"^GATE\s+{GATE_TOKEN}\s+POS\s+{GATE_TOKEN}\s*$")).unwrap()
+});
 // Korean Air (33): SPOT NO : 606
 gate_re!(KOREAN_SPOT, r"^SPOT NO\s*:\s*", r"\s*$");
 // Aer Lingus (48): STAND INFO = 400C
 gate_re!(AER_LINGUS_STAND, r"^STAND INFO\s*=\s*", r"\s*$");
 // Avianca dispatch (RA, QUATLASAV): GATE E12, GATE 13 EN SAL., E7 PARK EN BOG
-gate_re!(AVIANCA_GATE, r"^GATE\s+", r"(?:\s+EN\s+([A-Z]{3}))?(?:[\s.]|$)");
+gate_re!(
+    AVIANCA_GATE,
+    r"^GATE\s+",
+    r"(?:\s+EN\s+([A-Z]{3}))?(?:[\s.]|$)"
+);
 gate_re!(AVIANCA_PARK, r"^", r"\s+PARK EN ([A-Z]{3})\b");
 // Qantas (RA): GDAY QF0011 BAY 221
 gate_re!(QANTAS_BAY, r"^GDAY (QF\d{1,4}) BAY\s+", r"\s*$");
 // SkyWest without the ARR GATE INFO header (RA): MSP ARRIVAL GATE D9
-gate_re!(AIRPORT_ARRIVAL_GATE, r"^([A-Z]{3}) ARRIVAL GATE\s+", r"\s*$");
+gate_re!(
+    AIRPORT_ARRIVAL_GATE,
+    r"^([A-Z]{3}) ARRIVAL GATE\s+",
+    r"\s*$"
+);
 // Avianca (RA): GATE J-12 MIA is gate J12 at MIA
 re!(DASHED_AIRPORT, r"^GATE ([A-Z])-(\d{1,3}[A-Z]?) ([A-Z]{3})$");
 // Round 7 (RA unless noted): Frontier ops free text (QUANPOCF9) GATE D36;
@@ -474,27 +520,43 @@ re!(DASHED_AIRPORT, r"^GATE ([A-Z])-(\d{1,3}[A-Z]?) ([A-Z]{3})$");
 // QUPHXACYV.1ARRIVAL GATE Z9; Air France (C1) ARRIVAL PKG: K12.
 gate_re!(PLAIN_GATE_LINE, r"^GATE\s+", r"\s*$");
 gate_re!(IN_RANGE_COLON, r"^GATE:\s*", r"\s*$");
-gate_re!(ALLEGIANT, r"^--GATE ASSIGNMENT\s+([A-Z]{3}) GATE\s+", r"\s+ASSIGNED");
+gate_re!(
+    ALLEGIANT,
+    r"^--GATE ASSIGNMENT\s+([A-Z]{3}) GATE\s+",
+    r"\s+ASSIGNED"
+);
 gate_re!(AIR_NOSTRUM, r"^PKN:\S*\s+GATE:\s*", r"(?:\s|$)");
 gate_re!(VOLARIS, r"LLEGADA GATE\s+", r"\b");
 re!(ITA_ROUTE, r"^([A-Z]{3})/([A-Z]{3}) ETA (\d{4})$");
 re!(HHMM, r"^(?:[01]\d|2[0-3])[0-5]\d$");
 gate_re!(ITA_GATE, r"^GATE\s+", r"\s+BAG CLAIM");
 gate_re!(STAND_NO, r"^STAND NO:\s*", r"\s*$");
-gate_re!(CHINA_EASTERN, r"^HI SIR, MU(\d{1,4}) [A-Z]{3}/([A-Z]{3}), PARK BAY\s+", r"\b");
+gate_re!(
+    CHINA_EASTERN,
+    r"^HI SIR, MU(\d{1,4}) [A-Z]{3}/([A-Z]{3}), PARK BAY\s+",
+    r"\b"
+);
 gate_re!(FEDEX_EXPECT, r"^EXPECT GATE:\s*", r"\(([A-Z]{3})\)");
 // Anchored, so chat (`SEEING ARRIVAL GATE: F3`) and `PREVIOUS ARRIVAL GATE:`
 // lines are not read.
-gate_re!(ARRIVAL_GATE_IS, r"^(?:AIRSIDE\s+)?ARRIVAL GATE(?: IS)?:\s*", r"\s*$");
+gate_re!(
+    ARRIVAL_GATE_IS,
+    r"^(?:AIRSIDE\s+)?ARRIVAL GATE(?: IS)?:\s*",
+    r"\s*$"
+);
 // SkyWest AA in-range marker; the `GATE:` line must come after it.
 re!(IN_RANGE_MARKER, r"^IN-RANGE FROM AA\b");
-gate_re!(HEADER_ARR_GATE, r"^[A-Z0-9]{9}[.~]\dARRIVAL GATE\s+", r"\s*$");
+gate_re!(
+    HEADER_ARR_GATE,
+    r"^[A-Z0-9]{9}[.~]\dARRIVAL GATE\s+",
+    r"\s*$"
+);
 gate_re!(AIR_FRANCE_PKG, r"^ARRIVAL PKG:\s*", r"\b");
 // Where a message moves on to other flights (connections, the aircraft's
 // next flight); gate lines after it are not this flight's.
 re!(
     STOP_LINE,
-    r"^(?:CREW CONNECTING|CONNECTING GATE\b|NEXT FLT|NEXT FLIGHT|NEXT LEG|NEXT SECTOR|NXM\b|- NEXT FLIGHT|ON STAND-|CREW DEPT|TURN FLT|CREW CONNECTIONS|PAX CONNECTIONS|AC TURN|END$)"
+    r"^(?:CREW CONNECTING|CONNECTING GATE|NEXT FLT|NEXT FLIGHT|NEXT LEG|NEXT SECTOR|NXM\b|- NEXT FLIGHT|ON STAND-|CREW DEPT|TURN FLT|CREW CONNECTIONS|PAX CONNECTIONS|AC TURN|END$)"
 );
 // Label RA uplinks read by [`parse`] (Republic's and SkyWest's are skipped by
 // what `parse` reads, since their other messages are read here), and Finnair
@@ -532,7 +594,10 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
         }),
         "3M" => lines.iter().find_map(|l| {
             let c = VIRGIN_BAY.captures(l)?;
-            Some(with_flight(report(GateKind::ArrivalGate, "VIRGIN_AUSTRALIA_BAY", &c[2], ""), &c[1]))
+            Some(with_flight(
+                report(GateKind::ArrivalGate, "VIRGIN_AUSTRALIA_BAY", &c[2], ""),
+                &c[1],
+            ))
         }),
         "3T" => {
             if !lines.iter().any(|l| l.starts_with("ARR GATE MSG")) {
@@ -540,7 +605,10 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             }
             lines.iter().find_map(|l| {
                 let c = HAWAIIAN_ARR.captures(l)?;
-                Some(with_flight(report(GateKind::ArrivalGate, "HAWAIIAN_ARR_GATE", &c[2], ""), &c[1]))
+                Some(with_flight(
+                    report(GateKind::ArrivalGate, "HAWAIIAN_ARR_GATE", &c[2], ""),
+                    &c[1],
+                ))
             })
         }
         "21" => alaska_gate_change(&lines).or_else(|| alaska_eta_ack(&lines)),
@@ -552,21 +620,37 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             .iter()
             .find_map(|l| {
                 let c = JETSTAR.captures(l)?;
-                Some(report(GateKind::ArrivalGate, "JETSTAR_ARRIVAL_GATE", &c[1], ""))
+                Some(report(
+                    GateKind::ArrivalGate,
+                    "JETSTAR_ARRIVAL_GATE",
+                    &c[1],
+                    "",
+                ))
             })
             .or_else(|| jazz_gate(&lines))
             .or_else(|| jazz_flight_data(&lines))
             .or_else(|| {
-                lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-                    let c = AIR_FRANCE_PKG.captures(l)?;
-                    Some(report(GateKind::ArrivalGate, "AIR_FRANCE_ARRIVAL_PKG", &c[1], ""))
-                })
+                lines
+                    .iter()
+                    .take_while(|l| !STOP_LINE.is_match(l))
+                    .find_map(|l| {
+                        let c = AIR_FRANCE_PKG.captures(l)?;
+                        Some(report(
+                            GateKind::ArrivalGate,
+                            "AIR_FRANCE_ARRIVAL_PKG",
+                            &c[1],
+                            "",
+                        ))
+                    })
             })
             .or_else(|| arr_gate_pos(&lines))
             .or_else(|| {
                 lines.iter().find_map(|l| {
                     let c = SAS.captures(l)?;
-                    Some(with_flight(report(GateKind::ArrivalGate, "SAS_PASSENGER_INFO", &c[2], ""), &c[1]))
+                    Some(with_flight(
+                        report(GateKind::ArrivalGate, "SAS_PASSENGER_INFO", &c[2], ""),
+                        &c[1],
+                    ))
                 })
             })
             .or_else(|| jetstar_gate_change(&lines))
@@ -575,16 +659,22 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             if !JETBLUE_INR.is_match(first) {
                 return westjet_gate(&lines).or_else(|| route_gate(&lines));
             }
-            lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-                let c = JETBLUE_GATE.captures(l)?;
-                Some(report(GateKind::ArrivalGate, "JETBLUE_INR", &c[1], ""))
-            })
+            lines
+                .iter()
+                .take_while(|l| !STOP_LINE.is_match(l))
+                .find_map(|l| {
+                    let c = JETBLUE_GATE.captures(l)?;
+                    Some(report(GateKind::ArrivalGate, "JETBLUE_INR", &c[1], ""))
+                })
         }
         "40" => lines
             .iter()
             .find_map(|l| {
                 let c = HAWAIIAN_AT_GATE.captures(l)?;
-                Some(with_flight(report(GateKind::ArrivalGate, "HAWAIIAN_AT_GATE", &c[2], ""), &c[1]))
+                Some(with_flight(
+                    report(GateKind::ArrivalGate, "HAWAIIAN_AT_GATE", &c[2], ""),
+                    &c[1],
+                ))
             })
             .or_else(|| envoy_arriving(&lines))
             .or_else(|| route_gate(&lines)),
@@ -613,20 +703,38 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             }
             delta_arr_gate(&lines)
                 .or_else(|| {
-                    lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-                        if let Some(c) = TURKISH_PARK.captures(l) {
-                            return Some(report(GateKind::ArrivalGate, "TURKISH_PARKING_POSITION", &c[1], ""));
-                        }
-                        if let Some(c) = PARKING_ASSIGNED.captures(l) {
-                            return Some(report(GateKind::ArrivalGate, "PARKING_ASSIGNED", &c[1], ""));
-                        }
-                        ra_arrival_line(l)
+                    lines
+                        .iter()
+                        .take_while(|l| !STOP_LINE.is_match(l))
+                        .find_map(|l| {
+                            if let Some(c) = TURKISH_PARK.captures(l) {
+                                return Some(report(
+                                    GateKind::ArrivalGate,
+                                    "TURKISH_PARKING_POSITION",
+                                    &c[1],
+                                    "",
+                                ));
+                            }
+                            if let Some(c) = PARKING_ASSIGNED.captures(l) {
+                                return Some(report(
+                                    GateKind::ArrivalGate,
+                                    "PARKING_ASSIGNED",
+                                    &c[1],
+                                    "",
+                                ));
+                            }
+                            ra_arrival_line(l)
+                        })
+                })
+                .or_else(|| {
+                    lines.iter().find_map(|l| {
+                        let c = FLIGHT_AIRPORT_GATE.captures(l)?;
+                        Some(with_flight(
+                            report(GateKind::ArrivalGate, "FLT_AIRPORT_GATE", &c[3], &c[2]),
+                            &c[1],
+                        ))
                     })
                 })
-                .or_else(|| lines.iter().find_map(|l| {
-                    let c = FLIGHT_AIRPORT_GATE.captures(l)?;
-                    Some(with_flight(report(GateKind::ArrivalGate, "FLT_AIRPORT_GATE", &c[3], &c[2]), &c[1]))
-                }))
                 .or_else(|| frontier_gate(&lines))
                 .or_else(|| westjet_gate(&lines))
                 .or_else(|| arr_icao_gate(&lines))
@@ -652,14 +760,29 @@ fn with_flight(mut g: GateInfo, flight: &str) -> GateInfo {
 /// message moves on to connections or the next flight. Only the first route
 /// line is read.
 fn route_gate(lines: &[&str]) -> Option<GateInfo> {
-    let (i, c) = lines.iter().enumerate().find_map(|(i, l)| Some((i, ROUTE_LINE.captures(l)?)))?;
+    let (i, c) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| Some((i, ROUTE_LINE.captures(l)?)))?;
     let rest = &lines[i][c.get(0)?.end()..];
-    let gate = INLINE_GATE.captures(rest).map(|g| g[1].to_owned()).or_else(|| {
-        lines[i + 1..].iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-            LEADING_GATE.captures(l).or_else(|| NEW_ARRIVAL.captures(l)).map(|g| g[1].to_owned())
-        })
-    })?;
-    let mut g = with_flight(report(GateKind::ArrivalGate, "FLT_ROUTE_GATE", &gate, &c[4]), &c[1]);
+    let gate = INLINE_GATE
+        .captures(rest)
+        .map(|g| g[1].to_owned())
+        .or_else(|| {
+            lines[i + 1..]
+                .iter()
+                .take_while(|l| !STOP_LINE.is_match(l))
+                .find_map(|l| {
+                    LEADING_GATE
+                        .captures(l)
+                        .or_else(|| NEW_ARRIVAL.captures(l))
+                        .map(|g| g[1].to_owned())
+                })
+        })?;
+    let mut g = with_flight(
+        report(GateKind::ArrivalGate, "FLT_ROUTE_GATE", &gate, &c[4]),
+        &c[1],
+    );
     g.day = c.get(2).map(|m| m.as_str().to_owned());
     g.departure = Some(c[3].to_owned());
     Some(g)
@@ -667,11 +790,22 @@ fn route_gate(lines: &[&str]) -> Option<GateInfo> {
 
 /// Envoy `FLT 4258 ARRIVING DCA` and the `ARRIVAL GATE` line after it.
 fn envoy_arriving(lines: &[&str]) -> Option<GateInfo> {
-    let (i, c) = lines.iter().enumerate().find_map(|(i, l)| Some((i, ENVOY_ARRIVING.captures(l)?)))?;
-    lines[i + 1..].iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-        let g = ENVOY_GATE.captures(l)?;
-        Some(report(GateKind::ArrivalGate, "ENVOY_ARRIVING", &g[1], &c[1]))
-    })
+    let (i, c) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| Some((i, ENVOY_ARRIVING.captures(l)?)))?;
+    lines[i + 1..]
+        .iter()
+        .take_while(|l| !STOP_LINE.is_match(l))
+        .find_map(|l| {
+            let g = ENVOY_GATE.captures(l)?;
+            Some(report(
+                GateKind::ArrivalGate,
+                "ENVOY_ARRIVING",
+                &g[1],
+                &c[1],
+            ))
+        })
 }
 
 /// Alaska `GATE CHANGE IN LAX`, then the flight and `NEW GATE:` lines.
@@ -698,7 +832,10 @@ fn alaska_gate_change(lines: &[&str]) -> Option<GateInfo> {
 /// QF0011 BAY 221` and SkyWest's `EAU ARRIVAL GATE 1` without its header.
 fn ra_arrival_line(l: &str) -> Option<GateInfo> {
     if let Some(c) = QATAR_STAND.captures(l) {
-        let mut g = with_flight(report(GateKind::ArrivalGate, "QATAR_ARR_STAND", &c[4], &c[3]), &c[1]);
+        let mut g = with_flight(
+            report(GateKind::ArrivalGate, "QATAR_ARR_STAND", &c[4], &c[3]),
+            &c[1],
+        );
         g.departure = Some(c[2].to_owned());
         return Some(g);
     }
@@ -706,13 +843,26 @@ fn ra_arrival_line(l: &str) -> Option<GateInfo> {
         return Some(report(GateKind::ArrivalGate, "ARRIVAL_PARKING", &c[1], ""));
     }
     if let Some(c) = DASHED_AIRPORT.captures(l) {
-        return Some(report(GateKind::ArrivalGate, "GATE_DASH_AIRPORT", &format!("{}{}", &c[1], &c[2]), &c[3]));
+        return Some(report(
+            GateKind::ArrivalGate,
+            "GATE_DASH_AIRPORT",
+            &format!("{}{}", &c[1], &c[2]),
+            &c[3],
+        ));
     }
     if let Some(c) = QANTAS_BAY.captures(l) {
-        return Some(with_flight(report(GateKind::ArrivalGate, "QANTAS_BAY", &c[2], ""), &c[1]));
+        return Some(with_flight(
+            report(GateKind::ArrivalGate, "QANTAS_BAY", &c[2], ""),
+            &c[1],
+        ));
     }
     let c = AIRPORT_ARRIVAL_GATE.captures(l)?;
-    Some(report(GateKind::ArrivalGate, "AIRPORT_ARRIVAL_GATE", &c[2], &c[1]))
+    Some(report(
+        GateKind::ArrivalGate,
+        "AIRPORT_ARRIVAL_GATE",
+        &c[2],
+        &c[1],
+    ))
 }
 
 /// The RA forms listed with `PLAIN_GATE_LINE`: the Mesa header gate, then
@@ -721,7 +871,12 @@ fn ra_arrival_line(l: &str) -> Option<GateInfo> {
 /// Nostrum, Volaris, `STAND NO:`, China Eastern, FedEx and `ARRIVAL GATE:`.
 fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
     if let Some(c) = HEADER_ARR_GATE.captures(lines[0]) {
-        return Some(report(GateKind::ArrivalGate, "HEADER_ARRIVAL_GATE", &c[1], ""));
+        return Some(report(
+            GateKind::ArrivalGate,
+            "HEADER_ARRIVAL_GATE",
+            &c[1],
+            "",
+        ));
     }
     let frontier = lines[0].starts_with("QUANPOCF9");
     if frontier {
@@ -731,9 +886,29 @@ fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
         }
     }
     let mut in_range = false;
+    let mut flight_line = false;
     let mut ita: Option<(&str, &str, &str)> = None;
-    for l in lines.iter().take_while(|l| !STOP_LINE.is_match(l)) {
-        let arrival = |format, gate: &str, airport: &str| Some(report(GateKind::ArrivalGate, format, gate, airport));
+    for (i, l) in lines.iter().enumerate() {
+        if ARR_ICAO_LINE.is_match(l) {
+            // A flight line (SC8402 ARR:ZSJN): arr_icao_gate reads its gate.
+            flight_line = true;
+        }
+        if STOP_LINE.is_match(l) {
+            // ITA titles its own gate list; the route follows it.
+            if *l == "CONNECTING GATES"
+                && lines
+                    .iter()
+                    .skip(i + 1)
+                    .take(2)
+                    .any(|n| ITA_ROUTE.is_match(n))
+            {
+                continue;
+            }
+            break;
+        }
+        let arrival = |format, gate: &str, airport: &str| {
+            Some(report(GateKind::ArrivalGate, format, gate, airport))
+        };
         if frontier {
             if let Some(c) = PLAIN_GATE_LINE.captures(l) {
                 return arrival("FRONTIER_OPS", &c[1], "");
@@ -743,7 +918,7 @@ fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
             in_range = true;
             continue;
         }
-        if in_range {
+        if in_range && !flight_line {
             if let Some(c) = IN_RANGE_COLON.captures(l) {
                 return arrival("IN_RANGE_GATE", &c[1], "");
             }
@@ -752,7 +927,12 @@ fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
             ita = Some((c.get(1)?.as_str(), c.get(2)?.as_str(), c.get(3)?.as_str()));
         }
         if let (Some(c), Some((origin, airport, eta))) = (ITA_GATE.captures(l), ita) {
-            let mut g = report(GateKind::ArrivalGate, "ITA_CONNECTING_GATES", &c[1], airport);
+            let mut g = report(
+                GateKind::ArrivalGate,
+                "ITA_CONNECTING_GATES",
+                &c[1],
+                airport,
+            );
             g.departure = Some(origin.to_owned());
             if HHMM.is_match(eta) {
                 g.eta = Some(eta.to_owned());
@@ -772,7 +952,15 @@ fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
             return arrival("STAND_NO", &c[1], "");
         }
         if let Some(c) = CHINA_EASTERN.captures(l) {
-            return Some(with_flight(report(GateKind::ArrivalGate, "CHINA_EASTERN_PARK_BAY", &c[3], &c[2]), &c[1]));
+            return Some(with_flight(
+                report(
+                    GateKind::ArrivalGate,
+                    "CHINA_EASTERN_PARK_BAY",
+                    &c[3],
+                    &c[2],
+                ),
+                &c[1],
+            ));
         }
         if let Some(c) = FEDEX_EXPECT.captures(l) {
             return arrival("FEDEX_EXPECT_GATE", &c[1], &c[2]);
@@ -804,21 +992,34 @@ fn klm_connection_info(lines: &[&str]) -> Option<GateInfo> {
 /// Avianca dispatch (`QUATLASAV`): `GATE 13 EN SAL.`, `GATE E12` or `E7 PARK
 /// EN BOG`, before the dispatcher's `FROM:` line.
 fn avianca_dispatch(lines: &[&str]) -> Option<GateInfo> {
-    lines.iter().take_while(|l| !l.starts_with("FROM:")).find_map(|l| {
-        let c = AVIANCA_GATE.captures(l).or_else(|| AVIANCA_PARK.captures(l))?;
-        let airport = c.get(2).map_or("", |m| m.as_str());
-        Some(report(GateKind::ArrivalGate, "AVIANCA_DISPATCH", &c[1], airport))
-    })
+    lines
+        .iter()
+        .take_while(|l| !l.starts_with("FROM:"))
+        .find_map(|l| {
+            let c = AVIANCA_GATE
+                .captures(l)
+                .or_else(|| AVIANCA_PARK.captures(l))?;
+            let airport = c.get(2).map_or("", |m| m.as_str());
+            Some(report(
+                GateKind::ArrivalGate,
+                "AVIANCA_DISPATCH",
+                &c[1],
+                airport,
+            ))
+        })
 }
 
 /// Swiss/Edelweiss: `ARR GATE A52`, else `ARR POS D12` (the gate is a bus),
 /// before the connecting gates.
 fn arr_gate_pos(lines: &[&str]) -> Option<GateInfo> {
     [&ARR_GATE_LINE, &ARR_POS_LINE].into_iter().find_map(|re| {
-        lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-            let c = re.captures(l)?;
-            Some(report(GateKind::ArrivalGate, "ARR_GATE_POS", &c[1], ""))
-        })
+        lines
+            .iter()
+            .take_while(|l| !STOP_LINE.is_match(l))
+            .find_map(|l| {
+                let c = re.captures(l)?;
+                Some(report(GateKind::ArrivalGate, "ARR_GATE_POS", &c[1], ""))
+            })
     })
 }
 
@@ -864,7 +1065,10 @@ fn finnair(lines: &[&str]) -> Option<GateInfo> {
         .iter()
         .find_map(|l| {
             let c = FINNAIR_BOARD.captures(l)?;
-            let mut g = with_flight(report(GateKind::DepartureGate, "FINNAIR_BOARDING_GATE", &c[3], ""), &c[1]);
+            let mut g = with_flight(
+                report(GateKind::DepartureGate, "FINNAIR_BOARDING_GATE", &c[3], ""),
+                &c[1],
+            );
             g.departure = Some(c[2].to_owned());
             Some(g)
         })
@@ -873,7 +1077,10 @@ fn finnair(lines: &[&str]) -> Option<GateInfo> {
 
 /// Delta crew P/F (`CREW P/F` or `PART  1 OF` line): `ARR ATL GTE E15`.
 fn delta_arr_gate(lines: &[&str]) -> Option<GateInfo> {
-    if !lines.iter().any(|l| l.starts_with("CREW P/F") || l.starts_with("PART  1 OF")) {
+    if !lines
+        .iter()
+        .any(|l| l.starts_with("CREW P/F") || l.starts_with("PART  1 OF"))
+    {
         return None;
     }
     lines.iter().find_map(|l| {
@@ -907,11 +1114,20 @@ fn finnair_stand(lines: &[&str]) -> Option<GateInfo> {
 /// stand) or `CREW DEPT` (the crew's next flight). The ETA itself is left
 /// to the OOOI extractor.
 fn ba_pad11_stand(lines: &[&str]) -> Option<GateInfo> {
-    let (i, c) = lines.iter().enumerate().find_map(|(i, l)| Some((i, BA_ARRIVAL.captures(l)?)))?;
-    lines[i + 1..].iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-        let g = BA_STAND.captures(l)?;
-        Some(with_flight(report(GateKind::ArrivalGate, "BA_PAD11_STAND", &g[1], ""), &c[1]))
-    })
+    let (i, c) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| Some((i, BA_ARRIVAL.captures(l)?)))?;
+    lines[i + 1..]
+        .iter()
+        .take_while(|l| !STOP_LINE.is_match(l))
+        .find_map(|l| {
+            let g = BA_STAND.captures(l)?;
+            Some(with_flight(
+                report(GateKind::ArrivalGate, "BA_PAD11_STAND", &g[1], ""),
+                &c[1],
+            ))
+        })
 }
 
 /// Jazz flight data: `DEP YVR/06:20Z/GTE C40` and `ARR YYC/07:48Z/GTE A17`
@@ -941,7 +1157,9 @@ fn jazz_flight_data(lines: &[&str]) -> Option<GateInfo> {
 /// Jazz `JZA GATE DATA UPLINK`: the `FLIGHT:` line and `PLANNED ARRIVAL
 /// GATE IS C42`.
 fn jazz_gate(lines: &[&str]) -> Option<GateInfo> {
-    if !lines.iter().any(|l| l.starts_with("- JZA GATE DATA UPLINK") || l.starts_with("-  JZA GATE DATA UPLINK")) {
+    if !lines.iter().any(|l| {
+        l.starts_with("- JZA GATE DATA UPLINK") || l.starts_with("-  JZA GATE DATA UPLINK")
+    }) {
         return None;
     }
     let mut flight = None;
@@ -965,7 +1183,10 @@ fn jazz_gate(lines: &[&str]) -> Option<GateInfo> {
 /// Jetstar `GATE CHANGE MESSAGE - ARRIVAL`: the `JQ782/22 Nov MEL-ADL` route
 /// line and `NEW GATE: 23`.
 fn jetstar_gate_change(lines: &[&str]) -> Option<GateInfo> {
-    if !lines.iter().any(|l| l.starts_with("GATE CHANGE MESSAGE - ARRIVAL")) {
+    if !lines
+        .iter()
+        .any(|l| l.starts_with("GATE CHANGE MESSAGE - ARRIVAL"))
+    {
         return None;
     }
     let mut route = None;
@@ -995,9 +1216,15 @@ fn westjet_gate(lines: &[&str]) -> Option<GateInfo> {
     lines[i + 1..].iter().find_map(|l| {
         let (gate, airport) = match WESTJET_GATE.captures(l) {
             Some(c) => (c[2].to_owned(), c[1].to_owned()),
-            None => (WESTJET_ARR_GATE.captures(l)?[1].to_owned(), route[3].to_owned()),
+            None => (
+                WESTJET_ARR_GATE.captures(l)?[1].to_owned(),
+                route[3].to_owned(),
+            ),
         };
-        let mut g = with_flight(report(GateKind::ArrivalGate, "WESTJET_OPS_GATE", &gate, &airport), &route[1]);
+        let mut g = with_flight(
+            report(GateKind::ArrivalGate, "WESTJET_OPS_GATE", &gate, &airport),
+            &route[1],
+        );
         g.departure = Some(route[2].to_owned());
         Some(g)
     })
@@ -1005,11 +1232,20 @@ fn westjet_gate(lines: &[&str]) -> Option<GateInfo> {
 
 /// `SC8402 ARR:ZSJN` and the `GATE:10` line after it.
 fn arr_icao_gate(lines: &[&str]) -> Option<GateInfo> {
-    let (i, c) = lines.iter().enumerate().find_map(|(i, l)| Some((i, ARR_ICAO_LINE.captures(l)?)))?;
-    lines[i + 1..].iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-        let g = COLON_GATE.captures(l)?;
-        Some(with_flight(report(GateKind::ArrivalGate, "ARR_ICAO_GATE", &g[1], &c[2]), &c[1]))
-    })
+    let (i, c) = lines
+        .iter()
+        .enumerate()
+        .find_map(|(i, l)| Some((i, ARR_ICAO_LINE.captures(l)?)))?;
+    lines[i + 1..]
+        .iter()
+        .take_while(|l| !STOP_LINE.is_match(l))
+        .find_map(|l| {
+            let g = COLON_GATE.captures(l)?;
+            Some(with_flight(
+                report(GateKind::ArrivalGate, "ARR_ICAO_GATE", &g[1], &c[2]),
+                &c[1],
+            ))
+        })
 }
 
 /// LATAM `GATE ASSIGNMENT` with a `PPOS:602L` parking position (`PPOS:N/A`
@@ -1018,10 +1254,18 @@ fn latam_ppos(lines: &[&str]) -> Option<GateInfo> {
     if !lines.iter().any(|l| l.starts_with("GATE ASSIGNMENT")) {
         return None;
     }
-    lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-        let c = LATAM_PPOS.captures(l)?;
-        Some(report(GateKind::ArrivalGate, "LATAM_GATE_ASSIGNMENT", &c[1], ""))
-    })
+    lines
+        .iter()
+        .take_while(|l| !STOP_LINE.is_match(l))
+        .find_map(|l| {
+            let c = LATAM_PPOS.captures(l)?;
+            Some(report(
+                GateKind::ArrivalGate,
+                "LATAM_GATE_ASSIGNMENT",
+                &c[1],
+                "",
+            ))
+        })
 }
 
 /// Frontier `FROM PHL OPS` with a `GATE  E8` line; only when the uplink also
@@ -1031,10 +1275,18 @@ fn frontier_gate(lines: &[&str]) -> Option<GateInfo> {
     if !lines.iter().any(|l| l.starts_with("GATE AVAIL AT ARRIVAL")) {
         return None;
     }
-    lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
-        let c = FRONTIER_GATE.captures(l)?;
-        Some(report(GateKind::ArrivalGate, "FRONTIER_OPS", &c[1], &airport[1]))
-    })
+    lines
+        .iter()
+        .take_while(|l| !STOP_LINE.is_match(l))
+        .find_map(|l| {
+            let c = FRONTIER_GATE.captures(l)?;
+            Some(report(
+                GateKind::ArrivalGate,
+                "FRONTIER_OPS",
+                &c[1],
+                &airport[1],
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -1118,7 +1370,8 @@ mod tests {
 
     #[test]
     fn united_without_gate_is_not_read() {
-        let t = "QUNDCULUA~1GATE ASSIGN\r\nUA0214/21 KSTL KSFO\r\nSENT: 05:22:32Z\r\nGATE ASSIGN\r\n";
+        let t =
+            "QUNDCULUA~1GATE ASSIGN\r\nUA0214/21 KSTL KSFO\r\nSENT: 05:22:32Z\r\nGATE ASSIGN\r\n";
         assert!(parse(t).is_none());
     }
 
@@ -1132,17 +1385,25 @@ mod tests {
         assert_eq!(g.eta.as_deref(), Some("0542"));
         assert_eq!(g.gate, "16");
         let g = parse(RPA_L27).unwrap();
-        assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some("ORD"), "L27"));
+        assert_eq!(
+            (g.arrival.as_deref(), g.gate.as_str()),
+            (Some("ORD"), "L27")
+        );
     }
 
     #[test]
     fn skywest_arrival_gate() {
-        for (text, airport, gate) in
-            [(SKW, "BFL", "4"), (SKW_SIL, "FAT", "7"), (SKW_SAME_LINE, "LAX", "26B")]
-        {
+        for (text, airport, gate) in [
+            (SKW, "BFL", "4"),
+            (SKW_SIL, "FAT", "7"),
+            (SKW_SAME_LINE, "LAX", "26B"),
+        ] {
             let g = parse(text).unwrap_or_else(|| panic!("no gate in {text:?}"));
             assert_eq!(g.kind, GateKind::ArrivalGate);
-            assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some(airport), gate));
+            assert_eq!(
+                (g.arrival.as_deref(), g.gate.as_str()),
+                (Some(airport), gate)
+            );
             // The next-flight block is another flight's.
             assert_eq!(g.flight_number, None);
             assert_eq!(g.departure, None);
@@ -1165,7 +1426,10 @@ mod tests {
 
     #[test]
     fn summary_and_json() {
-        assert_eq!(parse(UA_AVAIL).unwrap().summary(), "GATE ASSIGN UA1170 KLAX->PHNL gate G5 AVAIL 06:30");
+        assert_eq!(
+            parse(UA_AVAIL).unwrap().summary(),
+            "GATE ASSIGN UA1170 KLAX->PHNL gate G5 AVAIL 06:30"
+        );
         assert_eq!(parse(SKW).unwrap().summary(), "ARRIVAL GATE BFL gate 4");
         let j = serde_json::to_value(parse(RPA).unwrap()).unwrap();
         assert_eq!(j["kind"], "arrival_gate");
@@ -1269,7 +1533,14 @@ mod tests {
         for &(name, label, text, kind, format, departure, arrival, gate, flight) in cases {
             let g = parse_report(label, text).unwrap_or_else(|| panic!("{name}: no gate"));
             assert_eq!(
-                (g.kind, g.format, g.departure.as_deref(), g.arrival.as_deref(), g.gate.as_str(), g.flight_number.as_deref()),
+                (
+                    g.kind,
+                    g.format,
+                    g.departure.as_deref(),
+                    g.arrival.as_deref(),
+                    g.gate.as_str(),
+                    g.flight_number.as_deref()
+                ),
                 (kind, Some(format), departure, arrival, gate, flight),
                 "{name}"
             );
@@ -1281,11 +1552,21 @@ mod tests {
     #[test]
     fn jazz_flight_data_gives_both_gates() {
         let g = parse_report("C1", JAZZ_FLIGHT_DATA).unwrap();
-        assert_eq!((g.departure_gate.as_deref(), g.gate.as_str()), (Some("C40"), "A17"));
+        assert_eq!(
+            (g.departure_gate.as_deref(), g.gate.as_str()),
+            (Some("C40"), "A17")
+        );
         assert_eq!(g.summary(), "ARRIVAL GATE YVR->YYC dep gate C40 gate A17");
-        let dep_only = parse_report("C1", "-  DFR FLT 8074\r\nDEP YVR/06:20Z/GTE C40\r\nPAX 46\r\n").unwrap();
+        let dep_only = parse_report(
+            "C1",
+            "-  DFR FLT 8074\r\nDEP YVR/06:20Z/GTE C40\r\nPAX 46\r\n",
+        )
+        .unwrap();
         assert_eq!(dep_only.kind, GateKind::DepartureGate);
-        assert_eq!((dep_only.departure.as_deref(), dep_only.gate.as_str()), (Some("YVR"), "C40"));
+        assert_eq!(
+            (dep_only.departure.as_deref(), dep_only.gate.as_str()),
+            (Some("YVR"), "C40")
+        );
         assert_eq!(dep_only.departure_gate, None);
     }
 
@@ -1295,24 +1576,65 @@ mod tests {
         // boarding gate (a departure gate), never the connection lists.
         assert!(parse_report("RA", FINNAIR_CONNECT).is_none());
         let g = parse_report("RA", FINNAIR_PAX).unwrap();
-        assert_eq!((g.kind, g.departure.as_deref(), g.gate.as_str()), (GateKind::DepartureGate, Some("HEL"), "9"));
+        assert_eq!(
+            (g.kind, g.departure.as_deref(), g.gate.as_str()),
+            (GateKind::DepartureGate, Some("HEL"), "9")
+        );
         assert_eq!(g.summary(), "DEPARTURE GATE AY1073 HEL gate 9");
-        assert!(parse_report("RA", "QUHELASAY~1\r\nCONNECTION INFO\r\nARRIVING STAND 131\r\n").is_none());
+        assert!(parse_report(
+            "RA",
+            "QUHELASAY~1\r\nCONNECTION INFO\r\nARRIVING STAND 131\r\n"
+        )
+        .is_none());
     }
 
     #[test]
     fn round7_review_cases() {
         // Horizon's bare gate line is not an Alaska ETA acknowledgement.
         let g = parse_report("RA", "ARRIVAL GATE:B9\r\n").unwrap();
-        assert_eq!((g.format, g.gate.as_str()), (Some("ARRIVAL_GATE_COLON"), "B9"));
+        assert_eq!(
+            (g.format, g.gate.as_str()),
+            (Some("ARRIVAL_GATE_COLON"), "B9")
+        );
         // A previous gate or chat line is not the arrival gate.
         assert!(parse_report("RA", "PREVIOUS ARRIVAL GATE: B4\r\n").is_none());
         assert!(parse_report("RA", "SEEING ARRIVAL GATE: F3\r\n").is_none());
         // An in-range marker of a later flight does not enable this GATE: line,
         // and one after a Shandong gate leaves its flight and airport.
-        assert!(parse_report("RA", "QUSILITOO.1ENROUTE PLAN    \r\nGATE: 4\r\nNEXT FLIGHT\r\nIN-RANGE FROM AA\r\n").is_none());
-        let g = parse_report("RA", "CURRENT FLIGHT:\r\nSC8402 ARR:ZSJN\r\nGATE:10\r\nWEATHER:\r\nIN-RANGE FROM AA\r\n").unwrap();
-        assert_eq!((g.flight_number.as_deref(), g.arrival.as_deref(), g.gate.as_str()), (Some("SC8402"), Some("ZSJN"), "10"));
+        assert!(parse_report(
+            "RA",
+            "QUSILITOO.1ENROUTE PLAN    \r\nGATE: 4\r\nNEXT FLIGHT\r\nIN-RANGE FROM AA\r\n"
+        )
+        .is_none());
+        let g = parse_report(
+            "RA",
+            "CURRENT FLIGHT:\r\nSC8402 ARR:ZSJN\r\nGATE:10\r\nWEATHER:\r\nIN-RANGE FROM AA\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                g.flight_number.as_deref(),
+                g.arrival.as_deref(),
+                g.gate.as_str()
+            ),
+            (Some("SC8402"), Some("ZSJN"), "10")
+        );
+        let g = parse_report(
+            "RA",
+            "CURRENT FLIGHT:\r\nSC8402 ARR:ZSJN\r\nIN-RANGE FROM AA\r\nGATE:10\r\n",
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                g.flight_number.as_deref(),
+                g.arrival.as_deref(),
+                g.gate.as_str()
+            ),
+            (Some("SC8402"), Some("ZSJN"), "10")
+        );
+        // A CONNECTING GATES list on label 32 is another flight's.
+        let g = parse_report("32", "ARR POS I12\r\nCONNECTING GATES\r\nARR GATE A52\r\n").unwrap();
+        assert_eq!(g.gate, "I12");
         // ITA keeps the origin and ETA, also with the title on its own line.
         for text in [
             "QUMGL1AAZ~1CONNECTING GATES\r\nZRH/FCO ETA 1220 \r\nGATE A32 BAG CLAIM 23 \r\n",
@@ -1320,17 +1642,30 @@ mod tests {
         ] {
             let g = parse_report("RA", text).unwrap();
             assert_eq!(
-                (g.departure.as_deref(), g.arrival.as_deref(), g.gate.as_str(), g.eta.as_deref()),
+                (
+                    g.departure.as_deref(),
+                    g.arrival.as_deref(),
+                    g.gate.as_str(),
+                    g.eta.as_deref()
+                ),
                 (Some("ZRH"), Some("FCO"), "A32", Some("1220"))
             );
         }
         // Air France parking after the next-flight line is not read.
-        assert!(parse_report("C1", ".PAROWAF 171200\r\nAGM\r\nNEXT FLIGHT\r\nARRIVAL PKG: K12 PKG TYPE: C TERM: E\r\n").is_none());
+        assert!(parse_report(
+            "C1",
+            ".PAROWAF 171200\r\nAGM\r\nNEXT FLIGHT\r\nARRIVAL PKG: K12 PKG TYPE: C TERM: E\r\n"
+        )
+        .is_none());
     }
 
     #[test]
     fn report_day_of_flight() {
-        let g = parse_report("40", "FLT 1658/22 AUS-DFW\r\nGATE D21 AVAILABILITY PLN ETA 0721\r\n").unwrap();
+        let g = parse_report(
+            "40",
+            "FLT 1658/22 AUS-DFW\r\nGATE D21 AVAILABILITY PLN ETA 0721\r\n",
+        )
+        .unwrap();
         assert_eq!(g.day.as_deref(), Some("22"));
         let g = parse_report("41", "FLT 5106 DTW-PHL\r\nGATE F18 ETA 0743L \r\n").unwrap();
         assert_eq!(g.day, None);
@@ -1369,7 +1704,11 @@ mod tests {
             ("empty", "40", ""),
         ];
         for (name, label, text) in cases {
-            assert!(parse_report(label, text).is_none(), "{name}: {:?}", parse_report(label, text));
+            assert!(
+                parse_report(label, text).is_none(),
+                "{name}: {:?}",
+                parse_report(label, text)
+            );
         }
     }
 
@@ -1383,8 +1722,14 @@ mod tests {
         assert_eq!(j["departure"], "CYWG");
         let jetstar = parse_report("C1", "ARRIVAL GATE THIS FLT:43\r\n").unwrap();
         assert_eq!(jetstar.summary(), "ARRIVAL GATE gate 43");
-        assert!(serde_json::to_value(&jetstar).unwrap().get("arrival").is_none());
+        assert!(serde_json::to_value(&jetstar)
+            .unwrap()
+            .get("arrival")
+            .is_none());
         // The RA uplinks keep their JSON shape (no `format`).
-        assert!(serde_json::to_value(parse(SKW).unwrap()).unwrap().get("format").is_none());
+        assert!(serde_json::to_value(parse(SKW).unwrap())
+            .unwrap()
+            .get("format")
+            .is_none());
     }
 }

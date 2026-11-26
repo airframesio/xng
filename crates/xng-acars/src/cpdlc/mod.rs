@@ -82,13 +82,13 @@ impl Bits<'_> {
 /// meters — from libacars's generated constraints and text formatters).
 fn read_altitude(b: &mut Bits) -> Option<String> {
     Some(match b.read(3)? {
-        0 => format!("{} ft", b.read(12)? * 10),        // QNH (0..2500) x10
-        1 => format!("{} m", b.read(14)?),              // QNH meters
-        2 => format!("{} ft QFE", b.read(12)? * 10),    // QFE (0..2100) x10
-        3 => format!("{} m QFE", b.read(13)?),          // QFE meters
-        4 => format!("{} ft", b.read(18)?),             // GNSS feet
-        5 => format!("{} m", b.read(16)?),              // GNSS meters
-        6 => format!("FL{}", 30 + b.read(10)?),         // flight level (30..600)
+        0 => format!("{} ft", b.read(12)? * 10), // QNH (0..2500) x10
+        1 => format!("{} m", b.read(14)?),       // QNH meters
+        2 => format!("{} ft QFE", b.read(12)? * 10), // QFE (0..2100) x10
+        3 => format!("{} m QFE", b.read(13)?),   // QFE meters
+        4 => format!("{} ft", b.read(18)?),      // GNSS feet
+        5 => format!("{} m", b.read(16)?),       // GNSS meters
+        6 => format!("FL{}", 30 + b.read(10)?),  // flight level (30..600)
         7 => format!("{} m", (100 + b.read(11)?) * 10), // metric FL (100..2000) x10
         _ => unreachable!(),
     })
@@ -99,11 +99,11 @@ fn read_altitude(b: &mut Bits) -> Option<String> {
 /// hundredths — from libacars's generated constraints and formatters).
 fn read_speed(b: &mut Bits) -> Option<String> {
     Some(match b.read(3)? {
-        0 => format!("{} kt", (7 + b.read(5)?) * 10),     // indicated (7..38)
-        1 => format!("{} km/h", (10 + b.read(7)?) * 10),  // indicated metric
-        2 => format!("{} kt", (7 + b.read(6)?) * 10),     // true (7..70)
-        3 => format!("{} km/h", (10 + b.read(7)?) * 10),  // true metric
-        4 => format!("{} kt GS", (7 + b.read(6)?) * 10),  // ground (7..70)
+        0 => format!("{} kt", (7 + b.read(5)?) * 10), // indicated (7..38)
+        1 => format!("{} km/h", (10 + b.read(7)?) * 10), // indicated metric
+        2 => format!("{} kt", (7 + b.read(6)?) * 10), // true (7..70)
+        3 => format!("{} km/h", (10 + b.read(7)?) * 10), // true metric
+        4 => format!("{} kt GS", (7 + b.read(6)?) * 10), // ground (7..70)
         5 => format!("{} km/h GS", (10 + b.read(8)?) * 10), // ground metric
         6 => format!("M{:.2}", (61 + b.read(5)?) as f32 / 100.0), // mach (61..92)
         7 => format!("M{:.2}", (93 + b.read(9)?) as f32 / 100.0), // mach large
@@ -172,7 +172,11 @@ fn read_latlon(b: &mut Bits) -> Option<String> {
         Some(m) => format!("{deg}°{:.1}'{dir}", m as f32 / 10.0),
         None => format!("{deg}°{dir}"),
     };
-    Some(format!("{} {}", fmt(lat_deg, lat_min, ns), fmt(lon_deg, lon_min, ew)))
+    Some(format!(
+        "{} {}",
+        fmt(lat_deg, lat_min, ns),
+        fmt(lon_deg, lon_min, ew)
+    ))
 }
 
 /// FANSPublishedIdentifier: fixName + OPTIONAL latitudeLongitude.
@@ -267,7 +271,7 @@ fn read_route_clearance(b: &mut Bits) -> Option<String> {
                     format!("{pb} BRG {deg} DIST {dist}")
                 }
                 4 => read_ia5(b, 3, 1)?, // airway SIZE(1..5)
-                _ => return None, // trackDetail: not decoded
+                _ => return None,        // trackDetail: not decoded
             };
             legs.push(leg);
         }
@@ -278,8 +282,6 @@ fn read_route_clearance(b: &mut Bits) -> Option<String> {
     }
     Some(parts.join(", "))
 }
-
-
 
 /// FANSTime: hours (0..23, 5 bits) + minutes (0..59, 6 bits).
 fn read_time(b: &mut Bits) -> Option<String> {
@@ -308,14 +310,27 @@ fn read_vertical_rate(b: &mut Bits) -> Option<String> {
 /// FANSDegrees: CHOICE magnetic/true, each INTEGER (1..360).
 fn read_degrees(b: &mut Bits) -> Option<String> {
     let mag = b.read(1)? == 0;
-    Some(format!("{}°{}", b.read(9)? + 1, if mag { "M" } else { "T" }))
+    Some(format!(
+        "{}°{}",
+        b.read(9)? + 1,
+        if mag { "M" } else { "T" }
+    ))
 }
 
 /// FANSDirection: ENUMERATED (0..10).
 fn read_direction(b: &mut Bits) -> Option<String> {
     const DIRS: [&str; 11] = [
-        "LEFT", "RIGHT", "EITHER SIDE", "NORTH", "SOUTH", "EAST", "WEST",
-        "NORTH-EAST", "NORTH-WEST", "SOUTH-EAST", "SOUTH-WEST",
+        "LEFT",
+        "RIGHT",
+        "EITHER SIDE",
+        "NORTH",
+        "SOUTH",
+        "EAST",
+        "WEST",
+        "NORTH-EAST",
+        "NORTH-WEST",
+        "SOUTH-EAST",
+        "SOUTH-WEST",
     ];
     DIRS.get(b.read(4)? as usize).map(|s| s.to_string())
 }
@@ -538,7 +553,8 @@ fn read_icao_unit_name_frequency(b: &mut Bits) -> Option<(String, String)> {
 }
 
 fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
-    let ty = tag.trim_start_matches(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == 'M');
+    let ty =
+        tag.trim_start_matches(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == 'M');
     match ty {
         "NULL" => Some(Vec::new()),
         "Altitude" => Some(vec![read_altitude(b)?]),
@@ -558,22 +574,16 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
         "PositionSpeed" => Some(vec![read_position(b)?, read_speed(b)?]),
         "TimeSpeed" => Some(vec![read_time(b)?, read_speed(b)?]),
         "AltitudeSpeed" => Some(vec![read_altitude(b)?, read_speed(b)?]),
-        "PositionTimeAltitude" => {
-            Some(vec![read_position(b)?, read_time(b)?, read_altitude(b)?])
-        }
+        "PositionTimeAltitude" => Some(vec![read_position(b)?, read_time(b)?, read_altitude(b)?]),
         "VerticalRate" => Some(vec![read_vertical_rate(b)?]),
         "Degrees" => Some(vec![read_degrees(b)?]),
         "DirectionDegrees" => Some(vec![read_direction(b)?, read_degrees(b)?]),
         "PositionDegrees" => Some(vec![read_position(b)?, read_degrees(b)?]),
         "FreeText" => Some(vec![read_freetext(b)?]),
         "RouteClearance" => Some(vec![read_route_clearance(b)?]),
-        "PositionRouteClearance" => {
-            Some(vec![read_position(b)?, read_route_clearance(b)?])
-        }
+        "PositionRouteClearance" => Some(vec![read_position(b)?, read_route_clearance(b)?]),
         // --- ACARS-3.1: additional argument shapes ---
-        "DistanceOffsetDirection" => {
-            Some(vec![read_distance_offset(b)?, read_direction(b)?])
-        }
+        "DistanceOffsetDirection" => Some(vec![read_distance_offset(b)?, read_direction(b)?]),
         "PositionDistanceOffsetDirection" => Some(vec![
             read_position(b)?,
             read_distance_offset(b)?,
@@ -587,9 +597,7 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
         "Frequency" => Some(vec![read_frequency(b)?]),
         "BeaconCode" => Some(vec![read_beacon_code(b)?]),
         "ProcedureName" => Some(vec![read_procedure_name(b)?]),
-        "PositionProcedureName" => {
-            Some(vec![read_position(b)?, read_procedure_name(b)?])
-        }
+        "PositionProcedureName" => Some(vec![read_position(b)?, read_procedure_name(b)?]),
         "Altimeter" => Some(vec![read_altimeter(b)?]),
         "ATISCode" => Some(vec![read_atis_code(b)?]),
         "RemainingFuelRemainingSouls" => {
@@ -597,13 +605,10 @@ fn read_args(tag: &str, b: &mut Bits) -> Option<Vec<String>> {
         }
         "ErrorInformation" => Some(vec![read_error_information(b)?]),
         "VersionNumber" => Some(vec![read_version_number(b)?]),
-        "ICAOfacilitydesignation" => {
-            Some(vec![read_icao_facility_designation(b)?])
+        "ICAOfacilitydesignation" => Some(vec![read_icao_facility_designation(b)?]),
+        "ICAOfacilitydesignationTp4table" => {
+            Some(vec![read_icao_facility_designation(b)?, read_tp4table(b)?])
         }
-        "ICAOfacilitydesignationTp4table" => Some(vec![
-            read_icao_facility_designation(b)?,
-            read_tp4table(b)?,
-        ]),
         "ToFromPosition" => Some(vec![read_tofrom(b)?, read_position(b)?]),
         "TimeDistanceToFromPosition" => Some(vec![
             read_time(b)?,
@@ -634,7 +639,9 @@ fn render(template: &str, args: &[String]) -> String {
     let mut out = template.to_string();
     for a in args {
         let Some(start) = out.find('[') else { break };
-        let Some(end) = out[start..].find(']') else { break };
+        let Some(end) = out[start..].find(']') else {
+            break;
+        };
         out.replace_range(start..start + end + 1, a);
     }
     out
@@ -648,7 +655,11 @@ pub fn decode(body: &[u8], downlink: bool) -> Option<CpdlcMessage> {
     let has_ref = b.read(1)? == 1;
     let has_ts = b.read(1)? == 1;
     let msg_id = b.read(6)? as u8;
-    let msg_ref = if has_ref { Some(b.read(6)? as u8) } else { None };
+    let msg_ref = if has_ref {
+        Some(b.read(6)? as u8)
+    } else {
+        None
+    };
     let timestamp = if has_ts {
         let h = b.read(5)?;
         let m = b.read(6)?;
@@ -660,13 +671,20 @@ pub fn decode(body: &[u8], downlink: bool) -> Option<CpdlcMessage> {
     } else {
         None
     };
-    let table: &[(&str, &str)] =
-        if downlink { &DOWNLINK_ELEMENTS } else { &UPLINK_ELEMENTS };
+    let table: &[(&str, &str)] = if downlink {
+        &DOWNLINK_ELEMENTS
+    } else {
+        &UPLINK_ELEMENTS
+    };
     let idx = b.read(8)? as usize;
     let (tag, label) = table.get(idx).copied()?;
     let first_args = read_args(tag, &mut b);
     let args = first_args.clone().unwrap_or_default();
-    let text = if args.is_empty() { label.to_string() } else { render(label, &args) };
+    let text = if args.is_empty() {
+        label.to_string()
+    } else {
+        render(label, &args)
+    };
 
     // Additional elements (SEQUENCE SIZE(1..4), 2-bit count) are only
     // reachable while every preceding element's argument shape decodes
@@ -675,13 +693,21 @@ pub fn decode(body: &[u8], downlink: bool) -> Option<CpdlcMessage> {
     if has_more && first_args.is_some() {
         if let Some(count) = b.read(2).map(|v| v + 1) {
             for _ in 0..count {
-                let Some(idx) = b.read(8).map(|v| v as usize) else { break };
-                let Some((tag, label)) = table.get(idx).copied() else { break };
+                let Some(idx) = b.read(8).map(|v| v as usize) else {
+                    break;
+                };
+                let Some((tag, label)) = table.get(idx).copied() else {
+                    break;
+                };
                 let elem_args = read_args(tag, &mut b);
                 let a = elem_args.clone().unwrap_or_default();
                 additional.push(CpdlcElement {
                     element: tag.to_string(),
-                    text: if a.is_empty() { label.to_string() } else { render(label, &a) },
+                    text: if a.is_empty() {
+                        label.to_string()
+                    } else {
+                        render(label, &a)
+                    },
                     args: a,
                 });
                 if elem_args.is_none() {
@@ -923,10 +949,10 @@ mod composite_tests {
         b.push(0, 1); // no timestamp
         b.push(7, 6); // msg id
         b.push(11, 8); // dM11
-        // FANSPosition CHOICE: fixname (index 0 of 5 → 3 bits), IA5 1..5.
+                       // FANSPosition CHOICE: fixname (index 0 of 5 → 3 bits), IA5 1..5.
         b.push(0, 3);
         b.push(3, 3); // length 4 (offset from 1)
-        for c in b"OAKEY" [..4].iter() {
+        for c in b"OAKEY"[..4].iter() {
             b.push(*c as u32, 7);
         }
         // FANSAltitude CHOICE index for flight level (per existing
@@ -993,7 +1019,7 @@ mod route_tests {
         b.push(0, 1); // no timestamp
         b.push(22, 6); // msg id
         b.push(40, 8); // dM40RouteClearance
-        // presence map: destination airport (bit 1) + route list (bit 8)
+                       // presence map: destination airport (bit 1) + route list (bit 8)
         b.push(0b0100000010, 10);
         b.ia5("KSFO"); // airport SIZE(4): no length bits
         b.push(1, 7); // 2 legs (SIZE 1..128)
@@ -1010,7 +1036,6 @@ mod route_tests {
         assert!(m.text.contains("ROUTE J501 OAK"), "{}", m.text);
     }
 }
-
 
 #[cfg(test)]
 mod arg_reader_tests {

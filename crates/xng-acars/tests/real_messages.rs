@@ -26,7 +26,9 @@ fn vt_anb_basic_report_with_refs_and_meteo() {
     );
     assert_eq!(tags.len(), 4);
 
-    let AdscTag::Report(r) = &tags[0] else { panic!("tag 0: {tags:?}") };
+    let AdscTag::Report(r) = &tags[0] else {
+        panic!("tag 0: {tags:?}")
+    };
     assert_eq!(r.kind, ReportKind::Basic);
     assert!(close(r.lat, 52.0401764, 1e-6), "lat {}", r.lat);
     assert!(close(r.lon, 19.8038864, 1e-6), "lon {}", r.lon);
@@ -36,7 +38,12 @@ fn vt_anb_basic_report_with_refs_and_meteo() {
     assert!(r.nav_redundancy_ok);
     assert!(!r.tcas_ok);
 
-    let AdscTag::EarthRef { true_track_deg, ground_speed_kt, vert_speed_fpm, .. } = &tags[1]
+    let AdscTag::EarthRef {
+        true_track_deg,
+        ground_speed_kt,
+        vert_speed_fpm,
+        ..
+    } = &tags[1]
     else {
         panic!("tag 1: {tags:?}")
     };
@@ -44,11 +51,24 @@ fn vt_anb_basic_report_with_refs_and_meteo() {
     assert!(close(*ground_speed_kt, 516.0, 0.01));
     assert_eq!(*vert_speed_fpm, 0);
 
-    let AdscTag::AirRef { true_heading_deg, mach, .. } = &tags[2] else { panic!() };
+    let AdscTag::AirRef {
+        true_heading_deg,
+        mach,
+        ..
+    } = &tags[2]
+    else {
+        panic!()
+    };
     assert!(close(*true_heading_deg, 266.8, 0.1));
     assert!(close(*mach, 0.8555, 1e-4));
 
-    let AdscTag::Meteo { wind_speed_kt, wind_dir_deg, temperature_c, .. } = &tags[3] else {
+    let AdscTag::Meteo {
+        wind_speed_kt,
+        wind_dir_deg,
+        temperature_c,
+        ..
+    } = &tags[3]
+    else {
         panic!()
     };
     assert!(close(*wind_speed_kt, 43.5, 0.01));
@@ -61,12 +81,21 @@ fn a6_pfe_report_with_climb() {
     let tags = adsc_tags(
         "/AUHASMO.ADS.A6-PFE0724D9586A36C92B2DCF1F0E74A8E4807C0F7219AF407C10422E9E08A1C4",
     );
-    let AdscTag::Report(r) = &tags[0] else { panic!() };
+    let AdscTag::Report(r) = &tags[0] else {
+        panic!()
+    };
     assert!(close(r.lat, 51.8189049, 1e-6));
     assert!(close(r.lon, 18.6704063, 1e-6));
     assert_eq!(r.alt_ft, 37552);
     assert!(r.tcas_ok);
-    let AdscTag::EarthRef { vert_speed_fpm, ground_speed_kt, .. } = &tags[1] else { panic!() };
+    let AdscTag::EarthRef {
+        vert_speed_fpm,
+        ground_speed_kt,
+        ..
+    } = &tags[1]
+    else {
+        panic!()
+    };
     assert_eq!(*vert_speed_fpm, 496);
     assert!(close(*ground_speed_kt, 457.0, 0.01));
 }
@@ -76,14 +105,21 @@ fn hb_jnb_waypoint_change_with_predicted_route() {
     let tags = adsc_tags(
         "/CTUE1YA.ADS.HB-JNB1424AB686D9308CA2EBA1D0D24A2C06C1B48CA004A248050667908CA004BF6",
     );
-    let AdscTag::Report(r) = &tags[0] else { panic!() };
+    let AdscTag::Report(r) = &tags[0] else {
+        panic!()
+    };
     assert_eq!(r.kind, ReportKind::WaypointChange);
     assert!(close(r.lat, 51.5665627, 1e-6));
     assert!(close(r.lon, 19.2610931, 1e-6));
     assert_eq!(r.alt_ft, 36000);
 
     let AdscTag::PredictedRoute {
-        next_lat, next_lon, next_alt_ft, next_eta_s, next_next_lat, ..
+        next_lat,
+        next_lon,
+        next_alt_ft,
+        next_eta_s,
+        next_next_lat,
+        ..
     } = &tags[1]
     else {
         panic!("expected predicted route: {tags:?}")
@@ -100,12 +136,19 @@ fn sp_lrh_low_altitude_approach() {
     let tags = adsc_tags(
         "/YQXE2YA.ADS.SP-LRH1424FD087806C0B527769F0D2500B877ED00B5401E2516707755C01340B768",
     );
-    let AdscTag::Report(r) = &tags[0] else { panic!() };
+    let AdscTag::Report(r) = &tags[0] else {
+        panic!()
+    };
     assert_eq!(r.kind, ReportKind::WaypointChange);
     assert!(close(r.lat, 52.0149422, 1e-6));
     assert!(close(r.lon, 21.0983849, 1e-6));
     assert_eq!(r.alt_ft, 2896);
-    let AdscTag::PredictedRoute { next_next_alt_ft, .. } = &tags[1] else { panic!() };
+    let AdscTag::PredictedRoute {
+        next_next_alt_ft, ..
+    } = &tags[1]
+    else {
+        panic!()
+    };
     assert_eq!(*next_next_alt_ft, 308);
 }
 
@@ -127,7 +170,9 @@ fn q0_link_test_classified() {
     use xng_acars::qseries::QKind;
     // research/Q0.md: "ACARS Link Test", messages are always empty.
     let d = decode("Q0", "", true);
-    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series: {:?}", d.app) };
+    let Some(AcarsApp::QSeries(q)) = d.app else {
+        panic!("expected Q-series: {:?}", d.app)
+    };
     assert_eq!(q.kind, QKind::LinkTest);
     assert_eq!(q.description, "ACARS Link Test");
 }
@@ -137,7 +182,9 @@ fn q2_eta_report_classified() {
     use xng_acars::qseries::QKind;
     // research/Q2.md example: "   2002  99/DS KJFK" — ETA Report.
     let d = decode("Q2", "   2002  99/DS KJFK", true);
-    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    let Some(AcarsApp::QSeries(q)) = d.app else {
+        panic!("expected Q-series")
+    };
     assert_eq!(q.kind, QKind::EtaReport);
     assert_eq!(q.description, "ETA Report");
 }
@@ -146,7 +193,9 @@ fn q2_eta_report_classified() {
 fn qf_off_destination_report_classified() {
     // research/QF.md example: "EWR2210ATL" — OFF Destination Report.
     let d = decode("QF", "EWR2210ATL", true);
-    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    let Some(AcarsApp::QSeries(q)) = d.app else {
+        panic!("expected Q-series")
+    };
     assert_eq!(q.description, "OFF Destination Report");
 }
 
@@ -154,7 +203,9 @@ fn qf_off_destination_report_classified() {
 fn qq_off_report_classified() {
     // research/QQ.md example: "KEWRKSWF20041942" — OFF Report.
     let d = decode("QQ", "KEWRKSWF20041942", true);
-    let Some(AcarsApp::QSeries(q)) = d.app else { panic!("expected Q-series") };
+    let Some(AcarsApp::QSeries(q)) = d.app else {
+        panic!("expected Q-series")
+    };
     assert_eq!(q.description, "OFF Report");
 }
 
@@ -176,7 +227,11 @@ fn qq_off_report_oooi_fields() {
 #[test]
 fn qq_off_report_with_status_tail() {
     // research/QQ.md: "KEWRKDFW1829OS KDFW ..." — KEWR → KDFW, OFF 18:29.
-    let d = decode("QQ", "KEWRKDFW1829OS KDFW /FUL0306/MO 1816/APH 0000000", true);
+    let d = decode(
+        "QQ",
+        "KEWRKDFW1829OS KDFW /FUL0306/MO 1816/APH 0000000",
+        true,
+    );
     let o = d.oooi.expect("QQ carries OOOI");
     assert_eq!(o.depa.as_deref(), Some("KEWR"));
     assert_eq!(o.dsta.as_deref(), Some("KDFW"));
@@ -206,7 +261,11 @@ fn close3(a: f64, b: f64) -> bool {
 #[test]
 fn label_20_position_report() {
     // Label_20_POS.test.ts: POSN38160W077075... → 38.160 / -77.075.
-    let d = decode("20", "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544", true);
+    let d = decode(
+        "20",
+        "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544",
+        true,
+    );
     let p = d.position.expect("20/POS carries a position");
     assert!(close3(p.latitude, 38.160), "lat {}", p.latitude);
     assert!(close3(p.longitude, -77.075), "lon {}", p.longitude);
@@ -237,7 +296,9 @@ fn h1_cfb_flr_realtime_failure() {
     // research/H1/CFB.md: "#CFBFLR/FR19121418400034433406TCAS (1SG)".
     let d = decode("H1", "#CFBFLR/FR19121418400034433406TCAS (1SG)", true);
     assert_eq!(d.sublabel.as_deref(), Some("CF"));
-    let Some(AcarsApp::Cfb(c)) = d.app else { panic!("expected CFB: {:?}", d.app) };
+    let Some(AcarsApp::Cfb(c)) = d.app else {
+        panic!("expected CFB: {:?}", d.app)
+    };
     assert_eq!(c.subtype, "FLR");
     assert_eq!(c.kind, CfbKind::RealtimeFailure);
     assert_eq!(c.description, "Realtime failure");
@@ -248,7 +309,9 @@ fn h1_cfb_apm_report() {
     use xng_acars::cfb::CfbKind;
     // research/H1/CFB.md ACMF snapshot.
     let d = decode("H1", "#CFBAPM_REPORT_A_20200805180631S.CSV", true);
-    let Some(AcarsApp::Cfb(c)) = d.app else { panic!("expected CFB") };
+    let Some(AcarsApp::Cfb(c)) = d.app else {
+        panic!("expected CFB")
+    };
     assert_eq!(c.subtype, "APM_REPORT");
     assert_eq!(c.kind, CfbKind::ApmReport);
 }
@@ -257,16 +320,26 @@ fn h1_cfb_apm_report() {
 fn h1_cfb_wrn_and_mpf_and_dotted() {
     use xng_acars::cfb::CfbKind;
     let d = decode("H1", "#CFBWRN/WN19121418390034000006NAV TCAS FAULT", true);
-    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    let Some(AcarsApp::Cfb(c)) = d.app else {
+        panic!()
+    };
     assert_eq!(c.kind, CfbKind::Warning);
 
     let d = decode("H1", "#CFBMPF/               /AN.N660AW/FIAAL652", true);
-    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    let Some(AcarsApp::Cfb(c)) = d.app else {
+        panic!()
+    };
     assert_eq!(c.kind, CfbKind::MaintenancePlanning);
 
     // research/H1/CFB/CFB.01.md dotted form.
-    let d = decode("H1", "#CFB.1/FLR/FR1602082254 27513406ADR1 X2,ADR3X,ADR2X", true);
-    let Some(AcarsApp::Cfb(c)) = d.app else { panic!() };
+    let d = decode(
+        "H1",
+        "#CFB.1/FLR/FR1602082254 27513406ADR1 X2,ADR3X,ADR2X",
+        true,
+    );
+    let Some(AcarsApp::Cfb(c)) = d.app else {
+        panic!()
+    };
     assert_eq!(c.kind, CfbKind::FailureRecord);
 }
 
@@ -305,7 +378,6 @@ fn label_4j_poswx_met_fields() {
     assert_eq!(m.altitude_ft, Some(27000));
 }
 
-
 // --- ACARS-3.1: real off-air CPDLC argument decode ---
 // `/AKLCDYA.AT1.9M-MTB...` is one of the real off-air FANS-1/A messages
 // embedded in libacars' own `examples/decode_acars_apps.c` (MIT). Running
@@ -322,7 +394,10 @@ fn aklcdya_real_cpdlc_contact_with_unit_and_frequency() {
         false,
     )
     .expect("parses ARINC-622 envelope");
-    let AcarsApp::Cpdlc { envelope, message, .. } = app else {
+    let AcarsApp::Cpdlc {
+        envelope, message, ..
+    } = app
+    else {
         panic!("expected CPDLC: {app:?}");
     };
     assert!(envelope.crc_ok, "real off-air message must pass CRC");
@@ -333,7 +408,6 @@ fn aklcdya_real_cpdlc_contact_with_unit_and_frequency() {
     assert_eq!(m.args, vec!["LUNBI", "AUCKLAND control", "123.900 MHz"]);
     assert_eq!(m.text, "AT LUNBI CONTACT AUCKLAND control 123.900 MHz");
 }
-
 
 // --- ACARS-2.4: H1 FPN flight-plan decode ---
 // Real off-air messages from airframes' acars-decoder-typescript
@@ -364,7 +438,6 @@ fn h1_fpn_flight_plan_with_waypoints() {
     assert!(close3(kayex.longitude, -120.948), "lon {}", kayex.longitude);
 }
 
-
 // --- ACARS-2.4: label 5Z United telex / structured downlink ---
 // Real documented examples from airframes' acars-decoder-typescript
 // `Label_5Z_Slash.test.ts` and acars-message-documentation `research/5Z.md`.
@@ -375,7 +448,12 @@ fn label_5z_txt_telex() {
         panic!("expected 5Z: {:?}", d.app);
     };
     use xng_acars::airline5z::Airline5z;
-    assert_eq!(a, Airline5z::Text { text: "DID U GET THE TIMES".into() });
+    assert_eq!(
+        a,
+        Airline5z::Text {
+            text: "DID U GET THE TIMES".into()
+        }
+    );
 }
 
 #[test]
@@ -386,7 +464,15 @@ fn label_5z_b3_departure_clearance() {
         panic!("expected 5Z: {:?}", d.app);
     };
     use xng_acars::airline5z::Airline5z;
-    let Airline5z::Typed { message_type, origin, destination, arrival_runway, day, .. } = a else {
+    let Airline5z::Typed {
+        message_type,
+        origin,
+        destination,
+        arrival_runway,
+        day,
+        ..
+    } = a
+    else {
         panic!("expected typed");
     };
     assert_eq!(message_type, "B3");
@@ -404,9 +490,23 @@ fn label_ra_united_gate_assign_tab_indented() {
         "QUNDCULUA~1GATE ASSIGN\r\n\tUA0942/21 KIAD LPPT\r\n\tSENT: 09:14:42Z\r\n\tGATE 43    OPEN\r\n\tRAMP FREQ  \r\n\tOPS FREQ   131.575\r\n\tEON        1003Z\r\n",
         false,
     );
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
-    assert_eq!((g.departure.as_deref(), g.arrival.as_deref(), g.gate.as_str()), (Some("KIAD"), Some("LPPT"), "43"));
-    let j = serde_json::to_value(decode("RA", "QUHDQITOO.1ARR GATE INFO   \r\nBFL ARRIVAL GATE 4\r\nNEXT FLIGHT INFORMATION-\r\n", false)).unwrap();
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
+    assert_eq!(
+        (
+            g.departure.as_deref(),
+            g.arrival.as_deref(),
+            g.gate.as_str()
+        ),
+        (Some("KIAD"), Some("LPPT"), "43")
+    );
+    let j = serde_json::to_value(decode(
+        "RA",
+        "QUHDQITOO.1ARR GATE INFO   \r\nBFL ARRIVAL GATE 4\r\nNEXT FLIGHT INFORMATION-\r\n",
+        false,
+    ))
+    .unwrap();
     assert_eq!(j["app"]["app"], "gate");
     assert_eq!(j["app"]["kind"], "arrival_gate");
     assert_eq!(j["app"]["arrival"], "BFL");
@@ -426,7 +526,12 @@ fn label_ra_finnair_connections_are_not_gates() {
 // --- Gate reports on other labels (production texts, names removed) ---
 #[test]
 fn label_b3_pdc_departure_gate() {
-    let j = serde_json::to_value(decode("B3", "/CYWG.DC1/RCD 024\r\nJZA110-CYWG-GATE 12-CYOW\r\nATIS O\r\n-TYP/CRJ9912E", false)).unwrap();
+    let j = serde_json::to_value(decode(
+        "B3",
+        "/CYWG.DC1/RCD 024\r\nJZA110-CYWG-GATE 12-CYOW\r\nATIS O\r\n-TYP/CRJ9912E",
+        false,
+    ))
+    .unwrap();
     assert_eq!(j["app"]["app"], "gate");
     assert_eq!(j["app"]["kind"], "departure_gate");
     assert_eq!(j["app"]["departure"], "CYWG");
@@ -437,21 +542,42 @@ fn label_b3_pdc_departure_gate() {
 #[test]
 fn label_40_and_ra_route_gates() {
     let d = decode("40", "FLT 1658/22 AUS-DFW\r\nGATE D21 AVAILABILITY PLN ETA 0721\r\nNEXT FLT 0602 ACFT 3JF SKD 0900 GRR\r\n", false);
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
-    assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some("DFW"), "D21"));
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
+    assert_eq!(
+        (g.arrival.as_deref(), g.gate.as_str()),
+        (Some("DFW"), "D21")
+    );
     // Label RA: new families still run after the United/Republic/SkyWest uplinks.
     let d = decode("RA", "FLT 4940 IAD GATE A4C\r\n", false);
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
-    assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some("IAD"), "A4C"));
-    let d = decode("RA", "QUNDCULUA~1GATE ASSIGN\r\nUA1720/09 KMSP KDEN\r\nSENT: 10:41:16Z\r\nGATE B47   OPEN\r\n", false);
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
-    assert_eq!((g.kind, g.format), (xng_acars::gate::GateKind::GateAssign, None));
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
+    assert_eq!(
+        (g.arrival.as_deref(), g.gate.as_str()),
+        (Some("IAD"), "A4C")
+    );
+    let d = decode(
+        "RA",
+        "QUNDCULUA~1GATE ASSIGN\r\nUA1720/09 KMSP KDEN\r\nSENT: 10:41:16Z\r\nGATE B47   OPEN\r\n",
+        false,
+    );
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
+    assert_eq!(
+        (g.kind, g.format),
+        (xng_acars::gate::GateKind::GateAssign, None)
+    );
 }
 
 #[test]
 fn label_5z_psa_gate_acknowledgement() {
     let d = decode("5Z", "/ACKFLT GATE F1", true);
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
     assert_eq!((g.gate.as_str(), g.arrival), ("F1", None));
 }
 
@@ -460,13 +586,33 @@ fn stands_and_parking_positions() {
     // BA PAD11: the stand becomes the gate app; the OOOI extractor keeps
     // the arrival ETA in the same decode.
     let d = decode("10", ":PAD11\r\nUTC\r\nARRIVAL- GMEDK BA2661  \r\nSTAND 36M  ETA 1341 //\r\nON STAND- UNKNOWN //", false);
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
-    assert_eq!((g.flight_number.as_deref(), g.gate.as_str()), (Some("BA2661"), "36M"));
-    let d = decode("25", "48   JFKB22\r\nCREW P/F        \r\nPART  1 OF  1 \r\nARR JFK GTE B22\r\n", false);
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
-    assert_eq!((g.arrival.as_deref(), g.gate.as_str()), (Some("JFK"), "B22"));
-    let d = decode("RA", "QUHELASAY~1\r\nAY1074 22NOV26\r\nARRIVING STAND 131 ELDT 12:53\r\n", false);
-    let Some(AcarsApp::Gate(g)) = d.app else { panic!("expected gate: {:?}", d.app) };
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
+    assert_eq!(
+        (g.flight_number.as_deref(), g.gate.as_str()),
+        (Some("BA2661"), "36M")
+    );
+    let d = decode(
+        "25",
+        "48   JFKB22\r\nCREW P/F        \r\nPART  1 OF  1 \r\nARR JFK GTE B22\r\n",
+        false,
+    );
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
+    assert_eq!(
+        (g.arrival.as_deref(), g.gate.as_str()),
+        (Some("JFK"), "B22")
+    );
+    let d = decode(
+        "RA",
+        "QUHELASAY~1\r\nAY1074 22NOV26\r\nARRIVING STAND 131 ELDT 12:53\r\n",
+        false,
+    );
+    let Some(AcarsApp::Gate(g)) = d.app else {
+        panic!("expected gate: {:?}", d.app)
+    };
     assert_eq!(g.gate, "131");
 }
 
