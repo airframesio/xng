@@ -44,7 +44,7 @@
 //! | American, Envoy, PSA, GoJet, Piedmont, Republic | 40, 41, C1, RA | `FLT 1658/22 AUS-DFW` / `GATE D21 ...`, `NEW ARRIVAL GATE NBR IS C33`, `FLT YX4704 RDU-LGA` |
 //! | Envoy arriving | 40 | `FLT 4258 ARRIVING DCA` / `ARRIVAL GATE D43A` |
 //! | Air Wisconsin | RA | `FLT 4940 IAD GATE A4C` |
-//! | Frontier | RA | `FROM PHL OPS` ... `GATE  E8` / `GATE AVAIL AT ARRIVAL  Y` |
+//! | Frontier | RA | `FROM PHL OPS` ... `GATE  E8` / `GATE AVAIL AT ARRIVAL  Y`; ops free text `QUANPOCF9` ... `GATE D36` |
 //! | Hawaiian | 3T, 40 | `804 ARR GATE 69A`, `HA0805 AT GATE A6` |
 //! | JetBlue in range | 41, 42 | `INR,221156,  GATE:514` |
 //! | Jetstar | C1 | `ARRIVAL GATE THIS FLT:43` |
@@ -68,13 +68,24 @@
 //! | Qantas bay | RA | `GDAY QF0011 BAY 221` |
 //! | Avianca | RA | `GATE J-12 MIA` (gate J12) |
 //! | Airport arrival gate line | RA | `EAU ARRIVAL GATE 1` |
-//! | Alaska ETA acknowledgement | 21 | `FROM:LAX OPS` / `AS1831` / `ARRIVAL GATE:65B` |
+//! | Alaska ETA acknowledgement | 21, RA | `FROM:LAX OPS` / `AS1831` / `ARRIVAL GATE:65B` |
 //! | SAS passenger info | C1 | `ATT SK0932  ETA: 1414  GATE: C33` |
-//! | Swiss / Edelweiss | 32 | `ARR GATE A52`, else `ARR POS D12` |
+//! | Swiss / Edelweiss / Helvetic | 32, C1 | `ARR GATE A52`, else `ARR POS D12` |
+//! | Air France arrival parking | C1 | `ARRIVAL PKG: K12 PKG TYPE: C` |
 //! | KLM connection info | 32 | `P64AMSKWKL170542` ... `KL 1750` / `GATE  A04  POS  A62` (at AMS) |
 //! | Korean Air spot | 33 | `SPOT NO : 606` |
 //! | Aer Lingus stand | 48 | `STAND INFO = 400C` |
 //! | Avianca dispatch | RA | `QUATLASAV` ... `GATE 13 EN SAL.`, `E7 PARK EN BOG` (until `FROM:`) |
+//! | SkyWest AA in-range | RA | `IN-RANGE FROM AA` / `GATE: 1D` (only with an `IN-RANGE` line) |
+//! | Allegiant in-range | RA | `--GATE ASSIGNMENT  PVU GATE 2 ASSIGNED` |
+//! | Air Nostrum | RA | `PKN:330   GATE:K88   BELT:19` |
+//! | Volaris | RA | `A SU LLEGADA GATE J16` |
+//! | ITA connecting gates | RA | `ZRH/FCO ETA 1220` / `GATE A32 BAG CLAIM 23` (at FCO) |
+//! | Stand number (China Southern and others) | RA | `STAND NO: 136` |
+//! | China Eastern park bay | RA | `HI SIR, MU9062 SWA/HFE, PARK BAY 6.` (at HFE) |
+//! | FedEx | RA | `EXPECT GATE: 2(SBD)` |
+//! | Arrival gate colon | RA | `AIRSIDE ARRIVAL GATE IS: B12`, Horizon `ARRIVAL GATE:B9` |
+//! | Mesa header gate | RA | `QUPHXACYV.1ARRIVAL GATE A1B` |
 //!
 //! A gate must contain a digit, so `GATE OPEN` or `GATE STATUS NOT AVAIL`
 //! never match. Reading stops where a message moves on to other flights
@@ -454,16 +465,36 @@ gate_re!(QANTAS_BAY, r"^GDAY (QF\d{1,4}) BAY\s+", r"\s*$");
 gate_re!(AIRPORT_ARRIVAL_GATE, r"^([A-Z]{3}) ARRIVAL GATE\s+", r"\s*$");
 // Avianca (RA): GATE J-12 MIA is gate J12 at MIA
 re!(DASHED_AIRPORT, r"^GATE ([A-Z])-(\d{1,3}[A-Z]?) ([A-Z]{3})$");
+// Round 7 (RA unless noted): Frontier ops free text (QUANPOCF9) GATE D36;
+// SkyWest AA in-range GATE: 1D; Allegiant --GATE ASSIGNMENT PVU GATE 2
+// ASSIGNED; Air Nostrum PKN:330 GATE:K88 BELT:19; Volaris A SU LLEGADA GATE
+// J16; ITA ZRH/FCO ETA 1220 / GATE A32 BAG CLAIM 23; China Southern STAND NO:
+// 136; China Eastern HI SIR, MU9062 SWA/HFE, PARK BAY 6.; FedEx EXPECT GATE:
+// 2(SBD); ARRIVAL GATE IS: B12; Horizon ARRIVAL GATE:B9; Mesa
+// QUPHXACYV.1ARRIVAL GATE Z9; Air France (C1) ARRIVAL PKG: K12.
+gate_re!(PLAIN_GATE_LINE, r"^GATE\s+", r"\s*$");
+gate_re!(IN_RANGE_COLON, r"^GATE:\s*", r"\s*$");
+gate_re!(ALLEGIANT, r"^--GATE ASSIGNMENT\s+([A-Z]{3}) GATE\s+", r"\s+ASSIGNED");
+gate_re!(AIR_NOSTRUM, r"^PKN:\S*\s+GATE:\s*", r"(?:\s|$)");
+gate_re!(VOLARIS, r"LLEGADA GATE\s+", r"\b");
+re!(ITA_ROUTE, r"^([A-Z]{3})/([A-Z]{3}) ETA \d{4}$");
+gate_re!(ITA_GATE, r"^GATE\s+", r"\s+BAG CLAIM");
+gate_re!(STAND_NO, r"^STAND NO:\s*", r"\s*$");
+gate_re!(CHINA_EASTERN, r"^HI SIR, MU(\d{1,4}) [A-Z]{3}/([A-Z]{3}), PARK BAY\s+", r"\b");
+gate_re!(FEDEX_EXPECT, r"^EXPECT GATE:\s*", r"\(([A-Z]{3})\)");
+gate_re!(ARRIVAL_GATE_IS, r"ARRIVAL GATE(?: IS)?:\s*", r"\s*$");
+gate_re!(HEADER_ARR_GATE, r"^[A-Z0-9]{9}[.~]\dARRIVAL GATE\s+", r"\s*$");
+gate_re!(AIR_FRANCE_PKG, r"^ARRIVAL PKG:\s*", r"\b");
 // Where a message moves on to other flights (connections, the aircraft's
 // next flight); gate lines after it are not this flight's.
 re!(
     STOP_LINE,
     r"^(?:CREW CONNECTING|CONNECTING GATE|NEXT FLT|NEXT FLIGHT|NEXT LEG|NEXT SECTOR|NXM\b|- NEXT FLIGHT|ON STAND-|CREW DEPT|TURN FLT|CREW CONNECTIONS|PAX CONNECTIONS|AC TURN|END$)"
 );
-// Label RA uplinks read by [`parse`] (Republic's are skipped by what `parse`
-// reads, since its other messages are read here), and Finnair connection lists (other
-// flights' departure gates).
-re!(RA_HANDLED_HEADER, r"^(?:QUNDCULUA|QUHDQITOO|QUSILITOO|QUHELASAY)");
+// Label RA uplinks read by [`parse`] (Republic's and SkyWest's are skipped by
+// what `parse` reads, since their other messages are read here), and Finnair
+// connection lists (other flights' departure gates).
+re!(RA_HANDLED_HEADER, r"^(?:QUNDCULUA|QUHELASAY)");
 
 /// Read a gate assignment from the families in the module docs (label B3
 /// clearances and airline gate, stand and parking messages on 10, 11, 21,
@@ -522,6 +553,13 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             .or_else(|| jazz_flight_data(&lines))
             .or_else(|| {
                 lines.iter().find_map(|l| {
+                    let c = AIR_FRANCE_PKG.captures(l)?;
+                    Some(report(GateKind::ArrivalGate, "AIR_FRANCE_ARRIVAL_PKG", &c[1], ""))
+                })
+            })
+            .or_else(|| arr_gate_pos(&lines))
+            .or_else(|| {
+                lines.iter().find_map(|l| {
                     let c = SAS.captures(l)?;
                     Some(with_flight(report(GateKind::ArrivalGate, "SAS_PASSENGER_INFO", &c[2], ""), &c[1]))
                 })
@@ -554,10 +592,14 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             if RA_HANDLED_HEADER.is_match(first) {
                 return None;
             }
-            // Republic's ARRIVAL GATE uplink is `parse`'s; its other messages
-            // (`RAH MESSAGE` / `FLT YX4704 RDU-LGA` / `GATE 29`) are read here.
+            // Republic's and SkyWest's ARRIVAL GATE uplinks are `parse`'s;
+            // their other messages (`RAH MESSAGE` / `FLT YX4704 RDU-LGA` /
+            // `GATE 29`, SkyWest in-range `GATE: 1D`) are read here.
             if parse_arrival_gate(text).is_some() {
                 return None;
+            }
+            if let Some(g) = alaska_eta_ack(&lines).or_else(|| ra_gate_round7(&lines)) {
+                return Some(g);
             }
             if first.starts_with("QUATLASAV") {
                 if let Some(g) = avianca_dispatch(&lines) {
@@ -666,6 +708,66 @@ fn ra_arrival_line(l: &str) -> Option<GateInfo> {
     }
     let c = AIRPORT_ARRIVAL_GATE.captures(l)?;
     Some(report(GateKind::ArrivalGate, "AIRPORT_ARRIVAL_GATE", &c[2], &c[1]))
+}
+
+/// The RA forms listed with `PLAIN_GATE_LINE`: the Mesa header gate, then
+/// line by line (before the message moves on) Frontier ops free text (after
+/// its `FROM PHL OPS` form), SkyWest in-range `GATE:`, ITA, Allegiant, Air
+/// Nostrum, Volaris, `STAND NO:`, China Eastern, FedEx and `ARRIVAL GATE:`.
+fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
+    if let Some(c) = HEADER_ARR_GATE.captures(lines[0]) {
+        return Some(report(GateKind::ArrivalGate, "HEADER_ARRIVAL_GATE", &c[1], ""));
+    }
+    let frontier = lines[0].starts_with("QUANPOCF9");
+    if frontier {
+        // FROM PHL OPS ... GATE AVAIL AT ARRIVAL also names the airport.
+        if let Some(g) = frontier_gate(lines) {
+            return Some(g);
+        }
+    }
+    let in_range = lines.iter().any(|l| l.starts_with("IN-RANGE"));
+    let mut ita_airport: Option<&str> = None;
+    for l in lines.iter().take_while(|l| !STOP_LINE.is_match(l)) {
+        let arrival = |format, gate: &str, airport: &str| Some(report(GateKind::ArrivalGate, format, gate, airport));
+        if frontier {
+            if let Some(c) = PLAIN_GATE_LINE.captures(l) {
+                return arrival("FRONTIER_OPS", &c[1], "");
+            }
+        }
+        if in_range {
+            if let Some(c) = IN_RANGE_COLON.captures(l) {
+                return arrival("IN_RANGE_GATE", &c[1], "");
+            }
+        }
+        if let Some(c) = ITA_ROUTE.captures(l) {
+            ita_airport = Some(c.get(2)?.as_str());
+        }
+        if let (Some(c), Some(a)) = (ITA_GATE.captures(l), ita_airport) {
+            return arrival("ITA_CONNECTING_GATES", &c[1], a);
+        }
+        if let Some(c) = ALLEGIANT.captures(l) {
+            return arrival("ALLEGIANT_IN_RANGE", &c[2], &c[1]);
+        }
+        if let Some(c) = AIR_NOSTRUM.captures(l) {
+            return arrival("AIR_NOSTRUM_PKN", &c[1], "");
+        }
+        if let Some(c) = VOLARIS.captures(l) {
+            return arrival("VOLARIS_LLEGADA", &c[1], "");
+        }
+        if let Some(c) = STAND_NO.captures(l) {
+            return arrival("STAND_NO", &c[1], "");
+        }
+        if let Some(c) = CHINA_EASTERN.captures(l) {
+            return Some(with_flight(report(GateKind::ArrivalGate, "CHINA_EASTERN_PARK_BAY", &c[3], &c[2]), &c[1]));
+        }
+        if let Some(c) = FEDEX_EXPECT.captures(l) {
+            return arrival("FEDEX_EXPECT_GATE", &c[1], &c[2]);
+        }
+        if let Some(c) = ARRIVAL_GATE_IS.captures(l) {
+            return arrival("ARRIVAL_GATE_COLON", &c[1], "");
+        }
+    }
+    None
 }
 
 /// KLM connection info: `KL 1750` and `GATE  A04  POS  A62`, the gate at
@@ -1120,6 +1222,20 @@ mod tests {
             ("Avianca dispatch gate", "RA", "QUATLASAV~1.\r\nBUENOS DIAS\r\nGATE 13 EN SAL. SLDS.\r\n\r\n------------\r\nFROM: DISP_X\r\n", ArrivalGate, "AVIANCA_DISPATCH", None, Some("SAL"), "13", None),
             ("Avianca dispatch park", "RA", "QUATLASAV~1PARK\n\tBN DIA CREW\n\tE7 PARK EN BOG\n\tSALU2 BN VLO\n\t\n\t------------\n\tFROM: DISP_X\n", ArrivalGate, "AVIANCA_DISPATCH", None, Some("BOG"), "E7", None),
             ("Avianca dispatch gate without airport", "RA", "QUATLASAV~1.\r\nGATE E12\r\nFROM: DISP_X\r\n", ArrivalGate, "AVIANCA_DISPATCH", None, None, "E12", None),
+            ("Frontier ops free text", "RA", "QUANPOCF9~1\r\nGATE D36\r\n", ArrivalGate, "FRONTIER_OPS", None, None, "D36", None),
+            ("SkyWest AA in-range", "RA", "QUSILITOO.1AA IN-RANGE     \r\nIN-RANGE FROM AA        \r\nGATE: 1D\r\nTERMINATING FLIGHT\r\n", ArrivalGate, "IN_RANGE_GATE", None, None, "1D", None),
+            ("Allegiant in-range", "RA", "QUANPOCG4~1           \r\n*AUTOMATED MSG FLT 9201*****IN-RANGE NOTICE*****\r\n--GATE ASSIGNMENT       PVU GATE 2 ASSIGNED      \r\n--NEXT FLIGHT           3232 PVU-SNA 19-1700Z\r\n", ArrivalGate, "ALLEGIANT_IN_RANGE", None, Some("PVU"), "2", None),
+            ("Air Nostrum PKN", "RA", "QUVLCASYW~1\r\nIB1059  SDR   K92\r\nPKN:330   GATE:K88   BELT:19  HALL:10\r\n", ArrivalGate, "AIR_NOSTRUM_PKN", None, None, "K88", None),
+            ("Volaris llegada", "RA", "QUANPH1Y4~1HOLA CAP, BUEN DIA. A SU LLEGADA GATE J16 Y GPU DISPONIBLE, FAVOR DE CONFIRMAR E\r\nN TIERRA\r\n", ArrivalGate, "VOLARIS_LLEGADA", None, None, "J16", None),
+            ("ITA connecting gates", "RA", "QUMGL1AAZ~1CONNECTING GATES\r\nEIHHI AZ0571/17 \r\nZRH/FCO ETA 1220 \r\nGATE A32 BAG CLAIM 23 \r\nFLT/DTE   TYP ETD   TO   \r\nAZ1781/17 INF 1315 PMO  \r\n", ArrivalGate, "ITA_CONNECTING_GATES", None, Some("FCO"), "A32", None),
+            ("China Southern stand no", "RA", "QUCANXMCZ~1RA170521\n\t//**TRANSFER PASSENGER INFORMATION***\n\tFLTNO         DEST     GATE  CDT DLY STAND\n\tNIL\n\tBAGGAGE CLAIM BELT: 01\n\tSTAND NO: 136\n", ArrivalGate, "STAND_NO", None, None, "136", None),
+            ("China Eastern park bay", "RA", "HI SIR, MU9062 SWA/HFE, PARK BAY 6.FOR REFERENCE ONLY.", ArrivalGate, "CHINA_EASTERN_PARK_BAY", None, Some("HFE"), "6", Some("9062")),
+            ("FedEx expect gate", "RA", "QUMEMXRFX~1(4511)\r\nRAMP INRANGE NOTICE\r\nEXPECT GATE: 2(SBD)\r\nGROUND POWER AVAILABLE\r\n", ArrivalGate, "FEDEX_EXPECT_GATE", None, Some("SBD"), "2", None),
+            ("airside arrival gate", "RA", "QUANPOCPD~1 FREETEXT MSG\r\nAIRSIDE ARRIVAL GATE IS: B12\r\n", ArrivalGate, "ARRIVAL_GATE_COLON", None, None, "B12", None),
+            ("Mesa header arrival gate", "RA", "QUPHXACYV.1ARRIVAL GATE A1B\r\n\r\n", ArrivalGate, "HEADER_ARRIVAL_GATE", None, None, "A1B", None),
+            ("Alaska ETA acknowledgement on RA", "RA", "ETA ACK\r\nFROM:ANC OPS\r\nAS2301\r\nETA:0126\r\nARRIVAL GATE:C7 \r\n", ArrivalGate, "ALASKA_ETA_ACK", None, Some("ANC"), "C7", Some("AS2301")),
+            ("Helvetic arrival position on C1", "C1", ".ZRHOWOA 191354\r\nAGM\r\nARR GATE GRZ\r\nARR POS  I12\r\nCONNECTING GATE INFO 19NOV1004Z\r\n", ArrivalGate, "ARR_GATE_POS", None, None, "I12", None),
+            ("Air France arrival parking", "C1", ".PAROWAF 171200\r\nAGM\r\nARRIVAL PKG: K12 PKG TYPE: C TERM: E\r\n", ArrivalGate, "AIR_FRANCE_ARRIVAL_PKG", None, None, "K12", None),
             ("Ethiopian arrival gate assigned", "RA", "QUJFKOWLX~1\r\nSWR DSP JFK\r\nGD MORNING ET500 CREW\r\nARR GATE B44 ASSIGNED\r\nHAPPY LANDING\r\n", ArrivalGate, "ARRIVAL_PARKING", None, None, "B44", None),
             ("Alaska gate change", "21", ",,1\r\nGATE UPDATE\r\nGATE CHANGE IN LAX\r\nAS1636\r\nNEW GATE: 210A\r\n\r\n", GateChange, "ALASKA_GATE_CHANGE", None, Some("LAX"), "210A", Some("AS1636")),
         ];
@@ -1175,6 +1291,8 @@ mod tests {
             ("KLM next flight gate", "32", "P64AMSKWKL170542\r\nCONNECTION INFO.\r\nKL 1750 \r\nNXM   KL 1771  17NOV 0805  B30 A62\r\nGATE  B30  POS  A62\r\n"),
             ("Avianca gate after FROM", "RA", "QUATLASAV~1.\r\nFROM: DISP_X\r\nGATE 13 EN SAL.\r\n"),
             ("Finnair connections", "RA", FINNAIR_CONNECT),
+            ("Frontier chat about another airport's gate", "RA", "QUANPOCF9~1\r\nGOOD TO KNOW. RIDES STILL ROUGH? \r\nSEEING GATE F3 IN KMIA\r\n"),
+            ("SkyWest gate without in-range", "RA", "QUSILITOO.1ENROUTE PLAN    \r\nGATE: 4\r\n"),
             // No gate for this flight, only for the connections and the next flight.
             ("gate status only", "40", "FLT 0278/21 PHL-EDI\r\nGATE STATUS NOT AVAIL\r\nNEXT FLT 0602 ACFT 3JF SKD 0900 GRR\r\nGATE B12\r\n"),
             ("connections only", "40", "FLT 4258/22 HPN-DCA\r\nCREW CONNECTING GATE INFO\r\nCREW SEAT FLT DEST GATE TIME\r\nGATE D35\r\n"),
