@@ -317,11 +317,24 @@ no longer skipped, only what `parse` reads; the FLT route allows an airline
 prefix, `FLT YX4704 RDU-LGA` / `GATE 29`); Avianca dispatch (`QUATLASAV`)
 `GATE 13 EN SAL.`, `GATE E12`, `E7 PARK EN BOG`, read until `FROM:`; `ARR
 GATE B44 ASSIGNED`.
+Round 7 (event digger #30): RA Frontier ops free text (`QUANPOCF9` + `GATE
+D36`, after its `FROM PHL OPS` form), SkyWest AA in-range `GATE: 1D` (SkyWest
+headers `QUHDQITOO`/`QUSILITOO` are no longer skipped, only what `parse`
+reads), Allegiant `--GATE ASSIGNMENT PVU GATE 2 ASSIGNED`, Air Nostrum
+`PKN:330 GATE:K88`, Volaris `A SU LLEGADA GATE J16`, ITA `ZRH/FCO ETA 1220`
+/ `GATE A32 BAG CLAIM 23` (A32 at FCO), `STAND NO: 136`, China Eastern
+`MU9062 SWA/HFE, PARK BAY 6` (6 at HFE), FedEx `EXPECT GATE: 2(SBD)`,
+`ARRIVAL GATE IS: B12` / `ARRIVAL GATE:B9`, Mesa `QUPHXACYV.1ARRIVAL GATE
+A1B`, Alaska ETA acks also on RA (tried before the round 7 forms); C1
+Helvetic `ARR GATE`/`ARR POS` (as on 32) and Air France `ARRIVAL PKG: K12`.
+Not read: Frontier chat about another airport's gate, SkyWest `GATE:`
+without an `IN-RANGE` line.
 `format` names the family (`PDC`, `FLT_ROUTE_GATE`, ...). A gate must
 contain a digit; reading stops at connections, `NEXT FLT`/`NEXT FLIGHT`/
 `NEXT LEG`/`NEXT SECTOR`/`- NEXT FLIGHT`,
 `TURN FLT`, `AC TURN` and `END`. RA uplinks read by `parse` (United,
-Republic, SkyWest, Finnair headers) are skipped. Hawaiian, JetBlue and
+Republic and SkyWest ARRIVAL GATE uplinks) and Finnair connection lists are
+skipped. Hawaiian, JetBlue and
 Jetstar do not name the airport, so `arrival` is absent. 5Z `/C3 GATE REQ`
 carries no gate and is not read.
 
