@@ -120,6 +120,7 @@ pub fn parse_line(line: &str, format: ExternFormat, station: &StationIdentity) -
             let block_id = char_of(a, &["blk_id", "block_id"]);
             let downlink = block_id.map(|c| c.is_ascii_digit()).unwrap_or(false);
             let appdec = xng_acars::decode(&label, &text, downlink);
+            let app = appdec.app_value(downlink);
             MessageBody::Acars(AcarsCore {
                 mode: char_of(a, &["mode"]).unwrap_or('2'),
                 tail: str_of(a, &["reg", "tail"]).map(|s| s.trim_start_matches('.').to_string()),
@@ -138,7 +139,7 @@ pub fn parse_line(line: &str, format: ExternFormat, station: &StationIdentity) -
                 more_to_come: false,
                 reassembled: false,
                 assstat: str_of(a, &["assstat"]).map(String::from),
-                app: appdec.app.map(|x| serde_json::to_value(&x).unwrap_or_default()),
+                app,
                 link: None,
             })
         }

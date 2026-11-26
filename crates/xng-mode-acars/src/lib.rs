@@ -316,42 +316,6 @@ impl AcarsMultiChannelDecoder {
     }
 }
 
-/// Combine the structured application decode with any flat text-extracted
-/// fields (OOOI gate/wheels times + airports, free-text position) into the
-/// single `app` JSON value carried by the message body. Returns `None` when
-/// there is nothing decoded. Flat fields appear at the top level (matching
-/// acarsdec's flat JSON); the structured app object is nested under `app`
-/// when both are present.
-fn build_app_value(appdec: &xng_acars::AppDecode) -> Option<serde_json::Value> {
-    let mut flat = serde_json::Map::new();
-
-    if let Some(serde_json::Value::Object(oooi_map)) =
-        appdec.oooi.as_ref().and_then(|o| serde_json::to_value(o).ok())
-    {
-        flat.extend(oooi_map);
-    }
-    if let Some(pos) = appdec.position.as_ref().and_then(|p| serde_json::to_value(p).ok()) {
-        flat.insert("position".to_string(), pos);
-    }
-    if let Some(serde_json::Value::Object(met_map)) =
-        appdec.met.as_ref().and_then(|m| serde_json::to_value(m).ok())
-    {
-        flat.extend(met_map);
-    }
-
-    let app_val = appdec.app.as_ref().map(|a| serde_json::to_value(a).unwrap_or_default());
-
-    match (flat.is_empty(), app_val) {
-        (true, None) => None,
-        (true, Some(a)) => Some(a),
-        (false, None) => Some(serde_json::Value::Object(flat)),
-        (false, Some(a)) => {
-            flat.insert("app".to_string(), a);
-            Some(serde_json::Value::Object(flat))
-        }
-    }
-}
-
 /// Convert a decoded frame into the normalized message model.
 pub fn to_message(
     f: &frame::AcarsFrame,
@@ -396,7 +360,7 @@ pub fn to_message(
             // structured field). OOOI fields are merged at the top of the
             // object so they serialize like acarsdec's flat JSON
             // (depa/dsta/eta/gtout/gtin/wloff/wlin).
-            let app = build_app_value(&appdec);
+            let app = appdec.app_value(f.downlink);
             MessageBody::Acars(AcarsCore {
                 mode: f.mode,
                 tail: f.tail.clone(),

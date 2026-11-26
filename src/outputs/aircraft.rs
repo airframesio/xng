@@ -7,8 +7,10 @@
 use serde_json::Value;
 use xng_types::{Message, MessageBody};
 
-/// A normalized aircraft state fix. ACARS/Aero ADS-C positions key on
-/// flight/registration (no ICAO hex) and so are not represented here.
+/// A normalized aircraft state fix. ACARS positions (ADS-C reports and
+/// free-text position reports, from any carrier) are represented when the
+/// ICAO address is known: from the ADS-C airframe-id group, else from the
+/// tail through the loaded aircraft database (`--aircraft-db`).
 pub(crate) struct AircraftFix {
     pub icao: String,
     pub callsign: Option<String>,
@@ -43,6 +45,10 @@ pub(crate) enum AircraftSource {
     /// re-encode preserves the non-ICAO fact (DF18 CF=5, not CF=2).
     TisBOther,
     AdsR,
+    /// A position the aircraft reported over ACARS (ADS-C or free text). Not
+    /// ADS-B, and often minutes old, so it goes to SBS only: Beast would
+    /// re-encode it as a 1090 squitter that feeders forward as real ADS-B.
+    Acars,
 }
 
 fn jf(d: &Value, k: &str) -> Option<f64> {
@@ -152,6 +158,75 @@ pub(crate) fn aircraft_fix(msg: &Message) -> Option<AircraftFix> {
                 source: AircraftSource::Adsb,
             })
         }
+        MessageBody::Acars(a) => acars_fix(a),
         _ => None,
     }
+}
+
+/// An aircraft fix from an ACARS message's decoded application layer: the
+/// ADS-C basic report (with earth-reference track/speed/vertical rate and the
+/// flight-id callsign when sent), else a free-text position report (kept only
+/// for downlinks by `xng_acars`). Predicted and projected positions are not
+/// where the aircraft is and are ignored.
+fn acars_fix(a: &xng_types::AcarsCore) -> Option<AircraftFix> {
+    let app = a.app.as_ref()?;
+    let structured = xng_acars::structured_app(app);
+    let mut fix = AircraftFix {
+        icao: String::new(),
+        callsign: a.flight.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from),
+        altitude_ft: None,
+        lat: None,
+        lon: None,
+        speed_kt: None,
+        speed_is_airspeed: false,
+        track_deg: None,
+        vertical_rate_fpm: None,
+        squawk: None,
+        source: AircraftSource::Acars,
+    };
+    let mut icao = None;
+    if structured.get("app").and_then(Value::as_str) == Some("adsc") {
+        for t in structured.get("tags").and_then(Value::as_array).into_iter().flatten() {
+            match t.get("tag").and_then(Value::as_str) {
+                Some("report") => {
+                    // Motion belongs to the report it follows: a second report
+                    // in the same downlink must not inherit the first one's.
+                    fix.track_deg = None;
+                    fix.speed_kt = None;
+                    fix.vertical_rate_fpm = None;
+                    fix.lat = jf(t, "lat");
+                    fix.lon = jf(t, "lon");
+                    fix.altitude_ft = ji(t, "alt_ft");
+                }
+                Some("earth_ref") => {
+                    if t.get("true_track_valid").and_then(Value::as_bool) == Some(true) {
+                        fix.track_deg = jf(t, "true_track_deg");
+                    }
+                    fix.speed_kt = jf(t, "ground_speed_kt");
+                    fix.vertical_rate_fpm = ji(t, "vert_speed_fpm");
+                }
+                Some("flight_id") => {
+                    if let Some(id) = js(t, "id") {
+                        fix.callsign = Some(id);
+                    }
+                }
+                Some("airframe_id") => icao = js(t, "icao").and_then(|s| norm_icao(&s)),
+                _ => {}
+            }
+        }
+    }
+    if fix.lat.is_none() {
+        let p = app.get("position")?;
+        fix.lat = jf(p, "latitude");
+        fix.lon = jf(p, "longitude");
+    }
+    let (lat, lon) = (fix.lat?, fix.lon?);
+    if !(-90.0..=90.0).contains(&lat) || !(-180.0..=180.0).contains(&lon) || (lat == 0.0 && lon == 0.0) {
+        return None;
+    }
+    fix.icao = icao.or_else(|| {
+        let tail = a.tail.as_deref()?;
+        super::dbinfo::AircraftDb::icao_for_reg(tail).map(|i| format!("{i:06X}"))
+    })?;
+    Some(fix)
 }

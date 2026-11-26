@@ -10,6 +10,7 @@ use tokio::sync::broadcast;
 use xng_types::{Message, MessageBody, Mode};
 
 use super::aircraft::aircraft_fix;
+use super::aircraft::AircraftSource as AircraftSourceKind;
 
 /// The 12 MHz MLAT counter for a message: prefer the demod's monotonic
 /// sample-clock tick (so an MLAT client can fit the receiver's clock drift),
@@ -70,7 +71,7 @@ pub fn format_beast(msg: &Message) -> Vec<Vec<u8>> {
     // Non-Mode-S aircraft (UAT/HFDL): synthesize 1090 ES frames from the fix.
     // Native ADS-B → DF17; a UAT TIS-B/ADS-R rebroadcast → DF18 (CF preserves
     // the provenance) so a raw-Beast consumer keeps the source class.
-    if let Some(fix) = aircraft_fix(msg) {
+    if let Some(fix) = aircraft_fix(msg).filter(|f| f.source != AircraftSourceKind::Acars) {
         if let Ok(icao) = u32::from_str_radix(&fix.icao, 16) {
             use crate::outputs::aircraft::AircraftSource;
             use xng_mode_adsb::synth::EsSource;
@@ -80,6 +81,7 @@ pub fn format_beast(msg: &Message) -> Vec<Vec<u8>> {
                 AircraftSource::TisB => EsSource::TisB,
                 AircraftSource::TisBOther => EsSource::TisBOther,
                 AircraftSource::AdsR => EsSource::AdsR,
+                AircraftSource::Acars => return Vec::new(),
             };
             return xng_mode_adsb::synth::synth_frames(
                 src,

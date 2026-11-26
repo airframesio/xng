@@ -1522,7 +1522,7 @@ fn publish_msg(
         // Prometheus cardinality.
         if msg.decode.crc_ok {
             state.record_acars_label(freq, &a.label);
-            if let Some(app) = a.app.as_ref() {
+            if let Some(app) = a.app.as_ref().map(xng_acars::structured_app) {
                 if app.get("app").and_then(|v| v.as_str()) == Some("military")
                     && app.get("crc_ok").and_then(|v| v.as_bool()) == Some(true)
                 {
@@ -1819,8 +1819,8 @@ fn apply_reassembly(
         let dec = xng_acars::decode(&core.label, &full, downlink);
         core.text = full;
         core.reassembled = true;
-        if let Some(app) = dec.app {
-            core.app = serde_json::to_value(&app).ok();
+        if let Some(app) = dec.app_value(downlink) {
+            core.app = Some(app);
         }
     }
 }

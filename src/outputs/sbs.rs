@@ -135,6 +135,58 @@ mod tests {
         }
     }
 
+    fn acars(app: serde_json::Value) -> Message {
+        msg_with(
+            Mode::Iridium,
+            MessageBody::Acars(xng_types::AcarsCore {
+                mode: '2',
+                tail: Some("N123AB".into()),
+                label: "B6".into(),
+                sublabel: None,
+                mfi: None,
+                block_id: Some('4'),
+                ack: None,
+                flight: Some("AS0123".into()),
+                msg_num: None,
+                text: String::new(),
+                more_to_come: false,
+                reassembled: false,
+                assstat: None,
+                app: Some(app),
+                link: None,
+            }),
+        )
+    }
+
+    // An ADS-C basic report carried over ACARS (here Iridium SBD) renders an
+    // SBS position line keyed on the airframe-id ICAO; projected positions
+    // are not the aircraft's and are ignored. Beast does not carry it.
+    #[test]
+    fn adsc_report_over_acars_renders_sbs() {
+        let m = acars(serde_json::json!({
+            "app": "adsc",
+            "tags": [
+                {"tag": "fixed_projection", "lat": 10.0, "lon": 10.0, "alt_ft": 1000, "eta_s": 60},
+                {"tag": "report", "kind": "periodic", "lat": 51.61, "lon": -30.25, "alt_ft": 37000},
+                {"tag": "earth_ref", "true_track_valid": true, "true_track_deg": 271.4, "ground_speed_kt": 486.0, "vert_speed_fpm": 0},
+                {"tag": "flight_id", "id": "ASA123"},
+                {"tag": "airframe_id", "icao": "a1b2c3"}
+            ]
+        }));
+        let line = format_sbs(&m).unwrap();
+        assert!(line.starts_with("MSG,3,1,1,A1B2C3,1,"), "{line}");
+        assert!(line.contains(",ASA123,37000,486.0,271.4,51.61000,-30.25000,0,"), "{line}");
+        assert!(crate::outputs::beast::format_beast(&m).is_empty());
+    }
+
+    // A free-text position with no ICAO (no airframe-id, no aircraft database
+    // match for the tail) has no SBS line: SBS needs an address.
+    #[test]
+    fn acars_position_without_icao_has_no_sbs_line() {
+        let m = acars(serde_json::json!({"position": {"latitude": 43.52, "longitude": -123.29}}));
+        assert!(format_sbs(&m).is_none());
+    }
+
     // XM-2.2: a UAT 978 ADS-B state vector renders an SBS position line keyed
     // on the same ICAO hex Mode S uses, so 978 traffic reaches tar1090/VRS.
     #[test]

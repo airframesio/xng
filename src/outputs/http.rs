@@ -657,7 +657,8 @@ fn update(d: &mut Dash, m: &Message) {
             // Military (AMC-style) report: the ICAO callsign (RCH4913) only
             // appears in the text — the ACARS flight id is a 2-character
             // carrier code (`MC`) — so prefer it, and surface the mission.
-            if let Some(app) = a.app.as_ref().filter(|v| v.get("app").and_then(Value::as_str) == Some("military")) {
+            let app_obj = a.app.as_ref().map(xng_acars::structured_app);
+            if let Some(app) = app_obj.filter(|v| v.get("app").and_then(Value::as_str) == Some("military")) {
                 c.insert("military".into(), json!(true));
                 if let Some(cs) = app.get("callsign").and_then(Value::as_str) {
                     flight = Some(cs.to_uppercase());
@@ -686,10 +687,33 @@ fn update(d: &mut Dash, m: &Message) {
                 }
             }
             if reg.is_some() || flight.is_some() {
+                // A position the aircraft reported in free text (labels 20/POS,
+                // 4J, H1 POS; downlinks only), overridden below by ADS-C.
+                if pos.is_none() {
+                    if let Some(p) = a.app.as_ref().and_then(|v| v.get("position")) {
+                        if let (Some(lat), Some(lon)) = (
+                            p.get("latitude").and_then(Value::as_f64),
+                            p.get("longitude").and_then(Value::as_f64),
+                        ) {
+                            pos = Some((lat, lon));
+                            c.insert("lat".into(), json!(lat));
+                            c.insert("lon".into(), json!(lon));
+                            c.insert("pos_source".into(), json!("text"));
+                        }
+                    }
+                }
                 // ADS-C position report from the application layer, if present.
-                if let Some(app) = &a.app {
+                if let Some(app) = app_obj {
                     if app.get("app").and_then(|v| v.as_str()) == Some("adsc") {
-                        for t in app.get("tags").and_then(Value::as_array).into_iter().flatten() {
+                        // Only the basic report is where the aircraft is; the
+                        // predicted-route / fixed-projection groups name points ahead.
+                        for t in app
+                            .get("tags")
+                            .and_then(Value::as_array)
+                            .into_iter()
+                            .flatten()
+                            .filter(|t| t.get("tag").and_then(Value::as_str) == Some("report"))
+                        {
                             if let (Some(lat), Some(lon)) = (
                                 t.get("lat").and_then(Value::as_f64),
                                 t.get("lon").and_then(Value::as_f64),
@@ -697,6 +721,7 @@ fn update(d: &mut Dash, m: &Message) {
                                 pos = Some((lat, lon));
                                 c.insert("lat".into(), json!(lat));
                                 c.insert("lon".into(), json!(lon));
+                                c.insert("pos_source".into(), json!("adsc"));
                                 if let Some(alt) = t.get("alt_ft").and_then(Value::as_i64) {
                                     c.insert("alt".into(), json!(alt));
                                 }
@@ -704,9 +729,15 @@ fn update(d: &mut Dash, m: &Message) {
                         }
                     }
                 }
+                // The ICAO address from the aircraft database (`--aircraft-db`)
+                // joins an ACARS-only aircraft to its ADS-B entity.
+                let icao = reg
+                    .as_deref()
+                    .and_then(super::dbinfo::AircraftDb::icao_for_reg)
+                    .map(|i| format!("{i:06X}"));
                 // Source = the carrier mode (acars/vdl2/hfdl/aero-l/iridium), so
                 // one aircraft on several carriers shows multiple source rows.
-                merge_aircraft(d, &mode, AcIds { icao: None, flight, reg }, c, pos);
+                merge_aircraft(d, &mode, AcIds { icao, flight, reg }, c, pos);
             }
         }
         // Iridium ring alerts carry the broadcasting satellite's geocentric
