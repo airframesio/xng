@@ -269,6 +269,27 @@ mod tests {
     }
 
     #[test]
+    fn long_range_report_on_channel_c_keeps_channel_and_position() {
+        let bits = xng_mode_ais::nmea::payload_to_bits("KC5E2b@U19PFdLbL");
+        let mut m = msg(27, xng_mode_ais::fields::decode(27, &bits).unwrap());
+        m.frequency_hz = 156_775_000;
+        if let MessageBody::Ais { nmea, mmsi, .. } = &mut m.body {
+            *nmea = vec!["!AIVDM,1,1,,C,KC5E2b@U19PFdLbL,0*01".into()];
+            *mmsi = Some(206_914_217);
+        }
+        let v = format_aiscatcher(&m).unwrap();
+        assert_eq!(v["type"], 27);
+        assert_eq!(v["channel"], "C");
+        assert!((v["lat"].as_f64().unwrap() - 4.84).abs() < 0.01, "{v}");
+        assert!((v["lon"].as_f64().unwrap() - 137.0233).abs() < 0.01, "{v}");
+        assert_eq!(v["speed"], 57.0);
+        assert_eq!(v["course"], 167.0);
+        assert_eq!(v["status"], 2);
+        assert_eq!(v["accuracy"], false);
+        assert_eq!(v["raim"], false);
+    }
+
+    #[test]
     fn position_report_uses_aiscatcher_names_and_types() {
         let m = msg(
             1,

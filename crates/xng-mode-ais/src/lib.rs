@@ -26,9 +26,13 @@ pub const CHANNEL_RATE: f64 = 48_000.0;
 /// One-sided channel passband (GMSK BT=0.4 at 9600 bd in a 25 kHz channel).
 pub const CHANNEL_PASSBAND_HZ: f64 = 8_000.0;
 
-/// AIS channel A/B designator by frequency. Channel A is 161.975 MHz
-/// (AIS 1, marine ch 87B), channel B is 162.025 MHz (AIS 2, ch 88B). A small
-/// ±12.5 kHz tolerance absorbs tuner rounding; anything else returns `'?'`
+/// AIS channel designator by frequency. Channel A is 161.975 MHz (AIS 1,
+/// marine ch 87B), channel B is 162.025 MHz (AIS 2, ch 88B). Channels C
+/// (156.775 MHz, ch 75) and D (156.825 MHz, ch 76) are the long-range
+/// channels that class A ships use for message 27 to satellites (ITU-R
+/// M.1371 annex 4); they are labelled `'C'`/`'D'` the way AIS-catcher labels
+/// them. A small ±12.5 kHz tolerance absorbs tuner rounding; anything else
+/// returns `'?'`
 /// rather than a silently wrong `'A'` (the AIVDM channel field stays a single
 /// valid ASCII char, so `(channel,total,seq)` fragment keying is unaffected).
 pub fn channel_letter(frequency_hz: u64) -> char {
@@ -38,6 +42,10 @@ pub fn channel_letter(frequency_hz: u64) -> char {
         'A'
     } else if near(162_025_000) {
         'B'
+    } else if near(156_775_000) {
+        'C'
+    } else if near(156_825_000) {
+        'D'
     } else {
         '?'
     }
@@ -217,10 +225,17 @@ mod tests {
     }
 
     #[test]
-    fn channel_letter_labels_a_b_and_marks_unknown() {
+    fn channel_letter_labels_a_to_d_and_marks_unknown() {
         // The two canonical AIS frequencies.
         assert_eq!(channel_letter(161_975_000), 'A');
         assert_eq!(channel_letter(162_025_000), 'B');
+        // The long-range (message 27) channels 75 and 76.
+        assert_eq!(channel_letter(156_775_000), 'C');
+        assert_eq!(channel_letter(156_825_000), 'D');
+        assert_eq!(channel_letter(156_780_000), 'C');
+        assert_eq!(channel_letter(156_820_000), 'D');
+        // Channel 16 (voice/DSC area) between them is not AIS.
+        assert_eq!(channel_letter(156_800_000), '?');
         // Tuner rounding within ±12.5 kHz still resolves.
         assert_eq!(channel_letter(161_980_000), 'A');
         assert_eq!(channel_letter(162_020_000), 'B');
