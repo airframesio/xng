@@ -18,6 +18,7 @@ pub enum ConsoleFormat {
 
 /// Best-effort one-liner from the decoded application layer JSON.
 fn app_summary(app: &serde_json::Value) -> Option<String> {
+    let app = xng_acars::structured_app(app);
     match app.get("app")?.as_str()? {
         "adsc" => {
             let tags = app.get("tags")?.as_array()?;

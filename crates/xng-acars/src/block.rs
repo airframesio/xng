@@ -93,6 +93,7 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
 
     let appdec = crate::decode(&label, &text, downlink);
     let min = msg_num.as_deref().and_then(crate::min::split_downlink);
+    let app = appdec.app_value(downlink);
     Some(AcarsBlock {
         min,
         core: AcarsCore {
@@ -109,9 +110,7 @@ pub fn parse(octets: &[u8]) -> Option<AcarsBlock> {
             more_to_come: ch[suffix_idx] == ETB,
             reassembled: false,
             assstat: None,
-            app: appdec
-                .app
-                .map(|a| serde_json::to_value(&a).unwrap_or_default()),
+            app,
             link: None,
         },
         downlink,
@@ -193,6 +192,21 @@ mod tests {
         let app = b.core.app.expect("ADS-C app should decode");
         assert_eq!(app["app"], "adsc");
         assert_eq!(app["crc_ok"], true);
+    }
+
+    #[test]
+    fn free_text_position_kept_on_downlinks_only() {
+        // Every carrier that parses ACARS blocks here (VDL2, HFDL, Aero,
+        // Iridium SBD) surfaces a free-text position report like VHF ACARS,
+        // and only when the aircraft sent it.
+        let text = "POSN43312W123174,EASON,215754,370,EBINY,220601,ELENN,M48,02216,185/TS215754,0921227A40";
+        let down = build('2', "N123AB", None, "H1", '4', Some("D01A"), Some("AS0123"), text, false);
+        let app = parse(&down).unwrap().core.app.expect("position decodes");
+        assert!((app["position"]["latitude"].as_f64().unwrap() - 43.52).abs() < 1e-3);
+        assert!((app["position"]["longitude"].as_f64().unwrap() + 123.29).abs() < 1e-3);
+        let up = build('2', "N123AB", None, "H1", 'A', None, None, text, false);
+        let app = parse(&up).unwrap().core.app;
+        assert!(app.as_ref().and_then(|a| a.get("position")).is_none(), "{app:?}");
     }
 
     #[test]

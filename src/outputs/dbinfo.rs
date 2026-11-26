@@ -240,6 +240,16 @@ pub fn is_military(icao: u32) -> bool {
 pub struct AircraftDb {
     by_icao: HashMap<u32, (String, String)>,
     military: std::collections::HashSet<u32>,
+    /// Normalized registration → ICAO address, for carriers that name the
+    /// aircraft only by tail (ACARS over VHF/VDL2/HFDL/Aero/Iridium). `None`
+    /// marks a registration shared by several addresses, which is not used.
+    by_reg: HashMap<String, Option<u32>>,
+}
+
+/// Registration key: uppercase, without the hyphen and dots, since ACARS
+/// tails usually drop the hyphen (`GEUUA` for G-EUUA) and pad with dots.
+pub fn reg_key(reg: &str) -> String {
+    reg.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_uppercase()).collect()
 }
 
 static AIRCRAFT_DB: OnceLock<AircraftDb> = OnceLock::new();
@@ -267,8 +277,37 @@ impl AircraftDb {
             );
         }
         let n = by_icao.len();
-        let _ = AIRCRAFT_DB.set(AircraftDb { by_icao, military });
+        let _ = AIRCRAFT_DB.set(AircraftDb::build(by_icao, military));
         Ok(n)
+    }
+
+    fn build(by_icao: HashMap<u32, (String, String)>, military: std::collections::HashSet<u32>) -> Self {
+        let mut by_reg: HashMap<String, Option<u32>> = HashMap::new();
+        for (icao, (reg, _)) in &by_icao {
+            let k = reg_key(reg);
+            if k.len() < 2 {
+                continue;
+            }
+            by_reg
+                .entry(k)
+                .and_modify(|v| {
+                    if *v != Some(*icao) {
+                        *v = None;
+                    }
+                })
+                .or_insert(Some(*icao));
+        }
+        AircraftDb { by_icao, military, by_reg }
+    }
+
+    fn icao_for(&self, reg: &str) -> Option<u32> {
+        self.by_reg.get(&reg_key(reg)).copied().flatten()
+    }
+
+    /// The ICAO address of the aircraft with registration `reg`, when the
+    /// loaded database names exactly one.
+    pub fn icao_for_reg(reg: &str) -> Option<u32> {
+        AIRCRAFT_DB.get()?.icao_for(reg)
     }
 
     pub fn lookup(icao: u32) -> Option<(&'static str, &'static str)> {
@@ -298,6 +337,22 @@ mod tests {
         assert!(!is_military(0xA9B27C)); // US civil
         assert!(!is_military(0x4D2023)); // Malta civil
         assert!(!is_military(0xADF7C7));
+    }
+
+    #[test]
+    fn registration_reverse_lookup() {
+        let mut by_icao = HashMap::new();
+        by_icao.insert(0x4CA87D, ("EI-DEI".to_string(), "A320".to_string()));
+        by_icao.insert(0xA1B2C3, ("N123AB".to_string(), "B738".to_string()));
+        // The same registration on two addresses (re-registered airframe).
+        by_icao.insert(0x111111, ("D-ABCD".to_string(), String::new()));
+        by_icao.insert(0x222222, ("D-ABCD".to_string(), String::new()));
+        let db = AircraftDb::build(by_icao, Default::default());
+        assert_eq!(db.icao_for("EIDEI"), Some(0x4CA87D));
+        assert_eq!(db.icao_for(".EI-DEI"), Some(0x4CA87D));
+        assert_eq!(db.icao_for("n123ab"), Some(0xA1B2C3));
+        assert_eq!(db.icao_for("DABCD"), None);
+        assert_eq!(db.icao_for("G-XXXX"), None);
     }
 
     #[test]

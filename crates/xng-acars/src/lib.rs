@@ -110,6 +110,55 @@ pub struct AppDecode {
     pub app: Option<AcarsApp>,
 }
 
+/// The structured application object inside a body's `app` value (see
+/// [`AppDecode::app_value`]): nested under `app` when flat text fields (OOOI,
+/// position, met) sit beside it, else the value itself.
+pub fn structured_app(app: &serde_json::Value) -> &serde_json::Value {
+    match app.get("app") {
+        Some(nested @ serde_json::Value::Object(_)) => nested,
+        _ => app,
+    }
+}
+
+impl AppDecode {
+    /// The single `app` JSON value a message body carries: the structured
+    /// application decode plus the flat text-extracted fields (OOOI times and
+    /// airports, free-text position, met). `None` when nothing decoded. Flat
+    /// fields sit at the top level (like acarsdec's flat JSON); the structured
+    /// app object is nested under `app` when both are present.
+    ///
+    /// The free-text position is kept only for downlinks: a message to the
+    /// aircraft names other places (forecast winds at fixes along the route,
+    /// weather), so a coordinate in an uplink is not where the aircraft is.
+    pub fn app_value(&self, downlink: bool) -> Option<serde_json::Value> {
+        let mut flat = serde_json::Map::new();
+        if let Some(serde_json::Value::Object(m)) =
+            self.oooi.as_ref().and_then(|o| serde_json::to_value(o).ok())
+        {
+            flat.extend(m);
+        }
+        if downlink {
+            if let Some(pos) = self.position.as_ref().and_then(|p| serde_json::to_value(p).ok()) {
+                flat.insert("position".to_string(), pos);
+            }
+        }
+        if let Some(serde_json::Value::Object(m)) =
+            self.met.as_ref().and_then(|m| serde_json::to_value(m).ok())
+        {
+            flat.extend(m);
+        }
+        let app = self.app.as_ref().map(|a| serde_json::to_value(a).unwrap_or_default());
+        match (flat.is_empty(), app) {
+            (true, a) => a,
+            (false, None) => Some(serde_json::Value::Object(flat)),
+            (false, Some(a)) => {
+                flat.insert("app".to_string(), a);
+                Some(serde_json::Value::Object(flat))
+            }
+        }
+    }
+}
+
 /// Decode the application layer of an ACARS message. `text` is the message
 /// text after the downlink MSN/flight-id header (i.e. [`xng-types`]'
 /// `AcarsCore::text`); `downlink` from the block-id class.
