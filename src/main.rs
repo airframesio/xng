@@ -209,7 +209,11 @@ impl OutputOpts {
         }
         if let Some(src) = &self.iridium_satmap {
             match satmap::init(src) {
-                Ok(n) => tracing::info!("iridium satmap: {n} satellites ({src})"),
+                Ok(n) => {
+                    tracing::info!("iridium satmap: {n} satellites ({src})");
+                    // Receiver location from ring-alert Doppler needs the TLEs.
+                    xng::doppler_locate::enable(0.0);
+                }
                 Err(e) => tracing::warn!("iridium satmap disabled: {e}"),
             }
         }

@@ -133,7 +133,9 @@ fn wideband_decoder_emits_frames_with_offsets() {
         frames.extend(dec.process(chunk));
     }
     let (o, f) = frames.first().expect("frame decoded");
-    assert!((o - off).abs() < 5_000.0, "offset {o}");
+    // The burst offset (detector bin + fine carrier estimate) is precise
+    // enough for ring-alert Doppler positioning.
+    assert!((o - off).abs() < 20.0, "offset {o}");
     assert_eq!(f.kind, "ring-alert");
     assert_eq!(f.details["sat"], 77);
 }
