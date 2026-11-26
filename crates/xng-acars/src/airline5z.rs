@@ -81,9 +81,7 @@ pub fn parse(text: &str) -> Option<Airline5z> {
     if first == "/TXT" {
         // Everything after the first line is the free text.
         let rest: Vec<&str> = lines.collect();
-        return Some(Airline5z::Text {
-            text: rest.join("\r\n"),
-        });
+        return Some(Airline5z::Text { text: rest.join("\r\n") });
     }
 
     // "/<TYPE> <args>": data[0] is blank (before the first '/'), data[1]
@@ -142,12 +140,7 @@ mod tests {
     fn txt_free_text() {
         // Label_5Z_Slash.test.ts "/TXT".
         let m = parse("/TXT\r\nDID U GET THE TIMES").unwrap();
-        assert_eq!(
-            m,
-            Airline5z::Text {
-                text: "DID U GET THE TIMES".into()
-            }
-        );
+        assert_eq!(m, Airline5z::Text { text: "DID U GET THE TIMES".into() });
     }
 
     #[test]
@@ -180,14 +173,7 @@ mod tests {
         // Label_5Z_Slash.test.ts "/B3 variant 1": ATL->IAD day 14 rwy 1C
         // (the trailing "G1273" is extra and not a structured field here).
         let m = parse("/B3 ATLIAD 14 R1C G1273").unwrap();
-        let Airline5z::Typed {
-            origin,
-            destination,
-            arrival_runway,
-            day,
-            ..
-        } = m
-        else {
+        let Airline5z::Typed { origin, destination, arrival_runway, day, .. } = m else {
             panic!("expected typed");
         };
         assert_eq!(origin.as_deref(), Some("ATL"));
@@ -201,12 +187,7 @@ mod tests {
         // research/5Z.md variant 2 (UA): "/C6 ORDCHS CHS HI..." → C6 type,
         // ORD→CHS. (Free-text continuation is on the following lines.)
         let m = parse("/C6 ORDCHS CHS HI...NO APU TONIGHT\r\nWILL NEED GROUND PWR").unwrap();
-        let Airline5z::Typed {
-            message_type,
-            description,
-            ..
-        } = &m
-        else {
+        let Airline5z::Typed { message_type, description, .. } = &m else {
             panic!("expected typed");
         };
         assert_eq!(message_type, "C6");

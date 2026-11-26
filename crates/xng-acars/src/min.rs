@@ -68,11 +68,7 @@ pub fn split_downlink(raw_min: &str) -> Option<DownlinkMin> {
     } else {
         None
     };
-    Some(DownlinkMin {
-        msg_num,
-        msg_num_seq,
-        seq,
-    })
+    Some(DownlinkMin { msg_num, msg_num_seq, seq })
 }
 
 #[cfg(test)]

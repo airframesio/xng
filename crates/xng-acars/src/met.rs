@@ -79,38 +79,22 @@ pub fn decode(label: &str, text: &str) -> Option<Met> {
     }
     let mut m = Met::default();
     for part in text.split('/') {
-        if let Some(v) = part
-            .strip_prefix("WND ")
-            .or_else(|| part.strip_prefix("WND"))
-        {
+        if let Some(v) = part.strip_prefix("WND ").or_else(|| part.strip_prefix("WND")) {
             let (dir, spd) = parse_wind(v);
             m.wind_dir_deg = dir;
             m.wind_speed_kt = spd;
-        } else if let Some(v) = part
-            .strip_prefix("SAT ")
-            .or_else(|| part.strip_prefix("SAT"))
-        {
+        } else if let Some(v) = part.strip_prefix("SAT ").or_else(|| part.strip_prefix("SAT")) {
             m.temperature_c = parse_temp(v);
-        } else if let Some(v) = part
-            .strip_prefix("TAS ")
-            .or_else(|| part.strip_prefix("TAS"))
-        {
+        } else if let Some(v) = part.strip_prefix("TAS ").or_else(|| part.strip_prefix("TAS")) {
             m.true_airspeed_kt = v.trim().parse().ok();
-        } else if let Some(v) = part
-            .strip_prefix("ALT ")
-            .or_else(|| part.strip_prefix("ALT"))
-        {
+        } else if let Some(v) = part.strip_prefix("ALT ").or_else(|| part.strip_prefix("ALT")) {
             // Flight level in hundreds of feet (FL270 → 27000 ft).
             if let Ok(fl) = v.trim().parse::<u32>() {
                 m.altitude_ft = Some(fl * 100);
             }
         }
     }
-    if m.is_empty() {
-        None
-    } else {
-        Some(m)
-    }
+    if m.is_empty() { None } else { Some(m) }
 }
 
 #[cfg(test)]

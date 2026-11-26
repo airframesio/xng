@@ -60,9 +60,7 @@ impl Oooi {
 /// or implausible — acarsdec copies the bytes unconditionally; we validate.
 fn airport(txt: &[u8], at: usize) -> Option<String> {
     let s = txt.get(at..at + 4)?;
-    if s.iter()
-        .all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit())
-    {
+    if s.iter().all(|&c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
         Some(String::from_utf8_lossy(s).into_owned())
     } else {
         None
@@ -113,11 +111,7 @@ fn clock(s: &str) -> Option<String> {
 
 /// A 4-character ICAO-style airport (`----` and other padding rejected).
 fn icao(s: &str) -> Option<String> {
-    if s.len() == 4 {
-        airport(s.as_bytes(), 0)
-    } else {
-        None
-    }
+    if s.len() == 4 { airport(s.as_bytes(), 0) } else { None }
 }
 
 /// A 3-letter IATA station (`---` and `///` rejected).
@@ -169,20 +163,8 @@ fn decode_report(label: &str, text: &str) -> Option<Oooi> {
             .or_else(|| compact_report(text))
             .or_else(|| day_clock_report(text))
             .or_else(|| csv_version_report(text))
-            .or_else(|| {
-                if label == "11" {
-                    arrival_uplink(text).or_else(|| arrival_eta_uplink(text))
-                } else {
-                    None
-                }
-            })
-            .or_else(|| {
-                if label == "14" {
-                    present_position(text)
-                } else {
-                    None
-                }
-            }),
+            .or_else(|| if label == "11" { arrival_uplink(text).or_else(|| arrival_eta_uplink(text)) } else { None })
+            .or_else(|| if label == "14" { present_position(text) } else { None }),
         "15" => delta_report(label, text).or_else(|| united_report(text)),
         "16" => csv_car_report(text).or_else(|| united_report(text)),
         "17" | "18" => united_report(text),
@@ -209,15 +191,13 @@ fn decode_report(label: &str, text: &str) -> Option<Oooi> {
 /// (also SUMMRY, OUTRP, ONRP, INRP; JetBlue prefixes `/FB 0242/AD TJSJ/<pos>,`).
 fn airline_report(text: &str) -> Option<Oooi> {
     let first = text.split(['\r', '\n']).next().unwrap_or("");
-    let (kw_at, kw) = ["OUTRP", "OFFRP", "ONRP", "INRP", "SUMMRY"]
-        .iter()
-        .find_map(|kw| {
-            first.match_indices(kw).find_map(|(i, _)| {
-                let before_ok = i == 0 || first.as_bytes()[i - 1] == b' ';
-                let after_ok = first.as_bytes().get(i + kw.len()) == Some(&b' ');
-                (before_ok && after_ok).then_some((i, *kw))
-            })
-        })?;
+    let (kw_at, kw) = ["OUTRP", "OFFRP", "ONRP", "INRP", "SUMMRY"].iter().find_map(|kw| {
+        first.match_indices(kw).find_map(|(i, _)| {
+            let before_ok = i == 0 || first.as_bytes()[i - 1] == b' ';
+            let after_ok = first.as_bytes().get(i + kw.len()) == Some(&b' ');
+            (before_ok && after_ok).then_some((i, *kw))
+        })
+    })?;
     let after = &text[kw_at + kw.len()..];
     let mut words = after.split_whitespace();
     let flight_day = words.next()?;
@@ -234,9 +214,7 @@ fn airline_report(text: &str) -> Option<Oooi> {
     let rest = &after[after.find(route)? + route.len()..];
     for tag in rest.split('/') {
         let mut kv = tag.split_whitespace();
-        let (Some(key), Some(val)) = (kv.next(), kv.next()) else {
-            continue;
-        };
+        let (Some(key), Some(val)) = (kv.next(), kv.next()) else { continue };
         match key {
             "OUT" | "OFF" | "ON" | "IN" => set_event(&mut o, key, clock(val)),
             "ETA" => o.eta = clock(val),
@@ -250,14 +228,10 @@ fn airline_report(text: &str) -> Option<Oooi> {
 /// `OFF01YX5763/21212240KDCAKLGA224047  77` (HHMMSS inline) on label 22.
 fn numbered_report(text: &str) -> Option<Oooi> {
     let text = strip_block_header(text);
-    let event = ["OUT", "OFF", "ONN", "INN"]
-        .into_iter()
-        .find(|e| text.starts_with(&format!("{e}01")))?;
+    let event = ["OUT", "OFF", "ONN", "INN"].into_iter().find(|e| text.starts_with(&format!("{e}01")))?;
     let slash = text.find('/')?;
     let flight = &text[5..slash];
-    let flight_ok = flight
-        .bytes()
-        .all(|c| c == b' ' || c.is_ascii_alphanumeric());
+    let flight_ok = flight.bytes().all(|c| c == b' ' || c.is_ascii_alphanumeric());
     if flight.is_empty() || flight.len() > 10 || !flight_ok {
         return None;
     }
@@ -273,10 +247,7 @@ fn numbered_report(text: &str) -> Option<Oooi> {
     };
     o.depa.as_ref()?;
     let tail = text.get(slash + 17..)?;
-    let time = if let Some(line) = tail
-        .strip_prefix("\r\n")
-        .or_else(|| tail.strip_prefix('\n'))
-    {
+    let time = if let Some(line) = tail.strip_prefix("\r\n").or_else(|| tail.strip_prefix('\n')) {
         let line = line.strip_prefix('\t').unwrap_or(line);
         line.get(..4).and_then(clock)
     } else {
@@ -293,11 +264,7 @@ fn label22_csv(text: &str) -> Option<Oooi> {
     if f.len() < 3 {
         return None;
     }
-    let mut o = Oooi {
-        depa: icao(f[0]),
-        dsta: icao(f[1]),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: icao(f[0]), dsta: icao(f[1]), ..Oooi::default() };
     set_event(&mut o, "OFF", clock(f[2]));
     has_time(&o).then_some(o)
 }
@@ -311,15 +278,9 @@ fn label44_report(text: &str) -> Option<Oooi> {
         return None;
     }
     let event = ["OFF", "ON", "IN"].into_iter().find(|e| {
-        f[0].len() == e.len() + 2
-            && f[0].starts_with(e)
-            && matches!(&f[0][e.len()..], "01" | "02" | "03")
+        f[0].len() == e.len() + 2 && f[0].starts_with(e) && matches!(&f[0][e.len()..], "01" | "02" | "03")
     })?;
-    let mut o = Oooi {
-        depa: icao(f[2]),
-        dsta: icao(f[3]),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: icao(f[2]), dsta: icao(f[3]), ..Oooi::default() };
     set_event(&mut o, event, clock(f[5]));
     if event == "OFF" {
         o.eta = f.get(6).and_then(|v| clock(v));
@@ -334,17 +295,13 @@ fn text_report(text: &str) -> Option<Oooi> {
         Some(i) if i == 0 || i == 10 => text[i..].trim_start_matches('-'),
         _ => text,
     };
-    let event = ["OUT", "OFF", "ONN", "INN", "ON", "IN"]
-        .into_iter()
-        .find(|e| s.starts_with(e))?;
+    let event = ["OUT", "OFF", "ONN", "INN", "ON", "IN"].into_iter().find(|e| s.starts_with(e))?;
     let s = s[event.len()..].trim_start_matches(' ');
     let body = s.strip_prefix("REPORT").or_else(|| s.strip_prefix("RPT"))?;
     let mut o = Oooi::default();
     for field in body.split(',') {
         let mut kv = field.split_whitespace();
-        let (Some(key), Some(val)) = (kv.next(), kv.next()) else {
-            continue;
-        };
+        let (Some(key), Some(val)) = (kv.next(), kv.next()) else { continue };
         match key {
             "DEP" => o.depa = icao(val),
             "DES" => o.dsta = icao(val),
@@ -367,10 +324,7 @@ fn station_report(label: &str, text: &str) -> Option<Oooi> {
         return None;
     }
     let time = time4(t, 3)?;
-    let mut o = Oooi {
-        depa: iata(t, 0),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: iata(t, 0), ..Oooi::default() };
     match label {
         "QE" => {
             o.gtout = Some(time);
@@ -397,24 +351,13 @@ fn united_report(text: &str) -> Option<Oooi> {
     }
     let kind: Vec<&str> = parts[1].split_whitespace().collect();
     let route: Vec<&str> = parts[2].split_whitespace().collect();
-    if kind.len() < 2
-        || route.len() < 2
-        || !matches!(kind[0], "13" | "14" | "15" | "16" | "17" | "18")
-    {
+    if kind.len() < 2 || route.len() < 2 || !matches!(kind[0], "13" | "14" | "15" | "16" | "17" | "18") {
         return None;
     }
-    let mut o = Oooi {
-        depa: icao(route[0]),
-        dsta: icao(route[1]),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: icao(route[0]), dsta: icao(route[1]), ..Oooi::default() };
     let reported = || {
         let v = parts.get(3)?.trim_start();
-        let v = v
-            .strip_prefix("IN ")
-            .unwrap_or(v)
-            .strip_prefix("TIME")?
-            .trim_start();
+        let v = v.strip_prefix("IN ").unwrap_or(v).strip_prefix("TIME")?.trim_start();
         v.get(..4).and_then(clock)
     };
     match kind[1..] {
@@ -451,19 +394,12 @@ fn strip_block_header(text: &str) -> &str {
         && t[1].is_ascii_digit()
         && t[2].is_ascii_digit()
         && t[3].is_ascii_uppercase()
-        && t[4..6]
-            .iter()
-            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && t[4..6].iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
         && t[6..10].iter().all(u8::is_ascii_digit);
-    if is_header {
-        &text[10..]
-    } else {
-        text
-    }
+    if is_header { &text[10..] } else { text }
 }
 
-static COMPACT_OUT: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^OUT01(\d{4})\d{4}([A-Z]{4})([A-Z]{4})?"));
+static COMPACT_OUT: LazyLock<Regex> = LazyLock::new(|| re(r"^OUT01(\d{4})\d{4}([A-Z]{4})([A-Z]{4})?"));
 static COMPACT_OFF: LazyLock<Regex> =
     LazyLock::new(|| re(r"^OFF01(\d{4})(?:DIA\d{2})?([A-Z]{4})([A-Z]{4})(\d{4})?"));
 static COMPACT_ON_IN: LazyLock<Regex> = LazyLock::new(|| re(r"^(ONN|INN)01(\d{4})([A-Z]{4}|-{4})"));
@@ -492,9 +428,7 @@ fn compact_report(text: &str) -> Option<Oooi> {
 }
 
 static DAY_CLOCK: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^(OUT|OFF|ONN|INN)\d{2}A(0[1-9]|[12]\d|3[01])(\d{6})([A-Z]{4})(?:([A-Z]{4})\d{6}|\d{4}([A-Z]{4})?)",
-    )
+    re(r"^(OUT|OFF|ONN|INN)\d{2}A(0[1-9]|[12]\d|3[01])(\d{6})([A-Z]{4})(?:([A-Z]{4})\d{6}|\d{4}([A-Z]{4})?)")
 });
 
 /// JAL (label 10) and ANA (label 11): event, version, `A`, day, HHMMSS:
@@ -515,19 +449,13 @@ fn day_clock_report(text: &str) -> Option<Oooi> {
     has_time(&o).then_some(o)
 }
 
-static DELTA_HEADER: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^(0[1-9]|[12]\d|3[01]|  )(?:[01]\d|2[0-3])(1[0-5]) ([A-Z0-9]{4}|-{4}| {4}) ([A-Z0-9]{4}|-{4}| {4})\d\r?\n\t?",
-    )
-});
-static DELTA_OUT: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^(?:\d{4}| {4})(\d{4})\d{4}[\d-]{4}[\d -]{4}"));
+static DELTA_HEADER: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^(0[1-9]|[12]\d|3[01]|  )(?:[01]\d|2[0-3])(1[0-5]) ([A-Z0-9]{4}|-{4}| {4}) ([A-Z0-9]{4}|-{4}| {4})\d\r?\n\t?"));
+static DELTA_OUT: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:\d{4}| {4})(\d{4})\d{4}[\d-]{4}[\d -]{4}"));
 static DELTA_OFF: LazyLock<Regex> =
     LazyLock::new(|| re(r"^(?:\d{4}| {4})([\d-]{4})\d{4}[\d -]{12}([\d -]{4})[\d -]{4}"));
-static DELTA_ON: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^(?:\d{4}| {4})(\d{4})\d{4} *(?:\r?\n|$)"));
-static DELTA_IN: LazyLock<Regex> =
-    LazyLock::new(|| re(r"^(?:\d{4}| {4})(\d{4})[\d ]{4}[\d ]{4} *$"));
+static DELTA_ON: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:\d{4}| {4})(\d{4})\d{4} *(?:\r?\n|$)"));
+static DELTA_IN: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:\d{4}| {4})(\d{4})[\d ]{4}[\d ]{4} *$"));
 static DELTA_SUMMARY: LazyLock<Regex> = LazyLock::new(|| re(r"^(?:\d{4}| {4})(\d{4})[\d ]{4}\S"));
 
 /// Delta: `<DD><HH><label> <dep> <arr><n>` then four-digit fields:
@@ -546,11 +474,7 @@ fn delta_report(label: &str, text: &str) -> Option<Oooi> {
         return None;
     }
     let body = &text[h.get(0)?.end()..];
-    let mut o = Oooi {
-        depa: icao(&h[3]),
-        dsta: icao(&h[4]),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: icao(&h[3]), dsta: icao(&h[4]), ..Oooi::default() };
     match label {
         "13" => set_event(&mut o, "OUT", clock(&DELTA_OUT.captures(body)?[1])),
         "10" => {
@@ -564,11 +488,7 @@ fn delta_report(label: &str, text: &str) -> Option<Oooi> {
             set_event(&mut o, "IN", clock(&DELTA_IN.captures(line)?[1]));
         }
         "11" => {
-            let line = body
-                .split(['\r', '\n'])
-                .next()
-                .unwrap_or("")
-                .trim_end_matches(' ');
+            let line = body.split(['\r', '\n']).next().unwrap_or("").trim_end_matches(' ');
             set_event(&mut o, "IN", clock(&DELTA_SUMMARY.captures(line)?[1]));
             if line.len() >= 16 {
                 set_event(&mut o, "ON", line.get(line.len() - 4..).and_then(clock));
@@ -580,9 +500,7 @@ fn delta_report(label: &str, text: &str) -> Option<Oooi> {
 }
 
 static CSV_VERSION: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^(OUT|OFF|ONE),V\d{2},[^,]*,([A-Z0-9-]{4}),([A-Z0-9-]{4}),(\d{4})(?:,|\s|$)(?:([\d-]{4})(?:,|\s|$)(?:(\d{4})(?:,|\s|$))?)?",
-    )
+    re(r"^(OUT|OFF|ONE),V\d{2},[^,]*,([A-Z0-9-]{4}),([A-Z0-9-]{4}),(\d{4})(?:,|\s|$)(?:([\d-]{4})(?:,|\s|$)(?:(\d{4})(?:,|\s|$))?)?")
 });
 
 /// Cathay Pacific `OUT,V02,CX 837 20261121 1,CYVR,VHHH,2044,2036,----, 1179`,
@@ -590,11 +508,7 @@ static CSV_VERSION: LazyLock<Regex> = LazyLock::new(|| {
 /// and `ONE,V02,CX 105 20261122 1,VHHH,YMML,0124,   96`.
 fn csv_version_report(text: &str) -> Option<Oooi> {
     let c = CSV_VERSION.captures(text)?;
-    let mut o = Oooi {
-        depa: icao(&c[2]),
-        dsta: icao(&c[3]),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: icao(&c[2]), dsta: icao(&c[3]), ..Oooi::default() };
     match &c[1] {
         "OUT" => set_event(&mut o, "OUT", clock(&c[4])),
         "OFF" => {
@@ -610,20 +524,14 @@ fn csv_version_report(text: &str) -> Option<Oooi> {
 }
 
 static CSV_CAR: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^CAR,V\d{2},[^,]*,[A-Z0-9]*,\d{2}[A-Z]{3}\d{2},([A-Z0-9-]{4}),([A-Z0-9-]{4}),\d{2},[A-Z]\r?\n([\d-]{4}),([\d-]{4}),([\d-]{4}),([\d-]{4}),",
-    )
+    re(r"^CAR,V\d{2},[^,]*,[A-Z0-9]*,\d{2}[A-Z]{3}\d{2},([A-Z0-9-]{4}),([A-Z0-9-]{4}),\d{2},[A-Z]\r?\n([\d-]{4}),([\d-]{4}),([\d-]{4}),([\d-]{4}),")
 });
 
 /// Cathay Pacific end of flight summary (label 16), OUT, OFF, ON, IN:
 /// `CAR,V03,CX 181 20261122 1,CX0181,22NOV26,VHHH,YSSY,01,Y\r\n1655,1721,0151,0157,...`.
 fn csv_car_report(text: &str) -> Option<Oooi> {
     let c = CSV_CAR.captures(text)?;
-    let mut o = Oooi {
-        depa: icao(&c[1]),
-        dsta: icao(&c[2]),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: icao(&c[1]), dsta: icao(&c[2]), ..Oooi::default() };
     set_event(&mut o, "OUT", clock(&c[3]));
     set_event(&mut o, "OFF", clock(&c[4]));
     set_event(&mut o, "ON", clock(&c[5]));
@@ -647,27 +555,21 @@ fn colon_times_report(text: &str) -> Option<Oooi> {
     has_time(&o).then_some(o)
 }
 
-static PUSHBACK: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"^PSHBK [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z")
-});
+static PUSHBACK: LazyLock<Regex> =
+    LazyLock::new(|| re(r"^PSHBK [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z"));
 
 /// Air Canada pushback `PSHBK AC0281/21/22 YVR 0603Z/    Z/    Z/0605Z`
 /// (label 4T) as the OUT time; the station is IATA, so it goes in `depa`
 /// like the QE/QF short layouts.
 fn pushback_report(text: &str) -> Option<Oooi> {
     let c = PUSHBACK.captures(text)?;
-    let mut o = Oooi {
-        depa: Some(c[1].to_string()),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: Some(c[1].to_string()), ..Oooi::default() };
     set_event(&mut o, "OUT", clock(&c[2]));
     has_time(&o).then_some(o)
 }
 
 static AIR_CANADA_EVENT: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^(ATD|ARV) [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z\s*$",
-    )
+    re(r"^(ATD|ARV) [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z\s*$")
 });
 
 /// Air Canada `ATD AC0128/22/22 YVR 0740Z` (sent at pushback, the OUT) and
@@ -686,9 +588,7 @@ fn air_canada_event(text: &str) -> Option<Oooi> {
 }
 
 static AGFSR: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^AGFSR [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01])/([A-Z]{3})([A-Z]{3})/\d{4}Z/",
-    )
+    re(r"^AGFSR [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01])/([A-Z]{3})([A-Z]{3})/\d{4}Z/")
 });
 
 /// Air Canada flight status report (label 4T), the last four of its 20
@@ -702,11 +602,7 @@ fn agfsr_report(text: &str) -> Option<Oooi> {
         return None;
     }
     let last = &fields[fields.len() - 4..];
-    let mut o = Oooi {
-        depa: Some(c[1].to_string()),
-        dsta: Some(c[2].to_string()),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: Some(c[1].to_string()), dsta: Some(c[2].to_string()), ..Oooi::default() };
     set_event(&mut o, "OUT", clock(last[0].trim()));
     set_event(&mut o, "OFF", clock(last[1].trim()));
     set_event(&mut o, "ON", clock(last[2].trim()));
@@ -715,9 +611,7 @@ fn agfsr_report(text: &str) -> Option<Oooi> {
 }
 
 static ARRIVAL_UPLINK: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^:PAD11\r?\nUTC\r?\nARRIVAL- [A-Z0-9]{4,6} +[A-Z0-9]{2}\d{1,4} *\r?\n(?:STAND \S+ +)?ATA (\d{4}) //",
-    )
+    re(r"^:PAD11\r?\nUTC\r?\nARRIVAL- [A-Z0-9]{4,6} +[A-Z0-9]{2}\d{1,4} *\r?\n(?:STAND \S+ +)?ATA (\d{4}) //")
 });
 
 /// British Airways arrival uplink at Heathrow (labels 10/11), sent after
@@ -731,9 +625,7 @@ fn arrival_uplink(text: &str) -> Option<Oooi> {
 }
 
 static SLOT_UPLINK: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^\dPAD11/SLOT\r?\n\t?[A-Z0-9]{2}\d{1,4} [A-Z0-9]{4,6}\r?\n\t?STD \d{4} STA \d{4}\r?\n\t?ATD (\d{4})\b",
-    )
+    re(r"^\dPAD11/SLOT\r?\n\t?[A-Z0-9]{2}\d{1,4} [A-Z0-9]{4,6}\r?\n\t?STD \d{4} STA \d{4}\r?\n\t?ATD (\d{4})\b")
 });
 
 /// Iberia slot uplink (label 10), sent after departure; ATD is the
@@ -746,9 +638,7 @@ fn slot_uplink(text: &str) -> Option<Oooi> {
 }
 
 static AIR_CANADA_ETA: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^(?:ETA|EAA) [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z\s*$",
-    )
+    re(r"^(?:ETA|EAA) [A-Z0-9]{3,8}/(?:0[1-9]|[12]\d|3[01])/(?:0[1-9]|[12]\d|3[01]) ([A-Z]{3}) (\d{4})Z\s*$")
 });
 
 /// Air Canada arrival estimates (label 4T), IATA station:
@@ -757,11 +647,7 @@ static AIR_CANADA_ETA: LazyLock<Regex> = LazyLock::new(|| {
 fn air_canada_eta(text: &str) -> Option<Oooi> {
     let c = AIR_CANADA_ETA.captures(text)?;
     let eta = clock(&c[2])?;
-    Some(Oooi {
-        dsta: Some(c[1].to_string()),
-        eta: Some(eta),
-        ..Oooi::default()
-    })
+    Some(Oooi { dsta: Some(c[1].to_string()), eta: Some(eta), ..Oooi::default() })
 }
 
 static CSV_ETA: LazyLock<Regex> =
@@ -772,36 +658,24 @@ static CSV_ETA: LazyLock<Regex> =
 fn csv_eta_report(text: &str) -> Option<Oooi> {
     let c = CSV_ETA.captures(text)?;
     let eta = clock(&c[3])?;
-    Some(Oooi {
-        depa: icao(&c[1]),
-        dsta: icao(&c[2]),
-        eta: Some(eta),
-        ..Oooi::default()
-    })
+    Some(Oooi { depa: icao(&c[1]), dsta: icao(&c[2]), eta: Some(eta), ..Oooi::default() })
 }
 
 static ARRIVAL_ETA_UPLINK: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^:PAD11\r?\nUTC\r?\nARRIVAL- [A-Z0-9]{4,6} +[A-Z0-9]{2}\d{1,4} *\r?\n(?:STAND \S+ +)?ETA (\d{4}) //",
-    )
+    re(r"^:PAD11\r?\nUTC\r?\nARRIVAL- [A-Z0-9]{4,6} +[A-Z0-9]{2}\d{1,4} *\r?\n(?:STAND \S+ +)?ETA (\d{4}) //")
 });
 
 /// British Airways arrival uplink before on-blocks (labels 10/11):
 /// `:PAD11\r\nUTC\r\nARRIVAL- GXWBB BA066  \r\nSTAND 305  ETA 0658 //`.
 fn arrival_eta_uplink(text: &str) -> Option<Oooi> {
     let c = ARRIVAL_ETA_UPLINK.captures(text)?;
-    Some(Oooi {
-        eta: Some(clock(&c[1])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { eta: Some(clock(&c[1])?), ..Oooi::default() })
 }
 
 // --- Round 5 layouts (production samples 2026-11-22) ---
 
 static HEADER_ESTIMATE: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"(?:^|,)\d[0-9A-Z]\d{2} (POSRPT|ETA|INRANG|DEPDLY)[ /]+[A-Z0-9]{1,8} *(?:/ORGDATE\d{4})?/(?:(?:0[1-9]|[12]\d|3[01]) +)?([A-Z0-9]{4})/([A-Z0-9]{4})\b",
-    )
+    re(r"(?:^|,)\d[0-9A-Z]\d{2} (POSRPT|ETA|INRANG|DEPDLY)[ /]+[A-Z0-9]{1,8} *(?:/ORGDATE\d{4})?/(?:(?:0[1-9]|[12]\d|3[01]) +)?([A-Z0-9]{4})/([A-Z0-9]{4})\b")
 });
 static ESTIMATE_TAG: LazyLock<Regex> = LazyLock::new(|| re(r"(?:^|[/\s])ETA ?(\d{4})\b"));
 static DEPDLY_ATD: LazyLock<Regex> = LazyLock::new(|| re(r"(?m)^ATD (\d{4})/ETD \d{4}\b"));
@@ -817,11 +691,7 @@ static DEPDLY_ATD: LazyLock<Regex> = LazyLock::new(|| re(r"(?m)^ATD (\d{4})/ETD 
 fn header_estimate(text: &str) -> Option<Oooi> {
     let c = HEADER_ESTIMATE.captures(text)?;
     let rest = &text[c.get(0)?.end()..];
-    let mut o = Oooi {
-        depa: icao(&c[2]),
-        dsta: icao(&c[3]),
-        ..Oooi::default()
-    };
+    let mut o = Oooi { depa: icao(&c[2]), dsta: icao(&c[3]), ..Oooi::default() };
     if &c[1] == "DEPDLY" {
         o.gtout = Some(clock(&DEPDLY_ATD.captures(rest)?[1])?);
     } else {
@@ -834,26 +704,18 @@ static GOL_ETA: LazyLock<Regex> = LazyLock::new(|| re(r"^ETA ?RPT\r?\nETA (\d{4}
 
 /// GOL (labels 33 and 80): `ETA RPT\r\nETA 0912`, `ETARPT\r\nETA 0845`.
 fn gol_eta(text: &str) -> Option<Oooi> {
-    Some(Oooi {
-        eta: Some(clock(&GOL_ETA.captures(text)?[1])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { eta: Some(clock(&GOL_ETA.captures(text)?[1])?), ..Oooi::default() })
 }
 
 static SAS_ETA: LazyLock<Regex> = LazyLock::new(|| re(r"^V\d{2}CA\d{3}/ETA-\d{2}/(\d{4})/"));
 
 /// SAS (label 83), about 30 minutes out: `V09CA033/ETA-30/0550/`.
 fn sas_eta(text: &str) -> Option<Oooi> {
-    Some(Oooi {
-        eta: Some(clock(&SAS_ETA.captures(text)?[1])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { eta: Some(clock(&SAS_ETA.captures(text)?[1])?), ..Oooi::default() })
 }
 
 static SAS_OFFRP: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^V\d{2}CA\d{3}/OFFRP/([A-Z0-9]{4})/([A-Z0-9]{4})/(?:0[1-9]|[12]\d|3[01])/(\d{4})/(?:ETA(\d{4})/)?",
-    )
+    re(r"^V\d{2}CA\d{3}/OFFRP/([A-Z0-9]{4})/([A-Z0-9]{4})/(?:0[1-9]|[12]\d|3[01])/(\d{4})/(?:ETA(\d{4})/)?")
 });
 
 /// SAS takeoff report (label 8B): `V09CA032/OFFRP/ESSA/EKCH/22/0505/ETA0602/`.
@@ -869,20 +731,13 @@ fn sas_offrp(text: &str) -> Option<Oooi> {
 }
 
 static KLM_ETA: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"^ETA\d{2}A(?:0[1-9]|[12]\d|3[01])\d{6}[A-Z]{3}\d{1,4} ([A-Z]{4})([A-Z]{4})(?:0[1-9]|[12]\d|3[01])(\d{4})",
-    )
+    re(r"^ETA\d{2}A(?:0[1-9]|[12]\d|3[01])\d{6}[A-Z]{3}\d{1,4} ([A-Z]{4})([A-Z]{4})(?:0[1-9]|[12]\d|3[01])(\d{4})")
 });
 
 /// KLM (label 10): `ETA31A22055150KLC1708 ELLXEHAM220602EHAM  30`.
 fn klm_eta(text: &str) -> Option<Oooi> {
     let c = KLM_ETA.captures(text)?;
-    Some(Oooi {
-        depa: icao(&c[1]),
-        dsta: icao(&c[2]),
-        eta: Some(clock(&c[3])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { depa: icao(&c[1]), dsta: icao(&c[2]), eta: Some(clock(&c[3])?), ..Oooi::default() })
 }
 
 static PRESENT_POSITION: LazyLock<Regex> =
@@ -891,20 +746,14 @@ static PRESENT_POSITION: LazyLock<Regex> =
 /// Present position report (label 14):
 /// `PRESENT POSITION REPORT\r\nDMY 211126,UTC 052937,LAT N41.561,...,FOB 15135,ETA 0600`.
 fn present_position(text: &str) -> Option<Oooi> {
-    Some(Oooi {
-        eta: Some(clock(&PRESENT_POSITION.captures(text)?[1])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { eta: Some(clock(&PRESENT_POSITION.captures(text)?[1])?), ..Oooi::default() })
 }
 
 static LABEL3A_ETA: LazyLock<Regex> = LazyLock::new(|| re(r"^/ETA (\d{4})/LAT "));
 
 /// Position report (label 3A): `/ETA 0905/LAT N 49.194/LON E 14.547/ALT 29999/FB 70`.
 fn label3a_eta(text: &str) -> Option<Oooi> {
-    Some(Oooi {
-        eta: Some(clock(&LABEL3A_ETA.captures(text)?[1])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { eta: Some(clock(&LABEL3A_ETA.captures(text)?[1])?), ..Oooi::default() })
 }
 
 static FINNAIR_ETA: LazyLock<Regex> = LazyLock::new(|| {
@@ -915,23 +764,14 @@ static FINNAIR_ETA: LazyLock<Regex> = LazyLock::new(|| {
 /// (departure, arrival, alternate, then the ETA).
 fn finnair_eta(text: &str) -> Option<Oooi> {
     let c = FINNAIR_ETA.captures(text)?;
-    Some(Oooi {
-        depa: icao(&c[1]),
-        dsta: icao(&c[2]),
-        eta: Some(clock(&c[3])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { depa: icao(&c[1]), dsta: icao(&c[2]), eta: Some(clock(&c[3])?), ..Oooi::default() })
 }
 
-static TRAKK_ETA: LazyLock<Regex> =
-    LazyLock::new(|| re(r"(?m)\ATRAKK \d{4} [\s\S]*?^ETA (\d{4}) EFOB"));
+static TRAKK_ETA: LazyLock<Regex> = LazyLock::new(|| re(r"(?m)\ATRAKK \d{4} [\s\S]*?^ETA (\d{4}) EFOB"));
 
 /// Waypoint report (label 81): `TRAKK 0627 FL370 FOB18.3\r\nAVERE 0645/HAR 0702\r\nETA 0754 EFOB 12.3`.
 fn trakk_eta(text: &str) -> Option<Oooi> {
-    Some(Oooi {
-        eta: Some(clock(&TRAKK_ETA.captures(text)?[1])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { eta: Some(clock(&TRAKK_ETA.captures(text)?[1])?), ..Oooi::default() })
 }
 
 static FPR_HEADER: LazyLock<Regex> =
@@ -951,20 +791,14 @@ fn fpr_report(text: &str) -> Option<Oooi> {
 }
 
 static UNITED_DUTY: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"(?m)^\t?-  FLT# \d{1,4}-\d{2} +([A-Z0-9]{4}) +\d{2}:\d{2}\r?\n\t?PART 117 +RLS \d+ +ACT DEP (\d{4})\b",
-    )
+    re(r"(?m)^\t?-  FLT# \d{1,4}-\d{2} +([A-Z0-9]{4}) +\d{2}:\d{2}\r?\n\t?PART 117 +RLS \d+ +ACT DEP (\d{4})\b")
 });
 
 /// United crew duty uplink (label C1) sent at pushback; ACT DEP is the OUT time:
 /// `-  FLT# 2464-21    KSFO     04:40\r\nPART 117        RLS 1   ACT DEP 0439`.
 fn united_duty_report(text: &str) -> Option<Oooi> {
     let c = UNITED_DUTY.captures(text)?;
-    Some(Oooi {
-        depa: icao(&c[1]),
-        gtout: Some(clock(&c[2])?),
-        ..Oooi::default()
-    })
+    Some(Oooi { depa: icao(&c[1]), gtout: Some(clock(&c[2])?), ..Oooi::default() })
 }
 
 /// Extract OOOI fields for `label` from message `text`. Returns `None` when
@@ -1196,11 +1030,7 @@ pub fn decode(label: &str, text: &str) -> Option<Oooi> {
         _ => return None,
     }
 
-    if o.is_empty() {
-        None
-    } else {
-        Some(o)
-    }
+    if o.is_empty() { None } else { Some(o) }
 }
 
 #[cfg(test)]
@@ -1305,12 +1135,7 @@ mod tests {
     // --- Report formats from Airframes production traffic (Nov 21-22 2026) ---
 
     fn times(o: &Oooi) -> [Option<&str>; 4] {
-        [
-            o.gtout.as_deref(),
-            o.wloff.as_deref(),
-            o.wlin.as_deref(),
-            o.gtin.as_deref(),
-        ]
+        [o.gtout.as_deref(), o.wloff.as_deref(), o.wlin.as_deref(), o.gtin.as_deref()]
     }
 
     #[test]
@@ -1333,19 +1158,12 @@ mod tests {
             "3501 SUMMRY 3390/20 KPHX/KILN .N337AZ\r\n/OUT 1600/FOB 0541\r\n/OFF 1615/FOB ----\r\n/ON  1930/FOB ----\r\n/IN  1937/FOB 0224",
         )
         .unwrap();
-        assert_eq!(
-            times(&o),
-            [Some("1600"), Some("1615"), Some("1930"), Some("1937")]
-        );
+        assert_eq!(times(&o), [Some("1600"), Some("1615"), Some("1930"), Some("1937")]);
     }
 
     #[test]
     fn airline_single_line_outrp() {
-        let o = decode(
-            "80",
-            "1001 OUTRP 1925/21 KBOS/MMGL .XA-VSX/OUT 1245/FOB  171",
-        )
-        .unwrap();
+        let o = decode("80", "1001 OUTRP 1925/21 KBOS/MMGL .XA-VSX/OUT 1245/FOB  171").unwrap();
         assert_eq!(o.depa.as_deref(), Some("KBOS"));
         assert_eq!(o.dsta.as_deref(), Some("MMGL"));
         assert_eq!(o.gtout.as_deref(), Some("1245"));
@@ -1388,29 +1206,17 @@ mod tests {
 
     #[test]
     fn airline_inrp_label_8d_and_outrp_label_82() {
-        let o = decode(
-            "8D",
-            "13H3 INRP   2513/21 EKCH/EGPH .OY-KBR\r\n/ON 1825/IN 1828",
-        )
-        .unwrap();
+        let o = decode("8D", "13H3 INRP   2513/21 EKCH/EGPH .OY-KBR\r\n/ON 1825/IN 1828").unwrap();
         assert_eq!(o.depa.as_deref(), Some("EKCH"));
         assert_eq!(times(&o), [None, None, Some("1825"), Some("1828")]);
 
-        let o = decode(
-            "82",
-            "1001 OUTRP  0602/21 YSSY/RKSI .HL7626\r\n/OUT 2347/FOB 3084",
-        )
-        .unwrap();
+        let o = decode("82", "1001 OUTRP  0602/21 YSSY/RKSI .HL7626\r\n/OUT 2347/FOB 3084").unwrap();
         assert_eq!(o.gtout.as_deref(), Some("2347"));
     }
 
     #[test]
     fn label_80_position_report_is_not_oooi() {
-        assert!(decode(
-            "80",
-            "3N01 POSRPT 0581/27 KIAD/MSLP .N962AV\r\n/POS N38541W077244"
-        )
-        .is_none());
+        assert!(decode("80", "3N01 POSRPT 0581/27 KIAD/MSLP .N962AV\r\n/POS N38541W077244").is_none());
     }
 
     #[test]
@@ -1439,17 +1245,11 @@ mod tests {
     #[test]
     fn british_airways_compact_reports() {
         let o = decode("11", "OUT0105400525LSZHEGLL").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("LSZH"), Some("EGLL"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("LSZH"), Some("EGLL")));
         assert_eq!(o.gtout.as_deref(), Some("0540"));
 
         let o = decode("12", "OFF010247DIA02KEWREGLL0859BAB7080926130450READY ").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("KEWR"), Some("EGLL"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("KEWR"), Some("EGLL")));
         assert_eq!(o.wloff.as_deref(), Some("0247"));
         assert_eq!(o.eta.as_deref(), Some("0859"));
 
@@ -1467,10 +1267,7 @@ mod tests {
     #[test]
     fn jal_and_ana_day_clock_reports() {
         let o = decode("10", "OUT04A21204409KSFO2044RJTT").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("KSFO"), Some("RJTT"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("KSFO"), Some("RJTT")));
         assert_eq!(o.gtout.as_deref(), Some("2044"));
 
         let o = decode("10", "ONN04A21200226YSSY2002").unwrap();
@@ -1481,21 +1278,11 @@ mod tests {
         assert_eq!(o.gtout.as_deref(), Some("0037"));
 
         let o = decode("11", "OFF01A21070436RJSSRJCC070421").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("RJSS"), Some("RJCC"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("RJSS"), Some("RJCC")));
         assert_eq!(o.wloff.as_deref(), Some("0704"));
 
-        let o = decode(
-            "14",
-            "M99ANH0218INN01ANA218    /21212126EDDMRJTT\n\t2124192 ",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("EDDM"), Some("RJTT"))
-        );
+        let o = decode("14", "M99ANH0218INN01ANA218    /21212126EDDMRJTT\n\t2124192 ").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("EDDM"), Some("RJTT")));
         assert_eq!(o.gtin.as_deref(), Some("2124"));
 
         assert!(decode("10", "ETA04M22062329   VTBS090161  340Y").is_none());
@@ -1503,46 +1290,23 @@ mod tests {
 
     #[test]
     fn delta_reports() {
-        let o = decode(
-            "13",
-            "210513 KLAX KATL6\r\n07830550038005490542            ",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("KLAX"), Some("KATL"))
-        );
+        let o = decode("13", "210513 KLAX KATL6\r\n07830550038005490542            ").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("KLAX"), Some("KATL")));
         assert_eq!(o.gtout.as_deref(), Some("0550"));
         assert_eq!(o.wloff, None);
 
-        let o = decode(
-            "10",
-            "210610 KLAX KATL6\r\n07830603037905520549054205500550            ",
-        )
-        .unwrap();
+        let o = decode("10", "210610 KLAX KATL6\r\n07830603037905520549054205500550            ").unwrap();
         assert_eq!(o.wloff.as_deref(), Some("0603"));
         assert_eq!(o.gtout.as_deref(), Some("0550"));
 
-        let o = decode(
-            "10",
-            "212010 KORD KATL6\r\n2894200502051942        19411941000000000000",
-        )
-        .unwrap();
+        let o = decode("10", "212010 KORD KATL6\r\n2894200502051942        19411941000000000000").unwrap();
         assert_eq!(o.wloff.as_deref(), Some("2005"));
         assert_eq!(o.gtout.as_deref(), Some("1941"));
 
-        let o = decode(
-            "15",
-            "210015 KSAT KBOS6\r\n081600450059\r\n000000903094901036000000000000001160000148",
-        )
-        .unwrap();
+        let o = decode("15", "210015 KSAT KBOS6\r\n081600450059\r\n000000903094901036000000000000001160000148").unwrap();
         assert_eq!(o.wlin.as_deref(), Some("0045"));
 
-        let o = decode(
-            "15",
-            "M70ADL0065201915 KLAX NZAA6\n\t006519470293\n\t      391944456540488833007827   ",
-        )
-        .unwrap();
+        let o = decode("15", "M70ADL0065201915 KLAX NZAA6\n\t006519470293\n\t      391944456540488833007827   ").unwrap();
         assert_eq!(o.dsta.as_deref(), Some("NZAA"));
         assert_eq!(o.wlin.as_deref(), Some("1947"));
 
@@ -1552,51 +1316,22 @@ mod tests {
         let o = decode("14", "212214 KJFK KSFO6\r\n03632222        ").unwrap();
         assert_eq!(o.gtin.as_deref(), Some("2222"));
 
-        let o = decode(
-            "11",
-            "210111 KSAT KBOS6\r\n081600560056111390  0       0011600001490045\r\n\r\n",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.gtin.as_deref(), o.wlin.as_deref()),
-            (Some("0056"), Some("0045"))
-        );
+        let o = decode("11", "210111 KSAT KBOS6\r\n081600560056111390  0       0011600001490045\r\n\r\n").unwrap();
+        assert_eq!((o.gtin.as_deref(), o.wlin.as_deref()), (Some("0056"), Some("0045")));
 
-        let o = decode(
-            "11",
-            "210511 KSLC KBOS8\r\n07020454    111200  0                   0449\r\n",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.gtin.as_deref(), o.wlin.as_deref()),
-            (Some("0454"), Some("0449"))
-        );
+        let o = decode("11", "210511 KSLC KBOS8\r\n07020454    111200  0                   0449\r\n").unwrap();
+        assert_eq!((o.gtin.as_deref(), o.wlin.as_deref()), (Some("0454"), Some("0449")));
 
         // a header for another label, a delay remark, a position report
         assert!(decode("13", "210514 KDTW KLAX6\r\n0694062900810084").is_none());
-        assert!(decode(
-            "12",
-            "212212 KSFO KATL6\r\n2253\r\nLONG LINE OF DEPARTURES\r\n"
-        )
-        .is_none());
-        assert!(decode(
-            "17",
-            "210617 KDTW EDDF7\r\n/FN 0086\r\nAGPED   06103900727-602750290039682"
-        )
-        .is_none());
+        assert!(decode("12", "212212 KSFO KATL6\r\n2253\r\nLONG LINE OF DEPARTURES\r\n").is_none());
+        assert!(decode("17", "210617 KDTW EDDF7\r\n/FN 0086\r\nAGPED   06103900727-602750290039682").is_none());
     }
 
     #[test]
     fn cathay_skywest_and_air_canada_reports() {
-        let o = decode(
-            "11",
-            "OUT,V02,CX 837 20261121 1,CYVR,VHHH,2044,2036,----, 1179",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("CYVR"), Some("VHHH"))
-        );
+        let o = decode("11", "OUT,V02,CX 837 20261121 1,CYVR,VHHH,2044,2036,----, 1179").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("CYVR"), Some("VHHH")));
         assert_eq!(o.gtout.as_deref(), Some("2044"));
 
         let o = decode("13", "ONE,V02,CX 105 20261122 1,VHHH,YMML,0124,   96").unwrap();
@@ -1615,41 +1350,20 @@ mod tests {
         let o = decode("4T", "PSHBK AC0281/21/22 YVR 0603Z/    Z/    Z/0605Z").unwrap();
         assert_eq!(o.depa.as_deref(), Some("YVR"));
         assert_eq!(o.gtout.as_deref(), Some("0603"));
-        assert_eq!(
-            decode("4T", "ETA AC0404/21/21 YUL 1510Z")
-                .unwrap()
-                .eta
-                .as_deref(),
-            Some("1510")
-        );
+        assert_eq!(decode("4T", "ETA AC0404/21/21 YUL 1510Z").unwrap().eta.as_deref(), Some("1510"));
     }
 
     #[test]
     fn air_canada_status_and_event_reports() {
         let o = decode("4T", "ATD AC0128/22/22 YVR 0740Z").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.gtout.as_deref()),
-            (Some("YVR"), Some("0740"))
-        );
+        assert_eq!((o.depa.as_deref(), o.gtout.as_deref()), (Some("YVR"), Some("0740")));
         let o = decode("4T", "ARV AC0856/21/22 LHR 0823Z").unwrap();
-        assert_eq!(
-            (o.dsta.as_deref(), o.wlin.as_deref()),
-            (Some("LHR"), Some("0823"))
-        );
-        assert_eq!(
-            decode("4T", "EAA AC7267/21/22 YYZ 0908Z")
-                .unwrap()
-                .eta
-                .as_deref(),
-            Some("0908")
-        );
+        assert_eq!((o.dsta.as_deref(), o.wlin.as_deref()), (Some("LHR"), Some("0823")));
+        assert_eq!(decode("4T", "EAA AC7267/21/22 YYZ 0908Z").unwrap().eta.as_deref(), Some("0908"));
 
         let o = decode("4T", "AGFSR AC0842/21/22/YYZFRA/0853Z/839/5146.5N00231.5W/389/CRUISE/0137/0342/M54/277016/0261/112/500/0242/0257/****/****").unwrap();
         assert_eq!(times(&o), [Some("0242"), Some("0257"), None, None]);
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("YYZ"), Some("FRA"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("YYZ"), Some("FRA")));
         let o = decode("4T", "AGFSR AC0856/21/22/YYZLHR/0823Z/733/5128.7N00028.0W/000/RL OUT/0118/0527/P08/085005/0111/090/106/0127/0150/0823/----").unwrap();
         assert_eq!(times(&o), [Some("0127"), Some("0150"), Some("0823"), None]);
         let o = decode("4T", "AGFSR AC0328/22/22/YYCYUL/0826Z/144/5057.2N11149.2W/270/LEVEL /0105/0012/M44/349019/0289/097/27 /0741/0810/    /    ").unwrap();
@@ -1661,54 +1375,27 @@ mod tests {
 
     #[test]
     fn cathay_off_and_summary_reports() {
-        let o = decode(
-            "12",
-            "OFF,V02,CX 837 20261121 1,CYVR,VHHH,2044,2104,1004, 1175",
-        )
-        .unwrap();
+        let o = decode("12", "OFF,V02,CX 837 20261121 1,CYVR,VHHH,2044,2104,1004, 1175").unwrap();
         assert_eq!(times(&o), [Some("2044"), Some("2104"), None, None]);
-        let o = decode(
-            "12",
-            "OFF,V03,CX 83  20261121 2,KLAX,VHHH,0437,0500,CX,1711",
-        )
-        .unwrap();
+        let o = decode("12", "OFF,V03,CX 83  20261121 2,KLAX,VHHH,0437,0500,CX,1711").unwrap();
         assert_eq!(times(&o), [Some("0437"), Some("0500"), None, None]);
         let o = decode("12", "OFF,V01,CX 314220261121 1,VIDP,VHHH,1008,1029,,  473").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.wloff.as_deref()),
-            (Some("VIDP"), Some("1029"))
-        );
+        assert_eq!((o.depa.as_deref(), o.wloff.as_deref()), (Some("VIDP"), Some("1029")));
         // An OFF field still dashed keeps the OUT time.
-        let o = decode(
-            "12",
-            "OFF,V02,CX 837 20261121 1,CYVR,VHHH,2044,----,----, 1175",
-        )
-        .unwrap();
+        let o = decode("12", "OFF,V02,CX 837 20261121 1,CYVR,VHHH,2044,----,----, 1175").unwrap();
         assert_eq!(times(&o), [Some("2044"), None, None, None]);
 
         let o = decode("16", "CAR,V03,CX 181 20261122 1,CX0181,22NOV26,VHHH,YSSY,01,Y\r\n1655,1721,0151,0157,1655,0829,---,--------,--------, ").unwrap();
-        assert_eq!(
-            times(&o),
-            [Some("1655"), Some("1721"), Some("0151"), Some("0157")]
-        );
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("VHHH"), Some("YSSY"))
-        );
+        assert_eq!(times(&o), [Some("1655"), Some("1721"), Some("0151"), Some("0157")]);
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("VHHH"), Some("YSSY")));
     }
 
     #[test]
     fn iberia_reports_and_ground_uplinks() {
         let o = decode("11", "OUT0118321827LSZH.FOB19560").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref(), o.gtout.as_deref()),
-            (Some("LSZH"), None, Some("1832"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref(), o.gtout.as_deref()), (Some("LSZH"), None, Some("1832")));
         let o = decode("12", "OFF010652LSZHLEMD").unwrap();
-        assert_eq!(
-            (o.dsta.as_deref(), o.wloff.as_deref()),
-            (Some("LEMD"), Some("0652"))
-        );
+        assert_eq!((o.dsta.as_deref(), o.wloff.as_deref()), (Some("LEMD"), Some("0652")));
         let o = decode("14", "INN010817EGLL.FOB6920").unwrap();
         assert_eq!(o.gtin.as_deref(), Some("0817"));
 
@@ -1722,42 +1409,16 @@ mod tests {
 
     #[test]
     fn delta_blank_and_dashed_headers() {
-        let o = decode(
-            "13",
-            "  0313          6\r\n    033200740328    173165061208",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.gtout.as_deref()),
-            (None, Some("0332"))
-        );
-        let o = decode(
-            "13",
-            "  0113 ---- ----6\r\n000001550198--------            ",
-        )
-        .unwrap();
+        let o = decode("13", "  0313          6\r\n    033200740328    173165061208").unwrap();
+        assert_eq!((o.depa.as_deref(), o.gtout.as_deref()), (None, Some("0332")));
+        let o = decode("13", "  0113 ---- ----6\r\n000001550198--------            ").unwrap();
         assert_eq!(o.gtout.as_deref(), Some("0155"));
-        let o = decode(
-            "10",
-            "  0110 ---- ----6\r\n0000----0196------------01550155            ",
-        )
-        .unwrap();
+        let o = decode("10", "  0110 ---- ----6\r\n0000----0196------------01550155            ").unwrap();
         assert_eq!(times(&o), [Some("0155"), None, None, None]);
-        let o = decode(
-            "10",
-            "  1410          6\r\n    14440344----            1444083617028547",
-        )
-        .unwrap();
+        let o = decode("10", "  1410          6\r\n    14440344----            1444083617028547").unwrap();
         assert_eq!(o.wloff.as_deref(), Some("1444"));
-        let o = decode(
-            "11",
-            "  2311          6\r\n    23290109003163                      2322\r\n\r\n",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.gtin.as_deref(), o.wlin.as_deref()),
-            (Some("2329"), Some("2322"))
-        );
+        let o = decode("11", "  2311          6\r\n    23290109003163                      2322\r\n\r\n").unwrap();
+        assert_eq!((o.gtin.as_deref(), o.wlin.as_deref()), (Some("2329"), Some("2322")));
         let o = decode("14", "  2314          6\r\n    23290109    ").unwrap();
         assert_eq!(o.gtin.as_deref(), Some("2329"));
     }
@@ -1765,41 +1426,23 @@ mod tests {
     #[test]
     fn arrival_estimates() {
         let o = decode("4T", "ETA AC0842/21/22 FRA 1010Z").unwrap();
-        assert_eq!(
-            (o.dsta.as_deref(), o.eta.as_deref()),
-            (Some("FRA"), Some("1010"))
-        );
+        assert_eq!((o.dsta.as_deref(), o.eta.as_deref()), (Some("FRA"), Some("1010")));
         assert_eq!(times(&o), [None, None, None, None]);
         let o = decode("4T", "EAA AC0856/21/22 LHR 0831Z").unwrap();
         assert_eq!(o.eta.as_deref(), Some("0831"));
         assert!(decode("4T", "EAA AC0856/21/22 LHR 2531Z").is_none());
 
         let o = decode("31", "ETA,V01,CX 111 20261121 1,VHHH,YSSY,2009,  144").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref(), o.eta.as_deref()),
-            (Some("VHHH"), Some("YSSY"), Some("2009"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref(), o.eta.as_deref()), (Some("VHHH"), Some("YSSY"), Some("2009")));
 
-        let o = decode(
-            "12",
-            "OFF,V02,CX 837 20261121 1,CYVR,VHHH,2044,2104,1004, 1175",
-        )
-        .unwrap();
+        let o = decode("12", "OFF,V02,CX 837 20261121 1,CYVR,VHHH,2044,2104,1004, 1175").unwrap();
         assert_eq!(o.eta.as_deref(), Some("1004"));
-        let o = decode(
-            "12",
-            "OFF,V03,CX 83  20261121 2,KLAX,VHHH,0437,0500,CX,1711",
-        )
-        .unwrap();
+        let o = decode("12", "OFF,V03,CX 83  20261121 2,KLAX,VHHH,0437,0500,CX,1711").unwrap();
         assert_eq!(o.eta, None);
 
         let o = decode("11", ":PAD11\r\nUTC\r\nARRIVAL- GXWBB BA066  \r\nSTAND 305  ETA 0658 //\r\nON STAND- UNKNOWN //").unwrap();
         assert_eq!((o.eta.as_deref(), o.gtin.as_deref()), (Some("0658"), None));
-        let o = decode(
-            "10",
-            ":PAD11\r\nUTC\r\nARRIVAL- GXWBB BA066  \r\nETA 0658 //",
-        )
-        .unwrap();
+        let o = decode("10", ":PAD11\r\nUTC\r\nARRIVAL- GXWBB BA066  \r\nETA 0658 //").unwrap();
         assert_eq!(o.eta.as_deref(), Some("0658"));
     }
 
@@ -1842,27 +1485,15 @@ mod tests {
 
     #[test]
     fn q_series_text_reports() {
-        let o = decode(
-            "QE",
-            "-------------------OUT REPORT\r\nDEP RCKU,OUT 1118,FOB 106",
-        )
-        .unwrap();
+        let o = decode("QE", "-------------------OUT REPORT\r\nDEP RCKU,OUT 1118,FOB 106").unwrap();
         assert_eq!(o.depa.as_deref(), Some("RCKU"));
         assert_eq!(o.gtout.as_deref(), Some("1118"));
 
-        let o = decode(
-            "QE",
-            "M77ASC4873-------------------OUT REPORT,DEP ZSQD,OUT 2350,FOB 110",
-        )
-        .unwrap();
+        let o = decode("QE", "M77ASC4873-------------------OUT REPORT,DEP ZSQD,OUT 2350,FOB 110").unwrap();
         assert_eq!(o.depa.as_deref(), Some("ZSQD"));
         assert_eq!(o.gtout.as_deref(), Some("2350"));
 
-        let o = decode(
-            "QF",
-            "----------OFF REPORT\r\nDEP RCKU,OFF 1124,DES RCSS,FOB 106",
-        )
-        .unwrap();
+        let o = decode("QF", "----------OFF REPORT\r\nDEP RCKU,OFF 1124,DES RCSS,FOB 106").unwrap();
         assert_eq!(o.dsta.as_deref(), Some("RCSS"));
         assert_eq!(o.wloff.as_deref(), Some("1124"));
 
@@ -1870,11 +1501,8 @@ mod tests {
         assert_eq!(o.dsta.as_deref(), Some("RCKU"));
         assert_eq!(o.wlin.as_deref(), Some("0843"));
 
-        let o = decode(
-            "QD",
-            "M55AZH9110------------INNRPT\n\tDES ZGSZ,N 22380E113495,IN 165807,FOB ,DEP ZBAA",
-        )
-        .unwrap();
+        let o = decode("QD", "M55AZH9110------------INNRPT\n\tDES ZGSZ,N 22380E113495,IN 165807,FOB ,DEP ZBAA")
+            .unwrap();
         assert_eq!(o.depa.as_deref(), Some("ZBAA"));
         assert_eq!(o.dsta.as_deref(), Some("ZGSZ"));
         assert_eq!(o.gtin.as_deref(), Some("1658"));
@@ -1915,27 +1543,15 @@ mod tests {
 
     #[test]
     fn united_slash_reports() {
-        let o = decode(
-            "14",
-            "/14 OFF EVENT      / KIAD KMCO 21 145718/TIME 1457\r\n/AU 17542332",
-        )
-        .unwrap();
+        let o = decode("14", "/14 OFF EVENT      / KIAD KMCO 21 145718/TIME 1457\r\n/AU 17542332").unwrap();
         assert_eq!(o.depa.as_deref(), Some("KIAD"));
         assert_eq!(o.dsta.as_deref(), Some("KMCO"));
         assert_eq!(o.wloff.as_deref(), Some("1457"));
 
-        let o = decode(
-            "17",
-            "/17 POST RPT       / KORD KAUS 21 214146/TIME 2140\r\n/FOB 0068",
-        )
-        .unwrap();
+        let o = decode("17", "/17 POST RPT       / KORD KAUS 21 214146/TIME 2140\r\n/FOB 0068").unwrap();
         assert_eq!(o.gtin.as_deref(), Some("2140"));
 
-        let o = decode(
-            "18",
-            "/18 POST TIMES SECS/ KSFO KDFW 20 042934/IN TIME0428/PDOOR 042934",
-        )
-        .unwrap();
+        let o = decode("18", "/18 POST TIMES SECS/ KSFO KDFW 20 042934/IN TIME0428/PDOOR 042934").unwrap();
         assert_eq!(o.gtin.as_deref(), Some("0428"));
 
         let o = decode(
@@ -1944,10 +1560,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.depa.as_deref(), Some("DGAA"));
-        assert_eq!(
-            times(&o),
-            [Some("2216"), Some("2235"), Some("0938"), Some("0946")]
-        );
+        assert_eq!(times(&o), [Some("2216"), Some("2235"), Some("0938"), Some("0946")]);
 
         assert!(decode("12", "/12 CREW EVENT     / KMSP KORD 21 222646/TIME 2226").is_none());
     }
@@ -1976,38 +1589,16 @@ mod tests {
             eta("83", "3N01 POSRPT 0054/SKBO/LFPG .N786AV/03A04:38\r\n/POS N47218 W001503/FL 40001/TAS 495/SAT - 52\r\n/SWND    39/DWND - 117/FOB 10100/ETA 0510"),
             (s("SKBO"), s("LFPG"), s("0510"))
         );
-        assert_eq!(
-            eta(
-                "80",
-                "3401 ETA    0317/22 LFPG/LIRF .EI-DTN\r\n/ETA 0650/FOB 0058"
-            ),
-            (s("LFPG"), s("LIRF"), s("0650"))
-        );
-        assert_eq!(
-            eta("80", "3701 INRANG 0574/22 KSAN/KSEA .N586AS\r\n/ETA 0554"),
-            (s("KSAN"), s("KSEA"), s("0554"))
-        );
-        assert_eq!(
-            eta(
-                "28",
-                "3702 INRANG 2223/22 KSEA/KPDX  N622QX /ETA 0515/EFD 063"
-            ),
-            (s("KSEA"), s("KPDX"), s("0515"))
-        );
+        assert_eq!(eta("80", "3401 ETA    0317/22 LFPG/LIRF .EI-DTN\r\n/ETA 0650/FOB 0058"), (s("LFPG"), s("LIRF"), s("0650")));
+        assert_eq!(eta("80", "3701 INRANG 0574/22 KSAN/KSEA .N586AS\r\n/ETA 0554"), (s("KSAN"), s("KSEA"), s("0554")));
+        assert_eq!(eta("28", "3702 INRANG 2223/22 KSEA/KPDX  N622QX /ETA 0515/EFD 063"), (s("KSEA"), s("KPDX"), s("0515")));
 
         let o = decode("80", "3001 DEPDLY 0187/22 KORD/MMMX .XA-VXZ\r\nATD 0713/ETD 0705/ETO 0733/FOB 13297\r\n35A/0008").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.gtout.as_deref(), o.eta),
-            (Some("KORD"), Some("0713"), None)
-        );
+        assert_eq!((o.depa.as_deref(), o.gtout.as_deref(), o.eta), (Some("KORD"), Some("0713"), None));
 
         // A POSRPT without an ETA and free text are not estimates.
         assert!(decode("80", "3N01 POSRPT 0381/22 KCVG/EDDP .D-AJFK\r\n/POS N42527W081184/ALT +35001/MCH 0807/FOB 0524").is_none());
-        assert!(decode(
-            "80",
-            "3A01 OPSCTL 3163/02 KRFD/KMHT .N1013A\r\nOUT 0450 OFF0505 \r\nETA0654"
-        )
-        .is_none());
+        assert!(decode("80", "3A01 OPSCTL 3163/02 KRFD/KMHT .N1013A\r\nOUT 0450 OFF0505 \r\nETA0654").is_none());
     }
 
     #[test]
@@ -2021,53 +1612,22 @@ mod tests {
             eta("14", "PRESENT POSITION REPORT\r\nDMY 211126,UTC 052937,LAT N41.561,LON W1.427,CAS 271,WD -102,WS 106,ALT 350,FOB 15135,ETA 0600"),
             s("0600")
         );
-        assert_eq!(
-            eta("3A", "/ETA 0905/LAT N 49.194/LON E 14.547/ALT 29999/FB 70"),
-            s("0905")
-        );
-        assert_eq!(
-            eta(
-                "81",
-                "TRAKK 0627 FL370 FOB18.3\r\nAVERE 0645/HAR 0702\r\nETA 0754 EFOB 12.3\r\n"
-            ),
-            s("0754")
-        );
-        assert_eq!(
-            eta(
-                "11",
-                "216023/INRANG/DS PANC/ETA 0538/FOB  24300\r\n/APU AVAIL/UPL NO"
-            ),
-            s("0538")
-        );
+        assert_eq!(eta("3A", "/ETA 0905/LAT N 49.194/LON E 14.547/ALT 29999/FB 70"), s("0905"));
+        assert_eq!(eta("81", "TRAKK 0627 FL370 FOB18.3\r\nAVERE 0645/HAR 0702\r\nETA 0754 EFOB 12.3\r\n"), s("0754"));
+        assert_eq!(eta("11", "216023/INRANG/DS PANC/ETA 0538/FOB  24300\r\n/APU AVAIL/UPL NO"), s("0538"));
 
-        let o = decode(
-            "1M",
-            "/AY0531/ETA01/221126/EFHK/EFRO/EFOU/2JK0\r\n0626/EFRO03/   ",
-        )
-        .unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref(), o.eta.as_deref()),
-            (Some("EFHK"), Some("EFRO"), Some("0626"))
-        );
+        let o = decode("1M", "/AY0531/ETA01/221126/EFHK/EFRO/EFOU/2JK0\r\n0626/EFRO03/   ").unwrap();
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref(), o.eta.as_deref()), (Some("EFHK"), Some("EFRO"), Some("0626")));
 
         let o = decode("10", "ETA31A22055150KLC1708 ELLXEHAM220602EHAM  30").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref(), o.eta.as_deref()),
-            (Some("ELLX"), Some("EHAM"), Some("0602"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref(), o.eta.as_deref()), (Some("ELLX"), Some("EHAM"), Some("0602")));
     }
 
     #[test]
     fn round5_oooi_reports() {
         let o = decode("8B", "V09CA032/OFFRP/ESSA/EKCH/22/0505/ETA0602/").unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.dsta.as_deref()),
-            (Some("ESSA"), Some("EKCH"))
-        );
-        assert_eq!(
-            (o.wloff.as_deref(), o.eta.as_deref()),
-            (Some("0505"), Some("0602"))
-        );
+        assert_eq!((o.depa.as_deref(), o.dsta.as_deref()), (Some("ESSA"), Some("EKCH")));
+        assert_eq!((o.wloff.as_deref(), o.eta.as_deref()), (Some("0505"), Some("0602")));
 
         let o = decode(
             "40",
@@ -2088,10 +1648,7 @@ mod tests {
             ".NDCULUA 220440\r\nAGM\r\nAN N496UA\r\n-  FLT# 2464-21    KSFO     04:40\r\nPART 117        RLS 1   ACT DEP 0439\r\nCCO TIME(ZULU)\r\n",
         )
         .unwrap();
-        assert_eq!(
-            (o.depa.as_deref(), o.gtout.as_deref()),
-            (Some("KSFO"), Some("0439"))
-        );
+        assert_eq!((o.depa.as_deref(), o.gtout.as_deref()), (Some("KSFO"), Some("0439")));
 
         // The estimated departure is not an OOOI time.
         assert!(decode(

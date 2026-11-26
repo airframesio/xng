@@ -87,24 +87,12 @@ pub struct BasicReport {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "tag", rename_all = "snake_case")]
 pub enum AdscTag {
-    Ack {
-        contract: u8,
-    },
-    Nack {
-        contract: u8,
-        reason: u8,
-        reason_text: String,
-        ext: Option<u8>,
-    },
-    Noncompliance {
-        contract: u8,
-        groups: Vec<NoncomplianceGroup>,
-    },
+    Ack { contract: u8 },
+    Nack { contract: u8, reason: u8, reason_text: String, ext: Option<u8> },
+    Noncompliance { contract: u8, groups: Vec<NoncomplianceGroup> },
     CancelEmergency,
     Report(BasicReport),
-    FlightId {
-        id: String,
-    },
+    FlightId { id: String },
     PredictedRoute {
         next_lat: f64,
         next_lon: f64,
@@ -114,57 +102,18 @@ pub enum AdscTag {
         next_next_lon: f64,
         next_next_alt_ft: i32,
     },
-    EarthRef {
-        true_track_valid: bool,
-        true_track_deg: f64,
-        ground_speed_kt: f64,
-        vert_speed_fpm: i32,
-    },
-    AirRef {
-        true_heading_valid: bool,
-        true_heading_deg: f64,
-        mach: f64,
-        vert_speed_fpm: i32,
-    },
-    Meteo {
-        wind_speed_kt: f64,
-        wind_dir_valid: bool,
-        wind_dir_deg: f64,
-        temperature_c: f64,
-    },
-    AirframeId {
-        icao: String,
-    },
-    IntermediateProjection {
-        distance_nm: f64,
-        true_track_valid: bool,
-        true_track_deg: f64,
-        alt_ft: i32,
-        eta_s: u32,
-    },
-    FixedProjection {
-        lat: f64,
-        lon: f64,
-        alt_ft: i32,
-        eta_s: u32,
-    },
-    DisconnectReason {
-        code: u8,
-        text: String,
-    },
+    EarthRef { true_track_valid: bool, true_track_deg: f64, ground_speed_kt: f64, vert_speed_fpm: i32 },
+    AirRef { true_heading_valid: bool, true_heading_deg: f64, mach: f64, vert_speed_fpm: i32 },
+    Meteo { wind_speed_kt: f64, wind_dir_valid: bool, wind_dir_deg: f64, temperature_c: f64 },
+    AirframeId { icao: String },
+    IntermediateProjection { distance_nm: f64, true_track_valid: bool, true_track_deg: f64, alt_ft: i32, eta_s: u32 },
+    FixedProjection { lat: f64, lon: f64, alt_ft: i32, eta_s: u32 },
+    DisconnectReason { code: u8, text: String },
     // Uplink (contract requests)
     CancelAllContracts,
-    CancelContract {
-        contract: u8,
-    },
-    UplinkCancelEmergency {
-        contract: u8,
-    },
-    ContractRequest {
-        kind: ContractKind,
-        contract: u8,
-        groups: Vec<RequestGroup>,
-    },
+    CancelContract { contract: u8 },
+    UplinkCancelEmergency { contract: u8 },
+    ContractRequest { kind: ContractKind, contract: u8, groups: Vec<RequestGroup> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -186,42 +135,18 @@ pub struct NoncomplianceGroup {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "request", rename_all = "snake_case")]
 pub enum RequestGroup {
-    LateralDeviationThreshold {
-        nm: f64,
-    },
-    ReportingInterval {
-        seconds: u32,
-    },
-    FlightIdModulus {
-        every_n: u8,
-    },
-    PredictedRouteModulus {
-        every_n: u8,
-    },
-    EarthRefModulus {
-        every_n: u8,
-    },
-    AirRefModulus {
-        every_n: u8,
-    },
-    MeteoModulus {
-        every_n: u8,
-    },
-    AirframeIdModulus {
-        every_n: u8,
-    },
-    VerticalSpeedThreshold {
-        fpm: i32,
-    },
-    AltitudeRange {
-        ceiling_ft: i32,
-        floor_ft: i32,
-    },
+    LateralDeviationThreshold { nm: f64 },
+    ReportingInterval { seconds: u32 },
+    FlightIdModulus { every_n: u8 },
+    PredictedRouteModulus { every_n: u8 },
+    EarthRefModulus { every_n: u8 },
+    AirRefModulus { every_n: u8 },
+    MeteoModulus { every_n: u8 },
+    AirframeIdModulus { every_n: u8 },
+    VerticalSpeedThreshold { fpm: i32 },
+    AltitudeRange { ceiling_ft: i32, floor_ft: i32 },
     ReportWaypointChanges,
-    AircraftIntent {
-        modulus: u8,
-        projection_time_min: u8,
-    },
+    AircraftIntent { modulus: u8, projection_time_min: u8 },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -274,10 +199,7 @@ fn tag_name(t: &AdscTag) -> &'static str {
 /// Parse an ADS-C payload (CRC already stripped). `dis` marks the .DIS
 /// IMI (single reason byte, no tags).
 pub fn parse(buf: &[u8], downlink: bool, dis: bool) -> AdscMessage {
-    let mut msg = AdscMessage {
-        tags: Vec::new(),
-        err: false,
-    };
+    let mut msg = AdscMessage { tags: Vec::new(), err: false };
     if dis {
         match buf.first() {
             Some(&b) => {
@@ -289,10 +211,7 @@ pub fn parse(buf: &[u8], downlink: bool, dis: bool) -> AdscMessage {
                     8 => "normal disconnect",
                     _ => "unknown",
                 };
-                msg.tags.push(AdscTag::DisconnectReason {
-                    code,
-                    text: text.to_owned(),
-                });
+                msg.tags.push(AdscTag::DisconnectReason { code, text: text.to_owned() });
             }
             None => msg.err = true,
         }
@@ -390,9 +309,7 @@ fn parse_downlink(mut buf: &[u8], msg: &mut AdscMessage) {
                     }
                     id.push(c as u8 as char);
                 }
-                Some(AdscTag::FlightId {
-                    id: id.trim_end().to_owned(),
-                })
+                Some(AdscTag::FlightId { id: id.trim_end().to_owned() })
             }),
             13 => take(&mut buf, 17).and_then(|b| {
                 let mut r = BitReader::new(b);
@@ -437,15 +354,12 @@ fn parse_downlink(mut buf: &[u8], msg: &mut AdscMessage) {
                     temperature_c: temperature_c(r.read(12)?),
                 })
             }),
-            17 => take(&mut buf, 3).map(|b| AdscTag::AirframeId {
-                icao: format!("{:02X}{:02X}{:02X}", b[0], b[1], b[2]),
-            }),
+            17 => take(&mut buf, 3)
+                .map(|b| AdscTag::AirframeId { icao: format!("{:02X}{:02X}{:02X}", b[0], b[1], b[2]) }),
             18 => take(&mut buf, 10)
                 .and_then(|b| parse_basic_report(b, ReportKind::VerticalRateChange)),
             19 => take(&mut buf, 10).and_then(|b| parse_basic_report(b, ReportKind::AltitudeRange)),
-            20 => {
-                take(&mut buf, 10).and_then(|b| parse_basic_report(b, ReportKind::WaypointChange))
-            }
+            20 => take(&mut buf, 10).and_then(|b| parse_basic_report(b, ReportKind::WaypointChange)),
             22 => take(&mut buf, 8).and_then(|b| {
                 let mut r = BitReader::new(b);
                 let d = distance_nm(r.read(16)?);
@@ -497,12 +411,7 @@ fn parse_noncompliance(buf: &mut &[u8]) -> Option<AdscTag> {
                 params.push((packed[i / 2] >> (((i + 1) % 2) * 4)) & 0xF);
             }
         }
-        groups.push(NoncomplianceGroup {
-            tag,
-            unrecognized,
-            group_unavailable,
-            params,
-        });
+        groups.push(NoncomplianceGroup { tag, unrecognized, group_unavailable, params });
     }
     Some(AdscTag::Noncompliance { contract, groups })
 }
@@ -543,19 +452,13 @@ fn parse_uplink(mut buf: &[u8], msg: &mut AdscMessage) {
 fn parse_request_groups(buf: &mut &[u8]) -> Vec<RequestGroup> {
     let mut groups = Vec::new();
     loop {
-        let Some((&tag, rest)) = buf.split_first() else {
-            return groups;
-        };
+        let Some((&tag, rest)) = buf.split_first() else { return groups };
         let mut b = rest;
         let parsed: Option<RequestGroup> = match tag {
-            10 => take(&mut b, 1).map(|x| RequestGroup::LateralDeviationThreshold {
-                nm: x[0] as f64 / 8.0,
-            }),
+            10 => take(&mut b, 1).map(|x| RequestGroup::LateralDeviationThreshold { nm: x[0] as f64 / 8.0 }),
             11 => take(&mut b, 1).map(|x| {
                 let sf = [0u32, 1, 8, 64][(x[0] >> 6) as usize];
-                RequestGroup::ReportingInterval {
-                    seconds: sf * ((x[0] & 0x3F) as u32 + 1),
-                }
+                RequestGroup::ReportingInterval { seconds: sf * ((x[0] & 0x3F) as u32 + 1) }
             }),
             12 => take(&mut b, 1).map(|x| RequestGroup::FlightIdModulus { every_n: x[0] }),
             13 => take(&mut b, 1).map(|x| RequestGroup::PredictedRouteModulus { every_n: x[0] }),

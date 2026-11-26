@@ -11,9 +11,9 @@ mod bits;
 pub mod adsc;
 pub mod airline5z;
 pub mod arinc622;
+pub mod cpdlc;
 pub mod block;
 pub mod cfb;
-pub mod cpdlc;
 pub mod fpn;
 pub mod gate;
 pub mod loadsheet;
@@ -171,11 +171,9 @@ pub fn decode(label: &str, text: &str, downlink: bool) -> AppDecode {
 pub fn summary(app: &AcarsApp) -> Option<String> {
     match app {
         AcarsApp::Adsc { message, .. } => message.summary(),
-        AcarsApp::Cpdlc { envelope, .. } => Some(format!(
-            "CPDLC {} ({})",
-            envelope.imi.as_str(),
-            envelope.gs_addr
-        )),
+        AcarsApp::Cpdlc { envelope, .. } => {
+            Some(format!("CPDLC {} ({})", envelope.imi.as_str(), envelope.gs_addr))
+        }
         AcarsApp::MediaAdvisory(m) => Some(format!(
             "MEDIA-ADV link {} {} at {}",
             m.current_link,
@@ -190,20 +188,13 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
         }),
         AcarsApp::FlightPlan(fp) => Some(format!(
             "FPN {}{}->{}",
-            fp.flight_number
-                .as_deref()
-                .map(|f| format!("{f} "))
-                .unwrap_or_default(),
+            fp.flight_number.as_deref().map(|f| format!("{f} ")).unwrap_or_default(),
             fp.origin.as_deref().unwrap_or("?"),
             fp.destination.as_deref().unwrap_or("?"),
         )),
         AcarsApp::Airline5z(a) => Some(match a {
             airline5z::Airline5z::Text { text } => format!("5Z TXT {text}"),
-            airline5z::Airline5z::Typed {
-                message_type,
-                description,
-                ..
-            } => {
+            airline5z::Airline5z::Typed { message_type, description, .. } => {
                 format!("5Z {message_type} ({description})")
             }
         }),
@@ -215,30 +206,16 @@ pub fn summary(app: &AcarsApp) -> Option<String> {
                 "MIAM v{} {}{}{}",
                 p.version,
                 p.pdu_type,
-                p.app_id
-                    .as_deref()
-                    .map(|a| format!(" app={a}"))
-                    .unwrap_or_default(),
-                if p.compressed {
-                    format!(" ({} bytes inflated)", p.data_len)
-                } else {
-                    String::new()
-                }
+                p.app_id.as_deref().map(|a| format!(" app={a}")).unwrap_or_default(),
+                if p.compressed { format!(" ({} bytes inflated)", p.data_len) } else { String::new() }
             ),
             miam::MiamFrame::FileTransferReq { file_id, file_size } => {
                 format!("MIAM file-transfer-req id={file_id} size={file_size}")
             }
-            miam::MiamFrame::FileSegment {
-                file_id,
-                segment_id,
-                ..
-            } => {
+            miam::MiamFrame::FileSegment { file_id, segment_id, .. } => {
                 format!("MIAM file-segment id={file_id} seg={segment_id}")
             }
-            f => format!(
-                "MIAM {}",
-                serde_json::json!(f)["frame"].as_str().unwrap_or("frame")
-            ),
+            f => format!("MIAM {}", serde_json::json!(f)["frame"].as_str().unwrap_or("frame")),
         }),
         AcarsApp::Ohma { message } => Some(format!(
             "OHMA {}",

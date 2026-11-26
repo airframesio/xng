@@ -200,11 +200,8 @@ mod tests {
     #[test]
     fn label_20_pos_scaled() {
         // Label_20_POS.test.ts: 38.160 / -77.075.
-        let p = decode(
-            "20",
-            "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544",
-        )
-        .unwrap();
+        let p = decode("20", "POSN38160W077075,,211733,360,OTT,212041,,N42,19689,40,544")
+            .unwrap();
         assert!(close(p.latitude, 38.160), "lat {}", p.latitude);
         assert!(close(p.longitude, -77.075), "lon {}", p.longitude);
     }
@@ -262,11 +259,7 @@ mod tests {
         )
         .unwrap();
         assert!(close(p.latitude, 50.0 + 43.5 / 60.0), "lat {}", p.latitude);
-        assert!(
-            close(p.longitude, 11.0 + 21.8 / 60.0),
-            "lon {}",
-            p.longitude
-        );
+        assert!(close(p.longitude, 11.0 + 21.8 / 60.0), "lon {}", p.longitude);
     }
 
     #[test]

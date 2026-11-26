@@ -32,12 +32,7 @@ fn parser_matches_shared_fixtures() {
             ));
         }
     }
-    assert!(
-        failures.is_empty(),
-        "{} fixture(s) differ:\n{}",
-        failures.len(),
-        failures.join("\n")
-    );
+    assert!(failures.is_empty(), "{} fixture(s) differ:\n{}", failures.len(), failures.join("\n"));
 }
 
 #[test]
@@ -46,13 +41,7 @@ fn decode_emits_loadsheet_app_on_any_label() {
         let label = f["label"].as_str().unwrap();
         let d = decode(label, f["text"].as_str().unwrap(), false);
         let is_ls = matches!(d.app, Some(AcarsApp::Loadsheet(_)));
-        assert_eq!(
-            is_ls,
-            !f["expected"].is_null(),
-            "{} label {label}: {:?}",
-            f["id"],
-            d.app
-        );
+        assert_eq!(is_ls, !f["expected"].is_null(), "{} label {label}: {:?}", f["id"], d.app);
         if is_ls {
             let v = serde_json::to_value(&d.app).unwrap();
             assert_eq!(v["app"], "loadsheet");

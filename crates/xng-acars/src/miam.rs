@@ -14,30 +14,17 @@ use serde::Serialize;
 #[serde(tag = "frame", rename_all = "snake_case")]
 pub enum MiamFrame {
     SingleTransfer(CorePdu),
-    FileTransferReq {
-        file_id: u16,
-        file_size: u32,
-    },
-    FileTransferAccept {
-        file_id: u16,
-        segment_size: u8,
-    },
+    FileTransferReq { file_id: u16, file_size: u32 },
+    FileTransferAccept { file_id: u16, segment_size: u8 },
     FileSegment {
         file_id: u16,
         segment_id: u16,
         /// CORE-PDU text fragment carried by this segment.
         payload: String,
     },
-    FileTransferAbort {
-        file_id: u16,
-        reason: u8,
-    },
-    XoffInd {
-        file_id: Option<u16>,
-    },
-    XonInd {
-        file_id: Option<u16>,
-    },
+    FileTransferAbort { file_id: u16, reason: u8 },
+    XoffInd { file_id: Option<u16> },
+    XonInd { file_id: Option<u16> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -91,12 +78,8 @@ pub fn parse(text: &str) -> Option<MiamFrame> {
             file_id: num(rest, 3)? as u16,
             reason: num(&rest[3..], 1)? as u8,
         }),
-        'Y' => Some(MiamFrame::XoffInd {
-            file_id: num(rest, 3).map(|v| v as u16),
-        }),
-        'X' => Some(MiamFrame::XonInd {
-            file_id: num(rest, 3).map(|v| v as u16),
-        }),
+        'Y' => Some(MiamFrame::XoffInd { file_id: num(rest, 3).map(|v| v as u16) }),
+        'X' => Some(MiamFrame::XonInd { file_id: num(rest, 3).map(|v| v as u16) }),
         _ => None,
     }
 }
@@ -119,9 +102,7 @@ const FILE_TIMEOUT_SECS: f64 = 600.0;
 
 impl FileReassembler {
     pub fn new() -> Self {
-        Self {
-            pending: std::collections::HashMap::new(),
-        }
+        Self { pending: std::collections::HashMap::new() }
     }
 
     /// Offer a label-MA message text; returns the completed CORE PDU
@@ -144,11 +125,7 @@ impl FileReassembler {
                 self.pending.remove(&(tail.to_owned(), file_id));
                 None
             }
-            MiamFrame::FileSegment {
-                file_id,
-                segment_id,
-                payload,
-            } => {
+            MiamFrame::FileSegment { file_id, segment_id, payload } => {
                 let e = self.pending.get_mut(&(tail.to_owned(), file_id))?;
                 e.parts.insert(segment_id, payload);
                 e.time = now;
@@ -166,7 +143,8 @@ impl FileReassembler {
                 if !contiguous {
                     return None;
                 }
-                let combined: String = e.parts.values().map(String::as_str).collect();
+                let combined: String =
+                    e.parts.values().map(String::as_str).collect();
                 self.pending.remove(&(tail.to_owned(), file_id));
                 core_pdu(&combined)
             }
@@ -308,11 +286,7 @@ fn core_pdu(text: &str) -> Option<CorePdu> {
         body
     };
     pdu.data_len = data.len();
-    if !data.is_empty()
-        && data
-            .iter()
-            .all(|&c| c == b'\r' || c == b'\n' || c == b'\t' || (0x20..0x7F).contains(&c))
-    {
+    if !data.is_empty() && data.iter().all(|&c| c == b'\r' || c == b'\n' || c == b'\t' || (0x20..0x7F).contains(&c)) {
         pdu.text = Some(String::from_utf8_lossy(&data).into_owned());
     }
     Some(pdu)
@@ -351,10 +325,7 @@ mod tests {
     fn file_transfer_frames_parse() {
         assert_eq!(
             parse("F012000345"),
-            Some(MiamFrame::FileTransferReq {
-                file_id: 12,
-                file_size: 345
-            })
+            Some(MiamFrame::FileTransferReq { file_id: 12, file_size: 345 })
         );
         assert_eq!(
             parse("S012003abc"),
@@ -372,31 +343,28 @@ mod tests {
         // Build a v1 DATA PDU: header (ver 1, type 0), pdu_len, aircraft
         // id, msg_num/ack, compression=DEFLATE, app_type=2-char + CRC32.
         let inner = b"#T2BThis is the embedded MIAM payload";
-        let compressed = miniz_oxide::deflate::compress_to_vec(inner, 6);
+        let compressed =
+            miniz_oxide::deflate::compress_to_vec(inner, 6);
         let mut hdr = vec![0x01u8]; // version 1, pdu_type DATA
         let total = 20 + compressed.len();
         hdr.extend_from_slice(&[(total >> 16) as u8, (total >> 8) as u8, total as u8]);
         hdr.extend_from_slice(b".N12345"); // aircraft id (7)
         hdr.push((42 << 1) | 1); // msg_num 42, ack
-                                 // compression DEFLATE (0x1), encoding ISO5, app_type 0 (2-char):
-                                 // comp = ((h0<<2)|(h1>>6))&7 → h0=0x00, h1=0b01_00_0000
+        // compression DEFLATE (0x1), encoding ISO5, app_type 0 (2-char):
+        // comp = ((h0<<2)|(h1>>6))&7 → h0=0x00, h1=0b01_00_0000
         hdr.push(0x00);
         hdr.push(0x40);
         hdr.extend_from_slice(b"T2"); // app id
         hdr.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // CRC32 (not checked)
-                                                          // Pad both parts to whole base85 words; the pad counts ride in
-                                                          // the two characters after the frame id.
+        // Pad both parts to whole base85 words; the pad counts ride in
+        // the two characters after the frame id.
         let hpad = (4 - hdr.len() % 4) % 4;
         let bpad = (4 - compressed.len() % 4) % 4;
         let mut hdr_p = hdr.clone();
         hdr_p.extend(std::iter::repeat(0).take(hpad));
         let mut body_p = compressed.clone();
         body_p.extend(std::iter::repeat(0).take(bpad));
-        let txt = format!(
-            "T{bpad}{hpad}{}|{}",
-            base85_encode(&hdr_p),
-            base85_encode(&body_p)
-        );
+        let txt = format!("T{bpad}{hpad}{}|{}", base85_encode(&hdr_p), base85_encode(&body_p));
 
         let MiamFrame::SingleTransfer(pdu) = parse(&txt).expect("miam") else {
             panic!("expected single transfer");
@@ -406,10 +374,7 @@ mod tests {
         assert_eq!(pdu.aircraft_id.as_deref(), Some(".N12345"));
         assert_eq!(pdu.msg_num, Some(42));
         assert!(pdu.compressed);
-        assert_eq!(
-            pdu.text.as_deref(),
-            Some(std::str::from_utf8(inner).unwrap())
-        );
+        assert_eq!(pdu.text.as_deref(), Some(std::str::from_utf8(inner).unwrap()));
     }
 }
 
@@ -452,9 +417,7 @@ mod file_tests {
         let req = format!("F007{:06}", core.len());
         assert!(fr.push("N12345", &req, 0.0).is_none());
         assert!(fr.push("N12345", &format!("S007001{a}"), 1.0).is_none());
-        let pdu = fr
-            .push("N12345", &format!("S007002{b}"), 2.0)
-            .expect("complete");
+        let pdu = fr.push("N12345", &format!("S007002{b}"), 2.0).expect("complete");
         assert_eq!(pdu.version, 1);
         assert_eq!(pdu.text.as_deref(), Some("HELLO FILE WORLD"));
     }
