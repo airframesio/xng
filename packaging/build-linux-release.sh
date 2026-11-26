@@ -72,7 +72,7 @@ fi
 if [ -z "${PROTOC:-}" ]; then
   PROTOC_VERSION=28.3
   case "$HOST_ARCH" in amd64) P=x86_64 ;; arm64) P=aarch_64 ;; esac
-  curl -fsSL -o /tmp/protoc.zip \
+  curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors -o /tmp/protoc.zip \
     "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${P}.zip"
   mkdir -p /tmp/protoc && unzip -qo /tmp/protoc.zip -d /tmp/protoc
   export PROTOC=/tmp/protoc/bin/protoc
@@ -80,7 +80,7 @@ fi
 
 if ! command -v cargo >/dev/null; then
   [ -x "$HOME/.cargo/bin/cargo" ] || \
-    curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
   export PATH=$HOME/.cargo/bin:$PATH
 fi
 rustup target add "$TARGET"
