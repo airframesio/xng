@@ -52,8 +52,11 @@ else
   # 32-bit ARM can't build the Opus source bundled with audiopus_sys (its
   # NEON files need -mfpu=neon), so link Ubuntu's static libopus.a instead,
   # as the armv7 Docker image does.
+  # libc6-dev:armhf is left out: the cross toolchain brings its own armhf libc
+  # headers, and the native package pulls libtirpc3:armhf, whose deps break
+  # whenever the ports mirror is a security update ahead of the amd64 one.
   $SUDO apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
-    libc6-dev:armhf $(for l in $LIBS libopus-dev; do echo "$l:armhf"; done)
+    $(for l in $LIBS libopus-dev; do echo "$l:armhf"; done)
   mkdir -p target/libopus-armhf/lib
   ln -sf /usr/lib/arm-linux-gnueabihf/libopus.a target/libopus-armhf/lib/
   export LIBOPUS_LIB_DIR=$PWD/target/libopus-armhf
@@ -63,7 +66,7 @@ else
   export CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER=arm-linux-gnueabihf-gcc
   export PKG_CONFIG_ALLOW_CROSS=1
   export PKG_CONFIG_LIBDIR=/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig
-  export BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf="--target=arm-linux-gnueabihf -I/usr/include/arm-linux-gnueabihf"
+  export BINDGEN_EXTRA_CLANG_ARGS_armv7_unknown_linux_gnueabihf="--target=arm-linux-gnueabihf --sysroot=/usr/arm-linux-gnueabihf -idirafter /usr/include"
 fi
 
 if [ -z "${PROTOC:-}" ]; then
