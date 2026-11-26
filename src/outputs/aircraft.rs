@@ -189,6 +189,11 @@ fn acars_fix(a: &xng_types::AcarsCore) -> Option<AircraftFix> {
         for t in structured.get("tags").and_then(Value::as_array).into_iter().flatten() {
             match t.get("tag").and_then(Value::as_str) {
                 Some("report") => {
+                    // Motion belongs to the report it follows: a second report
+                    // in the same downlink must not inherit the first one's.
+                    fix.track_deg = None;
+                    fix.speed_kt = None;
+                    fix.vertical_rate_fpm = None;
                     fix.lat = jf(t, "lat");
                     fix.lon = jf(t, "lon");
                     fix.altitude_ft = ji(t, "alt_ft");
