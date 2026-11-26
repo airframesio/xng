@@ -7,24 +7,87 @@ on:
   push:
     tags:
       - 'v*'
+  # Pull requests that touch the Linux packaging build and verify the
+  # binaries without publishing anything.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - packaging/**
+      - build_deb_package.sh
 
 permissions:
   contents: write
 
 jobs:
+  # Linux binaries and .debs are built in Ubuntu 22.04 (glibc 2.35), so they
+  # run on Ubuntu 22.04+, Debian 12 and Raspberry Pi OS Bookworm. armhf
+  # (32-bit Pi OS, Pi 2 and newer) is cross-compiled on amd64.
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64, armhf]
+    steps:
+      - name: Install git
+        run: apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build binary, tarball and .deb
+        env:
+          XNG_TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'pr' }}
+        run: packaging/build-linux-release.sh ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*
+
+  # Install each .deb and run each tarball binary on the distributions it is
+  # for. armhf runs under QEMU.
+  verify-linux:
+    name: Verify ${{ matrix.arch }} on ${{ matrix.image }}
+    needs: build-linux
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, platform: linux/amd64, image: 'debian:bookworm' }
+          - { arch: amd64, platform: linux/amd64, image: 'ubuntu:22.04' }
+          - { arch: arm64, platform: linux/arm64, image: 'debian:bookworm' }
+          - { arch: arm64, platform: linux/arm64, image: 'ubuntu:22.04' }
+          - { arch: armhf, platform: linux/arm/v7, image: 'debian:bookworm' }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist
+      - name: Set up QEMU
+        if: matrix.arch == 'armhf'
+        uses: docker/setup-qemu-action@v3
+      - name: Install the .deb and run xng
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} -v "$PWD/dist:/dist" ${{ matrix.image }} sh -euxc '
+            apt-get update
+            DEBIAN_FRONTEND=noninteractive apt-get install -y /dist/*.deb
+            xng --version
+            xng devices
+            mkdir /t && tar -C /t -xzf /dist/*.tar.gz && /t/*/xng --version
+          '
+
   build:
     name: Build ${{ matrix.target }}
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            deb: true
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            deb: true
           - os: macos-15
             target: aarch64-apple-darwin
           # SoapySDR on Windows is linked delay-loaded: radios need a
@@ -34,11 +97,6 @@ jobs:
             windows: true
     steps:
       - uses: actions/checkout@v4
-      - name: Install dependencies (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt update
-          sudo apt install -y libsoapysdr-dev libairspy-dev libairspyhf-dev protobuf-compiler
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install soapysdr airspy airspyhf protobuf
@@ -74,11 +132,6 @@ jobs:
           cp target/release/xng README.md LICENSE-MIT LICENSE-APACHE dist/${PKG}/
           tar -C dist -czf dist/${PKG}.tar.gz ${PKG}
           rm -r dist/${PKG}
-      - name: Build Debian package
-        if: matrix.deb
-        run: |
-          ./build_deb_package.sh
-          cp build/*.deb dist/
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
@@ -86,12 +139,14 @@ jobs:
 
   # Desktop app installers, built by the Desktop workflow.
   desktop:
+    if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/desktop.yml
     secrets: inherit
 
   release:
     name: Publish release
-    needs: [build, desktop]
+    needs: [build, build-linux, verify-linux, desktop]
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -124,10 +179,11 @@ jobs:
           | Asset | Platform |
           |---|---|
           | `xng-*-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 |
-          | `xng-*-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 (Pi 4/5 64-bit) |
+          | `xng-*-aarch64-unknown-linux-gnu.tar.gz` | Linux arm64 (Pi 3/4/5 with 64-bit Pi OS) |
+          | `xng-*-armv7-unknown-linux-gnueabihf.tar.gz` | Linux armhf (Pi 2/3/4/5 with 32-bit Pi OS) |
           | `xng-*-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
           | `xng-*-x86_64-pc-windows-msvc.zip` | Windows x86_64 (radios need [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/) installed) |
-          | `xng_*.deb` | Debian/Ubuntu packages (x86_64 + arm64) |
+          | `xng-*-amd64.deb`, `xng-*-arm64.deb`, `xng-*-armhf.deb` | Debian/Ubuntu/Pi OS packages |
           | `xng-desktop-*.deb` | Desktop app, Debian/Ubuntu (x86_64 + arm64) |
           | `xng-desktop-*-aarch64-apple-darwin.dmg` | Desktop app, macOS Apple Silicon |
           | `xng-desktop-*-x86_64-pc-windows-msvc.exe` | Desktop app installer, Windows x86_64 (radios need [PothosSDR](https://downloads.myriadrf.org/builds/PothosSDR/) installed) |
@@ -141,6 +197,11 @@ jobs:
           macOS runners) — `brew install soapysdr airspy airspyhf protobuf
           && cargo build --release --features airspy,airspyhf,sherpa`.
 
+          The Linux binaries and .debs run on Ubuntu 22.04 or newer, Debian
+          12 or newer and Raspberry Pi OS Bookworm (glibc 2.35+). The armhf
+          build needs a Pi 2 or newer (ARMv7); Pi Zero and Pi 1 are not
+          supported.
+
           Binaries are built with SoapySDR plus the native Airspy backends;
           they need `libsoapysdr` (and `libairspy`/`libairspyhf` for native
           Airspy) at runtime — the .deb declares these. Multi-arch Docker
@@ -148,11 +209,11 @@ jobs:
           `ghcr.io/airframesio/xng` for the same tag.
 
           Airband transcription works out of the box in the binaries, the
-          .deb and the amd64/arm64 Docker images: `--transcribe` runs
+          amd64/arm64 .debs and the amd64/arm64 Docker images: `--transcribe` runs
           sherpa-onnx with the ATC-tuned `skycontrol-atc-110m` model,
           downloaded once (137 MB) on first use. The armv7 image has no local
-          engine (sherpa-onnx has no 32-bit ARM build); use `--whisper-url`
-          there.
+          engine and neither do the armhf binary and .deb (sherpa-onnx has no
+          32-bit ARM build); use `--whisper-url` there.
 
           Quick start:
 
