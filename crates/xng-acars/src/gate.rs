@@ -477,19 +477,24 @@ gate_re!(IN_RANGE_COLON, r"^GATE:\s*", r"\s*$");
 gate_re!(ALLEGIANT, r"^--GATE ASSIGNMENT\s+([A-Z]{3}) GATE\s+", r"\s+ASSIGNED");
 gate_re!(AIR_NOSTRUM, r"^PKN:\S*\s+GATE:\s*", r"(?:\s|$)");
 gate_re!(VOLARIS, r"LLEGADA GATE\s+", r"\b");
-re!(ITA_ROUTE, r"^([A-Z]{3})/([A-Z]{3}) ETA \d{4}$");
+re!(ITA_ROUTE, r"^([A-Z]{3})/([A-Z]{3}) ETA (\d{4})$");
+re!(HHMM, r"^(?:[01]\d|2[0-3])[0-5]\d$");
 gate_re!(ITA_GATE, r"^GATE\s+", r"\s+BAG CLAIM");
 gate_re!(STAND_NO, r"^STAND NO:\s*", r"\s*$");
 gate_re!(CHINA_EASTERN, r"^HI SIR, MU(\d{1,4}) [A-Z]{3}/([A-Z]{3}), PARK BAY\s+", r"\b");
 gate_re!(FEDEX_EXPECT, r"^EXPECT GATE:\s*", r"\(([A-Z]{3})\)");
-gate_re!(ARRIVAL_GATE_IS, r"ARRIVAL GATE(?: IS)?:\s*", r"\s*$");
+// Anchored, so chat (`SEEING ARRIVAL GATE: F3`) and `PREVIOUS ARRIVAL GATE:`
+// lines are not read.
+gate_re!(ARRIVAL_GATE_IS, r"^(?:AIRSIDE\s+)?ARRIVAL GATE(?: IS)?:\s*", r"\s*$");
+// SkyWest AA in-range marker; the `GATE:` line must come after it.
+re!(IN_RANGE_MARKER, r"^IN-RANGE FROM AA\b");
 gate_re!(HEADER_ARR_GATE, r"^[A-Z0-9]{9}[.~]\dARRIVAL GATE\s+", r"\s*$");
 gate_re!(AIR_FRANCE_PKG, r"^ARRIVAL PKG:\s*", r"\b");
 // Where a message moves on to other flights (connections, the aircraft's
 // next flight); gate lines after it are not this flight's.
 re!(
     STOP_LINE,
-    r"^(?:CREW CONNECTING|CONNECTING GATE|NEXT FLT|NEXT FLIGHT|NEXT LEG|NEXT SECTOR|NXM\b|- NEXT FLIGHT|ON STAND-|CREW DEPT|TURN FLT|CREW CONNECTIONS|PAX CONNECTIONS|AC TURN|END$)"
+    r"^(?:CREW CONNECTING|CONNECTING GATE\b|NEXT FLT|NEXT FLIGHT|NEXT LEG|NEXT SECTOR|NXM\b|- NEXT FLIGHT|ON STAND-|CREW DEPT|TURN FLT|CREW CONNECTIONS|PAX CONNECTIONS|AC TURN|END$)"
 );
 // Label RA uplinks read by [`parse`] (Republic's and SkyWest's are skipped by
 // what `parse` reads, since their other messages are read here), and Finnair
@@ -552,7 +557,7 @@ pub fn parse_report(label: &str, text: &str) -> Option<GateInfo> {
             .or_else(|| jazz_gate(&lines))
             .or_else(|| jazz_flight_data(&lines))
             .or_else(|| {
-                lines.iter().find_map(|l| {
+                lines.iter().take_while(|l| !STOP_LINE.is_match(l)).find_map(|l| {
                     let c = AIR_FRANCE_PKG.captures(l)?;
                     Some(report(GateKind::ArrivalGate, "AIR_FRANCE_ARRIVAL_PKG", &c[1], ""))
                 })
@@ -725,8 +730,8 @@ fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
             return Some(g);
         }
     }
-    let in_range = lines.iter().any(|l| l.starts_with("IN-RANGE"));
-    let mut ita_airport: Option<&str> = None;
+    let mut in_range = false;
+    let mut ita: Option<(&str, &str, &str)> = None;
     for l in lines.iter().take_while(|l| !STOP_LINE.is_match(l)) {
         let arrival = |format, gate: &str, airport: &str| Some(report(GateKind::ArrivalGate, format, gate, airport));
         if frontier {
@@ -734,16 +739,25 @@ fn ra_gate_round7(lines: &[&str]) -> Option<GateInfo> {
                 return arrival("FRONTIER_OPS", &c[1], "");
             }
         }
+        if IN_RANGE_MARKER.is_match(l) {
+            in_range = true;
+            continue;
+        }
         if in_range {
             if let Some(c) = IN_RANGE_COLON.captures(l) {
                 return arrival("IN_RANGE_GATE", &c[1], "");
             }
         }
         if let Some(c) = ITA_ROUTE.captures(l) {
-            ita_airport = Some(c.get(2)?.as_str());
+            ita = Some((c.get(1)?.as_str(), c.get(2)?.as_str(), c.get(3)?.as_str()));
         }
-        if let (Some(c), Some(a)) = (ITA_GATE.captures(l), ita_airport) {
-            return arrival("ITA_CONNECTING_GATES", &c[1], a);
+        if let (Some(c), Some((origin, airport, eta))) = (ITA_GATE.captures(l), ita) {
+            let mut g = report(GateKind::ArrivalGate, "ITA_CONNECTING_GATES", &c[1], airport);
+            g.departure = Some(origin.to_owned());
+            if HHMM.is_match(eta) {
+                g.eta = Some(eta.to_owned());
+            }
+            return Some(g);
         }
         if let Some(c) = ALLEGIANT.captures(l) {
             return arrival("ALLEGIANT_IN_RANGE", &c[2], &c[1]);
@@ -809,25 +823,38 @@ fn arr_gate_pos(lines: &[&str]) -> Option<GateInfo> {
 }
 
 /// Alaska ETA acknowledgement: `FROM:LAX OPS`, the flight and `ARRIVAL
-/// GATE:65B`.
+/// GATE:65B`. The gate line alone is not enough (Horizon sends a bare
+/// `ARRIVAL GATE:B9`): the message must also have an `ETA ACK`, `FROM:<IATA>
+/// OPS` or AS flight line before the next flight.
 fn alaska_eta_ack(lines: &[&str]) -> Option<GateInfo> {
     let mut airport = None;
     let mut flight = None;
+    let mut ack = false;
+    let mut gate = None;
     for l in lines.iter().take_while(|l| !STOP_LINE.is_match(l)) {
+        if *l == "ETA ACK" {
+            ack = true;
+        }
         if let Some(c) = ALASKA_FROM.captures(l) {
             airport = Some(c[1].to_owned());
         }
         if let Some(c) = ALASKA_FLIGHT.captures(l) {
             flight = Some(c[1].to_owned());
         }
-        if let Some(c) = ALASKA_ARR_GATE.captures(l) {
-            let mut g = report(GateKind::ArrivalGate, "ALASKA_ETA_ACK", &c[1], "");
-            g.arrival = airport;
-            g.flight_number = flight;
-            return Some(g);
+        if gate.is_none() {
+            if let Some(c) = ALASKA_ARR_GATE.captures(l) {
+                gate = Some(c[1].to_owned());
+            }
         }
     }
-    None
+    let gate = gate?;
+    if !(ack || airport.is_some() || flight.is_some()) {
+        return None;
+    }
+    let mut g = report(GateKind::ArrivalGate, "ALASKA_ETA_ACK", &gate, "");
+    g.arrival = airport;
+    g.flight_number = flight;
+    Some(g)
 }
 
 /// Finnair: the boarding gate of a weight and balance message (a departure
@@ -1227,7 +1254,7 @@ mod tests {
             ("Allegiant in-range", "RA", "QUANPOCG4~1           \r\n*AUTOMATED MSG FLT 9201*****IN-RANGE NOTICE*****\r\n--GATE ASSIGNMENT       PVU GATE 2 ASSIGNED      \r\n--NEXT FLIGHT           3232 PVU-SNA 19-1700Z\r\n", ArrivalGate, "ALLEGIANT_IN_RANGE", None, Some("PVU"), "2", None),
             ("Air Nostrum PKN", "RA", "QUVLCASYW~1\r\nIB1059  SDR   K92\r\nPKN:330   GATE:K88   BELT:19  HALL:10\r\n", ArrivalGate, "AIR_NOSTRUM_PKN", None, None, "K88", None),
             ("Volaris llegada", "RA", "QUANPH1Y4~1HOLA CAP, BUEN DIA. A SU LLEGADA GATE J16 Y GPU DISPONIBLE, FAVOR DE CONFIRMAR E\r\nN TIERRA\r\n", ArrivalGate, "VOLARIS_LLEGADA", None, None, "J16", None),
-            ("ITA connecting gates", "RA", "QUMGL1AAZ~1CONNECTING GATES\r\nEIHHI AZ0571/17 \r\nZRH/FCO ETA 1220 \r\nGATE A32 BAG CLAIM 23 \r\nFLT/DTE   TYP ETD   TO   \r\nAZ1781/17 INF 1315 PMO  \r\n", ArrivalGate, "ITA_CONNECTING_GATES", None, Some("FCO"), "A32", None),
+            ("ITA connecting gates", "RA", "QUMGL1AAZ~1CONNECTING GATES\r\nEIHHI AZ0571/17 \r\nZRH/FCO ETA 1220 \r\nGATE A32 BAG CLAIM 23 \r\nFLT/DTE   TYP ETD   TO   \r\nAZ1781/17 INF 1315 PMO  \r\n", ArrivalGate, "ITA_CONNECTING_GATES", Some("ZRH"), Some("FCO"), "A32", None),
             ("China Southern stand no", "RA", "QUCANXMCZ~1RA170521\n\t//**TRANSFER PASSENGER INFORMATION***\n\tFLTNO         DEST     GATE  CDT DLY STAND\n\tNIL\n\tBAGGAGE CLAIM BELT: 01\n\tSTAND NO: 136\n", ArrivalGate, "STAND_NO", None, None, "136", None),
             ("China Eastern park bay", "RA", "HI SIR, MU9062 SWA/HFE, PARK BAY 6.FOR REFERENCE ONLY.", ArrivalGate, "CHINA_EASTERN_PARK_BAY", None, Some("HFE"), "6", Some("9062")),
             ("FedEx expect gate", "RA", "QUMEMXRFX~1(4511)\r\nRAMP INRANGE NOTICE\r\nEXPECT GATE: 2(SBD)\r\nGROUND POWER AVAILABLE\r\n", ArrivalGate, "FEDEX_EXPECT_GATE", None, Some("SBD"), "2", None),
@@ -1271,6 +1298,34 @@ mod tests {
         assert_eq!((g.kind, g.departure.as_deref(), g.gate.as_str()), (GateKind::DepartureGate, Some("HEL"), "9"));
         assert_eq!(g.summary(), "DEPARTURE GATE AY1073 HEL gate 9");
         assert!(parse_report("RA", "QUHELASAY~1\r\nCONNECTION INFO\r\nARRIVING STAND 131\r\n").is_none());
+    }
+
+    #[test]
+    fn round7_review_cases() {
+        // Horizon's bare gate line is not an Alaska ETA acknowledgement.
+        let g = parse_report("RA", "ARRIVAL GATE:B9\r\n").unwrap();
+        assert_eq!((g.format, g.gate.as_str()), (Some("ARRIVAL_GATE_COLON"), "B9"));
+        // A previous gate or chat line is not the arrival gate.
+        assert!(parse_report("RA", "PREVIOUS ARRIVAL GATE: B4\r\n").is_none());
+        assert!(parse_report("RA", "SEEING ARRIVAL GATE: F3\r\n").is_none());
+        // An in-range marker of a later flight does not enable this GATE: line,
+        // and one after a Shandong gate leaves its flight and airport.
+        assert!(parse_report("RA", "QUSILITOO.1ENROUTE PLAN    \r\nGATE: 4\r\nNEXT FLIGHT\r\nIN-RANGE FROM AA\r\n").is_none());
+        let g = parse_report("RA", "CURRENT FLIGHT:\r\nSC8402 ARR:ZSJN\r\nGATE:10\r\nWEATHER:\r\nIN-RANGE FROM AA\r\n").unwrap();
+        assert_eq!((g.flight_number.as_deref(), g.arrival.as_deref(), g.gate.as_str()), (Some("SC8402"), Some("ZSJN"), "10"));
+        // ITA keeps the origin and ETA, also with the title on its own line.
+        for text in [
+            "QUMGL1AAZ~1CONNECTING GATES\r\nZRH/FCO ETA 1220 \r\nGATE A32 BAG CLAIM 23 \r\n",
+            "QUMGL1AAZ~1\r\nCONNECTING GATES\r\nZRH/FCO ETA 1220\r\nGATE A32 BAG CLAIM 23\r\n",
+        ] {
+            let g = parse_report("RA", text).unwrap();
+            assert_eq!(
+                (g.departure.as_deref(), g.arrival.as_deref(), g.gate.as_str(), g.eta.as_deref()),
+                (Some("ZRH"), Some("FCO"), "A32", Some("1220"))
+            );
+        }
+        // Air France parking after the next-flight line is not read.
+        assert!(parse_report("C1", ".PAROWAF 171200\r\nAGM\r\nNEXT FLIGHT\r\nARRIVAL PKG: K12 PKG TYPE: C TERM: E\r\n").is_none());
     }
 
     #[test]
