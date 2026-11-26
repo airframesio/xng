@@ -57,11 +57,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: amd64, platform: linux/amd64, image: 'debian:bookworm' }
-          - { arch: amd64, platform: linux/amd64, image: 'ubuntu:22.04' }
-          - { arch: arm64, platform: linux/arm64, image: 'debian:bookworm' }
-          - { arch: arm64, platform: linux/arm64, image: 'ubuntu:22.04' }
-          - { arch: armhf, platform: linux/arm/v7, image: 'debian:bookworm' }
+          - { arch: amd64, platform: linux/amd64, image: 'debian:bookworm', apt: '' }
+          - { arch: amd64, platform: linux/amd64, image: 'ubuntu:22.04', apt: '' }
+          - { arch: arm64, platform: linux/arm64, image: 'debian:bookworm', apt: '' }
+          - { arch: arm64, platform: linux/arm64, image: 'ubuntu:22.04', apt: '' }
+          # armhf runs under QEMU, where libusb from the native Airspy backend
+          # plus the UHD SoapySDR module (pulled in by Recommends) crashes
+          # about 1 run in 6 while enumerating; a plain C program doing the
+          # same airspy_list_devices + SoapySDRDevice_enumerate crashes too.
+          # Install only the declared dependencies there.
+          - { arch: armhf, platform: linux/arm/v7, image: 'debian:bookworm', apt: '--no-install-recommends' }
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -74,7 +79,7 @@ jobs:
         run: |
           docker run --rm --platform ${{ matrix.platform }} -v "$PWD/dist:/dist" ${{ matrix.image }} sh -euxc '
             apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y /dist/*.deb
+            DEBIAN_FRONTEND=noninteractive apt-get install -y ${{ matrix.apt }} /dist/*.deb
             xng --version
             xng devices
             mkdir /t && tar -C /t -xzf /dist/*.tar.gz && /t/*/xng --version
