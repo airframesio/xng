@@ -143,3 +143,36 @@ fn long_packets_with_drift() {
         }
     }
 }
+
+/// A frame split over many small reads decodes the same as one read, with
+/// the same SNR (each chirp counted once).
+#[test]
+fn chunking_does_not_change_the_frame() {
+    let payload: Vec<u8> = (0..60u8).collect();
+    let tx = TxParams {
+        coding: CodingParams { sf: 9, cr: 4, ldro: false },
+        bw_hz: 125e3,
+        preamble: 16,
+        sync_word: 0x12,
+    };
+    let mut x = vec![Complex::new(0.0f32, 0.0); 999];
+    x.extend(modulate(&payload, &tx, 2, 700.0, 700.0 / 906.875e6 * 1e6));
+    x.extend(vec![Complex::new(0.0f32, 0.0); 20_000]);
+    // 5 dB SNR, so the estimate measures noise rather than leakage.
+    let mut rng = Rng(0x5eed);
+    let sigma = (10f64.powf(-5.0 / 10.0) / 2.0).sqrt();
+    for v in x.iter_mut() {
+        *v += Complex::new((sigma * rng.gauss()) as f32, (sigma * rng.gauss()) as f32);
+    }
+    let rx = |chunk: usize| {
+        let mut d = Demodulator::new(RxParams { sf: 9, bw_hz: 125e3, carrier_hz: 906.875e6, ldro: None });
+        x.chunks(chunk).flat_map(|c| d.process(c)).collect::<Vec<_>>()
+    };
+    let whole = rx(x.len());
+    let small = rx(700);
+    assert_eq!(whole.len(), 1);
+    assert_eq!(small.len(), 1);
+    assert_eq!(small[0].crc_ok, Some(true));
+    assert_eq!(small[0].payload, payload);
+    assert!((whole[0].snr_db - small[0].snr_db).abs() < 0.3, "{} vs {}", whole[0].snr_db, small[0].snr_db);
+}

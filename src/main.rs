@@ -111,7 +111,8 @@ impl TuneOpts {
             match xng_mode_lora::parse_meshtastic_key(k) {
                 Ok(c) => cfg.meshtastic_channels.push(c),
                 Err(e) => {
-                    eprintln!("xng: --meshtastic-key {k}: {e}");
+                    // The value may hold a private key: never echo it.
+                    eprintln!("xng: --meshtastic-key: {e}");
                     std::process::exit(2);
                 }
             }
@@ -120,7 +121,7 @@ impl TuneOpts {
             match xng_mode_lora::parse_meshcore_channel(c) {
                 Ok(c) => cfg.meshcore_channels.push(c),
                 Err(e) => {
-                    eprintln!("xng: --meshcore-channel {c}: {e}");
+                    eprintln!("xng: --meshcore-channel: {e}");
                     std::process::exit(2);
                 }
             }

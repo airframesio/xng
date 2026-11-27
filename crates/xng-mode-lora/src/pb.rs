@@ -55,6 +55,10 @@ fn varint(buf: &[u8], pos: &mut usize) -> Option<u64> {
     for shift in (0..64).step_by(7) {
         let b = *buf.get(*pos)?;
         *pos += 1;
+        // The tenth byte holds only bit 63.
+        if shift == 63 && b & 0x7F > 1 {
+            return None;
+        }
         v |= ((b & 0x7F) as u64) << shift;
         if b & 0x80 == 0 {
             return Some(v);
@@ -70,6 +74,10 @@ pub fn parse(buf: &[u8]) -> Option<Vec<(u32, Value<'_>)>> {
     let mut pos = 0;
     while pos < buf.len() {
         let key = varint(buf, &mut pos)?;
+        // Field numbers are 1..2^29-1.
+        if key >> 3 >= 1 << 29 {
+            return None;
+        }
         let field = (key >> 3) as u32;
         if field == 0 {
             return None;

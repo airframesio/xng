@@ -316,6 +316,10 @@ pub fn decode_payload(hb: &HeaderBlock, chirps: &[u32], sf: u8, ldro: bool) -> P
         }
     }
     let len = hb.header.length as usize;
+    // Too few chirps for the advertised length: never fill in zeros and
+    // call the result verified.
+    let need = 2 * len + if hb.header.has_crc { 4 } else { 0 };
+    let complete = nibbles.len() >= need;
     let ws = whitening_seq(len);
     let bytes: Vec<u8> = (0..len)
         .map(|i| {
@@ -327,7 +331,7 @@ pub fn decode_payload(hb: &HeaderBlock, chirps: &[u32], sf: u8, ldro: bool) -> P
     let crc_ok = if hb.header.has_crc {
         let c = |k: usize| nibbles.get(2 * len + k).copied().unwrap_or(0) as u16;
         let rx = c(0) | (c(1) << 4) | (c(2) << 8) | (c(3) << 12);
-        Some(rx == payload_crc(&bytes))
+        Some(complete && rx == payload_crc(&bytes))
     } else {
         None
     };

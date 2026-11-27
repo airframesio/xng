@@ -135,8 +135,10 @@ fn cstr(b: &[u8]) -> String {
     String::from_utf8_lossy(&b[..end]).to_string()
 }
 
-fn advert(p: &[u8], d: &mut Map<String, Value>) -> Option<()> {
-    if p.len() < 32 + 4 + 64 + 1 {
+/// Returns whether the signature verified.
+fn advert(p: &[u8], d: &mut Map<String, Value>) -> Option<bool> {
+    // App data is optional: key, timestamp and signature are the minimum.
+    if p.len() < 32 + 4 + 64 {
         return None;
     }
     let pubkey = &p[..32];
@@ -158,7 +160,9 @@ fn advert(p: &[u8], d: &mut Map<String, Value>) -> Option<()> {
         })
         .unwrap_or(false);
     d.insert("signature_valid".into(), json!(valid));
-    let flags = app[0];
+    let Some(&flags) = app.first() else {
+        return Some(valid);
+    };
     let node_type = match flags & 0x0F {
         1 => "chat",
         2 => "repeater",
@@ -186,7 +190,7 @@ fn advert(p: &[u8], d: &mut Map<String, Value>) -> Option<()> {
     if flags & 0x80 != 0 && app.len() > i {
         d.insert("name".into(), json!(cstr(&app[i..])));
     }
-    Some(())
+    Some(valid)
 }
 
 /// Decode one LoRa payload as a MeshCore packet.
@@ -217,7 +221,8 @@ pub fn decode(frame: &[u8], channels: &[Channel]) -> Option<Decoded> {
     i += 1;
     let hsize = ((path_len >> 6) + 1) as usize;
     let count = (path_len & 63) as usize;
-    if hsize > 3 {
+    // Firmware caps the path at 64 bytes (MAX_PATH_SIZE).
+    if hsize > 3 || hsize * count > 64 {
         return None;
     }
     let path = frame.get(i..i + hsize * count)?;
@@ -253,10 +258,11 @@ pub fn decode(frame: &[u8], channels: &[Channel]) -> Option<Decoded> {
             d.insert("ack_crc".into(), json!(format!("{:08x}", u32le(payload))));
             "ack".into()
         }
-        4 => {
-            advert(payload, &mut d)?;
-            "advert".into()
-        }
+        // A forged or corrupt advert must not rename or move a node.
+        4 => match advert(payload, &mut d)? {
+            true => "advert".into(),
+            false => "advert_bad_signature".into(),
+        },
         5 | 6 if payload.len() > 3 => {
             let ch_hash = payload[0];
             d.insert("channel_hash".into(), json!(format!("{ch_hash:02x}")));
@@ -266,12 +272,28 @@ pub fn decode(frame: &[u8], channels: &[Channel]) -> Option<Decoded> {
                 let Some(plain) = mac_then_decrypt(&ch.secret, &payload[1..]) else {
                     continue;
                 };
+                if ptype == 6 {
+                    // Datagram: data type (2), data length (1), data; the
+                    // rest is AES padding.
+                    let Some(n) = plain.get(2).map(|&n| n as usize) else {
+                        continue;
+                    };
+                    let Some(data) = plain.get(3..3 + n) else {
+                        continue;
+                    };
+                    d.insert("channel".into(), json!(ch.name));
+                    d.insert("data_type".into(), json!(u16::from_le_bytes([plain[0], plain[1]])));
+                    d.insert("data_hex".into(), json!(hex(data)));
+                    kind = "channel_data".into();
+                    done = true;
+                    break;
+                }
                 if plain.len() < 5 {
                     continue;
                 }
                 d.insert("channel".into(), json!(ch.name));
                 d.insert("sent_time".into(), json!(u32le(&plain)));
-                if ptype == 5 {
+                {
                     let txt_type = plain[4] >> 2;
                     d.insert("txt_type".into(), json!(txt_type));
                     let text = cstr(&plain[5..]);
@@ -285,9 +307,6 @@ pub fn decode(frame: &[u8], channels: &[Channel]) -> Option<Decoded> {
                         }
                     }
                     kind = "channel_text".into();
-                } else {
-                    d.insert("data_hex".into(), json!(hex(&plain[4..])));
-                    kind = "channel_data".into();
                 }
                 done = true;
                 break;
@@ -412,6 +431,37 @@ mod tests {
         let mut bad = pkt.clone();
         let n = bad.len();
         bad[n - 1] ^= 1;
-        assert_eq!(decode(&bad, &[]).unwrap().details["signature_valid"], false);
+        let bad = decode(&bad, &[]).unwrap();
+        assert_eq!(bad.details["signature_valid"], false);
+        assert_eq!(bad.kind, "advert_bad_signature");
+    }
+
+    #[test]
+    fn advert_without_app_data() {
+        use ed25519_dalek::Signer;
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let mut msg = pk.to_vec();
+        msg.extend(1_764_000_000u32.to_le_bytes());
+        let sig = sk.sign(&msg).to_bytes();
+        let mut pkt = vec![(4 << 2) | 1, 0];
+        pkt.extend(&msg);
+        pkt.extend(sig);
+        let d = decode(&pkt, &[]).unwrap();
+        assert_eq!(d.kind, "advert");
+        assert!(d.details.get("name").is_none());
+    }
+
+    #[test]
+    fn path_over_64_bytes_is_rejected() {
+        // Two-byte hashes, 33 hops: 66 bytes of path.
+        let mut pkt = vec![(3 << 2) | 1, (1 << 6) | 33];
+        pkt.extend([0u8; 66]);
+        pkt.extend([1, 2, 3, 4]);
+        assert!(decode(&pkt, &[]).is_none());
+        let mut ok = vec![(3 << 2) | 1, (1 << 6) | 32];
+        ok.extend([0u8; 64]);
+        ok.extend([1, 2, 3, 4]);
+        assert_eq!(decode(&ok, &[]).unwrap().kind, "ack");
     }
 }

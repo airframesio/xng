@@ -192,6 +192,7 @@ fn main() {
         w.write_all(&s.re.to_le_bytes()).unwrap();
         w.write_all(&s.im.to_le_bytes()).unwrap();
     }
+    w.flush().expect("write the capture");
     eprintln!(
         "wrote {} samples ({:.2} s at {out_rate} S/s) to {path}",
         iq.len(),

@@ -76,6 +76,10 @@ struct FrameState {
     cfo: f64,
     sync_word: u8,
     header: Option<(crate::coding::HeaderBlock, usize)>,
+    /// Chirps demodulated so far (header first). Kept across `process`
+    /// calls, so a frame spread over many reads is demodulated once and
+    /// each chirp counts once in the SNR.
+    bins: Vec<u32>,
     snr_acc: (f64, usize),
 }
 
@@ -433,6 +437,7 @@ impl Demodulator {
             cfo,
             sync_word,
             header: None,
+            bins: Vec::new(),
             snr_acc: (0.0, 0),
         }))
     }
@@ -443,16 +448,16 @@ impl Demodulator {
         first: usize,
         count: usize,
     ) -> Option<Vec<u32>> {
-        let mut out = Vec::with_capacity(count);
-        for k in first..first + count {
+        // Resume after the chirps an earlier call already measured.
+        for k in fs.bins.len().max(first)..first + count {
             let at = fs.data_start + k as f64 * fs.step;
             let pk = self.window(at, fs.cfo, true)?;
             let noise = ((pk.total - pk.pow) / (self.n as f32 - 1.0)).max(1e-20);
             fs.snr_acc.0 += (pk.pow / (self.n as f32 * noise)) as f64;
             fs.snr_acc.1 += 1;
-            out.push(pk.bin as u32);
+            fs.bins.push(pk.bin as u32);
         }
-        Some(out)
+        fs.bins.get(first..first + count).map(<[u32]>::to_vec)
     }
 
     fn frame(&mut self, fs: &mut FrameState) -> Result<Option<(LoraFrame, usize)>, usize> {
@@ -481,8 +486,6 @@ impl Demodulator {
         }
         let (hb, nsym) = fs.header.clone().unwrap();
         let Some(chirps) = self.demod_symbols(fs, 8, nsym) else {
-            // Undo the SNR samples taken on this partial attempt.
-            fs.snr_acc = (0.0, 0);
             return Ok(None);
         };
         let ldro = self.p.ldro();

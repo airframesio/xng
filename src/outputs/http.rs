@@ -168,9 +168,11 @@ fn mesh_update(d: &mut Dash, proto: &str, kind: &str, details: &Value) {
     } else if kind == "advert" {
         st("public_key").map(|k| k[..8.min(k.len())].to_string())
     } else if let Some(name) = st("sender") {
-        // Channel text names its sender; match the advert that named it.
+        // Channel text names its sender; match the advert that named it
+        // (an advertised node, never another provisional "~name" entry).
         d.mesh_nodes
             .values()
+            .filter(|n| n.get("id").and_then(Value::as_str).is_some_and(|i| !i.starts_with('~')))
             .find(|n| n.get("proto").and_then(Value::as_str) == Some(proto) && n.get("name").and_then(Value::as_str) == Some(name))
             .and_then(|n| n.get("id").and_then(Value::as_str).map(str::to_string))
             .or_else(|| Some(format!("~{name}")))
@@ -178,7 +180,17 @@ fn mesh_update(d: &mut Dash, proto: &str, kind: &str, details: &Value) {
         None
     };
     let Some(id) = id else { return };
-    let e = d.mesh_nodes.entry(format!("{proto}:{id}")).or_insert_with(|| json!({}));
+    // Text heard before the sender's advert sits under "~name": fold it
+    // into the advertised node.
+    let provisional = if kind == "advert" && !d.mesh_nodes.contains_key(&format!("{proto}:{id}")) {
+        st("name").and_then(|n| d.mesh_nodes.remove(&format!("{proto}:~{n}")))
+    } else {
+        None
+    };
+    let e = d
+        .mesh_nodes
+        .entry(format!("{proto}:{id}"))
+        .or_insert_with(|| provisional.unwrap_or_else(|| json!({})));
     let o = e.as_object_mut().unwrap();
     o.insert("proto".into(), json!(proto));
     o.insert("id".into(), json!(id));
@@ -1607,6 +1619,24 @@ mod tests {
         assert_eq!(c["text"], "hi");
         assert_eq!(c["msgs"], 2);
         assert_eq!(d.mesh_nodes["meshcore:~Folsom Base"]["name"], "Folsom Base");
+    }
+
+    #[test]
+    fn mesh_text_before_advert_folds_into_the_node() {
+        let mut d = Dash::default();
+        mesh_update(&mut d, "meshcore", "channel_text", &json!({ "sender": "Folsom Base", "text": "copy" }));
+        mesh_update(&mut d, "meshcore", "advert", &json!({ "public_key": "fd172438aa", "name": "Folsom Base", "lat": 38.7, "lon": -121.2 }));
+        assert_eq!(d.mesh_nodes.len(), 1);
+        let n = &d.mesh_nodes["meshcore:fd172438"];
+        assert_eq!(n["id"], "fd172438");
+        assert_eq!(n["text"], "copy");
+        assert_eq!(n["msgs"], 2);
+        mesh_update(&mut d, "meshcore", "channel_text", &json!({ "sender": "Folsom Base", "text": "again" }));
+        assert_eq!(d.mesh_nodes.len(), 1);
+        assert_eq!(d.mesh_nodes["meshcore:fd172438"]["history"].as_array().unwrap().len(), 2);
+        // A forged advert never touches the node.
+        mesh_update(&mut d, "meshcore", "advert_bad_signature", &json!({ "public_key": "fd172438aa", "name": "Evil" }));
+        assert_eq!(d.mesh_nodes["meshcore:fd172438"]["name"], "Folsom Base");
     }
 
     #[test]

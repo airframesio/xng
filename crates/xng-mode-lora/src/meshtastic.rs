@@ -179,8 +179,16 @@ pub struct Decoded {
     pub details: Value,
 }
 
-fn deg(v: Option<i32>) -> Option<f64> {
-    v.filter(|&x| x != 0).map(|x| x as f64 * 1e-7)
+/// Latitude/longitude from two 1e-7 degree fields. A field on the wire is
+/// present (zero included); only a 0,0 pair, which firmware sends when it has
+/// no fix, is dropped.
+fn latlon(m: &Msg, lat_field: u32, lon_field: u32) -> Option<(f64, f64)> {
+    let lat = m.get(lat_field).and_then(|v| v.as_i32());
+    let lon = m.get(lon_field).and_then(|v| v.as_i32());
+    if lat.is_none() && lon.is_none() || lat == Some(0) && lon == Some(0) {
+        return None;
+    }
+    Some((lat.unwrap_or(0) as f64 * 1e-7, lon.unwrap_or(0) as f64 * 1e-7))
 }
 
 fn round(v: f64, places: i32) -> f64 {
@@ -229,10 +237,8 @@ fn position(m: &Msg) -> Map<String, Value> {
             (23, "precision_bits", 'u'),
         ],
     );
-    if let Some(lat) = deg(m.get(1).and_then(|v| v.as_i32())) {
+    if let Some((lat, lon)) = latlon(m, 1, 2) {
         o.insert("lat".into(), json!(round(lat, 7)));
-    }
-    if let Some(lon) = deg(m.get(2).and_then(|v| v.as_i32())) {
         o.insert("lon".into(), json!(round(lon, 7)));
     }
     o
@@ -486,10 +492,8 @@ fn app(port: u64, payload: &[u8]) -> (String, Map<String, Value>) {
                     (7, "description", 't'),
                 ],
             );
-            if let Some(la) = deg(m.get(2).and_then(|v| v.as_i32())) {
+            if let Some((la, lo)) = latlon(m, 2, 3) {
                 w.insert("lat".into(), json!(round(la, 7)));
-            }
-            if let Some(lo) = deg(m.get(3).and_then(|v| v.as_i32())) {
                 w.insert("lon".into(), json!(round(lo, 7)));
             }
             o.insert("waypoint".into(), Value::Object(w));
@@ -541,13 +545,11 @@ fn app(port: u64, payload: &[u8]) -> (String, Map<String, Value>) {
                     (13, "num_online_local_nodes", 'u'),
                 ],
             );
-            if let Some(la) = deg(m.get(9).and_then(|v| v.as_i32())) {
-                r.insert("lat".into(), json!(round(la, 7)));
-                o.insert("lat".into(), json!(round(la, 7)));
-            }
-            if let Some(lo) = deg(m.get(10).and_then(|v| v.as_i32())) {
-                r.insert("lon".into(), json!(round(lo, 7)));
-                o.insert("lon".into(), json!(round(lo, 7)));
+            if let Some((la, lo)) = latlon(m, 9, 10) {
+                for t in [&mut r, &mut o] {
+                    t.insert("lat".into(), json!(round(la, 7)));
+                    t.insert("lon".into(), json!(round(lo, 7)));
+                }
             }
             o.insert("map_report".into(), Value::Object(r));
             "map_report".into()
@@ -565,7 +567,11 @@ fn app(port: u64, payload: &[u8]) -> (String, Map<String, Value>) {
 /// Try to read decrypted bytes as a `Data` message.
 fn parse_data(plain: &[u8]) -> Option<(u64, Msg<'_>)> {
     let m = Msg::parse(plain)?;
-    let port = m.get(1)?.as_u64()?;
+    // portnum is an enum: only a varint is well formed.
+    let port = match m.get(1)? {
+        crate::pb::Value::Varint(v) => *v,
+        _ => return None,
+    };
     if port == 0 || port > 511 {
         return None;
     }

@@ -94,7 +94,11 @@ pub fn parse_meshcore_channel(s: &str) -> Result<meshcore::Channel, String> {
 
 /// Look up a named preset.
 pub fn named_preset(name: &str) -> Option<Preset> {
-    let lower = name.to_ascii_lowercase();
+    let mut lower = name.to_ascii_lowercase();
+    // The app spells it out; the firmware's channel name is LongMod.
+    if lower == "longmoderate" {
+        lower = "longmod".into();
+    }
     if let Some((n, sf, bw, _)) = meshtastic::PRESETS
         .iter()
         .find(|(n, ..)| n.to_ascii_lowercase() == lower)
@@ -145,6 +149,13 @@ pub fn preset_for(mode: Mode, carrier_hz: f64, cfg: &LoraConfig) -> Preset {
         p.bw_hz = bw;
     }
     p
+}
+
+/// One-sided bandwidth a channel on `carrier_hz` occupies with the session's
+/// preset: the chirp band (BW / 2). The decoder's own filter adds a margin
+/// for carrier offset beyond that, and a capture of exactly 2 x BW needs none.
+pub fn capture_passband_hz(mode: Mode, carrier_hz: f64) -> f64 {
+    preset_for(mode, carrier_hz, &config()).bw_hz / 2.0
 }
 
 /// A frame with its decoded packet.
@@ -240,6 +251,11 @@ impl LoraChannelDecoder {
         &self.preset
     }
 
+    /// The session's mode (frames are labeled by their own sync word).
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
     pub fn channel_rate(&self) -> f64 {
         self.preset.bw_hz * demod::OVERSAMPLE as f64
     }
@@ -251,12 +267,14 @@ impl LoraChannelDecoder {
             .unwrap_or(-100.0)
     }
 
-    /// Decode a LoRa payload by its sync word (falling back to the session mode).
+    /// Decode a LoRa payload by its sync word. Either network is decoded
+    /// whatever the session's mode; other sync words (LoRaWAN, private
+    /// networks) are not mesh traffic and are dropped.
     pub fn decode_payload(&self, f: demod::LoraFrame) -> Option<MeshFrame> {
         let mode = match f.sync_word {
             meshtastic::SYNC_WORD => Mode::Meshtastic,
             meshcore::SYNC_WORD => Mode::MeshCore,
-            _ => self.mode,
+            _ => return None,
         };
         let (kind, mut details) = match mode {
             Mode::MeshCore => {
@@ -346,7 +364,8 @@ pub fn to_message(
             ..Default::default()
         },
         decode: DecodeQuality {
-            crc_ok: f.lora.crc_ok.unwrap_or(true),
+            // A frame sent without a payload CRC is not a verified one.
+            crc_ok: f.lora.crc_ok == Some(true),
             fec_corrected: Some(f.lora.corrected_bits),
             errors: None,
         },
