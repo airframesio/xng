@@ -30,7 +30,14 @@ pub fn format_payload_summary(msg: &Message, station_id: &str) -> Option<Value> 
     let pos = details.get("gps_pos")?;
     let lat = pos.get("lat")?.as_f64()?;
     let lon = pos.get("lon")?.as_f64()?;
-    if !lat.is_finite() || !lon.is_finite() || (lat == 0.0 && lon == 0.0) {
+    if !(-90.0..=90.0).contains(&lat)
+        || !(-180.0..=180.0).contains(&lon)
+        || (lat == 0.0 && lon == 0.0)
+    {
+        return None;
+    }
+    // No navigation solution: an all-zero ECEF block decodes to lat 180.
+    if pos.get("num_sv").and_then(Value::as_u64) == Some(0) {
         return None;
     }
     let alt = pos.get("alt_m").and_then(Value::as_f64);
@@ -84,6 +91,31 @@ pub fn format_payload_summary(msg: &Message, station_id: &str) -> Option<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_fix_or_out_of_range_positions_are_skipped() {
+        let msg = |lat: f64, num_sv: u8| Message {
+            mode: xng_types::Mode::Sonde,
+            timestamp: Utc::now(),
+            frequency_hz: 403_000_000,
+            signal: Default::default(),
+            decode: Default::default(),
+            body: MessageBody::Sonde {
+                kind: "rs41".into(),
+                details: json!({"serial": "S1", "gps_pos": {"lat": lat, "lon": 0.5, "alt_m": 100.0, "num_sv": num_sv}}),
+            },
+            raw: None,
+            source: xng_types::Provenance {
+                station: xng_types::StationIdentity::new("XX-TEST"),
+                app: xng_types::AppInfo::xng(),
+                sdr: None,
+                channel: None,
+            },
+        };
+        assert!(format_payload_summary(&msg(47.0, 8), "X").is_some());
+        assert!(format_payload_summary(&msg(47.0, 0), "X").is_none());
+        assert!(format_payload_summary(&msg(180.0, 8), "X").is_none());
+    }
 
     #[test]
     fn gps_week_to_utc() {
