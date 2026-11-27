@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { loadMarineIconImages, marineIconKey, marineIconRotates, type MarineIconKey } from "../lib/marineIcons";
+  import { loadMarineIconImages, marineIconKey, marineIconRotates, marineIconScale, type MarineIconKey } from "../lib/marineIcons";
+  import { aircraftIconKey, aircraftIconScale, loadAircraftIconImages, type AircraftIconKey } from "../lib/aircraftIcons";
   import type { Feature } from "geojson";
   import * as maplibregl from "maplibre-gl";
   import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
@@ -118,15 +119,19 @@
     });
   }
 
-  // Decoded once; added again whenever a style swap drops them.
-  let marineImages: [MarineIconKey, ImageData][] | null = null;
+  // Decoded once; added again whenever a style swap drops them. Aircraft
+  // take the map's aircraft color; balloons keep their own.
+  let iconImages: [string, ImageData][] | null = null;
   function addMarineImages(m: maplibregl.Map) {
     const add = () => {
-      for (const [key, image] of marineImages ?? []) if (!m.hasImage(`marine-${key}`)) m.addImage(`marine-${key}`, image, { pixelRatio: 2 });
+      for (const [id, image] of iconImages ?? []) if (!m.hasImage(id)) m.addImage(id, image, { pixelRatio: 2 });
     };
-    if (marineImages) return add();
-    void loadMarineIconImages(32, 2).then((images) => {
-      marineImages = images;
+    if (iconImages) return add();
+    void Promise.all([loadMarineIconImages(32, 2), loadAircraftIconImages({ size: 32, pixelRatio: 2, fill: css("--air") })]).then(([marine, aircraft]) => {
+      iconImages = [
+        ...marine.map(([key, image]) => [`marine-${key}`, image] as [string, ImageData]),
+        ...aircraft.map(([key, image]) => [`aircraft-${key}`, image] as [string, ImageData]),
+      ];
       add();
     });
   }
@@ -182,12 +187,13 @@
         "icon-ignore-placement": true,
       },
     });
-    // Vessels, aids, base stations and beacons: one icon per kind.
+    // Aircraft, balloons, vessels, aids, base stations and beacons: one icon
+    // per kind, sized by kind (a 747 reads bigger than a Cessna).
     layer({
       id: "marine", type: "symbol", source: "points", filter: ["has", "icon"],
       layout: {
         "icon-image": ["get", "icon"],
-        "icon-size": ["case", ["get", "picked"], 1.05, 0.72],
+        "icon-size": ["*", ["get", "scale"], ["case", ["get", "picked"], 1.05, 0.72]],
         "icon-rotate": ["get", "hdg"],
         "icon-rotation-alignment": "map",
         "icon-allow-overlap": true,
@@ -242,6 +248,16 @@
           const key = vesselIcon(e);
           props.icon = `marine-${key}`;
           props.hdg = marineIconRotates(key) && typeof hdg === "number" && hdg < 360 ? hdg : 0;
+          props.scale = marineIconScale(key, e.length as number | undefined);
+        } else if (k.key === "aircraft") {
+          const key: AircraftIconKey = aircraftIconKey({ type: e.actype as string | undefined, military: e.military as boolean | undefined });
+          props.icon = `aircraft-${key}`;
+          props.hdg = typeof hdg === "number" ? hdg : 0;
+          props.scale = aircraftIconScale(key);
+        } else if (k.key === "beacons" && e.mode === "sonde") {
+          props.icon = "aircraft-balloon";
+          props.hdg = 0;
+          props.scale = aircraftIconScale("balloon");
         }
         points.push({ type: "Feature", properties: props, geometry: { type: "Point", coordinates: [e.lon, e.lat] } });
         bounds.extend([e.lon, e.lat]);

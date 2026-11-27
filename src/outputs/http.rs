@@ -760,6 +760,16 @@ fn update(d: &mut Dash, m: &Message) {
                 }
                 _ => {}
             }
+            // Length in meters (to bow + to stern), from static reports, so the
+            // map can draw bigger ships bigger — sticky.
+            if let (Some(bow), Some(stern)) = (
+                det.get("to_bow").and_then(Value::as_u64),
+                det.get("to_stern").and_then(Value::as_u64),
+            ) {
+                if bow + stern > 0 && bow + stern < 1000 {
+                    o.insert("length".into(), json!(bow + stern));
+                }
+            }
             // Distress beacon (AIS-SART/MOB/EPIRB-AIS by MMSI prefix) — sticky.
             if let Some(dist) = det.get("distress") {
                 o.insert("distress".into(), dist.clone());
@@ -1993,11 +2003,12 @@ mod tests {
             msg(Mode::Ais, MessageBody::Ais { nmea: vec![], msg_type: Some(t), mmsi: Some(mmsi), details: Some(det) })
         };
         update(&mut d, &ais(18, 338_000_001, json!({ "lat": 1.0, "lon": 2.0 })));
-        update(&mut d, &ais(24, 338_000_001, json!({ "ship_type": 37 })));
+        update(&mut d, &ais(24, 338_000_001, json!({ "ship_type": 37, "to_bow": 8, "to_stern": 4 })));
         update(&mut d, &ais(21, 992_576_001, json!({ "aton_type": 30, "virtual_aid": true, "lat": 1.0, "lon": 2.0 })));
         update(&mut d, &ais(4, 2_573_000, json!({ "lat": 1.0, "lon": 2.0 })));
         assert_eq!(d.vessels[&338_000_001]["class"], "B");
         assert_eq!(d.vessels[&338_000_001]["shiptype"], 37);
+        assert_eq!(d.vessels[&338_000_001]["length"], 12);
         assert_eq!(d.vessels[&992_576_001]["aid_type"], 30);
         assert_eq!(d.vessels[&992_576_001]["virtual_aid"], true);
         assert_eq!(d.vessels[&2_573_000]["base_station"], true);
