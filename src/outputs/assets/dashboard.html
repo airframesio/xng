@@ -245,6 +245,7 @@ map.attributionControl.addAttribution('silhouettes &copy; <a href="https://githu
 const flightLayer = L.layerGroup().addTo(map);
 const shipLayer = L.layerGroup().addTo(map);
 const beaconLayer = L.layerGroup().addTo(map);
+const meshLayer = L.layerGroup().addTo(map);
 // "Show All Trails": by default a position trail is drawn only for the
 // selected entity; this toggle reveals every entity's trail. Backed by an
 // (otherwise empty) group so it lives in the Leaflet layer control — the real
@@ -287,6 +288,8 @@ function buildLayerControl(s) {
     overlays['<i class="lyr-ic">🚢</i>Ships'] = shipLayer;
   if (any('sonde', 'ads-l', 'adsl', 'sarsat', 'dsc', 'navtex') || (s.beacons || []).length)
     overlays['<i class="lyr-ic">📡</i>Beacons'] = beaconLayer;
+  if (any('meshtastic', 'meshcore') || (s.mesh_nodes || []).length)
+    overlays['<i class="lyr-ic">📶</i>Mesh nodes'] = meshLayer;
   const irid = any('iridium') || (s.iridium_sats || []).length
     || (s.iridium_rings || []).length || (s.iridium_devices || []).length;
   if (irid) {
@@ -485,7 +488,7 @@ function silDiv(sil, color, rot) {
 const MODE_COLORS = {
   acars: '#e0af68', vdl2: '#7aa2f7', hfdl: '#bb9af7', adsb: '#7dcfff',
   modes: '#7dcfff', ais: '#9ece6a', aero: '#f7768e', stdc: '#ff9e64',
-  iridium: '#73daca',
+  iridium: '#73daca', meshtastic: '#67ea94', meshcore: '#f7768e',
 };
 const modeColor = m => MODE_COLORS[m] || '#9aa5ce';
 
@@ -1097,6 +1100,27 @@ function render() {
     const p = upsert('b' + b.mode + ':' + b.id, b.lat, b.lon, icon, `${emoji} ${label}`, popup, b.trail, '#e0af68', beaconLayer);
     if (p) pts.push(p);
   }
+  for (const n of (s.mesh_nodes || [])) {
+    if (n.lat == null || n.lon == null) continue;
+    const label = escapeHtml(String(n.name || n.short || n.id || ''));
+    const popup = entityPopup('', label, [
+      ['network', n.proto === 'meshcore' ? 'MeshCore' : 'Meshtastic'],
+      ['node', escapeHtml(String(n.id || ''))],
+      ['hardware', n.hw && escapeHtml(String(n.hw))],
+      ['battery', n.batt != null ? escapeHtml(String(n.batt)) + '%' : null],
+      ['altitude', n.alt != null ? escapeHtml(String(n.alt)) + ' m' : null],
+      ['SNR', n.snr != null ? escapeHtml(String(n.snr)) + ' dB' : null],
+      ['last text', n.text && escapeHtml(String(n.text).slice(0, 80))],
+      ['msgs', n.msgs],
+      ['seen', `${fmtAge(s.now - n.seen)} ago`],
+    ]);
+    const color = n.proto === 'meshcore' ? '#f7768e' : '#67ea94';
+    // A colored dot (an emoji can't take the network's color).
+    const icon = L.divIcon({ className: 'mesh-ic', iconSize: [14, 14],
+      html: `<span style="display:block;width:10px;height:10px;margin:2px;border-radius:50%;background:${color};box-shadow:0 0 0 2px #0b0e14,0 0 6px ${color}"></span>` });
+    const p = upsert('m' + n.proto + ':' + n.id, n.lat, n.lon, icon, label, popup, n.trail, color, meshLayer);
+    if (p) pts.push(p);
+  }
   markers.forEach((e, k) => {
     if (!e.alive) {
       (e.layer || map).removeLayer(e.marker);
@@ -1205,6 +1229,20 @@ function render() {
       f: { proto: escapeHtml(String(p.proto || '')), capcode: cap, function: p.function ?? '', baud: p.baud ?? '', text: escapeHtml(txt.slice(0, 48)), msgs: p.msgs ?? '' },
     });
   }
+  for (const n of (s.mesh_nodes || [])) {
+    const nm = String(n.name || n.short || n.id || '');
+    const net = n.proto === 'meshcore' ? 'MeshCore' : 'Meshtastic';
+    const color = n.proto === 'meshcore' ? '#f7768e' : '#67ea94';
+    const txt = n.text ? String(n.text).trim() : '';
+    ents.push({
+      k: 'm' + n.proto + ':' + n.id, id: nm, type: 'mesh', lat: n.lat ?? null, lon: n.lon ?? null, srcs: [], expandable: false,
+      color, name: `${ic('📶')}${escapeHtml(nm)}`, seen: n.seen,
+      sv: { id: nm, flight: '', icao: '', reg: net, type: String(n.hw || ''), alt: n.alt, kt: undefined, msgs: n.msgs, seen: n.seen || 0 },
+      cols: ['', '', net, escapeHtml(String(n.hw || '')), n.alt ?? '', '', n.msgs ?? ''],
+      f: { net, node: escapeHtml(String(n.id || '')), hw: escapeHtml(String(n.hw || '')), batt: n.batt ?? '', snr: n.snr ?? '', hops: n.hops ?? '',
+        text: escapeHtml(txt.slice(0, 48)), msgs: n.msgs ?? '' },
+    });
+  }
   // --- Entity-type tabs: All (everything, generic columns) + one tab per
   // present type, each with its own column set. Only tabs with ≥1 entity show.
   const TABS = [
@@ -1224,6 +1262,8 @@ function render() {
       cols: [['unit', 'unit'], ['class', 'class'], ['pressure', 'psi', 1], ['motion', 'motion', 1], ['marker', 'marker', 1], ['msgs', 'msgs', 1]] },
     { key: 'pagers', label: '📟 Pagers', types: ['pager'],
       cols: [['proto', 'proto'], ['capcode', 'capcode', 1], ['function', 'fn', 1], ['baud', 'baud', 1], ['text', 'text'], ['msgs', 'msgs', 1]] },
+    { key: 'mesh', label: '📶 Mesh', types: ['mesh'],
+      cols: [['net', 'network'], ['node', 'node'], ['hw', 'type'], ['batt', 'batt %', 1], ['snr', 'snr', 1], ['hops', 'hops', 1], ['text', 'last text'], ['msgs', 'msgs', 1]] },
     { key: 'sats', label: '🛰 Sats', types: ['sat'], cols: [['type', 'type'], ['alt', 'alt']] },
   ];
   const inTab = (t, e) => (!t.types || t.types.includes(e.type)) && (!t.pred || t.pred(e));
@@ -1240,7 +1280,7 @@ function render() {
   // Sort. `name`/`seen` always valid; otherwise the active tab's column key.
   const colKeys = tab.cols.map(c => c[0]);
   if (sortCol !== 'seen' && sortCol !== 'name' && !colKeys.includes(sortCol)) sortCol = 'seen';
-  const NUM = new Set(['alt', 'kt', 'msgs', 'seen', 'pressure', 'baud', 'capcode', 'function', 'motion', 'marker', 'mmsi']);
+  const NUM = new Set(['alt', 'kt', 'msgs', 'seen', 'pressure', 'baud', 'capcode', 'function', 'motion', 'marker', 'mmsi', 'batt', 'snr', 'hops']);
   const numCol = NUM.has(sortCol);
   const dirMul = sortDir === 'asc' ? 1 : -1;
   const sval = e => sortCol === 'seen' ? (e.seen || 0)

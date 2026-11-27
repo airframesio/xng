@@ -493,7 +493,7 @@ airframes-station-id = "KE-KSEA-VDL2-ANT2"  # session-level id override
 - ❌ **rtl_433 ISM universe (320 protocols)** — only **TPMS** has a vehicle-ID angle; weather/AMR/security sensors near-zero mission fit. Reimplementing the catalog is a huge breadth commitment → better as `xng extern` wrapper than native core.
 - ❌ **wM-Bus (868.95 MHz utility meters)** — utility telemetry, often AES, no aviation/maritime fit. **skip.**
 - ❌ **P25/DMR/NXDN/TETRA voice-trunking** — vocoded + frequently encrypted + scanner-community focus; **out of mission** (metadata/GPS slice covered in D2). **skip.**
-- ❌ **LoRa / Meshtastic / LoRaWAN** — LoRaWAN encrypted; Meshtastic decodable-but-flaky (<5% CRC); novel but low maturity + low fit. **P4/skip.**
+- ✅ **Meshtastic / MeshCore** — HAVE (2026-11, crate `xng-mode-lora`): native LoRa CSS receiver + Meshtastic (default-key channels) + MeshCore (adverts, Public/hashtag group text); see docs/notes/MESH.md. ❌ LoRaWAN stays out (encrypted).
 - ❌ **WSPR/FT8/FT4/JS8 (HF MFSK + LDPC)** — strong existing tooling (WSJT-X), hard FEC, ham-centric; only relevance = HF propagation health (could inform HFDL site planning). **P3 niche.**
 - ✅ **ACARS-adjacent ground systems** — VHF ACARS/VDL2/HFDL/Aero/STD-C/Iridium all ✅ HAVE. ❌ MISSING **CSC/Gatelink / AeroMACS** (WiMAX 5 GHz airport-surface datalink — no mature open decoder, verify demand); 💡 VDL Mode 4 + ACARS-over-Iridium-Certus extend the family. *Critic addition:* **VDL Mode 4** (STDMA 25 kHz VHF, ADS-B/TIS-B/FIS-B/GNS-B — the "AIS of the sky," operational only in Sweden's LFV net + niches, WAVECOM W-CODE only) is the one VDL variant xng's VDL2 work doesn't touch → ⚠️ **LOW (regional, near-dead) — considered, declined**, named explicitly so a VDL mode isn't silently omitted.
 - **Maritime/SAR-adjacent** — covered in D3 (DSC, NAVTEX, AIS-SART, COSPAS-SARSAT, VDES).
@@ -523,7 +523,7 @@ airframes-station-id = "KE-KSEA-VDL2-ANT2"  # session-level id override
 | 18 | **GTFS-realtime (non-RF)** | HTTP/protobuf | ✅ | agency APIs | H (ingest, not decode) | M-H (transit, complement) | P3 (ingest layer) |
 | 19 | WSPR / FT8 / FT4 / JS8 | HF MFSK + LDPC | ✅ | WSJT-X, CWSL_DIGI | M (hard FEC) | L-M (HF prop health) | P4 |
 | 20 | rtl_433 full breadth / wM-Bus | 433/868/915 ISM | ✅/⚠️ AES | rtl_433, rtl-wmbus | M | L | wrap via `xng extern` |
-| 21 | Meshtastic / LoRaWAN | LoRa CSS | ⚠️/❌ enc | gr-lora_sdr | L | L | skip/P4 |
+| 21 | Meshtastic / MeshCore (✅ HAVE) / LoRaWAN | LoRa CSS | ✅ public keys / ❌ enc | gr-lora_sdr | L | L | done / skip |
 | 22 | P25/DMR/NXDN/TETRA voice | vocoded/encrypted | ⚠️ | OP25, telive | M | L (out-of-mission voice) | skip |
 | 23 | ERMES | 169 MHz 4-FSK | ✅ | PDW only | M | L (dead network) | skip |
 | 24 | VDL Mode 4 | STDMA 25 kHz VHF | ✅ | WAVECOM only | M | L (regional/near-dead) | skip (declined) |

@@ -33,7 +33,7 @@ struct Cli {
 struct TuneOpts {
     /// Decode mode: acars, vdl2, hfdl, aero, aero-c, std-c, ais, adsb, iridium,
     /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs, aprs, pocsag, eot, flex,
-    /// vdes, or time
+    /// vdes, time, meshtastic, or meshcore
     #[arg(short, long, default_value = "acars")]
     mode: String,
     /// Capture sample rate in Hz (must be an integer multiple of the
@@ -70,11 +70,68 @@ struct TuneOpts {
     /// VDL2 only: reject bursts whose carrier offset exceeds this many ppm
     #[arg(long)]
     max_ppm: Option<f64>,
+    /// Meshtastic/MeshCore: LoRa preset (LongFast, MediumFast, ShortTurbo, ...
+    /// or meshcore-us, meshcore-eu, meshcore-anz). Default: LongFast for
+    /// meshtastic; meshcore-us, or meshcore-eu in the 868 MHz band
+    #[arg(long)]
+    lora_preset: Option<String>,
+    /// Meshtastic/MeshCore: spreading factor(s) to listen for, comma
+    /// separated (overrides the preset; each adds one demodulator)
+    #[arg(long, value_delimiter = ',')]
+    lora_sf: Vec<u8>,
+    /// Meshtastic/MeshCore: LoRa bandwidth in kHz (overrides the preset)
+    #[arg(long)]
+    lora_bw: Option<f64>,
+    /// Meshtastic: extra channel to decrypt, as NAME=BASE64KEY (repeatable;
+    /// the default key on every preset's channel is always tried)
+    #[arg(long)]
+    meshtastic_key: Vec<String>,
+    /// MeshCore: extra group channel, as #hashtag or NAME=BASE64KEY
+    /// (repeatable; the Public channel is always tried)
+    #[arg(long)]
+    meshcore_channel: Vec<String>,
 }
 
 impl TuneOpts {
+    /// Install the session's LoRa mesh settings (first call wins).
+    fn install_lora(&self) {
+        let mut cfg = xng_mode_lora::LoraConfig {
+            preset: self.lora_preset.clone(),
+            sfs: self.lora_sf.clone(),
+            bw_hz: self.lora_bw.map(|k| k * 1e3),
+            ..Default::default()
+        };
+        if let Some(p) = &cfg.preset {
+            if xng_mode_lora::named_preset(p).is_none() {
+                eprintln!("xng: unknown --lora-preset {p}");
+                std::process::exit(2);
+            }
+        }
+        for k in &self.meshtastic_key {
+            match xng_mode_lora::parse_meshtastic_key(k) {
+                Ok(c) => cfg.meshtastic_channels.push(c),
+                Err(e) => {
+                    // The value may hold a private key: never echo it.
+                    eprintln!("xng: --meshtastic-key: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        for c in &self.meshcore_channel {
+            match xng_mode_lora::parse_meshcore_channel(c) {
+                Ok(c) => cfg.meshcore_channels.push(c),
+                Err(e) => {
+                    eprintln!("xng: --meshcore-channel: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        xng_mode_lora::set_config(cfg);
+    }
+
     /// The library-level tune request these flags describe.
     fn tune(&self) -> tuning::Tune {
+        self.install_lora();
         tuning::Tune {
             mode: self.mode.clone(),
             sample_rate: self.sample_rate,
@@ -343,7 +400,7 @@ enum Command {
         gain: Option<f64>,
         /// Mode to survey: acars, vdl2, hfdl, aero, std-c, ais, adsb, iridium,
         /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs, aprs, pocsag, eot,
-        /// flex, vdes, time
+        /// flex, vdes, time, meshtastic, meshcore
         #[arg(short, long, default_value = "acars")]
         mode: String,
         /// Capture sample rate in Hz (the mode's plan default when omitted)

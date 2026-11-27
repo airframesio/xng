@@ -28,6 +28,7 @@ const PLANS: Record<string, { rate: number; channels: number[] }> = {
 const MODE_IDS = [
   "acars", "ais", "adsb", "vdl2", "std-c", "aero-l", "aero-c", "hfdl", "iridium", "uat", "sarsat",
   "dsc", "navtex", "sonde", "ads-l", "atcs", "aprs", "pocsag", "eot", "flex", "vdes", "time",
+  "meshtastic", "meshcore",
 ];
 
 function plan(mode: string) {

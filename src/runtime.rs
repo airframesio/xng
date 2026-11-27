@@ -30,6 +30,7 @@ use xng_mode_vdes::VdesChannelDecoder;
 use xng_mode_sarsat::SarsatChannelDecoder;
 use xng_mode_sonde::SondeChannelDecoder;
 use xng_mode_time::TimeChannelDecoder;
+use xng_mode_lora::LoraChannelDecoder;
 use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
@@ -411,6 +412,8 @@ pub(crate) enum ModeChannel {
     Adsl(AdslChannelDecoder),
     Atcs(AtcsChannelDecoder),
     Time(TimeChannelDecoder),
+    /// LoRa mesh (Meshtastic / MeshCore); boxed, it holds FFT plans per SF.
+    Lora(Box<LoraChannelDecoder>),
     /// Placeholder for one airband channel; `collapse_airband` folds every
     /// placeholder of a session into one [`ModeChannel::AirbandSet`].
     AirbandPending,
@@ -496,7 +499,24 @@ impl ModeChannel {
             // Airband channels are built together (shared front end and the
             // session's per-channel settings) by `collapse_airband`.
             Mode::Airband => Ok(Self::AirbandPending),
+            // LoRa mesh: the preset (SF/BW) comes from --lora-preset or the
+            // mode's default for the tuned carrier.
+            Mode::Meshtastic | Mode::MeshCore => {
+                // `freq` is already the channel's own frequency.
+                let carrier = freq as f64;
+                Ok(Self::Lora(Box::new(LoraChannelDecoder::new(mode, sample_rate, offset, carrier)?)))
+            }
             other => Err(format!("mode {other} has no native core yet")),
+        }
+    }
+
+    /// One-sided bandwidth a channel at `freq` needs inside the capture.
+    /// LoRa depends on the preset in use (62.5 kHz MeshCore fits a 125 kS/s
+    /// capture); every other mode has a fixed passband.
+    fn capture_passband_hz(mode: Mode, freq: u64) -> f64 {
+        match mode {
+            Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::capture_passband_hz(mode, freq as f64),
+            _ => Self::passband_hz(mode),
         }
     }
 
@@ -521,6 +541,7 @@ impl ModeChannel {
             Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
             Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
             Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
+            Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_PASSBAND_HZ,
             Mode::Airband => xng_mode_airband::FRONT_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
@@ -551,6 +572,7 @@ impl ModeChannel {
             Self::Flex(_) => xng_mode_flex::CHANNEL_RATE,
             Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
             Self::Time(_) => xng_mode_time::CHANNEL_RATE,
+            Self::Lora(d) => d.channel_rate(),
             Self::AirbandPending | Self::AirbandSet(_) => xng_mode_airband::CHANNEL_RATE,
         }
     }
@@ -589,6 +611,7 @@ impl ModeChannel {
             Self::Flex(d) => d.level_dbfs(),
             Self::Vdes(d) => d.level_dbfs(),
             Self::Time(d) => d.level_dbfs(),
+            Self::Lora(d) => d.level_dbfs(),
             Self::AirbandPending => f32::NEG_INFINITY,
             Self::AirbandSet(s) => s.level_dbfs(0),
         }
@@ -866,6 +889,18 @@ impl ModeChannel {
                 let msgs = frames
                     .iter()
                     .map(|f| xng_mode_time::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, ok)
+            }
+            Self::Lora(dec) => {
+                let bad_before = dec.crc_failures;
+                let frames = dec.process(iq);
+                let ok = frames.len() as u64;
+                let seen = ok + (dec.crc_failures - bad_before);
+                let level = dec.level_dbfs();
+                let msgs = frames
+                    .iter()
+                    .map(|f| xng_mode_lora::to_message(f, freq, level, prov.clone()))
                     .collect();
                 (msgs, seen, ok)
             }
@@ -1246,7 +1281,7 @@ pub fn run_session(mut source: Box<dyn IqSource>, cfg: SessionConfig) -> anyhow:
     let mut decoders = Vec::new();
     for &freq in &cfg.channels_hz {
         let offset = freq as f64 - capture_center as f64;
-        if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+        if 2.0 * (offset.abs() + ModeChannel::capture_passband_hz(cfg.mode, freq)) > sample_rate {
             anyhow::bail!(
                 "channel {:.3} MHz is outside the capture (center {:.3} MHz, rate {} S/s)",
                 freq as f64 / 1e6,
@@ -1559,7 +1594,7 @@ pub fn run_station(sessions: Vec<(Box<dyn IqSource>, SessionConfig)>) -> anyhow:
         let mut decoders = Vec::new();
         for &freq in &cfg.channels_hz {
             let offset = freq as f64 - capture_center as f64;
-            if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+            if 2.0 * (offset.abs() + ModeChannel::capture_passband_hz(cfg.mode, freq)) > sample_rate {
                 anyhow::bail!(
                     "[{}] channel {:.3} MHz is outside the capture (center {:.3} MHz, rate {} S/s)",
                     cfg.mode,
@@ -1863,7 +1898,7 @@ pub(crate) fn build_decoders(
     let mut decoders = Vec::new();
     for &freq in &cfg.channels_hz {
         let offset = freq as f64 - capture_center as f64;
-        if 2.0 * (offset.abs() + ModeChannel::passband_hz(cfg.mode)) > sample_rate {
+        if 2.0 * (offset.abs() + ModeChannel::capture_passband_hz(cfg.mode, freq)) > sample_rate {
             anyhow::bail!(
                 "channel {:.3} MHz is outside the capture",
                 freq as f64 / 1e6

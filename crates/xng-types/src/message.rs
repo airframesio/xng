@@ -259,6 +259,19 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// Meshtastic packet; `kind` = text/position/nodeinfo/telemetry/...
+    /// (or `encrypted`), `details` = header, decrypted app fields and the
+    /// LoRa link (`lora`: SF, BW, SNR).
+    Meshtastic {
+        kind: String,
+        details: serde_json::Value,
+    },
+    /// MeshCore packet; `kind` = advert/channel_text/txt_msg/ack/trace/...,
+    /// `details` = route, path and decoded payload fields.
+    MeshCore {
+        kind: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 

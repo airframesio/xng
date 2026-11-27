@@ -69,6 +69,9 @@ struct Dash {
     receiver_estimate: Option<Value>,
     /// Pager capcodes (FLEX/POCSAG), keyed by "proto:capcode" (no position).
     pagers: HashMap<String, Value>,
+    /// LoRa mesh nodes (Meshtastic node number / MeshCore public key),
+    /// keyed by "proto:id": name, hardware, battery, last text, position.
+    mesh_nodes: HashMap<String, Value>,
     /// Cross-mode distress/emergency alerting surface (XM-6): ADS-B emergency
     /// squawks + TC28, AIS-SART/MOB/EPIRB-AIS, STD-C distress EGC, DSC distress
     /// alerts, and every COSPAS-SARSAT 406 beacon, keyed by "mode:entity".
@@ -154,6 +157,105 @@ impl Dashboard {
 
 /// Append to the entity's position trail (decimated: only when moved
 /// meaningfully; capped length).
+/// Fold one Meshtastic / MeshCore packet into the mesh node table. The
+/// sender is the Meshtastic `from` node or, for MeshCore, the advert's public
+/// key (by its first byte, the hash MeshCore paths use) or the channel
+/// message's sender name.
+fn mesh_update(d: &mut Dash, proto: &str, kind: &str, details: &Value) {
+    let st = |k: &str| details.get(k).and_then(Value::as_str);
+    let id = if proto == "meshtastic" {
+        st("from").map(str::to_string)
+    } else if kind == "advert" {
+        st("public_key").map(|k| k[..8.min(k.len())].to_string())
+    } else if let Some(name) = st("sender") {
+        // Channel text names its sender; match the advert that named it
+        // (an advertised node, never another provisional "~name" entry).
+        d.mesh_nodes
+            .values()
+            .filter(|n| n.get("id").and_then(Value::as_str).is_some_and(|i| !i.starts_with('~')))
+            .find(|n| n.get("proto").and_then(Value::as_str) == Some(proto) && n.get("name").and_then(Value::as_str) == Some(name))
+            .and_then(|n| n.get("id").and_then(Value::as_str).map(str::to_string))
+            .or_else(|| Some(format!("~{name}")))
+    } else {
+        None
+    };
+    let Some(id) = id else { return };
+    // Text heard before the sender's advert sits under "~name": fold it
+    // into the advertised node.
+    let provisional = if kind == "advert" && !d.mesh_nodes.contains_key(&format!("{proto}:{id}")) {
+        st("name").and_then(|n| d.mesh_nodes.remove(&format!("{proto}:~{n}")))
+    } else {
+        None
+    };
+    let e = d
+        .mesh_nodes
+        .entry(format!("{proto}:{id}"))
+        .or_insert_with(|| provisional.unwrap_or_else(|| json!({})));
+    let o = e.as_object_mut().unwrap();
+    o.insert("proto".into(), json!(proto));
+    o.insert("id".into(), json!(id));
+    for (k, dk) in [
+        ("long_name", "name"),
+        ("name", "name"),
+        ("sender", "name"),
+        ("short_name", "short"),
+        ("hw_model", "hw"),
+        ("node_type", "hw"),
+        ("hops_away", "hops"),
+        ("hops", "hops"),
+        ("channel", "channel"),
+    ] {
+        if let Some(v) = details.get(k) {
+            if dk == "name" && k == "sender" && o.contains_key("name") {
+                continue;
+            }
+            o.insert(dk.into(), v.clone());
+        }
+    }
+    if let Some(r) = details.get("user").and_then(|u| u.get("role")) {
+        o.insert("role".into(), r.clone());
+    }
+    if let Some(dm) = details.get("telemetry").and_then(|t| t.get("device_metrics")) {
+        for (k, dk) in [("battery_level", "batt"), ("voltage", "volts"), ("channel_utilization", "chutil")] {
+            if let Some(v) = dm.get(k) {
+                o.insert(dk.into(), v.clone());
+            }
+        }
+    }
+    if let Some(env) = details.get("telemetry").and_then(|t| t.get("environment_metrics")) {
+        o.insert("env".into(), env.clone());
+    }
+    if let Some(snr) = details.get("lora").and_then(|l| l.get("snr_db")).and_then(Value::as_f64) {
+        o.insert("snr".into(), json!((snr * 10.0).round() / 10.0));
+    }
+    if let (Some(lat), Some(lon)) = (details.get("lat").and_then(Value::as_f64), details.get("lon").and_then(Value::as_f64)) {
+        o.insert("lat".into(), json!(lat));
+        o.insert("lon".into(), json!(lon));
+        if let Some(a) = details.get("altitude") {
+            o.insert("alt".into(), a.clone());
+        }
+        push_trail(o, lat, lon);
+    }
+    if let Some(t) = st("text") {
+        let t = t.trim();
+        if !t.is_empty() {
+            o.insert("text".into(), json!(t));
+            let to = details.get("to").cloned().unwrap_or(Value::Null);
+            let channel = details.get("channel").cloned().unwrap_or(Value::Null);
+            let hist = o.entry("history").or_insert_with(|| json!([])).as_array_mut().unwrap();
+            hist.push(json!({ "text": t, "to": to, "channel": channel, "seen": now_s() }));
+            let n = hist.len();
+            if n > 20 {
+                hist.drain(..n - 20);
+            }
+        }
+    }
+    o.insert("last".into(), json!(kind));
+    o.insert("seen".into(), json!(now_s()));
+    let n = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+    o.insert("msgs".into(), json!(n + 1));
+}
+
 fn push_trail(o: &mut serde_json::Map<String, Value>, lat: f64, lon: f64) {
     let trail = o.entry("trail").or_insert_with(|| json!([]));
     let arr = trail.as_array_mut().unwrap();
@@ -958,6 +1060,10 @@ fn update(d: &mut Dash, m: &Message) {
                 push_trail(o, lat, lon);
             }
         }
+        // Meshtastic / MeshCore → a mesh node entity.
+        MessageBody::Meshtastic { kind, details } | MessageBody::MeshCore { kind, details } => {
+            mesh_update(d, m.mode.as_str(), kind, details);
+        }
         // Rail EOT/HOT telemetry → a "train" entity keyed by unit address (no
         // GPS position — table-only). kind = eot (telemetry) | hot (command).
         MessageBody::Eot { kind, details } => {
@@ -1068,6 +1174,7 @@ fn snapshot_value(d: &mut Dash, include_messages: bool) -> Value {
     d.beacons.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.trains.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.pagers.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    d.mesh_nodes.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     let alert_cut = now_s().saturating_sub(ALERT_EXPIRE_S);
     d.alerts.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= alert_cut);
     // Persist the accumulated beam pattern occasionally so it survives
@@ -1087,6 +1194,7 @@ fn snapshot_value(d: &mut Dash, include_messages: bool) -> Value {
         "beacons": d.beacons.values().collect::<Vec<_>>(),
         "trains": d.trains.values().collect::<Vec<_>>(),
         "pagers": d.pagers.values().collect::<Vec<_>>(),
+        "mesh_nodes": d.mesh_nodes.values().collect::<Vec<_>>(),
         "alerts": d.alerts.values().collect::<Vec<_>>(),
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
@@ -1211,6 +1319,9 @@ fn geo_entities(d: &Dash) -> Vec<(&'static str, &Value)> {
     }
     for e in d.beacons.values() {
         out.push(("beacon", e));
+    }
+    for e in d.mesh_nodes.values().filter(|e| e.get("lat").is_some()) {
+        out.push(("mesh", e));
     }
     // Iridium mobile-terminal positions (mt-position fixes) — IRID-6 export.
     for e in d.iridium_devices.values() {
@@ -1485,6 +1596,47 @@ mod tests {
                 channel: None,
             },
         }
+    }
+
+    #[test]
+    fn mesh_nodes_merge_by_node_and_match_meshcore_senders() {
+        let mut d = Dash::default();
+        let lora = json!({ "snr_db": 7.5 });
+        mesh_update(&mut d, "meshtastic", "nodeinfo", &json!({ "from": "!c0ffee01", "long_name": "Router", "short_name": "RTR", "hw_model": "RAK4631", "lora": lora }));
+        mesh_update(&mut d, "meshtastic", "position", &json!({ "from": "!c0ffee01", "lat": 38.6688, "lon": -120.9872 }));
+        mesh_update(&mut d, "meshtastic", "device_metrics", &json!({ "from": "!c0ffee01", "telemetry": { "device_metrics": { "battery_level": 87 } } }));
+        mesh_update(&mut d, "meshcore", "advert", &json!({ "public_key": "abcdef0123456789", "name": "KJ6ABC Pocket", "lat": 38.5, "lon": -121.4 }));
+        mesh_update(&mut d, "meshcore", "channel_text", &json!({ "sender": "KJ6ABC Pocket", "text": "hi", "channel": "Public" }));
+        mesh_update(&mut d, "meshcore", "channel_text", &json!({ "sender": "Folsom Base", "text": "copy" }));
+        assert_eq!(d.mesh_nodes.len(), 3);
+        let n = &d.mesh_nodes["meshtastic:!c0ffee01"];
+        assert_eq!(n["name"], "Router");
+        assert_eq!(n["batt"], 87);
+        assert_eq!(n["snr"], 7.5);
+        assert_eq!(n["msgs"], 3);
+        assert_eq!(n["trail"].as_array().unwrap().len(), 1);
+        let c = &d.mesh_nodes["meshcore:abcdef01"];
+        assert_eq!(c["text"], "hi");
+        assert_eq!(c["msgs"], 2);
+        assert_eq!(d.mesh_nodes["meshcore:~Folsom Base"]["name"], "Folsom Base");
+    }
+
+    #[test]
+    fn mesh_text_before_advert_folds_into_the_node() {
+        let mut d = Dash::default();
+        mesh_update(&mut d, "meshcore", "channel_text", &json!({ "sender": "Folsom Base", "text": "copy" }));
+        mesh_update(&mut d, "meshcore", "advert", &json!({ "public_key": "fd172438aa", "name": "Folsom Base", "lat": 38.7, "lon": -121.2 }));
+        assert_eq!(d.mesh_nodes.len(), 1);
+        let n = &d.mesh_nodes["meshcore:fd172438"];
+        assert_eq!(n["id"], "fd172438");
+        assert_eq!(n["text"], "copy");
+        assert_eq!(n["msgs"], 2);
+        mesh_update(&mut d, "meshcore", "channel_text", &json!({ "sender": "Folsom Base", "text": "again" }));
+        assert_eq!(d.mesh_nodes.len(), 1);
+        assert_eq!(d.mesh_nodes["meshcore:fd172438"]["history"].as_array().unwrap().len(), 2);
+        // A forged advert never touches the node.
+        mesh_update(&mut d, "meshcore", "advert_bad_signature", &json!({ "public_key": "fd172438aa", "name": "Evil" }));
+        assert_eq!(d.mesh_nodes["meshcore:fd172438"]["name"], "Folsom Base");
     }
 
     #[test]
