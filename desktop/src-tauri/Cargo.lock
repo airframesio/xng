@@ -9,6 +9,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.2.17",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -397,6 +408,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
+name = "base64ct"
+version = "1.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
+
+[[package]]
 name = "bindgen"
 version = "0.66.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -731,6 +748,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cipher"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
+dependencies = [
+ "crypto-common",
+ "inout",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -819,6 +846,12 @@ checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "const-oid"
+version = "0.9.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "convert_case"
@@ -1063,6 +1096,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "curve25519-dalek"
+version = "4.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.2.17",
+ "curve25519-dalek-derive",
+ "digest",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "darling"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1114,6 +1174,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5729f5117e208430e437df2f4843f5e5952997175992d1414f94c57d61e270b4"
 
 [[package]]
+name = "der"
+version = "0.7.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
+dependencies = [
+ "const-oid",
+ "zeroize",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1152,6 +1222,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -1295,6 +1366,30 @@ name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "serde",
+ "sha2",
+ "subtle",
+ "zeroize",
+]
 
 [[package]]
 name = "either"
@@ -1441,6 +1536,12 @@ checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
 ]
+
+[[package]]
+name = "fiat-crypto"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
 name = "field-offset"
@@ -2015,6 +2116,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hmac"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.39.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2322,6 +2432,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
 dependencies = [
  "cfb",
+]
+
+[[package]]
+name = "inout"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
+dependencies = [
+ "generic-array",
 ]
 
 [[package]]
@@ -3663,6 +3782,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pkcs8"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
+dependencies = [
+ "der",
+ "spki",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4921,6 +5050,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
+dependencies = [
+ "rand_core 0.6.4",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5057,6 +5195,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
+]
+
+[[package]]
+name = "spki"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
+dependencies = [
+ "base64ct",
+ "der",
 ]
 
 [[package]]
@@ -7109,7 +7257,7 @@ dependencies = [
 
 [[package]]
 name = "xng"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7155,6 +7303,7 @@ dependencies = [
  "xng-mode-flex",
  "xng-mode-hfdl",
  "xng-mode-iridium",
+ "xng-mode-lora",
  "xng-mode-navtex",
  "xng-mode-pocsag",
  "xng-mode-sarsat",
@@ -7172,7 +7321,7 @@ dependencies = [
 
 [[package]]
 name = "xng-acars"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "base64 0.22.1",
  "crc",
@@ -7185,7 +7334,7 @@ dependencies = [
 
 [[package]]
 name = "xng-desktop"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7207,7 +7356,7 @@ dependencies = [
 
 [[package]]
 name = "xng-dsp"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "crc",
  "num-complex",
@@ -7216,7 +7365,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-acars"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7228,7 +7377,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-adsb"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7239,7 +7388,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-adsl"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7251,7 +7400,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-aero"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7265,7 +7414,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-airband"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7277,7 +7426,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-ais"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7288,7 +7437,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-aprs"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7300,7 +7449,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-atcs"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7312,7 +7461,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-dsc"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7324,7 +7473,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-eot"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7336,7 +7485,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-flex"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7348,7 +7497,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-hfdl"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7361,7 +7510,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-iridium"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "crc",
@@ -7376,8 +7525,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "xng-mode-lora"
+version = "0.24.0"
+dependencies = [
+ "aes",
+ "base64 0.22.1",
+ "chrono",
+ "ed25519-dalek",
+ "hmac",
+ "num-complex",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "sha2",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
 name = "xng-mode-navtex"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7389,7 +7556,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-pocsag"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7401,7 +7568,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-sarsat"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7413,7 +7580,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-sonde"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7425,7 +7592,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-stdc"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7438,7 +7605,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-time"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7450,7 +7617,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-uat"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7462,7 +7629,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-vdes"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7473,7 +7640,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-vdl2"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7486,7 +7653,7 @@ dependencies = [
 
 [[package]]
 name = "xng-proto"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "prost",
  "tonic",
@@ -7496,7 +7663,7 @@ dependencies = [
 
 [[package]]
 name = "xng-sdr"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "num-complex",
  "pkg-config",
@@ -7506,7 +7673,7 @@ dependencies = [
 
 [[package]]
 name = "xng-types"
-version = "0.23.3"
+version = "0.24.0"
 dependencies = [
  "chrono",
  "serde",
