@@ -182,6 +182,7 @@ fn decode_report(label: &str, text: &str) -> Option<Oooi> {
             .or_else(|| air_canada_eta(text)),
         "22" => numbered_report(text).or_else(|| label22_csv(text)),
         "44" => label44_report(text),
+        "49" => label49_report(text),
         "QC" | "QD" | "QE" | "QF" => text_report(text).or_else(|| station_report(label, text)),
         _ => None,
     }
@@ -254,6 +255,27 @@ fn numbered_report(text: &str) -> Option<Oooi> {
         tail.get(..6).and_then(clock)
     };
     set_event(&mut o, event, time);
+    has_time(&o).then_some(o)
+}
+
+static LABEL49: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^01(OUT |OFF |ON  |IN  )[A-Z0-9 ]*/(0[1-9]|[12]\d|3[01])(\d{4})([A-Z]{4}|\*{4})([A-Z]{4}|\*{4})")
+        .expect("label 49 regex")
+});
+
+/// Label 49 flight-phase report whose code is an OOOI event:
+/// `01OFF     APZ136/211728KIADRKSI\r\n+  383182.8+ 21.1`. 01 + code (4,
+/// padded) + callsign + `/` + DDHHMM + origin + destination; the header time
+/// is the event time. Phase pairs (`TOIC`, `ERDC`, ...) carry no OOOI time.
+/// Same as acars-decoder-typescript `Label_49` (#578).
+fn label49_report(text: &str) -> Option<Oooi> {
+    let m = LABEL49.captures(text)?;
+    let mut o = Oooi {
+        depa: icao(&m[4]),
+        dsta: icao(&m[5]),
+        ..Oooi::default()
+    };
+    set_event(&mut o, m[1].trim_end(), clock(&m[3]));
     has_time(&o).then_some(o)
 }
 
@@ -1459,6 +1481,23 @@ mod tests {
     #[test]
     fn numbered_report_with_non_ascii_tail_does_not_panic() {
         assert!(decode("11", "OUT01ETH309/22220151HKJKHAAé0151").is_none());
+    }
+
+    #[test]
+    fn label_49_oooi_reports() {
+        let o = decode("49", "01OFF     APZ136/211728KIADRKSI\r\n+  383182.8+ 21.1215102230851").unwrap();
+        assert_eq!(o.depa.as_deref(), Some("KIAD"));
+        assert_eq!(o.dsta.as_deref(), Some("RKSI"));
+        assert_eq!(o.wloff.as_deref(), Some("1728"));
+
+        let o = decode("49", "01IN      UAL770/050912LEBLKORD\r\n+  0     0.0+ 12.0").unwrap();
+        assert_eq!(o.gtin.as_deref(), Some("0912"));
+
+        // Phase pair, masked header, day 00 and hour 24 carry no OOOI time.
+        assert!(decode("49", "01ERDCUAL770    /042300LEBLKORD\r\n+31994297.4- 11.1").is_none());
+        assert!(decode("49", "01OUT **********/**************\r\n*****").is_none());
+        assert!(decode("49", "01OUT     APZ136/002359KIADRKSI\r\n+").is_none());
+        assert!(decode("49", "01OFF     APZ136/212400KIADRKSI\r\n+").is_none());
     }
 
     #[test]

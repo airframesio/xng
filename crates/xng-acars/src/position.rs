@@ -1,4 +1,4 @@
-//! Free-text position-report extraction (ACARS labels `20`/POS, `4J`,
+//! Free-text position-report extraction (ACARS labels `20`/POS, `22`, `4J`,
 //! `H1` POS) → latitude / longitude.
 //!
 //! Clean-room port of the coordinate decoders in airframes' own
@@ -97,6 +97,43 @@ pub fn decode_decimal_minutes(s: &str) -> Option<Position> {
     })
 }
 
+/// Decode a packed degrees-minutes-seconds coordinate, `N 394138W 752038`
+/// (39° 41′ 38″, 75° 20′ 38″). Latitude has 6 digits, longitude 6 or 7.
+/// Used by label `22` (acars-decoder-typescript `decodeStringCoordinatesDMS`,
+/// #572).
+pub fn decode_dms(s: &str) -> Option<Position> {
+    let s = s.trim();
+    let lat_dir = *s.as_bytes().first()?;
+    if lat_dir != b'N' && lat_dir != b'S' {
+        return None;
+    }
+    let rest = s[1..].trim_start();
+    let lon_at = rest.find(['E', 'W'])?;
+    let lat_digits = rest[..lon_at].trim_end();
+    let lon_dir = rest.as_bytes()[lon_at];
+    let lon_digits = rest[lon_at + 1..].trim_start();
+    let dms = |d: &str, lens: &[usize]| -> Option<f64> {
+        if !lens.contains(&d.len()) || !d.bytes().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let v: u32 = d.parse().ok()?;
+        let (deg, min, sec) = (v / 10000, (v / 100) % 100, v % 100);
+        if min >= 60 || sec >= 60 {
+            return None;
+        }
+        Some(f64::from(deg) + f64::from(min) / 60.0 + f64::from(sec) / 3600.0)
+    };
+    let lat = dms(lat_digits, &[6])?;
+    let lon = dms(lon_digits, &[6, 7])?;
+    if lat > 90.0 || lon > 180.0 {
+        return None;
+    }
+    Some(Position {
+        latitude: lat * dir_sign(lat_dir)?,
+        longitude: lon * dir_sign(lon_dir)?,
+    })
+}
+
 /// Decode the older `4J` literal-decimal-point form: `N5043.5E01121.8`
 /// (50° 43.5′, 11° 21.8′). The minutes carry an explicit decimal point.
 fn decode_literal_dot(s: &str) -> Option<Position> {
@@ -157,6 +194,15 @@ pub fn decode(label: &str, text: &str) -> Option<Position> {
         // 4J: either the slash-IEI form (".../PSN39277W077359,..." or
         // ".../POS N5043.5E01121.8") or the legacy free text.
         "4J" => decode_4j(text),
+        // Label 22: "N 394138W 752038,-------,140706,11549,...", 11 comma
+        // fields, the first DDMMSS (degrees, minutes, seconds).
+        "22" => {
+            let fields: Vec<&str> = text.split(',').collect();
+            if fields.len() != 11 {
+                return None;
+            }
+            decode_dms(fields[0])
+        }
         _ => None,
     }
 }
@@ -260,6 +306,20 @@ mod tests {
         .unwrap();
         assert!(close(p.latitude, 50.0 + 43.5 / 60.0), "lat {}", p.latitude);
         assert!(close(p.longitude, 11.0 + 21.8 / 60.0), "lon {}", p.longitude);
+    }
+
+    #[test]
+    fn label_22_dms() {
+        // Same aircraft and second as the label 21 fix 39.694 / -75.344.
+        let p = decode("22", "N 394138W 752038,-------,140706,11549, ,      , ,M  1,31175  14,  79,").unwrap();
+        assert!(close(p.latitude, 39.6939), "{}", p.latitude);
+        assert!(close(p.longitude, -75.3439), "{}", p.longitude);
+        let p = decode("22", "S 335612E1511038,-------,140706,11549, ,      , ,M  1,31175  14,  79,").unwrap();
+        assert!(close(p.latitude, -33.9367) && close(p.longitude, 151.1772));
+        // Minutes or seconds of 60 and above, and other field counts.
+        assert!(decode("22", "N 396038W 752038,-------,140706,11549, ,      , ,M  1,31175  14,  79,").is_none());
+        assert!(decode("22", "N 394138W 752038,-------,140706").is_none());
+        assert!(decode("22", "OFF01YX5763/21212240KDCAKLGA224047  77").is_none());
     }
 
     #[test]
