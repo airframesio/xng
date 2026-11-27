@@ -746,8 +746,53 @@ pub fn summary(msg: &Message) -> String {
             }
             s
         }
+        MessageBody::Meshtastic { kind, details } => mesh_summary("MESHTASTIC", kind, details),
+        MessageBody::MeshCore { kind, details } => mesh_summary("MESHCORE", kind, details),
         MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
     }
+}
+
+/// "MESHTASTIC text !a1b2c3d4 > broadcast [LongFast] "hello""
+/// "MESHCORE advert Ridge Repeater (repeater) pos=38.68000,-120.99000"
+fn mesh_summary(proto: &str, kind: &str, d: &serde_json::Value) -> String {
+    let st = |k: &str| d.get(k).and_then(|v| v.as_str());
+    let mut s = format!("{proto} {kind}");
+    if let Some(from) = st("from") {
+        s.push_str(&format!(" {from} > {}", st("to").unwrap_or("?")));
+    }
+    if let Some(n) = st("sender").or_else(|| st("name")).or_else(|| st("long_name")) {
+        s.push_str(&format!(" {n}"));
+    }
+    if let Some(t) = st("node_type") {
+        s.push_str(&format!(" ({t})"));
+    }
+    if let (Some(src), Some(dst)) = (st("src_hash"), st("dest_hash")) {
+        s.push_str(&format!(" {src} > {dst}"));
+    }
+    if let Some(c) = st("channel") {
+        s.push_str(&format!(" [{c}]"));
+    }
+    if let (Some(lat), Some(lon)) = (d.get("lat").and_then(|v| v.as_f64()), d.get("lon").and_then(|v| v.as_f64())) {
+        s.push_str(&format!(" pos={lat:.5},{lon:.5}"));
+    }
+    if let Some(dm) = d.get("telemetry").and_then(|t| t.get("device_metrics")) {
+        if let Some(b) = dm.get("battery_level") {
+            s.push_str(&format!(" batt={b}%"));
+        }
+        if let Some(v) = dm.get("voltage").and_then(|v| v.as_f64()) {
+            s.push_str(&format!(" {v:.2}V"));
+        }
+    }
+    if let Some(h) = d.get("hops_away").or_else(|| d.get("hops")) {
+        s.push_str(&format!(" hops={h}"));
+    }
+    if let Some(t) = st("text") {
+        s.push_str(&format!(" \"{}\"", t.replace('\n', "·")));
+    }
+    if let Some(snr) = d.get("lora").and_then(|l| l.get("snr_db")).and_then(|v| v.as_f64()) {
+        s.push_str(&format!(" snr={snr:.1}dB"));
+    }
+    s
 }
 
 /// Consume the bus until it closes, printing each message to stdout.

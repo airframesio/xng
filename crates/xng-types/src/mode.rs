@@ -56,6 +56,10 @@ pub enum Mode {
     /// Airband voice (AM/NFM) channels: squelch-gated audio plus
     /// transmission start/end events.
     Airband,
+    /// Meshtastic LoRa mesh packets (sync word 0x2B).
+    Meshtastic,
+    /// MeshCore LoRa mesh packets (sync word 0x12).
+    MeshCore,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -86,6 +90,8 @@ impl Mode {
             Mode::Vdes => "vdes",
             Mode::Time => "time",
             Mode::Airband => "airband",
+            Mode::Meshtastic => "meshtastic",
+            Mode::MeshCore => "meshcore",
             Mode::Extern => "extern",
         }
     }
@@ -116,6 +122,8 @@ impl Mode {
             Mode::Vdes,
             Mode::Time,
             Mode::Airband,
+            Mode::Meshtastic,
+            Mode::MeshCore,
         ]
     }
 }
@@ -154,6 +162,8 @@ impl std::str::FromStr for Mode {
             "vdes" | "vdes-asm" | "asm" => Ok(Mode::Vdes),
             "time" | "timesignal" | "time-signal" | "wwv" | "chu" => Ok(Mode::Time),
             "airband" | "voice" | "atc" => Ok(Mode::Airband),
+            "meshtastic" | "mesh" => Ok(Mode::Meshtastic),
+            "meshcore" => Ok(Mode::MeshCore),
             other => Err(format!("unknown mode: {other}")),
         }
     }

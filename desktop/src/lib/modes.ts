@@ -40,6 +40,8 @@ export const MODES: ModeMeta[] = [
   { id: "eot", name: "EOT / HOT", what: "End-of-train telemetry", family: "ground" },
   { id: "atcs", name: "ATCS", what: "Rail control data radio", family: "ground" },
   { id: "time", name: "Time signals", what: "WWV, CHU, DCF77 and others", family: "ground" },
+  { id: "meshtastic", name: "Meshtastic", what: "LoRa mesh messages and node positions", family: "ground" },
+  { id: "meshcore", name: "MeshCore", what: "LoRa mesh adverts and channel messages", family: "ground" },
 ];
 
 const BY_ID = new Map(MODES.map((m) => [m.id, m]));

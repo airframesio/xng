@@ -90,6 +90,11 @@ pub fn plan(mode: Mode) -> (f64, Vec<u64>) {
             768_000.0,
             k(&[2_500, 3_330, 5_000, 7_850, 10_000, 14_670, 15_000, 20_000]),
         ),
+        // Meshtastic LongFast defaults: US 906.875 MHz (the whole US band's
+        // slot for "LongFast"); EU_868 869.525 MHz is the other common one.
+        Mode::Meshtastic => (2_000_000.0, k(&[906_875])),
+        // MeshCore's suggested USA setting, 910.525 MHz / 62.5 kHz.
+        Mode::MeshCore => (2_000_000.0, k(&[910_525])),
         _ => (2_400_000.0, vec![]),
     }
 }
@@ -122,6 +127,8 @@ pub fn core_channels(mode: Mode) -> Vec<u64> {
         // CHU 7850 kHz + WWV 10 MHz are the most-reliable round-the-clock HF
         // time channels.
         Mode::Time => k(&[7_850, 10_000]),
+        Mode::Meshtastic => k(&[906_875]),
+        Mode::MeshCore => k(&[910_525]),
         _ => Vec::new(),
     }
 }
@@ -147,6 +154,7 @@ pub fn passband(mode: Mode) -> f64 {
         Mode::Flex => xng_mode_flex::CHANNEL_PASSBAND_HZ,
         Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
         Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
+        Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_PASSBAND_HZ,
         _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
     }
 }
@@ -174,6 +182,7 @@ pub fn channel_rate(mode: Mode) -> f64 {
         Mode::Flex => xng_mode_flex::CHANNEL_RATE,
         Mode::Vdes => xng_mode_vdes::CHANNEL_RATE,
         Mode::Time => xng_mode_time::CHANNEL_RATE,
+        Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_RATE,
         _ => xng_mode_acars::CHANNEL_RATE,
     }
 }
