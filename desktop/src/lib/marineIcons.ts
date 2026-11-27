@@ -385,7 +385,12 @@ export function marineIconKey(target: MarineTarget): MarineIconKey {
     }
     // Without an aid type, type text such as "lighthouse" still says it is fixed.
     if (aid == null && !virtual && raw !== '' && !lower.startsWith('aton')) {
-      for (const [name, key] of NAME_INDEX) if (key === 'aton-fixed' && lower.includes(name)) return 'aton-fixed';
+      // Longest name first, so "lightship" (a floating aid) wins over "light".
+      for (const [name, key] of NAME_INDEX) {
+        if (!lower.includes(name)) continue;
+        if (key === 'aton-fixed') return 'aton-fixed';
+        if (key === 'aton' || key === 'aton-virtual') break;
+      }
     }
     return atonKey(aid, virtual);
   }
