@@ -425,7 +425,13 @@ export function marineIconRotates(key: MarineIconKey): boolean {
 
 const NAME_INDEX: [string, MarineIconKey][] = MARINE_ICON_LIST.flatMap((icon) =>
   icon.names.map((name) => [name, icon.key] as [string, MarineIconKey]),
-).sort((a, b) => b[0].length - a[0].length);
+).sort((a, b) => rank(b[0]) - rank(a[0]));
+
+// Longest name first, but the bare word "light" last, so "lighted buoy" is a
+// buoy while "lighthouse" and "light beacon" stay fixed aids.
+function rank(name: string): number {
+  return name === 'light' ? 0 : name.length;
+}
 
 /** A data URL for an icon, for <img> or a map's image loader. */
 export function marineIconDataUrl(key: MarineIconKey): string {
@@ -441,19 +447,24 @@ export async function loadMarineIconImages(
   pixelRatio = 2,
 ): Promise<[MarineIconKey, ImageData][]> {
   const px = Math.round(size * pixelRatio);
+  if (!Number.isFinite(px) || px <= 0) throw new RangeError(`icon size must be positive, got ${size} x ${pixelRatio}`);
   return Promise.all(
     MARINE_ICON_LIST.map(
       (icon) =>
         new Promise<[MarineIconKey, ImageData]>((resolve, reject) => {
           const img = new Image(px, px);
           img.onload = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = px;
-            canvas.height = px;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) return reject(new Error('no 2d context'));
-            ctx.drawImage(img, 0, 0, px, px);
-            resolve([icon.key, ctx.getImageData(0, 0, px, px)]);
+            try {
+              const canvas = document.createElement('canvas');
+              canvas.width = px;
+              canvas.height = px;
+              const ctx = canvas.getContext('2d');
+              if (!ctx) return reject(new Error('no 2d context'));
+              ctx.drawImage(img, 0, 0, px, px);
+              resolve([icon.key, ctx.getImageData(0, 0, px, px)]);
+            } catch (err) {
+              reject(err);
+            }
           };
           img.onerror = () => reject(new Error(`marine icon ${icon.key} failed to load`));
           img.src = marineIconDataUrl(icon.key);
