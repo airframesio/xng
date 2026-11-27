@@ -735,6 +735,41 @@ fn update(d: &mut Dash, m: &Message) {
                     o.insert("shiptype".into(), json!(st));
                 }
             }
+            // What kind of station this is, for the map icon — sticky, since
+            // a ship's static and position reports alternate.
+            match msg_type {
+                Some(1 | 2 | 3 | 5) => {
+                    o.insert("class".into(), json!("A"));
+                }
+                Some(18 | 19 | 24) => {
+                    o.insert("class".into(), json!("B"));
+                }
+                Some(4 | 11) => {
+                    o.insert("base_station".into(), json!(true));
+                }
+                Some(9) => {
+                    o.insert("sar_aircraft".into(), json!(true));
+                }
+                Some(21) => {
+                    if let Some(t) = det.get("aton_type").and_then(Value::as_u64) {
+                        o.insert("aid_type".into(), json!(t));
+                    }
+                    if let Some(v) = det.get("virtual_aid").and_then(Value::as_bool) {
+                        o.insert("virtual_aid".into(), json!(v));
+                    }
+                }
+                _ => {}
+            }
+            // Length in meters (to bow + to stern), from static reports, so the
+            // map can draw bigger ships bigger — sticky.
+            if let (Some(bow), Some(stern)) = (
+                det.get("to_bow").and_then(Value::as_u64),
+                det.get("to_stern").and_then(Value::as_u64),
+            ) {
+                if bow + stern > 0 && bow + stern < 1000 {
+                    o.insert("length".into(), json!(bow + stern));
+                }
+            }
             // Distress beacon (AIS-SART/MOB/EPIRB-AIS by MMSI prefix) — sticky.
             if let Some(dist) = det.get("distress") {
                 o.insert("distress".into(), dist.clone());
@@ -1957,6 +1992,26 @@ mod tests {
         let c = line["geometry"]["coordinates"].as_array().unwrap();
         assert!(c.len() >= 2, "trail has ≥2 points");
         assert_eq!(c[0][0], -120.0, "first trail point lon-first");
+    }
+
+    // The map icon needs the station kind: transponder class, aids to
+    // navigation (type, virtual), base stations. It sticks across reports.
+    #[test]
+    fn vessel_keeps_station_kind_for_map_icons() {
+        let mut d = Dash::default();
+        let ais = |t: u8, mmsi: u32, det: Value| {
+            msg(Mode::Ais, MessageBody::Ais { nmea: vec![], msg_type: Some(t), mmsi: Some(mmsi), details: Some(det) })
+        };
+        update(&mut d, &ais(18, 338_000_001, json!({ "lat": 1.0, "lon": 2.0 })));
+        update(&mut d, &ais(24, 338_000_001, json!({ "ship_type": 37, "to_bow": 8, "to_stern": 4 })));
+        update(&mut d, &ais(21, 992_576_001, json!({ "aton_type": 30, "virtual_aid": true, "lat": 1.0, "lon": 2.0 })));
+        update(&mut d, &ais(4, 2_573_000, json!({ "lat": 1.0, "lon": 2.0 })));
+        assert_eq!(d.vessels[&338_000_001]["class"], "B");
+        assert_eq!(d.vessels[&338_000_001]["shiptype"], 37);
+        assert_eq!(d.vessels[&338_000_001]["length"], 12);
+        assert_eq!(d.vessels[&992_576_001]["aid_type"], 30);
+        assert_eq!(d.vessels[&992_576_001]["virtual_aid"], true);
+        assert_eq!(d.vessels[&2_573_000]["base_station"], true);
     }
 
     // ECO-5: GPX uses lat/lon ATTRIBUTES (opposite field order from GeoJSON).

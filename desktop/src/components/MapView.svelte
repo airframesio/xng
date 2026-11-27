@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { loadMarineIconImages, marineIconKey, marineIconRotates, marineIconScale, type MarineIconKey } from "../lib/marineIcons";
+  import { aircraftIconKey, aircraftIconScale, loadAircraftIconImages, type AircraftIconKey } from "../lib/aircraftIcons";
   import type { Feature } from "geojson";
   import * as maplibregl from "maplibre-gl";
   import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
@@ -106,6 +108,34 @@
     return g.getImageData(0, 0, s, s);
   }
 
+  /** The AIS target as the marine icon set sees it (airframesio/assets marine/). */
+  function vesselIcon(e: Entity): MarineIconKey {
+    const aid = typeof e.aid_type === "number" ? e.aid_type : null;
+    return marineIconKey({
+      mmsi: e.mmsi as number | undefined,
+      type: aid != null ? `aton:${aid}${e.virtual_aid ? ":virtual" : ""}` : e.base_station ? "base station" : (e.shiptype as number | undefined),
+      messageType: e.sar_aircraft ? 9 : (e.type as number | undefined),
+      transponderClass: e.class as string | undefined,
+    });
+  }
+
+  // Decoded once; added again whenever a style swap drops them. Aircraft
+  // take the map's aircraft color; balloons keep their own.
+  let iconImages: [string, ImageData][] | null = null;
+  function addMarineImages(m: maplibregl.Map) {
+    const add = () => {
+      for (const [id, image] of iconImages ?? []) if (!m.hasImage(id)) m.addImage(id, image, { pixelRatio: 2 });
+    };
+    if (iconImages) return add();
+    void Promise.all([loadMarineIconImages(32, 2), loadAircraftIconImages({ size: 32, pixelRatio: 2, fill: css("--air") })]).then(([marine, aircraft]) => {
+      iconImages = [
+        ...marine.map(([key, image]) => [`marine-${key}`, image] as [string, ImageData]),
+        ...aircraft.map(([key, image]) => [`aircraft-${key}`, image] as [string, ImageData]),
+      ];
+      add();
+    });
+  }
+
   function addLayers(m: maplibregl.Map) {
     // Runs for the first style and again for the offline fallback style,
     // and both `load` and `styledata` can report the same one. So add only
@@ -125,6 +155,7 @@
     for (const fam of ["air", "sea", "sat", "ground"]) {
       if (!m.hasImage(`arrow-${fam}`)) m.addImage(`arrow-${fam}`, arrow(css(`--${fam}`), bg), { pixelRatio: 2 });
     }
+    addMarineImages(m);
     source("trails");
     source("points");
     source("home");
@@ -139,17 +170,30 @@
       },
     });
     layer({
-      id: "dots", type: "circle", source: "points", filter: ["!", ["has", "hdg"]],
+      id: "dots", type: "circle", source: "points", filter: ["all", ["!", ["has", "hdg"]], ["!", ["has", "icon"]]],
       paint: {
         "circle-radius": ["case", ["get", "picked"], 7, 4.5],
         "circle-color": colour, "circle-stroke-color": bg, "circle-stroke-width": 1.5,
       },
     });
     layer({
-      id: "arrows", type: "symbol", source: "points", filter: ["has", "hdg"],
+      id: "arrows", type: "symbol", source: "points", filter: ["all", ["has", "hdg"], ["!", ["has", "icon"]]],
       layout: {
         "icon-image": ["concat", "arrow-", ["get", "family"]],
         "icon-size": ["case", ["get", "picked"], 1.05, 0.72],
+        "icon-rotate": ["get", "hdg"],
+        "icon-rotation-alignment": "map",
+        "icon-allow-overlap": true,
+        "icon-ignore-placement": true,
+      },
+    });
+    // Aircraft, balloons, vessels, aids, base stations and beacons: one icon
+    // per kind, sized by kind (a 747 reads bigger than a Cessna).
+    layer({
+      id: "marine", type: "symbol", source: "points", filter: ["has", "icon"],
+      layout: {
+        "icon-image": ["get", "icon"],
+        "icon-size": ["*", ["get", "scale"], ["case", ["get", "picked"], 1.05, 0.72]],
         "icon-rotate": ["get", "hdg"],
         "icon-rotation-alignment": "map",
         "icon-allow-overlap": true,
@@ -173,7 +217,7 @@
     // Layer-scoped listeners are keyed by layer id and outlive a style
     // swap, so wire them once.
     if (!ready) {
-      for (const id of ["dots", "arrows"]) {
+      for (const id of ["dots", "arrows", "marine"]) {
         m.on("click", id, (e) => {
           const p = e.features?.[0]?.properties;
           if (p) picked = { kind: String(p.kind), id: String(p.id) };
@@ -200,6 +244,21 @@
         };
         const hdg = k.heading ? e[k.heading] : undefined;
         if (typeof hdg === "number") props.hdg = hdg;
+        if (k.key === "vessels") {
+          const key = vesselIcon(e);
+          props.icon = `marine-${key}`;
+          props.hdg = marineIconRotates(key) && typeof hdg === "number" && hdg < 360 ? hdg : 0;
+          props.scale = marineIconScale(key, e.length as number | undefined);
+        } else if (k.key === "aircraft") {
+          const key: AircraftIconKey = aircraftIconKey({ type: e.actype as string | undefined, military: e.military as boolean | undefined });
+          props.icon = `aircraft-${key}`;
+          props.hdg = typeof hdg === "number" ? hdg : 0;
+          props.scale = aircraftIconScale(key);
+        } else if (k.key === "beacons" && e.mode === "sonde") {
+          props.icon = "aircraft-balloon";
+          props.hdg = 0;
+          props.scale = aircraftIconScale("balloon");
+        }
         points.push({ type: "Feature", properties: props, geometry: { type: "Point", coordinates: [e.lon, e.lat] } });
         bounds.extend([e.lon, e.lat]);
         if (e.trail && e.trail.length > 1) {
