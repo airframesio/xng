@@ -166,9 +166,9 @@ local speech-to-text there: use `--whisper-url`). The binaries need
 `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf` for native Airspy):
 
 ```bash
-sudo apt install ./xng-0.24.0-arm64.deb    # pulls runtime deps (armhf: -armhf.deb)
+sudo apt install ./xng-0.25.0-arm64.deb    # pulls runtime deps (armhf: -armhf.deb)
 # or
-tar xzf xng-v0.24.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng-v0.24.0-x86_64-unknown-linux-gnu/xng /usr/local/bin/
+tar xzf xng-v0.25.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng-v0.25.0-x86_64-unknown-linux-gnu/xng /usr/local/bin/
 ```
 
 On Windows, unzip the `x86_64-pc-windows-msvc` release. To use a radio,
