@@ -126,6 +126,8 @@ pub struct AirframesToml {
     /// Inmarsat Aero (both `aero-l` and `aero-c` sessions).
     pub aero: Option<AirframesModeToml>,
     pub iridium: Option<AirframesModeToml>,
+    /// Radiosondes (payload summaries to the sonde intake, UDP 5573).
+    pub sonde: Option<AirframesModeToml>,
 }
 
 /// Per-mode override block under `[outputs.airframes.<mode>]`.
@@ -155,6 +157,7 @@ impl AirframesToml {
             Mode::Ais => self.ais.as_ref(),
             Mode::AeroL | Mode::AeroC => self.aero.as_ref(),
             Mode::Iridium => self.iridium.as_ref(),
+            Mode::Sonde => self.sonde.as_ref(),
             _ => None,
         }
     }

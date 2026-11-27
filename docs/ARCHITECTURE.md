@@ -136,7 +136,8 @@ ingests work unchanged: ACARS feeds acarsdec flat JSON (UDP `:5550`),
 VDL2 dumpvdl2 `decoded:json` (UDP `:5552`, verified field-for-field
 against dumpvdl2 2.6.0), HFDL dumphfdl `decoded:json` (TCP `:5556`), AIS
 AIS-catcher JSON batches (HTTP `:5599`), Aero JAERO JDUMP JSON (UDP `:5571` /
-`:5561`) and Iridium iridium-toolkit JSON (TCP `:5590`)
+`:5561`), Iridium iridium-toolkit JSON (TCP `:5590`) and radiosondes as
+radiosonde_auto_rx payload summaries (UDP `:5573`)
 (`src/outputs/airframes.rs`). Modes without a per-port ingest reach
 Airframes via asf-2.0 only. Full protocol in
 [ASF2.md](ASF2.md).
