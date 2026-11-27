@@ -3,6 +3,15 @@
   import * as maplibregl from "maplibre-gl";
   import workerUrl from "maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url";
   import { onMount } from "svelte";
+  import {
+    ALTITUDE_UNITS,
+    altitude,
+    altitudeUnitLabel,
+    formatAltitude,
+    metersToFeet,
+    setAltitudeUnit,
+    type AltitudeUnit,
+  } from "../lib/altitude.svelte";
   import { app } from "../lib/store.svelte";
   import type { Entity, EntityState } from "../lib/types";
   import Icon from "./Icon.svelte";
@@ -61,10 +70,18 @@
     const order = ["flight", "reg", "icao", "actype", "name", "mmsi", "country", "alt", "spd", "trk", "sog", "cog", "squawk", "msgs"];
     const names: Record<string, string> = {
       flight: "Flight", reg: "Registration", icao: "ICAO", actype: "Type", name: "Name", mmsi: "MMSI",
-      country: "Flag", alt: picked?.kind === "Iridium satellite" ? "Altitude (km)" : "Altitude (ft)", spd: "Speed (kt)", trk: "Track (°)", sog: "Speed (kt)",
+      country: "Flag", alt: picked?.kind === "Iridium satellite" ? "Altitude (km)" : "Altitude", spd: "Speed (kt)", trk: "Track (°)", sog: "Speed (kt)",
       cog: "Course (°)", squawk: "Squawk", msgs: "Messages",
     };
-    return order.filter((k) => e[k] != null && e[k] !== "").map((k) => [names[k], String(e[k])] as const);
+    // Aircraft altitudes arrive in feet, beacon (radiosonde) heights in
+    // meters; satellites keep kilometers.
+    const value = (k: string) => {
+      if (k !== "alt" || picked?.kind === "Iridium satellite") return String(e[k]);
+      const v = Number(e[k]);
+      if (picked?.kind === "Beacon" && Number.isFinite(v)) return formatAltitude(metersToFeet(v), true);
+      return formatAltitude(e[k]);
+    };
+    return order.filter((k) => e[k] != null && e[k] !== "").map((k) => [names[k], value(k)] as const);
   });
 
   /** A heading marker in one family colour, outlined in the ground colour. */
@@ -278,6 +295,15 @@
     <span style:--c="var(--sea)"><b class="mono">{counts.sea}</b> vessels</span>
     {#if counts.other}<span style:--c="var(--sat)"><b class="mono">{counts.other}</b> other</span>{/if}
     {#if counts.alerts}<span class="alert"><Icon name="alert" size={13} /> <b class="mono">{counts.alerts}</b> distress</span>{/if}
+    <select
+      class="unit"
+      title="Altitude unit"
+      aria-label="Altitude unit"
+      value={altitude.unit}
+      onchange={(e) => setAltitudeUnit(e.currentTarget.value as AltitudeUnit)}
+    >
+      {#each ALTITUDE_UNITS as u (u)}<option value={u}>{altitudeUnitLabel(u)}</option>{/each}
+    </select>
     <button class="btn sm quiet" onclick={fit}>Fit all</button>
   </div>
 
@@ -344,6 +370,19 @@
   .legend b {
     color: var(--ink);
     font-weight: 500;
+  }
+  .unit {
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r);
+    background: var(--bg);
+    color: var(--ink);
+    font: 400 12px/1 var(--mono);
+    cursor: pointer;
+  }
+  .unit:hover {
+    border-color: var(--faint);
   }
   .legend .alert,
   .legend .alert b {

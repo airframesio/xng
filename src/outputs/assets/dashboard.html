@@ -17,6 +17,10 @@
   #head { padding: 9px 12px; border-bottom: 1px solid #1c2230; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; flex: none; }
   #head b { color: #7aa2f7; font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #head .sub { color: #565f89; font-size: 12px; white-space: nowrap; }
+  #head .hr { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
+  /* Altitude unit picker, styled like the log bar buttons. */
+  #altunit { background: #16161e; border: 1px solid #2a2f41; border-radius: 4px; color: #c8ccd4; padding: 1px 4px; font: 11px ui-monospace, SFMono-Regular, Menlo, monospace; cursor: pointer; outline: none; }
+  #altunit:hover, #altunit:focus { border-color: #7aa2f7; }
   /* Mode filter chips — sit with the message log they filter. */
   #chips { padding: 7px 10px; border-bottom: 1px solid #1c2230; display: flex; flex-wrap: wrap; gap: 5px; flex: none; }
   .chip { border: 1px solid #2a2f41; border-radius: 10px; padding: 2px 9px; cursor: pointer; user-select: none; display: flex; gap: 6px; align-items: baseline; }
@@ -143,7 +147,7 @@
 <div id="satcard" hidden></div>
 <div id="hres" title="Drag to resize"></div>
 <div id="side">
-  <div id="head"><span><b id="station">xng station</b> <span class="ver" id="ver"></span></span><span class="sub" id="status"></span></div>
+  <div id="head"><span><b id="station">xng station</b> <span class="ver" id="ver"></span></span><span class="hr"><span class="sub" id="status"></span><select id="altunit" title="Altitude unit" aria-label="Altitude unit"></select></span></div>
   <div id="sdr">
     <div id="sdrhdr" title="Show receiver / SDR status"><span class="tw" id="sdrtw">▸</span><span>SDR status</span><span class="sub" id="sdrsum"></span></div>
     <div id="sdrbody" hidden></div>
@@ -491,6 +495,51 @@ const MODE_COLORS = {
   iridium: '#73daca', meshtastic: '#67ea94', meshcore: '#f7768e',
 };
 const modeColor = m => MODE_COLORS[m] || '#9aa5ce';
+
+// Altitude unit (localStorage xng.altunit): auto, ft, m or fl. Auto follows
+// the browser's region: feet for US, GB, CA, LR, MM, PR, GU, VI, AS or no
+// region, meters elsewhere. Every altitude on the page goes through fmtAlt.
+const ALT_UNITS = ['auto', 'ft', 'm', 'fl'];
+const FEET_REGIONS = new Set(['US', 'GB', 'CA', 'LR', 'MM', 'PR', 'GU', 'VI', 'AS']);
+function regionAltUnit() {
+  try {
+    for (const tag of (navigator.languages || [navigator.language])) {
+      if (!tag) continue;
+      const r = new Intl.Locale(tag).region;
+      if (r) return FEET_REGIONS.has(r) ? 'ft' : 'm';
+    }
+  } catch (e) { /* no Intl.Locale: feet */ }
+  return 'ft';
+}
+let altUnit = 'auto';
+try { const v = localStorage.getItem('xng.altunit'); if (ALT_UNITS.includes(v)) altUnit = v; } catch (e) { /* storage blocked */ }
+const altUnitNow = () => altUnit === 'auto' ? regionAltUnit() : altUnit;
+const FT_PER_M = 3.28084;
+// Meters to feet, leaving a missing or non-numeric value as it is.
+const mToFt = m => (m == null || m === '' || !Number.isFinite(Number(m))) ? m : Number(m) * FT_PER_M;
+// Altitude in feet to display HTML in the chosen unit. `elev` marks a height
+// or elevation (mesh node, radiosonde), where flight levels mean feet.
+function fmtAlt(ft, elev) {
+  if (ft == null || ft === '') return '';
+  const v = Number(ft);
+  if (!Number.isFinite(v)) return escapeHtml(String(ft));
+  const u = altUnitNow();
+  if (u === 'm') return `${Math.round(v / FT_PER_M).toLocaleString()} m`;
+  if (u === 'fl' && !elev && v >= 18000) return 'FL' + String(Math.round(v / 100)).padStart(3, '0');
+  return `${Math.round(v).toLocaleString()} ft`;
+}
+(function altUnitPicker() {
+  const sel = document.getElementById('altunit');
+  const auto = regionAltUnit() === 'm' ? 'Meters' : 'Feet';
+  const labels = { auto: `Automatic (${auto})`, ft: 'Feet', m: 'Meters', fl: 'Flight levels' };
+  sel.innerHTML = ALT_UNITS.map(u => `<option value="${u}">${labels[u]}</option>`).join('');
+  sel.value = altUnit;
+  sel.onchange = () => {
+    altUnit = sel.value;
+    try { localStorage.setItem('xng.altunit', altUnit); } catch (e) { /* storage blocked */ }
+    render();
+  };
+})();
 
 // Aircraft color by altitude: warm low, cool high (tar1090-style cue).
 function altColor(alt) {
@@ -1053,11 +1102,11 @@ function render() {
         ['military', a.military ? (a.mil_kind ? `yes (${escapeHtml(a.mil_kind)})` : 'yes') : null],
         ['mission', a.mission && escapeHtml(a.mission)],
         ['route', (a.dep || a.arr) ? `${escapeHtml(a.dep || '?')} &rarr; ${escapeHtml(a.arr || '?')}` : null],
-        ['altitude', a.alt != null ? `${a.alt} ft` : null],
+        ['altitude', a.alt != null ? fmtAlt(a.alt) : null],
         ['speed', a.spd != null ? `${a.spd} kt` : null],
         ['track', a.trk != null ? `${a.trk}&deg;` : null],
         ['squawk', a.squawk && escapeHtml(String(a.squawk))],
-        ['sel alt', a.sel_alt != null ? `${a.sel_alt} ft` : null],
+        ['sel alt', a.sel_alt != null ? fmtAlt(a.sel_alt) : null],
         ['ADS-B', a.adsb_version != null ? `v${a.adsb_version}` : null],
         ['NACp/SIL', (a.nacp != null || a.sil != null) ? `${a.nacp ?? '-'} / ${a.sil ?? '-'}` : null],
         ['wind/OAT', (a.wind_kt != null || a.oat_c != null)
@@ -1091,7 +1140,7 @@ function render() {
     const popup = entityPopup('', label, [
       ['mode', escapeHtml(String(b.mode || ''))],
       ['id', escapeHtml(String(b.id || ''))],
-      ['altitude', b.alt != null ? escapeHtml(String(b.alt)) : null],
+      ['altitude', b.alt != null ? fmtAlt(mToFt(b.alt), true) : null],
       ['msgs', b.msgs],
       ['seen', `${fmtAge(s.now - b.seen)} ago`],
     ]);
@@ -1108,7 +1157,7 @@ function render() {
       ['node', escapeHtml(String(n.id || ''))],
       ['hardware', n.hw && escapeHtml(String(n.hw))],
       ['battery', n.batt != null ? escapeHtml(String(n.batt)) + '%' : null],
-      ['altitude', n.alt != null ? escapeHtml(String(n.alt)) + ' m' : null],
+      ['altitude', n.alt != null ? fmtAlt(mToFt(n.alt), true) : null],
       ['SNR', n.snr != null ? escapeHtml(String(n.snr)) + ' dB' : null],
       ['last text', n.text && escapeHtml(String(n.text).slice(0, 80))],
       ['msgs', n.msgs],
@@ -1167,8 +1216,8 @@ function render() {
       k: 'a' + id, id, type: 'aircraft', mil: !!a.military, lat: a.lat ?? null, lon: a.lon ?? null, srcs, expandable: srcs.length >= 1,
       color: altColor(a.alt), name: `${ic(a.military ? '🎖️' : '✈️')}${escapeHtml(a.flight || a.reg || a.icao || id)}`, seen: a.seen,
       sv: { id, flight: a.flight || '', icao: a.icao || '', reg: a.reg || '', type: a.actype || '', alt: a.alt, kt: a.spd, msgs: a.msgs || 0, seen: a.seen || 0 },
-      cols: [escapeHtml(a.flight || ''), escapeHtml(a.icao || ''), escapeHtml(a.reg || ''), escapeHtml(a.actype || ''), a.alt ?? '', a.spd ?? '', a.msgs ?? ''],
-      f: { flight: escapeHtml(a.flight || ''), icao: escapeHtml(a.icao || ''), reg: escapeHtml(a.reg || ''), type: escapeHtml(a.actype || ''), alt: a.alt ?? '', kt: a.spd ?? '', msgs: a.msgs ?? '',
+      cols: [escapeHtml(a.flight || ''), escapeHtml(a.icao || ''), escapeHtml(a.reg || ''), escapeHtml(a.actype || ''), fmtAlt(a.alt), a.spd ?? '', a.msgs ?? ''],
+      f: { flight: escapeHtml(a.flight || ''), icao: escapeHtml(a.icao || ''), reg: escapeHtml(a.reg || ''), type: escapeHtml(a.actype || ''), alt: fmtAlt(a.alt), kt: a.spd ?? '', msgs: a.msgs ?? '',
         mission: escapeHtml(a.mission || ''), route: (a.dep || a.arr) ? `${escapeHtml(a.dep || '?')} &rarr; ${escapeHtml(a.arr || '?')}` : '', kind: escapeHtml(a.mil_kind || '') },
     });
   }
@@ -1198,9 +1247,9 @@ function render() {
     ents.push({
       k: 'b' + b.mode + ':' + b.id, id: ids, type: 'beacon', lat: b.lat ?? null, lon: b.lon ?? null, srcs: [], expandable: false,
       color: '#e0af68', name: `${ic(emoji)}${escapeHtml(ids)}`, seen: b.seen,
-      sv: { id: ids, flight: '', icao: '', reg: '', type: b.mode || '', alt: b.alt, kt: undefined, msgs: b.msgs, seen: b.seen || 0 },
-      cols: ['', '', '', escapeHtml(String(b.mode || '')), b.alt ?? '', '', b.msgs ?? ''],
-      f: { id: escapeHtml(ids), type: escapeHtml(String(b.mode || '')), alt: b.alt ?? '', msgs: b.msgs ?? '' },
+      sv: { id: ids, flight: '', icao: '', reg: '', type: b.mode || '', alt: mToFt(b.alt), kt: undefined, msgs: b.msgs, seen: b.seen || 0 },
+      cols: ['', '', '', escapeHtml(String(b.mode || '')), fmtAlt(mToFt(b.alt), true), '', b.msgs ?? ''],
+      f: { id: escapeHtml(ids), type: escapeHtml(String(b.mode || '')), alt: fmtAlt(mToFt(b.alt), true), msgs: b.msgs ?? '' },
     });
   }
   for (const t of (s.trains || [])) {
@@ -1237,8 +1286,8 @@ function render() {
     ents.push({
       k: 'm' + n.proto + ':' + n.id, id: nm, type: 'mesh', lat: n.lat ?? null, lon: n.lon ?? null, srcs: [], expandable: false,
       color, name: `${ic('📶')}${escapeHtml(nm)}`, seen: n.seen,
-      sv: { id: nm, flight: '', icao: '', reg: net, type: String(n.hw || ''), alt: n.alt, kt: undefined, msgs: n.msgs, seen: n.seen || 0 },
-      cols: ['', '', net, escapeHtml(String(n.hw || '')), n.alt ?? '', '', n.msgs ?? ''],
+      sv: { id: nm, flight: '', icao: '', reg: net, type: String(n.hw || ''), alt: mToFt(n.alt), kt: undefined, msgs: n.msgs, seen: n.seen || 0 },
+      cols: ['', '', net, escapeHtml(String(n.hw || '')), fmtAlt(mToFt(n.alt), true), '', n.msgs ?? ''],
       f: { net, node: escapeHtml(String(n.id || '')), hw: escapeHtml(String(n.hw || '')), batt: n.batt ?? '', snr: n.snr ?? '', hops: n.hops ?? '',
         text: escapeHtml(txt.slice(0, 48)), msgs: n.msgs ?? '' },
     });
@@ -1285,7 +1334,8 @@ function render() {
   const dirMul = sortDir === 'asc' ? 1 : -1;
   const sval = e => sortCol === 'seen' ? (e.seen || 0)
     : sortCol === 'name' ? (e.id || '')
-    : (isAll ? e.sv[sortCol] : e.f[sortCol]);
+    // Altitude cells are formatted text; sort on the number behind them.
+    : ((isAll || sortCol === 'alt') ? e.sv[sortCol] : e.f[sortCol]);
   view.sort((x, y) => {
     let xv = sval(x), yv = sval(y);
     if (numCol) {
@@ -1353,7 +1403,7 @@ function render() {
           `<td style="padding-left:20px;color:#7aa2f7">↳ ${escapeHtml(sr.source || '')}</td>` +
           `<td>${escapeHtml(sr.flight || '')}</td><td>${escapeHtml(sr.icao || '')}</td>` +
           `<td>${escapeHtml(sr.reg || '')}</td><td>${escapeHtml(sr.type || sr.actype || '')}</td>` +
-          `<td>${sr.alt ?? ''}</td><td>${sr.spd ?? ''}</td><td>${sr.msgs ?? ''}</td>` +
+          `<td>${fmtAlt(sr.alt)}</td><td>${sr.spd ?? ''}</td><td>${sr.msgs ?? ''}</td>` +
           `<td class="age">${sr.seen ? fmtAge(s.now - sr.seen) : ''}</td></tr>`);
       }
     }
