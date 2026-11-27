@@ -353,7 +353,8 @@ export function marineIconKeyForMmsi(mmsi: string | number | null | undefined): 
 function atonKey(aidType: number | null | undefined, virtual: boolean | null | undefined): MarineIconKey {
   if (virtual) return 'aton-virtual';
   // 1-19 are fixed (reference points, RACONs, structures, lights, beacons); 20-31 float.
-  if (aidType != null && aidType >= 1 && aidType <= 19) return 'aton-fixed';
+  // 4 is an emergency wreck marking buoy, so it floats.
+  if (aidType != null && aidType >= 1 && aidType <= 19 && aidType !== 4) return 'aton-fixed';
   return 'aton';
 }
 
@@ -381,6 +382,10 @@ export function marineIconKey(target: MarineTarget): MarineIconKey {
       if (virtual == null) virtual = parts.includes('virtual');
     } else if (virtual == null && lower.includes('virtual')) {
       virtual = true;
+    }
+    // Without an aid type, type text such as "lighthouse" still says it is fixed.
+    if (aid == null && !virtual && raw !== '' && !lower.startsWith('aton')) {
+      for (const [name, key] of NAME_INDEX) if (key === 'aton-fixed' && lower.includes(name)) return 'aton-fixed';
     }
     return atonKey(aid, virtual);
   }
