@@ -14,6 +14,8 @@
 //! - Aero-L  UDP  `:5571`  JAERO JDUMP JSON
 //! - Aero-C  UDP  `:5561`  JAERO JDUMP JSON
 //! - Iridium TCP  `:5590`  iridium-toolkit ACARS JSON, one object per line
+//! - Sonde   UDP  `:5573`  radiosonde_auto_rx payload summary JSON (the sonde
+//!   intake next to the aggregator, ms-importer-sondehub)
 //!
 //! STD-C / ADS-B / UAT / … have no per-port ingest — those modes reach
 //! Airframes via asf-2.0 only.
@@ -105,6 +107,7 @@ pub fn default_endpoint(mode: Mode) -> Option<(&'static str, u16, Proto)> {
         Mode::AeroL => Some((AIRFRAMES_HOST, 5571, Proto::Udp)),
         Mode::AeroC => Some((AIRFRAMES_HOST, 5561, Proto::Udp)),
         Mode::Iridium => Some((AIRFRAMES_HOST, 5590, Proto::Tcp)),
+        Mode::Sonde => Some((AIRFRAMES_HOST, 5573, Proto::Udp)),
         _ => None,
     }
 }
@@ -206,13 +209,16 @@ pub fn cli_router(feed: bool, station_id: &str, modes: &[Mode]) -> AirframesRout
 /// the body doesn't match the mode or isn't something that ingest takes. AIS
 /// is batched separately (see [`AisBatcher`]).
 fn serialize(msg: &Message, mode: Mode, station_id: &str) -> Option<Vec<u8>> {
-    use crate::outputs::{acarsdec_json, dumphfdl_json, dumpvdl2_json, iridium_toolkit_json, jaero_json};
+    use crate::outputs::{
+        acarsdec_json, dumphfdl_json, dumpvdl2_json, iridium_toolkit_json, jaero_json, sonde_summary,
+    };
     let v = match mode {
         Mode::AcarsPoa => acarsdec_json::format_acarsdec_with_station(msg, Some(station_id)),
         Mode::Vdl2 => dumpvdl2_json::format_dumpvdl2(msg, Some(station_id)),
         Mode::Hfdl => dumphfdl_json::format_dumphfdl(msg, Some(station_id)),
         Mode::AeroL | Mode::AeroC => jaero_json::format_jaero(msg, Some(station_id)),
         Mode::Iridium => iridium_toolkit_json::format_iridium_toolkit(msg, station_id),
+        Mode::Sonde => sonde_summary::format_payload_summary(msg, station_id),
         _ => None,
     }?;
     Some(v.to_string().into_bytes())
@@ -488,6 +494,7 @@ mod tests {
         assert_eq!(default_endpoint(Mode::AeroL), Some((AIRFRAMES_HOST, 5571, Proto::Udp)));
         assert_eq!(default_endpoint(Mode::AeroC), Some((AIRFRAMES_HOST, 5561, Proto::Udp)));
         assert_eq!(default_endpoint(Mode::Iridium), Some((AIRFRAMES_HOST, 5590, Proto::Tcp)));
+        assert_eq!(default_endpoint(Mode::Sonde), Some((AIRFRAMES_HOST, 5573, Proto::Udp)));
         // No public per-port ingest → asf-2.0 only.
         assert_eq!(default_endpoint(Mode::StdC), None);
         assert_eq!(default_endpoint(Mode::Adsb), None);
@@ -627,6 +634,14 @@ mod tests {
         let env = crate::outputs::aiscatcher_json::envelope("XX-TEST-AIS", msgs);
         out.push(("aiscatcher", env.to_string()));
 
+        // Sonde: the rs1729/RS rs41.txt example frame (sonde K1930293, near Zagreb).
+        const RS41_FRAME: &str = "8635f44093df1a602c87e0fa0521e8943d9cef4c7a67393f6d39fb546461f2111b6447ab79a746c80350cda5344157f8c0c12234f46902220f792816174b313933303239331a00000300000a00002f0007322ce53e31991abf12dada3eb68468c16755d51c7a2a15310216060245f302000d08a31607821e08bb210219060243f302000000000000000000000000000000220d7c1e0807d03cdc071fd81ddb19d70a8d0eb602b60cb518d40692ff00ff00ff001c277d59b8d83301ff0f881f0f38f4fe18b283038735ff000000003eb8ff4947201e6e3aff55415f13fc6e005440440cf100009e9f7406f85800832b631719d70010bebc172a8b00000000000000000000000000000000000000000000a48b7b15366181193ef05d07e1245b1be0f721f801f60804107b0b76110000000000000000000000000000000000ecc7";
+        let bytes: Vec<u8> =
+            (0..RS41_FRAME.len()).step_by(2).map(|i| u8::from_str_radix(&RS41_FRAME[i..i + 2], 16).unwrap()).collect();
+        let d = xng_mode_sonde::decode_dewhitened(&bytes).unwrap();
+        let m = xng_mode_sonde::to_message(&d, 403_000_000, -30.0, prov());
+        out.push(("sonde", String::from_utf8(serialize(&m, Mode::Sonde, "XX-TEST-SONDE").unwrap()).unwrap()));
+
         if let Ok(dir) = std::env::var("XNG_WIRE_SAMPLES_DIR") {
             let mut files: HashMap<&str, String> = HashMap::new();
             for (feed, line) in &out {
@@ -650,6 +665,7 @@ mod tests {
         assert_eq!(count("dumphfdl"), 2, "ACARS + performance data: {samples:#?}");
         assert_eq!(count("iridium-toolkit"), 1);
         assert_eq!(count("aiscatcher"), 1);
+        assert_eq!(count("sonde"), 1);
         for (feed, line) in &samples {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             match *feed {
@@ -668,6 +684,22 @@ mod tests {
                 }
                 "iridium-toolkit" => assert_eq!(v["source"]["station_id"], "XX-TEST-IRDM"),
                 "aiscatcher" => assert_eq!(v["msgs"].as_array().unwrap().len(), 2),
+                "sonde" => {
+                    // The radiosonde_auto_rx payload summary the sonde intake reads.
+                    assert_eq!(v["type"], "PAYLOAD_SUMMARY");
+                    assert_eq!(v["station"], "XX-TEST-SONDE");
+                    assert_eq!(v["callsign"], "K1930293");
+                    assert_eq!(v["model"], "RS41");
+                    assert_eq!(v["frame"], 5910);
+                    assert_eq!(v["sats"], 8);
+                    assert_eq!(v["freq"], "403.000 MHz");
+                    assert!((v["latitude"].as_f64().unwrap() - 46.050_263).abs() < 1e-5, "{v}");
+                    assert!((v["altitude"].as_f64().unwrap() - 28_410.02).abs() < 0.1, "{v}");
+                    // GPS week 1800, TOW 131874 s = 2014-07-07 12:37:54 GPS, 16 leap seconds then
+                    // (xng uses today's 18, a 2 s offset only for frames before 2017).
+                    assert_eq!(v["datetime"], "2014-07-07T12:37:36.000Z", "{v}");
+                    assert_eq!(v["software_name"], "xng");
+                }
                 _ => unreachable!(),
             }
         }

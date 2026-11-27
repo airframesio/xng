@@ -31,4 +31,5 @@ pub mod mqtt;
 pub mod nmea_tcp;
 pub mod nmea_udp;
 pub mod sbs;
+pub mod sonde_summary;
 pub mod zmq;

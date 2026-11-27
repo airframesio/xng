@@ -433,9 +433,10 @@ Each mode goes to its own Airframes ingest in the format that ingest reads:
 | AIS | HTTP `:5599` | AIS-catcher JSON batches (every 5 s, gzip) |
 | Aero L-band / C-band | UDP `:5571` / `:5561` | JAERO JDUMP JSON |
 | Iridium | TCP `:5590` | iridium-toolkit ACARS JSON |
+| Radiosonde | UDP `:5573` | radiosonde_auto_rx payload summary JSON (one per frame with a GPS fix) |
 
 Each block (`[outputs.airframes.acars]`, `.vdl2`, `.hfdl`, `.ais`, `.aero`,
-`.iridium`) takes `enabled`, `station-id`, `host` and `port`. Other modes
+`.iridium`, `.sonde`) takes `enabled`, `station-id`, `host` and `port`. Other modes
 (STD-C, ADS-B, UAT, ...) reach Airframes over asf-2.0. The multiplexed **asf-2.0**
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
