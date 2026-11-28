@@ -128,6 +128,18 @@ pub struct AirframesToml {
     pub iridium: Option<AirframesModeToml>,
     /// Radiosondes (payload summaries to the sonde intake, UDP 5573).
     pub sonde: Option<AirframesModeToml>,
+    /// `ports` (default: one UDP/TCP/HTTP ingest per mode) or `quic`: every
+    /// feed as its own stream on one connection to the feed gateway (TLS
+    /// over TCP when UDP is blocked), per port while it is down. Also
+    /// `quic-only` and `tls`. Sondes always go per port.
+    pub transport: Option<String>,
+    /// Feed gateway `host:port` (default feed.airframes.io:5580).
+    pub quic_endpoint: Option<String>,
+    /// PEM certificate/CA to trust for a self-hosted feed gateway.
+    pub quic_ca: Option<std::path::PathBuf>,
+    /// Lab only: no certificate check for the feed gateway.
+    #[serde(default)]
+    pub quic_insecure: bool,
 }
 
 /// Per-mode override block under `[outputs.airframes.<mode>]`.
@@ -524,7 +536,19 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
         });
     }
 
-    AirframesRouter { routes }
+    let quic = match crate::outputs::airframes_quic::QuicSettings::for_transport(
+        af.transport.as_deref(),
+        af.quic_endpoint.clone(),
+        af.quic_ca.clone(),
+        af.quic_insecure,
+    ) {
+        Ok(q) => q.filter(|_| !routes.is_empty()),
+        Err(e) => {
+            tracing::error!("{e:#}; feeding per port");
+            None
+        }
+    };
+    AirframesRouter { routes, quic }
 }
 
 #[cfg(test)]
@@ -643,6 +667,26 @@ mode = "vdl2"
         assert_eq!(route.target.station_id, "KE-KSEA-TEST"); // verbatim, no suffix
         assert_eq!(route.target.port, 5550);
         assert_eq!(route.sdr_id.as_deref(), Some("driver=rtlsdr,serial=1"));
+    }
+
+    #[test]
+    fn airframes_transport_quic() {
+        let toml = r#"
+station-id = "KE-KSEA"
+[outputs.airframes]
+transport = "quic"
+quic-endpoint = "gw.example:5580"
+[[session]]
+sdr = "rtl-acars"
+mode = "acars"
+"#;
+        let f: StationFile = toml::from_str(toml).unwrap();
+        let q = airframes_router(&f).quic.expect("quic uplink");
+        assert_eq!(q.endpoint, "gw.example:5580");
+        assert_eq!(q.transport, "auto");
+        // Default: per-port only.
+        let f: StationFile = toml::from_str(&toml.replace("transport = \"quic\"\n", "")).unwrap();
+        assert!(airframes_router(&f).quic.is_none());
     }
 
     #[test]

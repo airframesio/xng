@@ -447,6 +447,21 @@ Each block (`[outputs.airframes.acars]`, `.vdl2`, `.hfdl`, `.ais`, `.aero`,
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
 
+**One connection for every feed (preview).** `transport = "quic"` in
+`[outputs.airframes]` (or `--airframes-transport quic`) sends every feed
+above except sondes as its own stream on one QUIC connection to the
+Airframes feed gateway (`feed.airframes.io:5580`, ALPN `airframes-feed/1`),
+with TLS over TCP on the same port when UDP is blocked. The gateway sees
+each feed's health and last message, measures the link's round trip (and
+each direction when the clock is NTP synced), and can ask xng read-only
+diagnostics (`status`, `clock`, `net`). Messages go to the per-port ingests
+while the connection is down or until the gateway accepts a feed, so
+nothing is lost by turning it on. `quic-only` and `tls` pin one transport;
+`quic-endpoint`, `quic-ca` and `quic-insecure` (lab only) point it at a
+self-hosted gateway. A saved `xng atc login` sign-in links the connection
+to your account; without one it connects anonymously. The protocol is in
+aggregation-server `gateway/docs/PROTOCOL.md`.
+
 **Dashboard basemap.** The web dashboard (`http =`) draws
 [OpenFreeMap](https://openfreemap.org) vector tiles by default: OpenStreetMap
 data, no API key or account, and self-hostable. Pick a style under

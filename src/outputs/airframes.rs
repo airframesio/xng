@@ -69,6 +69,10 @@ pub struct Route {
 #[derive(Clone, Debug, Default)]
 pub struct AirframesRouter {
     pub routes: Vec<Route>,
+    /// Send every feed as its own stream on one connection to the Airframes
+    /// feed gateway, falling back to the per-port ingests while it is down
+    /// (`transport = "quic"`). See [`crate::outputs::airframes_quic`].
+    pub quic: Option<crate::outputs::airframes_quic::QuicSettings>,
 }
 
 impl AirframesRouter {
@@ -201,7 +205,7 @@ pub fn cli_router(feed: bool, station_id: &str, modes: &[Mode]) -> AirframesRout
             })
         })
         .collect();
-    AirframesRouter { routes }
+    AirframesRouter { routes, quic: None }
 }
 
 /// Serialize a message into its mode's native Airframes line/datagram
@@ -377,6 +381,11 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
     let mut sent: u64 = 0;
     let mut tcp: HashMap<String, TcpFeed> = HashMap::new();
     let mut ais: HashMap<(String, String), AisBatcher> = HashMap::new();
+    let uplink = router.quic.clone().map(|mut q| {
+        q.instance_tag = instance_tag(&router);
+        crate::outputs::airframes_quic::Uplink::spawn(q)
+    });
+    let mut via_quic: u64 = 0;
     loop {
         match rx.recv().await {
             Ok(msg) => {
@@ -384,6 +393,12 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                 let Some(target) = router.resolve(msg.mode, sdr_id) else {
                     continue;
                 };
+                if let Some(up) = &uplink {
+                    if quic_send(up, &msg, sdr_id, target) {
+                        via_quic += 1;
+                        continue;
+                    }
+                }
                 let endpoint = target.endpoint();
                 match target.proto {
                     Proto::Udp => {
@@ -421,8 +436,50 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    tracing::info!("airframes output: {sent} message(s) sent");
+    tracing::info!("airframes output: {sent} message(s) sent per port, {via_quic} over the feed gateway");
     Ok(())
+}
+
+/// A short stable tag for what this process feeds (its routes), so the
+/// gateway tells two xng processes on one host apart.
+fn instance_tag(router: &AirframesRouter) -> String {
+    let mut keys: Vec<String> = router
+        .routes
+        .iter()
+        .map(|r| format!("{}:{}:{}", r.sdr_id.as_deref().unwrap_or("any"), r.mode.as_str(), r.target.station_id))
+        .collect();
+    keys.sort();
+    // FNV-1a: stable across builds (std's hasher is not guaranteed to be).
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in keys.join(",").bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", h as u32)
+}
+
+/// Offer a message to the feed gateway uplink. False: send it per port.
+fn quic_send(up: &crate::outputs::airframes_quic::Uplink, msg: &Message, sdr_id: Option<&str>, target: &AirframesTarget) -> bool {
+    use crate::outputs::airframes_quic::{format_for, FeedSpec};
+    if format_for(msg.mode).is_none() {
+        return false;
+    }
+    let bytes = if msg.mode == Mode::Ais {
+        // One single-message batch body per DATA frame (the AIS intake's shape).
+        let Some(v) = crate::outputs::aiscatcher_json::format_aiscatcher(msg) else { return false };
+        crate::outputs::aiscatcher_json::envelope(&target.station_id, vec![v]).to_string().into_bytes()
+    } else {
+        let Some(b) = serialize(msg, msg.mode, &target.station_id) else { return false };
+        b
+    };
+    let spec = FeedSpec {
+        key: format!("{}:{}:{}", sdr_id.unwrap_or("any"), msg.mode.as_str(), target.station_id),
+        mode: msg.mode,
+        station_ident: target.station_id.clone(),
+        station_uuid: None,
+        sdr_id: sdr_id.map(str::to_string),
+    };
+    let capture_us = msg.timestamp.timestamp_micros().max(0) as u64;
+    up.send(&spec, capture_us, bytes)
 }
 
 #[cfg(test)]
@@ -463,6 +520,7 @@ mod tests {
                     },
                 },
             ],
+            quic: None,
         };
         assert_eq!(r.resolve(Mode::AcarsPoa, Some("rtl0")).unwrap().station_id, "EXACT");
         assert_eq!(r.resolve(Mode::AcarsPoa, Some("other")).unwrap().station_id, "WILD");

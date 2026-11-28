@@ -172,7 +172,7 @@ pub fn parse_line(line: &str, format: ExternFormat, station: &StationIdentity) -
 type OutputTask = tokio::task::JoinHandle<Result<(), std::io::Error>>;
 
 /// Start the outputs a wrapped decoder supports: console, JSONL, UDP, the
-/// asf-2.0 feeds and the web dashboard.
+/// per-mode Airframes feeds, the asf-2.0 feeds and the web dashboard.
 fn spawn_outputs(bus: &MessageBus, outputs: &OutputConfig, station: &StationIdentity) -> Vec<OutputTask> {
     let mut tasks = Vec::new();
     if outputs.console != console::ConsoleFormat::Off {
@@ -191,6 +191,9 @@ fn spawn_outputs(bus: &MessageBus, outputs: &OutputConfig, station: &StationIden
     }
     for target in outputs.udp.clone() {
         tasks.push(tokio::spawn(acarsdec_json::run(bus.subscribe(), target)));
+    }
+    if let Some(router) = outputs.airframes.clone().filter(|r| !r.is_empty()) {
+        tasks.push(tokio::spawn(crate::outputs::airframes::run(bus.subscribe(), router)));
     }
     if let Some(addr) = outputs.http.clone() {
         tasks.push(tokio::spawn(crate::outputs::http::run(
