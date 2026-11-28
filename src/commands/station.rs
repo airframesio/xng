@@ -518,12 +518,18 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
         let sdr_id = sess.sdr.clone().unwrap_or_else(|| "file".to_string());
         // The station and its UUID slot: where its name is set, so renaming
         // it keeps the UUID (see `outputs::station_uuid`).
+        // AeroL and AeroC share one `[outputs.airframes.aero]` block and one
+        // auto-suffixed ident, so they share their mode/base slots too.
+        let slot_mode = match mode {
+            Mode::AeroL | Mode::AeroC => "aero",
+            m => m.as_str(),
+        };
         let (station_id, slot, explicit_uuid) = if let Some(id) = &sess.airframes_station_id {
             (id.clone(), format!("session:{sdr_id}:{}", mode.as_str()), sess.airframes_station_uuid.clone())
         } else if let Some(id) = mode_cfg.and_then(|m| m.station_id.clone()) {
-            (id, format!("mode:{}", mode.as_str()), mode_cfg.and_then(|m| m.station_uuid.clone()))
+            (id, format!("mode:{slot_mode}"), mode_cfg.and_then(|m| m.station_uuid.clone()))
         } else if af.auto_suffix {
-            (auto_suffix(&base, mode), format!("base:{}", mode.as_str()), None)
+            (auto_suffix(&base, mode), format!("base:{slot_mode}"), None)
         } else {
             (base.clone(), "base".to_string(), base_uuid.clone())
         };
@@ -726,6 +732,29 @@ airframes-station-id = "KE-UUID-HF"
         let hf = by("uuid-hfdl").target.station_uuid.clone().unwrap();
         assert!(crate::outputs::station_uuid::parse(&hf).is_some());
         assert_eq!(airframes_router(&f).routes[2].target.station_uuid.as_deref(), Some(hf.as_str()));
+    }
+
+    #[test]
+    fn aero_l_and_aero_c_share_one_station_uuid() {
+        // Both read `[outputs.airframes.aero]`, so they feed one station.
+        // After a rename, a newly added aero-c session must keep the UUID
+        // the aero-l one saved.
+        let tag = uuid::Uuid::new_v4().simple().to_string()[..8].to_uppercase();
+        let old = format!(
+            "station-id = \"KE-{tag}\"\n[outputs.airframes]\n[outputs.airframes.aero]\nstation-id = \"KE-{tag}-OLD\"\n[[session]]\nsdr = \"aero-l\"\nmode = \"aero-l\"\n"
+        );
+        let f: StationFile = toml::from_str(&old).unwrap();
+        let first = airframes_router(&f).routes[0].target.station_uuid.clone().unwrap();
+        let renamed = format!(
+            "{}[[session]]\nsdr = \"aero-c\"\nmode = \"aero-c\"\n",
+            old.replace("-OLD", "-NEW")
+        );
+        let f: StationFile = toml::from_str(&renamed).unwrap();
+        let r = airframes_router(&f);
+        assert_eq!(r.routes.len(), 2);
+        for route in &r.routes {
+            assert_eq!(route.target.station_uuid.as_deref(), Some(first.as_str()));
+        }
     }
 
     #[test]

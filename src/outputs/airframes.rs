@@ -402,7 +402,7 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut sent: u64 = 0;
     let mut tcp: HashMap<String, TcpFeed> = HashMap::new();
-    let mut ais: HashMap<(String, String), AisBatcher> = HashMap::new();
+    let mut ais: HashMap<(String, String, Option<String>), AisBatcher> = HashMap::new();
     loop {
         match rx.recv().await {
             Ok(msg) => {
@@ -430,7 +430,7 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                     }
                     Proto::Http => {
                         if let Some(v) = crate::outputs::aiscatcher_json::format_aiscatcher(&msg) {
-                            let key = (endpoint.clone(), target.station_id.clone());
+                            let key = (endpoint.clone(), target.station_id.clone(), target.station_uuid.clone());
                             let batcher = ais.entry(key).or_insert_with(|| {
                                 AisBatcher::spawn(
                                     format!("http://{endpoint}/"),

@@ -447,7 +447,8 @@ Each block (`[outputs.airframes.acars]`, `.vdl2`, `.hfdl`, `.ais`, `.aero`,
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
 
-**Station UUIDs.** Every feed also carries a `station_uuid`, and Airframes
+**Station UUIDs.** The ACARS, VDL2, HFDL, JAERO (aero), Iridium and AIS feeds
+also carry a `station_uuid` (balloon summaries do not), and Airframes
 finds the station by it before the name. Renaming a station, on the website
 or with `station-id` here, keeps its feed, messages and stats on the same
 station. xng keeps one UUID per station in `station-uuids.json` (in

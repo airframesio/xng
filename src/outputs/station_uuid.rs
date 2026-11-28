@@ -82,7 +82,12 @@ pub fn derived(ident: &str) -> String {
 /// The ATC station UUID Airframes derives from `feeder_id`: the UUID of the
 /// station every ATC feeder had before it sent one.
 pub fn atc_derived(feeder_id: &str) -> String {
-    Uuid::new_v5(&ATC_NAMESPACE, feeder_id.trim().to_ascii_lowercase().as_bytes()).hyphenated().to_string()
+    Uuid::new_v5(
+        &ATC_NAMESPACE,
+        feeder_id.trim().to_ascii_lowercase().as_bytes(),
+    )
+    .hyphenated()
+    .to_string()
 }
 
 /// The ATC feeder's station UUID, sent in HELLO `station.uuid`: `explicit`
@@ -91,9 +96,13 @@ pub fn atc_derived(feeder_id: &str) -> String {
 /// feeder that already had a station therefore keeps it, and keeps it
 /// when its feeder id changes later (a new `atc.json`).
 pub fn resolve_atc(feeder_id: &str, explicit: Option<&str>) -> String {
-    let env = std::env::var("XNG_ATC_STATION_UUID").ok().filter(|v| !v.trim().is_empty());
+    let env = std::env::var("XNG_ATC_STATION_UUID")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
     let explicit = explicit.or(env.as_deref());
-    resolve_with(&default_path(), ATC_SLOT, "ATC feeder", explicit, || atc_derived(feeder_id))
+    resolve_with(&default_path(), ATC_SLOT, "ATC feeder", explicit, || {
+        atc_derived(feeder_id)
+    })
 }
 
 /// `XNG_STATION_UUID`, when set to a UUID.
@@ -132,14 +141,17 @@ fn resolve_with(
         }
     }
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let mut saved: Saved = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
-    if let Some(u) = saved.stations.get(slot).and_then(|u| parse(u)) {
+    if let Some(u) = load(path).stations.get(slot).and_then(|u| parse(u)) {
         return u;
     }
     let u = default();
+    // Another xng process may have written the file since: read it again
+    // just before saving, keep its entries, and use its value for this
+    // slot if it saved one first.
+    let mut saved = load(path);
+    if let Some(u) = saved.stations.get(slot).and_then(|u| parse(u)) {
+        return u;
+    }
     saved.stations.insert(slot.to_string(), u.clone());
     if let Err(e) = save(path, &saved) {
         tracing::debug!(
@@ -150,11 +162,19 @@ fn resolve_with(
     u
 }
 
+fn load(path: &Path) -> Saved {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
 fn save(path: &Path, saved: &Saved) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
+    // One temp file per process, so two writers never share one.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
     std::fs::write(&tmp, serde_json::to_vec_pretty(saved).unwrap_or_default())?;
     std::fs::rename(tmp, path)
 }
@@ -208,13 +228,47 @@ mod tests {
     #[test]
     fn atc_uuid_matches_the_one_airframes_derives() {
         // api-server: uuidv5(feederId.toLowerCase(), ATC_STATION_UUID_NAMESPACE)
-        assert_eq!(atc_derived("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"), "be0d6d34-e87d-53c1-9609-da58d850b485");
+        assert_eq!(
+            atc_derived("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"),
+            "be0d6d34-e87d-53c1-9609-da58d850b485"
+        );
         let dir = tempdir();
         let path = dir.join("station-uuids.json");
-        let first = resolve_with(&path, ATC_SLOT, "atc", None, || atc_derived("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+        let first = resolve_with(&path, ATC_SLOT, "atc", None, || {
+            atc_derived("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        });
         // A new feeder id later (atc.json lost) keeps the station.
-        let later = resolve_with(&path, ATC_SLOT, "atc", None, || atc_derived("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"));
+        let later = resolve_with(&path, ATC_SLOT, "atc", None, || {
+            atc_derived("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        });
         assert_eq!(first, later);
+    }
+
+    #[test]
+    fn a_save_keeps_what_another_process_wrote_meanwhile() {
+        let dir = tempdir();
+        let path = dir.join("station-uuids.json");
+        let theirs = "3f2b8c1e-7d4a-4c9e-9b1f-2a6e5d4c3b2a";
+        let other = "9a1d2c3b-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
+        // While this process computes its default, another one saves this
+        // slot and an unrelated one.
+        let got = resolve_with(&path, "base", "XX-KSEA", None, || {
+            let mut s = Saved::default();
+            s.stations.insert("base".into(), theirs.into());
+            s.stations.insert("mode:vdl2".into(), other.into());
+            save(&path, &s).unwrap();
+            derived("XX-KSEA")
+        });
+        assert_eq!(got, theirs);
+        // A later slot is added next to both, not over them.
+        let ais = resolve_at(&path, "mode:ais", "XX-KSEA-AIS", None);
+        let saved = load(&path);
+        assert_eq!(saved.stations.get("base").map(String::as_str), Some(theirs));
+        assert_eq!(
+            saved.stations.get("mode:vdl2").map(String::as_str),
+            Some(other)
+        );
+        assert_eq!(saved.stations.get("mode:ais"), Some(&ais));
     }
 
     #[test]
