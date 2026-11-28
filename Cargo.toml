@@ -112,7 +112,7 @@ rayon.workspace = true
 rumqttc.workspace = true
 toml = "0.8"
 sgp4 = "2"
-ureq = "2"
+ureq = { version = "2", features = ["brotli"] }  # gzip is on by default
 flate2 = "1"
 chrono.workspace = true
 clap = { version = "4", features = ["derive"] }
