@@ -186,7 +186,7 @@ fn nearby(q: &atc_nearby::Query) -> anyhow::Result<()> {
     // The same constraints, so `listen` picks what this printed.
     let mut extra = String::new();
     if let Some(c) = q.center_hz {
-        extra.push_str(&format!(" -c {:.3}", c as f64 / 1e6));
+        extra.push_str(&format!(" -c {c}"));
     }
     if q.radius_nm != 30 {
         extra.push_str(&format!(" --atc-nearby-radius-nm {}", q.radius_nm));
@@ -208,7 +208,7 @@ fn nearby(q: &atc_nearby::Query) -> anyhow::Result<()> {
     println!(
         "  xng listen --sdr driver=rtlsdr --mode airband -r {} -c {} --channels {} --labels {} --receiver-pos {},{} --atc-feed",
         q.sample_rate as u64,
-        mhz(plan.center_hz),
+        plan.center_hz,
         plan.channels.iter().map(|p| mhz(p.freq_hz)).collect::<Vec<_>>().join(","),
         shell_quote(&labels.join(",")),
         q.lat,
