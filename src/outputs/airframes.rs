@@ -39,6 +39,10 @@ pub enum Proto {
     Tcp,
     /// HTTP POST of batched JSON (the AIS intake).
     Http,
+    /// Only through the feed gateway (`transport = "quic"`): a mode with no
+    /// per-port ingest, sent while the gateway lists it and dropped
+    /// otherwise.
+    Gateway,
 }
 
 /// A resolved Airframes ingest endpoint plus the station id to stamp.
@@ -386,6 +390,7 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
         crate::outputs::airframes_quic::Uplink::spawn(q)
     });
     let mut via_quic: u64 = 0;
+    let mut gateway_dropped: u64 = 0;
     loop {
         match rx.recv().await {
             Ok(msg) => {
@@ -401,6 +406,10 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                 }
                 let endpoint = target.endpoint();
                 match target.proto {
+                    Proto::Gateway => {
+                        // Gateway-only mode the gateway does not take (now).
+                        gateway_dropped += 1;
+                    }
                     Proto::Udp => {
                         if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id) {
                             match socket.send_to(&bytes, &endpoint).await {
@@ -436,7 +445,7 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    tracing::info!("airframes output: {sent} message(s) sent per port, {via_quic} over the feed gateway");
+    tracing::info!("airframes output: {sent} message(s) sent per port, {via_quic} over the feed gateway, {gateway_dropped} not taken");
     Ok(())
 }
 
@@ -459,11 +468,12 @@ fn instance_tag(router: &AirframesRouter) -> String {
 
 /// Offer a message to the feed gateway uplink. False: send it per port.
 fn quic_send(up: &crate::outputs::airframes_quic::Uplink, msg: &Message, sdr_id: Option<&str>, target: &AirframesTarget) -> bool {
-    use crate::outputs::airframes_quic::{format_for, FeedSpec};
-    if format_for(msg.mode).is_none() {
-        return false;
-    }
-    let bytes = if msg.mode == Mode::Ais {
+    use crate::outputs::airframes_quic::{xng_payload, FeedSpec, XNG_FORMAT};
+    let Some(format) = up.wire_format(msg.mode) else { return false };
+    let bytes = if format == XNG_FORMAT {
+        let Some(b) = xng_payload(msg, &target.station_id) else { return false };
+        b
+    } else if msg.mode == Mode::Ais {
         // One single-message batch body per DATA frame (the AIS intake's shape).
         let Some(v) = crate::outputs::aiscatcher_json::format_aiscatcher(msg) else { return false };
         crate::outputs::aiscatcher_json::envelope(&target.station_id, vec![v]).to_string().into_bytes()
@@ -474,12 +484,30 @@ fn quic_send(up: &crate::outputs::airframes_quic::Uplink, msg: &Message, sdr_id:
     let spec = FeedSpec {
         key: format!("{}:{}:{}", sdr_id.unwrap_or("any"), msg.mode.as_str(), target.station_id),
         mode: msg.mode,
+        format,
         station_ident: target.station_id.clone(),
         station_uuid: None,
         sdr_id: sdr_id.map(str::to_string),
     };
     let capture_us = msg.timestamp.timestamp_micros().max(0) as u64;
     up.send(&spec, capture_us, bytes)
+}
+
+/// Routes for modes that have no per-port ingest but can go through the
+/// feed gateway (sent while it lists them). `station_id` gives each mode's id.
+pub fn add_gateway_routes(router: &mut AirframesRouter, modes: &[(Option<String>, Mode, String)]) {
+    for (sdr_id, mode, station_id) in modes {
+        if !crate::outputs::airframes_quic::gateway_eligible(*mode)
+            || router.routes.iter().any(|r| r.mode == *mode && r.sdr_id == *sdr_id)
+        {
+            continue;
+        }
+        router.routes.push(Route {
+            sdr_id: sdr_id.clone(),
+            mode: *mode,
+            target: AirframesTarget { host: String::new(), port: 0, proto: Proto::Gateway, station_id: station_id.clone() },
+        });
+    }
 }
 
 #[cfg(test)]

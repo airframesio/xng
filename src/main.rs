@@ -257,13 +257,18 @@ impl OutputOpts {
     /// feed gateway uplink when `--airframes-transport quic` is given.
     fn airframes_router(&self, station_ident: &str, modes: &[xng_types::Mode]) -> anyhow::Result<outputs::airframes::AirframesRouter> {
         let mut r = outputs::airframes::cli_router(self.feed_airframes, station_ident, modes);
-        if !r.is_empty() {
+        if self.feed_airframes {
             r.quic = outputs::airframes_quic::QuicSettings::for_transport(
                 self.airframes_transport.as_deref(),
                 self.airframes_quic_endpoint.clone(),
                 self.airframes_quic_ca.clone(),
                 self.airframes_quic_insecure,
             )?;
+            if r.quic.is_some() {
+                // Modes without a per-port ingest go through the gateway once it lists them.
+                let extra: Vec<_> = modes.iter().map(|&m| (None, m, station_ident.to_string())).collect();
+                outputs::airframes::add_gateway_routes(&mut r, &extra);
+            }
         }
         Ok(r)
     }
@@ -530,6 +535,11 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::atc::AtcCommand,
     },
+    /// Airframes feed gateway: see what it takes (`xng airframes ingests`)
+    Airframes {
+        #[command(subcommand)]
+        cmd: commands::airframes::AirframesCommand,
+    },
     /// Run the built-in pipeline self-test (bus + outputs + DSP sanity)
     Selftest {
         /// Also write messages to this JSONL file
@@ -759,6 +769,7 @@ fn main() -> anyhow::Result<()> {
             commands::ingest::run(grpc, quic, quic_cert_out.as_deref())
         }
         Command::Atc { cmd } => commands::atc::run(cmd),
+        Command::Airframes { cmd } => commands::airframes::run(cmd),
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
     }
 }

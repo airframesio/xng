@@ -459,7 +459,11 @@ while the connection is down or until the gateway accepts a feed, so
 nothing is lost by turning it on. `quic-only` and `tls` pin one transport;
 `quic-endpoint`, `quic-ca` and `quic-insecure` (lab only) point it at a
 self-hosted gateway. A saved `xng atc login` sign-in links the connection
-to your account; without one it connects anonymously. The protocol is in
+to your account; without one it connects anonymously. The gateway lists the
+modes it takes when xng connects, and xng sends every listed mode, in xng's
+own message format for modes with no native Airframes format (STD-C, SARSAT,
+NAVTEX, ...), so new modes start flowing as Airframes adds them, with no xng
+update. `xng airframes ingests` shows the list and how each mode would go. The protocol is in
 aggregation-server `gateway/docs/PROTOCOL.md`.
 
 **Dashboard basemap.** The web dashboard (`http =`) draws

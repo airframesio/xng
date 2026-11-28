@@ -123,8 +123,44 @@ impl QuicSettings {
     }
 }
 
-/// The wire format name the gateway expects for a mode, or `None` when the
-/// gateway does not take that mode (sondes go to their own intake).
+/// xng's own normalized message JSON, for modes without a native Airframes
+/// ingest format: `{"v":1,"station_id":..,"message":<Message>}`.
+pub const XNG_FORMAT: &str = "xng";
+
+/// Whether a mode may go to the gateway at all. ADS-B and UAT never go to
+/// Airframes (they belong on ADS-B networks), airband audio goes to the ATC
+/// ingest, sondes to their own intake.
+pub fn gateway_eligible(mode: Mode) -> bool {
+    !matches!(
+        mode,
+        Mode::Adsb | Mode::Uat | Mode::Airband | Mode::Sonde | Mode::Extern | Mode::Time
+    )
+}
+
+/// The format to send a mode in given the gateway's list (see
+/// [`Uplink::wire_format`]).
+pub fn choose_format(mode: Mode, ingests: Option<&[(String, String)]>) -> Option<&'static str> {
+    if !gateway_eligible(mode) {
+        return None;
+    }
+    let native = format_for(mode);
+    let Some(list) = ingests else { return native };
+    let listed = |f: &str| list.iter().any(|(lf, lm)| lf == f && lm == mode.as_str());
+    match native {
+        Some(f) if listed(f) => Some(f),
+        _ if listed(XNG_FORMAT) => Some(XNG_FORMAT),
+        _ => None,
+    }
+}
+
+/// The payload of an `xng` format DATA frame.
+pub fn xng_payload(msg: &xng_types::Message, station_id: &str) -> Option<Vec<u8>> {
+    serde_json::to_vec(&json!({ "v": 1, "station_id": station_id, "message": msg })).ok()
+}
+
+/// The native wire format name for a mode, or `None` when that mode has no
+/// native Airframes ingest format (it can still go as [`XNG_FORMAT`] when
+/// the gateway lists it).
 pub fn format_for(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::AcarsPoa => Some("acarsdec"),
@@ -222,6 +258,8 @@ const REFUSED: u8 = 2;
 pub struct FeedSpec {
     pub key: String,
     pub mode: Mode,
+    /// From [`Uplink::wire_format`].
+    pub format: &'static str,
     pub station_ident: String,
     pub station_uuid: Option<String>,
     pub sdr_id: Option<String>,
@@ -258,6 +296,9 @@ struct Shared {
     /// Feed key -> state, so `send` can fall back for refused feeds.
     states: Mutex<HashMap<String, Arc<AtomicU8>>>,
     link: Mutex<LinkStatus>,
+    /// (format, mode) pairs the gateway listed in WELCOME; `None` before the
+    /// first WELCOME or from a gateway that does not list them.
+    ingests: Mutex<Option<Vec<(String, String)>>>,
     started: Instant,
 }
 
@@ -269,6 +310,7 @@ impl Uplink {
             connected: AtomicBool::new(false),
             states: Mutex::new(HashMap::new()),
             link: Mutex::new(LinkStatus::default()),
+            ingests: Mutex::new(None),
             started: Instant::now(),
         });
         tokio::spawn(run(settings, rx, shared.clone()));
@@ -310,6 +352,19 @@ impl Uplink {
                 false
             }
         }
+    }
+
+    /// The format to send a mode in, from what the gateway lists: its native
+    /// format, else the xng format, else `None` (the gateway does not take
+    /// it; use the other outputs). A gateway that lists nothing takes the
+    /// native formats.
+    pub fn wire_format(&self, mode: Mode) -> Option<&'static str> {
+        choose_format(mode, self.shared.ingests.lock().unwrap().as_deref())
+    }
+
+    /// The (format, mode) pairs the gateway last listed.
+    pub fn ingests(&self) -> Option<Vec<(String, String)>> {
+        self.shared.ingests.lock().unwrap().clone()
     }
 
     /// The latest link status.
@@ -592,6 +647,14 @@ async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>)
         shared.states.lock().unwrap().clear();
         backoff = Duration::from_secs(1);
         let session_id = welcome["session_id"].as_str().unwrap_or("").to_string();
+        let ingests = parse_ingests(&welcome);
+        if let Some(list) = &ingests {
+            tracing::info!(
+                "airframes quic: gateway takes {}",
+                list.iter().map(|(f, m)| format!("{m} ({f})")).collect::<Vec<_>>().join(", ")
+            );
+        }
+        *shared.ingests.lock().unwrap() = ingests;
         let stats_every =
             Duration::from_secs(welcome["stats_s"].as_u64().unwrap_or(30).clamp(5, 600));
         tracing::info!(
@@ -624,6 +687,56 @@ async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>)
         reconnects += 1;
         sleep_draining(&mut rx, Duration::from_secs(1)).await;
     }
+}
+
+/// Connects once, says HELLO and returns the gateway's WELCOME (what it
+/// takes, limits, the account it sees), then closes. For `xng airframes
+/// ingests`.
+pub async fn probe(s: &QuicSettings) -> anyhow::Result<(Value, &'static str)> {
+    let dialer = Dialer::new(s)?;
+    let mut last = None;
+    let tries: &[bool] = match s.transport.as_str() {
+        "tcp" => &[false],
+        "quic" => &[true],
+        _ => &[true, false],
+    };
+    for &quic in tries {
+        match dial(&dialer, quic).await {
+            Ok((link, mut incoming)) => {
+                let tok = token(&s.credentials).await;
+                let hello = json!({
+                    "v": VERSION,
+                    "token": tok.as_ref().map(|t| t.token.clone()),
+                    "client": { "name": "xng", "version": env!("CARGO_PKG_VERSION"), "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH) },
+                    "instance_id": format!("probe-{}", uuid::Uuid::new_v4()),
+                });
+                link.ctrl().send(frame(HELLO, hello.to_string().as_bytes())).await?;
+                let r = tokio::time::timeout(Duration::from_secs(10), incoming.recv()).await;
+                let transport = link.transport();
+                link.close();
+                return match r {
+                    Ok(Some((WELCOME, p))) => Ok((serde_json::from_slice(&p)?, transport)),
+                    Ok(Some((ERROR, p))) => {
+                        let e: Value = serde_json::from_slice(&p).unwrap_or_default();
+                        anyhow::bail!("gateway refused: {}", e["message"].as_str().unwrap_or("?"))
+                    }
+                    _ => anyhow::bail!("no WELCOME from {}", s.endpoint),
+                };
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no transport")))
+}
+
+/// WELCOME `ingests` as (format, mode) pairs, or `None` when absent.
+pub fn parse_ingests(welcome: &Value) -> Option<Vec<(String, String)>> {
+    let list = welcome.get("ingests")?.as_array()?;
+    Some(
+        list.iter()
+            .filter_map(|i| Some((i["format"].as_str()?.to_string(), i["mode"].as_str()?.to_string())))
+            .collect(),
+    )
 }
 
 /// Waits, discarding queued items (the router already fell back for any
@@ -774,8 +887,7 @@ async fn open_feed(
     spec: &FeedSpec,
     shared: &Arc<Shared>,
 ) -> anyhow::Result<FeedConn> {
-    let format = format_for(spec.mode)
-        .ok_or_else(|| anyhow::anyhow!("no gateway format for {}", spec.mode.as_str()))?;
+    let format = spec.format;
     let open = json!({
         "key": spec.key,
         "mode": spec.mode.as_str(),
@@ -898,6 +1010,24 @@ mod tests {
         assert_eq!(u64::from_be_bytes(p[..8].try_into().unwrap()), 42);
         assert_eq!(u64::from_be_bytes(p[8..16].try_into().unwrap()), 100);
         assert!(u64::from_be_bytes(p[16..24].try_into().unwrap()) >= 100);
+    }
+
+    #[test]
+    fn formats_follow_the_gateway_list() {
+        let w = json!({ "ingests": [
+            { "format": "acarsdec", "mode": "acars" },
+            { "format": "xng", "mode": "std-c" },
+            { "format": "xng", "mode": "adsb" },
+        ]});
+        let list = parse_ingests(&w).unwrap();
+        assert_eq!(choose_format(Mode::AcarsPoa, Some(&list)), Some("acarsdec"));
+        assert_eq!(choose_format(Mode::StdC, Some(&list)), Some(XNG_FORMAT));
+        assert_eq!(choose_format(Mode::Vdl2, Some(&list)), None, "not listed: per port");
+        assert_eq!(choose_format(Mode::Adsb, Some(&list)), None, "ADS-B never");
+        // A gateway that lists nothing takes the native formats only.
+        assert_eq!(choose_format(Mode::Vdl2, None), Some("dumpvdl2"));
+        assert_eq!(choose_format(Mode::StdC, None), None);
+        assert!(parse_ingests(&json!({})).is_none());
     }
 
     #[test]
