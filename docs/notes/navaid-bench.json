@@ -1,0 +1,615 @@
+{
+ "cpu_s_per_signal_s": {
+  "dumpils:gs": 0.10909623392857143,
+  "dumpils:loc": 0.11319545972222222,
+  "voracious:loc": 0.6408981837962964,
+  "voracious:vor": 1.205329688271605,
+  "vortrack:vor": 0.01600834388888889,
+  "xng:gs": 0.02464204642857143,
+  "xng:loc": 0.025244947222222213,
+  "xng:vor": 0.026821331481481477
+ },
+ "gs_ddm": {
+  "dumpils": {
+   "30": {
+    "availability": 1.0,
+    "rms_ddm": 0.07584060404242267,
+    "within_0.005": 0.25
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_ddm": 0.07556515216603422,
+    "within_0.005": 0.25
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_ddm": 0.07560109169894287,
+    "within_0.005": 0.25
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_ddm": 0.07491670210779157,
+    "within_0.005": 0.25
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_ddm": 0.07338855922715194,
+    "within_0.005": 0.25
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.07049805179093856,
+    "within_0.005": 0.25
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_ddm": 0.06074770674692288,
+    "within_0.005": 0.25
+   }
+  },
+  "xng": {
+   "30": {
+    "availability": 1.0,
+    "rms_ddm": 0.03550010802345252,
+    "within_0.005": 0.125
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_ddm": 0.01908366920975526,
+    "within_0.005": 0.08333333333333333
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_ddm": 0.010393716691564936,
+    "within_0.005": 0.3333333333333333
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_ddm": 0.006244328649929328,
+    "within_0.005": 0.7083333333333334
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_ddm": 0.004868169444714821,
+    "within_0.005": 0.7916666666666667
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.0028356228588218894,
+    "within_0.005": 0.9583333333333334
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_ddm": 0.0018126136494359055,
+    "within_0.005": 1.0
+   }
+  }
+ },
+ "loc_ddm": {
+  "dumpils": {
+   "30": {
+    "availability": 1.0,
+    "rms_ddm": 0.07636401018532646,
+    "within_0.005": 0.25
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_ddm": 0.07642516007132463,
+    "within_0.005": 0.25
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_ddm": 0.07627094486261218,
+    "within_0.005": 0.25
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_ddm": 0.07570820385048765,
+    "within_0.005": 0.25
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_ddm": 0.07422208244396199,
+    "within_0.005": 0.25
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.07085384035458192,
+    "within_0.005": 0.25
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_ddm": 0.061112332490185224,
+    "within_0.005": 0.25
+   }
+  },
+  "voracious": {
+   "30": {
+    "availability": 1.0,
+    "rms_ddm": 0.07722872030500813,
+    "within_0.005": 0.25
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_ddm": 0.07721091859051805,
+    "within_0.005": 0.25
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_ddm": 0.0772072812898571,
+    "within_0.005": 0.25
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_ddm": 0.07718617434045695,
+    "within_0.005": 0.25
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_ddm": 0.07716104307856933,
+    "within_0.005": 0.25
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.07710016852339391,
+    "within_0.005": 0.25
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_ddm": 0.07702516515699308,
+    "within_0.005": 0.25
+   }
+  },
+  "xng": {
+   "30": {
+    "availability": 1.0,
+    "rms_ddm": 0.030798287023112002,
+    "within_0.005": 0.16666666666666666
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_ddm": 0.019283535395170456,
+    "within_0.005": 0.08333333333333333
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_ddm": 0.0134719550411352,
+    "within_0.005": 0.2916666666666667
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_ddm": 0.0072333052046619365,
+    "within_0.005": 0.4583333333333333
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_ddm": 0.004780882780709516,
+    "within_0.005": 0.75
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.002993684231446478,
+    "within_0.005": 0.9166666666666667
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_ddm": 0.0019828038270601955,
+    "within_0.005": 0.9583333333333334
+   }
+  }
+ },
+ "loc_ident": {
+  "voracious": {
+   "30": {
+    "correct": 0.0,
+    "wrong_reports": 23.0
+   },
+   "34": {
+    "correct": 0.0,
+    "wrong_reports": 23.0
+   },
+   "38": {
+    "correct": 0.0,
+    "wrong_reports": 23.0
+   },
+   "42": {
+    "correct": 0.0,
+    "wrong_reports": 23.0
+   },
+   "46": {
+    "correct": 0.0,
+    "wrong_reports": 23.0
+   },
+   "50": {
+    "correct": 0.0,
+    "wrong_reports": 23.0
+   }
+  },
+  "xng": {
+   "30": {
+    "correct": 0.0,
+    "wrong_reports": 0.0
+   },
+   "34": {
+    "correct": 0.0,
+    "wrong_reports": 0.0
+   },
+   "38": {
+    "correct": 0.0,
+    "wrong_reports": 0.0
+   },
+   "42": {
+    "correct": 1.0,
+    "wrong_reports": 0.0
+   },
+   "46": {
+    "correct": 1.0,
+    "wrong_reports": 0.0
+   },
+   "50": {
+    "correct": 1.0,
+    "wrong_reports": 0.0
+   }
+  }
+ },
+ "loc_twofreq": {
+  "dumpils": {
+   "40": {
+    "availability": 1.0,
+    "rms_ddm": 0.07607669873443212,
+    "within_0.005": 0.25
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.07081417652020248,
+    "within_0.005": 0.25
+   }
+  },
+  "voracious": {
+   "40": {
+    "availability": 1.0,
+    "rms_ddm": 0.0771824769424473,
+    "within_0.005": 0.25
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.07710377314412567,
+    "within_0.005": 0.25
+   }
+  },
+  "xng": {
+   "40": {
+    "availability": 1.0,
+    "rms_ddm": 0.007414051292358587,
+    "within_0.005": 0.5416666666666666
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_ddm": 0.0023809651513361815,
+    "within_0.005": 1.0
+   }
+  }
+ },
+ "note": "synthetic Annex 10 signals, identical cu8 IQ for every decoder; see bench/navaid/run.py",
+ "vor_ident": {
+  "voracious": {
+   "30": {
+    "correct": 0.0,
+    "wrong_reports": 12.25
+   },
+   "34": {
+    "correct": 0.0,
+    "wrong_reports": 10.5
+   },
+   "38": {
+    "correct": 0.0,
+    "wrong_reports": 11.25
+   },
+   "42": {
+    "correct": 0.0,
+    "wrong_reports": 12.0
+   },
+   "46": {
+    "correct": 0.0,
+    "wrong_reports": 11.25
+   },
+   "50": {
+    "correct": 0.0,
+    "wrong_reports": 13.5
+   }
+  },
+  "xng": {
+   "30": {
+    "correct": 0.0,
+    "wrong_reports": 0.0
+   },
+   "34": {
+    "correct": 0.0,
+    "wrong_reports": 0.0
+   },
+   "38": {
+    "correct": 0.0,
+    "wrong_reports": 0.0
+   },
+   "42": {
+    "correct": 1.0,
+    "wrong_reports": 0.0
+   },
+   "46": {
+    "correct": 1.0,
+    "wrong_reports": 0.0
+   },
+   "50": {
+    "correct": 1.0,
+    "wrong_reports": 0.0
+   }
+  }
+ },
+ "vor_impair": {
+  "carrier_err_3khz": {
+   "voracious": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 100.33589938171308,
+     "within_2deg": 0.0
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.2843934814789008,
+     "within_2deg": 1.0
+    }
+   },
+   "vortrack": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 101.10079804108722,
+     "within_2deg": 0.0
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.26377081376051226,
+     "within_2deg": 1.0
+    }
+   },
+   "xng": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 1.3614470280062998,
+     "within_2deg": 0.7954545454545454
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.24047936665855135,
+     "within_2deg": 1.0
+    }
+   }
+  },
+  "dvor_asym_10pct": {
+   "voracious": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 89.89927932165415,
+     "within_2deg": 0.0
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.3570885680139598,
+     "within_2deg": 1.0
+    }
+   },
+   "vortrack": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 108.70546572384909,
+     "within_2deg": 0.022727272727272728
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.24581039519317127,
+     "within_2deg": 1.0
+    }
+   },
+   "xng": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 1.1405237799524,
+     "within_2deg": 0.9545454545454546
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.2035868335574204,
+     "within_2deg": 1.0
+    }
+   }
+  },
+  "subcarrier_err_40hz": {
+   "voracious": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 92.79212267622263,
+     "within_2deg": 0.022727272727272728
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.38794333475666026,
+     "within_2deg": 1.0
+    }
+   },
+   "vortrack": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 96.05010741549133,
+     "within_2deg": 0.0
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.2750834207377297,
+     "within_2deg": 1.0
+    }
+   },
+   "xng": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 1.195506219708258,
+     "within_2deg": 0.9318181818181819
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.2125994443774739,
+     "within_2deg": 1.0
+    }
+   }
+  },
+  "voice_30pct": {
+   "voracious": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 109.73727495379373,
+     "within_2deg": 0.022727272727272728
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.3601579498459623,
+     "within_2deg": 1.0
+    }
+   },
+   "vortrack": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 111.5583680698972,
+     "within_2deg": 0.0
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 3.3740131079864843,
+     "within_2deg": 0.9772727272727273
+    }
+   },
+   "xng": {
+    "40": {
+     "availability": 1.0,
+     "rms_deg": 1.1420461721833945,
+     "within_2deg": 0.9545454545454546
+    },
+    "55": {
+     "availability": 1.0,
+     "rms_deg": 0.204643256647627,
+     "within_2deg": 1.0
+    }
+   }
+  }
+ },
+ "vor_radial": {
+  "voracious": {
+   "30": {
+    "availability": 1.0,
+    "rms_deg": 99.98691897193794,
+    "within_2deg": 0.0
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_deg": 104.06884527802775,
+    "within_2deg": 0.045454545454545456
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_deg": 99.1002396046917,
+    "within_2deg": 0.0
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_deg": 110.27425672874075,
+    "within_2deg": 0.0
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_deg": 93.6000333390632,
+    "within_2deg": 0.0
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_deg": 93.17392481962858,
+    "within_2deg": 0.0
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_deg": 0.406900914114221,
+    "within_2deg": 1.0
+   }
+  },
+  "vortrack": {
+   "30": {
+    "availability": 1.0,
+    "rms_deg": 103.00410266738947,
+    "within_2deg": 0.022727272727272728
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_deg": 90.33573511357471,
+    "within_2deg": 0.0
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_deg": 100.85072159448977,
+    "within_2deg": 0.0
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_deg": 107.71693300336182,
+    "within_2deg": 0.0
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_deg": 101.15823228375288,
+    "within_2deg": 0.0
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_deg": 43.748813737662935,
+    "within_2deg": 0.6136363636363636
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_deg": 0.2366241877526437,
+    "within_2deg": 1.0
+   }
+  },
+  "xng": {
+   "30": {
+    "availability": 1.0,
+    "rms_deg": 3.9213360615764215,
+    "within_2deg": 0.38636363636363635
+   },
+   "34": {
+    "availability": 1.0,
+    "rms_deg": 2.486235761885796,
+    "within_2deg": 0.5454545454545454
+   },
+   "38": {
+    "availability": 1.0,
+    "rms_deg": 1.4734941825770125,
+    "within_2deg": 0.8181818181818182
+   },
+   "42": {
+    "availability": 1.0,
+    "rms_deg": 1.0545601980104808,
+    "within_2deg": 0.9318181818181819
+   },
+   "46": {
+    "availability": 1.0,
+    "rms_deg": 0.6707126410468617,
+    "within_2deg": 1.0
+   },
+   "50": {
+    "availability": 1.0,
+    "rms_deg": 0.4559464269859729,
+    "within_2deg": 1.0
+   },
+   "55": {
+    "availability": 1.0,
+    "rms_deg": 0.255269986177063,
+    "within_2deg": 1.0
+   }
+  }
+ }
+}

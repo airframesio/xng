@@ -1515,7 +1515,7 @@ function silDiv(sil, color, rot) {
 const MODE_COLORS = {
   acars: '#e0af68', vdl2: '#7aa2f7', hfdl: '#bb9af7', adsb: '#7dcfff',
   modes: '#7dcfff', ais: '#9ece6a', aero: '#f7768e', stdc: '#ff9e64',
-  iridium: '#73daca', meshtastic: '#67ea94', meshcore: '#f7768e',
+  iridium: '#73daca', meshtastic: '#67ea94', meshcore: '#f7768e', vor: '#bb9af7', ils: '#ff9e64',
 };
 const modeColor = m => MODE_COLORS[m] || '#9aa5ce';
 
@@ -2333,6 +2333,26 @@ function render() {
         text: escapeHtml(txt.slice(0, 48)), msgs: n.msgs ?? '' },
     });
   }
+  for (const n of (s.navaids || [])) {
+    const kindLbl = n.kind === 'vor' ? 'VOR' : n.kind === 'localizer' ? 'LOC' : 'GS';
+    const freq = Number(n.freq_mhz || 0).toFixed(2);
+    const id = String(n.ident || freq);
+    const status = String(n.status || '').replace(/_/g, ' ');
+    const reading = n.kind === 'vor'
+      ? (n.radial != null ? `${Number(n.radial).toFixed(1)}°` : '')
+      : (n.ddm != null ? `${Number(n.ddm) >= 0 ? '+' : ''}${Number(n.ddm).toFixed(3)} (${Number(n.ddm_ua).toFixed(0)} µA)` : '');
+    const spread = n.kind === 'vor' ? n.radial_std : n.ddm_std;
+    const color = status === 'normal' ? '#9ece6a' : status === 'no signal' ? '#565f89' : '#e0af68';
+    ents.push({
+      k: 'n' + n.kind + ':' + freq, id, type: 'navaid', lat: null, lon: null, srcs: [], expandable: false,
+      color, name: `${ic('🧭')}${escapeHtml(id)}`, seen: n.seen,
+      sv: { id, flight: '', icao: '', reg: freq, type: kindLbl, alt: undefined, kt: undefined, msgs: n.msgs, seen: n.seen || 0 },
+      cols: ['', '', freq, kindLbl, '', '', n.msgs ?? ''],
+      f: { freq, kind: kindLbl, status: escapeHtml(status), reading,
+        spread: spread != null ? (n.kind === 'vor' ? `±${Number(spread).toFixed(1)}°` : `±${Number(spread).toFixed(3)}`) : '',
+        cn0: n.cn0 != null ? Number(n.cn0).toFixed(0) : '', msgs: n.msgs ?? '' },
+    });
+  }
   // --- Entity-type tabs: All (everything, generic columns) + one tab per
   // present type, each with its own column set. Only tabs with ≥1 entity show.
   const TABS = [
@@ -2354,6 +2374,8 @@ function render() {
       cols: [['proto', 'proto'], ['capcode', 'capcode', 1], ['function', 'fn', 1], ['baud', 'baud', 1], ['text', 'text'], ['msgs', 'msgs', 1]] },
     { key: 'mesh', label: '📶 Mesh', types: ['mesh'],
       cols: [['net', 'network'], ['node', 'node'], ['hw', 'type'], ['batt', 'batt %', 1], ['snr', 'snr', 1], ['hops', 'hops', 1], ['text', 'last text'], ['msgs', 'msgs', 1]] },
+    { key: 'navaids', label: '🧭 Navaids', types: ['navaid'],
+      cols: [['freq', 'MHz', 1], ['kind', 'type'], ['status', 'status'], ['reading', 'radial / DDM'], ['spread', 'spread'], ['cn0', 'C/N0 dB-Hz', 1], ['msgs', 'msgs', 1]] },
     { key: 'sats', label: '🛰 Sats', types: ['sat'], cols: [['type', 'type'], ['alt', 'alt']] },
   ];
   const inTab = (t, e) => (!t.types || t.types.includes(e.type)) && (!t.pred || t.pred(e));
@@ -2370,7 +2392,7 @@ function render() {
   // Sort. `name`/`seen` always valid; otherwise the active tab's column key.
   const colKeys = tab.cols.map(c => c[0]);
   if (sortCol !== 'seen' && sortCol !== 'name' && !colKeys.includes(sortCol)) sortCol = 'seen';
-  const NUM = new Set(['alt', 'kt', 'msgs', 'seen', 'pressure', 'baud', 'capcode', 'function', 'motion', 'marker', 'mmsi', 'batt', 'snr', 'hops']);
+  const NUM = new Set(['alt', 'kt', 'msgs', 'seen', 'pressure', 'baud', 'capcode', 'function', 'motion', 'marker', 'mmsi', 'batt', 'snr', 'hops', 'freq', 'cn0']);
   const numCol = NUM.has(sortCol);
   const dirMul = sortDir === 'asc' ? 1 : -1;
   const sval = e => sortCol === 'seen' ? (e.seen || 0)

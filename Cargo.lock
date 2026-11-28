@@ -4781,6 +4781,7 @@ dependencies = [
  "xng-mode-hfdl",
  "xng-mode-iridium",
  "xng-mode-lora",
+ "xng-mode-navaid",
  "xng-mode-navtex",
  "xng-mode-pocsag",
  "xng-mode-sarsat",
@@ -5006,6 +5007,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-navaid"
+version = "0.29.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "rustfft",
+ "serde",
+ "serde_json",
  "xng-dsp",
  "xng-types",
 ]

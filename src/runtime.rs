@@ -32,6 +32,7 @@ use xng_mode_sonde::SondeChannelDecoder;
 use xng_mode_time::TimeChannelDecoder;
 use xng_mode_lora::LoraChannelDecoder;
 use xng_mode_dme::DmeChannelDecoder;
+use xng_mode_navaid::{NavaidChannelDecoder, NavaidKind};
 use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
@@ -417,6 +418,8 @@ pub(crate) enum ModeChannel {
     Lora(Box<LoraChannelDecoder>),
     /// DME / TACAN ground transponder (receive only).
     Dme(Box<DmeChannelDecoder>),
+    /// VOR, ILS localizer or glideslope (receive-only measurements).
+    Navaid(Box<NavaidChannelDecoder>),
     /// Placeholder for one airband channel; `collapse_airband` folds every
     /// placeholder of a session into one [`ModeChannel::AirbandSet`].
     AirbandPending,
@@ -515,6 +518,15 @@ impl ModeChannel {
                 let carrier = freq as f64;
                 Ok(Self::Lora(Box::new(LoraChannelDecoder::new(mode, sample_rate, offset, carrier)?)))
             }
+            // VOR: any channel; ILS: localizer or glideslope by frequency.
+            Mode::Vor => Ok(Self::Navaid(Box::new(NavaidChannelDecoder::new(NavaidKind::Vor, sample_rate, offset)?))),
+            Mode::Ils => {
+                let d = NavaidChannelDecoder::for_freq(freq, sample_rate, offset)?;
+                if d.kind() == NavaidKind::Vor {
+                    return Err(format!("{freq} Hz is a VOR channel: use --mode vor"));
+                }
+                Ok(Self::Navaid(Box::new(d)))
+            }
             other => Err(format!("mode {other} has no native core yet")),
         }
     }
@@ -553,6 +565,7 @@ impl ModeChannel {
             Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_PASSBAND_HZ,
             Mode::Airband => xng_mode_airband::FRONT_PASSBAND_HZ,
             Mode::Dme => xng_mode_dme::CHANNEL_PASSBAND_HZ,
+            Mode::Vor | Mode::Ils => xng_mode_navaid::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -584,6 +597,7 @@ impl ModeChannel {
             Self::Time(_) => xng_mode_time::CHANNEL_RATE,
             Self::Lora(d) => d.channel_rate(),
             Self::Dme(_) => xng_mode_dme::CHANNEL_RATE,
+            Self::Navaid(_) => xng_mode_navaid::CHANNEL_RATE,
             Self::AirbandPending | Self::AirbandSet(_) => xng_mode_airband::CHANNEL_RATE,
         }
     }
@@ -624,6 +638,7 @@ impl ModeChannel {
             Self::Time(d) => d.level_dbfs(),
             Self::Lora(d) => d.level_dbfs(),
             Self::Dme(d) => d.level_dbfs(),
+            Self::Navaid(d) => d.level_dbfs(),
             Self::AirbandPending => f32::NEG_INFINITY,
             Self::AirbandSet(s) => s.level_dbfs(0),
         }
@@ -925,6 +940,14 @@ impl ModeChannel {
                     .map(|f| xng_mode_lora::to_message(f, freq, level, prov.clone()))
                     .collect();
                 (msgs, seen, ok)
+            }
+            // One observation per report interval; one with a carrier counts
+            // as a good frame.
+            Self::Navaid(dec) => {
+                let obs = dec.process(iq);
+                let ok = obs.iter().filter(|o| o.status != xng_mode_navaid::NavaidStatus::NoSignal).count() as u64;
+                let msgs = obs.iter().map(|o| xng_mode_navaid::to_message(o, freq, prov.clone())).collect();
+                (msgs, obs.len() as u64, ok)
             }
         }
     }

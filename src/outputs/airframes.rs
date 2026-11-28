@@ -155,6 +155,8 @@ pub fn mode_suffix(mode: Mode) -> Option<&'static str> {
         // Airband audio feeds the ATC aggregator (`--atc-feed`), not the
         // per-port message ingests.
         Mode::Airband => None,
+        // Navaid monitoring goes out over asf-2.0 only.
+        Mode::Vor | Mode::Ils => None,
         Mode::Extern => None,
     }
 }

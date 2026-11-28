@@ -72,6 +72,9 @@ struct Dash {
     /// LoRa mesh nodes (Meshtastic node number / MeshCore public key),
     /// keyed by "proto:id": name, hardware, battery, last text, position.
     mesh_nodes: HashMap<String, Value>,
+    /// VOR / localizer / glideslope channels, keyed by "kind:frequency_hz":
+    /// the latest radial or DDM, ident, status and C/N0 (no position).
+    navaids: HashMap<String, Value>,
     /// Cross-mode distress/emergency alerting surface (XM-6): ADS-B emergency
     /// squawks + TC28, AIS-SART/MOB/EPIRB-AIS, STD-C distress EGC, DSC distress
     /// alerts, and every COSPAS-SARSAT 406 beacon, keyed by "mode:entity".
@@ -157,6 +160,44 @@ impl Dashboard {
 
 /// Append to the entity's position trail (decimated: only when moved
 /// meaningfully; capped length).
+/// Fold one navaid observation into its channel's entity: the latest radial
+/// (VOR) or DDM (ILS), keeping the last ident heard while the current
+/// interval has none yet.
+fn navaid_update(d: &mut Dash, freq: u64, kind: &str, ident: Option<&str>, det: &Value) {
+    let e = d.navaids.entry(format!("{kind}:{freq}")).or_insert_with(|| json!({}));
+    let o = e.as_object_mut().unwrap();
+    o.insert("kind".into(), json!(kind));
+    o.insert("freq_mhz".into(), json!(freq as f64 / 1e6));
+    if let Some(id) = ident {
+        o.insert("ident".into(), json!(id));
+    }
+    for (src, dst) in [("status", "status"), ("cn0_dbhz", "cn0"), ("carrier_offset_hz", "offset_hz"), ("ident_depth_pct", "ident_depth")] {
+        if let Some(v) = det.get(src).filter(|v| !v.is_null()) {
+            o.insert(dst.into(), v.clone());
+        }
+    }
+    if let Some(v) = det.get("vor").filter(|v| !v.is_null()) {
+        for (src, dst) in [("radial_deg", "radial"), ("radial_std_deg", "radial_std"), ("mod30_pct", "mod30"), ("mod9960_pct", "mod9960")] {
+            if let Some(x) = v.get(src) {
+                o.insert(dst.into(), x.clone());
+            }
+        }
+    }
+    if let Some(ils) = det.get("ils").and_then(Value::as_array) {
+        if let Some(m) = ils.first() {
+            for (src, dst) in [("ddm", "ddm"), ("ddm_ua", "ddm_ua"), ("ddm_std", "ddm_std"), ("sdm_pct", "sdm")] {
+                if let Some(x) = m.get(src) {
+                    o.insert(dst.into(), x.clone());
+                }
+            }
+        }
+        o.insert("carriers".into(), json!(ils.len().max(1)));
+    }
+    o.insert("seen".into(), json!(now_s()));
+    let msgs = o.get("msgs").and_then(Value::as_u64).unwrap_or(0);
+    o.insert("msgs".into(), json!(msgs + 1));
+}
+
 /// Fold one Meshtastic / MeshCore packet into the mesh node table. The
 /// sender is the Meshtastic `from` node or, for MeshCore, the advert's public
 /// key (by its first byte, the hash MeshCore paths use) or the channel
@@ -1095,6 +1136,10 @@ fn update(d: &mut Dash, m: &Message) {
                 push_trail(o, lat, lon);
             }
         }
+        // VOR / ILS → one navaid entity per channel with the latest reading.
+        MessageBody::Navaid { kind, ident, details } => {
+            navaid_update(d, m.frequency_hz, kind, ident.as_deref(), details);
+        }
         // Meshtastic / MeshCore → a mesh node entity.
         MessageBody::Meshtastic { kind, details } | MessageBody::MeshCore { kind, details } => {
             mesh_update(d, m.mode.as_str(), kind, details);
@@ -1210,6 +1255,7 @@ fn snapshot_value(d: &mut Dash, include_messages: bool) -> Value {
     d.trains.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.pagers.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     d.mesh_nodes.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
+    d.navaids.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= cutoff);
     let alert_cut = now_s().saturating_sub(ALERT_EXPIRE_S);
     d.alerts.retain(|_, v| v["seen"].as_u64().unwrap_or(0) >= alert_cut);
     // Persist the accumulated beam pattern occasionally so it survives
@@ -1230,6 +1276,7 @@ fn snapshot_value(d: &mut Dash, include_messages: bool) -> Value {
         "trains": d.trains.values().collect::<Vec<_>>(),
         "pagers": d.pagers.values().collect::<Vec<_>>(),
         "mesh_nodes": d.mesh_nodes.values().collect::<Vec<_>>(),
+        "navaids": d.navaids.values().collect::<Vec<_>>(),
         "alerts": d.alerts.values().collect::<Vec<_>>(),
         "iridium_sats": d.iridium_sats.values().collect::<Vec<_>>(),
         "iridium_rings": d.iridium_rings.values().collect::<Vec<_>>(),
@@ -2189,6 +2236,24 @@ mod tests {
         // A beacon with no position (e.g. a DSC routine call) creates nothing.
         update(&mut d, &msg(Mode::Dsc, MessageBody::Dsc { kind: "individual".into(), details: json!({"from": 1234}) }));
         assert_eq!(d.beacons.len(), 1, "no-position message plots no beacon");
+    }
+
+    #[test]
+    fn navaid_observations_update_one_channel() {
+        let mut d = Dash::default();
+        let body = |radial: f64, ident: Option<&str>| MessageBody::Navaid {
+            kind: "vor".into(),
+            ident: ident.map(str::to_string),
+            details: json!({"status": "normal", "cn0_dbhz": 47.2, "vor": {"radial_deg": radial, "radial_std_deg": 0.6}, "ils": []}),
+        };
+        update(&mut d, &msg(Mode::Vor, body(123.0, Some("SAC"))));
+        update(&mut d, &msg(Mode::Vor, body(124.0, None)));
+        assert_eq!(d.navaids.len(), 1);
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let n = &snap["navaids"][0];
+        assert_eq!(n["ident"], "SAC", "the last ident is kept");
+        assert_eq!(n["radial"], 124.0, "the latest radial wins");
+        assert_eq!(n["msgs"], 2);
     }
 
     #[test]

@@ -58,6 +58,7 @@ xng-mode-time = { path = "crates/xng-mode-time" }
 xng-mode-airband = { path = "crates/xng-mode-airband" }
 xng-mode-lora = { path = "crates/xng-mode-lora" }
 xng-mode-dme = { path = "crates/xng-mode-dme" }
+xng-mode-navaid = { path = "crates/xng-mode-navaid" }
 prost = "0.13"
 tonic = "0.12"
 quinn = "0.11"
@@ -153,6 +154,7 @@ xng-mode-vdes.workspace = true
 xng-mode-time.workspace = true
 xng-mode-lora.workspace = true
 xng-mode-dme.workspace = true
+xng-mode-navaid.workspace = true
 xng-mode-airband.workspace = true
 prost.workspace = true
 tonic.workspace = true

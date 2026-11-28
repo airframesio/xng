@@ -749,6 +749,7 @@ pub fn summary(msg: &Message) -> String {
         MessageBody::Meshtastic { kind, details } => mesh_summary("MESHTASTIC", kind, details),
         MessageBody::MeshCore { kind, details } => mesh_summary("MESHCORE", kind, details),
         MessageBody::Dme { kind, details } => dme_summary(kind, details),
+        MessageBody::Navaid { kind, ident, details } => navaid_summary(kind, ident.as_deref(), details),
         MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
     }
 }
@@ -794,6 +795,48 @@ fn dme_summary(kind: &str, d: &serde_json::Value) -> String {
     }
     if let (Some(k), Some(f)) = (st("paired_kind"), num("paired_vhf_hz")) {
         s.push_str(&format!(" ↔ {} {:.3} MHz", k.to_ascii_uppercase(), f / 1e6));
+    }
+    s
+}
+
+/// "VOR SAC radial 123.4° ±0.6 C/N0 47 dB-Hz [normal]"
+/// "LOC ISAC DDM +0.050 (48 µA) SDM 40% | 2nd carrier -8 dB DDM +0.300 [normal]"
+fn navaid_summary(kind: &str, ident: Option<&str>, d: &serde_json::Value) -> String {
+    let f = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_f64());
+    let label = match kind {
+        "vor" => "VOR",
+        "localizer" => "LOC",
+        "glideslope" => "GS",
+        other => other,
+    };
+    let mut s = label.to_string();
+    if let Some(id) = ident {
+        s.push_str(&format!(" {id}"));
+    }
+    if let Some(v) = d.get("vor").filter(|v| !v.is_null()) {
+        if let (Some(r), Some(sd)) = (f(v, "radial_deg"), f(v, "radial_std_deg")) {
+            s.push_str(&format!(" radial {r:.1}° ±{sd:.1}"));
+        }
+    }
+    if let Some(ils) = d.get("ils").and_then(|v| v.as_array()) {
+        for (i, m) in ils.iter().enumerate() {
+            let (Some(ddm), Some(ua)) = (f(m, "ddm"), f(m, "ddm_ua")) else { continue };
+            if i == 0 {
+                s.push_str(&format!(" DDM {ddm:+.3} ({ua:.0} µA)"));
+                if let Some(sdm) = f(m, "sdm_pct") {
+                    s.push_str(&format!(" SDM {sdm:.0}%"));
+                }
+            } else {
+                let rel = f(m, "relative_db").unwrap_or(0.0);
+                s.push_str(&format!(" | 2nd carrier {rel:.0} dB DDM {ddm:+.3}"));
+            }
+        }
+    }
+    if let Some(c) = f(d, "cn0_dbhz") {
+        s.push_str(&format!(" C/N0 {c:.0} dB-Hz"));
+    }
+    if let Some(st) = d.get("status").and_then(|v| v.as_str()) {
+        s.push_str(&format!(" [{}]", st.replace('_', " ")));
     }
     s
 }
