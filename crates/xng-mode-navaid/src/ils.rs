@@ -7,7 +7,8 @@
 //! a 0.5 s block, so the tone frequencies are measured first: every 2 s a
 //! zero-padded spectrum of the last 8 s finds each tone's peak near its
 //! nominal frequency (nominal is used where a tone does not stand clear;
-//! the first 2 s of blocks wait for the first estimate). Per 0.5 s
+//! the first 2 s of blocks wait for the first estimate, and a report
+//! closed before it has no reading). Per 0.5 s
 //! block at [`TONE_RATE`] a least-squares fit of DC and the two tones at
 //! those frequencies gives the depths (at exactly 90 and 150 Hz this is the
 //! plain DFT: 45 and 75 whole cycles), from which:
@@ -276,11 +277,13 @@ impl IlsAnalyzer {
     pub fn take(&mut self, carrier_offset_hz: f64, relative_db: f64) -> Option<IlsMeasure> {
         if !self.pending.is_empty() {
             // Closing before the first estimate is due: measure the tones
-            // now if there is enough history, else fit at nominal.
+            // now if there is enough history. With less, a fit at nominal
+            // could be a bin off, so the interval reports no ILS reading.
             if self.hist.len() >= FIRST_EST_BLOCKS * BLOCK {
                 self.estimate_tones();
             } else {
-                self.fit_pending();
+                self.pending.clear();
+                return None;
             }
         }
         if self.results.is_empty() {

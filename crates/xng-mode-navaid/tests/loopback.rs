@@ -346,6 +346,25 @@ fn ils_tones_off_nominal_read_true_ddm() {
 }
 
 #[test]
+fn short_reports_before_the_tone_estimate_have_no_ddm() {
+    // 0.5 s reports of 91.2/152 Hz tones: none may carry a fit at nominal.
+    let mut p = IlsParams::localizer(0.0);
+    p.f30_hz = 30.4;
+    let obs = run(
+        NavaidKind::Localizer,
+        Scene::single(RATE, OFFSET, Signal::Ils(p), None),
+        8.0,
+        0.5,
+    );
+    assert!(obs.iter().any(|o| !o.ils.is_empty()));
+    for o in &obs {
+        if let Some(m) = o.ils.first() {
+            assert!(m.ddm.abs() < 0.002, "t {}: ddm {}", o.t_s, m.ddm);
+        }
+    }
+}
+
+#[test]
 fn wide_two_frequency_glideslope_finds_both_carriers() {
     // 32 kHz separation, the widest Annex 10 allows.
     let carrier = |off: f64, amp: f64, ddm: f64| CarrierSpec {
