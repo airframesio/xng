@@ -179,17 +179,20 @@ fn resolve_locked(
 /// lock file can't be written, or the file system has no locks); nothing is
 /// saved then.
 fn lock_file(path: &Path) -> Option<std::fs::File> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok()?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(path.with_extension("json.lock"))
-        .ok()?;
-    match file.lock() {
-        Ok(()) => Some(file),
+    let taken = (|| -> std::io::Result<std::fs::File> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_extension("json.lock"))?;
+        file.lock()?;
+        Ok(file)
+    })();
+    match taken {
+        Ok(file) => Some(file),
         Err(e) => {
             tracing::warn!(
                 "station uuid map {}: not locked, so not saved: {e}",
