@@ -150,6 +150,8 @@ pub fn mode_suffix(mode: Mode) -> Option<&'static str> {
         // per-mode router (so no station-id suffix).
         Mode::Aprs | Mode::Pocsag | Mode::Eot | Mode::Flex | Mode::Vdes | Mode::Time => None,
         Mode::Meshtastic | Mode::MeshCore => None,
+        // Navaid reports: shown locally; no Airframes ingest yet.
+        Mode::Dme => None,
         // Airband audio feeds the ATC aggregator (`--atc-feed`), not the
         // per-port message ingests.
         Mode::Airband => None,

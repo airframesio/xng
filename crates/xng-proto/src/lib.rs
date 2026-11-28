@@ -151,7 +151,8 @@ impl From<&Message> for asf2::DecodedMessage {
             | MessageBody::Vdes { kind, details }
             | MessageBody::Airband { kind, details }
             | MessageBody::Meshtastic { kind, details }
-            | MessageBody::MeshCore { kind, details } => {
+            | MessageBody::MeshCore { kind, details }
+            | MessageBody::Dme { kind, details } => {
                 Some(asf2::decoded_message::Body::Generic(asf2::GenericBody {
                     kind: kind.clone(),
                     details_json: details.to_string(),

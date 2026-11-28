@@ -155,6 +155,7 @@ pub fn passband(mode: Mode) -> f64 {
         Mode::Vdes => xng_mode_vdes::CHANNEL_PASSBAND_HZ,
         Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
         Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_PASSBAND_HZ,
+        Mode::Dme => xng_mode_dme::CHANNEL_PASSBAND_HZ,
         _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
     }
 }
@@ -183,6 +184,7 @@ pub fn channel_rate(mode: Mode) -> f64 {
         Mode::Vdes => xng_mode_vdes::CHANNEL_RATE,
         Mode::Time => xng_mode_time::CHANNEL_RATE,
         Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_RATE,
+        Mode::Dme => xng_mode_dme::CHANNEL_RATE,
         _ => xng_mode_acars::CHANNEL_RATE,
     }
 }

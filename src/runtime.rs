@@ -31,6 +31,7 @@ use xng_mode_sarsat::SarsatChannelDecoder;
 use xng_mode_sonde::SondeChannelDecoder;
 use xng_mode_time::TimeChannelDecoder;
 use xng_mode_lora::LoraChannelDecoder;
+use xng_mode_dme::DmeChannelDecoder;
 use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
@@ -414,6 +415,8 @@ pub(crate) enum ModeChannel {
     Time(TimeChannelDecoder),
     /// LoRa mesh (Meshtastic / MeshCore); boxed, it holds FFT plans per SF.
     Lora(Box<LoraChannelDecoder>),
+    /// DME / TACAN ground transponder (receive only).
+    Dme(Box<DmeChannelDecoder>),
     /// Placeholder for one airband channel; `collapse_airband` folds every
     /// placeholder of a session into one [`ModeChannel::AirbandSet`].
     AirbandPending,
@@ -499,6 +502,12 @@ impl ModeChannel {
             // Airband channels are built together (shared front end and the
             // session's per-channel settings) by `collapse_airband`.
             Mode::Airband => Ok(Self::AirbandPending),
+            // DME: the channel frequency names the X/Y channel and its pulse
+            // spacing (reply or interrogation side).
+            Mode::Dme => Ok(Self::Dme(Box::new(
+                DmeChannelDecoder::new(sample_rate, offset)?
+                    .with_carrier(freq, xng_mode_dme::detect::Thresholds::default()),
+            ))),
             // LoRa mesh: the preset (SF/BW) comes from --lora-preset or the
             // mode's default for the tuned carrier.
             Mode::Meshtastic | Mode::MeshCore => {
@@ -543,6 +552,7 @@ impl ModeChannel {
             Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
             Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_PASSBAND_HZ,
             Mode::Airband => xng_mode_airband::FRONT_PASSBAND_HZ,
+            Mode::Dme => xng_mode_dme::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -573,6 +583,7 @@ impl ModeChannel {
             Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
             Self::Time(_) => xng_mode_time::CHANNEL_RATE,
             Self::Lora(d) => d.channel_rate(),
+            Self::Dme(_) => xng_mode_dme::CHANNEL_RATE,
             Self::AirbandPending | Self::AirbandSet(_) => xng_mode_airband::CHANNEL_RATE,
         }
     }
@@ -612,6 +623,7 @@ impl ModeChannel {
             Self::Vdes(d) => d.level_dbfs(),
             Self::Time(d) => d.level_dbfs(),
             Self::Lora(d) => d.level_dbfs(),
+            Self::Dme(d) => d.level_dbfs(),
             Self::AirbandPending => f32::NEG_INFINITY,
             Self::AirbandSet(s) => s.level_dbfs(0),
         }
@@ -879,6 +891,16 @@ impl ModeChannel {
                     .collect();
                 (msgs, seen, seen)
             }
+            Self::Dme(dec) => {
+                let events = dec.process(iq);
+                let seen = events.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = events
+                    .iter()
+                    .map(|e| xng_mode_dme::to_message(e, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
             Self::Time(dec) => {
                 let frames = dec.process(iq);
                 let seen = frames.len() as u64;
@@ -978,6 +1000,25 @@ impl ModeChannel {
         let prov = base.for_channel(base_index, freq, self.channel_rate());
         let (msgs, seen, ok) = self.process(iq, freq, &prov);
         out.push(ChannelOut { freq, level: self.level(), msgs, seen, ok });
+    }
+}
+
+impl ModeChannel {
+    /// Flush whatever a decoder holds at end of stream (only DME buffers
+    /// results: its last pairs and an ident still being keyed).
+    fn finish(&mut self, freqs: &[u64], base_index: usize, base: &SharedProvenance, out: &mut Vec<ChannelOut>) {
+        if let Self::Dme(dec) = self {
+            let freq = freqs[0];
+            let prov = base.for_channel(base_index, freq, xng_mode_dme::CHANNEL_RATE);
+            let events = dec.finish(None);
+            let level = dec.level_dbfs();
+            let seen = events.len() as u64;
+            let msgs = events
+                .iter()
+                .map(|e| xng_mode_dme::to_message(e, freq, level, prov.clone()))
+                .collect();
+            out.push(ChannelOut { freq, level, msgs, seen, ok: seen });
+        }
     }
 }
 
@@ -1502,6 +1543,22 @@ pub(crate) fn decode_loop(
                 if let Some((state, _, _)) = &live {
                     state.record_channel(co.freq, seen, ok, co.level);
                 }
+            }
+        }
+    }
+    // End of stream or stop: flush decoders that hold results back.
+    for group in &mut groups {
+        out.clear();
+        group.dec.finish(&group.freqs, group.base_index, &base, &mut out);
+        for (k, co) in out.drain(..).enumerate() {
+            let row = &mut stats[group.base_index + k];
+            row.1 += co.seen;
+            row.2 += co.ok;
+            for msg in co.msgs {
+                publish_msg(
+                    msg, co.freq, &mut dedup, reasm.as_deref_mut(), &label_filter,
+                    &ais_filter, &mut ais_gate, &live, &bus,
+                );
             }
         }
     }
