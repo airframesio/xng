@@ -4748,6 +4748,7 @@ dependencies = [
  "xng-mode-ais",
  "xng-mode-aprs",
  "xng-mode-atcs",
+ "xng-mode-dme",
  "xng-mode-dsc",
  "xng-mode-eot",
  "xng-mode-flex",
@@ -4878,6 +4879,18 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-atcs"
+version = "0.27.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-dme"
 version = "0.27.0"
 dependencies = [
  "chrono",

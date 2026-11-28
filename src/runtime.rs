@@ -31,6 +31,7 @@ use xng_mode_sarsat::SarsatChannelDecoder;
 use xng_mode_sonde::SondeChannelDecoder;
 use xng_mode_time::TimeChannelDecoder;
 use xng_mode_lora::LoraChannelDecoder;
+use xng_mode_dme::DmeChannelDecoder;
 use xng_mode_uat::UatChannelDecoder;
 use xng_sdr::{IqSource, SdrError};
 use xng_types::{AppInfo, ChannelInfo, Message, MessageBody, Mode, Provenance, SdrInfo, StationIdentity};
@@ -414,6 +415,8 @@ pub(crate) enum ModeChannel {
     Time(TimeChannelDecoder),
     /// LoRa mesh (Meshtastic / MeshCore); boxed, it holds FFT plans per SF.
     Lora(Box<LoraChannelDecoder>),
+    /// DME / TACAN ground transponder (receive only).
+    Dme(Box<DmeChannelDecoder>),
     /// Placeholder for one airband channel; `collapse_airband` folds every
     /// placeholder of a session into one [`ModeChannel::AirbandSet`].
     AirbandPending,
@@ -499,6 +502,12 @@ impl ModeChannel {
             // Airband channels are built together (shared front end and the
             // session's per-channel settings) by `collapse_airband`.
             Mode::Airband => Ok(Self::AirbandPending),
+            // DME: the channel frequency names the X/Y channel and its pulse
+            // spacing (reply or interrogation side).
+            Mode::Dme => Ok(Self::Dme(Box::new(
+                DmeChannelDecoder::new(sample_rate, offset)?
+                    .with_carrier(freq, xng_mode_dme::detect::Thresholds::default()),
+            ))),
             // LoRa mesh: the preset (SF/BW) comes from --lora-preset or the
             // mode's default for the tuned carrier.
             Mode::Meshtastic | Mode::MeshCore => {
@@ -543,6 +552,7 @@ impl ModeChannel {
             Mode::Time => xng_mode_time::CHANNEL_PASSBAND_HZ,
             Mode::Meshtastic | Mode::MeshCore => xng_mode_lora::CHANNEL_PASSBAND_HZ,
             Mode::Airband => xng_mode_airband::FRONT_PASSBAND_HZ,
+            Mode::Dme => xng_mode_dme::CHANNEL_PASSBAND_HZ,
             _ => xng_mode_acars::CHANNEL_PASSBAND_HZ,
         }
     }
@@ -573,6 +583,7 @@ impl ModeChannel {
             Self::Vdes(_) => xng_mode_vdes::CHANNEL_RATE,
             Self::Time(_) => xng_mode_time::CHANNEL_RATE,
             Self::Lora(d) => d.channel_rate(),
+            Self::Dme(_) => xng_mode_dme::CHANNEL_RATE,
             Self::AirbandPending | Self::AirbandSet(_) => xng_mode_airband::CHANNEL_RATE,
         }
     }
@@ -612,6 +623,7 @@ impl ModeChannel {
             Self::Vdes(d) => d.level_dbfs(),
             Self::Time(d) => d.level_dbfs(),
             Self::Lora(d) => d.level_dbfs(),
+            Self::Dme(d) => d.level_dbfs(),
             Self::AirbandPending => f32::NEG_INFINITY,
             Self::AirbandSet(s) => s.level_dbfs(0),
         }
@@ -876,6 +888,16 @@ impl ModeChannel {
                 let msgs: Vec<Message> = frames
                     .iter()
                     .filter_map(|f| xng_mode_vdes::to_message(f, freq, level, prov.clone()))
+                    .collect();
+                (msgs, seen, seen)
+            }
+            Self::Dme(dec) => {
+                let events = dec.process(iq);
+                let seen = events.len() as u64;
+                let level = dec.level_dbfs();
+                let msgs = events
+                    .iter()
+                    .map(|e| xng_mode_dme::to_message(e, freq, level, prov.clone()))
                     .collect();
                 (msgs, seen, seen)
             }

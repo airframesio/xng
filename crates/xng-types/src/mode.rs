@@ -60,6 +60,9 @@ pub enum Mode {
     Meshtastic,
     /// MeshCore LoRa mesh packets (sync word 0x12).
     MeshCore,
+    /// DME / TACAN ground transponders (962–1213 MHz pulse pairs, receive
+    /// only): pair rate, Morse ident, channel and VOR/ILS pairing.
+    Dme,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -92,6 +95,7 @@ impl Mode {
             Mode::Airband => "airband",
             Mode::Meshtastic => "meshtastic",
             Mode::MeshCore => "meshcore",
+            Mode::Dme => "dme",
             Mode::Extern => "extern",
         }
     }
@@ -124,6 +128,7 @@ impl Mode {
             Mode::Airband,
             Mode::Meshtastic,
             Mode::MeshCore,
+            Mode::Dme,
         ]
     }
 }
@@ -164,6 +169,7 @@ impl std::str::FromStr for Mode {
             "airband" | "voice" | "atc" => Ok(Mode::Airband),
             "meshtastic" | "mesh" => Ok(Mode::Meshtastic),
             "meshcore" => Ok(Mode::MeshCore),
+            "dme" | "tacan" => Ok(Mode::Dme),
             other => Err(format!("unknown mode: {other}")),
         }
     }
