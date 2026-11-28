@@ -30,12 +30,16 @@ def main():
     exe, path, rate, secs, freq = sys.argv[1:6]
     secs = float(secs)
     t0 = time.monotonic()
-    out = subprocess.run(
+    proc = subprocess.run(
         [exe, "--standard", "dme", "--file", path, "--format", "cf32",
          "--rate", str(float(rate) / 1e6), "--freq", str(float(freq) / 1e6),
          "--secs", str(secs + 1.5)],
         capture_output=True, text=True, timeout=secs + 120,
-    ).stdout
+    )
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.exit(f"onair-cli exited with {proc.returncode}")
+    out = proc.stdout
     wall = time.monotonic() - t0
     rates, ident = [], ""
     cpu = float("nan")
