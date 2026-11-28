@@ -209,29 +209,40 @@ pub fn candidates(rows: &[Row], services: Option<&[String]>) -> Vec<Pick> {
     best
 }
 
-/// Sum of scores; each extra channel of a service is worth less than the
+/// How much each further channel of a service is worth relative to the
 /// one before it, so a cluster of CTAFs doesn't outrank a tower plus
 /// approach.
-fn window_value(chans: &[&Pick]) -> f64 {
-    let mut seen: Vec<(&str, i32)> = Vec::new();
-    let mut sorted: Vec<&&Pick> = chans.iter().collect();
-    sorted.sort_by(|a, b| b.score.total_cmp(&a.score));
-    let mut total = 0.0;
-    for p in sorted {
-        let n = match seen.iter_mut().find(|(s, _)| *s == p.service) {
-            Some((_, n)) => {
-                *n += 1;
-                *n - 1
-            }
-            None => {
-                seen.push((&p.service, 1));
-                0
-            }
-        };
-        let decay: f64 = if matches!(p.service.as_str(), "CTAF" | "UNICOM" | "GND" | "CLD") { 0.5 } else { 0.8 };
-        total += p.score * decay.powi(n);
+fn decay(svc: &str) -> f64 {
+    if matches!(svc, "CTAF" | "UNICOM" | "GND" | "CLD") {
+        0.5
+    } else {
+        0.8
     }
-    total
+}
+
+/// The best `max_channels` of `chans` and their value: greedily the
+/// channel adding the most (its score times its service's decay for each
+/// channel of that service already taken). Each service's marginal values
+/// only fall, so greedy is optimal here.
+fn best_subset<'a>(chans: &[&'a Pick], max_channels: usize) -> (Vec<&'a Pick>, f64) {
+    let mut left: Vec<&Pick> = chans.to_vec();
+    let mut taken: Vec<&Pick> = Vec::new();
+    let mut total = 0.0;
+    while taken.len() < max_channels && !left.is_empty() {
+        let gain = |p: &Pick| {
+            let n = taken.iter().filter(|t| t.service == p.service).count() as i32;
+            p.score * decay(&p.service).powi(n)
+        };
+        let (i, g) = left
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, gain(p)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .expect("left is not empty");
+        total += g;
+        taken.push(left.swap_remove(i));
+    }
+    (taken, total)
 }
 
 /// The slice of the band (`span_hz` wide) whose best `max_channels`
@@ -240,18 +251,45 @@ pub fn pick_window(cands: &[Pick], span_hz: u64, max_channels: usize) -> Vec<Pic
     let mut best: Vec<&Pick> = Vec::new();
     let mut best_total = 0.0;
     for (i, lo) in cands.iter().enumerate() {
-        let mut inside: Vec<&Pick> = cands[i..].iter().filter(|p| p.freq_hz - lo.freq_hz <= span_hz).collect();
-        inside.sort_by(|a, b| b.score.total_cmp(&a.score));
-        inside.truncate(max_channels);
-        let total = window_value(&inside);
+        let inside: Vec<&Pick> = cands[i..].iter().filter(|p| p.freq_hz - lo.freq_hz <= span_hz).collect();
+        let (taken, total) = best_subset(&inside, max_channels);
         if total > best_total {
-            best = inside;
+            best = taken;
             best_total = total;
         }
     }
     let mut out: Vec<Pick> = best.into_iter().cloned().collect();
     out.sort_by_key(|p| p.freq_hz);
     out
+}
+
+/// Keep the center this far from any carrier (the DC spike).
+const DC_CLEAR_HZ: u64 = 10_000;
+/// How far the center may move off the middle to clear a carrier; the
+/// window is narrowed by twice this so every channel stays in the span.
+const CENTER_SLACK_HZ: u64 = 25_000;
+
+/// A center between the outer channels, as near the middle as possible,
+/// at least [`DC_CLEAR_HZ`] from every carrier (else the clearest spot)
+/// and within [`CENTER_SLACK_HZ`] of the middle.
+fn center_for(channels: &[u64]) -> u64 {
+    let lo = *channels.iter().min().expect("channels");
+    let hi = *channels.iter().max().expect("channels");
+    let mid = (lo + hi) / 2;
+    let clearance = |c: u64| channels.iter().map(|f| f.abs_diff(c)).min().unwrap_or(u64::MAX);
+    let mut best = (mid, clearance(mid));
+    for step in 0..=(CENTER_SLACK_HZ / 1_000) {
+        for c in [mid + step * 1_000, mid.saturating_sub(step * 1_000)] {
+            let cl = clearance(c);
+            if cl >= DC_CLEAR_HZ {
+                return c;
+            }
+            if cl > best.1 {
+                best = (c, cl);
+            }
+        }
+    }
+    best.0
 }
 
 /// Plan a capture at `sample_rate`: the best window within 75% of the
@@ -267,16 +305,21 @@ pub fn plan(
 ) -> Option<Plan> {
     let span = (sample_rate * 0.75) as u64;
     let mut cands = candidates(rows, services);
-    if let Some(c) = center_hz {
-        // Keep clear of the center's DC spike too.
-        cands.retain(|p| p.freq_hz.abs_diff(c) <= span / 2 && p.freq_hz.abs_diff(c) >= 10_000);
-    }
-    let channels = pick_window(&cands, span, max_channels.max(1));
+    let window = match center_hz {
+        Some(c) => {
+            // Inside that capture, and clear of the center's DC spike.
+            cands.retain(|p| p.freq_hz.abs_diff(c) <= span / 2 && p.freq_hz.abs_diff(c) >= DC_CLEAR_HZ);
+            span
+        }
+        // Room for the center to move off a carrier.
+        None => span.saturating_sub(2 * CENTER_SLACK_HZ),
+    };
+    let channels = pick_window(&cands, window, max_channels.max(1));
     if channels.is_empty() {
         return None;
     }
     let hz: Vec<u64> = channels.iter().map(|p| p.freq_hz).collect();
-    Some(Plan { center_hz: center_hz.unwrap_or_else(|| crate::tuning::centroid_off_dc(&hz, true)), channels })
+    Some(Plan { center_hz: center_hz.unwrap_or_else(|| center_for(&hz)), channels })
 }
 
 /// Where the receiver is and what to look for.
@@ -382,6 +425,37 @@ mod tests {
         assert_eq!(p.center_hz, 126_500_000);
         assert_eq!(p.channels.len(), 1);
         assert_eq!(p.channels[0].freq_hz, 127_000_000);
+    }
+
+    #[test]
+    fn subset_counts_the_service_decay() {
+        // Two towers by raw score lose to approach + the better tower.
+        let rows = [
+            row("a:A:APP:1", 118.0, "APP", 0.0),
+            row("a:B:TWR:2", 118.1, "TWR", 0.0),
+            row("a:C:TWR:3", 118.2, "TWR", 1.0),
+        ];
+        let p = plan(&rows, 2_400_000.0, 2, None, None).unwrap();
+        let ids: Vec<&str> = p.channels.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["a:A:APP:1", "a:B:TWR:2"]);
+    }
+
+    #[test]
+    fn center_clears_every_carrier_and_keeps_the_span() {
+        // The middle and middle+25 kHz are both carriers.
+        let c = center_for(&[120_000_000, 120_025_000, 120_050_000]);
+        assert!([120_000_000u64, 120_025_000, 120_050_000].iter().all(|f| f.abs_diff(c) >= DC_CLEAR_HZ), "{c}");
+        // Channels spanning the whole window stay within half the span.
+        let rows = [
+            row("a:A:TWR:1", 120.0, "TWR", 0.0),
+            row("a:B:TWR:2", 120.9, "TWR", 0.0),
+            row("a:C:TWR:3", 121.8, "TWR", 0.0),
+        ];
+        let p = plan(&rows, 2_400_000.0, 8, None, None).unwrap();
+        for ch in &p.channels {
+            assert!(ch.freq_hz.abs_diff(p.center_hz) <= 900_000, "{} vs {}", ch.freq_hz, p.center_hz);
+            assert!(ch.freq_hz.abs_diff(p.center_hz) >= DC_CLEAR_HZ);
+        }
     }
 
     #[test]

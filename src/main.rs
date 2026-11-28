@@ -49,8 +49,9 @@ struct TuneOpts {
     /// Channel frequencies, comma separated (e.g. 131.550,131.725). The
     /// tui falls back to the mode's built-in plan (as many channels as
     /// fit the capture width and CPU budget); decode/listen require it.
-    /// Airband: `auto` picks the ATC channels near --receiver-pos from the
-    /// Airframes ATC catalog (and -c, and -r 2400000 unless given).
+    /// Airband listen/decode: `auto` picks the ATC channels near
+    /// --receiver-pos from the Airframes ATC catalog (listen also picks -c,
+    /// and -r 2400000, unless given). The tui does not take `auto`.
     #[arg(long, value_delimiter = ',')]
     channels: Vec<String>,
     /// Receiver location as lat,lon (e.g. 38.69,-121.59) — enables
@@ -554,7 +555,8 @@ fn main() -> anyhow::Result<()> {
                     anyhow::anyhow!("cannot guess IQ format; pass --format (cf32|cs16|cs8|cu8)")
                 })?,
             };
-            let (tune, airband) = auto_channels(&tune, &airband)?;
+            // A recording's rate and center are fixed: decode must be told them.
+            let (tune, airband) = auto_channels(&tune, &airband, true)?;
             let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
             let (mut outputs, station_ident) = output.build()?;
             outputs.airframes =
@@ -869,10 +871,12 @@ fn print_table(headers: &[&str], rows: &[[String; 5]]) {
 
 /// `--channels auto` (airband): pick the channels, and the center unless
 /// -c sets it, from the ATC catalog around --receiver-pos, labeled and
-/// linked to their catalog entries. Anything else passes through.
+/// linked to their catalog entries. Anything else passes through. With
+/// `fixed_capture` (a recording) -r and -c must be given and are kept.
 fn auto_channels(
     tune: &TuneOpts,
     airband: &xng::airband::cli::AirbandOpts,
+    fixed_capture: bool,
 ) -> anyhow::Result<(TuneOpts, xng::airband::cli::AirbandOpts)> {
     let (mut tune, mut airband) = (tune.clone(), airband.clone());
     if !(tune.channels.len() == 1 && tune.channels[0].trim().eq_ignore_ascii_case("auto")) {
@@ -881,6 +885,10 @@ fn auto_channels(
     anyhow::ensure!(tune.mode == "airband", "--channels auto picks ATC channels: use it with --mode airband");
     let (lat, lon) = parse_receiver_pos(&tune.receiver_pos)?
         .ok_or_else(|| anyhow::anyhow!("--channels auto needs --receiver-pos LAT,LON to find channels near you"))?;
+    anyhow::ensure!(
+        !fixed_capture || (tune.sample_rate.is_some() && tune.center_freq.is_some()),
+        "decode --channels auto needs the recording's -r and -c"
+    );
     let rate = *tune.sample_rate.get_or_insert(2_400_000.0);
     let center = tune.center_freq.as_deref().map(xng::freq::parse_hz).transpose()?;
     let q = airband.nearby_query(lat, lon, rate, center);
@@ -903,7 +911,7 @@ fn listen(
     output: &OutputOpts,
     airband: &xng::airband::cli::AirbandOpts,
 ) -> anyhow::Result<()> {
-    let (tune, airband) = auto_channels(tune, airband)?;
+    let (tune, airband) = auto_channels(tune, airband, false)?;
     let (tune, airband) = (&tune, &airband);
     let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
     let (mut outputs, station_ident) = output.build()?;

@@ -183,27 +183,43 @@ fn nearby(q: &atc_nearby::Query) -> anyhow::Result<()> {
         println!("  {}", atc_nearby::describe(p));
     }
     println!();
+    // The same constraints, so `listen` picks what this printed.
+    let mut extra = String::new();
+    if let Some(c) = q.center_hz {
+        extra.push_str(&format!(" -c {:.3}", c as f64 / 1e6));
+    }
+    if q.radius_nm != 30 {
+        extra.push_str(&format!(" --atc-nearby-radius-nm {}", q.radius_nm));
+    }
+    if q.max_channels != 8 {
+        extra.push_str(&format!(" --atc-nearby-max {}", q.max_channels));
+    }
+    if !q.services.is_empty() {
+        extra.push_str(&format!(" --atc-nearby-services {}", q.services.join(",")));
+    }
     println!("Feed them (picks again at start, so new catalog entries are used):");
     println!(
-        "  xng listen --sdr driver=rtlsdr --mode airband -r {} --channels auto --receiver-pos {},{} --atc-feed{}",
-        q.sample_rate as u64,
-        q.lat,
-        q.lon,
-        if q.radius_nm == 30 { String::new() } else { format!(" --atc-nearby-radius-nm {}", q.radius_nm) }
+        "  xng listen --sdr driver=rtlsdr --mode airband -r {}{extra} --channels auto --receiver-pos {},{} --atc-feed",
+        q.sample_rate as u64, q.lat, q.lon
     );
     let mhz = |hz: u64| format!("{:.3}", hz as f64 / 1e6);
     let labels: Vec<String> = plan.channels.iter().map(|p| format!("{}={}", mhz(p.freq_hz), p.label)).collect();
     println!("Or with these channels fixed:");
     println!(
-        "  xng listen --sdr driver=rtlsdr --mode airband -r {} -c {} --channels {} --labels \"{}\" --receiver-pos {},{} --atc-feed",
+        "  xng listen --sdr driver=rtlsdr --mode airband -r {} -c {} --channels {} --labels {} --receiver-pos {},{} --atc-feed",
         q.sample_rate as u64,
         mhz(plan.center_hz),
         plan.channels.iter().map(|p| mhz(p.freq_hz)).collect::<Vec<_>>().join(","),
-        labels.join(","),
+        shell_quote(&labels.join(",")),
         q.lat,
         q.lon
     );
     Ok(())
+}
+
+/// Single-quote for a POSIX shell: catalog names are data, not shell.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 fn status(path: &Path) -> anyhow::Result<()> {
@@ -263,5 +279,14 @@ fn prompt_password(prompt: &str) -> anyhow::Result<String> {
     {
         let _ = prompt;
         anyhow::bail!("reading a password from this terminal is not supported; pipe it with --password-stdin or sign in without --email")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn labels_are_quoted_for_the_shell() {
+        assert_eq!(super::shell_quote("120.500=KSFO TWR"), "'120.500=KSFO TWR'");
+        assert_eq!(super::shell_quote("a=O'HARE $(x)"), r"'a=O'\''HARE $(x)'");
     }
 }

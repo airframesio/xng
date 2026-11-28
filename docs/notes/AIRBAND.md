@@ -128,12 +128,15 @@ airframesio/aggregator-atc): ALPN `airframes-atc/1`, port 4433.
   be fed), scores each by service (tower 10, approach/departure 8, ground 6,
   center 5, delivery 4, ... times `exp(-distance/range)`, where the range
   is the service's usual reach) and takes the slice of 75% of the sample
-  rate (1.8 MHz at the default `-r 2400000`) whose best
+  rate less 50 kHz (1.75 MHz at the default `-r 2400000`) whose best
   `--atc-nearby-max` (8) channels score highest; each further channel of a
   service counts for less, so a cluster of CTAFs does not beat a tower and
-  its approach. The center goes between the outer channels, off any
-  carrier, unless `-c` is given (then only channels inside that capture are
-  picked). Each pick is labeled (`KSFO TWR`) and carries its catalog key,
+  its approach (the channels are chosen greedily by that discounted value).
+  The center goes near the middle, at least 10 kHz from every carrier and
+  at most 25 kHz off the middle, so every channel stays within 75% of the
+  capture. With `-c`, the center is kept and only channels inside that
+  capture are picked. `decode --channels auto` needs the recording's `-r`
+  and `-c`. Each pick is labeled (`KSFO TWR`) and carries its catalog key,
   so no match lookup follows; `--labels` and `--atc-frequency` still win
   for the channels they name. `--atc-nearby-services TWR,GND,APP` limits the
   services. The pick runs once at start (restart to pick again) and is
