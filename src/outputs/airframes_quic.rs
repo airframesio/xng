@@ -129,11 +129,19 @@ pub const XNG_FORMAT: &str = "xng";
 
 /// Whether a mode may go to the gateway at all. ADS-B and UAT never go to
 /// Airframes (they belong on ADS-B networks), airband audio goes to the ATC
-/// ingest, sondes to their own intake.
+/// ingest, sondes to their own intake. Navaid monitoring (VOR, ILS) stays
+/// local until Airframes has an ingest for it.
 pub fn gateway_eligible(mode: Mode) -> bool {
     !matches!(
         mode,
-        Mode::Adsb | Mode::Uat | Mode::Airband | Mode::Sonde | Mode::Extern | Mode::Time
+        Mode::Adsb
+            | Mode::Uat
+            | Mode::Airband
+            | Mode::Sonde
+            | Mode::Extern
+            | Mode::Time
+            | Mode::Vor
+            | Mode::Ils
     )
 }
 

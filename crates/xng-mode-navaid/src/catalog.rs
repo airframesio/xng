@@ -76,6 +76,13 @@ pub const ILS_PAIRS_KHZ: [(u32, u32); 40] = [
 
 fn khz(freq_hz: u64) -> Option<u32> {
     // Navaid channels sit on a 50 kHz raster; allow ±2 kHz of tuning slop.
+    // Outside both bands nothing can match (and the arithmetic below must
+    // not overflow or truncate).
+    let vhf = 107_998_000..=117_952_000;
+    let uhf = 328_598_000..=335_402_000;
+    if !vhf.contains(&freq_hz) && !uhf.contains(&freq_hz) {
+        return None;
+    }
     let k = ((freq_hz + 25_000) / 50_000) * 50;
     let err = (freq_hz as i64 - k as i64 * 1000).abs();
     (err <= 2_000).then_some(k as u32)
@@ -175,5 +182,14 @@ mod tests {
         assert_eq!(dme_channel_for_vhf(112_250_000).as_deref(), Some("59Y"));
         assert_eq!(dme_channel_for_vhf(112_300_000).as_deref(), Some("70X"));
         assert_eq!(dme_channel_for_vhf(117_950_000).as_deref(), Some("126Y"));
+    }
+
+    #[test]
+    fn out_of_band_frequencies() {
+        assert_eq!(kind_for_freq(107_374_290_500_000), None);
+        assert_eq!(kind_for_freq(u64::MAX), None);
+        assert_eq!(kind_for_freq(0), None);
+        assert_eq!(kind_for_freq(108_101_900), Some(NavaidKind::Localizer));
+        assert_eq!(kind_for_freq(108_097_000), None);
     }
 }

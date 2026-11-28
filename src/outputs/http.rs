@@ -168,6 +168,11 @@ fn navaid_update(d: &mut Dash, freq: u64, kind: &str, ident: Option<&str>, det: 
     let o = e.as_object_mut().unwrap();
     o.insert("kind".into(), json!(kind));
     o.insert("freq_mhz".into(), json!(freq as f64 / 1e6));
+    // Interval measurements are replaced, never carried over: an interval
+    // without a carrier must not show the last one's radial or DDM.
+    for k in ["cn0", "offset_hz", "radial", "radial_std", "mod30", "mod9960", "ddm", "ddm_ua", "ddm_std", "sdm", "carriers"] {
+        o.remove(k);
+    }
     if let Some(id) = ident {
         o.insert("ident".into(), json!(id));
     }

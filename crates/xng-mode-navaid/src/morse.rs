@@ -35,13 +35,18 @@ const FOLD_GLITCH_S: f64 = 0.4 * STANDARD_DOT_S;
 const WORD_GAP_S: f64 = 1.2;
 /// Votes are kept for this long (s).
 const VOTE_WINDOW_S: f64 = 180.0;
+/// Runs in the longest ident word (TEST, or I and three letters of up to
+/// four symbols each, is under 32). A word running longer is noise or
+/// voice: it is dropped up to the next word gap.
+const MAX_WORD_RUNS: usize = 40;
 /// Envelope history for folding (s) and the ident periods searched (s).
 const FOLD_HIST_S: f64 = 120.0;
 const PERIOD_MIN_S: f64 = 4.0;
 const PERIOD_MAX_S: f64 = 40.0;
 /// What an ident of this kind of station looks like (ICAO Annex 10: VOR
-/// idents are two or three letters; ILS localizer idents are an I and two or
-/// three letters). Anything else is a decoding error, so it is never reported.
+/// idents are two or three letters; ILS localizer idents are two or three
+/// letters, which may be preceded by an I). Anything else is a decoding
+/// error, so it is never reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum IdentRule {
     /// Two to four letters or digits.
@@ -59,10 +64,13 @@ impl IdentRule {
             return true;
         }
         match self {
-            IdentRule::Any => (2..=4).contains(&word.len()),
+            IdentRule::Any => {
+                (2..=4).contains(&word.len()) && word.chars().all(|c| c.is_ascii_alphanumeric())
+            }
             IdentRule::Vor => letters && (2..=3).contains(&word.len()),
             IdentRule::Localizer => {
-                letters && word.starts_with('I') && (3..=4).contains(&word.len())
+                letters
+                    && ((2..=3).contains(&word.len()) || (word.starts_with('I') && word.len() == 4))
             }
         }
     }
@@ -134,6 +142,10 @@ pub struct IdentDecoder {
     pub tone_snr_db: f32,
     /// The latest word decoded, voted or not.
     pub last_word: Option<String>,
+    /// When `last_word` was decoded (envelope samples).
+    last_word_t: u64,
+    /// The current word ran past [`MAX_WORD_RUNS`]; ignore it to the gap.
+    overlong: bool,
     /// Linear power history for folding.
     lin: VecDeque<f32>,
     /// Latest folded decode: (word, repetitions folded).
@@ -167,6 +179,8 @@ impl IdentDecoder {
             tone_db: f32::NAN,
             tone_snr_db: 0.0,
             last_word: None,
+            last_word_t: 0,
+            overlong: false,
             lin: VecDeque::new(),
             folded: None,
             fold_candidate: None,
@@ -178,7 +192,7 @@ impl IdentDecoder {
         if v.len() < (2.0 * ENV_RATE) as usize {
             return;
         }
-        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.sort_by(|a, b| a.total_cmp(b));
         // Idents are keyed well under half the time, so the 25th percentile
         // is noise and the top few percent are the tone.
         let noise = v[v.len() / 4];
@@ -212,6 +226,7 @@ impl IdentDecoder {
             self.t += 1;
             if self.t.is_multiple_of(refresh_every) || self.noise_db.is_nan() {
                 self.refresh_levels();
+                self.expire_votes();
             }
             let usable = self.tone_snr_db >= 4.0 && !self.noise_db.is_nan();
             let mid = 0.5 * (self.noise_db + self.tone_db);
@@ -249,6 +264,9 @@ impl IdentDecoder {
             }
             return;
         }
+        if self.overlong {
+            return;
+        }
         match self.runs.last_mut() {
             Some(last) if last.0 == self.keyed => last.1 += self.run,
             _ => {
@@ -256,16 +274,30 @@ impl IdentDecoder {
                     return; // leading silence
                 }
                 self.runs.push((self.keyed, self.run));
+                if self.runs.len() > MAX_WORD_RUNS {
+                    self.runs.clear();
+                    self.overlong = true;
+                }
             }
         }
     }
 
     fn finish_word(&mut self) {
         let runs = std::mem::take(&mut self.runs);
+        if std::mem::take(&mut self.overlong) {
+            return;
+        }
         if let Some(w) = decode_runs(&runs).filter(|w| self.rule.plausible(w)) {
             self.last_word = Some(w.clone());
+            self.last_word_t = self.t;
             self.votes.push_back((self.t, w));
         }
+        self.expire_votes();
+    }
+
+    /// Drop votes older than the window, by the running sample clock (so
+    /// they expire even when the station stops keying).
+    fn expire_votes(&mut self) {
         let keep = (VOTE_WINDOW_S * ENV_RATE) as u64;
         while self
             .votes
@@ -287,21 +319,32 @@ impl IdentDecoder {
             *counts.entry(w.as_str()).or_default() += 1;
         }
         let mut best: Option<(&str, u32)> = None;
+        let mut second = 0;
         for (w, c) in counts {
-            let better = match best {
-                None => true,
-                Some((bw, bc)) => c > bc || (c == bc && w.len() > bw.len()),
-            };
-            if better {
-                best = Some((w, c));
+            match best {
+                Some((_, bc)) if c <= bc => second = second.max(c),
+                _ => {
+                    second = best.map_or(0, |b| b.1);
+                    best = Some((w, c));
+                }
             }
         }
-        // Without a confident fold, a word must repeat three times and be at
-        // least half of everything decoded: noise makes short words (E, T,
-        // EE) too often for two matches to mean anything.
+        // Without a confident fold, a word must repeat three times, be at
+        // least half of everything decoded, and beat every other word: noise
+        // makes short words (E, T, EE) too often for two matches to mean
+        // anything, and a tie says nothing about which is right.
         let total = self.votes.len() as u32;
-        best.filter(|(_, c)| *c >= 3 && 2 * *c >= total)
+        best.filter(|(_, c)| *c >= 3 && 2 * *c >= total && *c > second)
             .map(|(w, c)| (w.to_string(), c))
+    }
+
+    /// The latest word decoded within the vote window, voted or not (what
+    /// the station is keying now; [`Self::last_word`] keeps the history).
+    pub fn recent_word(&self) -> Option<&str> {
+        let keep = (VOTE_WINDOW_S * ENV_RATE) as u64;
+        self.last_word
+            .as_deref()
+            .filter(|_| self.t.saturating_sub(self.last_word_t) <= keep)
     }
 
     /// Find the repetition period, average the repetitions and decode.
@@ -334,10 +377,12 @@ impl IdentDecoder {
         let max = ac.iter().cloned().fold(f64::MIN, f64::max);
         if max < 0.15 {
             self.folded = None;
+            self.fold_candidate = None;
             return;
         }
         // The shortest lag near the maximum is the period (not a multiple).
         let Some(i) = ac.iter().position(|&v| v >= 0.8 * max) else {
+            self.fold_candidate = None;
             return;
         };
         // Peak of that lobe.
@@ -350,6 +395,7 @@ impl IdentDecoder {
         // Three repetitions at least: with two, the spread between them
         // says too little about the noise to trust a weak fold.
         if k < 3 {
+            self.fold_candidate = None;
             return;
         }
         let start = n - k * period;
@@ -358,14 +404,17 @@ impl IdentDecoder {
             .collect();
         // A word is reported once two folds in a row (5 s apart, each with
         // more data) agree on it; it stays until another word does the same.
-        if let Some(w) = decode_folded(&reps, self.rule) {
-            match &mut self.fold_candidate {
-                Some((c, n)) if *c == w => *n += 1,
-                _ => self.fold_candidate = Some((w.clone(), 1)),
-            }
-            if self.fold_candidate.as_ref().is_some_and(|(_, n)| *n >= 2) {
-                self.folded = Some((w, k as u32));
-            }
+        // A failed fold breaks the run: the two must be adjacent.
+        let Some(w) = decode_folded(&reps, self.rule) else {
+            self.fold_candidate = None;
+            return;
+        };
+        match &mut self.fold_candidate {
+            Some((c, n)) if *c == w => *n += 1,
+            _ => self.fold_candidate = Some((w.clone(), 1)),
+        }
+        if self.fold_candidate.as_ref().is_some_and(|(_, n)| *n >= 2) {
+            self.folded = Some((w, k as u32));
         }
     }
 
@@ -407,7 +456,7 @@ fn decode_folded(reps: &[&[f32]], rule: IdentRule) -> Option<String> {
         .map(|i| reps.iter().map(|r| r[i]).sum::<f32>() / k)
         .collect();
     let mut sorted = t.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let lo_v = sorted[sorted.len() / 4];
     let hi_v = sorted[(sorted.len() as f64 * 0.97) as usize];
     if 10.0 * (hi_v / lo_v.max(1e-30)).log10() < 3.0 {
@@ -559,7 +608,7 @@ pub fn decode_runs(runs: &[(bool, usize)]) -> Option<String> {
 /// they are dots or dashes.
 fn estimate_dot(marks: &[f64]) -> f64 {
     let mut m = marks.to_vec();
-    m.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    m.sort_by(|a, b| a.total_cmp(b));
     let mut split = None;
     let mut best = 1.6;
     for i in 1..m.len() {
@@ -633,5 +682,69 @@ mod tests {
                 .collect();
             assert_eq!(decode_runs(&runs).as_deref(), Some("IABC"), "dot {dot}");
         }
+    }
+
+    #[test]
+    fn ident_rules() {
+        assert!(!IdentRule::Any.plausible("??"));
+        assert!(IdentRule::Any.plausible("AB1"));
+        // Annex 10: the localizer's I is optional.
+        for w in ["ISAC", "SAC", "SA", "TST"] {
+            assert!(IdentRule::Localizer.plausible(w), "{w}");
+        }
+        assert!(!IdentRule::Localizer.plausible("SACR"));
+        assert!(!IdentRule::Vor.plausible("ISAC"));
+    }
+
+    fn vote(d: &mut IdentDecoder, w: &str, n: usize) {
+        for _ in 0..n {
+            d.votes.push_back((d.t, w.to_string()));
+        }
+    }
+
+    #[test]
+    fn tied_votes_report_nothing() {
+        let mut d = IdentDecoder::new();
+        vote(&mut d, "ABC", 3);
+        vote(&mut d, "ABD", 3);
+        assert_eq!(d.ident(), None);
+        let mut d = IdentDecoder::new();
+        vote(&mut d, "ABC", 3);
+        vote(&mut d, "ABD", 1);
+        assert_eq!(d.ident().map(|x| x.0).as_deref(), Some("ABC"));
+    }
+
+    #[test]
+    fn votes_expire_when_keying_stops() {
+        let mut d = IdentDecoder::new();
+        let mut env = Vec::new();
+        for _ in 0..4 {
+            for (on, s) in key("TST", STANDARD_DOT_S, 4.0) {
+                let n = (s * ENV_RATE) as usize;
+                env.extend(std::iter::repeat_n(if on { 1.0 } else { 0.01 }, n));
+            }
+        }
+        d.push(&env);
+        assert!(d.recent_word().is_some());
+        // Carrier on, no keying, past the vote window.
+        d.push(&vec![0.01f32; ((VOTE_WINDOW_S + 10.0) * ENV_RATE) as usize]);
+        assert_eq!(d.words_heard(), 0);
+        assert_eq!(d.recent_word(), None);
+        assert_eq!(d.last_word.as_deref(), Some("TST"));
+    }
+
+    #[test]
+    fn endless_keying_is_dropped() {
+        let mut d = IdentDecoder::new();
+        // Dots with no word gap for a minute, then a gap.
+        let mut env = vec![0.01f32; (2.0 * ENV_RATE) as usize];
+        for _ in 0..200 {
+            env.extend(std::iter::repeat_n(1.0, 34));
+            env.extend(std::iter::repeat_n(0.01, 34));
+        }
+        env.extend(std::iter::repeat_n(0.01f32, (2.0 * ENV_RATE) as usize));
+        d.push(&env);
+        assert!(d.runs.is_empty());
+        assert_eq!(d.last_word, None);
     }
 }

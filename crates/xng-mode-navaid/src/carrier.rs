@@ -22,9 +22,11 @@ pub struct Carrier {
     pub peak_db: f64,
 }
 
-/// Equivalent noise bandwidth of the 48 kHz channel (the DDC's ±18 kHz
-/// passband and its transition bands), measured with white noise.
-pub const CHANNEL_NOISE_BW_HZ: f64 = 34_000.0;
+/// Cutoff of the low-pass the noise estimate looks through (Hz). The
+/// carrier's own modulation is in I; below this, Q holds only noise. A second
+/// ILS carrier beats at least 4 kHz away (Annex 10 separations, less the
+/// widest sidebands) and is over 45 dB down after this filter.
+pub const NOISE_LPF_HZ: f64 = 1_000.0;
 
 /// Find up to `max` carriers in `x` (sample rate `fs`) within ±`span_hz` of
 /// center. The strongest comes first. A second carrier must be at least
@@ -63,9 +65,9 @@ pub fn acquire(
         return Vec::new();
     }
     let mut sorted: Vec<f64> = cands.iter().map(|&k| p[k]).collect();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let floor = sorted[sorted.len() / 2].max(1e-300);
-    cands.sort_by(|&a, &b| p[b].partial_cmp(&p[a]).unwrap());
+    cands.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
 
     let mut out: Vec<Carrier> = Vec::new();
     for &k in &cands {
@@ -92,10 +94,14 @@ pub fn acquire(
             }
             // A carrier is a narrow line: well above its ±300 Hz neighborhood.
             let w = (300.0 / bin_hz) as usize;
+            if w == 0 {
+                // Bins too wide to see a line's neighborhood: no second carrier.
+                break;
+            }
             let mut neigh: Vec<f64> = (1..=w)
                 .flat_map(|d| [p[(k + d) % n], p[(k + n - d) % n]])
                 .collect();
-            neigh.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            neigh.sort_by(|a, b| a.total_cmp(b));
             if 10.0 * (p[k] / neigh[neigh.len() / 2].max(1e-300)).log10() < 18.0 {
                 continue;
             }
@@ -130,8 +136,55 @@ pub struct CarrierPll {
     ki: f64,
     /// Running carrier amplitude estimate (mean of I).
     pub amp: f64,
-    /// Running variance of Q (noise power in Q).
+    /// Running power of low-passed Q (noise only, see [`NOISE_LPF_HZ`]).
     pub q_var: f64,
+    noise_lpf: [Biquad; 2],
+    /// One-sided noise bandwidth of `noise_lpf` (Hz).
+    noise_bw_hz: f64,
+}
+
+/// Direct form I biquad (RBJ low-pass).
+#[derive(Clone, Copy, Default)]
+struct Biquad {
+    b: [f64; 3],
+    a: [f64; 2],
+    x: [f64; 2],
+    y: [f64; 2],
+}
+
+impl Biquad {
+    fn lowpass(fs: f64, fc: f64, q: f64) -> Self {
+        let w0 = TAU * fc / fs;
+        let (sn, cs) = w0.sin_cos();
+        let alpha = sn / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self {
+            b: [
+                (1.0 - cs) / 2.0 / a0,
+                (1.0 - cs) / a0,
+                (1.0 - cs) / 2.0 / a0,
+            ],
+            a: [-2.0 * cs / a0, (1.0 - alpha) / a0],
+            ..Default::default()
+        }
+    }
+
+    fn step(&mut self, x: f64) -> f64 {
+        let y = self.b[0] * x + self.b[1] * self.x[0] + self.b[2] * self.x[1]
+            - self.a[0] * self.y[0]
+            - self.a[1] * self.y[1];
+        self.x = [x, self.x[0]];
+        self.y = [y, self.y[0]];
+        y
+    }
+}
+
+/// Fourth-order Butterworth low-pass (two biquads).
+fn noise_lpf(fs: f64) -> [Biquad; 2] {
+    [
+        Biquad::lowpass(fs, NOISE_LPF_HZ, 0.541_196),
+        Biquad::lowpass(fs, NOISE_LPF_HZ, 1.306_563),
+    ]
 }
 
 impl CarrierPll {
@@ -148,6 +201,18 @@ impl CarrierPll {
             ki: (wn * t) * (wn * t),
             amp: 0.0,
             q_var: 0.0,
+            noise_lpf: noise_lpf(fs),
+            noise_bw_hz: {
+                // Σh² · fs/2 from the impulse response.
+                let mut f = noise_lpf(fs);
+                let mut e = 0.0;
+                for i in 0..(fs as usize) {
+                    let v = f[0].step(if i == 0 { 1.0 } else { 0.0 });
+                    let y = f[1].step(v);
+                    e += y * y;
+                }
+                e * fs / 2.0
+            },
         }
     }
 
@@ -157,10 +222,9 @@ impl CarrierPll {
 
     /// Carrier-to-noise density from the tracked amplitude and Q noise (dB-Hz).
     pub fn cn0_dbhz(&self) -> f64 {
-        // Complex AWGN of total variance σ² has σ²/2 in Q, and the noise
-        // reaching the PLL fills only the channel filter's noise bandwidth:
-        // N0 = σ²/B.
-        let n0 = 2.0 * self.q_var / CHANNEL_NOISE_BW_HZ.min(self.fs);
+        // Complex noise of density N0 puts N0/2 per Hz (two-sided) into Q,
+        // so low-passed Q has power N0·B for a one-sided noise bandwidth B.
+        let n0 = self.q_var / self.noise_bw_hz;
         if n0 <= 0.0 || self.amp <= 0.0 {
             return f64::NAN;
         }
@@ -177,7 +241,9 @@ impl CarrierPll {
             self.w += self.ki * err;
             self.phase = (self.phase + self.w + self.kp * err) % TAU;
             self.amp += AMP_ALPHA * (z.re - self.amp);
-            self.q_var += AMP_ALPHA * (z.im * z.im - self.q_var);
+            let q = self.noise_lpf[0].step(z.im);
+            let q = self.noise_lpf[1].step(q);
+            self.q_var += AMP_ALPHA * (q * q - self.q_var);
             i_out.push(z.re as f32);
         }
     }

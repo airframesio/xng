@@ -134,4 +134,5 @@ fn main() {
         w.write_all(&bytes).unwrap();
         done += n;
     }
+    w.flush().expect("flush the capture file");
 }

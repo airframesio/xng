@@ -9,6 +9,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${NAVAID_BENCH_TOOLS:-$ROOT/target/navaid-bench}"
+mkdir -p "$OUT"
+OUT="$(cd "$OUT" && pwd)"
 SRC="$OUT/src"
 mkdir -p "$SRC"
 cd "$SRC"

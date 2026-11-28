@@ -17,8 +17,8 @@ xng listen --sdr driver=rtlsdr --mode ils -r 960000 -c 110.200M \
     --channels 110.100,110.300
 
 # The glideslope paired with 110.10 MHz
-xng listen --sdr driver=rtlsdr --mode ils -r 240000 -c 334.500M \
-    --channels 334.550
+xng listen --sdr driver=rtlsdr --mode ils -r 240000 -c 334.350M \
+    --channels 334.400
 ```
 
 Each channel reports once every 10 seconds. A report is one asf-2.0
@@ -29,7 +29,7 @@ Navaids tab, and the console prints one line per report:
 ```
 [vor] 113.050 MHz VOR SAC radial 123.3° ±1.1 C/N0 50 dB-Hz [normal]
 [ils] 110.300 MHz LOC IOAK DDM -0.023 (-22 µA) SDM 40% | 2nd carrier -8 dB DDM +0.304 C/N0 46 dB-Hz [normal]
-[ils] 334.550 MHz GS DDM +0.040 (34 µA) SDM 80% C/N0 52 dB-Hz [normal]
+[ils] 334.400 MHz GS DDM +0.040 (34 µA) SDM 80% C/N0 52 dB-Hz [normal]
 ```
 
 Navaid reports are not sent to the Airframes per-mode ingests. They go out
@@ -44,10 +44,11 @@ over asf-2.0 and the JSON outputs only.
 | `carrier_offset_hz` | Carrier offset from the channel frequency, from the PLL |
 | `ident`, `ident_votes` | The ident once it is certain, and how many repetitions agree |
 | `ident_depth_pct`, `ident_tone_hz` | Ident modulation depth and measured tone frequency |
-| `vor.radial_deg`, `vor.radial_std_deg` | Radial over the report interval and its spread |
+| `vor.radial_deg`, `vor.radial_std_deg` | Radial over the report interval and its spread (absent when no block carried both tones) |
 | `vor.mod30_pct`, `vor.mod9960_pct`, `vor.deviation_hz`, `vor.subcarrier_offset_hz` | Signal health: 30 Hz AM depth, subcarrier depth, FM deviation (strong signals only), subcarrier frequency error |
 | `ils[].ddm`, `ils[].ddm_ua`, `ils[].ddm_std` | Difference in depth of modulation, the same in µA of course deflection (150 µA at 0.155 for a localizer, 0.175 for a glideslope), and its spread |
-| `ils[].sdm_pct`, `ils[].mod90_pct`, `ils[].mod150_pct`, `ils[].phase_lock_deg` | Sum of depths and the two tone depths, and the 90/150 Hz phase relationship |
+| `ils[].sdm_pct`, `ils[].mod90_pct`, `ils[].mod150_pct`, `ils[].phase_lock_deg` | Sum of depths and the two tone depths, and the 90/150 Hz phase relationship (absent when a tone is missing) |
+| `ils[].tone90_hz`, `ils[].tone150_hz` | Measured tone frequencies (Annex 10 allows 2.5 % off nominal; depths are measured at these) |
 | `ils[].carrier_offset_hz`, `ils[].relative_db` | For two-frequency systems, one entry per carrier (course first) |
 
 ## How it works
@@ -81,7 +82,7 @@ over asf-2.0 and the JSON outputs only.
    by autocorrelation) and decodes the average, gaining 3 dB each time the
    number of repetitions doubles. A folded word is reported only when
    every mark and space stands clear of the threshold, it fits the Annex
-   10 ident rules (VOR: 2 or 3 letters; localizer: I and 2 or 3 letters;
+   10 ident rules (VOR: 2 or 3 letters; localizer: 2 or 3 letters, optionally after an I;
    TST/TEST), and two folds in a row agree. Below its threshold the
    decoder reports no ident rather than a wrong one.
 
@@ -193,12 +194,12 @@ CPU seconds per second of signal, one channel, 8-bit IQ read from a file
 
 | Decoder | VOR | Localizer | Glideslope |
 |---|---|---|---|
-| xng | 0.027 | 0.025 | 0.025 |
-| vortrack | 0.016 (radial only) | – | – |
-| voracious | 1.21 | 0.64 | – |
-| dumpils | – | 0.113 | 0.109 |
+| xng | 0.031 | 0.030 | 0.028 |
+| vortrack | 0.018 (radial only) | – | – |
+| voracious | 1.29 | 0.68 | – |
+| dumpils | – | 0.123 | 0.112 |
 
-xng uses about 2.5 % of one core per channel and carries the ident,
+xng uses about 3 % of one core per channel and carries the ident,
 status, C/N0 and health figures as well; vortrack is cheaper but measures
 only the radial and holds it only above 50 dB-Hz.
 

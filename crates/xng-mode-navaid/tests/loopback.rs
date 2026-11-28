@@ -42,8 +42,8 @@ fn vor_radials_all_around() {
         let last = obs.last().unwrap();
         let v = last.vor.as_ref().expect("vor measure");
         assert!(
-            angle_err(v.radial_deg, radial) < 1.0,
-            "radial {radial}: got {}",
+            angle_err(v.radial_deg.unwrap(), radial) < 1.0,
+            "radial {radial}: got {:?}",
             v.radial_deg
         );
         assert!((v.mod30_pct - 30.0).abs() < 2.0, "mod30 {}", v.mod30_pct);
@@ -77,8 +77,8 @@ fn vor_deviation_on_a_clean_signal() {
         v.deviation_hz
     );
     assert!(
-        angle_err(v.radial_deg, 300.0) < 0.3,
-        "radial {}",
+        angle_err(v.radial_deg.unwrap(), 300.0) < 0.3,
+        "radial {:?}",
         v.radial_deg
     );
 }
@@ -94,7 +94,11 @@ fn vor_tolerates_subcarrier_error_dvor_and_voice() {
     };
     let obs = run(NavaidKind::Vor, vor_scene(p, Some(45.0)), 16.0, 4.0);
     let v = obs.last().unwrap().vor.as_ref().expect("vor measure");
-    assert!(angle_err(v.radial_deg, 77.0) < 2.0, "got {}", v.radial_deg);
+    assert!(
+        angle_err(v.radial_deg.unwrap(), 77.0) < 2.0,
+        "got {:?}",
+        v.radial_deg
+    );
     assert!(
         (v.subcarrier_offset_hz - 40.0).abs() < 3.0,
         "subcarrier offset {}",
@@ -116,7 +120,7 @@ fn vor_carrier_offset_is_measured() {
         "{:?}",
         last.carrier_offset_hz
     );
-    assert!(angle_err(last.vor.as_ref().unwrap().radial_deg, 200.0) < 1.0);
+    assert!(angle_err(last.vor.as_ref().unwrap().radial_deg.unwrap(), 200.0) < 1.0);
 }
 
 #[test]
@@ -276,4 +280,133 @@ fn cn0_estimate_is_calibrated() {
         let got = obs.last().unwrap().cn0_dbhz.unwrap();
         assert!((got - cn0).abs() < 1.0, "C/N0 {cn0}: got {got:.2}");
     }
+}
+
+#[test]
+fn dvor_low_deviation_ratio_keeps_the_radial() {
+    // Annex 10 lets a Doppler VOR's deviation ratio fall to 11 above 5°
+    // elevation; ratio 16 is the control.
+    for dev in [330.0, 480.0] {
+        let p = VorParams {
+            radial_deg: 60.0,
+            deviation_hz: dev,
+            ..Default::default()
+        };
+        let obs = run(NavaidKind::Vor, vor_scene(p, None), 12.0, 4.0);
+        let v = obs.last().unwrap().vor.as_ref().unwrap();
+        let r = v.radial_deg.unwrap();
+        assert!(angle_err(r, 60.0) < 0.5, "deviation {dev}: radial {r}");
+    }
+}
+
+#[test]
+fn ils_tones_off_nominal_read_true_ddm() {
+    // Both tones 1.33% high, phase-locked (91.2 and 152 Hz), equal depths:
+    // DDM is zero. Exact 90/150 Hz is the control.
+    for f30 in [30.4, 30.0] {
+        for (kind, mut p) in [
+            (NavaidKind::Localizer, IlsParams::localizer(0.0)),
+            (NavaidKind::Glideslope, IlsParams::glideslope(0.0)),
+        ] {
+            p.f30_hz = f30;
+            let obs = run(
+                kind,
+                Scene::single(RATE, OFFSET, Signal::Ils(p), None),
+                16.0,
+                4.0,
+            );
+            let m = &obs.last().unwrap().ils[0];
+            assert!(m.ddm.abs() < 0.002, "{kind:?} f30 {f30}: ddm {}", m.ddm);
+            assert!(
+                (m.tone150_hz - 5.0 * f30).abs() < 0.05,
+                "150 Hz tone at {}",
+                m.tone150_hz
+            );
+            assert!(m.phase_lock_deg.is_some());
+        }
+    }
+}
+
+#[test]
+fn wide_two_frequency_glideslope_finds_both_carriers() {
+    // 32 kHz separation, the widest Annex 10 allows.
+    let carrier = |off: f64, amp: f64, ddm: f64| CarrierSpec {
+        offset_hz: OFFSET + off,
+        amplitude: amp,
+        phase_rad: 0.3,
+        signal: Signal::Ils(IlsParams::glideslope(ddm)),
+    };
+    let scene = Scene {
+        sample_rate: RATE,
+        carriers: vec![carrier(16_000.0, 0.25, 0.05), carrier(-16_000.0, 0.12, 0.2)],
+        cn0_dbhz: Some(55.0),
+        seed: 4,
+    };
+    let obs = run(NavaidKind::Glideslope, scene, 10.0, 5.0);
+    let ils = &obs.last().unwrap().ils;
+    assert_eq!(ils.len(), 2, "{ils:?}");
+    assert!((ils[0].carrier_offset_hz - 16_000.0).abs() < 5.0);
+    assert!((ils[0].ddm - 0.05).abs() < 0.005, "{}", ils[0].ddm);
+    assert!((ils[1].carrier_offset_hz + 16_000.0).abs() < 5.0);
+    assert!((ils[1].ddm - 0.2).abs() < 0.01, "{}", ils[1].ddm);
+}
+
+#[test]
+fn cn0_ignores_a_second_carrier() {
+    // Same main carrier and noise, with and without a clearance carrier
+    // 8 dB down: the main carrier's C/N0 must not move.
+    let course = CarrierSpec {
+        offset_hz: OFFSET + 4_000.0,
+        amplitude: 0.25,
+        phase_rad: 0.7,
+        signal: Signal::Ils(IlsParams::localizer(0.0)),
+    };
+    let clearance = CarrierSpec {
+        offset_hz: OFFSET - 4_000.0,
+        amplitude: 0.25 * 10f64.powf(-8.0 / 20.0),
+        phase_rad: 2.1,
+        signal: Signal::Ils(IlsParams::localizer(0.3)),
+    };
+    for cn0 in [45.0, 60.0] {
+        let mut got = Vec::new();
+        for carriers in [
+            vec![course.clone()],
+            vec![course.clone(), clearance.clone()],
+        ] {
+            let scene = Scene {
+                sample_rate: RATE,
+                carriers,
+                cn0_dbhz: Some(cn0),
+                seed: 5,
+            };
+            let obs = run(NavaidKind::Localizer, scene, 12.0, 6.0);
+            got.push(obs.last().unwrap().cn0_dbhz.unwrap());
+        }
+        assert!((got[0] - cn0).abs() < 1.0, "single {cn0}: {got:?}");
+        assert!((got[1] - got[0]).abs() < 0.5, "dual {cn0}: {got:?}");
+    }
+}
+
+#[test]
+fn nonfinite_samples_do_not_panic() {
+    let mut d = NavaidChannelDecoder::new(NavaidKind::Vor, RATE, OFFSET).unwrap();
+    let mut g = Generator::new(vor_scene(VorParams::default(), Some(50.0)));
+    for i in 0..30 {
+        let mut x = g.next_block((RATE / 10.0) as usize);
+        if i % 3 == 0 {
+            x[7] = num_complex::Complex::new(f32::NAN, f32::INFINITY);
+        }
+        d.process(&x);
+    }
+}
+
+#[test]
+fn shortened_report_interval_reports_at_once() {
+    let mut d = NavaidChannelDecoder::new(NavaidKind::Vor, RATE, OFFSET).unwrap();
+    let mut g = Generator::new(vor_scene(VorParams::default(), Some(50.0)));
+    d.set_report_interval(10.0);
+    assert!(d.process(&g.next_block((2.0 * RATE) as usize)).is_empty());
+    d.set_report_interval(1.0);
+    let out = d.process(&g.next_block((RATE / 10.0) as usize));
+    assert_eq!(out.len(), 1);
 }

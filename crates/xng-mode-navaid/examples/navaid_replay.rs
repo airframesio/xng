@@ -51,7 +51,10 @@ fn main() {
     let t0 = Instant::now();
     let mut samples = 0u64;
     loop {
-        let n = read_full(&mut f, &mut buf);
+        let n = read_full(&mut f, &mut buf).unwrap_or_else(|e| {
+            eprintln!("read error: {e}");
+            std::process::exit(1);
+        });
         if n < bytes_per {
             break;
         }
@@ -86,14 +89,15 @@ fn main() {
     );
 }
 
-fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> usize {
+fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
         match f.read(&mut buf[n..]) {
             Ok(0) => break,
             Ok(k) => n += k,
-            Err(_) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
         }
     }
-    n
+    Ok(n)
 }

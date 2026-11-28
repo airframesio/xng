@@ -49,10 +49,13 @@ const SC_SEARCH_HZ: f64 = 105.0;
 /// One reporting interval's VOR measurement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VorMeasure {
-    /// Magnetic radial FROM the station (°), circular mean over the interval.
-    pub radial_deg: f64,
+    /// Magnetic radial FROM the station (°), circular mean over the interval;
+    /// absent when no block carried both tones.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radial_deg: Option<f64>,
     /// Circular standard deviation of the 0.5 s radials (°).
-    pub radial_std_deg: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub radial_std_deg: Option<f64>,
     /// 30 Hz variable AM depth (%).
     pub mod30_pct: f64,
     /// 9960 Hz subcarrier AM depth (%).
@@ -233,9 +236,11 @@ impl VorAnalyzer {
             self.sc_phase = (self.sc_phase + step) % TAU;
             fold[((start + i as u64) % SAMPLES_PER_CYCLE as u64) as usize] += z;
         }
-        // Correlate against every reference phase.
+        // Correlate against every reference phase. The template is for the
+        // nominal ratio 16; a Doppler VOR at ratio 11 (allowed above 5°
+        // elevation) still peaks at the true phase, only lower (see the
+        // loopback test), so one template serves the whole range.
         let mut c = vec![0.0f64; PHASE_GRID];
-        let mut best = 0;
         for (m, cm) in c.iter_mut().enumerate() {
             let t = &self.template[m * SAMPLES_PER_CYCLE..(m + 1) * SAMPLES_PER_CYCLE];
             let mut acc = Complex::new(0.0, 0.0);
@@ -244,6 +249,7 @@ impl VorAnalyzer {
             }
             *cm = acc.norm_sqr();
         }
+        let mut best = 0;
         for m in 1..PHASE_GRID {
             if c[m] > c[best] {
                 best = m;
@@ -320,21 +326,26 @@ impl VorAnalyzer {
             s += Complex::from_polar(b.weight, b.radial);
             wsum += b.weight;
         }
-        let mean = s.arg().rem_euclid(TAU);
-        let rbar = if wsum > 0.0 {
-            (s.norm() / wsum).min(1.0)
+        // No bearing evidence (both tones absent): no radial, but the
+        // depths still say what is on the air.
+        let (radial, std) = if wsum > 0.0 && s.norm() > 0.0 {
+            let rbar = (s.norm() / wsum).min(1.0);
+            let std = if rbar > 0.0 {
+                (-2.0 * rbar.ln()).sqrt()
+            } else {
+                PI
+            };
+            (
+                Some(s.arg().rem_euclid(TAU).to_degrees()),
+                Some(std.to_degrees()),
+            )
         } else {
-            0.0
-        };
-        let std = if rbar > 0.0 {
-            (-2.0 * rbar.ln()).sqrt()
-        } else {
-            PI
+            (None, None)
         };
         let n = res.len() as f64;
         Some(VorMeasure {
-            radial_deg: mean.to_degrees(),
-            radial_std_deg: std.to_degrees(),
+            radial_deg: radial,
+            radial_std_deg: std,
             mod30_pct: 100.0 * res.iter().map(|b| b.m30).sum::<f64>() / n,
             mod9960_pct: 100.0 * res.iter().map(|b| b.msc).sum::<f64>() / n,
             deviation_hz: res.iter().map(|b| b.dev).sum::<f64>() / n,
@@ -371,14 +382,11 @@ fn comb_frequency(x: &[Complex<f32>]) -> Option<f64> {
             .sum()
     };
     let m: Vec<f64> = (-span..=span).map(metric).collect();
-    let (bi, &best) = m
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())?;
+    let (bi, &best) = m.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
     let mut sorted = m.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.total_cmp(b));
     let median = sorted[sorted.len() / 2];
-    if best < 1.5 * median {
+    if best <= 0.0 || best < 1.5 * median {
         return None; // no subcarrier comb above the noise
     }
     let (l, r) = (

@@ -197,7 +197,7 @@ impl IdentPath {
             .map(|k| self.spec[idx(k)])
             .chain((span + 20..span + 220).map(|k| self.spec[idx(-k)]))
             .collect();
-        floor.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        floor.sort_by(|a, b| a.total_cmp(b));
         let floor = floor[floor.len() / 2].max(1e-300);
         if 10.0 * (best.1 / floor).log10() < 6.0 {
             return; // no ident tone yet

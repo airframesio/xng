@@ -20,7 +20,7 @@ Tests:
 CPU is user+system time per second of signal, measured per decoder run.
 """
 
-import argparse, cmath, json, math, os, resource, subprocess, sys, tempfile
+import argparse, cmath, json, math, os, resource, subprocess, sys, tempfile, threading
 from concurrent.futures import ThreadPoolExecutor
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -45,8 +45,11 @@ def timed(cmd, env=None, cwd=None):
     cmd = [str(c) for c in cmd]
     with tempfile.TemporaryFile() as fh:
         p = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.DEVNULL, env=env, cwd=cwd)
-        _, _, ru = os.wait4(p.pid, 0)
-        p.returncode = 0
+        _, status, ru = os.wait4(p.pid, 0)
+        p.returncode = os.waitstatus_to_exitcode(status)
+        if p.returncode != 0:
+            # A crashed or failed run must not be scored as a decoder result.
+            raise RuntimeError(f"{' '.join(cmd)} exited with {p.returncode}")
         fh.seek(0)
         out = fh.read().decode(errors="replace")
     return out, ru.ru_utime + ru.ru_stime
@@ -62,7 +65,7 @@ def run_xng(path, kind, rate, offset, report=2.0):
         o = json.loads(line)
         r = {"t": o["t_s"], "ident": o.get("ident"), "ident_last": o.get("ident_last")}
         if o.get("vor"):
-            r["radial"] = o["vor"]["radial_deg"]
+            r["radial"] = o["vor"].get("radial_deg")
         if o.get("ils"):
             r["ddm"] = o["ils"][0]["ddm"]
         rows.append(r)
@@ -180,15 +183,19 @@ class Bench:
         self.tmp = tmp
         self.cpu = {}
         self.n = 0
+        self.lock = threading.Lock()
 
     def file(self):
-        self.n += 1
-        return os.path.join(self.tmp, f"c{self.n}.cu8")
+        with self.lock:
+            self.n += 1
+            n = self.n
+        return os.path.join(self.tmp, f"c{n}.cu8")
 
     def cpu_add(self, name, cpu, seconds):
-        c = self.cpu.setdefault(name, [0.0, 0.0])
-        c[0] += cpu
-        c[1] += seconds
+        with self.lock:
+            c = self.cpu.setdefault(name, [0.0, 0.0])
+            c[0] += cpu
+            c[1] += seconds
 
     def vor_case(self, cn0, radial, seconds, seed, extra=(), ident=None, decoders=("xng", "voracious", "vortrack")):
         f = self.file()
@@ -353,7 +360,7 @@ def main():
 
     report["cpu_s_per_signal_s"] = {k: v[0] / v[1] for k, v in sorted(b.cpu.items()) if v[1] > 0}
     print(json.dumps(report["cpu_s_per_signal_s"], indent=1))
-    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     with open(a.out, "w") as fh:
         json.dump(report, fh, indent=1, sort_keys=True)
     print("wrote", a.out)

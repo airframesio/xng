@@ -129,6 +129,9 @@ pub struct IlsParams {
     pub sdm: f64,
     /// Extra phase on the 150 Hz tone (°), 0 = phase-locked.
     pub phase150_deg: f64,
+    /// The common 30 Hz the tones are locked to (they are its 3rd and 5th
+    /// harmonics); Annex 10 allows up to 2.5% off.
+    pub f30_hz: f64,
     pub ident: Option<IdentSpec>,
 }
 
@@ -138,6 +141,7 @@ impl IlsParams {
             ddm,
             sdm: 0.40,
             phase150_deg: 0.0,
+            f30_hz: 30.0,
             ident: None,
         }
     }
@@ -146,6 +150,7 @@ impl IlsParams {
             ddm,
             sdm: 0.80,
             phase150_deg: 0.0,
+            f30_hz: 30.0,
             ident: None,
         }
     }
@@ -293,7 +298,7 @@ impl Generator {
                         (m, q)
                     }
                     Signal::Ils(p) => {
-                        let w30 = TAU * 30.0 * t;
+                        let w30 = TAU * p.f30_hz * t;
                         let m90 = 0.5 * (p.sdm + p.ddm);
                         let m150 = 0.5 * (p.sdm - p.ddm);
                         let mut m = m90 * (3.0 * w30).cos()
