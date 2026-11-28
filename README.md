@@ -442,10 +442,21 @@ Each mode goes to its own Airframes ingest in the format that ingest reads:
 | Radiosonde | UDP `:5573` | radiosonde_auto_rx payload summary JSON (one per frame with a GPS fix) |
 
 Each block (`[outputs.airframes.acars]`, `.vdl2`, `.hfdl`, `.ais`, `.aero`,
-`.iridium`, `.sonde`) takes `enabled`, `station-id`, `host` and `port`. Other modes
+`.iridium`, `.sonde`) takes `enabled`, `station-id`, `station-uuid`, `host` and `port`. Other modes
 (STD-C, ADS-B, UAT, ...) reach Airframes over asf-2.0. The multiplexed **asf-2.0**
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
+
+**Station UUIDs.** Every feed also carries a `station_uuid`, and Airframes
+finds the station by it before the name. Renaming a station, on the website
+or with `station-id` here, keeps its feed, messages and stats on the same
+station. xng keeps one UUID per station in `station-uuids.json` (in
+`XNG_STATE_DIR`, else `~/.config/xng`); it starts as a UUID derived from the
+station id, so it is the same on every run even where nothing is saved. A
+station that already exists on Airframes has its own UUID: set it with
+`station-uuid` (top level, `[outputs.airframes]`, or a mode block; a session's
+`airframes-station-uuid`) or `XNG_STATION_UUID`. Airwaves OS sets it for you
+at sign-in.
 
 **Dashboard basemap.** The web dashboard (`http =`) draws
 [OpenFreeMap](https://openfreemap.org) vector tiles by default: OpenStreetMap

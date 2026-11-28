@@ -44,6 +44,9 @@ COPY --from=builder /usr/src/app/target/release/xng /usr/local/bin/xng
 # Downloaded speech-to-text models live here; the volume keeps them across
 # container restarts (or mount your own: -v xng-models:/var/cache/xng).
 ENV XDG_CACHE_HOME=/var/cache
+# Station UUIDs (station-uuids.json) live on the volume, so they survive
+# image updates.
+ENV XNG_STATE_DIR=/var/cache/xng
 VOLUME /var/cache/xng
 
 ENTRYPOINT ["xng"]
