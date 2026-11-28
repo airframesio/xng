@@ -154,12 +154,17 @@ fn resolve_locked(
     ident: &str,
     default: impl FnOnce() -> String,
 ) -> String {
-    let _file_lock = lock_file(path);
+    let file_lock = lock_file(path);
     let mut saved = load(path);
     if let Some(u) = saved.stations.get(slot).and_then(|u| parse(u)) {
         return u;
     }
     let u = default();
+    // Without the lock, a save could drop slots another process just
+    // added: use the UUID for this run and leave the map as it is.
+    if file_lock.is_none() {
+        return u;
+    }
     saved.stations.insert(slot.to_string(), u.clone());
     if let Err(e) = save(path, &saved) {
         tracing::debug!(
@@ -170,8 +175,9 @@ fn resolve_locked(
     u
 }
 
-/// Held until dropped. `None` when the directory can't be written, in which
-/// case nothing can be saved either.
+/// Held until dropped. `None` when the lock can't be taken (the directory or
+/// lock file can't be written, or the file system has no locks); nothing is
+/// saved then.
 fn lock_file(path: &Path) -> Option<std::fs::File> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok()?;
@@ -185,7 +191,10 @@ fn lock_file(path: &Path) -> Option<std::fs::File> {
     match file.lock() {
         Ok(()) => Some(file),
         Err(e) => {
-            tracing::debug!("station uuid map {}: not locked: {e}", path.display());
+            tracing::warn!(
+                "station uuid map {}: not locked, so not saved: {e}",
+                path.display()
+            );
             None
         }
     }
@@ -303,6 +312,31 @@ mod tests {
                 *u
             );
         }
+    }
+
+    #[test]
+    fn nothing_is_saved_without_the_lock() {
+        let dir = tempdir();
+        let path = dir.join("station-uuids.json");
+        let theirs = "3f2b8c1e-7d4a-4c9e-9b1f-2a6e5d4c3b2a";
+        let mut s = Saved::default();
+        s.stations.insert("mode:vdl2".into(), theirs.into());
+        save(&path, &s).unwrap();
+        // The lock file can't be opened (a directory is in its place),
+        // while the map itself stays writable.
+        std::fs::create_dir(path.with_extension("json.lock")).unwrap();
+        assert_eq!(
+            resolve_at(&path, "base", "XX-KSEA", None),
+            derived("XX-KSEA")
+        );
+        // Saved slots are still read; the map is left unchanged.
+        assert_eq!(resolve_at(&path, "mode:vdl2", "XX-OTHER", None), theirs);
+        let saved = load(&path);
+        assert_eq!(saved.stations.len(), 1);
+        assert_eq!(
+            saved.stations.get("mode:vdl2").map(String::as_str),
+            Some(theirs)
+        );
     }
 
     #[test]
