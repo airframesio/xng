@@ -52,6 +52,14 @@ const SC_SEARCH_HZ: f64 = 105.0;
 /// deviation 2.6 (measured), so this is four of its standard errors.
 const REF_NOISE_MEAN: f64 = 9.0;
 const REF_NOISE_SPREAD: f64 = 10.4;
+/// An unmodulated 9960 Hz tone is not a reference, though the template
+/// correlates with it through one Bessel line J_h(ratio). Folded (derotated
+/// at any 30 Hz alias) such a tone is a single harmonic of the cycle: the
+/// peak is then at most J_h^2 < 0.08 times what that harmonic alone
+/// explains, while a frequency-modulated reference, which spreads over many
+/// lines, gives 1 / max J_h^2 > 12 times. The peak must be this many times
+/// the strongest harmonic's.
+const REF_CW_FACTOR: f64 = 2.0;
 
 /// One reporting interval's VOR measurement.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -85,6 +93,7 @@ struct BlockResult {
     /// Reference correlation peak and the noise it would hold without one.
     ref_c: f64,
     ref_noise: f64,
+    ref_cw: f64,
 }
 
 pub struct VorAnalyzer {
@@ -288,6 +297,25 @@ impl VorAnalyzer {
             &templates()[self.ratio][best * SAMPLES_PER_CYCLE..(best + 1) * SAMPLES_PER_CYCLE];
         let t_norm: f64 = t_best.iter().map(|t| t.norm_sqr()).sum();
         let ref_noise = per_bin * sigma2 * t_norm;
+        // What a single tone (an unmodulated subcarrier) would give the same
+        // template: the fold's strongest harmonic, scaled to the template.
+        let ref_cw = t_norm
+            * (0..SAMPLES_PER_CYCLE)
+                .map(|h| {
+                    fold.iter()
+                        .enumerate()
+                        .map(|(k, f)| {
+                            f * Complex::from_polar(
+                                1.0,
+                                -TAU * (h * k % SAMPLES_PER_CYCLE) as f64
+                                    / SAMPLES_PER_CYCLE as f64,
+                            )
+                        })
+                        .sum::<Complex<f64>>()
+                        .norm_sqr()
+                })
+                .fold(0.0, f64::max)
+            / SAMPLES_PER_CYCLE as f64;
         // Weight by both tones' strength relative to the block's noise: the
         // product of the two depths works well and needs no noise estimate.
         let weight = (m30 * msc).max(0.0);
@@ -299,6 +327,7 @@ impl VorAnalyzer {
             dev: deviation,
             ref_c: c[best],
             ref_noise,
+            ref_cw,
         });
     }
 
@@ -356,7 +385,9 @@ impl VorAnalyzer {
         let n = res.len() as f64;
         let ref_c: f64 = res.iter().map(|b| b.ref_c).sum();
         let ref_noise: f64 = res.iter().map(|b| b.ref_noise).sum();
-        let reference = ref_c >= (REF_NOISE_MEAN + REF_NOISE_SPREAD / n.sqrt()) * ref_noise;
+        let ref_cw: f64 = res.iter().map(|b| b.ref_cw).sum();
+        let reference = ref_c >= (REF_NOISE_MEAN + REF_NOISE_SPREAD / n.sqrt()) * ref_noise
+            && ref_c >= REF_CW_FACTOR * ref_cw;
         let (radial, std) = if reference && wsum > 0.0 && s.norm() > 0.0 {
             let rbar = (s.norm() / wsum).min(1.0);
             let std = if rbar > 0.0 {

@@ -464,6 +464,23 @@ fn vor_without_reference_reports_no_radial() {
 }
 
 #[test]
+fn vor_unmodulated_subcarrier_reports_no_radial() {
+    // A 9960 Hz tone without FM is not a reference, weak or strong.
+    for cn0 in [30.0, 55.0] {
+        let p = VorParams {
+            deviation_hz: 0.0,
+            ..Default::default()
+        };
+        let obs = run(NavaidKind::Vor, vor_scene(p, Some(cn0)), 20.0, 2.0);
+        assert!(!obs.is_empty());
+        for o in &obs {
+            let v = o.vor.as_ref().unwrap();
+            assert_eq!(v.radial_deg, None, "C/N0 {cn0}: {v:?}");
+        }
+    }
+}
+
+#[test]
 fn carrier_early_in_one_large_chunk_is_found() {
     // 5 s of carrier then 5 s of silence, handed over in one call: the
     // search runs when its window fills, not at the end of the chunk.
