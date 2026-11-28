@@ -85,6 +85,9 @@
   .leaflet-popup-close-button:hover { color: #c8ccd4 !important; }
   .pp { display: flex; gap: 12px; align-items: flex-start; min-width: 210px; }
   .pp .pic { width: 64px; height: 64px; flex: none; margin-top: 2px; }
+  /* Track button (map, top left): blue while tracking. */
+  .track-ctl a { display: flex; align-items: center; justify-content: center; color: #333; }
+  .track-ctl a.on { background: #7aa2f7; color: #0b0e14; }
   .pp h3 { margin: 0 0 6px; padding-bottom: 5px; font-size: 14px; color: #7aa2f7; border-bottom: 1px solid #232a3d; letter-spacing: 0.02em; }
   .pp table { border-collapse: collapse; }
   .pp td { padding: 1px 10px 1px 0; vertical-align: baseline; }
@@ -1144,6 +1147,64 @@ return { AIRCRAFT_ICONS, aircraftIconKey, aircraftIconSvg, aircraftIconScale, ai
 const map = L.map('map', { zoomControl: true }).setView([40, -95], 4);
 map.attributionControl.addAttribution('silhouettes &copy; <a href="https://github.com/plane-watch/pw-silhouettes">Plane Watch</a>');
 
+// Track: keeps the selected aircraft, vessel or other item in the middle of
+// the map as it moves. Only the center changes, so the zoom stays as set.
+// Dragging the map or the arrow keys stop it; zooming doesn't (while tracking,
+// the wheel and a pinch zoom around the middle, and a zoom is never cut short).
+let tracking = null; // the tracked entity key
+let zooming = false;
+const TrackControl = L.Control.extend({
+  options: { position: 'topleft' },
+  onAdd() {
+    const bar = L.DomUtil.create('div', 'leaflet-bar track-ctl');
+    const a = L.DomUtil.create('a', '', bar);
+    a.href = '#';
+    a.setAttribute('role', 'button');
+    a.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">' +
+      '<path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Zm0-4.5a4.5 4.5 0 1 0 0-9 4.5 4.5 0 0 0 0 9Zm0-3a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z"/></svg>';
+    L.DomEvent.disableClickPropagation(bar);
+    L.DomEvent.on(a, 'click', e => { L.DomEvent.preventDefault(e); setTracking(!tracking); });
+    this.button = a;
+    return bar;
+  },
+});
+const trackCtl = new TrackControl().addTo(map);
+function trackedLatLng(key) {
+  const e = key && markers.get(key);
+  return e ? e.marker.getLatLng() : null;
+}
+function syncTrackButton() {
+  const a = trackCtl.button;
+  a.parentElement.hidden = !tracking && !trackedLatLng(selected);
+  a.classList.toggle('on', !!tracking);
+  a.setAttribute('aria-pressed', String(!!tracking));
+  a.title = tracking ? 'Stop tracking' : 'Track selected';
+  a.setAttribute('aria-label', a.title);
+}
+function setTracking(on) {
+  const key = on && trackedLatLng(selected) ? selected : null;
+  if (key !== tracking) {
+    tracking = key;
+    map.options.scrollWheelZoom = key ? 'center' : true;
+    map.options.touchZoom = key ? 'center' : true;
+    if (key) followTracked(true);
+  }
+  syncTrackButton();
+}
+function followTracked(animate) {
+  if (!tracking) return;
+  const ll = selected === tracking && trackedLatLng(tracking);
+  if (!ll) { setTracking(false); return; } // deselected, another pick, or gone
+  if (zooming || map.getCenter().equals(ll)) return;
+  map.panTo(ll, { animate, duration: 0.5 });
+}
+map.on('zoomstart', () => { zooming = true; });
+map.on('zoomend', () => { zooming = false; followTracked(false); });
+map.on('dragstart', () => { if (tracking) setTracking(false); });
+map.getContainer().addEventListener('keydown', e => {
+  if (tracking && e.key.startsWith('Arrow') && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) setTracking(false);
+});
+
 // Basemap. /map/config.json names a MapLibre style (OpenFreeMap by default:
 // OpenStreetMap vector tiles, no API key) or asks for raster. The vector map
 // renders with MapLibre beneath the Leaflet overlays; OpenStreetMap raster
@@ -2158,6 +2219,8 @@ function render() {
   syncIridium(s);
   renderReceiverEstimate(s);
   if (!fitted && pts.length) { map.fitBounds(pts, { maxZoom: 9, padding: [40, 40] }); fitted = true; }
+  followTracked(true);
+  syncTrackButton();
 
   if (s.station) document.getElementById('station').textContent = s.station;
   document.getElementById('ver').textContent = s.version ? 'xng v' + s.version : '';
