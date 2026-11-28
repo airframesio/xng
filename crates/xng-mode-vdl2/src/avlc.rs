@@ -29,7 +29,7 @@ pub struct AvlcAddress {
     pub status_bit: bool,
 }
 
-fn parse_address(octets: &[u8]) -> AvlcAddress {
+pub fn parse_address(octets: &[u8]) -> AvlcAddress {
     // Spec bit k (1-based, first transmitted) = our bit k-1.
     // Octet 1: bits 8..3 = da22..da27, bit 2 = status (A/G or C/R),
     // bit 1 = ext. Octets 2-4: bits 8..2 = da15..da21 / da8..da14 /

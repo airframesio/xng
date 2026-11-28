@@ -39,6 +39,11 @@ pub fn encode(tl: u32) -> [u8; HEADER_BITS] {
 /// Decode 25 received (descrambled) header bits; corrects a single bit
 /// error by exhaustive flip. Returns the transmission length.
 pub fn decode(bits: &[u8; HEADER_BITS]) -> Option<u32> {
+    decode_with_fixed(bits).map(|(tl, _)| tl)
+}
+
+/// As [`decode`], also returning how many header bits were corrected (0 or 1).
+pub fn decode_with_fixed(bits: &[u8; HEADER_BITS]) -> Option<(u32, u8)> {
     let check = |b: &[u8; HEADER_BITS]| -> bool {
         let mut bits20 = [0u8; 20];
         bits20.copy_from_slice(&b[..20]);
@@ -48,13 +53,13 @@ pub fn decode(bits: &[u8; HEADER_BITS]) -> Option<u32> {
         (0..17).fold(0u32, |acc, i| acc | ((b[3 + i] as u32) << i))
     };
     if check(bits) {
-        return Some(tl_of(bits));
+        return Some((tl_of(bits), 0));
     }
     for i in 0..HEADER_BITS {
         let mut t = *bits;
         t[i] ^= 1;
         if check(&t) {
-            return Some(tl_of(&t));
+            return Some((tl_of(&t), 1));
         }
     }
     None

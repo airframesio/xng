@@ -347,3 +347,27 @@ ICAO Doc 9705 and against dumpvdl2's `src/x25.{c,h}` (`X25_SNDCF_ID`,
 formatter text. Tests pin spec-derived Call-Request / Call-Accept SNDCF
 vectors and verify the CUD is no longer offset (no loopback). General X.25
 facility naming remains numeric (out of scope, as before).
+
+## dumpvdl2 JSON feed: XID frames and burst fields (2026-11)
+
+The dumpvdl2 `decoded:json` output (`src/outputs/dumpvdl2_json.rs`) now
+emits XID frames as well as ACARS, and carries `burst_len_octets`, `idx`,
+`hdr_bits_fixed` and an always-present `acars.msg_text`.
+
+- XID objects are re-encoded from xng's own XID parse (see the XID sections
+  above). Their JSON shapes (`type`/`type_descr` from C/R, P/F and the
+  connection-management h/r bits, value formats, and how malformed fields
+  are reported) were pinned by black-box dumpvdl2 2.7.0 output: 69
+  synthetic XID frames built with xng's own modulator, covering every
+  parameter type, every C/R x P/F x connection-management combination and
+  broken group layouts (a group longer than the field, cut-short headers,
+  an empty field), plus 10 off-air XIDs decoded from the same IQ by both decoders. The 79
+  vectors are the golden test file `src/outputs/testdata/dumpvdl2_xid.jsonl`.
+  No dumpvdl2 code was used.
+- `burst_len_octets` is the transmission length from the burst header
+  (already decoded for framing), and `hdr_bits_fixed` counts the header bits
+  the existing header FEC corrected (0 or 1).
+- Which fields are required comes from the public acars_vdlm2_parser structs
+  that acars_router decodes every VDL2 message into: `burst_len_octets`,
+  `idx` and `acars.msg_text` are non-optional there, so a message without
+  them is dropped.
