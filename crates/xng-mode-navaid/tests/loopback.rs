@@ -502,6 +502,16 @@ fn carriers_swapping_rank_keep_their_state() {
     // The clearance carrier becomes the stronger one; the next carrier
     // search (at 60 s) sees the swap.
     let after = feed(&mut Generator::new(scene(-2.0, 4)), 25.0);
+    // The report right after the search that sees the swap already holds
+    // both carriers' accumulated measurements, then later ones too.
+    let at_swap = after.iter().find(|o| (o.t_s - 60.0).abs() < 1e-6).unwrap();
+    assert_eq!(at_swap.ils.len(), 2, "{:?}", at_swap.ils);
+    assert!(
+        at_swap.ils.iter().all(|m| m.blocks >= 9),
+        "{:?}",
+        at_swap.ils
+    );
+    assert_eq!(at_swap.ident.as_deref(), Some("ISAC"));
     let last = after.last().unwrap();
     assert_eq!(last.ident.as_deref(), Some("ISAC"), "votes kept");
     assert_eq!(last.ils.len(), 2, "{:?}", last.ils);

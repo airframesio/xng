@@ -299,11 +299,13 @@ impl NavaidChannelDecoder {
             .collect();
         let kept_any = slots.iter().any(Option::is_some);
         // The ident path belongs to the strongest carrier. If the carriers
-        // swapped rank, the existing one (with its votes) moves across.
+        // swapped rank, the existing one (with its votes) moves across; when
+        // no carrier survived it is another transmitter, which starts fresh.
         let mut moved = None;
-        if slots
-            .first()
-            .is_some_and(|c| c.as_ref().is_none_or(|c| c.ident.is_none()))
+        if kept_any
+            && slots
+                .first()
+                .is_some_and(|c| c.as_ref().is_none_or(|c| c.ident.is_none()))
         {
             moved = slots
                 .iter_mut()
