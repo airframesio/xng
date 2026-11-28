@@ -28,6 +28,13 @@ pub const NAMESPACE: Uuid = Uuid::from_u128(0x2c9a_51d4_7e0b_4f3a_9c61_d84e_3b7f
 /// Environment variable with the base station's UUID.
 pub const ENV: &str = "XNG_STATION_UUID";
 
+/// Namespace of the ATC station UUIDs Airframes derives from a feeder id
+/// (api-server `ATC_STATION_UUID_NAMESPACE`). Never change it.
+pub const ATC_NAMESPACE: Uuid = Uuid::from_u128(0x6f7a_0c52_3f0e_4c8e_9d4a_1b2a_7c4e_5d60);
+
+/// Slot of the ATC feeder's station in the saved map.
+pub const ATC_SLOT: &str = "atc";
+
 /// The saved slot → UUID map.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Saved {
@@ -72,6 +79,23 @@ pub fn derived(ident: &str) -> String {
         .to_string()
 }
 
+/// The ATC station UUID Airframes derives from `feeder_id`: the UUID of the
+/// station every ATC feeder had before it sent one.
+pub fn atc_derived(feeder_id: &str) -> String {
+    Uuid::new_v5(&ATC_NAMESPACE, feeder_id.trim().to_ascii_lowercase().as_bytes()).hyphenated().to_string()
+}
+
+/// The ATC feeder's station UUID, sent in HELLO `station.uuid`: `explicit`
+/// (`station-uuid` in the ATC settings) when it is a UUID, else the saved
+/// one, else the one derived from `feeder_id`, which is then saved. A
+/// feeder that already had a station therefore keeps it, and keeps it
+/// when its feeder id changes later (a new `atc.json`).
+pub fn resolve_atc(feeder_id: &str, explicit: Option<&str>) -> String {
+    let env = std::env::var("XNG_ATC_STATION_UUID").ok().filter(|v| !v.trim().is_empty());
+    let explicit = explicit.or(env.as_deref());
+    resolve_with(&default_path(), ATC_SLOT, "ATC feeder", explicit, || atc_derived(feeder_id))
+}
+
 /// `XNG_STATION_UUID`, when set to a UUID.
 pub fn from_env() -> Option<String> {
     let v = std::env::var(ENV).ok()?;
@@ -91,6 +115,16 @@ pub fn resolve(slot: &str, ident: &str, explicit: Option<&str>) -> String {
 /// As [`resolve`], with the saved map at `path`. Never fails: a map that
 /// cannot be read or written leaves the derived UUID.
 pub fn resolve_at(path: &Path, slot: &str, ident: &str, explicit: Option<&str>) -> String {
+    resolve_with(path, slot, ident, explicit, || derived(ident))
+}
+
+fn resolve_with(
+    path: &Path,
+    slot: &str,
+    ident: &str,
+    explicit: Option<&str>,
+    default: impl FnOnce() -> String,
+) -> String {
     if let Some(raw) = explicit {
         match parse(raw) {
             Some(u) => return u,
@@ -105,7 +139,7 @@ pub fn resolve_at(path: &Path, slot: &str, ident: &str, explicit: Option<&str>) 
     if let Some(u) = saved.stations.get(slot).and_then(|u| parse(u)) {
         return u;
     }
-    let u = derived(ident);
+    let u = default();
     saved.stations.insert(slot.to_string(), u.clone());
     if let Err(e) = save(path, &saved) {
         tracing::debug!(
@@ -169,6 +203,18 @@ mod tests {
         assert_eq!(resolve_at(&path, "base", "XX-NEW", Some(set)), set);
         assert_eq!(resolve_at(&path, "base", "XX-NEW", Some("nope")), first);
         assert_eq!(resolve_at(&path, "base", "XX-NEW", None), first);
+    }
+
+    #[test]
+    fn atc_uuid_matches_the_one_airframes_derives() {
+        // api-server: uuidv5(feederId.toLowerCase(), ATC_STATION_UUID_NAMESPACE)
+        assert_eq!(atc_derived("AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA"), "be0d6d34-e87d-53c1-9609-da58d850b485");
+        let dir = tempdir();
+        let path = dir.join("station-uuids.json");
+        let first = resolve_with(&path, ATC_SLOT, "atc", None, || atc_derived("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+        // A new feeder id later (atc.json lost) keeps the station.
+        let later = resolve_with(&path, ATC_SLOT, "atc", None, || atc_derived("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"));
+        assert_eq!(first, later);
     }
 
     #[test]

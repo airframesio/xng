@@ -456,7 +456,11 @@ station id, so it is the same on every run even where nothing is saved. A
 station that already exists on Airframes has its own UUID: set it with
 `station-uuid` (top level, `[outputs.airframes]`, or a mode block; a session's
 `airframes-station-uuid`) or `XNG_STATION_UUID`. Airwaves OS sets it for you
-at sign-in.
+at sign-in. The ATC feed sends one too (HELLO `station.uuid`): by default the
+UUID Airframes already gave the feeder's ATC station, saved under the `atc`
+slot, so a new `atc.json` (new feeder id) keeps the station. Point it at
+another ATC station of your account with `station-uuid` in the ATC settings,
+`--atc-station-uuid` or `XNG_ATC_STATION_UUID`.
 
 **Dashboard basemap.** The web dashboard (`http =`) draws
 [OpenFreeMap](https://openfreemap.org) vector tiles by default: OpenStreetMap
