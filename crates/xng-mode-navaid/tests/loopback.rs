@@ -481,6 +481,25 @@ fn vor_unmodulated_subcarrier_reports_no_radial() {
 }
 
 #[test]
+fn vor_weak_signal_keeps_the_radial() {
+    // 30 dB-Hz: every 2 s report still carries a radial (the reference
+    // gates must not cost availability), and a usable one.
+    for radial in [123.0, 251.0] {
+        let p = VorParams {
+            radial_deg: radial,
+            ..Default::default()
+        };
+        let obs = run(NavaidKind::Vor, vor_scene(p, Some(30.0)), 20.0, 2.0);
+        assert!(!obs.is_empty());
+        for o in obs.iter().skip(1) {
+            let v = o.vor.as_ref().unwrap();
+            let r = v.radial_deg.unwrap_or_else(|| panic!("no radial: {v:?}"));
+            assert!(angle_err(r, radial) < 20.0, "{r} vs {radial}");
+        }
+    }
+}
+
+#[test]
 fn carrier_early_in_one_large_chunk_is_found() {
     // 5 s of carrier then 5 s of silence, handed over in one call: the
     // search runs when its window fills, not at the end of the chunk.
