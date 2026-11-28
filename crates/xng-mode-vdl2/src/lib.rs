@@ -231,15 +231,23 @@ impl Vdl2ChannelDecoder {
 }
 
 /// One-sided passband of the channelizer front end, which filters every
-/// channel to it: this is VDL2's channel filter on the channelized path
-/// (the back end's own selectivity FIR is skipped there). 10.5 kHz is the
-/// symbol rate, the same cutoff as that FIR — flat through the RC band edge
-/// (±8.4 kHz), the transition in the noise-only region. The channelizer's
-/// residual-vs-bin-edge rule is sized from it too. Passing that rule does not make a critically sampled bin
-/// flat there: a channel 37.5 kHz off a 100 kHz bin center still sits in the
-/// prototype's roll-off; the 2× bank the default uses is flat there (see
+/// channel to it: this is VDL2's channel filter on the channelized path (the
+/// back end's own selectivity FIR is skipped there).
+///
+/// The RC(α=0.6) spectrum ends at ±8.4 kHz and is about 26 dB down at
+/// 7.5 kHz, so a wider passband adds mostly noise. In
+/// `examples/sensitivity_wide` the default 2× bank decodes 75–80 of 100
+/// bursts at 18 dB in-channel SNR, against 18–19 at 10.5 kHz. The edge still
+/// leaves room for a transmitter 5 ppm off frequency (685 Hz at 137 MHz).
+/// Narrower gives that margin up: at 6.5 kHz a burst 1 kHz off decodes worse
+/// than at 10.5 kHz.
+///
+/// The channelizer's residual-vs-bin-edge rule is sized from it too. Passing
+/// that rule does not make a critically sampled bin flat there: a channel
+/// 37.5 kHz off a 100 kHz bin center still sits in the prototype's roll-off;
+/// the 2× bank the default uses is flat there (see
 /// [`Vdl2MultiChannelDecoder::new`]).
-pub const CHANNELIZER_PASSBAND_HZ: f64 = 10_500.0;
+pub const CHANNELIZER_PASSBAND_HZ: f64 = 7_500.0;
 
 /// One-sided passband for the shared-decimation front end at `channel_rate`.
 ///
