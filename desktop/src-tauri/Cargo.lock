@@ -7257,7 +7257,7 @@ dependencies = [
 
 [[package]]
 name = "xng"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7321,7 +7321,7 @@ dependencies = [
 
 [[package]]
 name = "xng-acars"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "base64 0.22.1",
  "crc",
@@ -7334,7 +7334,7 @@ dependencies = [
 
 [[package]]
 name = "xng-desktop"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7356,7 +7356,7 @@ dependencies = [
 
 [[package]]
 name = "xng-dsp"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "crc",
  "num-complex",
@@ -7365,7 +7365,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-acars"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7377,7 +7377,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-adsb"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7388,7 +7388,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-adsl"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7400,7 +7400,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-aero"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7414,7 +7414,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-airband"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7426,7 +7426,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-ais"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7437,7 +7437,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-aprs"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7449,7 +7449,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-atcs"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7461,7 +7461,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-dsc"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7473,7 +7473,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-eot"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7485,7 +7485,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-flex"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7497,7 +7497,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-hfdl"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7510,7 +7510,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-iridium"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "crc",
@@ -7526,7 +7526,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-lora"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -7544,7 +7544,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-navtex"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7556,7 +7556,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-pocsag"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7568,7 +7568,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-sarsat"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7580,7 +7580,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-sonde"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7592,7 +7592,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-stdc"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7605,7 +7605,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-time"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7617,7 +7617,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-uat"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7629,7 +7629,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-vdes"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7640,7 +7640,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-vdl2"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7653,7 +7653,7 @@ dependencies = [
 
 [[package]]
 name = "xng-proto"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "prost",
  "tonic",
@@ -7663,7 +7663,7 @@ dependencies = [
 
 [[package]]
 name = "xng-sdr"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "num-complex",
  "pkg-config",
@@ -7673,7 +7673,7 @@ dependencies = [
 
 [[package]]
 name = "xng-types"
-version = "0.26.0"
+version = "0.27.0"
 dependencies = [
  "chrono",
  "serde",
