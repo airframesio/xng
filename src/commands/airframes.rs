@@ -53,16 +53,23 @@ pub fn run(cmd: AirframesCommand) -> anyhow::Result<()> {
                 serde_json::Value::String(u) => println!("signed in as {u}"),
                 _ => println!("anonymous (sign in with `xng atc login`)"),
             }
-            let Some(list) = ingests else {
-                println!("this gateway does not list its ingests (it takes the native formats)");
-                return Ok(());
-            };
-            println!("\nThe gateway takes:");
-            for (f, m) in &list {
-                println!("  {m:<12} {f}");
+            match &ingests {
+                None => {
+                    println!("this gateway does not list its ingests (it takes the native formats)")
+                }
+                Some(list) => {
+                    println!("\nThe gateway takes:");
+                    for (f, m) in list {
+                        println!("  {m:<12} {f}");
+                    }
+                }
             }
             println!("\nThis xng would send:");
-            let listed = |f: &str, m: Mode| list.iter().any(|(lf, lm)| lf == f && lm == m.as_str());
+            let listed = |f: &str, m: Mode| match &ingests {
+                Some(list) => list.iter().any(|(lf, lm)| lf == f && lm == m.as_str()),
+                // No list: the native formats only (what the uplink assumes).
+                None => f != airframes_quic::XNG_FORMAT,
+            };
             for &mode in Mode::native_modes() {
                 let how = if !airframes_quic::gateway_eligible(mode) {
                     match mode {

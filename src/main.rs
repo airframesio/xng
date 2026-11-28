@@ -645,7 +645,7 @@ fn main() -> anyhow::Result<()> {
             let fmt: commands::extern_cmd::ExternFormat =
                 format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (mut outputs, station_ident) = output.build()?;
-            outputs.airframes = Some(output.airframes_router(
+            let mut router = output.airframes_router(
                 &station_ident,
                 &[
                     xng_types::Mode::AcarsPoa,
@@ -653,7 +653,13 @@ fn main() -> anyhow::Result<()> {
                     xng_types::Mode::Hfdl,
                     xng_types::Mode::Ais,
                 ],
-            )?);
+            )?;
+            // Two extern runs (different decoders) under one station id
+            // must not share a gateway session.
+            if let Some(q) = &mut router.quic {
+                q.instance_tag = format!("extern-{format}");
+            }
+            outputs.airframes = Some(router);
             commands::extern_cmd::run(fmt, &command, station_ident, outputs)
         }
         Command::Survey {

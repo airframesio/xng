@@ -255,6 +255,9 @@ impl StationFile {
             fix(&mut a.credentials);
             fix(&mut a.ca);
         }
+        if let Some(a) = &mut self.outputs.airframes {
+            fix(&mut a.quic_ca);
+        }
         for s in &mut self.sessions {
             fix(&mut s.file);
         }

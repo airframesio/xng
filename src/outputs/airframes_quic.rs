@@ -228,8 +228,8 @@ fn pong(ping: &[u8], t2: u64) -> Vec<u8> {
 }
 
 /// Whether the system clock is synchronized, for one-way latency. Linux:
-/// `timedatectl`; elsewhere unknown.
-fn clock_state() -> Value {
+/// `timedatectl`; elsewhere unknown. Blocking: run off the async workers.
+fn read_clock_state() -> Value {
     #[cfg(target_os = "linux")]
     {
         if let Ok(out) = std::process::Command::new("timedatectl")
@@ -242,7 +242,29 @@ fn clock_state() -> Value {
             }
         }
     }
+    unknown_clock()
+}
+
+fn unknown_clock() -> Value {
     json!({ "source": "unknown", "synced": false })
+}
+
+/// Refreshes the cached clock state now and every 5 minutes, each check
+/// bounded, so neither HELLO nor STATS waits on a slow `timedatectl`.
+fn spawn_clock_watch(shared: Arc<Shared>) {
+    tokio::spawn(async move {
+        loop {
+            let check = tokio::task::spawn_blocking(read_clock_state);
+            if let Ok(Ok(v)) = tokio::time::timeout(Duration::from_secs(5), check).await {
+                *shared.clock.lock().unwrap() = v;
+            }
+            // Ends with the last Uplink handle.
+            if Arc::strong_count(&shared) <= 1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(300)).await;
+        }
+    });
 }
 
 // ---- public handle ----
@@ -252,6 +274,11 @@ fn clock_state() -> Value {
 const PENDING: u8 = 0;
 const OPEN_OK: u8 = 1;
 const REFUSED: u8 = 2;
+
+/// Messages a gateway-only feed holds while the gateway decides on it.
+const HOLD_MAX: usize = 256;
+/// How long opening one feed may take before it is given up (and retried).
+const OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// What one feed carries.
 #[derive(Clone, Debug)]
@@ -265,11 +292,75 @@ pub struct FeedSpec {
     pub sdr_id: Option<String>,
 }
 
+/// A request to open a feed (the session opens it; messages go straight to
+/// the feed's writer).
 struct Item {
     spec: FeedSpec,
-    capture_us: u64,
-    /// `None`: open the feed only.
-    msg: Option<Vec<u8>>,
+}
+
+/// A feed's frame queue and, on TCP, its stream id.
+type FeedWriter = (mpsc::Sender<Vec<u8>>, Option<u16>);
+
+/// One feed, shared by `send` (which writes its messages) and the session
+/// (which opens it and reads OPENED).
+struct Feed {
+    state: AtomicU8,
+    /// The feed's frames: its own QUIC stream, or the TCP connection with
+    /// the feed's stream id. Set once the OPEN is sent.
+    writer: Mutex<Option<FeedWriter>>,
+    /// DATA payloads of a gateway-only feed received before OPENED (there
+    /// is no per-port path to hand them to meanwhile).
+    held: Mutex<Vec<Vec<u8>>>,
+    decoded: AtomicU64,
+    sent: AtomicU64,
+    dropped: AtomicU64,
+    last_us: AtomicU64,
+}
+
+impl Feed {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(PENDING),
+            writer: Mutex::new(None),
+            held: Mutex::new(Vec::new()),
+            decoded: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            last_us: AtomicU64::new(0),
+        }
+    }
+
+    /// Hands one DATA payload to the writer. Err(closed): the writer is gone.
+    fn write(&self, payload: &[u8]) -> Result<bool, ()> {
+        let w = self.writer.lock().unwrap();
+        let Some((tx, tcp_id)) = w.as_ref() else { return Ok(false) };
+        let fr = match tcp_id {
+            Some(id) => stream_frame(*id, DATA, payload),
+            None => frame(DATA, payload),
+        };
+        match tx.try_send(fr) {
+            Ok(()) => {
+                self.sent.fetch_add(1, Ordering::Relaxed);
+                Ok(true)
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                Ok(false)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(()),
+        }
+    }
+
+    fn json(&self, key: &str) -> Value {
+        json!({
+            "key": key,
+            "decoded": self.decoded.load(Ordering::Relaxed),
+            "sent": self.sent.load(Ordering::Relaxed),
+            "dropped": self.dropped.load(Ordering::Relaxed),
+            "last_decode_us": self.last_us.load(Ordering::Relaxed),
+            "open": self.state.load(Ordering::Relaxed) == OPEN_OK,
+        })
+    }
 }
 
 /// Latest link measurement from the gateway.
@@ -293,62 +384,104 @@ pub struct Uplink {
 
 struct Shared {
     connected: AtomicBool,
-    /// Feed key -> state, so `send` can fall back for refused feeds.
-    states: Mutex<HashMap<String, Arc<AtomicU8>>>,
+    /// Feed key -> feed, so `send` writes to it or falls back.
+    feeds: Mutex<HashMap<String, Arc<Feed>>>,
     link: Mutex<LinkStatus>,
     /// (format, mode) pairs the gateway listed in WELCOME; `None` before the
     /// first WELCOME or from a gateway that does not list them.
     ingests: Mutex<Option<Vec<(String, String)>>>,
+    /// Latest clock check (see [`spawn_clock_watch`]).
+    clock: Mutex<Value>,
     started: Instant,
+}
+
+impl Shared {
+    /// Forgets `feed` if it is still the current one for `key` (a later
+    /// replacement stays).
+    fn forget(&self, key: &str, feed: &Arc<Feed>) {
+        let mut feeds = self.feeds.lock().unwrap();
+        if feeds.get(key).is_some_and(|f| Arc::ptr_eq(f, feed)) {
+            feeds.remove(key);
+        }
+    }
+
+    fn clock(&self) -> Value {
+        self.clock.lock().unwrap().clone()
+    }
 }
 
 impl Uplink {
     /// Start the uplink task.
     pub fn spawn(settings: QuicSettings) -> Self {
-        let (tx, rx) = mpsc::channel(8192);
+        let (tx, rx) = mpsc::channel(1024);
         let shared = Arc::new(Shared {
             connected: AtomicBool::new(false),
-            states: Mutex::new(HashMap::new()),
+            feeds: Mutex::new(HashMap::new()),
             link: Mutex::new(LinkStatus::default()),
             ingests: Mutex::new(None),
+            clock: Mutex::new(unknown_clock()),
             started: Instant::now(),
         });
+        spawn_clock_watch(shared.clone());
         tokio::spawn(run(settings, rx, shared.clone()));
         Self { tx, shared }
     }
 
-    /// Queue one message for its feed. Returns false when it must go the
-    /// per-port way instead: not connected, the feed is not open yet (its
-    /// first message asks for it, so nothing is lost while the gateway
-    /// decides), the feed was refused, or the queue is full.
-    pub fn send(&self, spec: &FeedSpec, capture_us: u64, msg: Vec<u8>) -> bool {
+    /// Writes one message to its feed. Returns true once the feed's writer
+    /// took it (or, with `hold`, the feed holds it until the gateway opens
+    /// it). False: send it the per-port way instead (not connected, feed not
+    /// open yet, refused, closed, or its queue full).
+    ///
+    /// `hold` is for gateway-only modes, which have no per-port path: their
+    /// first messages wait (up to [`HOLD_MAX`]) for the gateway to accept
+    /// the feed instead of being dropped.
+    pub fn send(&self, spec: &FeedSpec, capture_us: u64, msg: Vec<u8>, hold: bool) -> bool {
         if !self.shared.connected.load(Ordering::Relaxed) || msg.len() > MAX_MESSAGE {
             return false;
         }
-        let mut states = self.shared.states.lock().unwrap();
-        match states.get(&spec.key).map(|st| st.load(Ordering::Relaxed)) {
-            Some(OPEN_OK) => self
-                .tx
-                .try_send(Item {
-                    spec: spec.clone(),
-                    capture_us,
-                    msg: Some(msg),
-                })
-                .is_ok(),
-            Some(_) => false,
-            None => {
-                states.insert(spec.key.clone(), Arc::new(AtomicU8::new(PENDING)));
-                if self
-                    .tx
-                    .try_send(Item {
-                        spec: spec.clone(),
-                        capture_us,
-                        msg: None,
-                    })
-                    .is_err()
-                {
-                    states.remove(&spec.key);
+        let feed = {
+            let mut feeds = self.shared.feeds.lock().unwrap();
+            match feeds.get(&spec.key) {
+                Some(f) => f.clone(),
+                None => {
+                    let f = Arc::new(Feed::new());
+                    if self.tx.try_send(Item { spec: spec.clone() }).is_err() {
+                        return false;
+                    }
+                    feeds.insert(spec.key.clone(), f.clone());
+                    f
                 }
+            }
+        };
+        feed.decoded.fetch_add(1, Ordering::Relaxed);
+        feed.last_us.store(capture_us, Ordering::Relaxed);
+        let payload = data_payload(capture_us, &msg);
+        match feed.state.load(Ordering::Relaxed) {
+            OPEN_OK => self.write_open(spec, &feed, &payload),
+            PENDING if hold => {
+                let mut held = feed.held.lock().unwrap();
+                // OPENED may have arrived meanwhile (it flushes under this lock).
+                if feed.state.load(Ordering::Relaxed) == OPEN_OK {
+                    drop(held);
+                    return self.write_open(spec, &feed, &payload);
+                }
+                if held.len() >= HOLD_MAX {
+                    feed.dropped.fetch_add(1, Ordering::Relaxed);
+                    return false;
+                }
+                held.push(payload);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn write_open(&self, spec: &FeedSpec, feed: &Arc<Feed>, payload: &[u8]) -> bool {
+        match feed.write(payload) {
+            Ok(taken) => taken,
+            Err(()) => {
+                // Its stream ended: forget it, so the next message reopens it.
+                self.shared.forget(&spec.key, feed);
                 false
             }
         }
@@ -384,17 +517,10 @@ enum Link {
     Tcp {
         out: mpsc::Sender<Vec<u8>>,
         next_id: u16,
+        /// The connection's reader, stopped on close (a peer that never
+        /// closes would otherwise keep it, and the socket, forever).
+        reader: tokio::task::AbortHandle,
     },
-}
-
-struct FeedConn {
-    tx: mpsc::Sender<Vec<u8>>, // complete frames for this feed
-    state: Arc<AtomicU8>,
-    decoded: Arc<AtomicU64>,
-    sent: Arc<AtomicU64>,
-    dropped: Arc<AtomicU64>,
-    last_us: Arc<AtomicU64>,
-    tcp_id: Option<u16>,
 }
 
 struct Dialer {
@@ -447,16 +573,18 @@ impl Dialer {
 /// Frames read from the control stream (or the TCP connection).
 type Incoming = mpsc::Receiver<(u8, Vec<u8>)>;
 
-async fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(mut r: R) -> Incoming {
+fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
+    mut r: R,
+) -> (Incoming, tokio::task::AbortHandle) {
     let (tx, rx) = mpsc::channel(256);
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Ok(f) = read_frame(&mut r).await {
             if tx.send(f).await.is_err() {
                 break;
             }
         }
     });
-    rx
+    (rx, task.abort_handle())
 }
 
 fn spawn_writer<W: AsyncWrite + Unpin + Send + 'static>(
@@ -475,11 +603,33 @@ fn spawn_writer<W: AsyncWrite + Unpin + Send + 'static>(
     tx
 }
 
+/// Connects to the gateway, trying each address the name resolves to (an
+/// unreachable IPv6 address must not hide a working IPv4 one) within one
+/// overall deadline. Certificates are checked against the host name.
 async fn dial(d: &Dialer, quic: bool) -> anyhow::Result<(Link, Incoming)> {
-    let addr = tokio::net::lookup_host(&d.addr)
-        .await?
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve {}", d.addr))?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(&d.addr).await?.collect();
+    anyhow::ensure!(!addrs.is_empty(), "cannot resolve {}", d.addr);
+    let mut last = None;
+    for addr in addrs {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(left, dial_addr(d, quic, addr)).await {
+            Ok(Ok(l)) => return Ok(l),
+            Ok(Err(e)) => last = Some(e.context(addr.to_string())),
+            Err(_) => last = Some(anyhow::anyhow!("{addr}: timed out")),
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("connect to {} timed out", d.addr)))
+}
+
+async fn dial_addr(
+    d: &Dialer,
+    quic: bool,
+    addr: std::net::SocketAddr,
+) -> anyhow::Result<(Link, Incoming)> {
     if quic {
         let bind: std::net::SocketAddr = if addr.is_ipv6() {
             "[::]:0".parse()?
@@ -492,7 +642,7 @@ async fn dial(d: &Dialer, quic: bool) -> anyhow::Result<(Link, Incoming)> {
             .await
             .map_err(|_| anyhow::anyhow!("QUIC handshake timed out (UDP blocked?)"))??;
         let (send, recv) = conn.open_bi().await?;
-        let rx = spawn_reader(recv).await;
+        let (rx, _) = spawn_reader(recv);
         let ctrl = spawn_writer(send, 256);
         Ok((Link::Quic { conn, ctrl }, rx))
     } else {
@@ -511,9 +661,9 @@ async fn dial(d: &Dialer, quic: bool) -> anyhow::Result<(Link, Incoming)> {
         .await
         .map_err(|_| anyhow::anyhow!("TLS handshake timed out"))??;
         let (r, w) = tokio::io::split(tls);
-        let rx = spawn_reader(r).await;
+        let (rx, reader) = spawn_reader(r);
         let out = spawn_writer(w, FEED_QUEUE * 4);
-        Ok((Link::Tcp { out, next_id: 0 }, rx))
+        Ok((Link::Tcp { out, next_id: 0, reader }, rx))
     }
 }
 
@@ -532,16 +682,25 @@ impl Link {
         }
     }
 
+    /// Ends the connection: QUIC closes (its streams end with it); TCP stops
+    /// the reader, and the writer ends once the last sender (the session's
+    /// and the forgotten feeds') is dropped.
     fn close(&self) {
-        if let Link::Quic { conn, .. } = self {
-            conn.close(0u32.into(), b"bye");
+        match self {
+            Link::Quic { conn, .. } => conn.close(0u32.into(), b"bye"),
+            Link::Tcp { reader, .. } => reader.abort(),
         }
     }
 }
 
 /// Token for HELLO/REAUTH from the saved sign-in, or `None` (anonymous).
-async fn token(creds: &Option<PathBuf>) -> Option<atc_auth::AccessToken> {
-    let path = creds.clone().unwrap_or_else(atc_auth::default_path);
+/// Never over a connection whose certificate was not checked
+/// (`--airframes-quic-insecure`): anyone on the path could take it.
+async fn token(s: &QuicSettings) -> Option<atc_auth::AccessToken> {
+    if s.insecure {
+        return None;
+    }
+    let path = s.credentials.clone().unwrap_or_else(atc_auth::default_path);
     let c = atc_auth::load(&path).ok()?;
     c.refresh_token.as_ref()?;
     match tokio::task::spawn_blocking(move || atc_auth::refresh(&path)).await {
@@ -554,6 +713,26 @@ async fn token(creds: &Option<PathBuf>) -> Option<atc_auth::AccessToken> {
     }
 }
 
+/// What came back for HELLO.
+enum Reply {
+    Welcome(Value),
+    Refused(Value),
+    /// Nothing (in time), the connection ended, or an unreadable WELCOME.
+    Failed(&'static str),
+}
+
+async fn await_welcome(incoming: &mut Incoming) -> Reply {
+    match tokio::time::timeout(Duration::from_secs(10), incoming.recv()).await {
+        Ok(Some((WELCOME, p))) => match serde_json::from_slice::<Value>(&p) {
+            Ok(v) if v.is_object() => Reply::Welcome(v),
+            _ => Reply::Failed("unreadable WELCOME"),
+        },
+        Ok(Some((ERROR, p))) => Reply::Refused(serde_json::from_slice(&p).unwrap_or_default()),
+        Ok(_) => Reply::Failed("no WELCOME"),
+        Err(_) => Reply::Failed("no WELCOME (timed out)"),
+    }
+}
+
 async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>) {
     let dialer = match Dialer::new(&s) {
         Ok(d) => d,
@@ -562,6 +741,9 @@ async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>)
             return;
         }
     };
+    if s.insecure {
+        tracing::warn!("airframes quic: certificate checks are off; connecting anonymously");
+    }
     let creds_path = s.credentials.clone().unwrap_or_else(atc_auth::default_path);
     let instance_id = match atc_auth::feeder_id(&creds_path) {
         Ok(id) if s.instance_tag.is_empty() => id,
@@ -596,18 +778,20 @@ async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>)
                     if use_quic { "quic" } else { "tcp" }
                 );
                 last_disconnect = format!("{e:#}");
-                sleep_draining(&mut rx, backoff).await;
+                if !sleep_draining(&mut rx, backoff).await {
+                    return;
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 continue;
             }
         };
-        let tok = token(&s.credentials).await;
+        let tok = token(&s).await;
         let hello = json!({
             "v": VERSION,
             "token": tok.as_ref().map(|t| t.token.clone()),
             "client": { "name": "xng", "version": env!("CARGO_PKG_VERSION"), "platform": format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH) },
             "instance_id": instance_id,
-            "clock": clock_state(),
+            "clock": shared.clock(),
             "capabilities": { "commands": COMMANDS },
             "reconnects": reconnects,
             "last_disconnect": last_disconnect,
@@ -616,27 +800,30 @@ async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>)
             .ctrl()
             .send(frame(HELLO, hello.to_string().as_bytes()))
             .await;
-        let welcome = match tokio::time::timeout(Duration::from_secs(10), incoming.recv()).await {
-            Ok(Some((WELCOME, p))) => serde_json::from_slice::<Value>(&p).unwrap_or_default(),
-            Ok(Some((ERROR, p))) => {
-                let e: Value = serde_json::from_slice(&p).unwrap_or_default();
+        let welcome = match await_welcome(&mut incoming).await {
+            Reply::Welcome(w) => w,
+            Reply::Refused(e) => {
                 tracing::warn!(
                     "airframes quic: gateway refused the connection: {}",
                     e["message"].as_str().unwrap_or("?")
                 );
                 link.close();
                 last_disconnect = e["code"].as_str().unwrap_or("refused").to_string();
-                sleep_draining(&mut rx, backoff.max(Duration::from_secs(30))).await;
+                if !sleep_draining(&mut rx, backoff.max(Duration::from_secs(30))).await {
+                    return;
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 continue;
             }
-            _ => {
+            Reply::Failed(why) => {
                 if use_quic {
                     quic_failures += 1;
                 }
                 link.close();
-                last_disconnect = "no WELCOME".into();
-                sleep_draining(&mut rx, backoff).await;
+                last_disconnect = why.into();
+                if !sleep_draining(&mut rx, backoff).await {
+                    return;
+                }
                 backoff = (backoff * 2).min(Duration::from_secs(60));
                 continue;
             }
@@ -644,7 +831,7 @@ async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>)
         if use_quic {
             quic_failures = 0;
         }
-        shared.states.lock().unwrap().clear();
+        shared.feeds.lock().unwrap().clear();
         backoff = Duration::from_secs(1);
         let session_id = welcome["session_id"].as_str().unwrap_or("").to_string();
         let ingests = parse_ingests(&welcome);
@@ -677,21 +864,30 @@ async fn run(s: QuicSettings, mut rx: mpsc::Receiver<Item>, shared: Arc<Shared>)
         let reason = session(&mut link, &mut incoming, &mut rx, &shared, stats_every, &s).await;
 
         shared.connected.store(false, Ordering::Relaxed);
-        shared.states.lock().unwrap().clear();
+        shared.feeds.lock().unwrap().clear();
         shared.link.lock().unwrap().connected = false;
         link.close();
+        if reason == SHUTDOWN {
+            return;
+        }
         tracing::warn!(
             "airframes quic: disconnected ({reason}); per-port feeding until reconnected"
         );
         last_disconnect = reason;
         reconnects += 1;
-        sleep_draining(&mut rx, Duration::from_secs(1)).await;
+        if !sleep_draining(&mut rx, Duration::from_secs(1)).await {
+            return;
+        }
     }
 }
 
+/// Session end reason when the last [`Uplink`] handle is gone.
+const SHUTDOWN: &str = "shutting down";
+
 /// Connects once, says HELLO and returns the gateway's WELCOME (what it
 /// takes, limits, the account it sees), then closes. For `xng airframes
-/// ingests`.
+/// ingests`. With `quic` (auto), a QUIC connection that gives no WELCOME
+/// is retried over TLS, as the uplink would.
 pub async fn probe(s: &QuicSettings) -> anyhow::Result<(Value, &'static str)> {
     let dialer = Dialer::new(s)?;
     let mut last = None;
@@ -703,7 +899,7 @@ pub async fn probe(s: &QuicSettings) -> anyhow::Result<(Value, &'static str)> {
     for &quic in tries {
         match dial(&dialer, quic).await {
             Ok((link, mut incoming)) => {
-                let tok = token(&s.credentials).await;
+                let tok = token(s).await;
                 let hello = json!({
                     "v": VERSION,
                     "token": tok.as_ref().map(|t| t.token.clone()),
@@ -711,17 +907,18 @@ pub async fn probe(s: &QuicSettings) -> anyhow::Result<(Value, &'static str)> {
                     "instance_id": format!("probe-{}", uuid::Uuid::new_v4()),
                 });
                 link.ctrl().send(frame(HELLO, hello.to_string().as_bytes())).await?;
-                let r = tokio::time::timeout(Duration::from_secs(10), incoming.recv()).await;
+                let r = await_welcome(&mut incoming).await;
                 let transport = link.transport();
                 link.close();
-                return match r {
-                    Ok(Some((WELCOME, p))) => Ok((serde_json::from_slice(&p)?, transport)),
-                    Ok(Some((ERROR, p))) => {
-                        let e: Value = serde_json::from_slice(&p).unwrap_or_default();
+                match r {
+                    Reply::Welcome(w) => return Ok((w, transport)),
+                    Reply::Refused(e) => {
                         anyhow::bail!("gateway refused: {}", e["message"].as_str().unwrap_or("?"))
                     }
-                    _ => anyhow::bail!("no WELCOME from {}", s.endpoint),
-                };
+                    Reply::Failed(why) => {
+                        last = Some(anyhow::anyhow!("{why} from {} over {transport}", s.endpoint))
+                    }
+                }
             }
             Err(e) => last = Some(e),
         }
@@ -739,14 +936,14 @@ pub fn parse_ingests(welcome: &Value) -> Option<Vec<(String, String)>> {
     )
 }
 
-/// Waits, discarding queued items (the router already fell back for any
-/// message sent while disconnected; these raced the disconnect).
-async fn sleep_draining(rx: &mut mpsc::Receiver<Item>, d: Duration) {
+/// Waits, discarding open requests (they are made again by the next
+/// message). False when the last [`Uplink`] handle is gone: stop.
+async fn sleep_draining(rx: &mut mpsc::Receiver<Item>, d: Duration) -> bool {
     let until = tokio::time::Instant::now() + d;
     loop {
         tokio::select! {
-            _ = tokio::time::sleep_until(until) => return,
-            m = rx.recv() => if m.is_none() { std::future::pending::<()>().await },
+            _ = tokio::time::sleep_until(until) => return true,
+            m = rx.recv() => if m.is_none() { return false },
         }
     }
 }
@@ -759,8 +956,11 @@ async fn session(
     stats_every: Duration,
     s: &QuicSettings,
 ) -> String {
-    let mut feeds: HashMap<String, FeedConn> = HashMap::new();
-    let mut by_tcp_id: HashMap<u16, String> = HashMap::new();
+    // The feeds this session opened (TCP: by stream id for OPENED).
+    let mut feeds: HashMap<String, Arc<Feed>> = HashMap::new();
+    let mut by_tcp_id: HashMap<u16, (String, Arc<Feed>)> = HashMap::new();
+    // QUIC feed streams that ended, from their reader tasks.
+    let (ended_tx, mut ended) = mpsc::unbounded_channel::<(String, Arc<Feed>)>();
     let mut stats = tokio::time::interval(stats_every);
     stats.tick().await;
     let mut last_rx = Instant::now();
@@ -768,30 +968,41 @@ async fn session(
     loop {
         tokio::select! {
             item = rx.recv() => {
-                let Some(item) = item else { return "shutting down".into() };
+                let Some(item) = item else { return SHUTDOWN.into() };
                 let key = item.spec.key.clone();
-                if !feeds.contains_key(&key) {
-                    match open_feed(link, &item.spec, shared).await {
-                        Ok(f) => {
-                            if let Some(id) = f.tcp_id {
-                                by_tcp_id.insert(id, key.clone());
-                            }
-                            feeds.insert(key.clone(), f);
+                let Some(feed) = shared.feeds.lock().unwrap().get(&key).cloned() else { continue };
+                if feeds.get(&key).is_some_and(|f| Arc::ptr_eq(f, &feed)) {
+                    continue;
+                }
+                match tokio::time::timeout(OPEN_TIMEOUT, open_feed(link, &item.spec, &feed, &ended_tx)).await {
+                    Ok(Ok(tcp_id)) => {
+                        if let Some(id) = tcp_id {
+                            by_tcp_id.insert(id, (key.clone(), feed.clone()));
                         }
-                        Err(e) => return format!("open feed: {e:#}"),
+                        feeds.insert(key, feed);
+                    }
+                    Ok(Err(e)) => {
+                        if let Link::Quic { conn, .. } = link {
+                            if conn.close_reason().is_some() {
+                                return format!("open feed: {e:#}");
+                            }
+                        }
+                        tracing::warn!("airframes quic: feed {key} not opened ({e:#}); retried with its next message");
+                        shared.forget(&key, &feed);
+                    }
+                    Err(_) => {
+                        tracing::warn!("airframes quic: feed {key} not opened in {OPEN_TIMEOUT:?}; retried with its next message");
+                        shared.forget(&key, &feed);
                     }
                 }
-                let f = feeds.get(&key).unwrap();
-                let Some(msg) = item.msg else { continue };
-                f.decoded.fetch_add(1, Ordering::Relaxed);
-                f.last_us.store(item.capture_us, Ordering::Relaxed);
-                let payload = data_payload(item.capture_us, &msg);
-                let fr = match f.tcp_id { Some(id) => stream_frame(id, DATA, &payload), None => frame(DATA, &payload) };
-                if f.tx.try_send(fr).is_ok() {
-                    f.sent.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    f.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Some((key, feed)) = ended.recv() => {
+                // Its stream ended with the connection still up: the next
+                // message opens it again (or goes per port meanwhile).
+                if feeds.get(&key).is_some_and(|f| Arc::ptr_eq(f, &feed)) {
+                    feeds.remove(&key);
                 }
+                shared.forget(&key, &feed);
             }
             fr = incoming.recv() => {
                 let Some((t, p)) = fr else { return "connection lost".into() };
@@ -811,7 +1022,7 @@ async fn session(
                     NOTICE => {
                         let v: Value = serde_json::from_slice(&p).unwrap_or_default();
                         if v["code"] == "token_expiring" {
-                            if let Some(t) = token(&s.credentials).await {
+                            if let Some(t) = token(s).await {
                                 let _ = link.ctrl().send(frame(REAUTH, json!({"token": t.token}).to_string().as_bytes())).await;
                             }
                         } else {
@@ -827,8 +1038,8 @@ async fn session(
                         // TCP: OPENED for a feed.
                         if p.len() >= 6 && p[2] == OPENED {
                             let id = u16::from_be_bytes([p[0], p[1]]);
-                            if let Some(f) = by_tcp_id.get(&id).and_then(|k| feeds.get(k)) {
-                                opened(&f.state, &p[6..], by_tcp_id.get(&id).unwrap());
+                            if let Some((key, f)) = by_tcp_id.get(&id) {
+                                opened(f, &p[6..], key);
                             }
                         }
                     }
@@ -842,15 +1053,12 @@ async fn session(
                 }
             }
             _ = stats.tick() => {
-                let list: Vec<Value> = feeds.iter().map(|(k, f)| json!({
-                    "key": k,
-                    "decoded": f.decoded.load(Ordering::Relaxed),
-                    "sent": f.sent.load(Ordering::Relaxed),
-                    "dropped": f.dropped.load(Ordering::Relaxed),
-                    "last_decode_us": f.last_us.load(Ordering::Relaxed),
-                    "sdr": { "state": "ok" },
-                })).collect();
-                let st = json!({ "feeds": list, "uptime_s": shared.started.elapsed().as_secs(), "clock": clock_state() });
+                let list: Vec<Value> = feeds.iter().map(|(k, f)| {
+                    let mut v = f.json(k);
+                    v["sdr"] = json!({ "state": "ok" });
+                    v
+                }).collect();
+                let st = json!({ "feeds": list, "uptime_s": shared.started.elapsed().as_secs(), "clock": shared.clock() });
                 let _ = link.ctrl().try_send(frame(STATS, st.to_string().as_bytes()));
             }
             _ = watchdog.tick() => {
@@ -868,12 +1076,20 @@ async fn session(
     }
 }
 
-fn opened(state: &AtomicU8, payload: &[u8], key: &str) {
+/// OPENED for a feed: accepted (send what it held, then take messages) or
+/// refused (drop what it held; per port from now on).
+fn opened(feed: &Feed, payload: &[u8], key: &str) {
     let v: Value = serde_json::from_slice(payload).unwrap_or_default();
+    let mut held = feed.held.lock().unwrap();
     if v["ok"].as_bool() == Some(true) {
-        state.store(OPEN_OK, Ordering::Relaxed);
+        for p in held.drain(..) {
+            let _ = feed.write(&p);
+        }
+        feed.state.store(OPEN_OK, Ordering::Relaxed);
     } else {
-        state.store(REFUSED, Ordering::Relaxed);
+        feed.dropped.fetch_add(held.len() as u64, Ordering::Relaxed);
+        held.clear();
+        feed.state.store(REFUSED, Ordering::Relaxed);
         tracing::warn!(
             "airframes quic: feed {key} refused ({}: {}); it stays on the per-port feed",
             v["code"].as_str().unwrap_or("?"),
@@ -882,59 +1098,46 @@ fn opened(state: &AtomicU8, payload: &[u8], key: &str) {
     }
 }
 
+/// Sends OPEN for a feed and sets its writer. Returns its TCP stream id.
 async fn open_feed(
     link: &mut Link,
     spec: &FeedSpec,
-    shared: &Arc<Shared>,
-) -> anyhow::Result<FeedConn> {
-    let format = spec.format;
+    feed: &Arc<Feed>,
+    ended: &mpsc::UnboundedSender<(String, Arc<Feed>)>,
+) -> anyhow::Result<Option<u16>> {
     let open = json!({
         "key": spec.key,
         "mode": spec.mode.as_str(),
-        "format": format,
+        "format": spec.format,
         "station_ident": spec.station_ident,
         "station_uuid": spec.station_uuid,
         "sdr": spec.sdr_id.as_ref().map(|id| json!({ "id": id })),
         "decoder": { "name": "xng", "version": env!("CARGO_PKG_VERSION") },
     });
-    let state = shared
-        .states
-        .lock()
-        .unwrap()
-        .entry(spec.key.clone())
-        .or_insert_with(|| Arc::new(AtomicU8::new(PENDING)))
-        .clone();
-    let mk = |tx, tcp_id| FeedConn {
-        tx,
-        state: state.clone(),
-        decoded: Arc::default(),
-        sent: Arc::default(),
-        dropped: Arc::default(),
-        last_us: Arc::default(),
-        tcp_id,
-    };
     match link {
         Link::Quic { conn, .. } => {
             let (mut send, mut recv) = conn.open_bi().await?;
             send.write_all(&frame(OPEN, open.to_string().as_bytes()))
                 .await?;
-            let st = state.clone();
-            let key = spec.key.clone();
+            *feed.writer.lock().unwrap() = Some((spawn_writer(send, FEED_QUEUE), None));
+            let (f, key, ended) = (feed.clone(), spec.key.clone(), ended.clone());
             tokio::spawn(async move {
                 while let Ok((t, p)) = read_frame(&mut recv).await {
                     if t == OPENED {
-                        opened(&st, &p, &key);
+                        opened(&f, &p, &key);
                     }
                 }
+                let _ = ended.send((key, f));
             });
-            Ok(mk(spawn_writer(send, FEED_QUEUE), None))
+            Ok(None)
         }
-        Link::Tcp { out, next_id } => {
+        Link::Tcp { out, next_id, .. } => {
             *next_id = next_id.wrapping_add(1).max(1);
             let id = *next_id;
             out.send(stream_frame(id, OPEN, open.to_string().as_bytes()))
                 .await?;
-            Ok(mk(out.clone(), Some(id)))
+            *feed.writer.lock().unwrap() = Some((out.clone(), Some(id)));
+            Ok(Some(id))
         }
     }
 }
@@ -942,7 +1145,7 @@ async fn open_feed(
 fn command(
     cmd: &Value,
     link: &Link,
-    feeds: &HashMap<String, FeedConn>,
+    feeds: &HashMap<String, Arc<Feed>>,
     shared: &Arc<Shared>,
 ) -> Value {
     let id = cmd["id"].clone();
@@ -951,15 +1154,9 @@ fn command(
         "status" => json!({
             "version": env!("CARGO_PKG_VERSION"),
             "uptime_s": shared.started.elapsed().as_secs(),
-            "feeds": feeds.iter().map(|(k, f)| json!({
-                "key": k,
-                "decoded": f.decoded.load(Ordering::Relaxed),
-                "sent": f.sent.load(Ordering::Relaxed),
-                "dropped": f.dropped.load(Ordering::Relaxed),
-                "open": f.state.load(Ordering::Relaxed) == OPEN_OK,
-            })).collect::<Vec<_>>(),
+            "feeds": feeds.iter().map(|(k, f)| f.json(k)).collect::<Vec<_>>(),
         }),
-        "clock" => clock_state(),
+        "clock" => shared.clock(),
         "net" => {
             let l = shared.link.lock().unwrap().clone();
             let mut v = json!({ "transport": link.transport(), "rtt_ms": l.rtt_ms, "reconnects": l.reconnects });
@@ -1001,6 +1198,37 @@ mod tests {
             assert_eq!(u16::from_be_bytes([p[0], p[1]]), 3);
             assert_eq!(p[2], OPEN);
         });
+    }
+
+    #[test]
+    fn held_messages_go_out_on_opened_and_are_dropped_on_refusal() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let f = Feed::new();
+        *f.writer.lock().unwrap() = Some((tx, Some(4)));
+        f.held.lock().unwrap().push(data_payload(1, b"a"));
+        f.held.lock().unwrap().push(data_payload(2, b"b"));
+        opened(&f, br#"{"ok":true}"#, "k");
+        assert_eq!(f.state.load(Ordering::Relaxed), OPEN_OK);
+        assert_eq!(f.sent.load(Ordering::Relaxed), 2);
+        assert!(rx.try_recv().is_ok() && rx.try_recv().is_ok());
+
+        let g = Feed::new();
+        g.held.lock().unwrap().push(data_payload(1, b"a"));
+        opened(&g, br#"{"ok":false,"code":"format"}"#, "k");
+        assert_eq!(g.state.load(Ordering::Relaxed), REFUSED);
+        assert_eq!(g.dropped.load(Ordering::Relaxed), 1);
+        assert!(g.held.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_full_writer_is_not_taken_and_a_closed_one_is_reported() {
+        let (tx, rx) = mpsc::channel(1);
+        let f = Feed::new();
+        *f.writer.lock().unwrap() = Some((tx, None));
+        assert_eq!(f.write(b"x"), Ok(true));
+        assert_eq!(f.write(b"y"), Ok(false), "full: per port instead");
+        drop(rx);
+        assert_eq!(f.write(b"z"), Err(()));
     }
 
     #[test]
