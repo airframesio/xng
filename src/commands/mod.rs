@@ -1,3 +1,4 @@
+pub mod airframes;
 pub mod atc;
 pub mod atc_setup;
 pub mod devices;

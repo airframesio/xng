@@ -134,6 +134,18 @@ pub struct AirframesToml {
     pub iridium: Option<AirframesModeToml>,
     /// Radiosondes (payload summaries to the sonde intake, UDP 5573).
     pub sonde: Option<AirframesModeToml>,
+    /// `ports` (default: one UDP/TCP/HTTP ingest per mode) or `quic`: every
+    /// feed as its own stream on one connection to the feed gateway (TLS
+    /// over TCP when UDP is blocked), per port while it is down. Also
+    /// `quic-only` and `tls`. Sondes always go per port.
+    pub transport: Option<String>,
+    /// Feed gateway `host:port` (default feed.airframes.io:5580).
+    pub quic_endpoint: Option<String>,
+    /// PEM certificate/CA to trust for a self-hosted feed gateway.
+    pub quic_ca: Option<std::path::PathBuf>,
+    /// Lab only: no certificate check for the feed gateway.
+    #[serde(default)]
+    pub quic_insecure: bool,
 }
 
 /// Per-mode override block under `[outputs.airframes.<mode>]`.
@@ -252,6 +264,9 @@ impl StationFile {
         if let Some(a) = &mut self.outputs.airband.atc {
             fix(&mut a.credentials);
             fix(&mut a.ca);
+        }
+        if let Some(a) = &mut self.outputs.airframes {
+            fix(&mut a.quic_ca);
         }
         for s in &mut self.sessions {
             fix(&mut s.file);
@@ -472,6 +487,18 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
         return AirframesRouter::default();
     }
 
+    let quic = match crate::outputs::airframes_quic::QuicSettings::for_transport(
+        af.transport.as_deref(),
+        af.quic_endpoint.clone(),
+        af.quic_ca.clone(),
+        af.quic_insecure,
+    ) {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::error!("{e:#}; feeding per port");
+            None
+        }
+    };
     let base = af.station_id.clone().unwrap_or_else(|| f.station_id.clone());
     let base_uuid = af
         .station_uuid
@@ -479,6 +506,7 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
         .or_else(|| f.station_uuid.clone())
         .or_else(crate::outputs::station_uuid::from_env);
     let mut routes = Vec::new();
+    let mut gateway_only = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
     for sess in &f.sessions {
@@ -493,26 +521,6 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
         if mode_cfg.and_then(|m| m.enabled) == Some(false) {
             continue;
         }
-        let Some((dhost, dport, proto)) = default_endpoint(mode) else {
-            // STD-C/ADS-B/UAT/...: no per-port ingest.
-            if mode_cfg.is_some() {
-                tracing::info!(
-                    "airframes: {} has no public per-port ingest — fed via asf-2.0 only",
-                    mode.as_str()
-                );
-            }
-            continue;
-        };
-        if !has_serializer(mode) {
-            if mode_cfg.is_some() {
-                tracing::info!(
-                    "airframes: {} feed configured but its native serializer isn't implemented yet — fed via asf-2.0 only",
-                    mode.as_str()
-                );
-            }
-            continue;
-        }
-
         // A session is one SDR (or a file); messages carry this id in their
         // provenance, letting the router target it precisely.
         let sdr_id = sess.sdr.clone().unwrap_or_else(|| "file".to_string());
@@ -534,6 +542,20 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
             (base.clone(), "base".to_string(), base_uuid.clone())
         };
         let station_uuid = crate::outputs::station_uuid::resolve(&slot, &station_id, explicit_uuid.as_deref());
+        let per_port = default_endpoint(mode).filter(|_| has_serializer(mode));
+        let Some((dhost, dport, proto)) = per_port else {
+            if quic.is_some() && crate::outputs::airframes_quic::gateway_eligible(mode) {
+                // No per-port ingest: through the feed gateway once it lists the mode.
+                gateway_only.push((Some(sdr_id), mode, station_id, Some(station_uuid)));
+            } else if mode_cfg.is_some() {
+                tracing::info!(
+                    "airframes: {} has no public per-port ingest — fed via asf-2.0 only",
+                    mode.as_str()
+                );
+            }
+            continue;
+        };
+
         let host = mode_cfg.and_then(|m| m.host.clone()).unwrap_or_else(|| dhost.to_string());
         let port = mode_cfg.and_then(|m| m.port).unwrap_or(dport);
 
@@ -551,7 +573,10 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
         });
     }
 
-    AirframesRouter { routes }
+    let quic = quic.filter(|_| !routes.is_empty() || !gateway_only.is_empty());
+    let mut router = AirframesRouter { routes, quic };
+    crate::outputs::airframes::add_gateway_routes(&mut router, &gateway_only);
+    router
 }
 
 #[cfg(test)]
@@ -670,6 +695,31 @@ mode = "vdl2"
         assert_eq!(route.target.station_id, "KE-KSEA-TEST"); // verbatim, no suffix
         assert_eq!(route.target.port, 5550);
         assert_eq!(route.sdr_id.as_deref(), Some("driver=rtlsdr,serial=1"));
+    }
+
+    #[test]
+    fn airframes_transport_quic() {
+        let toml = r#"
+station-id = "KE-KSEA"
+[outputs.airframes]
+transport = "quic"
+quic-endpoint = "gw.example:5580"
+[[session]]
+sdr = "rtl-acars"
+mode = "acars"
+"#;
+        let f: StationFile = toml::from_str(toml).unwrap();
+        let q = airframes_router(&f).quic.expect("quic uplink");
+        // A mode with no per-port ingest is routed through the gateway only.
+        let with_stdc = format!("{toml}[[session]]\nsdr = \"rtl-stdc\"\nmode = \"std-c\"\n");
+        let r = airframes_router(&toml::from_str(&with_stdc).unwrap());
+        let stdc = r.routes.iter().find(|x| x.mode == Mode::StdC).expect("std-c route");
+        assert_eq!(stdc.target.proto, crate::outputs::airframes::Proto::Gateway);
+        assert_eq!(q.endpoint, "gw.example:5580");
+        assert_eq!(q.transport, "auto");
+        // Default: per-port only.
+        let f: StationFile = toml::from_str(&toml.replace("transport = \"quic\"\n", "")).unwrap();
+        assert!(airframes_router(&f).quic.is_none());
     }
 
     #[test]

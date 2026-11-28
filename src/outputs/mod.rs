@@ -11,6 +11,7 @@ pub mod airband_record;
 pub mod airband_udp;
 pub mod airband_web;
 pub mod airframes;
+pub mod airframes_quic;
 pub mod beast;
 pub mod asf2_grpc;
 pub mod asf2_quic;

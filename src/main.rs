@@ -166,6 +166,22 @@ struct OutputOpts {
     /// Station ident (e.g. XX-KSEA-ACARS1)
     #[arg(long)]
     station_id: Option<String>,
+    /// How --feed-airframes sends: `ports` (one UDP/TCP/HTTP ingest per
+    /// mode, the default) or `quic` (every feed as its own stream on one
+    /// connection to the feed gateway, TLS over TCP when UDP is blocked;
+    /// per-port while it is down). Also `quic-only` and `tls`.
+    #[arg(long)]
+    airframes_transport: Option<String>,
+    /// Feed gateway host:port for --airframes-transport quic
+    /// (default feed.airframes.io:5580)
+    #[arg(long)]
+    airframes_quic_endpoint: Option<String>,
+    /// PEM certificate/CA to trust for the feed gateway (self-hosted)
+    #[arg(long)]
+    airframes_quic_ca: Option<PathBuf>,
+    /// DANGEROUS: no certificate check for the feed gateway. Lab use only.
+    #[arg(long)]
+    airframes_quic_insecure: bool,
     /// Stream asf-2.0 over gRPC to this ingest URL (e.g. http://127.0.0.1:6001)
     #[arg(long)]
     asf2_grpc: Option<String>,
@@ -237,6 +253,31 @@ struct OutputOpts {
 }
 
 impl OutputOpts {
+    /// The Airframes per-mode router for a single-session command, with the
+    /// feed gateway uplink when `--airframes-transport quic` is given.
+    fn airframes_router(&self, station_ident: &str, modes: &[xng_types::Mode]) -> anyhow::Result<outputs::airframes::AirframesRouter> {
+        let mut r = outputs::airframes::cli_router(self.feed_airframes, station_ident, modes);
+        if self.feed_airframes {
+            r.quic = outputs::airframes_quic::QuicSettings::for_transport(
+                self.airframes_transport.as_deref(),
+                self.airframes_quic_endpoint.clone(),
+                self.airframes_quic_ca.clone(),
+                self.airframes_quic_insecure,
+            )?;
+            if r.quic.is_some() {
+                // Modes without a per-port ingest go through the gateway once it lists them.
+                let uuid = Some(outputs::station_uuid::resolve(
+                    "base",
+                    station_ident,
+                    outputs::station_uuid::from_env().as_deref(),
+                ));
+                let extra: Vec<_> = modes.iter().map(|&m| (None, m, station_ident.to_string(), uuid.clone())).collect();
+                outputs::airframes::add_gateway_routes(&mut r, &extra);
+            }
+        }
+        Ok(r)
+    }
+
     /// Turn the CLI output flags into an output config (default basemap) and
     /// the station identity they name.
     fn build(&self) -> anyhow::Result<(runtime::OutputConfig, String)> {
@@ -499,6 +540,11 @@ enum Command {
         #[command(subcommand)]
         cmd: commands::atc::AtcCommand,
     },
+    /// Airframes feed gateway: see what it takes (`xng airframes ingests`)
+    Airframes {
+        #[command(subcommand)]
+        cmd: commands::airframes::AirframesCommand,
+    },
     /// Run the built-in pipeline self-test (bus + outputs + DSP sanity)
     Selftest {
         /// Also write messages to this JSONL file
@@ -559,8 +605,7 @@ fn main() -> anyhow::Result<()> {
             let (tune, airband) = auto_channels(&tune, &airband, true)?;
             let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
             let (mut outputs, station_ident) = output.build()?;
-            outputs.airframes =
-                Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
+            outputs.airframes = Some(output.airframes_router(&station_ident, &[mode])?);
             outputs.airband = airband.outputs()?;
             let airband_session = airband.session()?;
             let source = if is_stdin {
@@ -605,8 +650,7 @@ fn main() -> anyhow::Result<()> {
             let fmt: commands::extern_cmd::ExternFormat =
                 format.parse().map_err(|e: String| anyhow::anyhow!(e))?;
             let (mut outputs, station_ident) = output.build()?;
-            outputs.airframes = Some(outputs::airframes::cli_router(
-                output.feed_airframes,
+            let mut router = output.airframes_router(
                 &station_ident,
                 &[
                     xng_types::Mode::AcarsPoa,
@@ -614,7 +658,13 @@ fn main() -> anyhow::Result<()> {
                     xng_types::Mode::Hfdl,
                     xng_types::Mode::Ais,
                 ],
-            ));
+            )?;
+            // Two extern runs (different decoders) under one station id
+            // must not share a gateway session.
+            if let Some(q) = &mut router.quic {
+                q.instance_tag = format!("extern-{format}");
+            }
+            outputs.airframes = Some(router);
             commands::extern_cmd::run(fmt, &command, station_ident, outputs)
         }
         Command::Survey {
@@ -730,6 +780,7 @@ fn main() -> anyhow::Result<()> {
             commands::ingest::run(grpc, quic, quic_cert_out.as_deref())
         }
         Command::Atc { cmd } => commands::atc::run(cmd),
+        Command::Airframes { cmd } => commands::airframes::run(cmd),
         Command::Selftest { jsonl, json } => commands::selftest::run(jsonl.as_deref(), json),
     }
 }
@@ -915,8 +966,7 @@ fn listen(
     let (tune, airband) = (&tune, &airband);
     let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
     let (mut outputs, station_ident) = output.build()?;
-    outputs.airframes =
-        Some(outputs::airframes::cli_router(output.feed_airframes, &station_ident, &[mode]));
+    outputs.airframes = Some(output.airframes_router(&station_ident, &[mode])?);
     outputs.airband = airband.outputs()?;
     let airband_session = airband.session()?;
     let serial = sdr_args::SdrArgs::parse(sdr).serial;

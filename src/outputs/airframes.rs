@@ -39,6 +39,10 @@ pub enum Proto {
     Tcp,
     /// HTTP POST of batched JSON (the AIS intake).
     Http,
+    /// Only through the feed gateway (`transport = "quic"`): a mode with no
+    /// per-port ingest, sent while the gateway lists it and dropped
+    /// otherwise.
+    Gateway,
 }
 
 /// A resolved Airframes ingest endpoint plus the station id to stamp.
@@ -71,6 +75,10 @@ pub struct Route {
 #[derive(Clone, Debug, Default)]
 pub struct AirframesRouter {
     pub routes: Vec<Route>,
+    /// Send every feed as its own stream on one connection to the Airframes
+    /// feed gateway, falling back to the per-port ingests while it is down
+    /// (`transport = "quic"`). See [`crate::outputs::airframes_quic`].
+    pub quic: Option<crate::outputs::airframes_quic::QuicSettings>,
 }
 
 impl AirframesRouter {
@@ -209,7 +217,7 @@ pub fn cli_router(feed: bool, station_id: &str, modes: &[Mode]) -> AirframesRout
             })
         })
         .collect();
-    AirframesRouter { routes }
+    AirframesRouter { routes, quic: None }
 }
 
 /// Serialize a message into its mode's native Airframes line/datagram
@@ -259,12 +267,13 @@ const TCP_QUEUE: usize = 4096;
 struct TcpFeed {
     tx: mpsc::Sender<Vec<u8>>,
     dropped: u64,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl TcpFeed {
     fn spawn(endpoint: String) -> Self {
         let (tx, mut rx) = mpsc::channel::<Vec<u8>>(TCP_QUEUE);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut backoff = Duration::from_secs(1);
             // A line that failed to write is retried on the next connection.
             let mut pending: Option<Vec<u8>> = None;
@@ -299,7 +308,7 @@ impl TcpFeed {
                 }
             }
         });
-        Self { tx, dropped: 0 }
+        Self { tx, dropped: 0, task }
     }
 
     fn send(&mut self, mut line: Vec<u8>, endpoint: &str) -> bool {
@@ -328,20 +337,26 @@ const AIS_INTERVAL: Duration = Duration::from_secs(5);
 /// in AIS-catcher's `jsonaiscatcher` envelope under the feed's station id.
 struct AisBatcher {
     tx: mpsc::Sender<serde_json::Value>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl AisBatcher {
     fn spawn(url: String, station: String, station_uuid: Option<String>) -> Self {
         let (tx, mut rx) = mpsc::channel::<serde_json::Value>(AIS_BATCH * 4);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
             let mut queue: VecDeque<serde_json::Value> = VecDeque::new();
             let mut dropped: u64 = 0;
             let mut tick = tokio::time::interval(AIS_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            // The bus closed: post what is queued once more, then end.
+            let mut closed = false;
             loop {
+                if closed && queue.is_empty() {
+                    break;
+                }
                 tokio::select! {
-                    m = rx.recv() => match m {
+                    m = rx.recv(), if !closed => match m {
                         Some(m) => {
                             queue.push_back(m);
                             while queue.len() > AIS_QUEUE {
@@ -352,7 +367,7 @@ impl AisBatcher {
                                 }
                             }
                         }
-                        None => break,
+                        None => closed = true,
                     },
                     _ = tick.tick() => {
                         while !queue.is_empty() {
@@ -375,11 +390,15 @@ impl AisBatcher {
                                 }
                             }
                         }
+                        if closed && !queue.is_empty() {
+                            tracing::warn!("airframes ais: {} message(s) not posted at shutdown", queue.len());
+                            break;
+                        }
                     }
                 }
             }
         });
-        Self { tx }
+        Self { tx, task }
     }
 }
 
@@ -403,6 +422,16 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
     let mut sent: u64 = 0;
     let mut tcp: HashMap<String, TcpFeed> = HashMap::new();
     let mut ais: HashMap<(String, String, Option<String>), AisBatcher> = HashMap::new();
+    let uplink = router.quic.clone().map(|mut q| {
+        // A caller's tag (xng extern: the decoder format) plus the routes.
+        q.instance_tag = match q.instance_tag.as_str() {
+            "" => instance_tag(&router),
+            t => format!("{t}-{}", instance_tag(&router)),
+        };
+        crate::outputs::airframes_quic::Uplink::spawn(q)
+    });
+    let mut via_quic: u64 = 0;
+    let mut gateway_dropped: u64 = 0;
     loop {
         match rx.recv().await {
             Ok(msg) => {
@@ -410,8 +439,18 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                 let Some(target) = router.resolve(msg.mode, sdr_id) else {
                     continue;
                 };
+                if let Some(up) = &uplink {
+                    if quic_send(up, &msg, sdr_id, target, target.proto == Proto::Gateway) {
+                        via_quic += 1;
+                        continue;
+                    }
+                }
                 let endpoint = target.endpoint();
                 match target.proto {
+                    Proto::Gateway => {
+                        // Gateway-only mode the gateway does not take (now).
+                        gateway_dropped += 1;
+                    }
                     Proto::Udp => {
                         if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id, target.station_uuid.as_deref()) {
                             match socket.send_to(&bytes, &endpoint).await {
@@ -451,8 +490,96 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }
-    tracing::info!("airframes output: {sent} message(s) sent");
+    tracing::info!("airframes output: {sent} message(s) sent per port, {via_quic} over the feed gateway, {gateway_dropped} not taken");
+    drain_writers(tcp, ais).await;
     Ok(())
+}
+
+/// How long finishing (a decoded file, `xng extern` input that ended) waits
+/// for the per-port writers to send what they queued.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Lets the TCP and AIS writers finish their queues (they end once their
+/// sender is dropped), up to [`DRAIN_TIMEOUT`] in all; says what did not.
+async fn drain_writers(tcp: HashMap<String, TcpFeed>, ais: HashMap<(String, String, Option<String>), AisBatcher>) {
+    let mut tasks: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
+    for (endpoint, f) in tcp {
+        drop(f.tx);
+        tasks.push((endpoint, f.task));
+    }
+    for ((endpoint, _, _), b) in ais {
+        drop(b.tx);
+        tasks.push((endpoint, b.task));
+    }
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+    for (endpoint, mut task) in tasks {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            tracing::warn!("airframes output: {endpoint} did not take all queued messages before exit");
+        }
+    }
+}
+
+/// A short stable tag for what this process feeds (its routes), so the
+/// gateway tells two xng processes on one host apart.
+fn instance_tag(router: &AirframesRouter) -> String {
+    let mut keys: Vec<String> = router
+        .routes
+        .iter()
+        .map(|r| format!("{}:{}:{}", r.sdr_id.as_deref().unwrap_or("any"), r.mode.as_str(), r.target.station_id))
+        .collect();
+    keys.sort();
+    // FNV-1a: stable across builds (std's hasher is not guaranteed to be).
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in keys.join(",").bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    format!("{:08x}", h as u32)
+}
+
+/// Offer a message to the feed gateway uplink. False: send it per port.
+/// `hold`: a gateway-only mode, kept until the gateway decides on its feed.
+fn quic_send(up: &crate::outputs::airframes_quic::Uplink, msg: &Message, sdr_id: Option<&str>, target: &AirframesTarget, hold: bool) -> bool {
+    use crate::outputs::airframes_quic::{xng_payload, FeedSpec, XNG_FORMAT};
+    let Some(format) = up.wire_format(msg.mode) else { return false };
+    let bytes = if format == XNG_FORMAT {
+        let Some(b) = xng_payload(msg, &target.station_id) else { return false };
+        b
+    } else if msg.mode == Mode::Ais {
+        // One single-message batch body per DATA frame (the AIS intake's shape).
+        let Some(v) = crate::outputs::aiscatcher_json::format_aiscatcher(msg) else { return false };
+        crate::outputs::aiscatcher_json::envelope(&target.station_id, target.station_uuid.as_deref(), vec![v]).to_string().into_bytes()
+    } else {
+        let Some(b) = serialize(msg, msg.mode, &target.station_id, target.station_uuid.as_deref()) else { return false };
+        b
+    };
+    let spec = FeedSpec {
+        key: format!("{}:{}:{}", sdr_id.unwrap_or("any"), msg.mode.as_str(), target.station_id),
+        mode: msg.mode,
+        format,
+        station_ident: target.station_id.clone(),
+        station_uuid: target.station_uuid.clone(),
+        sdr_id: sdr_id.map(str::to_string),
+    };
+    let capture_us = msg.timestamp.timestamp_micros().max(0) as u64;
+    up.send(&spec, capture_us, bytes, hold)
+}
+
+/// Routes for modes that have no per-port ingest but can go through the
+/// feed gateway (sent while it lists them). `station_id` gives each mode's id.
+pub fn add_gateway_routes(router: &mut AirframesRouter, modes: &[(Option<String>, Mode, String, Option<String>)]) {
+    for (sdr_id, mode, station_id, station_uuid) in modes {
+        if !crate::outputs::airframes_quic::gateway_eligible(*mode)
+            || router.routes.iter().any(|r| r.mode == *mode && r.sdr_id == *sdr_id)
+        {
+            continue;
+        }
+        router.routes.push(Route {
+            sdr_id: sdr_id.clone(),
+            mode: *mode,
+            target: AirframesTarget { host: String::new(), port: 0, proto: Proto::Gateway, station_id: station_id.clone(), station_uuid: station_uuid.clone() },
+        });
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +622,7 @@ mod tests {
                     },
                 },
             ],
+            quic: None,
         };
         assert_eq!(r.resolve(Mode::AcarsPoa, Some("rtl0")).unwrap().station_id, "EXACT");
         assert_eq!(r.resolve(Mode::AcarsPoa, Some("other")).unwrap().station_id, "WILD");

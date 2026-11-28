@@ -39,6 +39,7 @@ http = "0.0.0.0:8080"          # live web dashboard (map + messages)
 # enabled = true
 # station-id = "XX-KSEA"        # base; defaults to the top-level station-id
 # auto-suffix = true            # XX-KSEA -> XX-KSEA-ACARS / -VDL2 / -HFDL / -AIS / -IMSL / -IRDM / -SONDE
+# transport = "quic"            # every feed on one connection to feed.airframes.io:5580 (preview)
 # [outputs.airframes.hfdl]
 # enabled = false               # decode HFDL locally, do not feed it
 # [outputs.airframes.aero]      # aero-l and aero-c sessions
