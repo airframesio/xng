@@ -42,6 +42,10 @@ use xng_types::Mode;
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct StationFile {
     pub station_id: String,
+    /// The station's UUID on Airframes (see `outputs::station_uuid`). Keeps
+    /// the feed on its station when the station is renamed. Optional: xng
+    /// keeps one per station by itself.
+    pub station_uuid: Option<String>,
     #[serde(default)]
     pub outputs: OutputsToml,
     #[serde(rename = "session")]
@@ -115,6 +119,8 @@ pub struct AirframesToml {
     pub enabled: bool,
     /// Base station id; defaults to the top-level `station-id`.
     pub station_id: Option<String>,
+    /// UUID of the base station; defaults to the top-level `station-uuid`.
+    pub station_uuid: Option<String>,
     /// Derive a per-mode station id by appending the mode suffix
     /// (e.g. `KE-KSEA` → `KE-KSEA-ACARS`). Off by default (id used verbatim).
     #[serde(default)]
@@ -138,6 +144,8 @@ pub struct AirframesModeToml {
     pub enabled: Option<bool>,
     /// Station id for this mode (overrides `auto-suffix` and the base).
     pub station_id: Option<String>,
+    /// UUID of that station (with `station-id`).
+    pub station_uuid: Option<String>,
     /// Override the ingest host (default: the verified public ingest).
     pub host: Option<String>,
     /// Override the ingest port.
@@ -202,6 +210,8 @@ pub struct SessionToml {
     pub feed: Option<bool>,
     /// Override the Airframes station id used for this decoder's messages.
     pub airframes_station_id: Option<String>,
+    /// UUID of that station (with `airframes-station-id`).
+    pub airframes_station_uuid: Option<String>,
     /// Airband channel defaults, per-channel overrides and the mix stream.
     #[serde(default)]
     pub airband: crate::airband::AirbandConfig,
@@ -463,6 +473,11 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
     }
 
     let base = af.station_id.clone().unwrap_or_else(|| f.station_id.clone());
+    let base_uuid = af
+        .station_uuid
+        .clone()
+        .or_else(|| f.station_uuid.clone())
+        .or_else(crate::outputs::station_uuid::from_env);
     let mut routes = Vec::new();
     let mut seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
 
@@ -498,12 +513,27 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
             continue;
         }
 
-        let station_id = sess
-            .airframes_station_id
-            .clone()
-            .or_else(|| mode_cfg.and_then(|m| m.station_id.clone()))
-            .or_else(|| af.auto_suffix.then(|| auto_suffix(&base, mode)))
-            .unwrap_or_else(|| base.clone());
+        // A session is one SDR (or a file); messages carry this id in their
+        // provenance, letting the router target it precisely.
+        let sdr_id = sess.sdr.clone().unwrap_or_else(|| "file".to_string());
+        // The station and its UUID slot: where its name is set, so renaming
+        // it keeps the UUID (see `outputs::station_uuid`).
+        // AeroL and AeroC share one `[outputs.airframes.aero]` block and one
+        // auto-suffixed ident, so they share their mode/base slots too.
+        let slot_mode = match mode {
+            Mode::AeroL | Mode::AeroC => "aero",
+            m => m.as_str(),
+        };
+        let (station_id, slot, explicit_uuid) = if let Some(id) = &sess.airframes_station_id {
+            (id.clone(), format!("session:{sdr_id}:{}", mode.as_str()), sess.airframes_station_uuid.clone())
+        } else if let Some(id) = mode_cfg.and_then(|m| m.station_id.clone()) {
+            (id, format!("mode:{slot_mode}"), mode_cfg.and_then(|m| m.station_uuid.clone()))
+        } else if af.auto_suffix {
+            (auto_suffix(&base, mode), format!("base:{slot_mode}"), None)
+        } else {
+            (base.clone(), "base".to_string(), base_uuid.clone())
+        };
+        let station_uuid = crate::outputs::station_uuid::resolve(&slot, &station_id, explicit_uuid.as_deref());
         let host = mode_cfg.and_then(|m| m.host.clone()).unwrap_or_else(|| dhost.to_string());
         let port = mode_cfg.and_then(|m| m.port).unwrap_or(dport);
 
@@ -514,13 +544,10 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
             );
         }
 
-        // A station session is one SDR (or a file); messages carry this id in
-        // their provenance, letting the router target it precisely.
-        let sdr_id = sess.sdr.clone().unwrap_or_else(|| "file".to_string());
         routes.push(Route {
             sdr_id: Some(sdr_id),
             mode,
-            target: AirframesTarget { host, port, proto, station_id },
+            target: AirframesTarget { host, port, proto, station_id, station_uuid: Some(station_uuid) },
         });
     }
 
@@ -672,6 +699,62 @@ airframes-station-id = "KE-KSEA-CUSTOM"
         let s3 = r.routes.iter().find(|x| x.sdr_id.as_deref() == Some("rtl-acars3")).unwrap();
         assert_eq!(s3.target.station_id, "KE-KSEA-CUSTOM"); // session override wins
         assert!(r.routes.iter().all(|x| x.sdr_id.as_deref() != Some("rtl-acars2")));
+    }
+
+    #[test]
+    fn airframes_routes_carry_station_uuids() {
+        let toml = r#"
+station-id = "KE-UUID"
+station-uuid = "3F2B8C1E-7D4A-4C9E-9B1F-2A6E5D4C3B2A"
+[outputs.airframes]
+[outputs.airframes.vdl2]
+station-id = "KE-UUID-VDL2"
+station-uuid = "11111111-2222-4333-8444-555555555555"
+[[session]]
+sdr = "uuid-acars"
+mode = "acars"
+[[session]]
+sdr = "uuid-vdl2"
+mode = "vdl2"
+[[session]]
+sdr = "uuid-hfdl"
+mode = "hfdl"
+airframes-station-id = "KE-UUID-HF"
+"#;
+        let f: StationFile = toml::from_str(toml).unwrap();
+        let r = airframes_router(&f);
+        let by = |sdr: &str| r.routes.iter().find(|x| x.sdr_id.as_deref() == Some(sdr)).unwrap();
+        // The base station takes the top-level UUID, lower-cased.
+        assert_eq!(by("uuid-acars").target.station_uuid.as_deref(), Some("3f2b8c1e-7d4a-4c9e-9b1f-2a6e5d4c3b2a"));
+        assert_eq!(by("uuid-vdl2").target.station_uuid.as_deref(), Some("11111111-2222-4333-8444-555555555555"));
+        // No UUID set: one is kept for the session's slot, first derived from
+        // its ident.
+        let hf = by("uuid-hfdl").target.station_uuid.clone().unwrap();
+        assert!(crate::outputs::station_uuid::parse(&hf).is_some());
+        assert_eq!(airframes_router(&f).routes[2].target.station_uuid.as_deref(), Some(hf.as_str()));
+    }
+
+    #[test]
+    fn aero_l_and_aero_c_share_one_station_uuid() {
+        // Both read `[outputs.airframes.aero]`, so they feed one station.
+        // After a rename, a newly added aero-c session must keep the UUID
+        // the aero-l one saved.
+        let tag = uuid::Uuid::new_v4().simple().to_string()[..8].to_uppercase();
+        let old = format!(
+            "station-id = \"KE-{tag}\"\n[outputs.airframes]\n[outputs.airframes.aero]\nstation-id = \"KE-{tag}-OLD\"\n[[session]]\nsdr = \"aero-l\"\nmode = \"aero-l\"\n"
+        );
+        let f: StationFile = toml::from_str(&old).unwrap();
+        let first = airframes_router(&f).routes[0].target.station_uuid.clone().unwrap();
+        let renamed = format!(
+            "{}[[session]]\nsdr = \"aero-c\"\nmode = \"aero-c\"\n",
+            old.replace("-OLD", "-NEW")
+        );
+        let f: StationFile = toml::from_str(&renamed).unwrap();
+        let r = airframes_router(&f);
+        assert_eq!(r.routes.len(), 2);
+        for route in &r.routes {
+            assert_eq!(route.target.station_uuid.as_deref(), Some(first.as_str()));
+        }
     }
 
     #[test]

@@ -1208,6 +1208,7 @@ fn spawn_airband_outputs(
             });
             let info = crate::outputs::atc_feed::StationInfo {
                 name: atc.station_name.clone().unwrap_or_else(|| station.ident.clone()),
+                uuid: None,
                 lat: pos.map(|p| p.0),
                 lon: pos.map(|p| p.1),
                 alt_m: None,

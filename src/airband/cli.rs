@@ -112,6 +112,11 @@ pub struct AirbandOpts {
     /// Station name shown to ATC listeners
     #[arg(long)]
     pub atc_station_name: Option<String>,
+    /// UUID of an existing Airframes ATC station of your account to feed as
+    /// (default: the one xng keeps, see station-uuids.json)
+    /// (or XNG_ATC_STATION_UUID)
+    #[arg(long)]
+    pub atc_station_uuid: Option<String>,
     /// Don't show your account's username next to this feeder's feeds
     #[arg(long)]
     pub atc_hide_username: bool,
@@ -294,6 +299,7 @@ impl AirbandOpts {
             ca: self.atc_ca.clone(),
             insecure: self.atc_insecure,
             station_name: self.atc_station_name.clone(),
+            station_uuid: self.atc_station_uuid.clone(),
             hide_username: self.atc_hide_username,
             bitrate: self.atc_bitrate,
             catalog_match: !self.atc_no_catalog_match,

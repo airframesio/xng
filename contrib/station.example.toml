@@ -1,6 +1,7 @@
 # xng station configuration — the whole receive site in one process.
 #   xng station station.toml
 station-id = "XX-KSEA-1"
+# station-uuid = "…"   # the station's UUID on Airframes (keeps its feed when renamed)
 
 [outputs]
 feed-airframes = true
@@ -52,6 +53,7 @@ center = "131.000M"
 channels = ["130.025", "131.125", "131.550", "131.725"]
 # feed = false                          # disable Airframes feed for this decoder
 # airframes-station-id = "XX-KSEA-ACARS2"  # override the station id for it
+# airframes-station-uuid = "…"             # and that station's UUID
 
 [[session]]
 sdr = "driver=airspy"          # rate/center/channels derive from the
