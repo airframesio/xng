@@ -175,11 +175,12 @@ impl std::str::FromStr for DmeChannel {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim().to_ascii_uppercase();
-        let (num, band) = s.split_at(s.len().saturating_sub(1));
-        let band = match band {
-            "X" => Band::X,
-            "Y" => Band::Y,
-            _ => return Err(format!("not a DME channel: {s}")),
+        let (num, band) = if let Some(n) = s.strip_suffix('X') {
+            (n, Band::X)
+        } else if let Some(n) = s.strip_suffix('Y') {
+            (n, Band::Y)
+        } else {
+            return Err(format!("not a DME channel: {s}"));
         };
         let n: u8 = num.parse().map_err(|_| format!("not a DME channel: {s}"))?;
         DmeChannel::new(n, band).ok_or_else(|| format!("DME channel out of range: {s}"))
@@ -192,6 +193,14 @@ mod tests {
 
     fn ch(s: &str) -> DmeChannel {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn rejects_bad_names_without_panicking() {
+        for s in ["", "X", "1é", "é", "64Z", "0X", "127Y", "-1X", "６４X"] {
+            assert!(s.parse::<DmeChannel>().is_err(), "{s}");
+        }
+        assert_eq!(ch(" 64y ").to_string(), "64Y");
     }
 
     #[test]

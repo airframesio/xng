@@ -1003,6 +1003,25 @@ impl ModeChannel {
     }
 }
 
+impl ModeChannel {
+    /// Flush whatever a decoder holds at end of stream (only DME buffers
+    /// results: its last pairs and an ident still being keyed).
+    fn finish(&mut self, freqs: &[u64], base_index: usize, base: &SharedProvenance, out: &mut Vec<ChannelOut>) {
+        if let Self::Dme(dec) = self {
+            let freq = freqs[0];
+            let prov = base.for_channel(base_index, freq, xng_mode_dme::CHANNEL_RATE);
+            let events = dec.finish(None);
+            let level = dec.level_dbfs();
+            let seen = events.len() as u64;
+            let msgs = events
+                .iter()
+                .map(|e| xng_mode_dme::to_message(e, freq, level, prov.clone()))
+                .collect();
+            out.push(ChannelOut { freq, level, msgs, seen, ok: seen });
+        }
+    }
+}
+
 /// The provenance fields common to every channel of a session; the per-channel
 /// `ChannelInfo` is filled in per frame for shared decoders.
 pub(crate) struct SharedProvenance {
@@ -1524,6 +1543,22 @@ pub(crate) fn decode_loop(
                 if let Some((state, _, _)) = &live {
                     state.record_channel(co.freq, seen, ok, co.level);
                 }
+            }
+        }
+    }
+    // End of stream or stop: flush decoders that hold results back.
+    for group in &mut groups {
+        out.clear();
+        group.dec.finish(&group.freqs, group.base_index, &base, &mut out);
+        for (k, co) in out.drain(..).enumerate() {
+            let row = &mut stats[group.base_index + k];
+            row.1 += co.seen;
+            row.2 += co.ok;
+            for msg in co.msgs {
+                publish_msg(
+                    msg, co.freq, &mut dedup, reasm.as_deref_mut(), &label_filter,
+                    &ais_filter, &mut ais_gate, &live, &bus,
+                );
             }
         }
     }

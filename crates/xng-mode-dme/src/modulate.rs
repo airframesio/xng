@@ -201,11 +201,12 @@ pub fn generate(cfg: &SimConfig) -> SimOutput {
         if cfg.suppress_random_during_ident && keyed(t) {
             continue;
         }
-        // Transponder priority: ident pairs win; drop a reply that collides.
-        let i = ident_times.partition_point(|&x| x < t - cfg.spacing_us - 10.0);
-        if ident_times
-            .get(i)
-            .is_some_and(|&x| (x - t).abs() < cfg.spacing_us + 10.0)
+        // Transponder priority: ident pairs win; drop a reply that would sit
+        // within the dead time of one (either side), or, with TACAN, start
+        // less than 400 µs before a burst.
+        let guard = cfg.dead_time_us.max(cfg.spacing_us + 10.0);
+        let i = ident_times.partition_point(|&x| x < t - guard);
+        if ident_times.get(i).is_some_and(|&x| (x - t).abs() < guard)
             || (cfg.tacan && ident_times.get(i).is_some_and(|&x| x - t < 400.0))
         {
             continue;
@@ -292,4 +293,48 @@ pub fn score(truth: &[TruthPair], detected_us: &[f64], tol_us: f64) -> (usize, u
         }
     }
     (tp, fp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rng_is_deterministic_per_seed() {
+        for seed in [0, 1, u64::MAX] {
+            let mut a = Rng::new(seed);
+            let mut b = Rng::new(seed);
+            let xa: Vec<u64> = (0..64).map(|_| a.next_u64()).collect();
+            let xb: Vec<u64> = (0..64).map(|_| b.next_u64()).collect();
+            assert_eq!(xa, xb, "seed {seed}");
+            assert!(xa.iter().any(|&x| x != 0), "seed {seed}");
+            let u = Rng::new(seed).uniform();
+            assert!(u > 0.0 && u < 1.0);
+        }
+        assert_ne!(Rng::new(1).next_u64(), Rng::new(2).next_u64());
+    }
+
+    #[test]
+    fn random_pairs_keep_the_dead_time_from_ident_pairs() {
+        let sim = generate(&SimConfig {
+            sample_rate: 1_000_000.0,
+            duration_s: 3.0,
+            ident: Some("SFO".into()),
+            ..Default::default()
+        });
+        let ident: Vec<f64> = sim
+            .pairs
+            .iter()
+            .filter(|p| p.ident)
+            .map(|p| p.t_us)
+            .collect();
+        for p in sim.pairs.iter().filter(|p| !p.ident) {
+            let i = ident.partition_point(|&x| x < p.t_us);
+            for j in [i.wrapping_sub(1), i] {
+                if let Some(&x) = ident.get(j) {
+                    assert!((x - p.t_us).abs() >= 60.0, "{} vs {x}", p.t_us);
+                }
+            }
+        }
+    }
 }

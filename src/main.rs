@@ -33,7 +33,7 @@ struct Cli {
 struct TuneOpts {
     /// Decode mode: acars, vdl2, hfdl, aero, aero-c, std-c, ais, adsb, iridium,
     /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs, aprs, pocsag, eot, flex,
-    /// vdes, time, meshtastic, or meshcore
+    /// vdes, time, dme, meshtastic, or meshcore
     #[arg(short, long, default_value = "acars")]
     mode: String,
     /// Capture sample rate in Hz (must be an integer multiple of the

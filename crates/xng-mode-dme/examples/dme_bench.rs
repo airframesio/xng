@@ -8,7 +8,8 @@
 //!
 //! `sim` writes a synthetic X-channel transponder (2700 pp/s random pairs and
 //! an optional ident). `run` decodes a cf32 file and writes one pair time
-//! (µs) per line, printing idents and the CPU time. `score` matches pair
+//! (µs) per line, printing idents and the CPU time (file read and decode;
+//! the same span gr-dme's flowgraph is timed over). `score` matches pair
 //! times against the truth.
 
 use num_complex::Complex;
@@ -59,6 +60,9 @@ fn sim(a: &[String]) {
 
 fn run(a: &[String]) {
     let rate: f64 = a[1].parse().unwrap();
+    // Timed from the file read on, like gr-dme's file source flowgraph.
+    let t0 = Instant::now();
+    let cpu0 = cpu_seconds();
     let mut bytes = Vec::new();
     std::fs::File::open(&a[0])
         .unwrap()
@@ -80,8 +84,6 @@ fn run(a: &[String]) {
     }
     let mut pairs = Vec::new();
     let mut events = Vec::new();
-    let t0 = Instant::now();
-    let cpu0 = cpu_seconds();
     for chunk in iq.chunks(65_536) {
         events.extend(dec.process_with_pairs(chunk, &mut pairs));
     }

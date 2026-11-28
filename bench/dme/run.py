@@ -57,11 +57,17 @@ def match(truth, det, offset, tol=TOL_US):
     return tp, len(det) - tp
 
 
-def median_offset(truth, det):
+def median_offset(truth, det, who="decoder"):
+    """Constant timing offset of a decoder, from a high-SNR calibration run."""
     det = np.asarray(det, dtype=float)
+    if len(truth) < 2 or len(det) == 0:
+        sys.exit(f"calibration failed: {who} found {len(det)} pairs ({len(truth)} sent)")
     i = np.clip(np.searchsorted(truth, det), 1, len(truth) - 1)
     d = np.where(abs(det - truth[i]) < abs(det - truth[i - 1]), det - truth[i], det - truth[i - 1])
-    return float(np.median(d))
+    off = float(np.median(d))
+    if not np.isfinite(off):
+        sys.exit(f"calibration failed: {who} timing offset is {off}")
+    return off
 
 
 def load(p):
@@ -91,7 +97,7 @@ def main():
 
     # Calibrate each decoder's constant timing offset at high SNR.
     truth, xd, _, gd, _ = case(wd, "cal", 25, secs=2.0, ident="-")
-    xoff, goff = median_offset(truth, xd), median_offset(truth, gd)
+    xoff, goff = median_offset(truth, xd, "xng"), median_offset(truth, gd, "gr-dme")
 
     snrs = [3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20] if not quick else [4, 6, 8, 12]
     seeds = [1, 2, 3] if not quick else [1]

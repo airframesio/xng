@@ -15,7 +15,8 @@
 //! Squitter and replies are identical pulse pairs, so on the reply frequency
 //! alone only their sum is observable (`random_pps`). Tuning the
 //! interrogation frequency of the same channel instead reports the aircraft
-//! interrogation rate (role `interrogation`), which is the reply load.
+//! interrogations received from nearby aircraft (role `interrogation`): a
+//! local view of the demand on the transponder, not its full reply load.
 //!
 //! Written from ICAO Annex 10 Vol I §3.5. No code from gr-dme or other DME
 //! decoders (see PROVENANCE.md).
@@ -43,6 +44,11 @@ pub const CHANNEL_PASSBAND_HZ: f64 = 300_000.0;
 pub const STATUS_INTERVAL_S: f64 = 10.0;
 /// Pairs a status interval needs before it is reported.
 const MIN_STATUS_PAIRS: u64 = 20;
+/// How long an ident from a spacing other than the busiest is held, µs: a
+/// strong channel's pulse skirts make weak pairs at the other spacings that
+/// repeat its ident, so a held ident is dropped if the busiest spacing
+/// decodes the same text meanwhile.
+const IDENT_HOLD_US: f64 = 3e6;
 /// TACAN main reference burst: 12 pairs 30 µs apart (X mode), sent 15 times
 /// a second. Counted from this many consecutive pairs at that gap.
 const BURST_MIN_PAIRS: u32 = 8;
@@ -108,10 +114,21 @@ struct SpacingState {
     /// Report-threshold pairs since start.
     total: u64,
     snr_sum: f64,
-    ident_hits_at_start: u64,
+    strong_hits_at_start: u64,
     last_t: f64,
     burst_len: u32,
     bursts: u64,
+    last_ident: Option<String>,
+    /// Stream time the last ident of this spacing ended, µs.
+    last_ident_end_us: f64,
+    repeats: u32,
+}
+
+/// An ident waiting out [`IDENT_HOLD_US`].
+struct HeldIdent {
+    spacing: usize,
+    ident: ident::Ident,
+    due_us: f64,
 }
 
 /// Decodes one DME channel from a capture.
@@ -126,8 +143,7 @@ pub struct DmeChannelDecoder {
     candidates: Vec<(DmeChannel, Role)>,
     interval_start_us: f64,
     now_us: f64,
-    last_ident: Option<String>,
-    repeats: u32,
+    held: Vec<HeldIdent>,
 }
 
 impl DmeChannelDecoder {
@@ -167,8 +183,7 @@ impl DmeChannelDecoder {
             candidates: Vec::new(),
             interval_start_us: 0.0,
             now_us: 0.0,
-            last_ident: None,
-            repeats: 0,
+            held: Vec::new(),
         };
         d.set_spacings(&[12, 30, 36], th);
         Ok(d)
@@ -198,10 +213,13 @@ impl DmeChannelDecoder {
                 pairs: 0,
                 total: 0,
                 snr_sum: 0.0,
-                ident_hits_at_start: 0,
+                strong_hits_at_start: 0,
                 last_t: f64::NEG_INFINITY,
                 burst_len: 0,
                 bursts: 0,
+                last_ident: None,
+                last_ident_end_us: f64::NEG_INFINITY,
+                repeats: 0,
             })
             .collect();
     }
@@ -236,11 +254,10 @@ impl DmeChannelDecoder {
         let end = self.now_us + 5e6;
         for i in 0..self.states.len() {
             if let Some(id) = self.states[i].ident.advance_to(end) {
-                if self.is_busiest(i) {
-                    ev.push(DmeEvent::Ident(self.ident_report(i, id)));
-                }
+                self.on_ident(i, id, &mut ev);
             }
         }
+        self.release_held(f64::INFINITY, &mut ev);
         self.pairs = pairs;
         ev
     }
@@ -270,11 +287,10 @@ impl DmeChannelDecoder {
         // Quiet channel: keep the ident clocks moving.
         for i in 0..self.states.len() {
             if let Some(id) = self.states[i].ident.advance_to(self.now_us) {
-                if self.is_busiest(i) {
-                    ev.push(DmeEvent::Ident(self.ident_report(i, id)));
-                }
+                self.on_ident(i, id, &mut ev);
             }
         }
+        self.release_held(self.now_us, &mut ev);
         if self.now_us - self.interval_start_us >= STATUS_INTERVAL_S * 1e6 {
             if let Some(s) = self.status() {
                 ev.push(DmeEvent::Status(s));
@@ -297,10 +313,8 @@ impl DmeChannelDecoder {
             let Some(i) = self.states.iter().position(|s| s.us == p.spacing_us) else {
                 continue;
             };
-            if let Some(id) = self.states[i].ident.push(p.t_us) {
-                if self.is_busiest(i) {
-                    ev.push(DmeEvent::Ident(self.ident_report(i, id)));
-                }
+            if let Some(id) = self.states[i].ident.push_pair(p.t_us, !p.weak) {
+                self.on_ident(i, id, ev);
             }
             if p.weak {
                 continue;
@@ -337,12 +351,62 @@ impl DmeChannelDecoder {
             .unwrap_or(0)
     }
 
-    /// Whether spacing `i` carries the most pairs since start. Idents are
-    /// only reported there: a strong 12 µs channel also makes periodic weak
-    /// "pairs" at other spacings out of pulse skirts, which repeat the ident.
+    /// Whether spacing `i` carries the most pairs since start.
     fn is_busiest(&self, i: usize) -> bool {
         let n = self.states[i].total;
         self.states.iter().all(|s| s.total <= n)
+    }
+
+    /// Whether another, busier spacing decoded `text` within the hold time
+    /// of `end_us`: then spacing `i`'s copy is a pulse-skirt echo.
+    fn echoes_busier(&self, i: usize, text: &str, end_us: f64) -> bool {
+        let n = self.states[i].total;
+        self.states.iter().enumerate().any(|(j, s)| {
+            j != i
+                && s.total > n
+                && s.last_ident.as_deref() == Some(text)
+                && (s.last_ident_end_us - end_us).abs() <= IDENT_HOLD_US
+        })
+    }
+
+    /// Route an ident decoded on spacing `i`. Interrogations carry no ident,
+    /// so a spacing known to be one is ignored. The busiest spacing reports
+    /// at once; another spacing (a second channel sharing the frequency, or
+    /// echoes of the busiest one) is held and dropped if it repeats a busier
+    /// spacing's ident.
+    fn on_ident(&mut self, i: usize, id: ident::Ident, ev: &mut Vec<DmeEvent>) {
+        if self.link(i).role == Some(Role::Interrogation) {
+            return;
+        }
+        if self.is_busiest(i) {
+            let text = id.text.clone();
+            let end = id.end_us;
+            ev.push(DmeEvent::Ident(self.ident_report(i, id)));
+            self.held
+                .retain(|h| h.ident.text != text || (h.ident.end_us - end).abs() > IDENT_HOLD_US);
+        } else if !self.echoes_busier(i, &id.text, id.end_us) {
+            let due_us = self.now_us + IDENT_HOLD_US;
+            self.held.push(HeldIdent {
+                spacing: i,
+                ident: id,
+                due_us,
+            });
+        }
+    }
+
+    /// Report held idents due by `now` that no busier spacing repeated.
+    fn release_held(&mut self, now: f64, ev: &mut Vec<DmeEvent>) {
+        let mut k = 0;
+        while k < self.held.len() {
+            if self.held[k].due_us > now {
+                k += 1;
+                continue;
+            }
+            let h = self.held.remove(k);
+            if !self.echoes_busier(h.spacing, &h.ident.text, h.ident.end_us) {
+                ev.push(DmeEvent::Ident(self.ident_report(h.spacing, h.ident)));
+            }
+        }
     }
 
     fn link(&self, i: usize) -> LinkInfo {
@@ -358,18 +422,21 @@ impl DmeChannelDecoder {
     }
 
     fn ident_report(&mut self, i: usize, id: ident::Ident) -> IdentReport {
-        if self.last_ident.as_deref() == Some(id.text.as_str()) {
-            self.repeats += 1;
+        let st = &mut self.states[i];
+        if st.last_ident.as_deref() == Some(id.text.as_str()) {
+            st.repeats += 1;
         } else {
-            self.repeats = 1;
-            self.last_ident = Some(id.text.clone());
+            st.repeats = 1;
+            st.last_ident = Some(id.text.clone());
         }
+        st.last_ident_end_us = id.end_us;
+        let repeats = st.repeats;
         IdentReport {
             ident: id.text,
             morse: id.morse,
             dot_ms: id.dot_ms,
             ident_rate_hz: id.rate_hz,
-            repeats: self.repeats,
+            repeats,
             link: self.link(i),
         }
     }
@@ -382,12 +449,13 @@ impl DmeChannelDecoder {
         let total: u64 = self.states.iter().map(|s| s.pairs).sum();
         let st = &self.states[i];
         let pairs = st.pairs;
-        let ident_hits = st.ident.hits - st.ident_hits_at_start;
+        // Strong pairs only, like `pps`.
+        let ident_hits = st.ident.strong_hits - st.strong_hits_at_start;
         let report = (total >= MIN_STATUS_PAIRS).then(|| {
             let pps = pairs as f64 / secs;
             // Remove the random coincidences the ident test also counts.
-            let ident_pps =
-                (ident_hits as f64 / secs - st.ident.background_hits_per_s()).clamp(0.0, pps);
+            let ident_pps = (ident_hits as f64 / secs - st.ident.strong_background_hits_per_s())
+                .clamp(0.0, pps);
             let bursts = st.bursts as f64 / secs;
             StatusReport {
                 interval_s: secs,
@@ -400,7 +468,7 @@ impl DmeChannelDecoder {
                     0.0
                 },
                 level_dbfs: self.det.level_dbfs(),
-                last_ident: self.last_ident.clone(),
+                last_ident: st.last_ident.clone(),
                 reference_bursts_per_s: bursts,
                 // Main bursts come at 15 Hz; DME has none.
                 tacan: (10.0..=20.0).contains(&bursts),
@@ -411,7 +479,7 @@ impl DmeChannelDecoder {
             s.pairs = 0;
             s.snr_sum = 0.0;
             s.bursts = 0;
-            s.ident_hits_at_start = s.ident.hits;
+            s.strong_hits_at_start = s.ident.strong_hits;
         }
         report
     }

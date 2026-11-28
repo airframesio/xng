@@ -283,3 +283,40 @@ fn messages_serialize() {
         assert_eq!(j["body"]["details"]["channel"], "64X");
     }
 }
+
+#[test]
+fn reply_ident_under_busier_interrogations_on_the_same_frequency() {
+    // 1025 MHz is the 64Y reply (30 µs) and the 1X/1Y interrogation
+    // (12/36 µs). Busy 1X interrogations must not hide 64Y's ident.
+    let rate = 1_000_000.0;
+    let reply = generate(&SimConfig {
+        sample_rate: rate,
+        duration_s: 9.0,
+        spacing_us: 30.0,
+        snr_db: 15.0,
+        ident: Some("ABC".into()),
+        seed: 31,
+        ..Default::default()
+    });
+    let interrogations = generate(&SimConfig {
+        sample_rate: rate,
+        duration_s: 9.0,
+        spacing_us: 12.0,
+        random_pps: 5000.0,
+        snr_db: 15.0,
+        seed: 32,
+        ..Default::default()
+    });
+    let iq: Vec<Complex<f32>> = reply
+        .iq
+        .iter()
+        .zip(&interrogations.iq)
+        .map(|(a, b)| a + b)
+        .collect();
+    let (_, ev) = run(&iq, rate, 0.0, Some(1_025_000_000));
+    let id = idents(&ev);
+    assert_eq!(id.len(), 1, "{id:?}");
+    assert_eq!(id[0].ident, "ABC");
+    assert_eq!(id[0].link.channel.as_deref(), Some("64Y"));
+    assert_eq!(id[0].link.role, Some(Role::Reply));
+}

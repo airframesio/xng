@@ -65,8 +65,9 @@ pub struct Ident {
 pub struct IdentDetector {
     /// Pairs of the last two periods (period learning).
     recent: VecDeque<f64>,
-    /// Pairs waiting to be scored.
-    delayed: VecDeque<f64>,
+    /// Pairs waiting to be scored, with whether each was at the report
+    /// threshold (strong) or only weak.
+    delayed: VecDeque<(f64, bool)>,
     /// Scored pairs of the last four periods.
     hist: VecDeque<f64>,
     period: Option<f64>,
@@ -74,6 +75,8 @@ pub struct IdentDetector {
     triples: VecDeque<(f64, f64)>,
     bin: i64,
     bin_hits: u32,
+    /// Hits in this bin from strong (report-threshold) pairs.
+    bin_strong_hits: u32,
     /// Raw on/off of the last five bins (majority vote).
     raw: VecDeque<bool>,
     state: bool,
@@ -83,8 +86,14 @@ pub struct IdentDetector {
     session_start_bin: Option<i64>,
     /// Background (random coincidence) hits per off bin, smoothed.
     background: f64,
+    /// As `background`, counting strong pairs only.
+    strong_background: f64,
+    /// Off bins scored with a known period (background warm-up).
+    off_bins: u32,
     /// Total ident hits (diagnostics).
     pub hits: u64,
+    /// Ident hits from strong pairs (the pairs status rates count).
+    pub strong_hits: u64,
 }
 
 impl Default for IdentDetector {
@@ -103,13 +112,17 @@ impl IdentDetector {
             triples: VecDeque::new(),
             bin: 0,
             bin_hits: 0,
+            bin_strong_hits: 0,
             raw: VecDeque::from(vec![false; 5]),
             state: false,
             run: 0,
             runs: Vec::new(),
             session_start_bin: None,
             background: 0.0,
+            strong_background: 0.0,
+            off_bins: 0,
             hits: 0,
+            strong_hits: 0,
         }
     }
 
@@ -121,6 +134,12 @@ impl IdentDetector {
     /// Random coincidences counted as ident hits, per second.
     pub fn background_hits_per_s(&self) -> f64 {
         self.background * 1e6 / BIN_US
+    }
+
+    /// As [`background_hits_per_s`](Self::background_hits_per_s), for
+    /// strong pairs only (to set against [`strong_hits`](Self::strong_hits)).
+    pub fn strong_background_hits_per_s(&self) -> f64 {
+        self.strong_background * 1e6 / BIN_US
     }
 
     /// Whether the keying is currently "on" (ident being sent).
@@ -135,6 +154,12 @@ impl IdentDetector {
     /// [`LOOKBACK_US`] later, so the first Morse element is not lost while
     /// the period locks.
     pub fn push(&mut self, t: f64) -> Option<Ident> {
+        self.push_pair(t, true)
+    }
+
+    /// As [`push`](Self::push); `strong` marks a report-threshold pair (weak
+    /// pairs help keying but are not counted in `strong_hits`).
+    pub fn push_pair(&mut self, t: f64, strong: bool) -> Option<Ident> {
         while self
             .recent
             .front()
@@ -166,14 +191,14 @@ impl IdentDetector {
         }
         self.update_period();
         self.recent.push_back(t);
-        self.delayed.push_back(t);
+        self.delayed.push_back((t, strong));
         self.drain(t - LOOKBACK_US)
     }
 
     /// Score delayed pairs up to time `until`.
     fn drain(&mut self, until: f64) -> Option<Ident> {
         let mut done = None;
-        while let Some(&t) = self.delayed.front() {
+        while let Some(&(t, strong)) = self.delayed.front() {
             if t > until {
                 break;
             }
@@ -206,6 +231,10 @@ impl IdentDetector {
                 if let Some(obs) = hit {
                     self.bin_hits += 1;
                     self.hits += 1;
+                    if strong {
+                        self.bin_strong_hits += 1;
+                        self.strong_hits += 1;
+                    }
                     // Track slow drift of the transponder's ident clock.
                     if (obs - per).abs() < 0.5 {
                         self.period = Some(per + 0.02 * (obs - per));
@@ -230,10 +259,17 @@ impl IdentDetector {
         let mut out = None;
         while self.bin < b {
             let on = self.bin_hits >= self.on_threshold();
-            if !self.state && !on {
-                self.background += 0.01 * (self.bin_hits as f64 - self.background);
+            if !self.state && !on && self.period.is_some() {
+                // Running mean over the first 100 bins, then a 1 % average:
+                // a cold start would otherwise read random hits as keying.
+                self.off_bins = self.off_bins.saturating_add(1);
+                let a = (1.0 / self.off_bins as f64).max(0.01);
+                self.background += a * (self.bin_hits as f64 - self.background);
+                self.strong_background +=
+                    a * (self.bin_strong_hits as f64 - self.strong_background);
             }
             self.bin_hits = 0;
+            self.bin_strong_hits = 0;
             if let Some(id) = self.push_bin(on) {
                 out = Some(id);
             }
