@@ -14,6 +14,14 @@ pub const CLIENT_ID: &str = "airframes-feeder";
 pub const SCOPE: &str = "atc:feed";
 pub const DEFAULT_API: &str = "https://api.airframes.io";
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
+/// Waits between retries of a refresh that failed on the network.
+const REFRESH_RETRY_DELAYS: [u64; 3] = [2, 5, 15];
+
+/// A transport failure (no HTTP response at all), as opposed to an answer.
+fn is_network_error(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<ureq::Error>(), Some(ureq::Error::Transport(_)))
+        || e.downcast_ref::<std::io::Error>().is_some()
+}
 
 /// What `atc.json` holds.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -193,11 +201,42 @@ pub fn refresh(path: &Path) -> anyhow::Result<AccessToken> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("not signed in to the Airframes ATC network; run `xng atc login`"))?;
     let api = c.api.clone().unwrap_or_else(|| DEFAULT_API.to_string());
-    let (status, v) = post(
-        &format!("{}/auth/token", api.trim_end_matches('/')),
-        serde_json::json!({ "grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID }),
-    )?;
+    // A refresh whose response is lost (timeout, dropped connection) has
+    // usually already rotated the token on the server. Retrying the same
+    // token soon is what lets the server recognise the lost response and
+    // re-exchange it, so network errors are retried here within seconds
+    // rather than on the feed's next reconnect a minute or more later.
+    let url = format!("{}/auth/token", api.trim_end_matches('/'));
+    let body = serde_json::json!({ "grant_type": "refresh_token", "refresh_token": rt, "client_id": CLIENT_ID });
+    let mut attempt = 0;
+    let (status, v) = loop {
+        match post(&url, body.clone()) {
+            Ok(r) => break r,
+            Err(e) if attempt < REFRESH_RETRY_DELAYS.len() && is_network_error(&e) => {
+                let wait = REFRESH_RETRY_DELAYS[attempt];
+                tracing::warn!("atc sign-in refresh failed ({e:#}); retrying in {wait}s");
+                std::thread::sleep(Duration::from_secs(wait));
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
     if status >= 400 {
+        // The server saw this token used moments ago (our own lost response,
+        // or another xng sharing the sign-in). Not a dead sign-in: use a newer
+        // token another process saved, or try again after the server's 30 s
+        // race window, when it re-exchanges the token.
+        if status == 400 && v.get("reason").and_then(|r| r.as_str()) == Some("concurrent") {
+            if let Ok(now) = load(path) {
+                if now.refresh_token.as_deref().is_some_and(|cur| cur != rt) {
+                    return refresh(path);
+                }
+            }
+            return Err(anyhow::anyhow!(
+                "{}; the sign-in was refreshed moments ago, trying again shortly",
+                api_error(status, &v)
+            ));
+        }
         if status == 400 || status == 401 {
             return Err(anyhow::anyhow!(
                 "{}; the saved sign-in was rejected, run `xng atc login` again",
