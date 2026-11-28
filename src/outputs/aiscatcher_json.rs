@@ -217,8 +217,8 @@ pub fn format_aiscatcher(msg: &Message) -> Option<Value> {
 }
 
 /// One AIS intake POST body: AIS-catcher's `jsonaiscatcher` envelope.
-pub fn envelope(station: &str, msgs: Vec<Value>) -> Value {
-    json!({
+pub fn envelope(station: &str, station_uuid: Option<&str>, msgs: Vec<Value>) -> Value {
+    let mut v = json!({
         "protocol": "jsonaiscatcher",
         "encodetime": chrono::Utc::now().format("%Y%m%d%H%M%S").to_string(),
         "stationid": station,
@@ -230,7 +230,11 @@ pub fn envelope(station: &str, msgs: Vec<Value>) -> Value {
         },
         "device": { "product": "xng", "vendor": "", "serial": "", "setting": "" },
         "msgs": msgs,
-    })
+    });
+    if let Some(u) = station_uuid {
+        v["station_uuid"] = json!(u);
+    }
+    v
 }
 
 #[cfg(test)]
@@ -372,7 +376,7 @@ mod tests {
 
     #[test]
     fn envelope_names_the_station() {
-        let e = envelope("XX-TEST-AIS", vec![json!({ "type": 1 })]);
+        let e = envelope("XX-TEST-AIS", None, vec![json!({ "type": 1 })]);
         assert_eq!(e["protocol"], "jsonaiscatcher");
         assert_eq!(e["stationid"], "XX-TEST-AIS");
         assert_eq!(e["msgs"].as_array().unwrap().len(), 1);
