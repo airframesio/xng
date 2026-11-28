@@ -29,6 +29,9 @@
   let offline = $state(false);
   let fitted = false;
   let picked = $state<{ kind: string; id: string } | null>(null);
+  // Track: keep the picked target centered as it moves. Only the center
+  // changes, so the zoom stays; dragging the map (or the arrow keys) stops it.
+  let tracking = $state(false);
 
   const KINDS: { key: keyof EntityState; kind: string; family: string; heading?: string }[] = [
     { key: "aircraft", kind: "Aircraft", family: "air", heading: "trk" },
@@ -229,6 +232,29 @@
     ready = true;
   }
 
+  /** Bind Track's controls once per map: a pan stops it, zoom goes around the target. */
+  function bindTracking(m: maplibregl.Map) {
+    m.on("dragstart", (e) => {
+      const touches = (e.originalEvent as TouchEvent | undefined)?.touches;
+      if (!touches || touches.length < 2) tracking = false;
+    });
+    m.getCanvasContainer().addEventListener("keydown", (e) => {
+      if (!e.shiftKey && e.key.startsWith("Arrow")) tracking = false;
+    });
+    // A zoom around the pointer moved the center: put the target back.
+    m.on("moveend", () => follow(false));
+  }
+
+  /** While tracking, move the map so the picked target is in the middle. */
+  function follow(ease: boolean) {
+    const e = pickedEntity;
+    if (!map || !tracking || !e || typeof e.lat !== "number" || typeof e.lon !== "number" || map.isMoving()) return;
+    const c = map.getCenter();
+    if (c.lng === e.lon && c.lat === e.lat) return;
+    if (ease) map.easeTo({ center: [e.lon, e.lat], duration: 400 });
+    else map.jumpTo({ center: [e.lon, e.lat] });
+  }
+
   function render(state: EntityState | null) {
     if (!map || !ready) return;
     const points: Feature[] = [];
@@ -281,7 +307,8 @@
     (map.getSource("points") as maplibregl.GeoJSONSource).setData({ type: "FeatureCollection", features: points });
     (map.getSource("trails") as maplibregl.GeoJSONSource).setData({ type: "FeatureCollection", features: trails });
     (map.getSource("home") as maplibregl.GeoJSONSource).setData({ type: "FeatureCollection", features: home });
-    if (!fitted && !bounds.isEmpty()) {
+    if (tracking) follow(true);
+    else if (!fitted && !bounds.isEmpty()) {
       fitted = true;
       map.fitBounds(bounds, { padding: 70, maxZoom: 9, duration: 600 });
     }
@@ -309,6 +336,7 @@
       pitchWithRotate: false,
     });
     map = m;
+    bindTracking(m);
     m.addControl(new maplibregl.NavigationControl({ showCompass: false }), "bottom-right");
     let styled = false;
     m.on("load", () => {
@@ -344,6 +372,24 @@
     void picked;
     render(app.entities);
   });
+
+  // Tracking ends with the target it was tracking.
+  $effect(() => {
+    void picked?.kind;
+    void picked?.id;
+    tracking = false;
+  });
+
+  // While tracking, scroll and pinch zoom around the target; starting eases it to the middle.
+  $effect(() => {
+    const on = tracking;
+    if (!map) return;
+    map.scrollZoom.disable();
+    map.scrollZoom.enable(on ? { around: "center" } : undefined);
+    map.touchZoomRotate.disable();
+    map.touchZoomRotate.enable(on ? { around: "center" } : undefined);
+    if (on) follow(true);
+  });
 </script>
 
 <div class="mapwrap">
@@ -377,7 +423,15 @@
           <small>{picked.kind}</small>
           <h3 class="mono">{labelOf(pickedEntity) || picked.id}</h3>
         </div>
-        <button class="btn sm quiet" onclick={() => (picked = null)} aria-label="Close"><Icon name="close" size={14} /></button>
+        <div class="actions">
+          <button
+            class="btn sm {tracking ? 'on' : 'quiet'}"
+            onclick={() => (tracking = !tracking)}
+            aria-pressed={tracking}
+            title={tracking ? "Stop tracking" : "Keep it centered as it moves (dragging the map stops it)"}
+          >{tracking ? "Tracking" : "Track"}</button>
+          <button class="btn sm quiet" onclick={() => (picked = null)} aria-label="Close"><Icon name="close" size={14} /></button>
+        </div>
       </header>
       <dl>
         {#each pickedFacts as [k, v] (k)}
@@ -474,6 +528,16 @@
     align-items: flex-start;
     padding: 10px 8px 8px 12px;
     border-bottom: 1px solid var(--line);
+  }
+  .card .actions {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+  }
+  .card .on {
+    border-color: var(--accent);
+    background: var(--accent);
+    color: var(--bg);
   }
   .card small {
     font-size: 11px;
