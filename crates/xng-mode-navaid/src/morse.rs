@@ -150,6 +150,9 @@ pub struct IdentDecoder {
     lin: VecDeque<f32>,
     /// Latest folded decode: (word, repetitions folded).
     folded: Option<(String, u32)>,
+    /// When a fold last decoded `folded` (envelope samples); the fold is
+    /// dropped once this is older than the vote window.
+    folded_t: u64,
     /// The latest confident fold and how many folds in a row agreed on it.
     fold_candidate: Option<(String, u32)>,
     rule: IdentRule,
@@ -183,6 +186,7 @@ impl IdentDecoder {
             overlong: false,
             lin: VecDeque::new(),
             folded: None,
+            folded_t: 0,
             fold_candidate: None,
         }
     }
@@ -311,8 +315,13 @@ impl IdentDecoder {
     /// The ident: the folded word once two folds agree on it, else the word
     /// decoded most often in the vote window, with its count.
     pub fn ident(&self) -> Option<(String, u32)> {
+        let keep = (VOTE_WINDOW_S * ENV_RATE) as u64;
         if let Some(f) = &self.folded {
-            return Some(f.clone());
+            // Brief decoding failures keep it; a fold nothing has confirmed
+            // for the vote window gives way to the votes.
+            if self.t.saturating_sub(self.folded_t) <= keep {
+                return Some(f.clone());
+            }
         }
         let mut counts: HashMap<&str, u32> = HashMap::new();
         for (_, w) in &self.votes {
@@ -415,6 +424,10 @@ impl IdentDecoder {
         }
         if self.fold_candidate.as_ref().is_some_and(|(_, n)| *n >= 2) {
             self.folded = Some((w, k as u32));
+            self.folded_t = self.t;
+        } else if self.folded.as_ref().is_some_and(|(f, _)| *f == w) {
+            // The published word heard again: still fresh.
+            self.folded_t = self.t;
         }
     }
 
@@ -731,6 +744,20 @@ mod tests {
         assert_eq!(d.words_heard(), 0);
         assert_eq!(d.recent_word(), None);
         assert_eq!(d.last_word.as_deref(), Some("TST"));
+    }
+
+    #[test]
+    fn stale_fold_gives_way_to_votes() {
+        let mut d = IdentDecoder::new();
+        d.folded = Some(("ABC".into(), 4));
+        d.folded_t = 0;
+        vote(&mut d, "XYZ", 3);
+        assert_eq!(d.ident().map(|x| x.0).as_deref(), Some("ABC"));
+        d.t = (VOTE_WINDOW_S * ENV_RATE) as u64 + 1;
+        // Votes were cast at t = 0 too, so cast fresh ones.
+        d.votes.clear();
+        vote(&mut d, "XYZ", 3);
+        assert_eq!(d.ident().map(|x| x.0).as_deref(), Some("XYZ"));
     }
 
     #[test]

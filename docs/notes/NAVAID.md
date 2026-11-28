@@ -44,7 +44,7 @@ over asf-2.0 and the JSON outputs only.
 | `carrier_offset_hz` | Carrier offset from the channel frequency, from the PLL |
 | `ident`, `ident_votes` | The ident once it is certain, and how many repetitions agree |
 | `ident_depth_pct`, `ident_tone_hz` | Ident modulation depth and measured tone frequency |
-| `vor.radial_deg`, `vor.radial_std_deg` | Radial over the report interval and its spread (absent when no block carried both tones) |
+| `vor.radial_deg`, `vor.radial_std_deg` | Radial over the report interval and its spread (absent when the 9960 Hz reference or the 30 Hz tone is not there) |
 | `vor.mod30_pct`, `vor.mod9960_pct`, `vor.deviation_hz`, `vor.subcarrier_offset_hz` | Signal health: 30 Hz AM depth, subcarrier depth, FM deviation (strong signals only), subcarrier frequency error |
 | `ils[].ddm`, `ils[].ddm_ua`, `ils[].ddm_std` | Difference in depth of modulation, the same in µA of course deflection (150 µA at 0.155 for a localizer, 0.175 for a glideslope), and its spread |
 | `ils[].sdm_pct`, `ils[].mod90_pct`, `ils[].mod150_pct`, `ils[].phase_lock_deg` | Sum of depths and the two tone depths, and the 90/150 Hz phase relationship (absent when a tone is missing) |
@@ -60,7 +60,11 @@ over asf-2.0 and the JSON outputs only.
    coherent: the in-phase arm holds the signal and the noise in the
    quadrature arm is discarded, 3 dB better than an envelope detector, and
    the two carriers of a two-frequency system never beat against each
-   other. The carriers are searched again every 20 seconds.
+   other. Each loop's phase detector looks through a 1.5 kHz low-pass, so
+   a stronger second carrier in the channel cannot take it over. The
+   carriers are searched again every 20 seconds; a carrier found again
+   keeps its loop and measurements even when the two swap rank, and the
+   ident follows the strongest.
 2. **VOR.** The in-phase signal is decimated to 2400 Hz (80 samples per
    30 Hz cycle). The variable phase is a single-bin DFT of the 30 Hz AM.
    The reference phase comes from the 9960 Hz subcarrier: the FM is not
@@ -72,9 +76,13 @@ over asf-2.0 and the JSON outputs only.
    found by a comb search over the FM line spectrum, whose lines are 30 Hz
    apart, and the 30 Hz alias is resolved by the fold correlation.
    Blocks are weighted by their 30 Hz and subcarrier depths and averaged
-   on the circle.
-3. **ILS.** 90 and 150 Hz single-bin DFTs on whole 30 Hz cycles in 0.5 s
-   blocks give the two depths, DDM and SDM.
+   on the circle. No radial is reported when the reference correlation
+   does not stand clear of the noise it would hold with no subcarrier.
+3. **ILS.** The tone frequencies are measured from the spectrum of the
+   last 8 s (Annex 10 lets them sit 2.5% off nominal; the first estimate
+   comes after 2 s and the blocks before it wait for it), then a
+   least-squares fit of the two tones in each 0.5 s block gives the two
+   depths, DDM and SDM. At exactly 90 and 150 Hz the fit is the plain DFT.
 4. **Ident.** The 1020 Hz tone is located to within a fraction of a Hz,
    narrowed to ±5 Hz and keyed into a Morse decoder with an adaptive
    threshold. Idents repeat every few seconds, so the decoder also folds

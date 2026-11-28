@@ -11,7 +11,7 @@
 
 use num_complex::Complex;
 use rustfft::FftPlanner;
-use std::f64::consts::TAU;
+use std::f64::consts::{FRAC_1_SQRT_2, TAU};
 
 /// One carrier found by [`acquire`].
 #[derive(Debug, Clone, Copy)]
@@ -27,11 +27,15 @@ pub struct Carrier {
 /// ILS carrier beats at least 4 kHz away (Annex 10 separations, less the
 /// widest sidebands) and is over 45 dB down after this filter.
 pub const NOISE_LPF_HZ: f64 = 1_000.0;
+/// Cutoff of the low-pass ahead of the PLL's phase detector (Hz): far above
+/// the loop bandwidth, below the nearest second carrier.
+const PD_LPF_HZ: f64 = 1_500.0;
 
 /// Find up to `max` carriers in `x` (sample rate `fs`) within ±`span_hz` of
 /// center. The strongest comes first. A second carrier must be at least
 /// `min_sep_hz` away, a narrow line, and within 20 dB of the first; that keeps
-/// VOR subcarrier and voice sidebands out.
+/// VOR subcarrier and voice sidebands out. A window holding a non-finite
+/// sample finds nothing.
 pub fn acquire(
     x: &[Complex<f32>],
     fs: f64,
@@ -41,6 +45,13 @@ pub fn acquire(
 ) -> Vec<Carrier> {
     let n = x.len().next_power_of_two() / 2;
     if n < 1024 {
+        return Vec::new();
+    }
+    // A non-finite sample would spread through the whole spectrum.
+    if x[x.len() - n..]
+        .iter()
+        .any(|s| !s.re.is_finite() || !s.im.is_finite())
+    {
         return Vec::new();
     }
     let mut buf: Vec<Complex<f64>> = (0..n)
@@ -139,6 +150,8 @@ pub struct CarrierPll {
     /// Running power of low-passed Q (noise only, see [`NOISE_LPF_HZ`]).
     pub q_var: f64,
     noise_lpf: [Biquad; 2],
+    /// Low-pass on the phase detector's input (I and Q).
+    pd_lpf: [Biquad; 2],
     /// One-sided noise bandwidth of `noise_lpf` (Hz).
     noise_bw_hz: f64,
 }
@@ -202,6 +215,7 @@ impl CarrierPll {
             amp: 0.0,
             q_var: 0.0,
             noise_lpf: noise_lpf(fs),
+            pd_lpf: [Biquad::lowpass(fs, PD_LPF_HZ, FRAC_1_SQRT_2); 2],
             noise_bw_hz: {
                 // Σh² · fs/2 from the impulse response.
                 let mut f = noise_lpf(fs);
@@ -237,7 +251,12 @@ impl CarrierPll {
         for &s in x {
             let (sn, cs) = self.phase.sin_cos();
             let z = Complex::new(s.re as f64, s.im as f64) * Complex::new(cs, -sn);
-            let err = z.im.atan2(z.re);
+            // The phase detector looks through a low-pass: a second carrier
+            // in the channel (4–32 kHz away, possibly stronger) would
+            // otherwise own the phase of z and leave this loop without a
+            // detector, free to settle anywhere, even inverted.
+            let pd = Complex::new(self.pd_lpf[0].step(z.re), self.pd_lpf[1].step(z.im));
+            let err = pd.im.atan2(pd.re);
             self.w += self.ki * err;
             self.phase = (self.phase + self.w + self.kp * err) % TAU;
             self.amp += AMP_ALPHA * (z.re - self.amp);

@@ -286,16 +286,29 @@ fn cn0_estimate_is_calibrated() {
 fn dvor_low_deviation_ratio_keeps_the_radial() {
     // Annex 10 lets a Doppler VOR's deviation ratio fall to 11 above 5°
     // elevation; ratio 16 is the control.
-    for dev in [330.0, 480.0] {
+    for dev in [330.0, 390.0, 450.0, 480.0, 510.0] {
         let p = VorParams {
             radial_deg: 60.0,
             deviation_hz: dev,
             ..Default::default()
         };
-        let obs = run(NavaidKind::Vor, vor_scene(p, None), 12.0, 4.0);
-        let v = obs.last().unwrap().vor.as_ref().unwrap();
-        let r = v.radial_deg.unwrap();
-        assert!(angle_err(r, 60.0) < 0.5, "deviation {dev}: radial {r}");
+        let obs = run(NavaidKind::Vor, vor_scene(p, None), 12.0, 0.5);
+        // Every short interval after the comb search settles, and the
+        // subcarrier offset (the true one is 0, not a 30 Hz alias).
+        for o in obs.iter().filter(|o| o.t_s > 4.0) {
+            let v = o.vor.as_ref().unwrap();
+            let r = v.radial_deg.unwrap();
+            assert!(
+                angle_err(r, 60.0) < 0.5,
+                "deviation {dev} t {}: radial {r}",
+                o.t_s
+            );
+            assert!(
+                v.subcarrier_offset_hz.abs() < 1.0,
+                "offset {}",
+                v.subcarrier_offset_hz
+            );
+        }
     }
 }
 
@@ -315,8 +328,13 @@ fn ils_tones_off_nominal_read_true_ddm() {
                 16.0,
                 4.0,
             );
+            // The first report too: blocks before the first tone estimate
+            // wait for it rather than being fitted at nominal.
+            for o in &obs {
+                let d = o.ils[0].ddm;
+                assert!(d.abs() < 0.002, "{kind:?} f30 {f30} t {}: ddm {d}", o.t_s);
+            }
             let m = &obs.last().unwrap().ils[0];
-            assert!(m.ddm.abs() < 0.002, "{kind:?} f30 {f30}: ddm {}", m.ddm);
             assert!(
                 (m.tone150_hz - 5.0 * f30).abs() < 0.05,
                 "150 Hz tone at {}",
@@ -409,4 +427,89 @@ fn shortened_report_interval_reports_at_once() {
     d.set_report_interval(1.0);
     let out = d.process(&g.next_block((RATE / 10.0) as usize));
     assert_eq!(out.len(), 1);
+}
+
+#[test]
+fn vor_without_reference_reports_no_radial() {
+    // Carrier and 30 Hz AM but no 9960 Hz subcarrier: depths, no bearing.
+    let p = VorParams {
+        mod_sc: 0.0,
+        ..Default::default()
+    };
+    let obs = run(NavaidKind::Vor, vor_scene(p, Some(55.0)), 20.0, 2.0);
+    for o in &obs {
+        let v = o.vor.as_ref().unwrap();
+        assert_eq!(v.radial_deg, None, "{v:?}");
+        assert!(v.mod30_pct > 25.0);
+    }
+}
+
+#[test]
+fn carrier_early_in_one_large_chunk_is_found() {
+    // 5 s of carrier then 5 s of silence, handed over in one call: the
+    // search runs when its window fills, not at the end of the chunk.
+    let mut g = Generator::new(vor_scene(VorParams::default(), Some(50.0)));
+    let mut x = g.next_block((5.0 * RATE) as usize);
+    x.extend(std::iter::repeat_n(
+        num_complex::Complex::new(0.0f32, 0.0),
+        (5.0 * RATE) as usize,
+    ));
+    let mut d = NavaidChannelDecoder::new(NavaidKind::Vor, RATE, OFFSET).unwrap();
+    let out = d.process(&x);
+    assert_eq!(out.len(), 1);
+    assert_ne!(out[0].status, NavaidStatus::NoSignal);
+}
+
+#[test]
+fn carriers_swapping_rank_keep_their_state() {
+    let scene = |course_db: f64, seed: u64| {
+        let mut p = IlsParams::localizer(0.03);
+        p.ident = Some(IdentSpec::standard("ISAC"));
+        let mut q = IlsParams::localizer(0.3);
+        q.ident = Some(IdentSpec::standard("ISAC"));
+        Scene {
+            sample_rate: RATE,
+            carriers: vec![
+                CarrierSpec {
+                    offset_hz: OFFSET + 4_000.0,
+                    amplitude: 0.25 * 10f64.powf(course_db / 20.0),
+                    phase_rad: 0.7,
+                    signal: Signal::Ils(p),
+                },
+                CarrierSpec {
+                    offset_hz: OFFSET - 4_000.0,
+                    amplitude: 0.25 * 10f64.powf(-course_db / 20.0),
+                    phase_rad: 2.1,
+                    signal: Signal::Ils(q),
+                },
+            ],
+            cn0_dbhz: Some(50.0),
+            seed,
+        }
+    };
+    let mut d = NavaidChannelDecoder::new(NavaidKind::Localizer, RATE, OFFSET).unwrap();
+    d.set_report_interval(5.0);
+    let block = (RATE / 10.0) as usize;
+    let mut feed = |g: &mut Generator, s: f64| {
+        let mut out = Vec::new();
+        for _ in 0..(s * 10.0) as usize {
+            out.extend(d.process(&g.next_block(block)));
+        }
+        out
+    };
+    let before = feed(&mut Generator::new(scene(2.0, 3)), 40.0);
+    assert_eq!(before.last().unwrap().ident.as_deref(), Some("ISAC"));
+    // The clearance carrier becomes the stronger one; the next carrier
+    // search (at 60 s) sees the swap.
+    let after = feed(&mut Generator::new(scene(-2.0, 4)), 25.0);
+    let last = after.last().unwrap();
+    assert_eq!(last.ident.as_deref(), Some("ISAC"), "votes kept");
+    assert_eq!(last.ils.len(), 2, "{:?}", last.ils);
+    assert!((last.ils[0].carrier_offset_hz + 4_000.0).abs() < 5.0);
+    assert!((last.ils[0].ddm - 0.3).abs() < 0.01, "{}", last.ils[0].ddm);
+    assert!(
+        (last.ils[1].ddm - 0.03).abs() < 0.003,
+        "{}",
+        last.ils[1].ddm
+    );
 }

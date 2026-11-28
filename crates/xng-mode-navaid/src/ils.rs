@@ -6,7 +6,8 @@
 //! tones sit up to 2.5% off nominal (Category I), which is a whole DFT bin of
 //! a 0.5 s block, so the tone frequencies are measured first: every 2 s a
 //! zero-padded spectrum of the last 8 s finds each tone's peak near its
-//! nominal frequency (nominal is used until a tone stands clear). Per 0.5 s
+//! nominal frequency (nominal is used where a tone does not stand clear;
+//! the first 2 s of blocks wait for the first estimate). Per 0.5 s
 //! block at [`TONE_RATE`] a least-squares fit of DC and the two tones at
 //! those frequencies gives the depths (at exactly 90 and 150 Hz this is the
 //! plain DFT: 45 and 75 whole cycles), from which:
@@ -33,6 +34,9 @@ const BLOCK: usize = 1_200; // 0.5 s
 const HIST_N: usize = 19_200;
 const EST_FFT_N: usize = 65_536;
 const EST_EVERY_BLOCKS: u64 = 4;
+/// The first estimate waits for this much history (2 s, 0.5 Hz bins before
+/// padding: enough to find a tone 2.5% off nominal).
+const FIRST_EST_BLOCKS: usize = 4;
 /// Searched either side of nominal (fraction): 2.5% plus margin.
 const TONE_TOL: f64 = 0.03;
 /// A tone is measurable in a block when its amplitude is this many standard
@@ -93,6 +97,10 @@ pub struct IlsAnalyzer {
     f150: f64,
     /// Inverse Gram matrix of the fit's basis, for (f90, f150).
     fit: Option<(f64, f64, [[f64; 5]; 5])>,
+    /// The tones have been measured at least once.
+    estimated: bool,
+    /// Blocks waiting for the first tone estimate.
+    pending: Vec<Vec<f32>>,
 }
 
 impl IlsAnalyzer {
@@ -109,6 +117,8 @@ impl IlsAnalyzer {
             f90: 90.0,
             f150: 150.0,
             fit: None,
+            estimated: false,
+            pending: Vec::new(),
         }
     }
 
@@ -137,9 +147,28 @@ impl IlsAnalyzer {
             self.hist.drain(..d);
         }
         self.blocks_seen += 1;
-        if self.hist.len() >= HIST_N / 2 && self.blocks_seen.is_multiple_of(EST_EVERY_BLOCKS) {
+        if self.hist.len() >= FIRST_EST_BLOCKS * BLOCK
+            && self.blocks_seen.is_multiple_of(EST_EVERY_BLOCKS)
+        {
             self.estimate_tones();
         }
+        if self.estimated {
+            self.fit_block(&b);
+        } else {
+            // Until the tones are measured, a fit at nominal could be a
+            // bin off: keep the block for the first estimate.
+            self.pending.push(b);
+        }
+    }
+
+    /// Fit every block held back for the first tone estimate.
+    fn fit_pending(&mut self) {
+        for b in std::mem::take(&mut self.pending) {
+            self.fit_block(&b);
+        }
+    }
+
+    fn fit_block(&mut self, b: &[f32]) {
         let (f90, f150) = (self.f90, self.f150);
         let ginv = match self.fit {
             Some((a, c, g)) if a == f90 && c == f150 => g,
@@ -239,10 +268,21 @@ impl IlsAnalyzer {
         };
         self.f90 = find(90.0);
         self.f150 = find(150.0);
+        self.estimated = true;
+        self.fit_pending();
     }
 
     /// Close the interval.
     pub fn take(&mut self, carrier_offset_hz: f64, relative_db: f64) -> Option<IlsMeasure> {
+        if !self.pending.is_empty() {
+            // Closing before the first estimate is due: measure the tones
+            // now if there is enough history, else fit at nominal.
+            if self.hist.len() >= FIRST_EST_BLOCKS * BLOCK {
+                self.estimate_tones();
+            } else {
+                self.fit_pending();
+            }
+        }
         if self.results.is_empty() {
             return None;
         }

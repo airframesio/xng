@@ -58,6 +58,8 @@ pub const IDENT_HZ: f64 = 1_020.0;
 
 const ACQ_N: usize = 32_768; // 0.68 s
 const REACQ_S: f64 = 20.0;
+/// With no carrier, search again this often (s).
+const RETRY_S: f64 = 5.0;
 const PLL_BN_HZ: f64 = 15.0;
 /// A carrier found again within this of a tracked one is the same carrier.
 const SAME_CARRIER_HZ: f64 = 60.0;
@@ -251,68 +253,91 @@ impl NavaidChannelDecoder {
         )
     }
 
-    fn new_chain(&self, primary: bool, c: &Carrier) -> Chain {
+    fn new_chain(&self, c: &Carrier) -> Chain {
         Chain {
             pll: CarrierPll::new(CHANNEL_RATE, c.freq_hz, PLL_BN_HZ),
             peak_db: c.peak_db,
             ibuf: Vec::new(),
             vor: (self.kind == NavaidKind::Vor).then(VorAnalyzer::new),
             ils: (self.kind != NavaidKind::Vor).then(|| IlsAnalyzer::new(self.kind)),
-            ident: (primary && self.kind != NavaidKind::Glideslope).then(|| {
-                IdentPath::new(
-                    IDENT_HZ,
-                    if self.kind == NavaidKind::Vor {
-                        morse::IdentRule::Vor
-                    } else {
-                        morse::IdentRule::Localizer
-                    },
-                )
-            }),
+            ident: None,
         }
     }
 
+    fn new_ident(&self) -> Option<IdentPath> {
+        (self.kind != NavaidKind::Glideslope).then(|| {
+            IdentPath::new(
+                IDENT_HZ,
+                if self.kind == NavaidKind::Vor {
+                    morse::IdentRule::Vor
+                } else {
+                    morse::IdentRule::Localizer
+                },
+            )
+        })
+    }
+
     /// Track the carriers `found`. A tracked chain whose carrier is found
-    /// again keeps running with its state and the interval's measurements;
-    /// only new carriers get new chains, which are run through the
-    /// acquisition window so they start with its samples.
+    /// again (by frequency, whatever its rank now) keeps running with its
+    /// state and the interval's measurements; only new carriers get new
+    /// chains, which are run through the acquisition window so they start
+    /// with its samples. The ident follows the strongest carrier.
     fn build_chains(&mut self, found: &[Carrier]) {
         let same = |c: &Chain, f: &Carrier| (f.freq_hz - c.pll.freq_hz()).abs() <= SAME_CARRIER_HZ;
+        let dist = |c: &Chain, f: &Carrier| (f.freq_hz - c.pll.freq_hz()).abs();
         let mut old = std::mem::take(&mut self.chains);
-        let keep_primary = match (old.first(), found.first()) {
-            (Some(c), Some(f)) => same(c, f),
-            _ => false,
-        };
-        if !keep_primary {
-            // Secondaries hang off the primary (it carries the ident).
-            old.clear();
+        let mut slots: Vec<Option<Chain>> = found
+            .iter()
+            .map(|f| {
+                let p = (0..old.len())
+                    .filter(|&p| same(&old[p], f))
+                    .min_by(|&a, &b| dist(&old[a], f).total_cmp(&dist(&old[b], f)))?;
+                let mut c = old.remove(p);
+                c.peak_db = f.peak_db;
+                Some(c)
+            })
+            .collect();
+        let kept_any = slots.iter().any(Option::is_some);
+        // The ident path belongs to the strongest carrier. If the carriers
+        // swapped rank, the existing one (with its votes) moves across.
+        let mut moved = None;
+        if slots
+            .first()
+            .is_some_and(|c| c.as_ref().is_none_or(|c| c.ident.is_none()))
+        {
+            moved = slots
+                .iter_mut()
+                .skip(1)
+                .flatten()
+                .find_map(|c| c.ident.take())
+                .or_else(|| old.iter_mut().find_map(|c| c.ident.take()));
         }
         let acq = std::mem::take(&mut self.acq);
-        let mut primary = keep_primary.then(|| old.remove(0));
         let mut chains = Vec::with_capacity(found.len());
-        for (i, f) in found.iter().enumerate() {
-            let kept = if i == 0 {
-                primary.take()
-            } else {
-                old.iter().position(|c| same(c, f)).map(|p| old.remove(p))
-            };
-            chains.push(match kept {
-                Some(mut c) => {
-                    c.peak_db = f.peak_db;
-                    c
-                }
+        for (i, (f, slot)) in found.iter().zip(slots).enumerate() {
+            let mut c = match slot {
+                Some(c) => c,
                 None => {
-                    let mut c = self.new_chain(i == 0, f);
+                    let mut c = self.new_chain(f);
+                    if i == 0 && moved.is_none() {
+                        // A new ident path hears the window with its chain.
+                        c.ident = self.new_ident();
+                    }
                     c.feed(&acq);
                     c
                 }
-            });
+            };
+            if i == 0 && c.ident.is_none() {
+                c.ident = moved.take().or_else(|| self.new_ident());
+            }
+            chains.push(c);
         }
         self.acq = acq;
         self.chains = chains;
         if self.chains.is_empty() {
             self.on_air_since = None;
-        } else if !keep_primary {
-            // A new primary gets the full time to send its ident.
+        } else if !kept_any {
+            // A new transmitter gets the full time to send its ident.
             self.on_air_since = Some(self.total);
         }
     }
@@ -352,7 +377,8 @@ impl NavaidChannelDecoder {
             None => input.to_vec(),
         };
         let mut out = Vec::new();
-        // Work in pieces so reports and reacquisition land on time.
+        // Work in pieces that end at each report and carrier search, so
+        // both run on time and see only the samples up to then.
         let mut rest = &chan[..];
         while !rest.is_empty() {
             if self.since_report >= self.report_n {
@@ -360,8 +386,9 @@ impl NavaidChannelDecoder {
                 out.push(self.report());
                 continue;
             }
-            let to_report = (self.report_n - self.since_report) as usize;
-            let take = rest.len().min(to_report.max(1));
+            let to_report = self.report_n - self.since_report;
+            let to_acq = self.next_search().saturating_sub(self.total);
+            let take = rest.len().min(to_report.min(to_acq).max(1) as usize);
             let (piece, tail) = rest.split_at(take);
             rest = tail;
             self.step(piece);
@@ -373,6 +400,20 @@ impl NavaidChannelDecoder {
             self.chan = chan;
         }
         out
+    }
+
+    /// Sample count at which the next carrier search is due.
+    fn next_search(&self) -> u64 {
+        if self.chains.is_empty() {
+            let full = self.total + ACQ_N.saturating_sub(self.acq.len()) as u64;
+            let retry = self
+                .last_try
+                .map_or(0, |t| t + (RETRY_S * CHANNEL_RATE) as u64);
+            full.max(retry)
+        } else {
+            let every = (REACQ_S * CHANNEL_RATE) as u64;
+            (self.total / every + 1) * every
+        }
     }
 
     fn step(&mut self, x: &[Complex<f32>]) {
@@ -391,7 +432,7 @@ impl NavaidChannelDecoder {
             // Look for a carrier as soon as the window is full, then every 5 s.
             let due = self
                 .last_try
-                .is_none_or(|t| self.total - t >= (5.0 * CHANNEL_RATE) as u64);
+                .is_none_or(|t| self.total - t >= (RETRY_S * CHANNEL_RATE) as u64);
             if self.acq.len() >= ACQ_N && due {
                 self.last_try = Some(self.total);
                 let found = self.find_carriers();
@@ -404,15 +445,9 @@ impl NavaidChannelDecoder {
         }
         let every = (REACQ_S * CHANNEL_RATE) as u64;
         if before / every != self.total / every {
+            // Matched chains keep their state and take the new peak level.
             let found = self.find_carriers();
-            let unchanged = found.len() == self.chains.len()
-                && found
-                    .iter()
-                    .zip(&self.chains)
-                    .all(|(f, c)| (f.freq_hz - c.pll.freq_hz()).abs() <= SAME_CARRIER_HZ);
-            if !unchanged {
-                self.build_chains(&found);
-            }
+            self.build_chains(&found);
         }
     }
 
@@ -474,9 +509,11 @@ impl NavaidChannelDecoder {
             .map(|t| (self.total - t) as f64 / CHANNEL_RATE)
             .unwrap_or(0.0);
         // Status follows what is keyed now; `last` is only history.
-        let status = match (&ident, &recent) {
-            (Some(i), _) | (None, Some(i)) if i == "TEST" || i == "TST" => NavaidStatus::Test,
-            (Some(_), _) => NavaidStatus::Normal,
+        let is_test = |w: &Option<String>| w.as_deref().is_some_and(|w| w == "TEST" || w == "TST");
+        let status = match &ident {
+            // A station keying TEST now is in test, whatever it sent before.
+            _ if is_test(&recent) || (recent.is_none() && is_test(&ident)) => NavaidStatus::Test,
+            Some(_) => NavaidStatus::Normal,
             _ if kind == NavaidKind::Glideslope => NavaidStatus::Normal,
             _ if on_air_s >= NO_IDENT_AFTER_S
                 && main

@@ -170,7 +170,7 @@ fn navaid_update(d: &mut Dash, freq: u64, kind: &str, ident: Option<&str>, det: 
     o.insert("freq_mhz".into(), json!(freq as f64 / 1e6));
     // Interval measurements are replaced, never carried over: an interval
     // without a carrier must not show the last one's radial or DDM.
-    for k in ["cn0", "offset_hz", "radial", "radial_std", "mod30", "mod9960", "ddm", "ddm_ua", "ddm_std", "sdm", "carriers"] {
+    for k in ["cn0", "offset_hz", "ident_depth", "radial", "radial_std", "mod30", "mod9960", "ddm", "ddm_ua", "ddm_std", "sdm", "carriers"] {
         o.remove(k);
     }
     if let Some(id) = ident {
@@ -641,6 +641,15 @@ fn update(d: &mut Dash, m: &Message) {
     // per-entity map layers below.
     if let Some((key, alert)) = distress_alert(m) {
         d.alerts.insert(key, alert);
+    }
+
+    // A navaid interval with no carrier is sent with crc_ok false but is not
+    // a corrupt frame: it must still reach its channel, so the entry shows
+    // no_signal and drops the last interval's readings.
+    if !m.decode.crc_ok {
+        if let MessageBody::Navaid { kind, ident, details } = &m.body {
+            navaid_update(d, m.frequency_hz, kind, ident.as_deref(), details);
+        }
     }
 
     // Only clean (CRC-valid) frames compose map/table entities. Corrupt frames
@@ -2259,6 +2268,20 @@ mod tests {
         assert_eq!(n["ident"], "SAC", "the last ident is kept");
         assert_eq!(n["radial"], 124.0, "the latest radial wins");
         assert_eq!(n["msgs"], 2);
+        // An interval with no carrier (sent with crc_ok false) still updates
+        // the channel and clears the readings.
+        let mut m = msg(Mode::Vor, MessageBody::Navaid {
+            kind: "vor".into(),
+            ident: None,
+            details: json!({"status": "no_signal", "level_dbfs": -60.0}),
+        });
+        m.decode.crc_ok = false;
+        update(&mut d, &m);
+        let snap: Value = serde_json::from_str(&snapshot(&mut d)).unwrap();
+        let n = &snap["navaids"][0];
+        assert_eq!(n["status"], "no_signal");
+        assert!(n.get("radial").is_none() && n.get("cn0").is_none());
+        assert_eq!(n["msgs"], 3);
     }
 
     #[test]
