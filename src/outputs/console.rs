@@ -748,8 +748,54 @@ pub fn summary(msg: &Message) -> String {
         }
         MessageBody::Meshtastic { kind, details } => mesh_summary("MESHTASTIC", kind, details),
         MessageBody::MeshCore { kind, details } => mesh_summary("MESHCORE", kind, details),
+        MessageBody::Dme { kind, details } => dme_summary(kind, details),
         MessageBody::Undecoded => format!("FRAME ({} raw bytes)", msg.raw.as_ref().map_or(0, |r| r.len())),
     }
+}
+
+/// "DME ident SFO (... ..-. ---) 77X ↔ VOR 113.000 MHz"
+/// "DME status 77X reply 2712 pp/s (ident 0) snr 18.4 dB ident SFO"
+fn dme_summary(kind: &str, d: &serde_json::Value) -> String {
+    let st = |k: &str| d.get(k).and_then(|v| v.as_str());
+    let num = |k: &str| d.get(k).and_then(|v| v.as_f64());
+    let mut s = format!("DME {kind}");
+    if kind == "ident" {
+        if let Some(id) = st("ident") {
+            s.push_str(&format!(" {id}"));
+        }
+        if let Some(m) = st("morse") {
+            s.push_str(&format!(" ({m})"));
+        }
+    }
+    match (st("channel"), num("spacing_us")) {
+        (Some(c), _) => s.push_str(&format!(" {c}")),
+        (None, Some(us)) => s.push_str(&format!(" {us:.0}us")),
+        _ => {}
+    }
+    if kind == "status" {
+        if let Some(r) = st("role") {
+            s.push_str(&format!(" {r}"));
+        }
+        if let Some(p) = num("pps") {
+            s.push_str(&format!(" {p:.0} pp/s"));
+        }
+        if let Some(p) = num("ident_pps") {
+            s.push_str(&format!(" (ident {p:.0})"));
+        }
+        if let Some(x) = num("snr_db") {
+            s.push_str(&format!(" snr {x:.1} dB"));
+        }
+        if d.get("tacan").and_then(|v| v.as_bool()) == Some(true) {
+            s.push_str(" TACAN");
+        }
+        if let Some(id) = st("last_ident") {
+            s.push_str(&format!(" ident {id}"));
+        }
+    }
+    if let (Some(k), Some(f)) = (st("paired_kind"), num("paired_vhf_hz")) {
+        s.push_str(&format!(" ↔ {} {:.3} MHz", k.to_ascii_uppercase(), f / 1e6));
+    }
+    s
 }
 
 /// "MESHTASTIC text !a1b2c3d4 > broadcast [LongFast] "hello""

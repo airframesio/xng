@@ -1,0 +1,16 @@
+[package]
+name = "xng-mode-dme"
+description = "Passive DME (distance measuring equipment) receiver for xng: X/Y pulse-pair detection at 962-1213 MHz, pulse-pair rate, 1350 Hz Morse ident, TACAN reference bursts and the ICAO VOR/ILS channel pairing table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+num-complex = { workspace = true }
+xng-dsp = { workspace = true }
+xng-types = { workspace = true }

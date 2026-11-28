@@ -272,6 +272,13 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// DME ground transponder report; `kind` = `ident` / `status`,
+    /// `details` = channel, pairing, pair rates and the decoded ident (see
+    /// `xng_mode_dme`).
+    Dme {
+        kind: String,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 
