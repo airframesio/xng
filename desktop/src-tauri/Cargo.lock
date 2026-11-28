@@ -30,9 +30,24 @@ dependencies = [
 
 [[package]]
 name = "alloc-no-stdlib"
+version = "2.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc7bb162ec39d46ab1ca8c77bf72e890535becd1751bb45f64c597edb4c8c6b3"
+
+[[package]]
+name = "alloc-no-stdlib"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2fb6cfd47bf496ff64095c20eaba0c201404ee38714d4142fcfa1dc334fcc7a"
+
+[[package]]
+name = "alloc-stdlib"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e76a019e91224d279006ff972f1e984179a6e9feb050adba6ce8274aef23195"
+dependencies = [
+ "alloc-no-stdlib 2.0.4",
+]
 
 [[package]]
 name = "alloc-stdlib"
@@ -40,7 +55,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b5c1865780388bfa186411ab5f247819487fc4864c6e9c3106611fa347586e1"
 dependencies = [
- "alloc-no-stdlib",
+ "alloc-no-stdlib 3.0.0",
 ]
 
 [[package]]
@@ -530,9 +545,19 @@ version = "9.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "627b7cfb0578f0eafce087a90fcd40add1231900b69e4d4de2d456260a4f5d81"
 dependencies = [
- "alloc-no-stdlib",
- "alloc-stdlib",
- "brotli-decompressor",
+ "alloc-no-stdlib 3.0.0",
+ "alloc-stdlib 0.3.0",
+ "brotli-decompressor 6.3.1",
+]
+
+[[package]]
+name = "brotli-decompressor"
+version = "4.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a334ef7c9e23abf0ce748e8cd309037da93e606ad52eb372e4ce327a0dcfbdfd"
+dependencies = [
+ "alloc-no-stdlib 2.0.4",
+ "alloc-stdlib 0.2.4",
 ]
 
 [[package]]
@@ -541,8 +566,8 @@ version = "6.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75c74c9c51b9140663e196b5fb88bc94c334d7a497c8311cb759d8557874747f"
 dependencies = [
- "alloc-no-stdlib",
- "alloc-stdlib",
+ "alloc-no-stdlib 3.0.0",
+ "alloc-stdlib 0.3.0",
 ]
 
 [[package]]
@@ -6394,6 +6419,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02d1a66277ed75f640d608235660df48c8e3c19f3b4edb6a263315626cc3c01d"
 dependencies = [
  "base64 0.22.1",
+ "brotli-decompressor 4.0.3",
  "flate2",
  "log",
  "once_cell",
@@ -7264,7 +7290,7 @@ dependencies = [
 
 [[package]]
 name = "xng"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7305,6 +7331,7 @@ dependencies = [
  "xng-mode-ais",
  "xng-mode-aprs",
  "xng-mode-atcs",
+ "xng-mode-dme",
  "xng-mode-dsc",
  "xng-mode-eot",
  "xng-mode-flex",
@@ -7328,7 +7355,7 @@ dependencies = [
 
 [[package]]
 name = "xng-acars"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "base64 0.22.1",
  "crc",
@@ -7341,7 +7368,7 @@ dependencies = [
 
 [[package]]
 name = "xng-desktop"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7363,7 +7390,7 @@ dependencies = [
 
 [[package]]
 name = "xng-dsp"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "crc",
  "num-complex",
@@ -7372,7 +7399,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-acars"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7384,7 +7411,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-adsb"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7395,7 +7422,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-adsl"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7407,7 +7434,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-aero"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7421,7 +7448,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-airband"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7433,7 +7460,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-ais"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7444,7 +7471,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-aprs"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7456,7 +7483,19 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-atcs"
-version = "0.28.0"
+version = "0.29.0"
+dependencies = [
+ "chrono",
+ "num-complex",
+ "serde",
+ "serde_json",
+ "xng-dsp",
+ "xng-types",
+]
+
+[[package]]
+name = "xng-mode-dme"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7468,7 +7507,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-dsc"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7480,7 +7519,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-eot"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7492,7 +7531,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-flex"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7504,7 +7543,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-hfdl"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7517,7 +7556,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-iridium"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "crc",
@@ -7533,7 +7572,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-lora"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -7551,7 +7590,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-navtex"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7563,7 +7602,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-pocsag"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7575,7 +7614,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-sarsat"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7587,7 +7626,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-sonde"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7599,7 +7638,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-stdc"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7612,7 +7651,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-time"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7624,7 +7663,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-uat"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7636,7 +7675,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-vdes"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7647,7 +7686,7 @@ dependencies = [
 
 [[package]]
 name = "xng-mode-vdl2"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "num-complex",
@@ -7660,7 +7699,7 @@ dependencies = [
 
 [[package]]
 name = "xng-proto"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "prost",
  "tonic",
@@ -7670,7 +7709,7 @@ dependencies = [
 
 [[package]]
 name = "xng-sdr"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "num-complex",
  "pkg-config",
@@ -7680,7 +7719,7 @@ dependencies = [
 
 [[package]]
 name = "xng-types"
-version = "0.28.0"
+version = "0.29.0"
 dependencies = [
  "chrono",
  "serde",
