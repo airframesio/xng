@@ -266,7 +266,12 @@ impl OutputOpts {
             )?;
             if r.quic.is_some() {
                 // Modes without a per-port ingest go through the gateway once it lists them.
-                let extra: Vec<_> = modes.iter().map(|&m| (None, m, station_ident.to_string())).collect();
+                let uuid = Some(outputs::station_uuid::resolve(
+                    "base",
+                    station_ident,
+                    outputs::station_uuid::from_env().as_deref(),
+                ));
+                let extra: Vec<_> = modes.iter().map(|&m| (None, m, station_ident.to_string(), uuid.clone())).collect();
                 outputs::airframes::add_gateway_routes(&mut r, &extra);
             }
         }

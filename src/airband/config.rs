@@ -255,6 +255,11 @@ pub struct AtcFeedSettings {
     pub token: Option<String>,
     /// Station name shown to listeners.
     pub station_name: Option<String>,
+    /// The ATC station's UUID on Airframes (HELLO `station.uuid`), to put
+    /// this feeder on an existing ATC station of the account. Default: the
+    /// one saved in station-uuids.json, first the one Airframes derives
+    /// from the feeder id.
+    pub station_uuid: Option<String>,
     /// Ask the network not to show the account's username next to this
     /// feeder's feeds.
     pub hide_username: bool,
@@ -288,6 +293,7 @@ impl Default for AtcFeedSettings {
             credentials: None,
             token: None,
             station_name: None,
+            station_uuid: None,
             hide_username: false,
             location_precision_m: 100,
             bitrate: 24_000,

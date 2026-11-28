@@ -52,6 +52,8 @@ pub struct AirframesTarget {
     pub port: u16,
     pub proto: Proto,
     pub station_id: String,
+    /// Sent as `station_uuid` so the station keeps its feed when renamed.
+    pub station_uuid: Option<String>,
 }
 
 impl AirframesTarget {
@@ -190,6 +192,11 @@ pub fn cli_router(feed: bool, station_id: &str, modes: &[Mode]) -> AirframesRout
     if !feed {
         return AirframesRouter::default();
     }
+    let station_uuid = Some(crate::outputs::station_uuid::resolve(
+        "base",
+        station_id,
+        crate::outputs::station_uuid::from_env().as_deref(),
+    ));
     let routes = modes
         .iter()
         .filter_map(|&mode| {
@@ -205,6 +212,7 @@ pub fn cli_router(feed: bool, station_id: &str, modes: &[Mode]) -> AirframesRout
                     port,
                     proto,
                     station_id: station_id.to_string(),
+                    station_uuid: station_uuid.clone(),
                 },
             })
         })
@@ -216,11 +224,11 @@ pub fn cli_router(feed: bool, station_id: &str, modes: &[Mode]) -> AirframesRout
 /// payload (no trailing newline), stamping `station_id`. Returns `None` when
 /// the body doesn't match the mode or isn't something that ingest takes. AIS
 /// is batched separately (see [`AisBatcher`]).
-fn serialize(msg: &Message, mode: Mode, station_id: &str) -> Option<Vec<u8>> {
+fn serialize(msg: &Message, mode: Mode, station_id: &str, station_uuid: Option<&str>) -> Option<Vec<u8>> {
     use crate::outputs::{
         acarsdec_json, dumphfdl_json, dumpvdl2_json, iridium_toolkit_json, jaero_json, sonde_summary,
     };
-    let v = match mode {
+    let mut v = match mode {
         Mode::AcarsPoa => acarsdec_json::format_acarsdec_with_station(msg, Some(station_id)),
         Mode::Vdl2 => dumpvdl2_json::format_dumpvdl2(msg, Some(station_id)),
         Mode::Hfdl => dumphfdl_json::format_dumphfdl(msg, Some(station_id)),
@@ -229,7 +237,25 @@ fn serialize(msg: &Message, mode: Mode, station_id: &str) -> Option<Vec<u8>> {
         Mode::Sonde => sonde_summary::format_payload_summary(msg, station_id),
         _ => None,
     }?;
+    if let Some(u) = station_uuid {
+        stamp_station_uuid(&mut v, mode, u);
+    }
     Some(v.to_string().into_bytes())
+}
+
+/// Add `station_uuid` next to the field the ingest reads the station ident
+/// from. The sonde intake matches stations its own way and gets none.
+fn stamp_station_uuid(v: &mut serde_json::Value, mode: Mode, uuid: &str) {
+    let obj = match mode {
+        Mode::Vdl2 => v.get_mut("vdl2"),
+        Mode::Hfdl => v.get_mut("hfdl"),
+        Mode::Iridium => v.get_mut("source"),
+        Mode::Sonde => None,
+        _ => Some(v),
+    };
+    if let Some(serde_json::Value::Object(o)) = obj {
+        o.insert("station_uuid".into(), serde_json::Value::String(uuid.to_string()));
+    }
 }
 
 /// Lines queued per TCP ingest while it is unreachable; the oldest are kept
@@ -315,7 +341,7 @@ struct AisBatcher {
 }
 
 impl AisBatcher {
-    fn spawn(url: String, station: String) -> Self {
+    fn spawn(url: String, station: String, station_uuid: Option<String>) -> Self {
         let (tx, mut rx) = mpsc::channel::<serde_json::Value>(AIS_BATCH * 4);
         let task = tokio::spawn(async move {
             let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(30)).build();
@@ -347,7 +373,7 @@ impl AisBatcher {
                         while !queue.is_empty() {
                             let n = queue.len().min(AIS_BATCH);
                             let batch: Vec<_> = queue.iter().take(n).cloned().collect();
-                            let body = crate::outputs::aiscatcher_json::envelope(&station, batch);
+                            let body = crate::outputs::aiscatcher_json::envelope(&station, station_uuid.as_deref(), batch);
                             let (agent2, url2) = (agent.clone(), url.clone());
                             let res = tokio::task::spawn_blocking(move || post_gzip_json(&agent2, &url2, &body)).await;
                             match res {
@@ -395,7 +421,7 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut sent: u64 = 0;
     let mut tcp: HashMap<String, TcpFeed> = HashMap::new();
-    let mut ais: HashMap<(String, String), AisBatcher> = HashMap::new();
+    let mut ais: HashMap<(String, String, Option<String>), AisBatcher> = HashMap::new();
     let uplink = router.quic.clone().map(|mut q| {
         // A caller's tag (xng extern: the decoder format) plus the routes.
         q.instance_tag = match q.instance_tag.as_str() {
@@ -426,7 +452,7 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                         gateway_dropped += 1;
                     }
                     Proto::Udp => {
-                        if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id) {
+                        if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id, target.station_uuid.as_deref()) {
                             match socket.send_to(&bytes, &endpoint).await {
                                 Ok(_) => sent += 1,
                                 Err(e) => tracing::warn!("airframes udp send to {endpoint} failed: {e}"),
@@ -434,7 +460,7 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                         }
                     }
                     Proto::Tcp => {
-                        if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id) {
+                        if let Some(bytes) = serialize(&msg, msg.mode, &target.station_id, target.station_uuid.as_deref()) {
                             let feed = tcp.entry(endpoint.clone()).or_insert_with(|| TcpFeed::spawn(endpoint.clone()));
                             if feed.send(bytes, &endpoint) {
                                 sent += 1;
@@ -443,9 +469,13 @@ pub async fn run(mut rx: broadcast::Receiver<Arc<Message>>, router: AirframesRou
                     }
                     Proto::Http => {
                         if let Some(v) = crate::outputs::aiscatcher_json::format_aiscatcher(&msg) {
-                            let key = (endpoint.clone(), target.station_id.clone());
+                            let key = (endpoint.clone(), target.station_id.clone(), target.station_uuid.clone());
                             let batcher = ais.entry(key).or_insert_with(|| {
-                                AisBatcher::spawn(format!("http://{endpoint}/"), target.station_id.clone())
+                                AisBatcher::spawn(
+                                    format!("http://{endpoint}/"),
+                                    target.station_id.clone(),
+                                    target.station_uuid.clone(),
+                                )
                             });
                             if batcher.tx.try_send(v).is_ok() {
                                 sent += 1;
@@ -471,13 +501,13 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Lets the TCP and AIS writers finish their queues (they end once their
 /// sender is dropped), up to [`DRAIN_TIMEOUT`] in all; says what did not.
-async fn drain_writers(tcp: HashMap<String, TcpFeed>, ais: HashMap<(String, String), AisBatcher>) {
+async fn drain_writers(tcp: HashMap<String, TcpFeed>, ais: HashMap<(String, String, Option<String>), AisBatcher>) {
     let mut tasks: Vec<(String, tokio::task::JoinHandle<()>)> = Vec::new();
     for (endpoint, f) in tcp {
         drop(f.tx);
         tasks.push((endpoint, f.task));
     }
-    for ((endpoint, _), b) in ais {
+    for ((endpoint, _, _), b) in ais {
         drop(b.tx);
         tasks.push((endpoint, b.task));
     }
@@ -518,9 +548,9 @@ fn quic_send(up: &crate::outputs::airframes_quic::Uplink, msg: &Message, sdr_id:
     } else if msg.mode == Mode::Ais {
         // One single-message batch body per DATA frame (the AIS intake's shape).
         let Some(v) = crate::outputs::aiscatcher_json::format_aiscatcher(msg) else { return false };
-        crate::outputs::aiscatcher_json::envelope(&target.station_id, vec![v]).to_string().into_bytes()
+        crate::outputs::aiscatcher_json::envelope(&target.station_id, target.station_uuid.as_deref(), vec![v]).to_string().into_bytes()
     } else {
-        let Some(b) = serialize(msg, msg.mode, &target.station_id) else { return false };
+        let Some(b) = serialize(msg, msg.mode, &target.station_id, target.station_uuid.as_deref()) else { return false };
         b
     };
     let spec = FeedSpec {
@@ -528,7 +558,7 @@ fn quic_send(up: &crate::outputs::airframes_quic::Uplink, msg: &Message, sdr_id:
         mode: msg.mode,
         format,
         station_ident: target.station_id.clone(),
-        station_uuid: None,
+        station_uuid: target.station_uuid.clone(),
         sdr_id: sdr_id.map(str::to_string),
     };
     let capture_us = msg.timestamp.timestamp_micros().max(0) as u64;
@@ -537,8 +567,8 @@ fn quic_send(up: &crate::outputs::airframes_quic::Uplink, msg: &Message, sdr_id:
 
 /// Routes for modes that have no per-port ingest but can go through the
 /// feed gateway (sent while it lists them). `station_id` gives each mode's id.
-pub fn add_gateway_routes(router: &mut AirframesRouter, modes: &[(Option<String>, Mode, String)]) {
-    for (sdr_id, mode, station_id) in modes {
+pub fn add_gateway_routes(router: &mut AirframesRouter, modes: &[(Option<String>, Mode, String, Option<String>)]) {
+    for (sdr_id, mode, station_id, station_uuid) in modes {
         if !crate::outputs::airframes_quic::gateway_eligible(*mode)
             || router.routes.iter().any(|r| r.mode == *mode && r.sdr_id == *sdr_id)
         {
@@ -547,7 +577,7 @@ pub fn add_gateway_routes(router: &mut AirframesRouter, modes: &[(Option<String>
         router.routes.push(Route {
             sdr_id: sdr_id.clone(),
             mode: *mode,
-            target: AirframesTarget { host: String::new(), port: 0, proto: Proto::Gateway, station_id: station_id.clone() },
+            target: AirframesTarget { host: String::new(), port: 0, proto: Proto::Gateway, station_id: station_id.clone(), station_uuid: station_uuid.clone() },
         });
     }
 }
@@ -577,6 +607,7 @@ mod tests {
                         port: 5550,
                         proto: Proto::Udp,
                         station_id: "EXACT".into(),
+                        station_uuid: None,
                     },
                 },
                 Route {
@@ -587,6 +618,7 @@ mod tests {
                         port: 5550,
                         proto: Proto::Udp,
                         station_id: "WILD".into(),
+                        station_uuid: None,
                     },
                 },
             ],
@@ -665,7 +697,7 @@ mod tests {
             for f in dec.process(chunk) {
                 if f.acars.is_some() {
                     let m = xng_mode_vdl2::to_message(&f, 136_975_000, -10.77, prov());
-                    if let Some(b) = serialize(&m, Mode::Vdl2, "XX-TEST-VDL2") {
+                    if let Some(b) = serialize(&m, Mode::Vdl2, "XX-TEST-VDL2", None) {
                         out.push(("dumpvdl2", String::from_utf8(b).unwrap()));
                         break 'vdl2;
                     }
@@ -680,7 +712,7 @@ mod tests {
             for e in dec.process(chunk) {
                 if e.acars.as_ref().is_some_and(|b| b.crc_ok) {
                     let m = xng_mode_aero::to_message(&e, 1_545_000_000, -20.0, prov());
-                    if let Some(b) = serialize(&m, Mode::AeroL, "XX-TEST-IMSL") {
+                    if let Some(b) = serialize(&m, Mode::AeroL, "XX-TEST-IMSL", None) {
                         out.push(("jaero", String::from_utf8(b).unwrap()));
                         break 'aero;
                     }
@@ -709,7 +741,7 @@ mod tests {
         events.extend(parser.parse(&perf, 1800));
         for e in &events {
             let m = xng_mode_hfdl::to_message(e, 8_927_000, -23.0, prov());
-            if let Some(b) = serialize(&m, Mode::Hfdl, "XX-TEST-HFDL") {
+            if let Some(b) = serialize(&m, Mode::Hfdl, "XX-TEST-HFDL", None) {
                 out.push(("dumphfdl", String::from_utf8(b).unwrap()));
             }
         }
@@ -726,7 +758,7 @@ mod tests {
             raw_bits: Vec::new(),
         };
         let m = xng_mode_iridium::to_message(&f, 1_626_270_000, -41.0, prov());
-        out.push(("iridium-toolkit", String::from_utf8(serialize(&m, Mode::Iridium, "XX-TEST-IRDM").unwrap()).unwrap()));
+        out.push(("iridium-toolkit", String::from_utf8(serialize(&m, Mode::Iridium, "XX-TEST-IRDM", None).unwrap()).unwrap()));
 
         // AIS: a class A position report and a static/voyage report.
         let mut msgs = Vec::new();
@@ -759,7 +791,7 @@ mod tests {
             };
             msgs.push(crate::outputs::aiscatcher_json::format_aiscatcher(&m).unwrap());
         }
-        let env = crate::outputs::aiscatcher_json::envelope("XX-TEST-AIS", msgs);
+        let env = crate::outputs::aiscatcher_json::envelope("XX-TEST-AIS", None, msgs);
         out.push(("aiscatcher", env.to_string()));
 
         // Sonde: the rs1729/RS rs41.txt example frame (sonde K1930293, near Zagreb).
@@ -768,7 +800,7 @@ mod tests {
             (0..RS41_FRAME.len()).step_by(2).map(|i| u8::from_str_radix(&RS41_FRAME[i..i + 2], 16).unwrap()).collect();
         let d = xng_mode_sonde::decode_dewhitened(&bytes).unwrap();
         let m = xng_mode_sonde::to_message(&d, 403_000_000, -30.0, prov());
-        out.push(("sonde", String::from_utf8(serialize(&m, Mode::Sonde, "XX-TEST-SONDE").unwrap()).unwrap()));
+        out.push(("sonde", String::from_utf8(serialize(&m, Mode::Sonde, "XX-TEST-SONDE", None).unwrap()).unwrap()));
 
         if let Ok(dir) = std::env::var("XNG_WIRE_SAMPLES_DIR") {
             let mut files: HashMap<&str, String> = HashMap::new();
@@ -891,11 +923,40 @@ mod tests {
             flate2::read::GzDecoder::new(&body[..]).read_to_string(&mut json).unwrap();
             json
         });
-        let b = AisBatcher::spawn(format!("http://{addr}/"), "XX-TEST-AIS".into());
+        let b = AisBatcher::spawn(
+            format!("http://{addr}/"),
+            "XX-TEST-AIS".into(),
+            Some("3f2b8c1e-7d4a-4c9e-9b1f-2a6e5d4c3b2a".into()),
+        );
         b.tx.send(serde_json::json!({ "type": 1, "mmsi": 366053209 })).await.unwrap();
         let json = tokio::task::spawn_blocking(move || server.join().unwrap()).await.unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["stationid"], "XX-TEST-AIS");
+        assert_eq!(v["station_uuid"], "3f2b8c1e-7d4a-4c9e-9b1f-2a6e5d4c3b2a");
         assert_eq!(v["msgs"][0]["mmsi"], 366053209);
+    }
+
+    #[test]
+    fn station_uuid_goes_next_to_the_station_ident() {
+        use serde_json::json;
+        let u = "3f2b8c1e-7d4a-4c9e-9b1f-2a6e5d4c3b2a";
+        let mut acars = json!({ "station_id": "XX" });
+        stamp_station_uuid(&mut acars, Mode::AcarsPoa, u);
+        assert_eq!(acars["station_uuid"], u);
+        let mut vdl2 = json!({ "vdl2": { "station": "XX" } });
+        stamp_station_uuid(&mut vdl2, Mode::Vdl2, u);
+        assert_eq!(vdl2["vdl2"]["station_uuid"], u);
+        let mut hfdl = json!({ "hfdl": { "station": "XX" } });
+        stamp_station_uuid(&mut hfdl, Mode::Hfdl, u);
+        assert_eq!(hfdl["hfdl"]["station_uuid"], u);
+        let mut jaero = json!({ "station": "XX" });
+        stamp_station_uuid(&mut jaero, Mode::AeroC, u);
+        assert_eq!(jaero["station_uuid"], u);
+        let mut iridium = json!({ "source": { "station_id": "XX" } });
+        stamp_station_uuid(&mut iridium, Mode::Iridium, u);
+        assert_eq!(iridium["source"]["station_uuid"], u);
+        let mut sonde = json!({ "station": "XX" });
+        stamp_station_uuid(&mut sonde, Mode::Sonde, u);
+        assert!(sonde.get("station_uuid").is_none());
     }
 }

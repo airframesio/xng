@@ -1,7 +1,8 @@
 //! `xng atc login | logout | status`: sign this feeder in to the Airframes
 //! ATC network. `xng atc match`: show which ATC catalog entries channels
 //! would be fed under. `xng atc nearby`: the channels `--channels auto`
-//! would pick.
+//! would pick. `xng atc setup`: plan a feed for this station's SDRs and
+//! write it as a station file.
 
 use crate::airband::atc_auth::{self, DEFAULT_API};
 use crate::airband::atc_catalog::{self, Resolution};
@@ -53,6 +54,10 @@ pub enum AtcCommand {
         #[arg(long, default_value = DEFAULT_API)]
         api: String,
     },
+    /// Set up an ATC feed: find the station's position and SDRs, pick the
+    /// busiest ATC channels nearby, pack them onto the SDRs, and write a
+    /// station file for `xng station`
+    Setup(crate::commands::atc_setup::SetupArgs),
     /// Show the ATC channels `listen --mode airband --channels auto` would
     /// pick near a position, and the command that feeds them
     Nearby {
@@ -121,6 +126,7 @@ pub fn run(cmd: AtcCommand) -> anyhow::Result<()> {
             Ok(())
         }
         AtcCommand::Status { credentials } => status(&credentials.unwrap_or_else(atc_auth::default_path)),
+        AtcCommand::Setup(a) => crate::commands::atc_setup::run(a),
         AtcCommand::Match { frequencies, lat, lon, api } => match_frequencies(&frequencies, lat, lon, &api),
         AtcCommand::Nearby { lat, lon, radius_nm, sample_rate, center_freq, max_channels, services, api, credentials } => {
             let center_hz = center_freq.as_deref().map(crate::freq::parse_hz).transpose()?;

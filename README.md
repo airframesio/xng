@@ -166,9 +166,9 @@ local speech-to-text there: use `--whisper-url`). The binaries need
 `libsoapysdr` at runtime (plus `libairspy`/`libairspyhf` for native Airspy):
 
 ```bash
-sudo apt install ./xng-0.27.0-arm64.deb    # pulls runtime deps (armhf: -armhf.deb)
+sudo apt install ./xng-0.28.0-arm64.deb    # pulls runtime deps (armhf: -armhf.deb)
 # or
-tar xzf xng-v0.27.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng-v0.27.0-x86_64-unknown-linux-gnu/xng /usr/local/bin/
+tar xzf xng-v0.28.0-x86_64-unknown-linux-gnu.tar.gz && sudo cp xng-v0.28.0-x86_64-unknown-linux-gnu/xng /usr/local/bin/
 ```
 
 On Windows, unzip the `x86_64-pc-windows-msvc` release. To use a radio,
@@ -326,6 +326,12 @@ xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
 xng listen --sdr driver=rtlsdr --mode airband -r 2400000 --channels auto \
     --receiver-pos 37.62,-122.38 --atc-feed
 
+# Several dongles: plan them all at once and run the station file it writes
+# (each SDR takes the busiest slice of the band the others left; without
+# --lat/--lon the position comes from a rough IP lookup)
+xng atc setup --lat 37.62 --lon -122.38 --station-name "SFO west ridge"
+xng station ~/.config/xng/atc-station.toml
+
 # ...and transcribe them. Release binaries, the .deb and the amd64/arm64
 # Docker images include sherpa-onnx: --transcribe runs the ATC-tuned
 # skycontrol-atc-110m model, downloaded once (137 MB) on first use.
@@ -442,10 +448,26 @@ Each mode goes to its own Airframes ingest in the format that ingest reads:
 | Radiosonde | UDP `:5573` | radiosonde_auto_rx payload summary JSON (one per frame with a GPS fix) |
 
 Each block (`[outputs.airframes.acars]`, `.vdl2`, `.hfdl`, `.ais`, `.aero`,
-`.iridium`, `.sonde`) takes `enabled`, `station-id`, `host` and `port`. Other modes
+`.iridium`, `.sonde`) takes `enabled`, `station-id`, `station-uuid`, `host` and `port`. Other modes
 (STD-C, ADS-B, UAT, ...) reach Airframes over asf-2.0. The multiplexed **asf-2.0**
 feed carries every mode separately under the canonical station id and is
 independent of this per-port path.
+
+**Station UUIDs.** The ACARS, VDL2, HFDL, JAERO (aero), Iridium and AIS feeds
+also carry a `station_uuid` (balloon summaries do not), and Airframes
+finds the station by it before the name. Renaming a station, on the website
+or with `station-id` here, keeps its feed, messages and stats on the same
+station. xng keeps one UUID per station in `station-uuids.json` (in
+`XNG_STATE_DIR`, else `~/.config/xng`); it starts as a UUID derived from the
+station id, so it is the same on every run even where nothing is saved. A
+station that already exists on Airframes has its own UUID: set it with
+`station-uuid` (top level, `[outputs.airframes]`, or a mode block; a session's
+`airframes-station-uuid`) or `XNG_STATION_UUID`. Airwaves OS sets it for you
+at sign-in. The ATC feed sends one too (HELLO `station.uuid`): by default the
+UUID Airframes already gave the feeder's ATC station, saved under the `atc`
+slot, so a new `atc.json` (new feeder id) keeps the station. Point it at
+another ATC station of your account with `station-uuid` in the ATC settings,
+`--atc-station-uuid` or `XNG_ATC_STATION_UUID`.
 
 **One connection for every feed (preview).** `transport = "quic"` in
 `[outputs.airframes]` (or `--airframes-transport quic`) sends every feed

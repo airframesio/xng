@@ -29,6 +29,8 @@ use xng_types::Message;
 #[derive(Clone, Debug, Default)]
 pub struct StationInfo {
     pub name: String,
+    /// Station UUID for HELLO `station.uuid`; filled in by [`run`] when unset.
+    pub uuid: Option<String>,
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub alt_m: Option<f64>,
@@ -604,6 +606,10 @@ pub async fn run(
             return Ok(());
         }
     };
+    let mut station = station;
+    if station.uuid.is_none() {
+        station.uuid = Some(crate::outputs::station_uuid::resolve_atc(&feeder_id, s.station_uuid.as_deref()));
+    }
     let dialer = match Dialer::new(&s) {
         Ok(d) => d,
         Err(e) => {
@@ -756,6 +762,9 @@ async fn session(
     let mut link = link.map_err(|e| e.context(if quic { "QUIC" } else { "TLS/TCP" }))?;
 
     let mut st = json!({"name": station.name, "location_precision_m": s.location_precision_m});
+    if let Some(u) = &station.uuid {
+        st["uuid"] = json!(u);
+    }
     if let (Some(lat), Some(lon)) = (station.lat, station.lon) {
         st["lat"] = json!(p::round_coord(lat, s.location_precision_m).clamp(-90.0, 90.0));
         st["lon"] = json!(p::round_coord(lon, s.location_precision_m).clamp(-180.0, 180.0));
