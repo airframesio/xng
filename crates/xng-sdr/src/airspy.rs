@@ -2,8 +2,9 @@
 //!
 //! Direct FFI against the libairspy C API (declarations transcribed from
 //! airspyone_host's airspy.h), so Airspy hardware works without a SoapyAirspy
-//! shim. The library delivers float32 IQ on its own USB thread; samples cross
-//! into [`crate::IqSource::read`] through [`crate::pump::SamplePump`].
+//! shim. The library delivers the raw real samples on its own USB thread,
+//! [`conv`] turns them into IQ there, and they cross into
+//! [`crate::IqSource::read`] through [`crate::pump::SamplePump`].
 //!
 //! Rates: the device advertises a discrete list (R2: 2.5/10 Msps, Mini:
 //! 3/6 Msps), but firmware >= 1.0.7 accepts arbitrary rates, which libairspy
@@ -11,13 +12,15 @@
 //! whatever was asked and only report the advertised list if the device
 //! refuses.
 
+mod conv;
+
 use crate::pump::{SamplePump, sample_channel};
 use crate::{IqSource, SdrError};
 use num_complex::Complex;
 use std::os::raw::{c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 mod ffi {
     use std::os::raw::{c_int, c_void};
@@ -42,6 +45,7 @@ mod ffi {
     }
 
     pub const AIRSPY_SAMPLE_FLOAT32_IQ: c_int = 0;
+    pub const AIRSPY_SAMPLE_UINT16_REAL: c_int = 4;
     pub const AIRSPY_SUCCESS: c_int = 0;
 
     pub type SampleBlockCb = unsafe extern "C" fn(*mut Transfer) -> c_int;
@@ -126,29 +130,50 @@ struct StreamStats {
 struct StreamCtx {
     tx: SyncSender<Vec<Complex<f32>>>,
     stats: Arc<StreamStats>,
+    /// Only the USB thread locks it, so the lock is never contended.
+    conv: Mutex<conv::AirspyConverter>,
 }
 
 unsafe extern "C" fn rx_callback(transfer: *mut ffi::Transfer) -> c_int {
     let t = &*transfer;
-    if t.sample_type == ffi::AIRSPY_SAMPLE_FLOAT32_IQ && t.sample_count > 0 {
-        let n = t.sample_count as usize;
-        let samples = std::slice::from_raw_parts(t.samples as *const Complex<f32>, n);
+    if t.sample_type == ffi::AIRSPY_SAMPLE_UINT16_REAL && t.sample_count > 0 {
+        // UINT16_REAL: sample_count counts real samples, two per IQ sample.
+        let raw = std::slice::from_raw_parts(t.samples as *const u16, t.sample_count as usize);
         let ctx = &*(t.ctx as *const StreamCtx);
         ctx.stats.transfers.fetch_add(1, Ordering::Relaxed);
         if t.dropped_samples > 0 {
             ctx.stats.usb_dropped.fetch_add(t.dropped_samples, Ordering::Relaxed);
         }
-        let head_pwr: f32 = samples.iter().take(64).map(|s| s.norm_sqr()).sum();
-        if head_pwr < 1e-9 {
+        // Convert every transfer, even one about to be dropped below: the
+        // converter's filter history has to stay continuous.
+        let mut samples = Vec::with_capacity(raw.len() / 2);
+        ctx.conv
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .process(raw, &mut samples);
+        if stalled(raw) {
             ctx.stats.near_zero.fetch_add(1, Ordering::Relaxed);
         }
         // Drop the transfer if the consumer is behind; stalling the USB
         // thread only moves the overflow into the device.
-        if ctx.tx.try_send(samples.to_vec()).is_err() {
+        if ctx.tx.try_send(samples).is_err() {
             ctx.stats.chan_dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
     0
+}
+
+/// Whether a transfer looks like a device stall: its first 128 raw samples
+/// are flat to within one ADC count. Judged before conversion, because the
+/// converter's slow DC tracker keeps its output nonzero for many transfers
+/// after the input goes flat. A live R2 never holds that still: across 762
+/// recorded transfers at gain 20, the flattest head still spanned 12 counts.
+fn stalled(raw: &[u16]) -> bool {
+    let head = &raw[..raw.len().min(128)];
+    match (head.iter().min(), head.iter().max()) {
+        (Some(&lo), Some(&hi)) => hi - lo < 2,
+        _ => false,
+    }
 }
 
 /// A single-channel RX capture from an Airspy R2/Mini.
@@ -200,6 +225,11 @@ impl AirspyIqSource {
         }
         let guard = scopeguard(dev);
 
+        // Configure in IQ mode, so libairspy reads the requested rate and
+        // reports the advertised ones as IQ rates: with a real sample type it
+        // passes an off-list rate to the device undoubled and doubles the
+        // list it returns. The switch to raw samples comes just before
+        // start_rx (set_sample_type only changes the delivered format).
         check("set_sample_type", unsafe {
             ffi::airspy_set_sample_type(dev, ffi::AIRSPY_SAMPLE_FLOAT32_IQ)
         })?;
@@ -231,9 +261,19 @@ impl AirspyIqSource {
         }
         check("set_freq", unsafe { ffi::airspy_set_freq(dev, center_freq_hz as u32) })?;
 
+        // The raw samples at twice the IQ rate, unpacked by libairspy when
+        // packing is on; `conv` turns them into IQ at the rate set above.
+        check("set_sample_type", unsafe {
+            ffi::airspy_set_sample_type(dev, ffi::AIRSPY_SAMPLE_UINT16_REAL)
+        })?;
+
         let (tx, pump) = sample_channel();
         let stats = Arc::new(StreamStats::default());
-        let ctx = Box::new(StreamCtx { tx, stats: stats.clone() });
+        let ctx = Box::new(StreamCtx {
+            tx,
+            stats: stats.clone(),
+            conv: Mutex::new(conv::AirspyConverter::new()),
+        });
         check("start_rx", unsafe {
             ffi::airspy_start_rx(dev, rx_callback, &*ctx as *const StreamCtx as *mut c_void)
         })?;
@@ -315,6 +355,19 @@ mod tests {
         assert!(major >= 1);
         // No device attached in CI: must still return cleanly.
         enumerate().expect("enumerate");
+    }
+
+    /// Flat transfers (all zeros, or stuck mid-scale) read as stalls; one
+    /// count of jitter still does; ADC noise and an empty slice don't.
+    #[test]
+    fn stall_is_judged_on_raw_samples() {
+        assert!(stalled(&[0; 4096]));
+        assert!(stalled(&[2048; 4096]));
+        let jitter: Vec<u16> = (0..4096).map(|k| 2048 + (k % 2) as u16).collect();
+        assert!(stalled(&jitter));
+        let noise: Vec<u16> = (0..4096).map(|k| 2048 + ((k * 7919) % 25) as u16).collect();
+        assert!(!stalled(&noise));
+        assert!(!stalled(&[]));
     }
 
     #[test]
