@@ -63,6 +63,12 @@ pub enum Mode {
     /// DME / TACAN ground transponders (962–1213 MHz pulse pairs, receive
     /// only): pair rate, Morse ident, channel and VOR/ILS pairing.
     Dme,
+    /// VOR navaid monitoring: carrier, ident and receiver-derived radial
+    /// (108–117.95 MHz). Receive only, not for navigation.
+    Vor,
+    /// ILS localizer (108.10–111.95 MHz) and glideslope (328.6–335.4 MHz)
+    /// monitoring: DDM, SDM, ident. Receive only, not for navigation.
+    Ils,
     /// Message injected via a wrapped external decoder.
     Extern,
 }
@@ -96,6 +102,8 @@ impl Mode {
             Mode::Meshtastic => "meshtastic",
             Mode::MeshCore => "meshcore",
             Mode::Dme => "dme",
+            Mode::Vor => "vor",
+            Mode::Ils => "ils",
             Mode::Extern => "extern",
         }
     }
@@ -129,6 +137,8 @@ impl Mode {
             Mode::Meshtastic,
             Mode::MeshCore,
             Mode::Dme,
+            Mode::Vor,
+            Mode::Ils,
         ]
     }
 }
@@ -170,6 +180,8 @@ impl std::str::FromStr for Mode {
             "meshtastic" | "mesh" => Ok(Mode::Meshtastic),
             "meshcore" => Ok(Mode::MeshCore),
             "dme" | "tacan" => Ok(Mode::Dme),
+            "vor" | "dvor" | "vor-dme" | "vortac" => Ok(Mode::Vor),
+            "ils" | "localizer" | "loc" | "glideslope" | "glidepath" | "gs" => Ok(Mode::Ils),
             other => Err(format!("unknown mode: {other}")),
         }
     }

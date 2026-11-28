@@ -279,6 +279,16 @@ pub enum MessageBody {
         kind: String,
         details: serde_json::Value,
     },
+    /// Navaid observation (VOR, ILS localizer or glideslope) for one
+    /// reporting interval. `kind` = `vor` / `localizer` / `glideslope`,
+    /// `ident` = the voted Morse ident, `details` = status, levels, C/N0 and
+    /// the radial or DDM/SDM measurements (see `xng_mode_navaid`).
+    Navaid {
+        kind: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ident: Option<String>,
+        details: serde_json::Value,
+    },
     Undecoded,
 }
 

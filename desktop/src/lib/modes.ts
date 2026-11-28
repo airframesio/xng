@@ -24,6 +24,8 @@ export const MODES: ModeMeta[] = [
   { id: "hfdl", name: "HFDL", what: "Long-range airline datalink on shortwave", family: "air" },
   { id: "uat", name: "UAT 978", what: "US light-aircraft positions and weather", family: "air" },
   { id: "ads-l", name: "ADS-L", what: "Gliders, drones and light aircraft", family: "air" },
+  { id: "vor", name: "VOR", what: "VOR radials, idents and station health", family: "air" },
+  { id: "ils", name: "ILS", what: "Localizer and glideslope course readings and idents", family: "air" },
   { id: "ais", name: "AIS", what: "Ship positions and details", family: "sea" },
   { id: "vdes", name: "VDES", what: "Application messages beside AIS", family: "sea" },
   { id: "dsc", name: "DSC", what: "Maritime distress and calling", family: "sea" },
