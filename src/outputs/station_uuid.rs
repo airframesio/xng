@@ -141,17 +141,25 @@ fn resolve_with(
         }
     }
     let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(u) = load(path).stations.get(slot).and_then(|u| parse(u)) {
-        return u;
-    }
-    let u = default();
-    // Another xng process may have written the file since: read it again
-    // just before saving, keep its entries, and use its value for this
-    // slot if it saved one first.
+    resolve_locked(path, slot, ident, default)
+}
+
+/// Read, update and save the map under an exclusive lock on
+/// `station-uuids.json.lock`, so two xng processes sharing one state
+/// directory never drop each other's slots. `LOCK` above covers threads of
+/// this process; this covers other processes.
+fn resolve_locked(
+    path: &Path,
+    slot: &str,
+    ident: &str,
+    default: impl FnOnce() -> String,
+) -> String {
+    let _file_lock = lock_file(path);
     let mut saved = load(path);
     if let Some(u) = saved.stations.get(slot).and_then(|u| parse(u)) {
         return u;
     }
+    let u = default();
     saved.stations.insert(slot.to_string(), u.clone());
     if let Err(e) = save(path, &saved) {
         tracing::debug!(
@@ -160,6 +168,27 @@ fn resolve_with(
         );
     }
     u
+}
+
+/// Held until dropped. `None` when the directory can't be written, in which
+/// case nothing can be saved either.
+fn lock_file(path: &Path) -> Option<std::fs::File> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_extension("json.lock"))
+        .ok()?;
+    match file.lock() {
+        Ok(()) => Some(file),
+        Err(e) => {
+            tracing::debug!("station uuid map {}: not locked: {e}", path.display());
+            None
+        }
+    }
 }
 
 fn load(path: &Path) -> Saved {
@@ -245,30 +274,35 @@ mod tests {
     }
 
     #[test]
-    fn a_save_keeps_what_another_process_wrote_meanwhile() {
+    fn concurrent_writers_keep_every_slot() {
+        // Each thread opens the lock file itself and skips the in-process
+        // mutex, like separate xng processes do. The slow default holds the
+        // read-to-save window open so that unlocked writers would overwrite
+        // each other.
         let dir = tempdir();
         let path = dir.join("station-uuids.json");
-        let theirs = "3f2b8c1e-7d4a-4c9e-9b1f-2a6e5d4c3b2a";
-        let other = "9a1d2c3b-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
-        // While this process computes its default, another one saves this
-        // slot and an unrelated one.
-        let got = resolve_with(&path, "base", "XX-KSEA", None, || {
-            let mut s = Saved::default();
-            s.stations.insert("base".into(), theirs.into());
-            s.stations.insert("mode:vdl2".into(), other.into());
-            save(&path, &s).unwrap();
-            derived("XX-KSEA")
-        });
-        assert_eq!(got, theirs);
-        // A later slot is added next to both, not over them.
-        let ais = resolve_at(&path, "mode:ais", "XX-KSEA-AIS", None);
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let ident = format!("XX-KSEA-{i}");
+                    resolve_locked(&path, &format!("mode:{i}"), &ident, || {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        derived(&ident)
+                    })
+                })
+            })
+            .collect();
+        let got: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
         let saved = load(&path);
-        assert_eq!(saved.stations.get("base").map(String::as_str), Some(theirs));
-        assert_eq!(
-            saved.stations.get("mode:vdl2").map(String::as_str),
-            Some(other)
-        );
-        assert_eq!(saved.stations.get("mode:ais"), Some(&ais));
+        for (i, u) in got.iter().enumerate() {
+            assert_eq!(saved.stations.get(&format!("mode:{i}")), Some(u));
+            // Renamed later: the saved slot still wins.
+            assert_eq!(
+                resolve_at(&path, &format!("mode:{i}"), "XX-RENAMED", None),
+                *u
+            );
+        }
     }
 
     #[test]
