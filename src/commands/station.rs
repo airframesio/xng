@@ -17,6 +17,10 @@
 //! station-id = "XX-KSEA"   # base; auto-suffix derives XX-KSEA-ACARS, …
 //! auto-suffix = true
 //!
+//! # Optionally send a mode to several places, e.g. Airframes and acarshub.
+//! [outputs.airframes.vdl2]
+//! targets = ["tcp://feed.airframes.io:5553", "192.168.1.20:5555"]
+//!
 //! [[session]]
 //! sdr = "driver=rtlsdr,serial=00000001"
 //! gain = 48
@@ -32,7 +36,7 @@
 //! ```
 
 use crate::outputs::airframes::{
-    auto_suffix, default_endpoint, has_serializer, AirframesRouter, AirframesTarget, Route,
+    auto_suffix, default_endpoint, has_serializer, AirframesRouter, AirframesTarget, Proto, Route,
 };
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -142,6 +146,45 @@ pub struct AirframesModeToml {
     pub host: Option<String>,
     /// Override the ingest port.
     pub port: Option<u16>,
+    /// Send this mode to several places instead of one, e.g. Airframes and a
+    /// local acarshub: `["tcp://feed.airframes.io:5553", "192.168.1.20:15555"]`.
+    /// Each entry is `host:port`, optionally prefixed `udp://`, `tcp://` or
+    /// (AIS) `http://`; without a prefix it uses the mode's usual transport.
+    /// Every message goes to every target. Replaces `host`/`port`.
+    pub targets: Option<Vec<FeedTargetToml>>,
+}
+
+/// One `targets` entry: `[udp|tcp|http://]host:port`.
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+#[serde(try_from = "String")]
+pub struct FeedTargetToml {
+    /// `None` = the mode's usual transport.
+    pub proto: Option<Proto>,
+    pub host: String,
+    pub port: u16,
+}
+
+impl TryFrom<String> for FeedTargetToml {
+    type Error = String;
+    fn try_from(s: String) -> Result<Self, String> {
+        let (proto, rest) = match s.split_once("://") {
+            Some((scheme, rest)) => (Some(scheme.parse::<Proto>()?), rest),
+            None => (None, s.as_str()),
+        };
+        let example = "like `feed.airframes.io:5550` or `tcp://192.168.1.20:5553`";
+        let (host, port) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| format!("target `{s}` needs host:port, {example}"))?;
+        let port = port
+            .parse::<u16>()
+            .ok()
+            .filter(|&p| p != 0)
+            .ok_or_else(|| format!("target `{s}`: `{port}` isn't a port number"))?;
+        if host.is_empty() || host.contains('/') {
+            return Err(format!("target `{s}` needs host:port, {example}"));
+        }
+        Ok(Self { proto, host: host.to_string(), port })
+    }
 }
 
 fn default_true() -> bool {
@@ -149,6 +192,45 @@ fn default_true() -> bool {
 }
 
 impl AirframesToml {
+    /// Catch the `targets` mistakes the schema can't: giving it together with
+    /// `host`/`port`, an empty list, or a transport the mode's format can't
+    /// use (AIS posts batches over HTTP; the others send lines over UDP or TCP).
+    pub fn check(&self) -> Result<(), String> {
+        let blocks = [
+            ("acars", &self.acars, Mode::AcarsPoa),
+            ("vdl2", &self.vdl2, Mode::Vdl2),
+            ("hfdl", &self.hfdl, Mode::Hfdl),
+            ("ais", &self.ais, Mode::Ais),
+            ("aero", &self.aero, Mode::AeroL),
+            ("iridium", &self.iridium, Mode::Iridium),
+        ];
+        for (name, block, mode) in blocks {
+            let Some(targets) = block.as_ref().and_then(|b| b.targets.as_ref()) else {
+                continue;
+            };
+            let b = block.as_ref().expect("targets come from a block");
+            let at = format!("[outputs.airframes.{name}]");
+            if b.host.is_some() || b.port.is_some() {
+                return Err(format!("{at}: give either `targets` or `host`/`port`, not both"));
+            }
+            if targets.is_empty() {
+                return Err(format!(
+                    "{at}: `targets` is empty; leave it out to feed the usual ingest, or set `enabled = false`"
+                ));
+            }
+            for t in targets {
+                let Some(p) = t.proto else { continue };
+                if mode == Mode::Ais && p != Proto::Http {
+                    return Err(format!("{at}: AIS is posted over http, not {}", p.as_str()));
+                }
+                if mode != Mode::Ais && p == Proto::Http {
+                    return Err(format!("{at}: {name} is sent over udp or tcp, not http"));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn mode_cfg(&self, mode: Mode) -> Option<&AirframesModeToml> {
         match mode {
             Mode::AcarsPoa => self.acars.as_ref(),
@@ -213,6 +295,9 @@ pub fn load(path: &Path) -> anyhow::Result<StationFile> {
     let f: StationFile = toml::from_str(&text)
         .map_err(|e| anyhow::anyhow!("parse {}: {e}", path.display()))?;
     anyhow::ensure!(!f.sessions.is_empty(), "{}: no [[session]] entries", path.display());
+    if let Some(af) = &f.outputs.airframes {
+        af.check().map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    }
     for (i, sess) in f.sessions.iter().enumerate() {
         anyhow::ensure!(
             sess.sdr.is_some() ^ sess.file.is_some(),
@@ -289,7 +374,12 @@ pub fn build(
         mqtt: st.outputs.mqtt.clone(),
         mqtt_topic: st.outputs.mqtt_topic.clone().unwrap_or_else(|| "xng".into()),
         zmq: st.outputs.zmq.clone(),
-        airframes: Some(airframes_router(&st)),
+        airframes: {
+            if let Some(af) = &st.outputs.airframes {
+                af.check().map_err(|e| anyhow::anyhow!(e))?;
+            }
+            Some(airframes_router(st))
+        },
         own_ship_mmsi: st.outputs.own_ship_mmsi,
         airband: {
             st.outputs.airband.validate().map_err(|e| anyhow::anyhow!("[outputs.airband]: {e}"))?;
@@ -504,24 +594,36 @@ pub fn airframes_router(f: &StationFile) -> AirframesRouter {
             .or_else(|| mode_cfg.and_then(|m| m.station_id.clone()))
             .or_else(|| af.auto_suffix.then(|| auto_suffix(&base, mode)))
             .unwrap_or_else(|| base.clone());
-        let host = mode_cfg.and_then(|m| m.host.clone()).unwrap_or_else(|| dhost.to_string());
-        let port = mode_cfg.and_then(|m| m.port).unwrap_or(dport);
-
-        let key = (station_id.clone(), format!("{host}:{port}"));
-        if !seen.insert(key) {
-            tracing::warn!(
-                "airframes: two decoders feed the same id+endpoint ({station_id} → {host}:{port}); Airframes dedup may inflate counts"
-            );
-        }
+        // One target by default (the public ingest, or `host`/`port`), or
+        // every entry of `targets`.
+        let endpoints: Vec<(String, u16, Proto)> = match mode_cfg.and_then(|m| m.targets.as_ref()) {
+            Some(targets) => targets
+                .iter()
+                .map(|t| (t.host.clone(), t.port, t.proto.unwrap_or(proto)))
+                .collect(),
+            None => vec![(
+                mode_cfg.and_then(|m| m.host.clone()).unwrap_or_else(|| dhost.to_string()),
+                mode_cfg.and_then(|m| m.port).unwrap_or(dport),
+                proto,
+            )],
+        };
 
         // A station session is one SDR (or a file); messages carry this id in
         // their provenance, letting the router target it precisely.
         let sdr_id = sess.sdr.clone().unwrap_or_else(|| "file".to_string());
-        routes.push(Route {
-            sdr_id: Some(sdr_id),
-            mode,
-            target: AirframesTarget { host, port, proto, station_id },
-        });
+        for (host, port, proto) in endpoints {
+            let key = (station_id.clone(), format!("{host}:{port}"));
+            if !seen.insert(key) {
+                tracing::warn!(
+                    "airframes: two decoders feed the same id+endpoint ({station_id} → {host}:{port}); Airframes dedup may inflate counts"
+                );
+            }
+            routes.push(Route {
+                sdr_id: Some(sdr_id.clone()),
+                mode,
+                target: AirframesTarget { host, port, proto, station_id: station_id.clone() },
+            });
+        }
     }
 
     AirframesRouter { routes }
@@ -706,6 +808,82 @@ mode = "vdl2"
         let r = airframes_router(&f);
         let target = r.resolve(xng_types::Mode::Vdl2, Some("rtl-vdl2")).expect("VDL2 routed");
         assert_eq!(target.port, 5552);
+    }
+
+    #[test]
+    fn a_mode_can_feed_several_targets() {
+        let toml = r#"
+station-id = "XX-KHVN"
+[outputs.airframes]
+[outputs.airframes.vdl2]
+station-id = "XX-KHVN-VDL2"
+targets = ["tcp://feed.airframes.io:5553", "192.168.1.20:15555"]
+[outputs.airframes.acars]
+targets = ["feed.airframes.io:5550", "udp://192.168.1.20:15550"]
+[[session]]
+sdr = "rtl-vdl2"
+mode = "vdl2"
+[[session]]
+sdr = "rtl-acars"
+mode = "acars"
+"#;
+        let f: StationFile = toml::from_str(toml).unwrap();
+        f.outputs.airframes.as_ref().unwrap().check().unwrap();
+        let r = airframes_router(&f);
+        let got = |mode, sdr| -> Vec<(String, Proto, String)> {
+            r.resolve_all(mode, Some(sdr))
+                .iter()
+                .map(|t| (t.endpoint(), t.proto, t.station_id.clone()))
+                .collect()
+        };
+        assert_eq!(
+            got(Mode::Vdl2, "rtl-vdl2"),
+            [
+                ("feed.airframes.io:5553".into(), Proto::Tcp, "XX-KHVN-VDL2".into()),
+                // No prefix: VDL2's usual transport.
+                ("192.168.1.20:15555".into(), Proto::Udp, "XX-KHVN-VDL2".into()),
+            ]
+        );
+        assert_eq!(
+            got(Mode::AcarsPoa, "rtl-acars"),
+            [
+                ("feed.airframes.io:5550".into(), Proto::Udp, "XX-KHVN".into()),
+                ("192.168.1.20:15550".into(), Proto::Udp, "XX-KHVN".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn feed_target_strings_are_checked() {
+        let parse = |s: &str| FeedTargetToml::try_from(s.to_string());
+        assert_eq!(
+            parse("tcp://feed.airframes.io:5553").unwrap(),
+            FeedTargetToml { proto: Some(Proto::Tcp), host: "feed.airframes.io".into(), port: 5553 }
+        );
+        assert_eq!(parse("[::1]:5550").unwrap().host, "[::1]");
+        for bad in ["feed.airframes.io", "zmq://h:1", "h:0", "h:port", ":5550", "tcp://h:5553/x"] {
+            assert!(parse(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn target_mistakes_are_refused() {
+        let check = |block: &str| {
+            let toml = format!("station-id = \"X\"\n[outputs.airframes]\n{block}\n[[session]]\nsdr = \"r\"\nmode = \"vdl2\"\n");
+            toml::from_str::<StationFile>(&toml).unwrap().outputs.airframes.unwrap().check()
+        };
+        let err = check("[outputs.airframes.vdl2]\nport = 5553\ntargets = [\"h:1\"]").unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        let err = check("[outputs.airframes.vdl2]\ntargets = []").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        let err = check("[outputs.airframes.vdl2]\ntargets = [\"http://h:1\"]").unwrap_err();
+        assert!(err.contains("udp or tcp"), "{err}");
+        let err = check("[outputs.airframes.ais]\ntargets = [\"udp://h:1\"]").unwrap_err();
+        assert!(err.contains("http"), "{err}");
+        assert!(check("[outputs.airframes.ais]\ntargets = [\"h:5599\", \"http://h2:80\"]").is_ok());
+        // A malformed entry fails while parsing.
+        let toml = "station-id = \"X\"\n[outputs.airframes.vdl2]\ntargets = [\"nope\"]\n[[session]]\nsdr = \"r\"\nmode = \"vdl2\"\n";
+        assert!(toml::from_str::<StationFile>(toml).is_err());
     }
 
     #[test]

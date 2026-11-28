@@ -42,6 +42,10 @@ http = "0.0.0.0:8080"          # live web dashboard (map + messages)
 # enabled = false               # decode HFDL locally, do not feed it
 # [outputs.airframes.aero]      # aero-l and aero-c sessions
 # port = 5571
+# [outputs.airframes.vdl2]      # send VDL2 to Airframes and a local acarshub
+# targets = ["feed.airframes.io:5552", "192.168.1.20:5555"]
+#                               # host:port, optionally udp:// or tcp:// (AIS: http://);
+#                               # every message goes to every target
 
 [[session]]
 sdr = "driver=rtlsdr,serial=00000001"
