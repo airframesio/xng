@@ -143,6 +143,15 @@ airframesio/aggregator-atc): ALPN `airframes-atc/1`, port 4433.
   printed. `xng atc nearby --lat .. --lon ..` prints it without tuning,
   plus the equivalent fixed `--channels` command. Same scoring as
   aggregator-atc's `atc-feed-nearby.py`.
+- **`xng atc setup`** does the same for every SDR on the station and writes
+  a station TOML (`~/.config/xng/atc-station.toml`, `--force` to replace):
+  position from `--lat/--lon`, else a rough IP lookup (ipinfo.io, then
+  ipapi.co); SDRs from `--sdr` (repeatable), else everything `xng devices`
+  lists (`--max-sdrs`). Each SDR takes the best window of the channels the
+  ones before it left (`atc_nearby::plan_many`), so no channel is fed twice.
+  RTL-SDRs that share a serial are refused (`rtl_eeprom -s`). With several
+  SDRs above 2.048 MS/s it warns about shared USB hubs. `--dry-run` prints
+  the file.
 - **Per transmission**: SQUELCH open (signal and noise dBFS), Opus AUDIO
   packets (16 kHz mono, 20 ms, default 24 kbit/s) with TX_START on the first
   and TX_END on the last, then SQUELCH close. Audio is squelch-gated, so a

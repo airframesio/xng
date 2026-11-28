@@ -326,6 +326,12 @@ xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
 xng listen --sdr driver=rtlsdr --mode airband -r 2400000 --channels auto \
     --receiver-pos 37.62,-122.38 --atc-feed
 
+# Several dongles: plan them all at once and run the station file it writes
+# (each SDR takes the busiest slice of the band the others left; without
+# --lat/--lon the position comes from a rough IP lookup)
+xng atc setup --lat 37.62 --lon -122.38 --station-name "SFO west ridge"
+xng station ~/.config/xng/atc-station.toml
+
 # ...and transcribe them. Release binaries, the .deb and the amd64/arm64
 # Docker images include sherpa-onnx: --transcribe runs the ATC-tuned
 # skycontrol-atc-110m model, downloaded once (137 MB) on first use.
