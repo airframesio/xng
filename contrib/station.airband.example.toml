@@ -34,6 +34,7 @@ bitrate = 24000
 # streams = ["120.5", "121.8", "scan"]   # default: every channel
 # server = "atc-ingest.airframes.io:4433"
 # transport = "auto"             # auto (QUIC, then TCP), quic or tcp
+# catalog-match = true           # find each channel's ATC catalog entry by frequency and receiver-pos
 receiver = { type = "rtlsdr", model = "RTL-SDR Blog V4", antenna = "discone" }
 
 # Transcribe transmissions. Transcripts go to the JSON outputs,
@@ -66,12 +67,11 @@ afc-max-hz = 1500                # follow carriers up to 1.5 kHz off
 [[session.airband.channel]]
 freq = "120.500"
 label = "SFO Tower"
-atc-frequency = "airport:KSFO:TWR:120500"
+atc-frequency = "airport:KSFO:TWR:120500"   # optional: the feeder finds it in the ATC catalog
 
 [[session.airband.channel]]
 freq = "121.800"
-label = "SFO Ground"
-atc-frequency = "airport:KSFO:GND:121800"
+label = "SFO Ground"                # the label also picks the entry when several share 121.8 nearby
 
 [[session.airband.channel]]
 freq = "120.900"

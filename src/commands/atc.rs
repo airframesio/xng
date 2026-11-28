@@ -1,7 +1,9 @@
 //! `xng atc login | logout | status`: sign this feeder in to the Airframes
-//! ATC network.
+//! ATC network. `xng atc match`: show which ATC catalog entries channels
+//! would be fed under.
 
 use crate::airband::atc_auth::{self, DEFAULT_API};
+use crate::airband::atc_catalog::{self, Resolution};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -31,6 +33,23 @@ pub enum AtcCommand {
     Status {
         #[arg(long)]
         credentials: Option<PathBuf>,
+    },
+    /// Show the ATC catalog entry each frequency would be fed under at a
+    /// position (what the feeder does for channels without atc-frequency)
+    Match {
+        /// Frequencies in MHz, optionally with the channel label that breaks
+        /// ties: 120.5 "121.9=SJC Ground"
+        #[arg(required = true)]
+        frequencies: Vec<String>,
+        /// Station latitude
+        #[arg(long, allow_hyphen_values = true)]
+        lat: f64,
+        /// Station longitude
+        #[arg(long, allow_hyphen_values = true)]
+        lon: f64,
+        /// Airframes API base URL
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
     },
 }
 
@@ -68,7 +87,43 @@ pub fn run(cmd: AtcCommand) -> anyhow::Result<()> {
             Ok(())
         }
         AtcCommand::Status { credentials } => status(&credentials.unwrap_or_else(atc_auth::default_path)),
+        AtcCommand::Match { frequencies, lat, lon, api } => match_frequencies(&frequencies, lat, lon, &api),
     }
+}
+
+fn match_frequencies(freqs: &[String], lat: f64, lon: f64, api: &str) -> anyhow::Result<()> {
+    anyhow::ensure!((-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon), "invalid position");
+    for arg in freqs {
+        let (f, hint) = match arg.split_once('=') {
+            Some((f, l)) => (f, Some(l.trim())),
+            None => (arg.as_str(), None),
+        };
+        let hz = crate::freq::parse_hz(f.trim())?;
+        let cands = atc_catalog::fetch(api, hz, lat, lon)?;
+        let mhz = hz as f64 / 1e6;
+        match atc_catalog::pick(&cands, hint) {
+            Resolution::Matched(c) => println!("{mhz:.3}  {}  \"{}\"", c.id, c.label()),
+            Resolution::NotAllowed(c) => println!(
+                "{mhz:.3}  {}  not fed: {}",
+                c.id,
+                c.policy_reason.as_deref().unwrap_or("streaming is not permitted")
+            ),
+            Resolution::Ambiguous(_) => {
+                println!("{mhz:.3}  ambiguous: label the channel with the airport and service, or set atc-frequency")
+            }
+            Resolution::NoMatch => println!("{mhz:.3}  no ATC frequency near this position"),
+        }
+        for c in cands.iter().take(5) {
+            println!(
+                "         {:<32} {:>6.1} km  confidence {:.2}{}",
+                c.id,
+                c.distance_km,
+                c.confidence,
+                if c.streamable { "" } else { "  (not streamable)" }
+            );
+        }
+    }
+    Ok(())
 }
 
 fn status(path: &Path) -> anyhow::Result<()> {

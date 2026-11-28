@@ -491,7 +491,7 @@ enum Command {
         #[arg(long)]
         quic_cert_out: Option<PathBuf>,
     },
-    /// Airframes ATC network: sign this feeder in or out (`xng atc login`)
+    /// Airframes ATC network: sign this feeder in or out (`xng atc login`), match frequencies to the ATC catalog (`xng atc match`)
     Atc {
         #[command(subcommand)]
         cmd: commands::atc::AtcCommand,

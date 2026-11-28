@@ -103,9 +103,22 @@ airframesio/aggregator-atc): ALPN `airframes-atc/1`, port 4433.
   `location-precision-m`, and `hide_username` when `--atc-hide-username` /
   `hide-username` is set) → WELCOME → one OPEN per fed stream → OPENED. A
   channel stream is `mode: single`; the scan stream is `mode: scan` with up to
-  16 frequencies. A channel with `atc-frequency` sends that key; otherwise the
-  server resolves `freq_hz` from the station position, and a rejection lists
-  candidate keys in the log.
+  16 frequencies. A channel with `atc-frequency` sends that key. The others
+  are looked up in the ATC catalog before connecting (`catalog-match`, on by
+  default; `--atc-no-catalog-match` turns it off): api-server
+  `GET /v1/atc/frequencies/match` with the carrier and the station position
+  (rounded like HELLO's). The best candidate is used when it is clear (the
+  only one, or confidence >= 0.5 and 0.2 ahead, the rule aggregator-atc uses
+  for a bare `freq_hz`); otherwise the channel label breaks the tie by
+  airport ident (`KSFO` or `SFO`), service (`Tower`, `Ground`, `Approach`,
+  ...) and name words. The entry's key goes in the OPEN and, for a channel
+  without a label, its name becomes the feed label (`KSFO TWR (120.500)`).
+  Channels that stay ambiguous, or whose entry the network does not allow,
+  are not fed (the log names the candidates), so they cannot sink a scan
+  feed. Answers are kept across reconnects; failed lookups are retried at
+  the next connect, and meanwhile the channel goes with `freq_hz` only for
+  the server to resolve. `xng atc match --lat 37.62 --lon -122.38 120.5
+  "121.9=SJC Ground"` prints what the feeder would pick.
 - **Per transmission**: SQUELCH open (signal and noise dBFS), Opus AUDIO
   packets (16 kHz mono, 20 ms, default 24 kbit/s) with TX_START on the first
   and TX_END on the last, then SQUELCH close. Audio is squelch-gated, so a
