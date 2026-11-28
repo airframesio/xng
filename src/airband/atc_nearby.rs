@@ -303,8 +303,39 @@ pub fn plan(
     services: Option<&[String]>,
     center_hz: Option<u64>,
 ) -> Option<Plan> {
-    let span = (sample_rate * 0.75) as u64;
+    plan_from(candidates(rows, services), sample_rate, max_channels, center_hz)
+}
+
+/// Plans for `sdrs` captures at `sample_rate`, best first: each SDR takes
+/// the best window of the channels the ones before it left, so no channel
+/// is fed twice. Stops early when nothing is left.
+pub fn plan_many(
+    rows: &[Row],
+    sample_rate: f64,
+    max_channels: usize,
+    services: Option<&[String]>,
+    sdrs: usize,
+) -> Vec<Plan> {
     let mut cands = candidates(rows, services);
+    let mut plans = Vec::new();
+    for _ in 0..sdrs {
+        let Some(p) = plan_from(cands.clone(), sample_rate, max_channels, None) else {
+            break;
+        };
+        cands.retain(|c| !p.channels.iter().any(|t| t.freq_hz == c.freq_hz));
+        plans.push(p);
+    }
+    plans
+}
+
+/// How wide a slice of the band one capture at `sample_rate` picks
+/// channels from when xng chooses the center.
+pub fn window_hz(sample_rate: f64) -> u64 {
+    ((sample_rate * 0.75) as u64).saturating_sub(2 * CENTER_SLACK_HZ)
+}
+
+fn plan_from(mut cands: Vec<Pick>, sample_rate: f64, max_channels: usize, center_hz: Option<u64>) -> Option<Plan> {
+    let span = (sample_rate * 0.75) as u64;
     let window = match center_hz {
         Some(c) => {
             // Inside that capture, and clear of the center's DC spike.
@@ -456,6 +487,34 @@ mod tests {
             assert!(ch.freq_hz.abs_diff(p.center_hz) <= 900_000, "{} vs {}", ch.freq_hz, p.center_hz);
             assert!(ch.freq_hz.abs_diff(p.center_hz) >= DC_CLEAR_HZ);
         }
+    }
+
+    #[test]
+    fn several_sdrs_split_the_band_without_repeats() {
+        let rows = [
+            row("a:A:TWR:1", 119.4, "TWR", 1.0),
+            row("a:A:GND:2", 120.1, "GND", 1.0),
+            row("a:B:APP:3", 125.3, "APP", 5.0),
+            row("a:B:APP:4", 126.0, "APP", 5.0),
+            row("a:C:TWR:5", 125.7, "TWR", 9.0),
+            row("a:D:CTR:6", 132.0, "CTR", 60.0),
+        ];
+        let plans = plan_many(&rows, 2_400_000.0, 8, None, 2);
+        assert_eq!(plans.len(), 2);
+        let mut seen: Vec<u64> = plans.iter().flat_map(|p| p.channels.iter().map(|c| c.freq_hz)).collect();
+        let n = seen.len();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "a channel was planned twice");
+        for p in &plans {
+            for c in &p.channels {
+                assert!(c.freq_hz.abs_diff(p.center_hz) <= 900_000);
+            }
+        }
+        // The 125-126 MHz cluster scores highest, so the first SDR gets it.
+        assert!(plans[0].channels.iter().any(|c| c.id == "a:B:APP:3"));
+        // More SDRs than windows: stops when the channels run out.
+        assert_eq!(plan_many(&rows[..1], 2_400_000.0, 8, None, 3).len(), 1);
     }
 
     #[test]
