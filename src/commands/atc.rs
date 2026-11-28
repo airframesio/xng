@@ -77,9 +77,13 @@ pub enum AtcCommand {
         /// Only these services, e.g. TWR,GND,APP
         #[arg(long, value_delimiter = ',')]
         services: Vec<String>,
-        /// Airframes API base URL
-        #[arg(long, default_value = DEFAULT_API)]
-        api: String,
+        /// Airframes API base URL (default: the sign-in's, like `listen`,
+        /// else https://api.airframes.io)
+        #[arg(long)]
+        api: Option<String>,
+        /// Credentials file from `xng atc login` (default ~/.config/xng/atc.json)
+        #[arg(long)]
+        credentials: Option<PathBuf>,
     },
 }
 
@@ -118,8 +122,12 @@ pub fn run(cmd: AtcCommand) -> anyhow::Result<()> {
         }
         AtcCommand::Status { credentials } => status(&credentials.unwrap_or_else(atc_auth::default_path)),
         AtcCommand::Match { frequencies, lat, lon, api } => match_frequencies(&frequencies, lat, lon, &api),
-        AtcCommand::Nearby { lat, lon, radius_nm, sample_rate, center_freq, max_channels, services, api } => {
+        AtcCommand::Nearby { lat, lon, radius_nm, sample_rate, center_freq, max_channels, services, api, credentials } => {
             let center_hz = center_freq.as_deref().map(crate::freq::parse_hz).transpose()?;
+            let api = api.unwrap_or_else(|| {
+                let path = credentials.unwrap_or_else(atc_auth::default_path);
+                atc_auth::load(&path).ok().and_then(|c| c.api).unwrap_or_else(|| DEFAULT_API.to_string())
+            });
             let services = services.iter().map(|s| s.trim().to_ascii_uppercase()).collect();
             nearby(&atc_nearby::Query { api, lat, lon, radius_nm, sample_rate, max_channels, services, center_hz })
         }
