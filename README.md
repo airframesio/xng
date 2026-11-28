@@ -320,6 +320,12 @@ xng listen --sdr driver=rtlsdr --mode airband -r 2400000 -c 121.15 \
     --scan --scan-priority 120.5 --record-dir ~/airband --http 0.0.0.0:8080 \
     --receiver-pos 37.62,-122.38 --atc-feed
 
+# Or let xng pick the ATC channels near you from the Airframes ATC catalog
+# (tower, approach, ground, ... that fit one dongle; preview with
+# `xng atc nearby --lat 37.62 --lon -122.38`)
+xng listen --sdr driver=rtlsdr --mode airband -r 2400000 --channels auto \
+    --receiver-pos 37.62,-122.38 --atc-feed
+
 # ...and transcribe them. Release binaries, the .deb and the amd64/arm64
 # Docker images include sherpa-onnx: --transcribe runs the ATC-tuned
 # skycontrol-atc-110m model, downloaded once (137 MB) on first use.

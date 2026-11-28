@@ -15,6 +15,7 @@
 
 pub mod atc_auth;
 pub mod atc_catalog;
+pub mod atc_nearby;
 pub mod atc_proto;
 pub mod cli;
 pub mod config;

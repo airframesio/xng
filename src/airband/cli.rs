@@ -126,6 +126,17 @@ pub struct AirbandOpts {
     /// https://api.airframes.io)
     #[arg(long)]
     pub atc_api: Option<String>,
+    /// --channels auto: look this far around --receiver-pos for ATC
+    /// channels (nautical miles)
+    #[arg(long, default_value_t = 30)]
+    pub atc_nearby_radius_nm: u32,
+    /// --channels auto: feed at most this many channels
+    #[arg(long, default_value_t = 8)]
+    pub atc_nearby_max: usize,
+    /// --channels auto: only these services, e.g. TWR,GND,APP (default:
+    /// every voice service except ATIS/AWOS/ASOS/VOLMET)
+    #[arg(long, value_delimiter = ',')]
+    pub atc_nearby_services: Vec<String>,
 
     /// Transcribe transmissions (locally with skycontrol-atc-110m in a
     /// sherpa build, else Whisper base.en, unless --transcribe-model or
@@ -180,6 +191,41 @@ fn freq_map(v: &[String], what: &str) -> anyhow::Result<Vec<(u64, String)>> {
 }
 
 impl AirbandOpts {
+    /// Take `--channels auto`'s picks: label each (unless --labels names
+    /// it) and give it its catalog key (unless --atc-frequency does), so
+    /// the feed is linked without another lookup.
+    pub fn add_picks(&mut self, picks: &[super::atc_nearby::Pick]) -> anyhow::Result<()> {
+        let labeled: Vec<u64> = freq_map(&self.labels, "--labels")?.into_iter().map(|(f, _)| f).collect();
+        let keyed: Vec<u64> = freq_map(&self.atc_frequency, "--atc-frequency")?.into_iter().map(|(f, _)| f).collect();
+        for p in picks {
+            if !labeled.contains(&p.freq_hz) {
+                self.labels.push(format!("{}hz={}", p.freq_hz, p.label));
+            }
+            if !keyed.contains(&p.freq_hz) {
+                self.atc_frequency.push(format!("{}hz={}", p.freq_hz, p.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `--channels auto` lookup for a receiver at (lat, lon).
+    pub fn nearby_query(&self, lat: f64, lon: f64, sample_rate: f64, center_hz: Option<u64>) -> super::atc_nearby::Query {
+        let api = self.atc_api.clone().unwrap_or_else(|| {
+            let creds = self.atc_credentials.clone().unwrap_or_else(super::atc_auth::default_path);
+            super::atc_auth::load(&creds).ok().and_then(|c| c.api).unwrap_or_else(|| super::atc_auth::DEFAULT_API.to_string())
+        });
+        super::atc_nearby::Query {
+            api,
+            lat,
+            lon,
+            radius_nm: if self.atc_nearby_radius_nm == 0 { 30 } else { self.atc_nearby_radius_nm },
+            sample_rate,
+            max_channels: if self.atc_nearby_max == 0 { 8 } else { self.atc_nearby_max },
+            services: self.atc_nearby_services.iter().map(|s| s.trim().to_ascii_uppercase()).collect(),
+            center_hz,
+        }
+    }
+
     /// Session settings these flags describe.
     pub fn session(&self) -> anyhow::Result<AirbandConfig> {
         let mut c = AirbandConfig { mix: self.mix, ..Default::default() };
@@ -297,6 +343,28 @@ mod tests {
         assert_eq!(parse_squelch("OFF").unwrap(), SquelchMode::Off);
         assert!(parse_squelch("manual").is_err());
         assert!(parse_squelch("loud").is_err());
+    }
+
+    #[test]
+    fn picks_fill_labels_and_keys() {
+        let pick = |hz: u64, id: &str, label: &str| super::super::atc_nearby::Pick::for_test(hz, id, label);
+        let mut o = AirbandOpts {
+            labels: vec!["121.8=SFO Ground".into()],
+            atc_frequency: vec!["120.5=airport:KSFO:TWR:120500".into()],
+            squelch: "auto".into(),
+            ..Default::default()
+        };
+        o.add_picks(&[
+            pick(120_500_000, "airport:KSFO:TWR:120500x", "KSFO TWR"),
+            pick(121_800_000, "airport:KSFO:GND:121800", "KSFO GND"),
+        ])
+        .unwrap();
+        let s = o.session().unwrap();
+        let ch = |hz: u64| s.channels.iter().find(|c| c.freq_hz().unwrap() == hz).unwrap().clone();
+        assert_eq!(ch(120_500_000).atc_frequency.as_deref(), Some("airport:KSFO:TWR:120500"));
+        assert_eq!(ch(120_500_000).label.as_deref(), Some("KSFO TWR"));
+        assert_eq!(ch(121_800_000).label.as_deref(), Some("SFO Ground"));
+        assert_eq!(ch(121_800_000).atc_frequency.as_deref(), Some("airport:KSFO:GND:121800"));
     }
 
     #[test]

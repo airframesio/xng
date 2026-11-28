@@ -119,6 +119,30 @@ airframesio/aggregator-atc): ALPN `airframes-atc/1`, port 4433.
   the next connect, and meanwhile the channel goes with `freq_hz` only for
   the server to resolve. `xng atc match --lat 37.62 --lon -122.38 120.5
   "121.9=SJC Ground"` prints what the feeder would pick.
+- **Picking channels** (`--channels auto`): `decode`/`listen --mode airband
+  --channels auto --receiver-pos LAT,LON` asks api-server
+  `GET /v1/atc/frequencies?near=LAT,LON&radius_nm=30&band=VHF&status=active`
+  (`--atc-nearby-radius-nm`) for the catalog around the station, keeps AM
+  voice channels in 118-137 MHz that may be streamed (not ATIS, AWOS, ASOS,
+  VOLMET, emergency or military, which hold the squelch open or should not
+  be fed), scores each by service (tower 10, approach/departure 8, ground 6,
+  center 5, delivery 4, ... times `exp(-distance/range)`, where the range
+  is the service's usual reach) and takes the slice of 75% of the sample
+  rate less 50 kHz (1.75 MHz at the default `-r 2400000`) whose best
+  `--atc-nearby-max` (8) channels score highest; each further channel of a
+  service counts for less, so a cluster of CTAFs does not beat a tower and
+  its approach (the channels are chosen greedily by that discounted value).
+  The center goes near the middle, at least 10 kHz from every carrier and
+  at most 25 kHz off the middle, so every channel stays within 75% of the
+  capture. With `-c`, the center is kept and only channels inside that
+  capture are picked. `decode --channels auto` needs the recording's `-r`
+  and `-c`. Each pick is labeled (`KSFO TWR`) and carries its catalog key,
+  so no match lookup follows; `--labels` and `--atc-frequency` still win
+  for the channels they name. `--atc-nearby-services TWR,GND,APP` limits the
+  services. The pick runs once at start (restart to pick again) and is
+  printed. `xng atc nearby --lat .. --lon ..` prints it without tuning,
+  plus the equivalent fixed `--channels` command. Same scoring as
+  aggregator-atc's `atc-feed-nearby.py`.
 - **Per transmission**: SQUELCH open (signal and noise dBFS), Opus AUDIO
   packets (16 kHz mono, 20 ms, default 24 kbit/s) with TX_START on the first
   and TX_END on the last, then SQUELCH close. Audio is squelch-gated, so a
