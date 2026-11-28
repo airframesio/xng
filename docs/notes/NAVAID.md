@@ -120,7 +120,7 @@ RMS radial error (2 s reports, four radials per level) by C/N0 in dB-Hz:
 
 | Decoder | 30 | 34 | 38 | 42 | 46 | 50 | 55 |
 |---|---|---|---|---|---|---|---|
-| **xng** | **3.9°** | **2.5°** | **1.5°** | **1.1°** | **0.7°** | **0.5°** | 0.3° |
+| **xng** | **5.0°** | **2.4°** | **1.5°** | **1.1°** | **0.7°** | **0.5°** | 0.2° |
 | vortrack | 103° | 90° | 101° | 108° | 101° | 44° | 0.2° |
 | voracious | 100° | 104° | 99° | 110° | 94° | 93° | 0.4° |
 
@@ -128,7 +128,7 @@ Reports within 2° of the truth:
 
 | Decoder | 30 | 34 | 38 | 42 | 46 | 50 | 55 |
 |---|---|---|---|---|---|---|---|
-| **xng** | **39 %** | **55 %** | **82 %** | **93 %** | **100 %** | **100 %** | 100 % |
+| **xng** | **27 %** | **61 %** | **84 %** | **95 %** | **100 %** | **100 %** | 100 % |
 | vortrack | 2 % | 0 % | 0 % | 0 % | 0 % | 61 % | 100 % |
 | voracious | 0 % | 5 % | 0 % | 0 % | 0 % | 0 % | 100 % |
 
@@ -142,10 +142,10 @@ Impairments (RMS error at 40 dB-Hz / 55 dB-Hz):
 
 | Impairment | xng | vortrack | voracious |
 |---|---|---|---|
-| Carrier 3 kHz off frequency | **1.4°** / **0.2°** | 101° / 0.3° | 100° / 0.3° |
-| Subcarrier 40 Hz off (0.4 %) | **1.2°** / **0.2°** | 96° / 0.3° | 93° / 0.4° |
-| 30 % voice modulation | **1.1°** / **0.2°** | 112° / 3.4° | 110° / 0.4° |
-| Doppler VOR, 10 % sideband asymmetry | **1.1°** / **0.2°** | 109° / 0.2° | 90° / 0.4° |
+| Carrier 3 kHz off frequency | **1.3°** / **0.2°** | 101° / 0.3° | 100° / 0.3° |
+| Subcarrier 40 Hz off (0.4 %) | **1.3°** / **0.2°** | 96° / 0.3° | 93° / 0.4° |
+| 30 % voice modulation | **1.2°** / **0.2°** | 112° / 3.4° | 110° / 0.4° |
+| Doppler VOR, 10 % sideband asymmetry | **1.2°** / **0.2°** | 109° / 0.2° | 90° / 0.4° |
 
 ### Localizer and glideslope DDM
 
@@ -153,14 +153,14 @@ RMS DDM error (four DDMs per level, including full scale):
 
 | Decoder | 30 | 34 | 38 | 42 | 46 | 50 | 55 |
 |---|---|---|---|---|---|---|---|
-| **xng** localizer | **0.031** | **0.019** | **0.014** | **0.007** | **0.005** | **0.003** | **0.002** |
+| **xng** localizer | **0.029** | **0.021** | **0.010** | **0.006** | **0.004** | **0.003** | **0.002** |
 | dumpils localizer | 0.076 | 0.076 | 0.076 | 0.076 | 0.074 | 0.071 | 0.061 |
 | voracious localizer | 0.077 | 0.077 | 0.077 | 0.077 | 0.077 | 0.077 | 0.077 |
-| **xng** glideslope | **0.036** | **0.019** | **0.010** | **0.006** | **0.005** | **0.003** | **0.002** |
-| dumpils glideslope | 0.076 | 0.076 | 0.076 | 0.075 | 0.073 | 0.071 | 0.061 |
+| **xng** glideslope | **0.034** | **0.018** | **0.011** | **0.007** | **0.005** | **0.003** | **0.002** |
+| dumpils glideslope | 0.076 | 0.076 | 0.076 | 0.075 | 0.073 | 0.070 | 0.061 |
 
 Two-frequency localizer (course carrier 4 kHz above the channel, clearance
-carrier 4 kHz below and 10 dB weaker with a 0.3 DDM): xng 0.007 / 0.002 at
+carrier 4 kHz below and 10 dB weaker with a 0.3 DDM): xng 0.006 / 0.002 at
 40 / 50 dB-Hz, dumpils 0.076 / 0.071, voracious 0.077 / 0.077.
 
 0.002 DDM is about 2 µA of localizer deflection. The two other decoders
@@ -183,7 +183,7 @@ the average number of reports per run that carry a wrong ident.
 | **xng** VOR | correct | 0 % | 0 % | 0 % | 100 % | 100 % | 100 % |
 | | wrong | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
 | voracious VOR | correct | 0 % | 0 % | 0 % | 0 % | 0 % | 0 % |
-| | wrong | 12.2 | 10.5 | 11.2 | 12.0 | 11.2 | 13.5 |
+| | wrong | 12.8 | 10.5 | 11.8 | 11.2 | 11.2 | 13.8 |
 | **xng** localizer | correct | 0 % | 0 % | 0 % | 100 % | 100 % | 100 % |
 | | wrong | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
 | voracious localizer | correct | 0 % | 0 % | 0 % | 0 % | 0 % | 0 % |
@@ -202,10 +202,10 @@ CPU seconds per second of signal, one channel, 8-bit IQ read from a file
 
 | Decoder | VOR | Localizer | Glideslope |
 |---|---|---|---|
-| xng | 0.031 | 0.030 | 0.028 |
-| vortrack | 0.018 (radial only) | – | – |
-| voracious | 1.29 | 0.68 | – |
-| dumpils | – | 0.123 | 0.112 |
+| xng | 0.030 | 0.032 | 0.031 |
+| vortrack | 0.016 (radial only) | – | – |
+| voracious | 1.22 | 0.71 | – |
+| dumpils | – | 0.123 | 0.125 |
 
 xng uses about 3 % of one core per channel and carries the ident,
 status, C/N0 and health figures as well; vortrack is cheaper but measures
