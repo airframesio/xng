@@ -10,6 +10,7 @@
 //! REAUTH before it expires.
 
 use crate::airband::atc_auth::{self, AccessToken};
+use crate::airband::atc_catalog::{self, Resolution};
 use crate::airband::atc_proto as p;
 use crate::airband::config::{parse_streams, AtcFeedSettings};
 use crate::airband::opus_enc::OpusEncoder;
@@ -464,7 +465,12 @@ impl Feed {
 }
 
 /// OPEN payloads for the streams to feed, with their channel numbers.
-fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> Vec<(StreamId, Value)> {
+fn plan_feeds(
+    s: &AtcFeedSettings,
+    chans: &[Arc<ChannelMeta>],
+    catalog: &atc_catalog::Matches,
+    bitrate: u32,
+) -> Vec<(StreamId, Value)> {
     let streams = parse_streams(&s.streams).unwrap_or_default();
     let wanted: Vec<StreamId> =
         if streams.is_empty() { chans.iter().map(|c| StreamId::Channel(c.freq_hz)).collect() } else { streams };
@@ -487,12 +493,27 @@ fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> 
         r
     };
     let codec = json!({"name": "opus", "sample_rate": crate::airband::hub::AUDIO_RATE, "channels": 1, "frame_ms": 20, "bitrate": bitrate});
+    // The catalog entry found for a channel without a configured key.
+    let found = |c: &ChannelMeta| match (&c.atc_frequency, catalog.by_freq.get(&c.freq_hz)) {
+        (None, Some(Resolution::Matched(m))) => Some(m),
+        _ => None,
+    };
+    // Channels the catalog says not to feed: not allowed, or ambiguous (the
+    // server would reject it, and on a scan feed every frequency with it).
+    let skip = |c: &ChannelMeta| {
+        c.atc_frequency.is_none()
+            && matches!(catalog.by_freq.get(&c.freq_hz), Some(Resolution::NotAllowed(_) | Resolution::Ambiguous(_)))
+    };
     let freq_ref = |c: &ChannelMeta| {
         let mut f = json!({"freq_hz": c.freq_hz});
-        if let Some(k) = &c.atc_frequency {
+        if let Some(k) = c.atc_frequency.as_ref().or(found(c).map(|m| &m.id)) {
             f["id"] = json!(k);
         }
         f
+    };
+    let label = |c: &ChannelMeta| match (&c.label, found(c)) {
+        (None, Some(m)) => format!("{} ({:.3})", m.label(), c.freq_hz as f64 / 1e6),
+        _ => c.display(),
     };
     let announce = crate::airband::transcribe::announced();
     let transcript = |freqs: &[u64]| -> Option<Value> {
@@ -517,14 +538,25 @@ fn plan_feeds(s: &AtcFeedSettings, chans: &[Arc<ChannelMeta>], bitrate: u32) -> 
                     tracing::warn!("atc feed: no airband channel at {:.3} MHz to feed", *f as f64 / 1e6);
                     continue;
                 };
+                if skip(c) {
+                    continue;
+                }
                 json!({"ch": ch, "key": clean_key(&c.key), "mode": "single", "frequencies": [freq_ref(c)],
-                       "label": c.display(), "codec": codec, "receiver": receiver(Some(c))})
+                       "label": label(c), "codec": codec, "receiver": receiver(Some(c))})
             }
             StreamId::Scan => {
                 let locked: Vec<u64> =
                     hub().scan.lock().unwrap().as_ref().map(|s| s.locked_out.clone()).unwrap_or_default();
-                let fl: Vec<Value> =
-                    chans.iter().filter(|c| !locked.contains(&c.freq_hz)).take(16).map(|c| freq_ref(c)).collect();
+                let fl: Vec<Value> = chans
+                    .iter()
+                    .filter(|c| !locked.contains(&c.freq_hz) && !skip(c))
+                    .take(16)
+                    .map(|c| freq_ref(c))
+                    .collect();
+                if fl.is_empty() {
+                    tracing::warn!("atc feed: no frequency of the scan can be fed");
+                    continue;
+                }
                 if chans.len() > 16 {
                     tracing::warn!("atc feed: a scan feed carries at most 16 frequencies; the first 16 are declared");
                 }
@@ -590,9 +622,33 @@ pub async fn run(
             _ = tokio::time::sleep(Duration::from_millis(200)) => {}
         }
     };
+    let api = s.api.clone().unwrap_or_else(|| {
+        atc_auth::load(&creds).ok().and_then(|c| c.api).unwrap_or_else(|| atc_auth::DEFAULT_API.to_string())
+    });
+    // Channels to look up in the catalog: those without a configured key.
+    let lookups: Vec<(u64, Option<String>)> =
+        chans.iter().filter(|c| c.atc_frequency.is_none()).map(|c| (c.freq_hz, c.label.clone())).collect();
+    let mut catalog = atc_catalog::Matches::default();
     let mut backoff = Duration::from_secs(1);
     let mut quic_failures = 0u32;
     loop {
+        if let (true, Some(lat), Some(lon)) = (s.catalog_match && !lookups.is_empty(), station.lat, station.lon) {
+            if lookups.iter().any(|(f, _)| !catalog.by_freq.contains_key(f)) {
+                // The published (rounded) position is all the lookup needs.
+                let (lat, lon) =
+                    (p::round_coord(lat, s.location_precision_m), p::round_coord(lon, s.location_precision_m));
+                let (api, todo) = (api.clone(), lookups.clone());
+                let mut m = std::mem::take(&mut catalog);
+                let job = tokio::task::spawn_blocking(move || {
+                    m.fill(&api, lat, lon, &todo);
+                    m
+                });
+                catalog = tokio::select! {
+                    _ = &mut closed => return Ok(()),
+                    m = job => m.unwrap_or_default(),
+                };
+            }
+        }
         let use_quic = match s.transport.as_str() {
             "quic" => true,
             "tcp" => false,
@@ -600,7 +656,19 @@ pub async fn run(
         };
         let started = Instant::now();
         let mut opened = false;
-        let r = session(&s, &dialer, use_quic, &tokens, &feeder_id, &station, &chans, &mut closed, &mut opened).await;
+        let r = session(
+            &s,
+            &dialer,
+            use_quic,
+            &tokens,
+            &feeder_id,
+            &station,
+            &chans,
+            &catalog,
+            &mut closed,
+            &mut opened,
+        )
+        .await;
         match r {
             Ok(true) => break, // bus closed
             Ok(false) => {}
@@ -666,6 +734,7 @@ async fn session(
     feeder_id: &str,
     station: &StationInfo,
     chans: &[Arc<ChannelMeta>],
+    catalog: &atc_catalog::Matches,
     closed: &mut std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
     opened: &mut bool,
 ) -> anyhow::Result<bool> {
@@ -715,7 +784,7 @@ async fn session(
     let user = welcome.pointer("/user/username").and_then(|v| v.as_str()).unwrap_or("?").to_string();
 
     // Declare the feeds.
-    let mut plan = plan_feeds(s, chans, bitrate);
+    let mut plan = plan_feeds(s, chans, catalog, bitrate);
     if plan.len() > max_channels {
         tracing::warn!("atc feed: server allows {max_channels} channels; feeding the first {max_channels}");
         plan.truncate(max_channels);
@@ -964,6 +1033,42 @@ mod tests {
             squelch: xng_mode_airband::squelch::SquelchMode::Off,
             sdr: None,
         })
+    }
+
+    /// Catalog matches give the OPEN its key and label; ambiguous or
+    /// disallowed channels are left out, also from the scan feed.
+    #[test]
+    fn catalog_matches_shape_the_opens() {
+        use crate::airband::atc_catalog::Candidate;
+        let mut catalog = atc_catalog::Matches::default();
+        let twr = Candidate {
+            id: "airport:KSFO:TWR:120500".into(),
+            freq_hz: 120_500_000,
+            service: "TWR".into(),
+            facility_ident: Some("KSFO".into()),
+            streamable: true,
+            ..Default::default()
+        };
+        catalog.by_freq.insert(120_500_000, Resolution::Matched(twr.clone()));
+        catalog.by_freq.insert(121_900_000, Resolution::Ambiguous(vec![twr.clone(), twr.clone()]));
+        catalog.by_freq.insert(118_500_000, Resolution::NotAllowed(twr));
+        let mut configured = (*chan(118_500_000)).clone();
+        configured.atc_frequency = Some("airport:KXYZ:TWR:118500".into());
+        let chans = vec![chan(120_500_000), chan(121_900_000), Arc::new(configured), chan(119_000_000)];
+        let streams = ["120.5", "121.9", "118.5", "119.0", "scan"].map(String::from).to_vec();
+        let s = AtcFeedSettings { streams, ..Default::default() };
+        let plan = plan_feeds(&s, &chans, &catalog, 24_000);
+        let opens: Vec<&Value> = plan.iter().map(|(_, o)| o).collect();
+        assert_eq!(opens.len(), 4, "{opens:?}");
+        assert_eq!(opens[0]["frequencies"][0]["id"], "airport:KSFO:TWR:120500");
+        assert_eq!(opens[0]["label"], "KSFO TWR (120.500)");
+        // A configured key wins over what the catalog says.
+        assert_eq!(opens[1]["frequencies"][0]["id"], "airport:KXYZ:TWR:118500");
+        // No lookup answer: the carrier alone, for the server to match.
+        assert!(opens[2]["frequencies"][0].get("id").is_none());
+        let scan: Vec<u64> =
+            opens[3]["frequencies"].as_array().unwrap().iter().map(|f| f["freq_hz"].as_u64().unwrap()).collect();
+        assert_eq!(scan, vec![120_500_000, 118_500_000, 119_000_000]);
     }
 
     fn transcript(f: u64, tx: u64, start_us: i64, end_us: i64) -> crate::airband::hub::Transcript {

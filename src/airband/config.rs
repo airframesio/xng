@@ -271,6 +271,13 @@ pub struct AtcFeedSettings {
     pub streams: Vec<String>,
     /// Receiver description shown to listeners (`{"type":"rtlsdr",...}`).
     pub receiver: Option<serde_json::Value>,
+    /// Look each channel without an `atc-frequency` up in the Airframes ATC
+    /// catalog by carrier and station position, and feed it under the entry
+    /// found (also its name as the label when the channel has none).
+    pub catalog_match: bool,
+    /// api-server base URL for catalog lookups (default: the one the
+    /// sign-in belongs to, else https://api.airframes.io).
+    pub api: Option<String>,
 }
 
 impl Default for AtcFeedSettings {
@@ -288,6 +295,8 @@ impl Default for AtcFeedSettings {
             insecure: false,
             streams: Vec::new(),
             receiver: None,
+            catalog_match: true,
+            api: None,
         }
     }
 }

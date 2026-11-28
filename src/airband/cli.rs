@@ -118,6 +118,14 @@ pub struct AirbandOpts {
     /// Opus bitrate for the ATC feed (bit/s)
     #[arg(long, default_value_t = 24_000)]
     pub atc_bitrate: u32,
+    /// Don't look channels up in the ATC catalog (feed them by carrier only
+    /// unless --atc-frequency names the entry)
+    #[arg(long)]
+    pub atc_no_catalog_match: bool,
+    /// Airframes API for ATC catalog lookups (default: the sign-in's, else
+    /// https://api.airframes.io)
+    #[arg(long)]
+    pub atc_api: Option<String>,
 
     /// Transcribe transmissions (locally with skycontrol-atc-110m in a
     /// sherpa build, else Whisper base.en, unless --transcribe-model or
@@ -242,6 +250,8 @@ impl AirbandOpts {
             station_name: self.atc_station_name.clone(),
             hide_username: self.atc_hide_username,
             bitrate: self.atc_bitrate,
+            catalog_match: !self.atc_no_catalog_match,
+            api: self.atc_api.clone(),
             ..Default::default()
         });
         let transcribe = (self.transcribe || self.transcribe_model.is_some() || self.whisper_url.is_some()).then(|| {
