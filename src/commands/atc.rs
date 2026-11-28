@@ -1,9 +1,11 @@
 //! `xng atc login | logout | status`: sign this feeder in to the Airframes
 //! ATC network. `xng atc match`: show which ATC catalog entries channels
-//! would be fed under.
+//! would be fed under. `xng atc nearby`: the channels `--channels auto`
+//! would pick.
 
 use crate::airband::atc_auth::{self, DEFAULT_API};
 use crate::airband::atc_catalog::{self, Resolution};
+use crate::airband::atc_nearby;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -51,6 +53,34 @@ pub enum AtcCommand {
         #[arg(long, default_value = DEFAULT_API)]
         api: String,
     },
+    /// Show the ATC channels `listen --mode airband --channels auto` would
+    /// pick near a position, and the command that feeds them
+    Nearby {
+        /// Station latitude
+        #[arg(long, allow_hyphen_values = true)]
+        lat: f64,
+        /// Station longitude
+        #[arg(long, allow_hyphen_values = true)]
+        lon: f64,
+        /// Search radius (nautical miles)
+        #[arg(long, default_value_t = 30)]
+        radius_nm: u32,
+        /// SDR sample rate (Hz); sets how much of the band one capture covers
+        #[arg(short = 'r', long, default_value_t = 2_400_000.0)]
+        sample_rate: f64,
+        /// Center frequency to stay on (default: picked)
+        #[arg(short = 'c', long)]
+        center_freq: Option<String>,
+        /// Pick at most this many channels
+        #[arg(long, default_value_t = 8)]
+        max_channels: usize,
+        /// Only these services, e.g. TWR,GND,APP
+        #[arg(long, value_delimiter = ',')]
+        services: Vec<String>,
+        /// Airframes API base URL
+        #[arg(long, default_value = DEFAULT_API)]
+        api: String,
+    },
 }
 
 pub fn run(cmd: AtcCommand) -> anyhow::Result<()> {
@@ -88,6 +118,11 @@ pub fn run(cmd: AtcCommand) -> anyhow::Result<()> {
         }
         AtcCommand::Status { credentials } => status(&credentials.unwrap_or_else(atc_auth::default_path)),
         AtcCommand::Match { frequencies, lat, lon, api } => match_frequencies(&frequencies, lat, lon, &api),
+        AtcCommand::Nearby { lat, lon, radius_nm, sample_rate, center_freq, max_channels, services, api } => {
+            let center_hz = center_freq.as_deref().map(crate::freq::parse_hz).transpose()?;
+            let services = services.iter().map(|s| s.trim().to_ascii_uppercase()).collect();
+            nearby(&atc_nearby::Query { api, lat, lon, radius_nm, sample_rate, max_channels, services, center_hz })
+        }
     }
 }
 
@@ -123,6 +158,43 @@ fn match_frequencies(freqs: &[String], lat: f64, lon: f64, api: &str) -> anyhow:
             );
         }
     }
+    Ok(())
+}
+
+fn nearby(q: &atc_nearby::Query) -> anyhow::Result<()> {
+    let plan = atc_nearby::resolve(q)?;
+    let lo = plan.channels.first().map_or(0, |p| p.freq_hz);
+    let hi = plan.channels.last().map_or(0, |p| p.freq_hz);
+    println!(
+        "center {:.3} MHz, {} channels across {:.3} MHz:",
+        plan.center_hz as f64 / 1e6,
+        plan.channels.len(),
+        (hi - lo) as f64 / 1e6
+    );
+    for p in &plan.channels {
+        println!("  {}", atc_nearby::describe(p));
+    }
+    println!();
+    println!("Feed them (picks again at start, so new catalog entries are used):");
+    println!(
+        "  xng listen --sdr driver=rtlsdr --mode airband -r {} --channels auto --receiver-pos {},{} --atc-feed{}",
+        q.sample_rate as u64,
+        q.lat,
+        q.lon,
+        if q.radius_nm == 30 { String::new() } else { format!(" --atc-nearby-radius-nm {}", q.radius_nm) }
+    );
+    let mhz = |hz: u64| format!("{:.3}", hz as f64 / 1e6);
+    let labels: Vec<String> = plan.channels.iter().map(|p| format!("{}={}", mhz(p.freq_hz), p.label)).collect();
+    println!("Or with these channels fixed:");
+    println!(
+        "  xng listen --sdr driver=rtlsdr --mode airband -r {} -c {} --channels {} --labels \"{}\" --receiver-pos {},{} --atc-feed",
+        q.sample_rate as u64,
+        mhz(plan.center_hz),
+        plan.channels.iter().map(|p| mhz(p.freq_hz)).collect::<Vec<_>>().join(","),
+        labels.join(","),
+        q.lat,
+        q.lon
+    );
     Ok(())
 }
 

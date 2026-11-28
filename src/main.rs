@@ -29,7 +29,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Args)]
+#[derive(Args, Clone)]
 struct TuneOpts {
     /// Decode mode: acars, vdl2, hfdl, aero, aero-c, std-c, ais, adsb, iridium,
     /// uat, sarsat, dsc, navtex, sonde, ads-l, atcs, aprs, pocsag, eot, flex,
@@ -49,6 +49,8 @@ struct TuneOpts {
     /// Channel frequencies, comma separated (e.g. 131.550,131.725). The
     /// tui falls back to the mode's built-in plan (as many channels as
     /// fit the capture width and CPU budget); decode/listen require it.
+    /// Airband: `auto` picks the ATC channels near --receiver-pos from the
+    /// Airframes ATC catalog (and -c, and -r 2400000 unless given).
     #[arg(long, value_delimiter = ',')]
     channels: Vec<String>,
     /// Receiver location as lat,lon (e.g. 38.69,-121.59) — enables
@@ -491,7 +493,7 @@ enum Command {
         #[arg(long)]
         quic_cert_out: Option<PathBuf>,
     },
-    /// Airframes ATC network: sign this feeder in or out (`xng atc login`), match frequencies to the ATC catalog (`xng atc match`)
+    /// Airframes ATC network: sign this feeder in or out (`xng atc login`), match frequencies to the ATC catalog (`xng atc match`), pick channels near you (`xng atc nearby`)
     Atc {
         #[command(subcommand)]
         cmd: commands::atc::AtcCommand,
@@ -552,6 +554,7 @@ fn main() -> anyhow::Result<()> {
                     anyhow::anyhow!("cannot guess IQ format; pass --format (cf32|cs16|cs8|cu8)")
                 })?,
             };
+            let (tune, airband) = auto_channels(&tune, &airband)?;
             let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
             let (mut outputs, station_ident) = output.build()?;
             outputs.airframes =
@@ -864,6 +867,35 @@ fn print_table(headers: &[&str], rows: &[[String; 5]]) {
     println!("  {}", line("└", "┴", "┘"));
 }
 
+/// `--channels auto` (airband): pick the channels, and the center unless
+/// -c sets it, from the ATC catalog around --receiver-pos, labeled and
+/// linked to their catalog entries. Anything else passes through.
+fn auto_channels(
+    tune: &TuneOpts,
+    airband: &xng::airband::cli::AirbandOpts,
+) -> anyhow::Result<(TuneOpts, xng::airband::cli::AirbandOpts)> {
+    let (mut tune, mut airband) = (tune.clone(), airband.clone());
+    if !(tune.channels.len() == 1 && tune.channels[0].trim().eq_ignore_ascii_case("auto")) {
+        return Ok((tune, airband));
+    }
+    anyhow::ensure!(tune.mode == "airband", "--channels auto picks ATC channels: use it with --mode airband");
+    let (lat, lon) = parse_receiver_pos(&tune.receiver_pos)?
+        .ok_or_else(|| anyhow::anyhow!("--channels auto needs --receiver-pos LAT,LON to find channels near you"))?;
+    let rate = *tune.sample_rate.get_or_insert(2_400_000.0);
+    let center = tune.center_freq.as_deref().map(xng::freq::parse_hz).transpose()?;
+    let q = airband.nearby_query(lat, lon, rate, center);
+    eprintln!("xng: finding ATC channels within {} nm of {lat:.3},{lon:.3} ({})", q.radius_nm, q.api);
+    let plan = xng::airband::atc_nearby::resolve(&q)?;
+    eprintln!("xng: tuning {:.3} MHz for {} channels:", plan.center_hz as f64 / 1e6, plan.channels.len());
+    for p in &plan.channels {
+        eprintln!("  {}", xng::airband::atc_nearby::describe(p));
+    }
+    tune.center_freq = Some(format!("{}", plan.center_hz));
+    tune.channels = plan.channels.iter().map(|p| p.freq_hz.to_string()).collect();
+    airband.add_picks(&plan.channels)?;
+    Ok((tune, airband))
+}
+
 fn listen(
     sdr: &str,
     gain: Option<f64>,
@@ -871,6 +903,8 @@ fn listen(
     output: &OutputOpts,
     airband: &xng::airband::cli::AirbandOpts,
 ) -> anyhow::Result<()> {
+    let (tune, airband) = auto_channels(tune, airband)?;
+    let (tune, airband) = (&tune, &airband);
     let (mode, rate, center_hz, channels_hz) = parse_tune(&tune.tune())?;
     let (mut outputs, station_ident) = output.build()?;
     outputs.airframes =
