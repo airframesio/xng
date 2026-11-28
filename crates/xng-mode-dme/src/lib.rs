@@ -15,8 +15,9 @@
 //! Squitter and replies are identical pulse pairs, so on the reply frequency
 //! alone only their sum is observable (`random_pps`). Tuning the
 //! interrogation frequency of the same channel instead reports the aircraft
-//! interrogations received from nearby aircraft (role `interrogation`): a
-//! local view of the demand on the transponder, not its full reply load.
+//! interrogations received from nearby aircraft (role `interrogation`): the
+//! locally received interrogation rate, which is not the beacon's reply load
+//! (the receiver and the beacon hear different aircraft).
 //!
 //! Written from ICAO Annex 10 Vol I §3.5. No code from gr-dme or other DME
 //! decoders (see PROVENANCE.md).

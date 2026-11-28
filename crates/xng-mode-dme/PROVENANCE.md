@@ -19,6 +19,14 @@ No gr-dme source is in this repository, and xng's detector differs in design
 (energy of both pulses added before one decision, median noise floor, balance
 gate, peak picking over the whole pair window, and an ident detector).
 
+## OnAir
+
+The DME mode of [OnAir](https://github.com/adswill/OnAir) (GPL-3.0) is a
+second benchmark reference only. It was built from source outside this
+repository and run through its command line receiver; its DME header and
+command-line source were read only to call it and parse its output
+(`bench/dme/onair_run.py`). No OnAir source is in this repository.
+
 ## Verification posture: synthetic, no off-air capture yet
 
 There is no DME capture in the corpus. `modulate.rs` synthesizes a

@@ -1,15 +1,15 @@
 //! Benchmark helper for `bench/dme`.
 //!
 //! ```text
-//! dme_bench sim  <out.cf32> <truth.csv> <rate> <seconds> <snr_db> [ident] [offset_hz] [shape] [seed]
+//! dme_bench sim  <out.cf32> <truth.csv> <rate> <seconds> <snr_db> [ident] [offset_hz] [shape] [seed] [random_pps] [dot_ms]
 //! dme_bench run  <in.cf32> <rate> <pairs.txt> [carrier_hz]
 //! dme_bench score <truth.csv> <pairs.txt> <tol_us> <seconds>
 //! ```
 //!
 //! `sim` writes a synthetic X-channel transponder (2700 pp/s random pairs and
 //! an optional ident). `run` decodes a cf32 file and writes one pair time
-//! (µs) per line, printing idents and the CPU time (file read and decode;
-//! the same span gr-dme's flowgraph is timed over). `score` matches pair
+//! (µs) per line, printing idents and the CPU time (file read, decode and
+//! pair-file write: the same work gr-dme's timed flowgraph does). `score` matches pair
 //! times against the truth.
 
 use num_complex::Complex;
@@ -43,6 +43,8 @@ fn sim(a: &[String]) {
             _ => PulseShape::Gaussian,
         },
         seed: a.get(8).map(|s| s.parse().unwrap()).unwrap_or(1),
+        random_pps: a.get(9).map(|s| s.parse().unwrap()).unwrap_or(2700.0),
+        dot_ms: a.get(10).map(|s| s.parse().unwrap()).unwrap_or(125.0),
         ident_start_s: 1.0,
         ..Default::default()
     };
@@ -88,12 +90,14 @@ fn run(a: &[String]) {
         events.extend(dec.process_with_pairs(chunk, &mut pairs));
     }
     events.extend(dec.finish(Some(&mut pairs)));
-    let cpu = cpu_seconds() - cpu0;
-    let wall = t0.elapsed().as_secs_f64();
     let mut f = BufWriter::new(std::fs::File::create(&a[2]).unwrap());
     for p in &pairs {
         writeln!(f, "{:.3}", p.t_us).unwrap();
     }
+    f.flush().unwrap();
+    drop(f);
+    let cpu = cpu_seconds() - cpu0;
+    let wall = t0.elapsed().as_secs_f64();
     for e in &events {
         match e {
             DmeEvent::Ident(r) => println!("IDENT {} {} repeats={}", r.ident, r.morse, r.repeats),
