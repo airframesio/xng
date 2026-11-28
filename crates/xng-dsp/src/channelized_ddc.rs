@@ -61,6 +61,11 @@ const OVERSAMPLED_TAPS_PER_TRANSITION: f64 = 8.0;
 /// Fewest / most taps per branch for the oversampled prototype.
 const OVERSAMPLED_MIN_TAPS: usize = 4;
 const OVERSAMPLED_MAX_TAPS: usize = 16;
+/// Largest prime factor of an FFT-friendly oversampled bin count. rustfft
+/// runs a bank whose `M` has a larger prime factor several times slower
+/// (`M` = 230 = 2·5·23 costs about five times `M` = 240 at 10 MS/s), so the
+/// chooser takes such an `M` only when nothing smoother carries the plan.
+const OVERSAMPLED_MAX_PRIME: usize = 11;
 /// Channel filter sizing behind an oversampled bank, whose bins pass far
 /// more out-of-channel content than a critically sampled one (≈ −100 dB vs
 /// ≈ −70 dB for [`TAPS_PER_TRANSITION`]).
@@ -379,8 +384,9 @@ fn choose_num_bins(
 /// length follows from that. Candidates are the even `M` whose bin rate is
 /// within `[output, MAX_BIN_TO_OUTPUT_RATIO·output]` and whose rate after
 /// the channel filter's decimation stays ≤ `max_resample_ratio`·output (see
-/// [`MAX_RESAMPLE_RATIO`]); among them, take the shortest prototype, then the
-/// largest `M` (lowest bin rate: cheapest per-channel finish).
+/// [`MAX_RESAMPLE_RATIO`]); among them, prefer an FFT-friendly `M` (see
+/// [`OVERSAMPLED_MAX_PRIME`]), then the shortest prototype, then the largest
+/// `M` (lowest bin rate: cheapest per-channel finish).
 fn choose_oversampled_bins(
     input_rate: f64,
     output_rate: f64,
@@ -390,8 +396,8 @@ fn choose_oversampled_bins(
 ) -> Result<(usize, usize), String> {
     let min_m =
         ((2.0 * input_rate / (MAX_BIN_TO_OUTPUT_RATIO * output_rate)).ceil() as usize).max(4);
-    let max_m = ((2.0 * input_rate / output_rate).floor() as usize).min(256);
-    let mut best: Option<(usize, usize)> = None;
+    let max_m = (2.0 * input_rate / output_rate).floor() as usize;
+    let mut best: Option<(usize, usize, bool)> = None;
     for m in (min_m..=max_m).filter(|m| m.is_multiple_of(2)) {
         let spacing = input_rate / m as f64;
         let worst = offsets
@@ -413,16 +419,35 @@ fn choose_oversampled_bins(
         if post_rate > max_resample_ratio * output_rate {
             continue;
         }
-        if best.is_none_or(|(_, t)| tpb <= t) {
-            best = Some((m, tpb));
+        let awkward = largest_prime_factor(m) > OVERSAMPLED_MAX_PRIME;
+        if best.is_none_or(|(_, t, a)| (awkward, tpb) <= (a, t)) {
+            best = Some((m, tpb, awkward));
         }
     }
-    best.ok_or_else(|| {
+    best.map(|(m, tpb, _)| (m, tpb)).ok_or_else(|| {
         format!(
             "no oversampled bin count carries ±{passband_hz} Hz at {output_rate} S/s from \
              {input_rate} S/s"
         )
     })
+}
+
+/// Largest prime factor of `n` (1 for `n` ≤ 1).
+fn largest_prime_factor(mut n: usize) -> usize {
+    let mut largest = 1;
+    let mut p = 2;
+    while p * p <= n {
+        while n.is_multiple_of(p) {
+            largest = p;
+            n /= p;
+        }
+        p += 1;
+    }
+    if n > 1 {
+        n
+    } else {
+        largest
+    }
 }
 
 #[cfg(test)]
@@ -793,12 +818,52 @@ mod tests {
         assert!(bad.is_empty(), "near neighbours not rejected:\n{}", bad.join("\n"));
     }
 
+    /// The helper on smooth counts and on the prime-heavy counts the old
+    /// chooser picked.
+    #[test]
+    fn largest_prime_factor_of_bin_counts() {
+        assert_eq!(largest_prime_factor(1), 1);
+        assert_eq!(largest_prime_factor(256), 2);
+        assert_eq!(largest_prime_factor(240), 5);
+        assert_eq!(largest_prime_factor(224), 7);
+        assert_eq!(largest_prime_factor(176), 11);
+        // Counts the old chooser picked at 8 and 10 MS/s.
+        assert_eq!(largest_prime_factor(230), 23);
+        assert_eq!(largest_prime_factor(236), 59);
+    }
+
+    /// US ACARS plan at 10 MS/s: the shortest prototype comes with prime-heavy
+    /// counts (236 = 4·59 below the old 256 cap). The chosen `M` must be
+    /// FFT-friendly and may exceed 256.
+    #[test]
+    fn oversampled_bins_prefer_fft_friendly_counts() {
+        let plan = [
+            130.425, 130.45, 130.55, 130.825, 130.85, 131.125, 131.25, 131.425, 131.45, 131.475,
+            131.525, 131.55, 131.65, 131.725, 131.825, 131.85,
+        ];
+        let offsets: Vec<f64> = plan.iter().map(|f| f * 1e6 - 131.1375e6).collect();
+        let (m, _) =
+            choose_oversampled_bins(10e6, 24_000.0, 5_000.0, &offsets, MAX_RESAMPLE_RATIO).unwrap();
+        assert!(largest_prime_factor(m) <= OVERSAMPLED_MAX_PRIME, "M={m}");
+        assert!(m > 256, "M={m}");
+    }
+
+    /// At 5.3 MS/s with the resampler guard at 1.0 (bins must decimate to
+    /// exactly 100 kS/s), only `M` = 106 = 2·53 fits. The chooser still
+    /// returns it rather than failing.
+    #[test]
+    fn oversampled_bins_fall_back_to_awkward_counts() {
+        let (fs, out_rate) = (5_300_000.0, 100_000.0);
+        let (m, _) = choose_oversampled_bins(fs, out_rate, 10_500.0, &[0.0], 1.0).unwrap();
+        assert_eq!(m, 106);
+    }
+
+    /// On this plan, without the guard, the chooser's shortest FFT-friendly
+    /// prototype comes with `M` = 72: 66.7 kS/s bins → channel filter
+    /// decimation by 2 → 33.3 kS/s, 1.39× the output rate, into the cubic
+    /// resampler. The guard must steer it away from that.
     #[test]
     fn oversampled_resample_guard() {
-        // On this plan, without the guard, the chooser's shortest prototype
-        // (6 taps) comes with M = 74: 64.9 kS/s bins → channel filter
-        // decimation by 2 → 32.4 kS/s, 1.35× the output rate, into the cubic
-        // resampler.
         let (fs, out_rate, pb) = (2_400_000.0, 24_000.0, 5_000.0);
         let offsets = [-100_000.0, 37_500.0, 162_500.0];
         let ratio = |m: usize| {
